@@ -24,6 +24,38 @@ $(function () {
 
     var CUSTOM_RANGE_START = 900000;
 
+    // ── Segmented retexture staging (preview-before-save) ──────────────
+    // A selected variant lives here, fully temporary, until Save commits it.
+    //   stagedRetexture = { displayId, mpqPath, filename, itemName,
+    //                       unitColors, unitLightness, glbUrl, pngUrl, name }
+    // glbUrl is a temp preview GLB (no DB row, no patch). On Save we POST
+    // CommitSegmentedRetexture to persist and get the real displayId.
+    var stagedRetexture = null;
+    var stagedPreviewGlbs = [];   // temp GLB urls to clean up on modal close
+
+    // When a retexture entry point is clicked from the DETAIL view (e.g. the
+    // header "Retexture variations" button), the retexture panel lives inside
+    // the hidden #colEdit column and can't show. We stash the request here,
+    // enter edit mode, and openRetexturePanel runs again once #colEdit is
+    // visible (consumed at the end of showEditPanel).
+    var pendingRetexOpen = null;
+
+    function hasUnsavedRetexture() {
+        return stagedRetexture != null && !stagedRetexture.committed;
+    }
+
+    // Guard against losing an unsaved retexture on tab close / navigation.
+    // (The panel's own back/cancel routes through closeRetexturePanel, which
+    // warns separately; this catches the browser-level navigate-away case.)
+    window.addEventListener('beforeunload', function (e) {
+        if (hasUnsavedRetexture()) {
+            e.preventDefault();
+            e.returnValue = '';   // triggers the browser's generic confirm
+            return '';
+        }
+    });
+
+
     // ===================== BASELINE INTEGRATION =====================
 
     BaselineSystem.checkStatus(function (status) {
@@ -37,6 +69,17 @@ $(function () {
     });
 
     // ===================== CONSTANTS =====================
+
+    // Check if patch-4.MPQ exists (retextures available for download)
+    function checkPatchMAvailable() {
+        $.ajax({
+            url: '/Items/DownloadPatch?file=patch-4.MPQ',
+            type: 'HEAD',
+            success: function () { $('#btnDownloadPatchM').show(); },
+            error: function () { $('#btnDownloadPatchM').hide(); }
+        });
+    }
+    checkPatchMAvailable();
 
     var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Artifact'];
     var QUALITY_COLORS = ['#9d9d9d', 'inherit', '#1eff00', '#0070dd', '#a335ee', '#ff8000', '#e6cc80'];
@@ -326,6 +369,24 @@ $(function () {
     function loadTextureGrid(displayId, targetSelector) {
         $.getJSON('/Items/TextureInfo', { displayId: displayId }, function (data) {
             if (!data.found || !data.textures || data.textures.length === 0) {
+                var isEditEmpty = (targetSelector === '#editTextureContent');
+                var invTypeEmpty = currentDetailItem ? (currentDetailItem.inventory_type || 0) : 0;
+                // Body-atlas (painted armor) has no model textures, so TextureInfo
+                // is empty — but it CAN be retextured via the component-slot path.
+                // Render the entry point HERE, inside the edit panel (#colEdit), so
+                // the slide-in panel is actually visible when clicked. (Putting it
+                // in the detail panel opened a panel in a hidden column — it only
+                // appeared after entering edit. This is the right home.)
+                if (isEditEmpty && isBodyAtlasType(invTypeEmpty)) {
+                    $(targetSelector).html(
+                        '<div class="text-center p-2" style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">' +
+                        'Painted armor — no model texture. Recolor its body-atlas components:</div>' +
+                        '<div class="text-center"><button class="btn-retex-panel" id="btnBodyAtlasRetex" ' +
+                        'title="Retexture variations (painted armor)">' +
+                        '<i class="fa-solid fa-wand-magic-sparkles"></i> Retexture variations</button></div>'
+                    );
+                    return;
+                }
                 $(targetSelector).html(
                     '<div class="text-center p-2" style="font-size: 11px; color: var(--text-muted);">' +
                     'No textures found for this model</div>'
@@ -335,12 +396,21 @@ $(function () {
 
             var html = '';
 
-            // Model info header
-            html += '<div style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px; padding: 0 2px;">' +
+            // Model info header — and, in edit mode, a launcher button for
+            // the new retexture panel (sibling of the per-texture wand icons,
+            // for users who want to retexture without picking a specific tex
+            // first; it opens the panel on the first texture).
+            var isEdit = (targetSelector === '#editTextureContent');
+            html += '<div style="font-size: 11px; color: var(--text-muted); margin-bottom: 8px; padding: 0 2px; display:flex; align-items:center; gap:6px;">' +
                 '<span style="color: var(--accent);">' + esc(data.modelName) + '</span>' +
                 ' · ' + data.vertexCount.toLocaleString() + 'v/' + data.triangleCount.toLocaleString() + 't' +
-                ' · ' + (data.m2Size / 1024).toFixed(0) + 'KB' +
-                '</div>';
+                ' · ' + (data.m2Size / 1024).toFixed(0) + 'KB';
+            if (isEdit) {
+                html += '<button class="btn-retex-panel" id="btnOpenRetexturePanel" ' +
+                    'title="Open retexture panel" style="margin-left:auto;">' +
+                    '<i class="fa-solid fa-wand-magic-sparkles"></i> Retexture textures</button>';
+            }
+            html += '</div>';
 
             // Texture grid
             html += '<div class="item-texture-grid">';
@@ -414,35 +484,132 @@ $(function () {
     // ===================== RETEXTURE =====================
 
     // Right-click on texture card → show retexture dialog
-    $(document).on('click', '.btn-retexture', function (e) {
-        e.stopPropagation();
-        var $card = $(this).closest('.item-texture-card');
-        var mpqPath = $card.data('mpq-path');
-        var filename = $card.find('.item-texture-name').text();
-        var width = $card.data('width');
-        var height = $card.data('height');
-        var format = $card.data('format');
+    // ── Retexture Panel: content factory ────────────────────────────────
+    // Returns the inner HTML for the retexture panel. Same content as the
+    // old modal (mode tabs, palette/variations/segmented sections, footer)
+    // minus the overlay wrapper and the modal-internal 3D viewer pane.
+    // Preview is driven via window.retexEquipWeaponGlbDirect on the existing
+    // character viewer to the right — see the .segmented-card click handler.
+    // ── Body-atlas panel: Variations-only, no source BLP ────────────────
+    // Painted armor (boots/gloves/belts/chest/legs/etc.) has no model texture,
+    // so the model-texture modes don't apply. This panel reuses the SAME
+    // variations element ids (variationTheme/variationCount/variationGenBtn/
+    // variationDetected/variationGallery) so the existing generate handler and
+    // the body-atlas dispatch work unchanged. A slot-status line shows which
+    // component slots were found vs missing after the first generate.
+    function buildBodyAtlasPanelContent(texData) {
+        var slot = SLOT_NAMES[texData.inventoryType] || 'Armor';
+        return (
+            '<div class="retex-panel-header">' +
+            '<i class="fa-solid fa-wand-magic-sparkles" style="color:var(--accent);font-size:16px;"></i>' +
+            '<div class="retex-panel-title">Retexture<span class="retex-tex-name">' + esc(texData.filename) + '</span></div>' +
+            '<button class="btn-sm btn-outline-subtle" id="retexBackBtn" title="Back to edit">' +
+            '<i class="fa-solid fa-arrow-left"></i> Back</button>' +
+            '</div>' +
+            '<div class="retex-panel-body">' +
+            '<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">' +
+            esc(slot) + ' · painted armor (body atlas) · no model texture</div>' +
+            '<div style="font-size:10px;color:var(--text-muted);margin-bottom:12px;">' +
+            'This piece paints into the shared body atlas. Variations recolors every ' +
+            'component slot it can find in the MPQ. Click a card to preview on your character.</div>' +
 
-        var itemName = currentDetailItem ? (currentDetailItem.name || '') : '';
+            // Slot status — filled in after the first generate (found vs missing).
+            '<div id="bodyAtlasSlotStatus" style="font-size:10px;margin-bottom:10px;"></div>' +
 
-        // Show retexture modal
-        var modal = $('<div class="texture-overlay" id="retextureOverlay">' +
-            '<div class="retexture-dialog">' +
-            '<div style="font-size:15px;font-weight:600;margin-bottom:12px;color:var(--text-primary);">' +
-            '<i class="fa-solid fa-wand-magic-sparkles" style="color:var(--accent);"></i> Retexture: ' + esc(filename) + '</div>' +
+            // Variations section — same ids as the model panel so handlers reuse.
+            '<div id="retexVariationsSection" style="margin-bottom:12px;">' +
+            '<label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:3px;">Theme (or leave blank for surprise)</label>' +
+            '<input type="text" id="variationTheme" class="form-input" ' +
+            'placeholder="e.g. marble &amp; gold, obsidian, frost, blood, holy" ' +
+            'style="margin-bottom:8px;font-size:12px;" />' +
+            '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">' +
+            '<label style="font-size:11px;color:var(--text-secondary);">Variants:</label>' +
+            '<select id="variationCount" class="form-input" style="width:60px;font-size:12px;padding:2px 4px;">' +
+            '<option>2</option><option selected>4</option><option>6</option><option>8</option></select>' +
+            '<button class="btn-sm btn-accent" id="variationGenBtn"><i class="fa-solid fa-dice"></i> Generate variants</button>' +
+            '</div>' +
+            '<div id="variationDetected" style="font-size:10px;color:var(--text-muted);margin-bottom:8px;"></div>' +
+            '<div id="variationGallery" class="retex-card-grid"></div>' +
+            '</div>' +
+            '</div>'
+        );
+    }
+
+    function buildRetexturePanelContent(texData) {
+        // Body-atlas (painted armor) variant: no source BLP, no model-texture
+        // modes (scratch/modify/palette/segmented all operate on a model
+        // texture this item doesn't have). Only Variations applies — it recolors
+        // the component slots server-side. Render a slimmed panel locked to it.
+        if (texData.bodyAtlas) {
+            return buildBodyAtlasPanelContent(texData);
+        }
+        var mpqPath = texData.mpqPath;
+        var filename = texData.filename;
+        var width = texData.width;
+        var height = texData.height;
+        var format = texData.format;
+        return (
+            '<div class="retex-panel-header">' +
+            '<i class="fa-solid fa-wand-magic-sparkles" style="color:var(--accent);font-size:16px;"></i>' +
+            '<div class="retex-panel-title">Retexture<span class="retex-tex-name">' + esc(filename) + '</span></div>' +
+            '<button class="btn-sm btn-outline-subtle" id="retexBackBtn" title="Back to edit">' +
+            '<i class="fa-solid fa-arrow-left"></i> Back</button>' +
+            '</div>' +
+            '<div class="retex-panel-body">' +
             '<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;">' +
             width + '×' + height + ' · ' + esc(format) + ' · ' + esc(mpqPath) + '</div>' +
 
-            // Mode toggle
-            '<div style="display:flex;gap:8px;margin-bottom:12px;">' +
-            '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary);cursor:pointer;padding:6px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);flex:1;transition:all 0.15s;" class="retex-mode-btn" data-mode="scratch">' +
-            '<input type="radio" name="retexMode" value="scratch" style="accent-color:var(--accent);"> Generate from scratch</label>' +
-            '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary);cursor:pointer;padding:6px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);flex:1;transition:all 0.15s;" class="retex-mode-btn active" data-mode="modify">' +
-            '<input type="radio" name="retexMode" value="modify" checked style="accent-color:var(--accent);"> Modify existing</label>' +
+            // Mode toggle. Variations first + default; Palette swap second;
+            // From scratch / Modify after. (Segmented mode removed May 2026.)
+            '<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;">' +
+            '<label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text-primary);cursor:pointer;padding:5px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);flex:1;transition:all 0.15s;min-width:100px;" class="retex-mode-btn active" data-mode="variations">' +
+            '<input type="radio" name="retexMode" value="variations" checked style="accent-color:var(--accent);"> Variations</label>' +
+            '<label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text-primary);cursor:pointer;padding:5px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);flex:1;transition:all 0.15s;min-width:100px;" class="retex-mode-btn" data-mode="palette">' +
+            '<input type="radio" name="retexMode" value="palette" style="accent-color:var(--accent);"> Palette swap</label>' +
+            '<label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text-primary);cursor:pointer;padding:5px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);flex:1;transition:all 0.15s;min-width:100px;" class="retex-mode-btn" data-mode="scratch">' +
+            '<input type="radio" name="retexMode" value="scratch" style="accent-color:var(--accent);"> From scratch</label>' +
+            '<label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text-primary);cursor:pointer;padding:5px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);flex:1;transition:all 0.15s;min-width:100px;" class="retex-mode-btn" data-mode="modify">' +
+            '<input type="radio" name="retexMode" value="modify" style="accent-color:var(--accent);"> Modify existing</label>' +
             '</div>' +
 
-            // Denoise slider (hidden by default, shown for modify mode)
-            '<div id="retexDenoiseRow" style="margin-bottom:12px;">' +
+            // Vision recolor section (hidden unless palette mode)
+            '<div id="retexPaletteSection" style="display:none;margin-bottom:12px;">' +
+            '<label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:3px;">Recolor Instruction</label>' +
+            '<textarea id="recolorInstruction" class="form-input" rows="2" ' +
+            'placeholder="e.g. Swap all gray/steel for obsidian black. Make gold borders brighter. Change blue tints to deep crimson." ' +
+            'style="margin-bottom:8px;resize:vertical;font-size:12px;"></textarea>' +
+            '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">' +
+            '<button class="btn-sm btn-outline-subtle" id="recolorPreviewBtn">' +
+            '<i class="fa-solid fa-eye"></i> Preview recolor</button>' +
+            '<label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text-primary);cursor:pointer;">' +
+            '<input type="checkbox" id="paletteChainAI" style="accent-color:var(--accent);"> + AI polish</label>' +
+            '<label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--status-warning, #d49a00);cursor:pointer;" title="TEST: skip brute-force, send original straight to Flux at 0.5">' +
+            '<input type="checkbox" id="paletteSkipBrute" style="accent-color:var(--accent);"> Flux-only (test)</label>' +
+            '<div id="paletteAIDenoiseRow" style="display:none;flex:1;">' +
+            '<input type="range" id="paletteAIDenoise" min="10" max="80" value="50" style="width:100%;accent-color:var(--accent);" />' +
+            '<span style="font-size:10px;color:var(--text-muted);" id="paletteAIDenoiseVal">0.50</span>' +
+            '</div></div>' +
+            '<div id="recolorPreview" style="display:none;"></div>' +
+            '</div>' +
+
+            // Variations section (default mode — visible on open).
+            '<div id="retexVariationsSection" style="margin-bottom:12px;">' +
+            '<label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:3px;">Theme (or leave blank for surprise)</label>' +
+            '<input type="text" id="variationTheme" class="form-input" ' +
+            'placeholder="e.g. frost, fel corruption, blood, volcanic, holy, shadow" ' +
+            'style="margin-bottom:8px;font-size:12px;" />' +
+            '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">' +
+            '<label style="font-size:11px;color:var(--text-secondary);">Variants:</label>' +
+            '<select id="variationCount" class="form-input" style="width:60px;font-size:12px;padding:2px 4px;">' +
+            '<option>2</option><option selected>4</option><option>6</option><option>8</option></select>' +
+            '<button class="btn-sm btn-accent" id="variationGenBtn"><i class="fa-solid fa-dice"></i> Generate variants</button>' +
+            '</div>' +
+            '<div id="variationDetected" style="font-size:10px;color:var(--text-muted);margin-bottom:8px;"></div>' +
+            '<div id="variationGallery" class="retex-card-grid"></div>' +
+            '</div>' +
+
+            // Denoise + AI fields (shown for modify mode)
+            '<div id="retexDenoiseRow" style="margin-bottom:12px;display:none;">' +
             '<label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:3px;">' +
             'Modification Strength: <span id="retexDenoiseVal">0.50</span></label>' +
             '<div style="display:flex;align-items:center;gap:8px;">' +
@@ -451,42 +618,581 @@ $(function () {
             '<span style="font-size:10px;color:var(--text-muted);">Major</span>' +
             '</div>' +
             '</div>' +
-
+            '<div id="retexAIFields" style="display:none;">' +
             '<label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:3px;">Style Direction</label>' +
             '<input type="text" id="retextureStyle" class="form-input" placeholder="e.g. dark corrupted, frost-enchanted, golden holy" style="margin-bottom:10px;" />' +
             '<label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:3px;">Custom Prompt (optional — bypasses Ollama, sent directly to Flux)</label>' +
-            '<textarea id="retexturePrompt" class="form-input" rows="3" placeholder="⚠ Must describe a FLAT TEXTURE, not an object. e.g. \'flat 2D texture, dark obsidian surface with gold inlay borders, hand-painted WoW style, no perspective\'" style="margin-bottom:14px;resize:vertical;"></textarea>' +
-            '<div class="d-flex gap-2 justify-content-end">' +
-            '<button class="btn-sm btn-outline-subtle" id="retextureCancel">Cancel</button>' +
-            '<button class="btn-sm btn-accent" id="retextureGo" ' +
-            'data-mpq="' + esc(mpqPath) + '" data-filename="' + esc(filename) + '">' +
-            '<i class="fa-solid fa-wand-magic-sparkles"></i> Generate</button>' +
+            '<textarea id="retexturePrompt" class="form-input" rows="3" placeholder="⚠ Must describe a FLAT TEXTURE, not an object." style="margin-bottom:14px;resize:vertical;"></textarea>' +
             '</div>' +
             '<div id="retextureStatus" style="margin-top:12px;display:none;"></div>' +
-            '</div></div>');
+            '</div>' +  // /retex-panel-body
 
-        modal.on('click', function (ev) {
-            if ($(ev.target).hasClass('texture-overlay')) $(this).remove();
+            // Footer
+            '<div class="retex-panel-foot">' +
+            '<span class="retex-unsaved-dot">Unsaved retexture — Save to keep</span>' +
+            '<button class="btn-sm btn-outline-subtle" id="retextureCancel">Close</button>' +
+            '<button class="btn-sm btn-accent" id="retextureGo" style="display:none;" ' +
+            'data-mpq="' + esc(mpqPath) + '" data-filename="' + esc(filename) + '">' +
+            '<i class="fa-solid fa-wand-magic-sparkles"></i> Generate</button>' +
+            '</div>'
+        );
+    }
+
+    // ── Retexture Panel: open / close (slide-swap with edit card) ────────
+    // The panel lives in #colEdit alongside #editPanel. Toggling the
+    // .retex-swap-active class on #colEdit triggers the CSS slide. The
+    // character viewer to the right stays mounted — click a card to push a
+    // staged retexture onto it via equipWeaponGlbDirect.
+    function openRetexturePanel(texData) {
+        if (!texData || (!texData.mpqPath && !texData.bodyAtlas)) {
+            showToast('No texture selected', 'warning');
+            return;
+        }
+
+        // The retexture panel slides in over #colEdit. If we're still in the
+        // detail view (#colEdit hidden), enter edit mode FIRST, then re-open
+        // once the edit panel is visible — otherwise the slide happens in a
+        // hidden column and nothing appears until the user manually hits Edit.
+        // Covers every entry point (detail-header button, edit-panel button,
+        // weapon texture clicks) since they all funnel through here.
+        if (!editMode || !$('#colEdit').is(':visible')) {
+            if (!currentDetailEntry) {
+                showToast('Open an item first', 'warning');
+                return;
+            }
+            pendingRetexOpen = texData;
+            // Same path the Edit button uses: custom items edit directly,
+            // base-game items get the clone/edit confirm modal first. Either
+            // way, showEditPanel consumes pendingRetexOpen when #colEdit shows.
+            $('#btnEditOriginal').trigger('click');
+            return;
+        }
+
+        // Reset staging on (re)open.
+        stagedRetexture = null;
+        stagedPreviewGlbs = [];
+
+        var $panel = $('#retexturePanel');
+        $panel.html(buildRetexturePanelContent(texData));
+
+        // Store the panel's "from texture" data on the panel itself so the
+        // mode handlers (segGenBtn, retextureGo) can pull mpq/filename/etc.
+        // without grovelling through #retextureGo's data-attrs (which still
+        // carry them too, for backward-compat with the existing handlers).
+        $panel.data('retex-tex', texData);
+
+        // Engage the slide. The CSS rule keeps the panel always absolutely-
+        // positioned and parked off-right via translateX; adding the
+        // .retex-swap-active class on #colEdit slides it into place via a
+        // CSS transition (0.32s ease). requestAnimationFrame ensures the
+        // new innerHTML has committed before the class flips, so the
+        // transition starts from a fully-painted off-right state.
+        requestAnimationFrame(function () {
+            $('#colEdit').addClass('retex-swap-active');
         });
-        $('body').append(modal);
+    }
+
+    function closeRetexturePanel(opts) {
+        opts = opts || {};
+        if (hasUnsavedRetexture() && !opts.force) {
+            var ok = window.confirm(
+                'You have an unsaved retexture preview ("' + (stagedRetexture.name || 'variant') +
+                '").\n\nGo back to edit? The preview stays on the character — but you must hit Save on the edit panel to keep it. Closing without Save will discard it.');
+            if (!ok) return false;
+        }
+
+        // Slide back: remove the active class; CSS transitions the panels.
+        $('#colEdit').removeClass('retex-swap-active');
+
+        // After the transition, sweep any temp preview GLBs we haven't
+        // committed (the staged one, if any, stays on the character via the
+        // earlier equipWeaponGlbDirect call — its temp file lives until Save
+        // or until the stale-sweep runs server-side).
+        cleanupStagedPreviewGlbs(
+            hasUnsavedRetexture() ? stagedRetexture.glbUrl : null);
+
+        return true;
+    }
+
+    // Per-texture wand button (inside the edit form's texture cards) →
+    // opens the retexture panel for that texture.
+    $(document).on('click', '.btn-retexture', function (e) {
+        e.stopPropagation();
+        var $card = $(this).closest('.item-texture-card');
+        openRetexturePanel({
+            mpqPath: $card.data('mpq-path'),
+            filename: $card.find('.item-texture-name').text(),
+            width: $card.data('width'),
+            height: $card.data('height'),
+            format: $card.data('format')
+        });
     });
 
-    $(document).on('click', '#retextureCancel', function () {
-        $('#retextureOverlay').remove();
+    // Panel-level "Retexture textures" button on the edit form → opens with
+    // the first texture preselected. The button is injected by renderEditForm
+    // (or wherever the edit panel is rendered) with id #btnOpenRetexturePanel.
+    $(document).on('click', '#btnOpenRetexturePanel', function (e) {
+        e.stopPropagation();
+        // Find the first texture card in the edit form's texture list. The
+        // texture cards are .item-texture-card elements rendered by
+        // loadEditTextures. If none yet rendered, bail with a hint.
+        var $first = $('.item-texture-card').first();
+        if (!$first.length) {
+            showToast('Loading textures — try again in a moment', 'info');
+            return;
+        }
+        openRetexturePanel({
+            mpqPath: $first.data('mpq-path'),
+            filename: $first.find('.item-texture-name').text(),
+            width: $first.data('width'),
+            height: $first.data('height'),
+            format: $first.data('format')
+        });
     });
 
-    // Mode toggle: show/hide denoise slider
+    // Body-atlas armor (boots/gloves/belts/chest/legs) → open the retexture
+    // panel DIRECTLY to Variations, no clicked BLP. Synthesizes a texData
+    // flagged bodyAtlas so openRetexturePanel skips the mpqPath guard and
+    // buildRetexturePanelContent renders the body-atlas variant of the panel.
+    $(document).on('click', '#btnBodyAtlasRetex', function (e) {
+        e.stopPropagation();
+        if (!currentDetailItem || !(currentDetailItem.display_id > 0)) {
+            showToast('No display ID for this item', 'warning');
+            return;
+        }
+        openRetexturePanel({
+            bodyAtlas: true,
+            displayId: currentDetailItem.display_id,
+            filename: currentDetailItem.name || 'Armor',
+            inventoryType: currentDetailItem.inventory_type || 0
+        });
+    });
+
+    // Close panel button(s).
+    $(document).on('click', '#retextureCancel, #retexBackBtn', function () {
+        closeRetexturePanel();
+    });
+
+    // Check vision model availability whenever the panel is shown — moved
+    // out of the per-open callback so it runs each time the panel opens.
+    $(document).on('change', 'input[name="retexMode"]', function (ev) {
+        // Lazy vision-model check: only when palette mode is selected.
+        if ($(this).val() === 'palette') {
+            $.get('/Items/VisionRecolorStatus', function (data) {
+                if (!data.available && $('#retexPaletteSection').is(':visible')
+                    && !$('#retexPaletteSection .vision-warning').length) {
+                    $('#retexPaletteSection').prepend(
+                        '<div class="vision-warning" style="font-size:11px;color:var(--status-warning);margin-bottom:6px;">' +
+                        '<i class="fa-solid fa-triangle-exclamation"></i> Vision model not configured — set Ollama Vision Model in Settings</div>');
+                }
+            });
+        }
+    });
+
+    // Vision recolor preview button
+    $(document).on('click', '#recolorPreviewBtn', function () {
+        var $btn = $(this);
+        var instruction = $('#recolorInstruction').val() || '';
+        if (!instruction.trim()) {
+            showToast('Enter a recolor instruction', 'warning');
+            return;
+        }
+        var displayId = currentDetailItem ? (currentDetailItem.display_id || 0) : 0;
+        var mpqPath = $('#retextureGo').data('mpq');
+        var filename = $('#retextureGo').data('filename');
+
+        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Analyzing...');
+        $.ajax({
+            url: '/Items/VisionRecolorPreview',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                displayId: displayId,
+                originalMpqPath: mpqPath,
+                originalBlpFilename: filename,
+                instruction: instruction
+            }),
+            success: function (data) {
+                $btn.prop('disabled', false).html('<i class="fa-solid fa-eye"></i> Preview recolor');
+                if (data.success && data.previewUrl) {
+                    $('#recolorPreview').show().html(
+                        '<img src="' + esc(data.previewUrl) + '?t=' + Date.now() + '" ' +
+                        'style="max-width:100%;border-radius:4px;image-rendering:pixelated;" />');
+                } else {
+                    $('#recolorPreview').show().html(
+                        '<div style="font-size:11px;color:var(--status-error);">' + esc(data.error || 'Preview failed') + '</div>');
+                }
+            },
+            error: function () {
+                $btn.prop('disabled', false).html('<i class="fa-solid fa-eye"></i> Preview recolor');
+                showToast('Preview request failed', 'error');
+            }
+        });
+    });
+
+    // Best-effort delete of temp preview GLBs (skip `keepUrl` if the staged
+    // one is still in use on the character). Called by closeRetexturePanel
+    // and by the panel's re-open path (which resets staging).
+    function cleanupStagedPreviewGlbs(keepUrl) {
+        (stagedPreviewGlbs || []).forEach(function (url) {
+            if (url === keepUrl) return;
+            $.ajax({
+                url: '/Items/DeletePreviewGlb',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ glbUrl: url })
+            });
+        });
+        stagedPreviewGlbs = (keepUrl ? [keepUrl] : []);
+    }
+
+    // Mode toggle: show/hide sections based on mode. No modal-layout
+    // gymnastics — the panel is always the panel; only the inner sections
+    // change visibility per mode.
     $(document).on('change', 'input[name="retexMode"]', function () {
-        var isModify = $(this).val() === 'modify';
-        $('#retexDenoiseRow').toggle(isModify);
+        var mode = $(this).val();
+        var isVar = mode === 'variations';
+        // Gallery modes have their own Generate + per-card click-to-preview,
+        // so the main Generate button and AI fields are irrelevant in them.
+        var isGallery = isVar;
+        $('#retexDenoiseRow').toggle(mode === 'modify');
+        $('#retexAIFields').toggle(mode !== 'palette' && !isGallery);
+        $('#retexPaletteSection').toggle(mode === 'palette');
+        $('#retexVariationsSection').toggle(isVar);
+        $('#retextureGo').toggle(!isGallery);
         $('.retex-mode-btn').removeClass('active');
         $(this).closest('.retex-mode-btn').addClass('active');
+    });
+
+    // ── Variations: generate variants ──
+    // Painted-armor (body-atlas) inventory types: chest/legs/feet/waist/wrist/
+    // hands/back/tabard/robe/shirt. These have no standalone model — they paint
+    // component textures into the character body atlas, so they use the
+    // GenerateBodyAtlasVariations endpoint + equipBodyAtlasRetextureDirect paint
+    // path instead of the GLB preview/mount path. Helm(1)/shoulder(3)/weapons
+    // have models and keep the GLB path.
+    var BODY_ATLAS_INVENTORY_TYPES = [4, 5, 6, 7, 8, 9, 10, 16, 19, 20];
+    function isBodyAtlasType(t) { return BODY_ATLAS_INVENTORY_TYPES.indexOf(t) !== -1; }
+    // Body-atlas variation cards store their recolored per-slot URLs here, keyed
+    // by card index (a slot dict doesn't fit cleanly in a data-attribute).
+    var bodyAtlasVariants = [];
+
+    $(document).on('click', '#variationGenBtn', function () {
+        var $b = $(this);
+        var displayId = currentDetailItem ? (currentDetailItem.display_id || 0) : 0;
+        var invType = currentDetailItem ? (currentDetailItem.inventory_type || 0) : 0;
+        var bodyAtlas = isBodyAtlasType(invType);
+        var mpqPath = $('#retextureGo').data('mpq');
+        var filename = $('#retextureGo').data('filename');
+        var theme = $('#variationTheme').val() || '';
+        var count = parseInt($('#variationCount').val()) || 4;
+
+        $b.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Generating...');
+        $('#variationGallery').html(
+            '<div style="grid-column:1/-1;font-size:11px;color:var(--text-muted);">' +
+            '<i class="fa-solid fa-spinner fa-spin"></i> Designing coherent palettes & rendering...</div>');
+
+        $.ajax({
+            url: bodyAtlas ? '/Items/GenerateBodyAtlasVariations' : '/Items/GenerateVariations',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(bodyAtlas ? {
+                displayId: displayId,
+                theme: theme,
+                count: count
+            } : {
+                displayId: displayId,
+                originalMpqPath: mpqPath,
+                originalBlpFilename: filename,
+                theme: theme,
+                count: count
+            }),
+            success: function (data) {
+                $b.prop('disabled', false).html('<i class="fa-solid fa-dice"></i> Generate variants');
+                if (!data.success) {
+                    $('#variationGallery').html('<div style="grid-column:1/-1;font-size:11px;color:var(--status-error);">' +
+                        (data.error || 'Failed') + '</div>');
+                    return;
+                }
+                if (data.detectedFamilies && data.detectedFamilies.length) {
+                    $('#variationDetected').text('Detected: ' +
+                        data.detectedFamilies.map(function (f) { return f.family + ' ' + f.percent + '%'; }).join(', '));
+                }
+                // Body-atlas cards keep their recolored slot URLs in the
+                // index-keyed array; weapon cards carry the recolor instruction.
+                bodyAtlasVariants = bodyAtlas ? (data.variants || []) : [];
+
+                // Slot transparency: show which component slots resolved in the
+                // MPQ and which were missing. data.slots = found slot indices.
+                if (bodyAtlas) {
+                    var SLOT_LABELS = {
+                        0: 'Arm upper', 1: 'Arm lower', 2: 'Hand', 3: 'Torso upper',
+                        4: 'Torso lower', 5: 'Leg upper', 6: 'Leg lower', 7: 'Foot'
+                    };
+                    var found = data.slots || [];
+                    var foundSet = {};
+                    found.forEach(function (s) { foundSet[s] = true; });
+                    var parts = [];
+                    for (var s = 0; s <= 7; s++) {
+                        if (foundSet[s]) {
+                            parts.push('<span style="color:var(--status-success,#3fb950);">' +
+                                '<i class="fa-solid fa-check"></i> ' + SLOT_LABELS[s] + '</span>');
+                        }
+                    }
+                    var missingLabels = [];
+                    for (var s2 = 0; s2 <= 7; s2++) {
+                        if (!foundSet[s2]) missingLabels.push(SLOT_LABELS[s2]);
+                    }
+                    var statusHtml = '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;">' +
+                        parts.join('') + '</div>';
+                    if (missingLabels.length) {
+                        statusHtml += '<div style="color:var(--text-muted);">Not in MPQ (skipped): ' +
+                            esc(missingLabels.join(', ')) + '</div>';
+                    }
+                    $('#bodyAtlasSlotStatus').html(statusHtml);
+                }
+
+                var html = '';
+                (data.variants || []).forEach(function (v, i) {
+                    var swapStr = Object.keys(v.swaps || {}).map(function (k) {
+                        return k + '→' + v.swaps[k];
+                    }).join(', ');
+                    // Same .retex-card pattern as segmented — clickable card,
+                    // selected ring, no Apply button. The whole card click
+                    // previews-on-character and stages.
+                    var common =
+                        '<img class="retex-card-img" src="' + v.previewUrl + '" alt="" />' +
+                        '<div class="retex-card-body">' +
+                        '<div class="retex-card-title">' + esc(v.name) +
+                        '<span class="retex-card-selectmark"><i class="fa-solid fa-circle-check"></i></span></div>' +
+                        '<div class="retex-card-sub">' + esc(swapStr) + '</div>' +
+                        '</div></div>';
+                    if (bodyAtlas) {
+                        // No instruction/GLB — the click paints v.slotUrls (looked
+                        // up by data-idx) straight onto the body atlas.
+                        html +=
+                            '<div class="retex-card variation-card" data-idx="' + i + '" ' +
+                            'data-mode="bodyatlas" ' +
+                            'data-name="' + escAttr(v.name || ('Variant ' + (i + 1))) + '">' +
+                            common;
+                    } else {
+                        html +=
+                            '<div class="retex-card variation-card" data-idx="' + i + '" ' +
+                            'data-name="' + escAttr(v.name || ('Variant ' + (i + 1))) + '" ' +
+                            'data-instruction="' + escAttr(v.instruction) + '">' +
+                            common;
+                    }
+                });
+                $('#variationGallery').html(html ||
+                    '<div style="grid-column:1/-1;font-size:11px;color:var(--text-muted);">No variants produced.</div>');
+            },
+            error: function () {
+                $b.prop('disabled', false).html('<i class="fa-solid fa-dice"></i> Generate variants');
+                $('#variationGallery').html('<div style="grid-column:1/-1;font-size:11px;color:var(--status-error);">Request failed</div>');
+            }
+        });
+    });
+
+    // ── Variations: click a card → stage it + push onto the character ───
+    // Mirrors the segmented-card handler exactly. No DB write, no patch.
+    // PreviewVariationGlb re-runs the brute-force palette swap from the
+    // variant's instruction into a temp PNG, wraps it in a throwaway GLB,
+    // and we mount that on the character viewer to the right via
+    // equipWeaponGlbDirect. The selection is staged; it commits only on Save
+    // (via /Items/CommitStagedRetexture → RetextureFromBitmapAsync on the
+    // same temp PNG, so what was previewed is what gets persisted).
+    $(document).on('click', '.variation-card', function () {
+        var $card = $(this);
+
+        // ── Body-atlas (painted armor): paint the recolored component slots
+        //    straight onto the character. No GLB, no PreviewVariationGlb. ──
+        if ($card.attr('data-mode') === 'bodyatlas') {
+            var baIdx = parseInt($card.attr('data-idx'), 10);
+            var bv = bodyAtlasVariants[baIdx];
+            if (!bv || !bv.slotUrls) { showToast('Variant has no slots', 'error'); return; }
+
+            $('.variation-card').removeClass('selected');
+            $card.addClass('selected');
+
+            if (window.cv && window.cv.character && window.cv.equip &&
+                window.cv.equip.equipBodyAtlasRetextureDirect) {
+                Promise.resolve(window.cv.equip.equipBodyAtlasRetextureDirect(
+                    window.cv.character, bv.slotUrls
+                )).catch(function (err) {
+                    console.warn('[retex] body-atlas preview apply failed', err);
+                    showToast('Couldn\u2019t apply preview to character', 'warning');
+                });
+
+                // Stage it (commit path for body-atlas is still TODO — this just
+                // records the selection so the unsaved-dot shows and a future
+                // Save handler can persist the recolored slots).
+                stagedRetexture = {
+                    displayId: currentDetailItem ? (currentDetailItem.display_id || 0) : 0,
+                    itemName: currentDetailItem ? (currentDetailItem.name || '') : '',
+                    name: $card.attr('data-name') || 'Variant',
+                    inventoryType: currentDetailItem ? (currentDetailItem.inventory_type || 0) : 0,
+                    slotUrls: bv.slotUrls,
+                    swaps: bv.swaps,
+                    mode: 'bodyatlas',
+                    committed: false
+                };
+                $('.retex-unsaved-dot').css('display', 'inline-flex');
+            } else {
+                showToast('Character viewer not mounted — click an item first', 'warning');
+            }
+            return;
+        }
+
+        var instruction = $card.attr('data-instruction') || '';
+        if (!instruction) {
+            showToast('Variant has no instruction', 'error');
+            return;
+        }
+        var displayId = currentDetailItem ? (currentDetailItem.display_id || 0) : 0;
+        var mpqPath = $('#retextureGo').data('mpq');
+        var filename = $('#retextureGo').data('filename');
+        var itemName = currentDetailItem ? (currentDetailItem.name || '') : '';
+        var name = $card.attr('data-name') || 'Variant';
+
+        // Selected-state ring + spinner on the clicked card.
+        $('.variation-card').removeClass('selected');
+        $card.addClass('selected');
+        var $img = $card.find('.retex-card-img');
+        var prevOpacity = $img.css('opacity');
+        $img.css('opacity', 0.5);
+
+        $.ajax({
+            url: '/Items/PreviewVariationGlb',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                displayId: displayId,
+                itemName: itemName,
+                originalBlpFilename: filename,
+                originalMpqPath: mpqPath,
+                instruction: instruction
+            }),
+            success: function (data) {
+                $img.css('opacity', prevOpacity || 1);
+                if (!data.success || !data.glbUrl) {
+                    showToast('Preview failed: ' + (data.error || 'unknown'), 'error');
+                    $card.removeClass('selected');
+                    return;
+                }
+                stagedPreviewGlbs.push(data.glbUrl);
+
+                // Stage the selection (temporary — commits on Save).
+                var inventoryType = currentDetailItem ? (currentDetailItem.inventory_type || 0) : 0;
+                stagedRetexture = {
+                    displayId: displayId,
+                    mpqPath: mpqPath,
+                    filename: filename,
+                    itemName: itemName,
+                    glbUrl: data.glbUrl,
+                    pngUrl: data.pngUrl,
+                    pngPath: data.pngPath,
+                    name: name,
+                    inventoryType: inventoryType,
+                    styleDirection: instruction,
+                    mode: 'variation',
+                    committed: false
+                };
+                $('.retex-unsaved-dot').css('display', 'inline-flex');
+
+                if (window.retexEquipWeaponGlbDirect && window.cv && window.cv.character) {
+                    Promise.resolve(window.retexEquipWeaponGlbDirect(
+                        window.cv.character, data.glbUrl, inventoryType
+                    )).catch(function (err) {
+                        console.warn('[retex] character preview apply failed', err);
+                        showToast('Couldn\u2019t apply preview to character', 'warning');
+                    });
+                } else {
+                    showToast('Character viewer not mounted — click an item first', 'warning');
+                }
+            },
+            error: function () {
+                $img.css('opacity', prevOpacity || 1);
+                $card.removeClass('selected');
+                showToast('Preview request failed', 'error');
+            }
+        });
+    });
+
+
+    // Chain-to-AI / Flux-only checkbox toggles
+    $(document).on('change', '#paletteChainAI', function () {
+        if ($(this).is(':checked')) $('#paletteSkipBrute').prop('checked', false);
+        $('#paletteAIDenoiseRow').toggle(
+            $('#paletteChainAI').is(':checked') || $('#paletteSkipBrute').is(':checked'));
+    });
+    $(document).on('change', '#paletteSkipBrute', function () {
+        if ($(this).is(':checked')) $('#paletteChainAI').prop('checked', false);
+        $('#paletteAIDenoiseRow').toggle(
+            $('#paletteChainAI').is(':checked') || $('#paletteSkipBrute').is(':checked'));
+    });
+    $(document).on('input', '#paletteAIDenoise', function () {
+        $('#paletteAIDenoiseVal').text(($(this).val() / 100).toFixed(2));
     });
 
     // Denoise slider label update
     $(document).on('input', '#retexDenoise', function () {
         $('#retexDenoiseVal').text(($(this).val() / 100).toFixed(2));
     });
+
+    // ── Stage a preview result on the character + show the 2D thumbnail ───
+    // Shared between palette/scratch/modify paths. The 2D image stays in
+    // #retextureStatus (info-dense, user wanted both); the 3D preview rides
+    // the existing character viewer via retexEquipWeaponGlbDirect.
+    // ctx carries the form data needed at commit time (displayId / itemName
+    // / mpqPath / filename / mode / styleDirection).
+    function stagePreviewResult(data, ctx) {
+        if (!data || !data.success || !data.glbUrl || !data.pngPath) {
+            showToast('Preview failed: ' + ((data && data.error) || 'unknown'), 'error');
+            $('#retextureStatus').html(
+                '<div style="font-size:11px;color:var(--status-error);">' +
+                '<i class="fa-solid fa-triangle-exclamation"></i> ' +
+                esc((data && data.error) || 'Preview failed') + '</div>');
+            return;
+        }
+
+        stagedPreviewGlbs.push(data.glbUrl);
+        stagedRetexture = {
+            displayId: ctx.displayId,
+            mpqPath: ctx.mpqPath,
+            filename: ctx.filename,
+            itemName: ctx.itemName,
+            glbUrl: data.glbUrl,
+            pngUrl: data.pngUrl,
+            pngPath: data.pngPath,
+            name: ctx.name || (data.mode || 'Preview'),
+            inventoryType: currentDetailItem ? (currentDetailItem.inventory_type || 0) : 0,
+            styleDirection: ctx.styleDirection || '',
+            mode: ctx.mode,
+            committed: false
+        };
+        $('.retex-unsaved-dot').css('display', 'inline-flex');
+
+        // 2D thumbnail in the status block (user explicitly wanted both).
+        var html =
+            '<div style="font-size:12px;color:var(--accent);font-weight:600;margin-bottom:8px;">' +
+            '<i class="fa-solid fa-eye"></i> Preview ready — Save to keep</div>' +
+            '<img src="' + esc(data.pngUrl) + '?t=' + Date.now() + '" ' +
+            'style="max-width:100%;border-radius:4px;image-rendering:pixelated;margin-bottom:8px;" />' +
+            '<div style="font-size:10px;color:var(--text-muted);">Mode: ' + esc(data.mode || ctx.mode) + '</div>';
+        $('#retextureStatus').show().html(html);
+
+        // Mount on the live character viewer.
+        if (window.retexEquipWeaponGlbDirect && window.cv && window.cv.character) {
+            Promise.resolve(window.retexEquipWeaponGlbDirect(
+                window.cv.character, data.glbUrl, stagedRetexture.inventoryType
+            )).catch(function (err) {
+                console.warn('[retex] character preview apply failed', err);
+                showToast('Couldn\u2019t apply preview to character', 'warning');
+            });
+        } else {
+            showToast('Character viewer not mounted — click an item first', 'warning');
+        }
+    }
 
     $(document).on('click', '#retextureGo', function () {
         var $btn = $(this);
@@ -496,22 +1202,78 @@ $(function () {
         var customPrompt = $('#retexturePrompt').val() || '';
         var itemName = currentDetailItem ? (currentDetailItem.name || '') : '';
         var displayId = currentDetailItem ? (currentDetailItem.display_id || 0) : 0;
-        var modifyExisting = $('input[name="retexMode"]:checked').val() === 'modify';
-        var denoise = modifyExisting ? parseInt($('#retexDenoise').val()) / 100.0 : 1.0;
+        var mode = $('input[name="retexMode"]:checked').val();
 
         if (!displayId) {
             showToast('No item selected', 'error');
             return;
         }
 
-        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Generating...');
+        // Palette swap mode (vision-guided recolor → preview-on-character)
+        if (mode === 'palette') {
+            var instruction = $('#recolorInstruction').val() || '';
+            if (!instruction.trim()) {
+                showToast('Enter a recolor instruction', 'warning');
+                return;
+            }
+            var chainToAI = $('#paletteChainAI').is(':checked');
+            var skipBrute = $('#paletteSkipBrute').is(':checked');
+            var aiDenoise = (chainToAI || skipBrute)
+                ? parseInt($('#paletteAIDenoise').val()) / 100.0 : 0;
+
+            $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Previewing...');
+            $('#retextureStatus').show().html(
+                '<div style="font-size:11px;color:var(--text-muted);">' +
+                '<i class="fa-solid fa-spinner fa-spin"></i> ' +
+                (skipBrute ? 'Flux-only test (no brute force)... 30-60s.'
+                    : chainToAI ? 'Brute-force draft + Flux polish... 30-60s.'
+                        : 'Brute-force palette swap... 5-15s.') +
+                '</div>');
+
+            $.ajax({
+                url: '/Items/PreviewPaletteGlb',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    displayId: displayId,
+                    itemName: itemName,
+                    originalBlpFilename: filename,
+                    originalMpqPath: mpqPath,
+                    instruction: instruction,
+                    chainToAI: chainToAI,
+                    skipBruteForce: skipBrute,
+                    styleDirection: style,
+                    aiDenoise: aiDenoise
+                }),
+                success: function (data) {
+                    $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Preview again');
+                    stagePreviewResult(data, {
+                        displayId: displayId, mpqPath: mpqPath, filename: filename,
+                        itemName: itemName, styleDirection: instruction,
+                        mode: 'palette', name: 'Palette swap'
+                    });
+                },
+                error: function () {
+                    $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Retry');
+                    $('#retextureStatus').html(
+                        '<div style="font-size:11px;color:var(--status-error);">Request failed</div>');
+                }
+            });
+            return;
+        }
+
+        // AI modes (scratch / modify → preview-on-character via Flux)
+        var modifyExisting = mode === 'modify';
+        var denoise = modifyExisting ? parseInt($('#retexDenoise').val()) / 100.0 : 1.0;
+
+        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Previewing...');
         $('#retextureStatus').show().html(
             '<div style="font-size:11px;color:var(--text-muted);">' +
             '<i class="fa-solid fa-spinner fa-spin"></i> Sending to Ollama + Flux pipeline... This may take 30-60s.' +
             '</div>');
 
         $.ajax({
-            url: '/Items/Retexture',
+            url: '/Items/PreviewFluxGlb',
             method: 'POST',
             contentType: 'application/json',
             data: JSON.stringify({
@@ -525,56 +1287,75 @@ $(function () {
                 denoiseStrength: denoise
             }),
             success: function (data) {
-                if (data.success) {
-                    var html = '<div style="font-size:12px;color:var(--status-online);font-weight:600;margin-bottom:8px;">' +
-                        '<i class="fa-solid fa-check"></i> Retexture complete!</div>';
-
-                    if (data.previewUrl) {
-                        html += '<img src="' + esc(data.previewUrl) + '?t=' + Date.now() + '" style="max-width:100%;border-radius:4px;image-rendering:pixelated;margin-bottom:8px;" />';
-                    }
-
-                    html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:4px;">' +
-                        data.originalWidth + '×' + data.originalHeight + ' ' + esc(data.originalFormat || '') +
-                        ' · BLP: ' + (data.blpSize / 1024).toFixed(1) + 'KB</div>';
-
-                    if (data.newDisplayId > 0) {
-                        html += '<div style="font-size:11px;color:var(--accent);margin-bottom:8px;font-weight:600;">' +
-                            'New Display ID: ' + data.newDisplayId + '</div>';
-
-                        // If in edit mode, offer to apply the new displayId
-                        if (editMode && editEntry) {
-                            html += '<button class="btn-sm btn-accent" id="btnApplyNewDisplayId" data-did="' + data.newDisplayId + '" style="margin-bottom:8px;">' +
-                                '<i class="fa-solid fa-arrow-right"></i> Apply to this item</button> ';
-                        }
-                    }
-
-                    if (data.prompt) {
-                        html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:8px;font-style:italic;word-break:break-word;">' +
-                            'Prompt: "' + esc(data.prompt.substring(0, 150)) + (data.prompt.length > 150 ? '...' : '') + '"</div>';
-                    }
-
-                    if (data.patchUrl) {
-                        var patchFile = data.patchUrl.split('/').pop();
-                        html += '<a href="/Items/DownloadPatch?file=' + encodeURIComponent(patchFile) + '" class="btn-sm btn-accent" download="' + esc(patchFile) + '" style="text-decoration:none;display:inline-block;">' +
-                            '<i class="fa-solid fa-download"></i> Download ' + esc(patchFile) + '</a>';
-                    }
-
-                    $('#retextureStatus').html(html);
-                    $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Generate Another');
-                } else {
-                    $('#retextureStatus').html(
-                        '<div style="font-size:11px;color:var(--status-error);">' +
-                        '<i class="fa-solid fa-triangle-exclamation"></i> ' + esc(data.error || 'Unknown error') + '</div>');
-                    $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Retry');
-                }
+                $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Preview again');
+                stagePreviewResult(data, {
+                    displayId: displayId, mpqPath: mpqPath, filename: filename,
+                    itemName: itemName, styleDirection: style,
+                    mode: modifyExisting ? 'flux_img2img' : 'flux_txt2img',
+                    name: modifyExisting ? 'Modify' : 'From scratch'
+                });
             },
             error: function () {
+                $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Retry');
                 $('#retextureStatus').html(
                     '<div style="font-size:11px;color:var(--status-error);">Request failed</div>');
-                $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Retry');
             }
         });
     });
+
+    function handleRetextureError() {
+        $('#retextureGo').prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Generate');
+        $('#retextureStatus').html('<div style="font-size:11px;color:var(--status-error);">Request failed</div>');
+    }
+
+    function handleRetextureSuccess(data) {
+        if (data.success) {
+            var html = '<div style="font-size:12px;color:var(--status-online);font-weight:600;margin-bottom:8px;">' +
+                '<i class="fa-solid fa-check"></i> Retexture complete!</div>';
+
+            if (data.previewUrl) {
+                html += '<img src="' + esc(data.previewUrl) + '?t=' + Date.now() + '" style="max-width:100%;border-radius:4px;image-rendering:pixelated;margin-bottom:8px;" />';
+            }
+
+            html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:4px;">' +
+                (data.originalWidth || '?') + '×' + (data.originalHeight || '?') + ' ' + esc(data.originalFormat || '') +
+                (data.blpSize ? ' · BLP: ' + (data.blpSize / 1024).toFixed(1) + 'KB' : '') + '</div>';
+
+            if (data.mode) {
+                html += '<div style="font-size:10px;color:var(--accent);margin-bottom:4px;">Mode: ' + esc(data.mode) + '</div>';
+            }
+
+            if (data.newDisplayId > 0) {
+                html += '<div style="font-size:11px;color:var(--accent);margin-bottom:8px;font-weight:600;">' +
+                    'New Display ID: ' + data.newDisplayId + '</div>';
+
+                if (editMode && editEntry) {
+                    html += '<button class="btn-sm btn-accent" id="btnApplyNewDisplayId" data-did="' + data.newDisplayId + '" style="margin-bottom:8px;">' +
+                        '<i class="fa-solid fa-arrow-right"></i> Apply to this item</button> ';
+                }
+            }
+
+            if (data.prompt) {
+                html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:8px;font-style:italic;word-break:break-word;">' +
+                    'Prompt: "' + esc(data.prompt.substring(0, 150)) + (data.prompt.length > 150 ? '...' : '') + '"</div>';
+            }
+
+            if (data.patchUrl) {
+                var patchFile = data.patchUrl.split('/').pop();
+                html += '<a href="/Items/DownloadPatch?file=' + encodeURIComponent(patchFile) + '" class="btn-sm btn-accent" download="' + esc(patchFile) + '" style="text-decoration:none;display:inline-block;">' +
+                    '<i class="fa-solid fa-download"></i> Download ' + esc(patchFile) + '</a>';
+            }
+
+            $('#retextureStatus').html(html);
+            $('#retextureGo').prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Generate Another');
+            checkPatchMAvailable();
+        } else {
+            $('#retextureStatus').html(
+                '<div style="font-size:11px;color:var(--status-error);">' +
+                '<i class="fa-solid fa-triangle-exclamation"></i> ' + esc(data.error || 'Unknown error') + '</div>');
+            $('#retextureGo').prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Retry');
+        }
+    }
 
     // ===================== ITEM CHANGELOG =====================
 
@@ -662,6 +1443,15 @@ $(function () {
         // Show edit panel, hide detail panel
         $('#colDetail').hide();
         $('#colEdit').show();
+
+        // If a retexture open was requested from the detail view, fulfill it
+        // now that #colEdit (which hosts the slide-in retexture panel) is
+        // visible. Defer a tick so the column's layout is committed first.
+        if (pendingRetexOpen) {
+            var pend = pendingRetexOpen;
+            pendingRetexOpen = null;
+            setTimeout(function () { openRetexturePanel(pend); }, 0);
+        }
     }
 
     function closeEditPanel() {
@@ -671,6 +1461,13 @@ $(function () {
         editIsBaseGame = false;
         editSourceEntry = null;
         editOriginalRow = null;
+
+        // Reset retexture panel state — if it was slid in, slide it back
+        // (no warn; closing the edit panel is an explicit exit). Any temp
+        // preview GLBs get swept; staging is dropped.
+        $('#colEdit').removeClass('retex-swap-active');
+        if (stagedRetexture) cleanupStagedPreviewGlbs(null);
+        stagedRetexture = null;
 
         $('#colEdit').hide();
         $('#colDetail').show();
@@ -1097,6 +1894,76 @@ $(function () {
 
         $('#btnSaveItem').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Saving...');
 
+        // If there's a staged (preview-only) retexture, commit it FIRST — this
+        // is the single point where the retexture is persisted to the DB and
+        // patch-4.MPQ. The returned displayId is written onto the item so the
+        // normal Save below assigns it. Nothing was persisted before this
+        // moment.
+        //
+        // Commit endpoint depends on the mode:
+        //   - Body-atlas (painted armor) → /Items/CommitBodyAtlasRetexture
+        //                        (per-slot component BLPs + m_texture[0..7]).
+        //   - Everything else  → /Items/CommitStagedRetexture (commits the
+        //                        EXACT temp PNG that was previewed; pngPath is
+        //                        validated server-side as being under
+        //                        wwwroot/item_textures_cache/).
+        if (hasUnsavedRetexture()) {
+            $('#btnSaveItem').html('<i class="fa-solid fa-spinner fa-spin"></i> Committing retexture...');
+            var commitUrl, commitBody;
+            if (stagedRetexture.mode === 'bodyatlas') {
+                // Painted armor: commit the per-slot recolored PNGs. The server
+                // validates each slot path under item_textures_cache, encodes a
+                // component BLP per slot, and patches m_texture[0..7].
+                commitUrl = '/Items/CommitBodyAtlasRetexture';
+                commitBody = {
+                    displayId: stagedRetexture.displayId,
+                    itemName: stagedRetexture.itemName,
+                    styleDirection: stagedRetexture.name || '[body-atlas]',
+                    slotUrls: stagedRetexture.slotUrls
+                };
+            } else {
+                commitUrl = '/Items/CommitStagedRetexture';
+                commitBody = {
+                    displayId: stagedRetexture.displayId,
+                    itemName: stagedRetexture.itemName,
+                    originalBlpFilename: stagedRetexture.filename,
+                    originalMpqPath: stagedRetexture.mpqPath,
+                    pngPath: stagedRetexture.pngPath,
+                    styleDirection: stagedRetexture.styleDirection || '',
+                    mode: stagedRetexture.mode || 'staged_commit'
+                };
+            }
+            $.ajax({
+                url: commitUrl,
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify(commitBody),
+                success: function (res) {
+                    if (!res.success || !(res.newDisplayId > 0)) {
+                        $('#btnSaveItem').prop('disabled', false).html('<i class="fa-solid fa-floppy-disk"></i> Save');
+                        showToast('Retexture commit failed: ' + (res.error || 'unknown'), 'error');
+                        return;
+                    }
+                    // Mark committed so the close warning won't fire, point the
+                    // item at the new displayId, and continue the normal save.
+                    stagedRetexture.committed = true;
+                    data.display_id = res.newDisplayId;
+                    var $f = $('#editFieldDisplayId');
+                    if ($f.length) $f.val(res.newDisplayId);
+                    doActualSave(data);
+                },
+                error: function () {
+                    $('#btnSaveItem').prop('disabled', false).html('<i class="fa-solid fa-floppy-disk"></i> Save');
+                    showToast('Retexture commit failed — server error', 'error');
+                }
+            });
+            return;
+        }
+
+        doActualSave(data);
+    }
+
+    function doActualSave(data) {
         $.ajax({
             url: '/Items/Save',
             method: 'POST',
@@ -1108,6 +1975,8 @@ $(function () {
                     var savedEntry = data.entry;
                     // Reset save button before closing
                     $('#btnSaveItem').prop('disabled', false).html('<i class="fa-solid fa-floppy-disk"></i> Save');
+                    // Clear any staged retexture — it's now committed + assigned.
+                    stagedRetexture = null;
                     // Close editor and return to browse mode
                     closeEditPanel();
                     // Refresh the search results to reflect changes
@@ -1366,6 +2235,14 @@ $(function () {
         openEditPanel(currentDetailEntry, false);
     });
 
+    // If the confirm modal is dismissed (X / backdrop / Cancel) WITHOUT entering
+    // edit, drop any pending retexture-open so it doesn't auto-fire on a later
+    // edit. The confirm buttons above route through showEditPanel, which
+    // consumes pendingRetexOpen first, so this only clears genuine cancels.
+    $(document).on('hidden.bs.modal', '#editOriginalModal', function () {
+        if (!editMode) pendingRetexOpen = null;
+    });
+
     // ── Save / Cancel ──
     $('#btnSaveItem').on('click', saveItem);
     $('#btnCancelEdit').on('click', closeEditPanel);
@@ -1485,7 +2362,7 @@ $(function () {
         }
 
         showToast('Display ID updated to ' + newDid + ' — Save to apply', 'success');
-        $('#retextureOverlay').remove();
+        closeRetexturePanel({ force: true });
 
         // Reload textures and model preview for the new displayId
         loadEditTextures(newDid);
@@ -1498,7 +2375,8 @@ $(function () {
     });
 
     // ── Texture panel toggle ──
-    $('#itemTextureToggle').on('click', function () {
+    $('#itemTextureToggle').on('click', function (e) {
+        if ($(e.target).closest('.btn-download-patch').length) return;
         $(this).toggleClass('collapsed');
         $('#itemTextureBody').toggleClass('collapsed');
     });

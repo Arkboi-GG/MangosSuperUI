@@ -77,7 +77,8 @@ export function buildModelParts(data) {
     return parts;
 }
 
-export function buildWmoParts(data) {
+export function buildWmoParts(data, opts) {
+    const forceDoubleSide = opts && opts.forceDoubleSide;
     const posAttr = new THREE.Float32BufferAttribute(data.positions, 3);
     const normAttr = new THREE.Float32BufferAttribute(data.normals, 3);
     const uvAttr = new THREE.Float32BufferAttribute(data.uvs, 2);
@@ -96,18 +97,24 @@ export function buildWmoParts(data) {
         geo.setAttribute('uv', uvAttr);
         geo.setIndex(new THREE.BufferAttribute(new Uint32Array(subIndices), 1));
 
+        // Instance interiors (AQ, Naxx) are viewed from inside — FrontSide
+        // culling hides walls the camera looks at from the interior. Force
+        // DoubleSide for all WMO materials when forceDoubleSide is set.
+        const sideMode = forceDoubleSide ? THREE.DoubleSide
+            : (sub.doubleSided ? THREE.DoubleSide : THREE.FrontSide);
+
         let material;
         if (sub.textureBase64) {
             material = makeWmoMaterial({
                 map: makeTextureFromDataURI(sub.textureBase64),
-                side: sub.doubleSided ? THREE.DoubleSide : THREE.FrontSide,
+                side: sideMode,
                 alphaTest: sub.transparent ? 0.5 : 0,
                 transparent: !!sub.transparent
             });
         } else {
             material = makeWmoMaterial({
                 color: 0xaaaaaa,
-                side: sub.doubleSided ? THREE.DoubleSide : THREE.FrontSide
+                side: sideMode
             });
         }
         parts.push({ geometry: geo, material: material });
@@ -118,7 +125,6 @@ export function buildWmoParts(data) {
 export function buildTerrainGeometry(tile) {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(tile.positions, 3));
-    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(tile.indices), 1));
 
     const uvs = new Float32Array(tile.positions.length / 3 * 2);
     for (let i = 0; i < tile.positions.length / 3; i++) {
@@ -126,6 +132,52 @@ export function buildTerrainGeometry(tile) {
         uvs[i * 2 + 1] = 1.0 - Math.floor(i / tile.vertsWidth) / (tile.vertsHeight - 1);
     }
     geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+
+    // Build indices, skipping terrain holes.
+    //
+    // tile.holes is a flat int[256] from the server — 16×16 MCNK chunks, each
+    // carrying the low-res hole bitmask from the ADT's MCNK header offset 0x3C.
+    // A set bit means "this 2×2 cell block is a hole — don't render terrain here."
+    //
+    // Bit layout uses interleaved row/col masks (same as VMaNGOS GridMap::IsHole):
+    //   HoletabH = [0x1111, 0x2222, 0x4444, 0x8888]  (column masks)
+    //   HoletabV = [0x000F, 0x00F0, 0x0F00, 0xF000]  (row masks)
+    //   isHole = (holeMask & HoletabH[holeCol] & HoletabV[holeRow]) !== 0
+    const holes = tile.holes;
+    const HOLE_TAB_H = [0x1111, 0x2222, 0x4444, 0x8888];
+    const HOLE_TAB_V = [0x000F, 0x00F0, 0x0F00, 0xF000];
+    const w = tile.vertsWidth;
+    const h = tile.vertsHeight;
+    const idxList = [];
+
+    for (let y = 0; y < h - 1; y++) {
+        for (let x = 0; x < w - 1; x++) {
+            if (holes) {
+                const chunkX = (x >> 3);
+                const chunkY = (y >> 3);
+                if (chunkX < 16 && chunkY < 16) {
+                    const holeMask = holes[chunkY * 16 + chunkX];
+                    if (holeMask) {
+                        const cellInChunkX = x - (chunkX << 3);
+                        const cellInChunkY = y - (chunkY << 3);
+                        const holeCol = cellInChunkX >> 1;
+                        const holeRow = cellInChunkY >> 1;
+                        if (holeMask & HOLE_TAB_H[holeCol] & HOLE_TAB_V[holeRow]) {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            const tl = y * w + x;
+            const tr = tl + 1;
+            const bl = (y + 1) * w + x;
+            const br = bl + 1;
+            idxList.push(tl, bl, tr, tr, bl, br);
+        }
+    }
+
+    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(idxList), 1));
     geo.computeVertexNormals();
     return geo;
 }
@@ -226,13 +278,11 @@ export class InstancePool {
             const part = reg.parts[pi];
             const im = new THREE.InstancedMesh(part.geometry, part.material, INITIAL_CAPACITY);
             im.count = 0;
-            im.frustumCulled = false;
-            // Phase 4: streamed instances are deliberately NOT selectable.
-            // The swap-with-last in removeInstance() during unload would
-            // silently re-target any outline-proxy to a different placement.
-            // Phase 5/7 will flip this to selectable:true once the
-            // unload-during-edit story is designed (will need a
-            // streamedUnloaded signal in ObjectStream.pump).
+            // PERF: frustumCulled = true — Three.js will skip drawing this
+            // entire InstancedMesh when its bounding sphere is outside the
+            // camera frustum. We recompute the bounding sphere in
+            // flushBounds() after all instances for a pump cycle are placed.
+            im.frustumCulled = true;
             tagEntity(im, {
                 type: isWmo ? 'wmo' : 'm2',
                 id: 'instanced:' + modelPath,
@@ -247,7 +297,8 @@ export class InstancePool {
         const set = {
             meshes, idToIndex: {}, indexToId: {},
             count: 0, capacity: INITIAL_CAPACITY,
-            isWmo, parentGroup: parent
+            isWmo, parentGroup: parent,
+            boundsDirty: false
         };
         this.sets[modelPath] = set;
         return set;
@@ -271,6 +322,7 @@ export class InstancePool {
             set.meshes[mi].count = set.count;
             set.meshes[mi].instanceMatrix.needsUpdate = true;
         }
+        set.boundsDirty = true;
     }
 
     removeInstance(modelPath, placementId) {
@@ -296,6 +348,20 @@ export class InstancePool {
         set.count--;
         for (let mi = 0; mi < set.meshes.length; mi++) set.meshes[mi].count = set.count;
         if (set.count === 0) this.disposeSet(modelPath);
+        else set.boundsDirty = true;
+    }
+
+    /** Recompute bounding spheres for all InstancedMeshes that changed.
+     *  Call once per pump cycle (after addInstance/removeInstance batch). */
+    flushBounds() {
+        for (const mp in this.sets) {
+            const set = this.sets[mp];
+            if (!set.boundsDirty) continue;
+            set.boundsDirty = false;
+            for (let mi = 0; mi < set.meshes.length; mi++) {
+                set.meshes[mi].computeBoundingSphere();
+            }
+        }
     }
 
     _grow(modelPath, set) {
@@ -309,7 +375,7 @@ export class InstancePool {
             const part = reg.parts[pi];
             const newIm = new THREE.InstancedMesh(part.geometry, part.material, newCap);
             newIm.count = set.count;
-            newIm.frustumCulled = false;
+            newIm.frustumCulled = true;
 
             const oldIm = set.meshes[pi];
             for (let i = 0; i < set.count; i++) {
@@ -325,6 +391,7 @@ export class InstancePool {
         }
         set.meshes = newMeshes;
         set.capacity = newCap;
+        set.boundsDirty = true;
     }
 
     disposeSet(modelPath) {
@@ -380,24 +447,22 @@ export class ObjectStream {
         this.editor = editor;
         this.pool = new InstancePool();
 
-        // activePlacements: id → { model, x, y, z, rotY, scale, type, rotX, rotZ,
-        //                          kind:'d'|'w', instanced:bool }
         this.activePlacements = {};
 
         this._fetchQueue = [];
         this._fetchInFlight = 0;
         this._fetching = {};
+        this._failedModels = {};     // negative cache for 404'd models
         this._streamingInFlight = false;
 
         this.LOAD_RADIUS = 250;
         this.UNLOAD_RADIUS = 350;
 
-        // One-shot diag flag: when true, the next /WorldEditor/NearbyObjects
-        // request is sent with wmoDoodadDiag=1. The server then bypasses its
-        // placement cache for that request and logs every WMO it composes
-        // (one banner + 3 doodad dumps each). Set by clearAll() so every
-        // preset reload (re)arms it; cleared by pump() after one send.
         this._diagNextNearby = true;
+
+        // Generation counter — incremented on clearAll(). Pump responses
+        // that arrive after a clearAll are stale and must be discarded.
+        this._generation = 0;
     }
 
     attachTo(scene) { this.pool.attachTo(scene); }
@@ -408,6 +473,8 @@ export class ObjectStream {
 
     _enqueueFetch(modelPath, priority) {
         if (this._fetching[modelPath]) return;
+        if (this._failedModels[modelPath]) return;
+        if (this.pool.isModelLoaded(modelPath)) return;
         this._fetching[modelPath] = true;
         this._fetchQueue.push({ path: modelPath, priority: priority || 0 });
         this._drain();
@@ -422,20 +489,32 @@ export class ObjectStream {
             const modelPath = item.path;
             const isWmo = modelPath.toLowerCase().indexOf('.wmo') !== -1;
             const url = isWmo ? '/WorldEditor/WmoModel' : '/WorldEditor/DoodadModel';
+            const gen = this._generation;
 
             getJSON(url + '?path=' + encodeURIComponent(modelPath))
                 .then((mdata) => {
                     this._fetchInFlight--;
+                    if (gen !== this._generation) { delete this._fetching[modelPath]; this._drain(); return; }
                     if (mdata.success && mdata.positions && mdata.positions.length > 0) {
-                        const parts = isWmo ? buildWmoParts(mdata) : buildModelParts(mdata);
+                        // Force DoubleSide for WMOs in instance/raid maps (mapId > 1)
+                        // so interior faces are visible when the camera is inside.
+                        const instanceMap = this.editor.tileGrid && this.editor.tileGrid.mapId > 1;
+                        const parts = isWmo
+                            ? buildWmoParts(mdata, { forceDoubleSide: instanceMap })
+                            : buildModelParts(mdata);
                         this.pool.registerModel(modelPath, parts);
                         this._instantiatePending(modelPath);
+                        // PERF: recompute bounding spheres after new instances placed
+                        this.pool.flushBounds();
+                    } else {
+                        this._failedModels[modelPath] = true;
                     }
                     delete this._fetching[modelPath];
                     this._drain();
                 })
                 .catch(() => {
                     this._fetchInFlight--;
+                    this._failedModels[modelPath] = true;
                     delete this._fetching[modelPath];
                     this._drain();
                 });
@@ -453,6 +532,9 @@ export class ObjectStream {
     }
 
     pump(camX, camZ, globalMidHeight, globalHeightScale) {
+        // DUNGEON: skip streaming entirely for dungeon maps
+        if (this.editor.tileGrid && this.editor.tileGrid.isDungeon) return;
+
         if (!this.editor.currentPreset || this._streamingInFlight) return;
 
         // Unload distant
@@ -468,9 +550,11 @@ export class ObjectStream {
             if (p.instanced) this.pool.removeInstance(p.model, id);
             delete this.activePlacements[id];
         }
+        if (toRemove.length > 0) this.pool.flushBounds();
 
         // Server fetch
         this._streamingInFlight = true;
+        const gen = this._generation;
         let url = '/WorldEditor/NearbyObjects' +
             '?preset=' + encodeURIComponent(this.editor.currentPreset) +
             '&camX=' + camX.toFixed(1) +
@@ -479,8 +563,6 @@ export class ObjectStream {
             '&globalMidHeight=' + globalMidHeight +
             '&globalHeightScale=' + globalHeightScale;
 
-        // One-shot WMO doodad composition diagnostic. Server bypasses the
-        // placement cache for this request and logs every WMO it composes.
         if (this._diagNextNearby) {
             url += '&wmoDoodadDiag=true';
             this._diagNextNearby = false;
@@ -490,10 +572,13 @@ export class ObjectStream {
         getJSON(url)
             .then((resp) => {
                 this._streamingInFlight = false;
+                if (gen !== this._generation) return;
                 if (!resp.success) return;
                 const adds = resp.add || {};
                 this._addDoodads(adds.doodads || [], camX, camZ);
                 this._addWmos((adds.wmos || []), camX, camZ);
+                // PERF: recompute bounding spheres after this batch
+                this.pool.flushBounds();
             })
             .catch(() => { this._streamingInFlight = false; });
     }
@@ -573,12 +658,14 @@ export class ObjectStream {
     }
 
     clearAll() {
+        this._generation++;
         this.pool.disposeAll();
         this.activePlacements = {};
         this._fetchQueue = [];
         this._fetchInFlight = 0;
         this._fetching = {};
-        // Re-arm one-shot diag for the next preset's first NearbyObjects call.
+        this._failedModels = {};
+        this._streamingInFlight = false;
         this._diagNextNearby = true;
     }
 }
@@ -594,7 +681,6 @@ export class ObjectStream {
 export class TileGrid {
     constructor(editor) {
         this.editor = editor;
-        // 'gx,gy' → { mesh, gridX, gridY, dx, dy, loading, waterMesh }
         this.tiles = {};
         this.loading = {};
         this.tileWidthMesh = 0;
@@ -608,9 +694,17 @@ export class TileGrid {
         this.textureRes = 128;
         this.fogNear = 180;
         this.fogFar = 550;
+
+        // DUNGEON: dungeon-mode state
+        this.isDungeon = false;
+        this.dungeonGroup = null;
+        this.dungeonMeshes = [];
+        this.dungeonMapId = 0;
+        this.dungeonInfo = null;
     }
 
     terrainMeshes() {
+        if (this.isDungeon) return this.dungeonMeshes;
         const out = [];
         for (const k in this.tiles) {
             const t = this.tiles[k];
@@ -618,6 +712,8 @@ export class TileGrid {
         }
         return out;
     }
+
+    dungeonWmoMeshes() { return this.dungeonMeshes; }
 
     setTileRadius(r) {
         this.TILE_RADIUS = Math.max(1, r | 0);
@@ -634,13 +730,18 @@ export class TileGrid {
 
     updateFogForRadius(scene, camera, r) {
         const range = Math.max(0.3, r + 0.5) * (this.tileWidthMesh || 400);
-        this.fogNear = range * 0.3;
-        this.fogFar = range * 0.9;
+
+        // Instance/raid maps (mapId > 1) are floating structures — push fog
+        // way back and increase far clip so the full architecture is visible.
+        // Outdoor zones keep tight fog for atmosphere + perf.
+        const isInstance = this.mapId > 1;
+        this.fogNear = isInstance ? range * 1.5 : range * 0.3;
+        this.fogFar = isInstance ? range * 4.0 : range * 0.9;
         if (scene.fog) {
             scene.fog.near = this.fogNear;
             scene.fog.far = this.fogFar;
         }
-        camera.far = range * 1.5;
+        camera.far = isInstance ? range * 5.0 : range * 1.5;
         camera.updateProjectionMatrix();
     }
 
@@ -655,10 +756,20 @@ export class TileGrid {
         const editor = this.editor;
         editor.currentPreset = presetKey;
 
-        // Clear existing tiles
+        this._clearDungeon();
         Object.keys(this.tiles).forEach((k) => this._unloadTile(k));
         this.tiles = {};
         this.loading = {};
+
+        this.tileWidthMesh = 0;
+        this.globalMidHeight = 0;
+        this.globalHeightScale = 2.0;
+        this.isDungeon = false;
+
+        if (presetKey.startsWith('dungeon:')) {
+            const mapId = parseInt(presetKey.substring(8));
+            if (!isNaN(mapId)) return this._loadDungeon(mapId, statusCallback);
+        }
 
         return getJSON('/WorldEditor/Heightmap?preset=' + encodeURIComponent(presetKey) + '&tileRadius=1')
             .then((hm) => {
@@ -669,6 +780,7 @@ export class TileGrid {
                 this.tileWidthMesh = hm.tileWidthMesh;
                 this.globalMidHeight = hm.midHeight;
                 this.globalHeightScale = hm.heightScale;
+                this.mapId = hm.mapId || 0;
 
                 const center = hm.tiles.find((t) => t.dx === 0 && t.dy === 0);
                 if (center) {
@@ -701,7 +813,13 @@ export class TileGrid {
                             if (texLoaded >= toLoad.length) {
                                 this.updateFogForRadius(editor.viewport.scene, editor.viewport.rig.camera, this.TILE_RADIUS);
                                 statusCallback && statusCallback(hm.label || presetKey);
-                                toLoad.forEach((e) => this._loadWater(e));
+                                // Skip water for instance/raid maps — their ADTs contain
+                                // overworld water (rivers, lakes) from the terrain below
+                                // the floating instance, which renders as erratic blue
+                                // planes cutting through the architecture.
+                                if (this.mapId <= 1) {
+                                    toLoad.forEach((e) => this._loadWater(e));
+                                }
                                 editor.signals.presetLoaded.dispatch(presetKey);
                                 resolve(hm);
                             }
@@ -711,7 +829,152 @@ export class TileGrid {
             });
     }
 
+    // ── DUNGEON loading pipeline ──────────────────────────────────────────
+
+    _loadDungeon(mapId, statusCallback) {
+        const editor = this.editor;
+        this.isDungeon = true;
+        this.dungeonMapId = mapId;
+
+        statusCallback && statusCallback('Loading dungeon info...');
+
+        return getJSON('/WorldEditor/DungeonInfo?mapId=' + mapId)
+            .then((info) => {
+                if (!info.success) {
+                    statusCallback && statusCallback('Dungeon info failed: ' + info.error);
+                    return null;
+                }
+                this.dungeonInfo = info;
+                statusCallback && statusCallback('Loading ' + info.name + ' geometry...');
+                return getJSON('/WorldEditor/WmoModel?path=' + encodeURIComponent(info.wmoPath));
+            })
+            .then((wmoData) => {
+                if (!wmoData || !wmoData.success) {
+                    statusCallback && statusCallback('Dungeon WMO load failed');
+                    return null;
+                }
+                statusCallback && statusCallback('Building dungeon meshes...');
+                const parts = buildWmoParts(wmoData);
+                if (parts.length === 0) {
+                    statusCallback && statusCallback('Dungeon WMO has no geometry');
+                    return null;
+                }
+                const group = new THREE.Group();
+                group.name = 'dungeonWmo';
+
+                for (let i = 0; i < parts.length; i++) {
+                    const mesh = new THREE.Mesh(parts[i].geometry, parts[i].material);
+                    mesh.frustumCulled = false;
+                    mesh.geometry.computeBoundsTree();
+                    group.add(mesh);
+                    this.dungeonMeshes.push(mesh);
+                }
+
+                if (this.dungeonInfo.modf) group.position.set(0, 0, 0);
+
+                this.dungeonGroup = group;
+                editor.viewport.scene.add(group);
+
+                const bbox = new THREE.Box3();
+                group.traverse((c) => {
+                    if (c.isMesh && c.geometry) {
+                        c.geometry.computeBoundingBox();
+                        const meshBbox = c.geometry.boundingBox.clone();
+                        meshBbox.applyMatrix4(c.matrixWorld);
+                        bbox.union(meshBbox);
+                    }
+                });
+
+                const center = new THREE.Vector3();
+                const size = new THREE.Vector3();
+                bbox.getCenter(center);
+                bbox.getSize(size);
+                const maxDim = Math.max(size.x, size.y, size.z);
+
+                this.tileWidthMesh = maxDim;
+                this.globalMidHeight = center.y;
+                this.globalHeightScale = 1.0;
+
+                const scene = editor.viewport.scene;
+                const camera = editor.viewport.rig.camera;
+                scene.fog.near = maxDim * 0.4;
+                scene.fog.far = maxDim * 1.2;
+                camera.far = maxDim * 2.0;
+                camera.near = 0.1;
+                camera.updateProjectionMatrix();
+
+                scene.background = new THREE.Color(0x111118);
+                scene.fog.color = new THREE.Color(0x111118);
+
+                const sky = scene.getObjectByName('sky');
+                const ground = scene.getObjectByName('ground');
+                if (sky) sky.visible = false;
+                if (ground) ground.visible = false;
+
+                const rig = editor.viewport.rig;
+                camera.position.set(center.x, center.y + 2, center.z);
+                rig.controls.target.set(center.x, center.y, center.z + 10);
+
+                if (!rig.walk.mode) {
+                    rig.enterWalkMode();
+                    editor.signals.walkModeChanged.dispatch(true);
+                }
+
+                statusCallback && statusCallback(this.dungeonInfo.name);
+                editor.signals.presetLoaded.dispatch(editor.currentPreset);
+
+                return {
+                    success: true, label: this.dungeonInfo.name, isDungeon: true,
+                    tileWidthMesh: this.tileWidthMesh,
+                    midHeight: this.globalMidHeight,
+                    heightScale: this.globalHeightScale
+                };
+            })
+            .catch((err) => {
+                console.error('Dungeon load failed:', err);
+                statusCallback && statusCallback('Dungeon load failed: ' + err.message);
+                return null;
+            });
+    }
+
+    _clearDungeon() {
+        if (this.dungeonGroup) {
+            const scene = this.editor.viewport.scene;
+            scene.remove(this.dungeonGroup);
+
+            this.dungeonGroup.traverse((c) => {
+                if (c.isMesh) {
+                    if (c.geometry) {
+                        if (c.geometry.boundsTree) c.geometry.disposeBoundsTree();
+                        c.geometry.dispose();
+                    }
+                    if (c.material) {
+                        if (c.material.map) c.material.map.dispose();
+                        c.material.dispose();
+                    }
+                }
+            });
+
+            this.dungeonGroup = null;
+            this.dungeonMeshes = [];
+            this.dungeonInfo = null;
+            this.isDungeon = false;
+
+            const FOG_COLOR = 0xc49a50;
+            scene.background = new THREE.Color(FOG_COLOR);
+            if (scene.fog) scene.fog.color = new THREE.Color(FOG_COLOR);
+
+            const sky = scene.getObjectByName('sky');
+            const ground = scene.getObjectByName('ground');
+            if (sky) sky.visible = true;
+            if (ground) ground.visible = true;
+        }
+    }
+
+    // ── Progressive terrain loading ───────────────────────────────────────
+
     checkProgressive(controlsTarget) {
+        if (this.isDungeon) return;
         if (!this.editor.currentPreset || this.tileWidthMesh === 0) return;
         const cam = this.cameraToGrid(controlsTarget);
         for (let dy = -this.TILE_RADIUS; dy <= this.TILE_RADIUS; dy++) {
@@ -759,7 +1022,7 @@ export class TileGrid {
                     entry.mesh.position.y = -0.5;
                 }
                 delete this.loading[key];
-                this._loadWater(entry);
+                if (this.mapId <= 1) this._loadWater(entry);
             });
         }).catch(() => { delete this.loading[key]; });
     }
@@ -877,6 +1140,12 @@ export class TileGrid {
     }
 
     applyWireframe(on) {
+        if (this.isDungeon && this.dungeonGroup) {
+            this.dungeonGroup.traverse((c) => {
+                if (c.isMesh && c.material) c.material.wireframe = on;
+            });
+            return;
+        }
         for (const k in this.tiles) {
             const t = this.tiles[k];
             if (t.mesh && t.mesh.material) t.mesh.material.wireframe = on;
@@ -886,6 +1155,7 @@ export class TileGrid {
     unloadTile(key) { this._unloadTile(key); }
 
     clearAll() {
+        this._clearDungeon();
         Object.keys(this.tiles).forEach((k) => this._unloadTile(k));
         this.tiles = {};
         this.loading = {};

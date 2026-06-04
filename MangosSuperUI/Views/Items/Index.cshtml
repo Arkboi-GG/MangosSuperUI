@@ -207,6 +207,10 @@
                         <div id="itemTexturePanel" style="display:none; border-top: 1px solid var(--border-light);">
                             <div class="texture-panel-header" id="itemTextureToggle">
                                 <i class="fa-solid fa-palette"></i> Model Textures
+                                <a id="btnDownloadPatchM" href="/Items/DownloadPatch?file=patch-4.MPQ" download="patch-4.MPQ"
+                                   class="btn-download-patch" style="display:none;" title="Download patch-4.MPQ (all retextures)">
+                                    <i class="fa-solid fa-download"></i> patch-4
+                                </a>
                                 <i class="fa-solid fa-chevron-down chevron" style="margin-left:auto;font-size:11px;color:var(--text-muted);transition:transform 0.2s;"></i>
                             </div>
                             <div class="texture-panel-body" id="itemTextureBody">
@@ -250,6 +254,18 @@
                         <div class="card-body edit-panel-body" id="editFormContainer">
                             <!-- Populated by JS -->
                         </div>
+                    </div>
+
+                    <!-- Retexture Panel — slide-swaps with the edit card.
+                         Lives in the same column (#colEdit) so when active it
+                         occupies the edit card's slot. The character viewer
+                         on the right stays mounted and shows live preview via
+                         equipWeaponGlbDirect. Populated by items.js.
+                         NO inline styles — CSS owns display/position/transform
+                         (inline styles defeat the cascade we need for the
+                         slide animation). -->
+                    <div class="card retex-panel" id="retexturePanel">
+                        <!-- Populated by openRetexturePanel() in items.js -->
                     </div>
                 </div>
             </div>
@@ -442,11 +458,88 @@
         .item-texture-card { position: relative; }
         .item-texture-card:hover .btn-retexture { opacity: 1; }
         .btn-retexture:hover { background: var(--accent-hover); transform: scale(1.1); }
+        .btn-download-patch { margin-left: auto; margin-right: 8px; font-size: 10px; padding: 2px 8px; border-radius: var(--radius-sm); background: var(--bg-input); color: var(--accent); border: 1px solid var(--border); text-decoration: none; white-space: nowrap; transition: background var(--transition-fast), border-color var(--transition-fast); }
+        .btn-download-patch:hover { background: var(--accent-subtle); border-color: var(--accent); }
         .retex-mode-btn.active { border-color: var(--accent); background: var(--accent-subtle); }
         .texture-overlay { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: pointer; animation: fadeIn 0.15s ease-out; }
         .texture-overlay-content { max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; align-items: center; }
-        .retexture-dialog { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 20px; max-width: 420px; width: 90vw; }
         @@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        /* ── Retexture Panel — slide-swaps with the edit card ──────────────
+           Both #editPanel and #retexturePanel live in #colEdit. JS adds the
+           .retex-swap-active class to #colEdit when the retexture panel
+           should be visible; CSS transitions handle the slide.
+
+           Layout: the edit card stays at its normal `position: sticky` slot
+           (which gives the column its height). The retexture panel is ALWAYS
+           absolutely positioned over that same area, hidden offscreen-right
+           by default and slid into place when .retex-swap-active fires.
+           Keeping `position: absolute` constant (no position-switching mid-
+           transition) avoids the layout-thrash that breaks transforms. */
+        #colEdit { position: relative; overflow: hidden; }
+        #colEdit > #editPanel,
+        #colEdit > #retexturePanel {
+            transition: transform 0.32s ease, opacity 0.24s ease;
+            will-change: transform, opacity;
+        }
+        /* Resting: edit visible, retexture parked offscreen-right + inert.
+           top: 16px matches the sticky offset of #editPanel so the two cards
+           occupy the exact same screen rectangle when one slides into place. */
+        #colEdit > #retexturePanel {
+            position: absolute;
+            top: 16px;
+            left: 0;
+            right: 0;
+            transform: translateX(110%);
+            opacity: 0;
+            pointer-events: none;
+        }
+        /* Active: retexture slid in, edit slid off-right + inert. */
+        #colEdit.retex-swap-active > #editPanel {
+            transform: translateX(110%);
+            opacity: 0;
+            pointer-events: none;
+        }
+        #colEdit.retex-swap-active > #retexturePanel {
+            transform: translateX(0);
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        /* Retexture panel inner styling — uses the same .card chrome as the
+           edit panel so the swap feels like one continuous surface. */
+        .retex-panel .retex-panel-header { padding: 12px 16px; border-bottom: 1px solid var(--border-light); display: flex; align-items: center; gap: 10px; }
+        .retex-panel .retex-panel-title { font-size: 14px; font-weight: 600; color: var(--text-primary); flex: 1; min-width: 0; }
+        .retex-panel .retex-panel-title .retex-tex-name { color: var(--text-muted); font-weight: 400; margin-left: 6px; font-size: 12px; }
+        .retex-panel .retex-panel-body { padding: 14px 16px; max-height: calc(100vh - 130px); overflow-y: auto; }
+        .retex-panel .retex-panel-foot { padding: 10px 16px; border-top: 1px solid var(--border-light); display: flex; gap: 8px; justify-content: flex-end; align-items: center; background: var(--bg-body); }
+
+        /* Unsaved-staging indicator inside the panel footer. */
+        .retex-unsaved-dot { display: none; align-items: center; gap: 6px; margin-right: auto; font-size: 11px; color: var(--status-warning, #d49a00); font-weight: 600; }
+        .retex-unsaved-dot::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--status-warning, #d49a00); display: inline-block; }
+
+        /* Variation/segmented gallery — compact clickable cards. 2-col in the
+           panel (panel is narrower than the old modal), keeping cards
+           readable while still showing all variants without excessive scroll. */
+        .retex-card-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+        .retex-card { background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; cursor: pointer; transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+        .retex-card:hover { transform: translateY(-2px); box-shadow: 0 6px 14px rgba(0,0,0,0.35); border-color: var(--border-light); }
+        .retex-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-subtle), 0 6px 14px rgba(0,0,0,0.35); }
+        .retex-card-img { width: 100%; aspect-ratio: 2 / 1; object-fit: cover; image-rendering: pixelated; display: block; background: #2a2a2a; }
+        .retex-card-body { padding: 6px 8px; }
+        .retex-card-title { font-size: 11px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 5px; line-height: 1.25; }
+        .retex-card-sub { font-size: 9px; color: var(--text-muted); margin-top: 2px; line-height: 1.3; max-height: 24px; overflow: hidden; }
+        .retex-card-badge { font-size: 7.5px; font-weight: 700; color: var(--accent); border: 1px solid var(--accent); border-radius: 2px; padding: 0 3px; letter-spacing: 0.3px; }
+        .retex-card-selectmark { margin-left: auto; font-size: 11px; color: var(--accent); opacity: 0; transition: opacity 0.12s; }
+        .retex-card.selected .retex-card-selectmark { opacity: 1; }
+
+        /* Per-texture-card "Retexture textures" button on the edit form. */
+        .btn-retex-panel { background: var(--accent); color: white; border: none; border-radius: var(--radius-sm); padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer; transition: background var(--transition-fast); }
+        .btn-retex-panel:hover { background: var(--accent-hover); }
+
+
+        .retex-card.selected .retex-card-selectmark { opacity: 1; }
+
 
         /* ── 3D Model Preview ── */
         .model-preview-container { width: 100%; height: 200px; background: var(--bg-input); border-radius: var(--radius-sm); border: 1px solid var(--border); overflow: hidden; margin-bottom: 12px; }
@@ -595,6 +688,11 @@
     </script>
     <script type="module" asp-append-version="true">
         import { mountItemsCharacterPanel } from '/js/items-character-panel.js';
+        // equip.js's direct-mount helper lets items.js put a STAGED (uncommitted)
+        // retexture GLB onto the character's hand by URL, no displayId needed.
+        // The retexture panel calls it on each card click for live preview.
+        import { equipWeaponGlbDirect } from '/js/character-viewer/equip.js';
+        window.retexEquipWeaponGlbDirect = equipWeaponGlbDirect;
 
         // Show the character card on first user interaction with the
         // results (i.e. when they click an item). We could mount eagerly,

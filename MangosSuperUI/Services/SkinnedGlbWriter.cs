@@ -144,6 +144,14 @@ public static class SkinnedGlbWriter
             Console.WriteLine($"[SkinnedGlbWriter] baked {animsBaked}/{animationsToBake.Count} requested animations");
 
             // ── Mesh ────────────────────────────────────────────────────────
+            // Diagnostic: dump every submesh geoset ID so we can see if
+            // cat 17 / cat 32 exist in the parsed M2. Remove once verified.
+            var allGeoIds = m2.Submeshes.Select(s => s.Id).ToList();
+            var catSummary = allGeoIds.GroupBy(id => id / 100)
+                .OrderBy(g => g.Key)
+                .Select(g => $"cat{g.Key}=[{string.Join(",", g.Select(id => id.ToString()))}]");
+            Console.WriteLine($"[SkinnedGlbWriter] {m2.Submeshes.Count} submeshes, geoset IDs: {string.Join(" ", catSummary)}");
+
             var scene = new SceneBuilder("scene");
             var submeshTexture = BuildSubmeshTextureMap(m2);
             var seenMeshNames = new HashSet<string>();
@@ -320,6 +328,22 @@ public static class SkinnedGlbWriter
             {
                 var bone = m2.Bones[boneIdx];
                 var node = boneNodes[boneIdx];
+
+                // Diagnostic: log eye bone track status for bones 83/84
+                bool isEyeBone = (boneIdx == 83 || boneIdx == 84);
+                if (isEyeBone)
+                {
+                    Console.WriteLine($"[SkinnedGlbWriter] EYE BONE {boneIdx} in {clipName}: " +
+                        $"trans(ts={bone.Translation.Timestamps.Count} keys={bone.Translation.Keys.Count} globalSeq={bone.Translation.GlobalSequence}) " +
+                        $"rot(ts={bone.Rotation.Timestamps.Count} keys={bone.Rotation.Keys.Count} globalSeq={bone.Rotation.GlobalSequence}) " +
+                        $"scale(ts={bone.Scale.Timestamps.Count} keys={bone.Scale.Keys.Count} globalSeq={bone.Scale.GlobalSequence}) " +
+                        $"seqWindow=[{startMs}..{endMs}]");
+                    if (bone.Rotation.Timestamps.Count > 0)
+                    {
+                        var allTs = bone.Rotation.Timestamps;
+                        Console.WriteLine($"[SkinnedGlbWriter]   rot timestamps range: [{allTs.Min()}..{allTs.Max()}] count={allTs.Count}");
+                    }
+                }
 
                 // Rest-pose translation for this bone (used as base for any
                 // translation track — see class doc on TRS mapping).

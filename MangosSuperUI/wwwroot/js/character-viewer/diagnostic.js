@@ -736,6 +736,106 @@ export function mountDiagnosticPanel({
         console.log(`[diagnostic] applied face texture to mesh ${id}`);
     }, { bg: '#2a3a3a' });
 
+    // ── Face variation picker (CharSections.dbc) ──
+    // Fetches all (variation, color) combos from the server and lets you
+    // cycle through them to find which one has open eyes for each race.
+    info(faceSection, '── CharSections face variation picker ──', 'color: #aaa; margin-top: 8px;');
+    info(faceSection, 'Paints a face variation onto the body atlas FACE_LOWER + FACE_UPPER regions. Cycle through to find open eyes.', 'font-size: 10px; color: #888;');
+
+    const faceVarRow = document.createElement('div');
+    faceVarRow.style.cssText = 'display: flex; gap: 4px; align-items: center; flex-wrap: wrap; margin: 4px 0;';
+
+    const faceVarSelect = document.createElement('select');
+    faceVarSelect.style.cssText = 'background: #1a1a1a; border: 1px solid #444; border-radius: 3px; color: #ddd; padding: 2px 4px; font-family: inherit; font-size: 11px; flex: 1;';
+    faceVarSelect.innerHTML = '<option value="">-- load variations --</option>';
+    faceVarRow.appendChild(faceVarSelect);
+    faceSection.appendChild(faceVarRow);
+
+    const faceVarStatus = document.createElement('div');
+    faceVarStatus.style.cssText = 'font-size: 10px; color: #888; margin: 2px 0;';
+    faceSection.appendChild(faceVarStatus);
+
+    // Derive race/gender from the canvas dataset (same as equip.js)
+    function getCurrentRaceGender() {
+        const canvasEl = document.getElementById('char-preview-canvas');
+        const glbUrl = canvasEl?.dataset.glbUrl || '';
+        const match = glbUrl.match(/\/character_models\/([A-Z][a-z]+(?:[A-Z][a-z]+)*?)(Male|Female)/);
+        if (match) return { race: match[1], gender: match[2] };
+        return { race: 'Human', gender: 'Male' };
+    }
+
+    btn(faceVarRow, 'Load', async () => {
+        const { race, gender } = getCurrentRaceGender();
+        faceVarStatus.textContent = `Loading variations for ${race} ${gender}...`;
+        try {
+            const res = await fetch(`/Items/FaceVariations?race=${race}&gender=${gender}`);
+            const data = await res.json();
+            faceVarSelect.innerHTML = '';
+            for (const r of data.rows) {
+                const o = document.createElement('option');
+                o.value = JSON.stringify(r);
+                o.textContent = `var=${r.variation} col=${r.color} | ${r.lower?.split('\\').pop() || '(empty)'}`;
+                faceVarSelect.appendChild(o);
+            }
+            faceVarStatus.textContent = `${data.count} face rows for ${race} ${gender}`;
+        } catch (err) {
+            faceVarStatus.textContent = `Error: ${err.message}`;
+        }
+    }, { bg: '#2a3a2a' });
+
+    btn(faceSection, '▶ Apply selected variation to body atlas', async () => {
+        const val = faceVarSelect.value;
+        if (!val) { faceVarStatus.textContent = 'Select a variation first'; return; }
+        const { variation, color } = JSON.parse(val);
+        const { race, gender } = getCurrentRaceGender();
+        faceVarStatus.textContent = `Applying var=${variation} col=${color}...`;
+
+        try {
+            // Load the base skin first
+            const skinCanvas = document.getElementById('char-preview-canvas');
+            const skinUrl = skinCanvas?.dataset.skinUrl;
+            let baseSkin = null;
+            if (skinUrl) {
+                const skinRes = await fetch(skinUrl);
+                if (skinRes.ok) baseSkin = await createImageBitmap(await skinRes.blob());
+            }
+
+            // Create a 256×256 canvas with the base skin
+            const atlas = document.createElement('canvas');
+            atlas.width = 256; atlas.height = 256;
+            const ctx = atlas.getContext('2d');
+            if (baseSkin) ctx.drawImage(baseSkin, 0, 0, 256, 256);
+            else { ctx.fillStyle = '#c8a888'; ctx.fillRect(0, 0, 256, 256); }
+
+            // Paint face_lower (128×64 at 0,192)
+            const lowerUrl = `/Items/FaceTexture?race=${race}&gender=${gender}&variation=${variation}&color=${color}&region=lower`;
+            const lowerRes = await fetch(lowerUrl);
+            if (lowerRes.ok) {
+                const lowerBmp = await createImageBitmap(await lowerRes.blob());
+                ctx.drawImage(lowerBmp, 0, 192, 128, 64);
+            }
+
+            // Paint face_upper (128×32 at 0,160)
+            const upperUrl = `/Items/FaceTexture?race=${race}&gender=${gender}&variation=${variation}&color=${color}&region=upper`;
+            const upperRes = await fetch(upperUrl);
+            if (upperRes.ok) {
+                const upperBmp = await createImageBitmap(await upperRes.blob());
+                ctx.drawImage(upperBmp, 0, 160, 128, 32);
+            }
+
+            // Apply to character body
+            const tex = new THREE.CanvasTexture(atlas);
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.flipY = false;
+            compositor.applyBodyTexture(character, tex);
+
+            faceVarStatus.textContent = `Applied var=${variation} col=${color} for ${race} ${gender}`;
+        } catch (err) {
+            faceVarStatus.textContent = `Error: ${err.message}`;
+            console.error('[diagnostic] face variation apply failed', err);
+        }
+    }, { bg: '#2a5a3a' });
+
     // ════════════════════════════════════════════════════════════════
     // SECTION 8 — Legacy harness (region paint, isolation, presets)
     // ════════════════════════════════════════════════════════════════

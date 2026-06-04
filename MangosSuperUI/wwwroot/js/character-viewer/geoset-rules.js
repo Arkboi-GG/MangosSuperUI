@@ -83,7 +83,10 @@
 // cat 3  — face: mouth (v1=default, v2=alt)
 // cat 4  — gloves / hand armor (v1=bare, v2-4=glove variants)
 // cat 5  — boots / feet (v1=bare feet, v2-4=boot variants)
-// cat 7  — ears (default hidden by hair; not seen in any truth snapshot)
+// cat 7  — ears (v1=minimal, v2=normal/default per WMV). WMV explicitly
+//          sets CG_EARS to variant 2 by default, with variant 1 as the
+//          "minimal" option used by some helms. Some races (NightElf)
+//          have prominent ears that need v2 to look right.
 // cat 8  — sleeves (v2/v3 — note: NO variant 1 in this model)
 // cat 9  — long pants/leggings (v2/v3 — no variant 1)
 // cat 10 — mid-torso garment ("shirt-tail" hanging below chest; v2 only)
@@ -91,16 +94,25 @@
 // cat 12 — tabard bottom (v2 only)
 // cat 13 — ROBE vs THIGHS — mutually exclusive! v1 = bare thighs, v2 = robe
 // cat 15 — shoulders + optional cape (v1 = shoulders only, v2-6 = capes)
+// cat 17 — eye glow. NOT PRESENT in vanilla 1.12 character M2s (confirmed
+//          empirically May 19 2026 — HumanMale, NightElfFemale, TrollMale
+//          all lack cat 17 submeshes). Eye appearance is purely texture-
+//          driven in vanilla via CharSections face BLPs composited onto
+//          the body atlas FACE_UPPER/FACE_LOWER regions.
+//          Kept in NAKED_DEFAULTS defensively in case any race does have it.
+// cat 32 — face geometry. Also NOT PRESENT in vanilla character M2s.
+//          Same as cat 17 — retained defensively.
 //
-// Cats 6, 14, 16+ — not present in HumanMale.m2.
-// Cats present but unused in the items we've tested: 7 (ears),
-//   10 (only cloth-shirt truth uses it), 12 (only tabard would use it).
+// Cats 6, 14, 16 — not present in most vanilla character M2s.
 
-// Default hair-style variant for cat 0. Vanilla HumanMale has ~13 hair
-// geometries indexed 1-13. Variant 10 chosen by visual testing
-// (Session K) as a reasonable default. Future work: drive this from a
-// per-character hair-style selector / from CharSections.dbc.
-const HAIR_VARIANT = 10;
+// Preferred hair-style variant for cat 0. Variant 10 was visually tested
+// on HumanMale (Session K) and looks good. Other races may have fewer
+// hair styles (TrollMale only goes to 7, NightElfFemale to 8). The
+// resolver tries PREFERRED_HAIR_VARIANT first; if it doesn't exist in the
+// model, it falls back to the highest available variant. This ensures
+// every race gets hair (fixing the Troll-bald-scalp bug) while keeping
+// the tested look on Human.
+const PREFERRED_HAIR_VARIANT = 10;
 
 // ════════════════════════════════════════════════════════════════════
 // Naked-default state — VERIFIED against naked-truth-human-male.json
@@ -119,9 +131,11 @@ const NAKED_DEFAULTS = {
     3: 1,   // face mouth
     4: 1,   // bare hands (variant 1)
     5: 1,   // bare feet (variant 1)
-    7: 1,   // ears (variant 1 = default/smaller; v2 = larger alternative)
+    7: 2,   // ears (variant 2 = normal/default per WMV; v1 = minimal)
     13: 1,   // bare thighs (variant 1; "no robe")
     15: 1,   // shoulders only (variant 1; "no cape")
+    17: 1,   // eye glow normal (per WMV CG_EYEGLOW default = 1)
+    32: 1,   // face geometry (per WMV CG_FACE forced to 1)
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -137,7 +151,10 @@ const NAKED_DEFAULTS = {
 // Cat 7 (ears) is in here for the same reason: ears are character
 // customization, not equipment. (Earrings could change cat 7 in
 // principle, but earrings aren't body-atlas items in vanilla.)
-const CHARACTER_APPEARANCE_CATEGORIES = new Set([1, 2, 3, 7]);
+//
+// Cat 17 (eye glow) and cat 32 (face geometry) are intrinsic to the
+// character model — no vanilla equipment changes these.
+const CHARACTER_APPEARANCE_CATEGORIES = new Set([1, 2, 3, 7, 17, 32]);
 
 // ════════════════════════════════════════════════════════════════════
 // Per-inventory-type rules.
@@ -365,11 +382,27 @@ export function resolveVisibleGeosets(geosetList, items) {
     for (const cat of byCategory.keys()) {
         selectedVariant.set(cat, 0);  // default everything hidden
     }
-    // Cat 0 = base body (variant 0) + ONE hair style (variants 1-13 on
-    // HumanMale). The previous 'all' setting made every hair variant
-    // visible simultaneously, producing the giant-mass-of-hair look
-    // seen pre-Session-K.
-    if (byCategory.has(0)) selectedVariant.set(0, [0, HAIR_VARIANT]);
+    // Cat 0 = base body (variant 0) + ONE hair style. The number of hair
+    // variants varies per race (HumanMale has 1-13, TrollMale only 1-7,
+    // NightElfFemale 2-8). Try PREFERRED_HAIR_VARIANT (10) first — it was
+    // visually tested on HumanMale. If it doesn't exist in this model,
+    // fall back to the highest available variant so we always get hair
+    // (and the scalp dome that comes with it on races like Troll).
+    if (byCategory.has(0)) {
+        const cat0Meshes = byCategory.get(0);
+        const cat0Variants = [...new Set(cat0Meshes
+            .map(m => m.userData?.geosetVariant)
+            .filter(v => typeof v === 'number' && v > 0))];
+        let hairVariant;
+        if (cat0Variants.includes(PREFERRED_HAIR_VARIANT)) {
+            hairVariant = PREFERRED_HAIR_VARIANT;
+        } else if (cat0Variants.length > 0) {
+            hairVariant = Math.max(...cat0Variants);
+        } else {
+            hairVariant = 0;
+        }
+        selectedVariant.set(0, hairVariant > 0 ? [0, hairVariant] : [0]);
+    }
     for (const [cat, variant] of Object.entries(NAKED_DEFAULTS)) {
         selectedVariant.set(Number(cat), variant);
     }

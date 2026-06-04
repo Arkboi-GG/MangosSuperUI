@@ -5,7 +5,7 @@
 //   2. Material factories (lit/flat aware, r162 ColorManagement)
 //   3. Lighting rig (ambient/hemi/sun/fill + sky dome + ground plane)
 //   4. CameraRig (camera + OrbitControls + walk-mode look state)
-//   5. WalkMode helpers (terrain snap + forward collision)
+//   5. WalkMode helpers (terrain snap + forward collision + DUNGEON floor snap)
 //   6. safeDispose (recursive geometry/material/texture cleanup)
 //   7. Viewport (renderer, scene assembly, animate loop, resize, input dispatch)
 
@@ -283,8 +283,9 @@ export class CameraRig {
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // updateSnap(): cast ray downward, lift camera to eyeHeight above terrain.
+//   DUNGEON MODE: raycast dungeonMeshes directly, multi-floor Y-snap.
 // updateCollision(): cast forward from camera, push back if a WMO is closer
-// than COLLISION_DISTANCE.
+//   than COLLISION_DISTANCE. (Currently disabled — blocks cave entrances.)
 
 const COLLISION_DISTANCE = 3;
 
@@ -294,6 +295,17 @@ export class WalkMode {
         this._down = new THREE.Vector3(0, -1, 0);
         this._rayDown = new THREE.Raycaster();
         this._rayFwd = new THREE.Raycaster();
+
+        // ── PERF: throttle + cache ──────────────────────────────────────
+        // WMO raycasts are expensive (InstancedMesh without per-instance BVH).
+        // In dense areas like Stormwind, raycasting every WMO mesh every frame
+        // tanks FPS. We throttle the full snap to ~20Hz and cache the WMO hit
+        // result between frames.
+        this._snapFrame = 0;
+        this._cachedBestY = null;        // last computed best Y
+        this._cachedTargetY = null;      // smoothed target Y for interpolation
+        this._wmoMeshCache = null;       // cached wmoMeshList array
+        this._wmoMeshCacheFrame = -999;  // frame when cache was built
     }
 
     updateSnap() {
@@ -301,46 +313,130 @@ export class WalkMode {
         if (!rig.walk.mode) return;
         if (!this.editor.tileGrid) return;
 
-        const terrainMeshes = this.editor.tileGrid.terrainMeshes();
-        if (terrainMeshes.length === 0) return;
+        this._snapFrame++;
 
-        const origin = new THREE.Vector3(rig.camera.position.x, 500, rig.camera.position.z);
-        this._rayDown.set(origin, this._down);
-        this._rayDown.far = 1000;
+        // ── DUNGEON MODE ─────────────────────────────────────────────────
+        // Dungeon meshes have BVH → fast raycast. Run every frame, no throttle needed.
+        if (this.editor.tileGrid.isDungeon) {
+            const dungeonMeshes = this.editor.tileGrid.dungeonMeshes;
+            if (!dungeonMeshes || dungeonMeshes.length === 0) return;
 
-        const hits = this._rayDown.intersectObjects(terrainMeshes);
-        if (hits.length > 0) {
-            const targetY = hits[0].point.y + rig.walk.eyeHeight;
+            const origin = new THREE.Vector3(rig.camera.position.x, 500, rig.camera.position.z);
+            this._rayDown.set(origin, this._down);
+            this._rayDown.far = 1000;
+
+            const hits = this._rayDown.intersectObjects(dungeonMeshes, false);
+            if (hits.length > 0) {
+                let bestY = null;
+                for (let i = 0; i < hits.length; i++) {
+                    const hy = hits[i].point.y;
+                    if (hy < rig.camera.position.y + 1) {
+                        if (bestY === null || hy > bestY) bestY = hy;
+                    }
+                }
+                if (bestY === null) bestY = hits[hits.length - 1].point.y;
+
+                const targetY = bestY + rig.walk.eyeHeight;
+                const dy = (targetY - rig.camera.position.y) * 0.3;
+                rig.camera.position.y += dy;
+                rig.controls.target.y += dy;
+            }
+            return;
+        }
+
+        // ── NORMAL TERRAIN MODE (with throttled WMO raycast) ─────────────
+
+        // PERF: full raycast at ~20Hz (every 3rd frame at 60fps).
+        // Between samples, keep smoothing toward the last known target Y.
+        const doFullRaycast = (this._snapFrame % 3 === 0);
+
+        if (doFullRaycast) {
+            const origin = new THREE.Vector3(rig.camera.position.x, 500, rig.camera.position.z);
+            this._rayDown.set(origin, this._down);
+            this._rayDown.far = 1000;
+
+            // Terrain raycast — BVH-accelerated, always fast
+            const terrainMeshes = this.editor.tileGrid.terrainMeshes();
+            let terrainY = null;
+            if (terrainMeshes.length > 0) {
+                const terrainHits = this._rayDown.intersectObjects(terrainMeshes);
+                if (terrainHits.length > 0) terrainY = terrainHits[0].point.y;
+            }
+
+            // WMO raycast — expensive, use cached mesh list + spatial filter
+            let wmoY = null;
+            const stream = this.editor.objectStream;
+            if (stream) {
+                const wmoMeshes = this._getWmoMeshesNearby(stream, rig.camera.position);
+                if (wmoMeshes.length > 0) {
+                    const wmoHits = this._rayDown.intersectObjects(wmoMeshes, false);
+                    if (wmoHits.length > 0) wmoY = wmoHits[0].point.y;
+                }
+            }
+
+            // Decision logic (unchanged)
+            let bestY;
+            if (terrainY === null && wmoY !== null) {
+                bestY = wmoY;
+                this._inCave = true;
+            } else if (terrainY !== null && this._inCave && wmoY !== null) {
+                bestY = wmoY;
+            } else if (terrainY !== null) {
+                bestY = terrainY;
+                this._inCave = false;
+            } else {
+                bestY = null;
+            }
+
+            this._cachedBestY = bestY;
+        }
+
+        // Apply smoothed Y snap (runs every frame for smooth movement)
+        if (this._cachedBestY !== null) {
+            const targetY = this._cachedBestY + rig.walk.eyeHeight;
             const dy = (targetY - rig.camera.position.y) * 0.3;
             rig.camera.position.y += dy;
             rig.controls.target.y += dy;
         }
     }
 
-    updateCollision() {
-        const rig = this.editor.viewport.rig;
-        if (!rig.walk.mode) return;
-        const stream = this.editor.objectStream;
-        if (!stream) return;
-
-        const dir = new THREE.Vector3();
-        rig.camera.getWorldDirection(dir);
-        dir.y = 0;
-        if (dir.lengthSq() === 0) return;
-        dir.normalize();
-
-        this._rayFwd.set(rig.camera.position.clone(), dir);
-        this._rayFwd.far = COLLISION_DISTANCE + 2;
-
-        const wmoMeshes = stream.wmoMeshList();
-        if (wmoMeshes.length === 0) return;
-
-        const hits = this._rayFwd.intersectObjects(wmoMeshes, false);
-        if (hits.length > 0 && hits[0].distance < COLLISION_DISTANCE) {
-            const pushBack = COLLISION_DISTANCE - hits[0].distance;
-            rig.camera.position.addScaledVector(dir, -pushBack);
-            rig.controls.target.addScaledVector(dir, -pushBack);
+    /// PERF: return WMO meshes near the camera, using a cached list that
+    /// refreshes every ~30 frames (~0.5s). Between refreshes, the same
+    /// array is reused (no traverse/alloc). Also filters to meshes whose
+    /// bounding sphere is within 80 units of the camera XZ.
+    _getWmoMeshesNearby(stream, camPos) {
+        // Rebuild full mesh list every ~30 frames
+        if (!this._wmoMeshCache || (this._snapFrame - this._wmoMeshCacheFrame) > 30) {
+            this._wmoMeshCache = stream.wmoMeshList();
+            this._wmoMeshCacheFrame = this._snapFrame;
         }
+
+        // Spatial filter: only test meshes near the camera
+        const RADIUS_SQ = 80 * 80;
+        const cx = camPos.x, cz = camPos.z;
+        const nearby = [];
+        for (let i = 0; i < this._wmoMeshCache.length; i++) {
+            const m = this._wmoMeshCache[i];
+            // InstancedMesh doesn't have a meaningful single position,
+            // but its parent Group (wmoGroup) is at y=-0.5 with no XZ offset.
+            // For instanced meshes, skip the spatial filter (they contain
+            // instances scattered across the map — the GPU handles culling).
+            // For regular Meshes (placement-store custom WMOs), check position.
+            if (m.isInstancedMesh) {
+                nearby.push(m);
+            } else {
+                const wp = m.getWorldPosition(new THREE.Vector3());
+                const dx = wp.x - cx, dz = wp.z - cz;
+                if (dx * dx + dz * dz < RADIUS_SQ) nearby.push(m);
+            }
+        }
+        return nearby;
+    }
+
+    updateCollision() {
+        // WMO forward collision disabled — it blocks cave/dungeon entrances.
+        // TODO: re-enable with portal-aware logic that distinguishes between
+        // solid exterior walls (push back) and enterable doorways (pass through).
     }
 }
 
@@ -596,7 +692,8 @@ export class Viewport {
 
         // Object streaming check (~600ms, offset from terrain to spread load)
         this._streamTimer++;
-        if (this._streamTimer >= 36 && this.editor.objectStream && this.editor.currentPreset && this.editor.tileGrid) {
+        if (this._streamTimer >= 36 && this.editor.objectStream && this.editor.currentPreset && this.editor.tileGrid
+            && this.editor.tileGrid.tileWidthMesh > 0) {
             this._streamTimer = 0;
             this.editor.objectStream.pump(
                 this.rig.camera.position.x,
@@ -626,6 +723,37 @@ export class Viewport {
         // overlay pass has valid ghost depth to sample).
         if (this._placementCtx) this._placementCtx.runIfNeeded();
 
-        this.composer.render();
+        // ── PERF: bypass EffectComposer in walk mode ────────────────────
+        const needOutline = this.outlinePass &&
+            this.outlinePass.selectedObjects &&
+            this.outlinePass.selectedObjects.length > 0;
+        const hasPlacementCtx = this._placementCtx && this._placementCtx._passInserted;
+
+        // Reset render info BEFORE rendering so we capture accurate stats
+        this.renderer.info.reset();
+
+        if (!needOutline && !hasPlacementCtx && this.rig.walk.mode) {
+            this.renderer.render(this.scene, this.rig.camera);
+        } else {
+            // When using composer, capture scene render stats by doing a manual
+            // info.reset before the composer runs. The RenderPass (first pass)
+            // does the real scene render; subsequent passes add their own calls.
+            this.composer.render();
+        }
+
+        // ── PERF: diagnostic log (every 5s) ─────────────────────────
+        if (this._fpsCounter % 300 === 1) {
+            const info = this.renderer.info;
+            const walk = this.rig.walk.mode ? 'WALK' : 'orbit';
+            const bypass = (!needOutline && !hasPlacementCtx && this.rig.walk.mode) ? 'BYPASS' : 'COMPOSER';
+            let sceneChildCount = 0;
+            this.scene.traverse(() => { sceneChildCount++; });
+            const tg = this.editor.tileGrid;
+            const tileCount = tg ? Object.keys(tg.tiles).length : 0;
+            const os = this.editor.objectStream;
+            const activeP = os ? Object.keys(os.activePlacements).length : 0;
+            const imSets = os ? Object.keys(os.pool.sets).length : 0;
+            console.log(`[render] ${walk} ${bypass} calls=${info.render.calls} tris=${info.render.triangles} | scene=${sceneChildCount} tiles=${tileCount} placements=${activeP} imSets=${imSets} | tex=${info.memory.textures} geo=${info.memory.geometries} | fps=${this.currentFps}`);
+        }
     }
 }

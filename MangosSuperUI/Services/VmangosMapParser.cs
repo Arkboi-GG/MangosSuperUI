@@ -169,16 +169,41 @@ public static class VmangosMapParser
             }
         }
 
-        return BuildMeshResult(v9, v8, centerChunkX, centerChunkY, radius);
+        // Read terrain holes from .map file.
+        // VMaNGOS stores 16×16 uint16 hole bitmasks (one per MCNK chunk) at
+        // holesOffset (header bytes 32-35). Each uint16 is the low-res hole
+        // mask from the ADT MCNK header offset 0x3C. A set bit means "this
+        // 2×2 cell block is a hole — don't render terrain here."
+        uint holesOffset = BitConverter.ToUInt32(data, 32);
+        uint holesSize = BitConverter.ToUInt32(data, 36);
+
+        ushort[]? holes = null;
+        if (holesOffset > 0 && holesSize >= 256 * 2 && holesOffset + holesSize <= data.Length)
+        {
+            holes = new ushort[256]; // 16×16 chunks
+            int holePos = (int)holesOffset;
+            for (int i = 0; i < 256; i++)
+            {
+                holes[i] = BitConverter.ToUInt16(data, holePos);
+                holePos += 2;
+            }
+        }
+
+        return BuildMeshResult(v9, v8, centerChunkX, centerChunkY, radius, holes);
     }
 
-    /// <summary>
+    // <summary>
     /// Build a Three.js-ready mesh from V9 outer vertices for the requested chunk region.
     /// V9 is a continuous 129×129 grid: v9[y * 129 + x] where x,y ∈ [0,128].
     /// Each chunk spans 8 cells, so chunk (cx,cy) covers V9 rows [cy*8..(cy+1)*8]
     /// and cols [cx*8..(cx+1)*8].
+    ///
+    /// When holes are provided (16×16 uint16 bitmasks from the .map file), cells
+    /// marked as holes are skipped during index generation. This creates openings
+    /// in the terrain where cave/dungeon WMO geometry is visible below.
     /// </summary>
-    private static TerrainResult BuildMeshResult(float[] v9, float[] v8, int cx, int cy, int radius)
+    private static TerrainResult BuildMeshResult(float[] v9, float[] v8,
+        int cx, int cy, int radius, ushort[]? holes = null)
     {
         int minCX = Math.Max(0, cx - radius);
         int maxCX = Math.Min(15, cx + radius);
@@ -236,12 +261,50 @@ public static class VmangosMapParser
             }
         }
 
-        // Build triangle indices
+        // Build triangle indices, skipping cells marked as terrain holes.
+        //
+        // The low-res hole bitmask (uint16 per MCNK chunk) maps a 4×4 grid
+        // onto the chunk's 8×8 cell grid. Each bit controls a 2×2 cell block.
+        // Bit index = (holeRow * 4 + holeCol), where holeRow/holeCol ∈ [0,3],
+        // covering cells [holeRow*2..holeRow*2+1, holeCol*2..holeCol*2+1].
+        //
+        // Reference: wowdev.wiki ADT/v18 — MCNK header offset 0x3C "holes".
         var indices = new List<int>();
         for (int y = 0; y < vertsH - 1; y++)
         {
             for (int x = 0; x < vertsW - 1; x++)
             {
+                // Check if this cell is a terrain hole
+                if (holes != null)
+                {
+                    // Map mesh-local vertex (x,y) back to global V9 cell coordinate
+                    int globalCellX = v9StartX + x;
+                    int globalCellY = v9StartY + y;
+
+                    // Which MCNK chunk (0..15) does this cell belong to?
+                    int chunkX = globalCellX / 8;
+                    int chunkY = globalCellY / 8;
+
+                    if (chunkX >= 0 && chunkX < 16 && chunkY >= 0 && chunkY < 16)
+                    {
+                        ushort holeMask = holes[chunkY * 16 + chunkX];
+                        if (holeMask != 0)
+                        {
+                            // Cell position within the chunk (0..7)
+                            int cellInChunkX = globalCellX - chunkX * 8;
+                            int cellInChunkY = globalCellY - chunkY * 8;
+
+                            // Map to the 4×4 hole grid (each bit covers 2×2 cells)
+                            int holeCol = cellInChunkX / 2; // 0..3
+                            int holeRow = cellInChunkY / 2; // 0..3
+                            int holeBit = holeRow * 4 + holeCol;
+
+                            if ((holeMask & (1 << holeBit)) != 0)
+                                continue; // Hole — skip triangles for this cell
+                        }
+                    }
+                }
+
                 int tl = y * vertsW + x;
                 int tr = tl + 1;
                 int bl = (y + 1) * vertsW + x;

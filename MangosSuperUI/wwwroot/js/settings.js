@@ -66,6 +66,7 @@ $(function () {
                 if (s.spellCreator.ollama) {
                     $('#cfgOllamaUrl').val(s.spellCreator.ollama.baseUrl);
                     $('#cfgOllamaModel').val(s.spellCreator.ollama.model);
+                    $('#cfgOllamaVisionModel').val(s.spellCreator.ollama.visionModel);
                 }
 
                 // Vanilla BLP paths
@@ -379,7 +380,8 @@ $(function () {
                 },
                 ollama: {
                     baseUrl: $('#cfgOllamaUrl').val() || '',
-                    model: $('#cfgOllamaModel').val() || ''
+                    model: $('#cfgOllamaModel').val() || '',
+                    visionModel: $('#cfgOllamaVisionModel').val() || ''
                 },
                 rawBlpPath: $('#cfgRawBlpPath').val() || '',
                 dataPath: $('#cfgSpellDataPath').val() || '',

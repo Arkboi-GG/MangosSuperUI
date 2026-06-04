@@ -10,7 +10,7 @@ namespace MangosSuperUI.Services;
 /// AI-powered item retexturing pipeline with persistent storage.
 ///
 /// All retextures are saved to the `custom_item_retexture` table in vmangos_admin.
-/// patch-M.MPQ is rebuilt from ALL stored retextures every time, ensuring
+/// patch-4.MPQ is rebuilt from ALL stored retextures every time, ensuring
 /// the patch always contains every custom item texture (same pattern as
 /// SpellCreator's unified patch rebuild).
 ///
@@ -20,9 +20,9 @@ namespace MangosSuperUI.Services;
 ///   3. Result resized to vanilla dimensions, encoded to BLP
 ///   4. M2 cloned with patched texture path
 ///   5. Everything saved to DB (BLP + M2 as BLOBs)
-///   6. RebuildPatchM() reads ALL retextures from DB, builds unified patch-M.MPQ
+///   6. RebuildPatchM() reads ALL retextures from DB, builds unified patch-4.MPQ
 ///      with all custom BLPs, M2s, and a single patched ItemDisplayInfo.dbc
-///   7. patch-M.MPQ deployed to WoW client Data folder
+///   7. patch-4.MPQ deployed to WoW client Data folder
 /// </summary>
 public class ItemRetextureService
 {
@@ -99,6 +99,27 @@ public class ItemRetextureService
                 prompt TEXT,
                 style_direction VARCHAR(512) NOT NULL DEFAULT '',
                 created_at DATETIME DEFAULT NOW()
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+        // Body-atlas (painted armor) retextures. Unlike weapons (one model
+        // texture → one BLP → DBC field 3), painted armor has up to 8 component
+        // textures (m_texture[0..7] = ItemDisplayInfo fields 14..21), each its
+        // own BLP in its own Item\TextureComponents\{subdir}\ directory. So this
+        // table is ONE ROW PER SLOT, all sharing a new_display_id. RebuildPatchM
+        // groups by new_display_id, clones the source row once, and patches each
+        // slot's field. Separate table so the single-BLP weapon flow is untouched.
+        await conn.ExecuteAsync(@"
+            CREATE TABLE IF NOT EXISTS custom_item_retexture_atlas (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                display_id INT UNSIGNED NOT NULL,
+                new_display_id INT UNSIGNED NOT NULL,
+                item_name VARCHAR(255) NOT NULL DEFAULT '',
+                slot TINYINT UNSIGNED NOT NULL,
+                custom_blp_mpq_path VARCHAR(512) NOT NULL DEFAULT '',
+                custom_blp LONGBLOB,
+                style_direction VARCHAR(512) NOT NULL DEFAULT '',
+                created_at DATETIME DEFAULT NOW(),
+                INDEX idx_atlas_newdisplay (new_display_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
     }
 
@@ -271,45 +292,23 @@ public class ItemRetextureService
             }
 
             // ── Step 6: Build MPQ paths ──
+            // DBC-only approach: no M2 cloning.
+            // The vanilla M2 uses type-1 textures resolved via ItemDisplayInfo.dbc,
+            // not embedded filenames. We just need:
+            //   - Custom BLP in the same directory as the vanilla M2
+            //   - DBC TextureName1 pointing at the custom BLP name (no ext, no dir)
+            //   - DBC ModelName1 unchanged (vanilla M2 from base MPQs)
             string customBlpName = $"Custom_{request.DisplayId}_{Path.GetFileNameWithoutExtension(targetTex.Filename)}.blp";
             string customBlpMpqPath = customBlpName;
-
-            // ── Step 7: Clone M2 with patched texture path ──
-            byte[]? m2Bytes = null;
-            string? m2MpqPath = null;
 
             var modelInfo = texInfo.ModelName;
             if (!string.IsNullOrEmpty(modelInfo))
             {
-                m2Bytes = FindAndExtractItemM2(modelInfo);
-                if (m2Bytes != null)
-                {
-                    string m2BaseName = Path.GetFileNameWithoutExtension(modelInfo);
-                    string m2Dir = GuessM2Directory(modelInfo);
-                    m2MpqPath = $"{m2Dir}Custom_{request.DisplayId}_{m2BaseName}.m2";
-
-                    // BLP in same directory as M2
-                    customBlpMpqPath = $"{m2Dir}{customBlpName}";
-
-                    // Patch texture reference in M2
-                    var texEntries = M2TextureParser.ParseTextures(m2Bytes);
-                    var matchingTex = texEntries.FirstOrDefault(t =>
-                        !string.IsNullOrEmpty(t.Filename) &&
-                        Path.GetFileName(t.Filename).Equals(targetTex.Filename,
-                            StringComparison.OrdinalIgnoreCase));
-
-                    if (matchingTex != null)
-                    {
-                        var replacements = new Dictionary<int, string>
-                        {
-                            [matchingTex.Index] = customBlpMpqPath
-                        };
-                        M2TextureParser.PatchTextureFilenames(m2Bytes, replacements);
-                    }
-                }
+                string m2Dir = GuessM2Directory(modelInfo);
+                customBlpMpqPath = $"{m2Dir}{customBlpName}";
             }
 
-            // ── Step 8: Allocate new displayId and save to DB ──
+            // ── Step 7: Allocate new displayId and save to DB ──
             uint newDisplayId = await AllocateDisplayIdAsync();
 
             using (var conn = _db.Admin())
@@ -321,7 +320,7 @@ public class ItemRetextureService
                          prompt, style_direction)
                     VALUES
                         (@DisplayId, @NewDisplayId, @ItemName, @TexFilename, @TexMpqPath,
-                         @BlpMpqPath, @M2MpqPath, @BlpBytes, @M2Bytes,
+                         @BlpMpqPath, '', @BlpBytes, NULL,
                          @Prompt, @Style)",
                     new
                     {
@@ -331,17 +330,15 @@ public class ItemRetextureService
                         TexFilename = targetTex.Filename,
                         TexMpqPath = targetTex.MpqPath,
                         BlpMpqPath = customBlpMpqPath,
-                        M2MpqPath = m2MpqPath ?? "",
                         BlpBytes = blpBytes,
-                        M2Bytes = m2Bytes,
                         Prompt = prompt,
                         Style = request.StyleDirection
                     });
             }
 
             _logger.LogInformation(
-                "Retexture: Saved to DB — displayId {Old}→{New}, BLP: {Blp}, M2: {M2}",
-                request.DisplayId, newDisplayId, customBlpMpqPath, m2MpqPath ?? "(none)");
+                "Retexture: Saved to DB — displayId {Old}→{New}, BLP: {Blp}",
+                request.DisplayId, newDisplayId, customBlpMpqPath);
 
             // Register in DbcService so SuperUI knows about this displayId immediately
             // Pass null for both model and texture — clones everything from source.
@@ -349,12 +346,12 @@ public class ItemRetextureService
             // and finds the vanilla M2 via the original model name for GLB generation.
             _dbc.RegisterCustomDisplayEntry(newDisplayId, request.DisplayId, null, null);
 
-            // ── Step 9: Rebuild patch-M.MPQ with ALL retextures ──
+            // ── Step 9: Rebuild patch-4.MPQ with ALL retextures ──
             var rebuildResult = await RebuildPatchMAsync();
 
             result.PatchMpqPath = rebuildResult.PatchWebPath;
             result.CustomBlpMpqPath = customBlpMpqPath;
-            result.CustomM2MpqPath = m2MpqPath;
+            result.CustomM2MpqPath = null;
             result.NewDisplayId = newDisplayId;
             result.BlpSizeBytes = blpBytes.Length;
             result.Success = rebuildResult.Success;
@@ -362,6 +359,7 @@ public class ItemRetextureService
                 result.Error = rebuildResult.Error;
 
             _itemTextures.InvalidateCache(request.DisplayId);
+            _itemTextures.InvalidateCache(newDisplayId);
 
             _logger.LogInformation(
                 "Retexture: Complete! displayId {Old}→{New}, total retextures in patch: {Count}",
@@ -378,7 +376,506 @@ public class ItemRetextureService
     }
 
     // ═══════════════════════════════════════════════════════════════════
+    // PREVIEW-ONLY RENDER (May 2026)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Run the Flux generation portion of RetextureAsync (steps 1–4: craft
+    /// prompt, build workflow, ComfyUI generate, resize to vanilla dims) and
+    /// return the resized PNG path — WITHOUT touching the DB or rebuilding
+    /// patch-4.MPQ. The PNG lives under wwwroot/item_textures_cache/retexture_resized/
+    /// with a Guid-suffixed filename so concurrent previews don't overwrite
+    /// each other. Used by /Items/PreviewFluxGlb and PreviewPaletteGlb's
+    /// optional Flux polish step. Commit happens later via
+    /// RetextureFromBitmapAsync on the same PNG, so what was previewed on
+    /// the character is byte-identical to what's persisted.
+    /// </summary>
+    /// <param name="request">Same shape RetextureAsync takes (DisplayId, ItemName,
+    /// StyleDirection / CustomPrompt, ModifyExisting, DenoiseStrength, OriginalMpqPath,
+    /// OriginalBlpFilename).</param>
+    /// <returns>Absolute path to the resized PNG on disk, or null on failure.
+    /// On null, check logs — the failure has already been logged.</returns>
+    public async Task<string?> RenderToPngAsync(RetextureRequest request, CancellationToken ct = default)
+    {
+        try
+        {
+            // ── Step 1: Read original texture metadata ──
+            var texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
+            if (texInfo == null)
+            {
+                _logger.LogWarning("RenderToPngAsync: no textures for displayId {Id}",
+                    request.DisplayId);
+                return null;
+            }
+
+            var targetTex = texInfo.Textures.FirstOrDefault(t =>
+                t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
+                || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase))
+                ?? texInfo.Textures.FirstOrDefault();
+            if (targetTex == null)
+            {
+                _logger.LogWarning("RenderToPngAsync: no matching texture for displayId {Id}",
+                    request.DisplayId);
+                return null;
+            }
+
+            int targetW = targetTex.Width > 0 ? targetTex.Width : 64;
+            int targetH = targetTex.Height > 0 ? targetTex.Height : 64;
+
+            // ── Step 2: Craft prompt via Ollama (skip if CustomPrompt given) ──
+            string prompt = !string.IsNullOrEmpty(request.CustomPrompt)
+                ? request.CustomPrompt
+                : await CraftTexturePromptAsync(
+                    request.ItemName, request.StyleDirection, targetTex.Filename,
+                    targetW, targetH, ct);
+            _logger.LogInformation("RenderToPngAsync: Prompt → \"{Prompt}\"", prompt);
+
+            // ── Step 3: Generate with Flux via ComfyUI ──
+            if (!await _comfy.IsAnyNodeOnlineAsync(ct))
+            {
+                _logger.LogWarning("RenderToPngAsync: no ComfyUI nodes online");
+                return null;
+            }
+
+            int genW = 512;
+            int genH = targetW == targetH ? 512 : (int)(512.0 * targetH / targetW);
+            genH = Math.Max(64, (genH / 64) * 64);
+
+            Dictionary<string, object> workflow;
+
+            if (request.ModifyExisting && targetTex.HasPreview)
+            {
+                string previewPath = Path.Combine(_env.WebRootPath,
+                    targetTex.PreviewPngPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+
+                if (!File.Exists(previewPath))
+                {
+                    workflow = BuildTextureWorkflow(prompt, request.DisplayId, genW, genH);
+                }
+                else
+                {
+                    string uploadPngPath = Path.Combine(
+                        Path.GetTempPath(),
+                        $"retex_src_{request.DisplayId}_{Path.GetFileName(previewPath)}");
+
+                    using (var srcBitmap = SKBitmap.Decode(previewPath))
+                    {
+                        if (srcBitmap != null)
+                        {
+                            using var resized = srcBitmap.Resize(
+                                new SKImageInfo(genW, genH, SKColorType.Rgba8888, SKAlphaType.Unpremul),
+                                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
+                            if (resized != null)
+                            {
+                                using var outStream = File.Create(uploadPngPath);
+                                resized.Encode(outStream, SKEncodedImageFormat.Png, 100);
+                            }
+                        }
+                    }
+
+                    string? uploadedName = await _comfy.UploadImageFileAsync(uploadPngPath, ct);
+                    try { File.Delete(uploadPngPath); } catch { }
+
+                    if (uploadedName == null)
+                    {
+                        workflow = BuildTextureWorkflow(prompt, request.DisplayId, genW, genH);
+                    }
+                    else
+                    {
+                        float denoise = Math.Clamp(request.DenoiseStrength, 0.1f, 1.0f);
+                        workflow = BuildImg2ImgWorkflow(prompt, uploadedName, request.DisplayId,
+                            genW, genH, denoise);
+                        _logger.LogInformation("RenderToPngAsync: img2img mode, denoise={Denoise}", denoise);
+                    }
+                }
+            }
+            else
+            {
+                workflow = BuildTextureWorkflow(prompt, request.DisplayId, genW, genH);
+            }
+
+            var outputDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "retexture_output");
+            string? generatedPng = await _comfy.GenerateAsync(
+                workflow, $"retex_{request.DisplayId}", outputDir, ct);
+
+            if (generatedPng == null)
+            {
+                _logger.LogWarning("RenderToPngAsync: Flux generation failed for displayId {Id}",
+                    request.DisplayId);
+                return null;
+            }
+
+            // ── Step 4: Resize to vanilla dimensions ──
+            // Guid suffix so concurrent previews / preview+commit don't trash
+            // each other. RetextureAsync uses a deterministic filename because
+            // it commits immediately and discards the PNG; here the PNG IS
+            // the staged artifact, so uniqueness matters.
+            var resizedDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "retexture_resized");
+            Directory.CreateDirectory(resizedDir);
+            string resizedPng = Path.Combine(resizedDir,
+                $"preview_{request.DisplayId}_{Path.GetFileNameWithoutExtension(targetTex.Filename)}_{Guid.NewGuid():N}.png");
+
+            using (var resizedBmp = _blpWriter.ResizePngToBitmap(generatedPng, targetW, targetH))
+            {
+                if (resizedBmp == null)
+                {
+                    _logger.LogWarning("RenderToPngAsync: failed to resize generated texture");
+                    return null;
+                }
+                using var outStream = File.Create(resizedPng);
+                resizedBmp.Encode(outStream, SKEncodedImageFormat.Png, 100);
+            }
+
+            return resizedPng;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RenderToPngAsync: failed for displayId {Id}",
+                request.DisplayId);
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     // REBUILD PATCH-M.MPQ — ALL RETEXTURES
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Retexture from an already-rendered PNG (e.g. from palette-swap vision recolor).
+    /// Skips Ollama prompt crafting and ComfyUI/Flux entirely — just resizes the PNG
+    /// to vanilla dimensions, encodes BLP, saves to DB, rebuilds patch-4.MPQ.
+    ///
+    /// Used by the palette-swap-only path so the texture isn't degraded by a needless
+    /// Flux img2img passthrough (which softens detail via the VAE roundtrip and burns
+    /// VRAM/time loading Flux for no reason).
+    /// </summary>
+    public async Task<RetextureResult> RetextureFromBitmapAsync(
+        RetextureRequest request, string sourcePngPath, CancellationToken ct = default)
+    {
+        await EnsureTableAsync();
+        var result = new RetextureResult { DisplayId = request.DisplayId };
+
+        try
+        {
+            if (!File.Exists(sourcePngPath))
+            {
+                result.Error = $"Source PNG not found: {sourcePngPath}";
+                return result;
+            }
+
+            // ── Step 1: Read original texture metadata ──
+            var texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
+            if (texInfo == null)
+            {
+                result.Error = "Could not extract textures for this item";
+                return result;
+            }
+
+            var targetTex = texInfo.Textures.FirstOrDefault(t =>
+                t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
+                || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase))
+                ?? texInfo.Textures.FirstOrDefault();
+
+            if (targetTex == null)
+            {
+                result.Error = "No textures found for this model";
+                return result;
+            }
+
+            int targetW = targetTex.Width > 0 ? targetTex.Width : 64;
+            int targetH = targetTex.Height > 0 ? targetTex.Height : 64;
+            bool useDxt1 = targetTex.Format == "DXT1";
+            result.OriginalWidth = targetW;
+            result.OriginalHeight = targetH;
+            result.OriginalFormat = targetTex.Format;
+
+            _logger.LogInformation(
+                "RetextureFromBitmap: displayId {Id}, source '{Src}' → {W}x{H} {Fmt} (no Flux)",
+                request.DisplayId, Path.GetFileName(sourcePngPath), targetW, targetH, targetTex.Format);
+
+            // ── Step 2: Resize source PNG to vanilla dimensions ──
+            var resizedDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "retexture_resized");
+            Directory.CreateDirectory(resizedDir);
+            string resizedPng = Path.Combine(resizedDir,
+                $"{request.DisplayId}_palette_{Path.GetFileNameWithoutExtension(targetTex.Filename)}.png");
+
+            using (var resizedBmp = _blpWriter.ResizePngToBitmap(sourcePngPath, targetW, targetH))
+            {
+                if (resizedBmp == null)
+                {
+                    result.Error = "Failed to resize recolored texture";
+                    return result;
+                }
+                using var outStream = File.Create(resizedPng);
+                resizedBmp.Encode(outStream, SKEncodedImageFormat.Png, 100);
+            }
+
+            result.GeneratedPngPath = $"/item_textures_cache/retexture_resized/{Path.GetFileName(resizedPng)}";
+
+            // ── Step 3: Encode to BLP ──
+            using var blpBitmap = SKBitmap.Decode(resizedPng);
+            if (blpBitmap == null)
+            {
+                result.Error = "Failed to decode resized PNG for BLP encoding";
+                return result;
+            }
+
+            var blpBytes = _blpWriter.EncodeBitmapToBlp(blpBitmap, useDxt1);
+            if (blpBytes == null)
+            {
+                result.Error = "BLP encoding failed";
+                return result;
+            }
+
+            // ── Step 4: Allocate new displayId BEFORE building MPQ paths ──
+            // Use newDisplayId in BLP filename so each retexture of the same
+            // source item gets a unique BLP path (fixes filename-collision bug).
+            uint newDisplayId = await AllocateDisplayIdAsync();
+
+            // ── Step 5: Build MPQ paths ──
+            string customBlpName = $"Custom_{newDisplayId}_{Path.GetFileNameWithoutExtension(targetTex.Filename)}.blp";
+            string customBlpMpqPath = customBlpName;
+
+            var modelInfo = texInfo.ModelName;
+            if (!string.IsNullOrEmpty(modelInfo))
+            {
+                string m2Dir = GuessM2Directory(modelInfo);
+                customBlpMpqPath = $"{m2Dir}{customBlpName}";
+            }
+
+            // ── Step 6: Save to DB ──
+            using (var conn = _db.Admin())
+            {
+                await conn.ExecuteAsync(@"
+                    INSERT INTO custom_item_retexture
+                        (display_id, new_display_id, item_name, texture_filename, texture_mpq_path,
+                         custom_blp_mpq_path, custom_m2_mpq_path, custom_blp, custom_m2,
+                         prompt, style_direction)
+                    VALUES
+                        (@DisplayId, @NewDisplayId, @ItemName, @TexFilename, @TexMpqPath,
+                         @BlpMpqPath, '', @BlpBytes, NULL,
+                         @Prompt, @Style)",
+                    new
+                    {
+                        DisplayId = request.DisplayId,
+                        NewDisplayId = newDisplayId,
+                        ItemName = request.ItemName,
+                        TexFilename = targetTex.Filename,
+                        TexMpqPath = targetTex.MpqPath,
+                        BlpMpqPath = customBlpMpqPath,
+                        BlpBytes = blpBytes,
+                        Prompt = "[palette swap — no AI prompt]",
+                        Style = request.StyleDirection
+                    });
+            }
+
+            _logger.LogInformation(
+                "RetextureFromBitmap: Saved to DB — displayId {Old}→{New}, BLP: {Blp}",
+                request.DisplayId, newDisplayId, customBlpMpqPath);
+
+            _dbc.RegisterCustomDisplayEntry(newDisplayId, request.DisplayId, null, null);
+
+            // ── Step 7: Rebuild patch-4.MPQ ──
+            var rebuildResult = await RebuildPatchMAsync();
+
+            result.PatchMpqPath = rebuildResult.PatchWebPath;
+            result.CustomBlpMpqPath = customBlpMpqPath;
+            result.CustomM2MpqPath = null;
+            result.NewDisplayId = newDisplayId;
+            result.BlpSizeBytes = blpBytes.Length;
+            result.Success = rebuildResult.Success;
+            result.Prompt = "[palette swap]";
+            if (!rebuildResult.Success)
+                result.Error = rebuildResult.Error;
+
+            _itemTextures.InvalidateCache(request.DisplayId);
+            _itemTextures.InvalidateCache(newDisplayId);
+
+            _logger.LogInformation(
+                "RetextureFromBitmap: Complete! displayId {Old}→{New}, total retextures in patch: {Count}",
+                request.DisplayId, newDisplayId, rebuildResult.TotalEntries);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureFromBitmap: Failed for displayId {Id}", request.DisplayId);
+            result.Error = ex.Message;
+            return result;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // BODY-ATLAS COMMIT (painted armor — May 2026)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Slot → MPQ subdir under Item\TextureComponents\. Canonical vanilla 1.12
+    // layout (same map as BodyAtlasTextureService.SlotToSubdir — kept inline so
+    // the services stay decoupled). The client prepends this dir and appends
+    // .blp to the bare name we write into the m_texture[] DBC field.
+    private static readonly Dictionary<int, string> AtlasSlotSubdir = new()
+    {
+        { 0, "ArmUpperTexture" },
+        { 1, "ArmLowerTexture" },
+        { 2, "HandTexture" },
+        { 3, "TorsoUpperTexture" },
+        { 4, "TorsoLowerTexture" },
+        { 5, "LegUpperTexture" },
+        { 6, "LegLowerTexture" },
+        { 7, "FootTexture" },
+    };
+
+    /// <summary>
+    /// Commit a body-atlas (painted armor) retexture. The painted-armor analog
+    /// of RetextureFromBitmapAsync: instead of one model texture → one BLP →
+    /// DBC field 3, this takes the recolored COMPONENT PNGs (one per body-atlas
+    /// slot) and persists each as its own BLP, all under a single new displayId,
+    /// patched into m_texture[0..7] (DBC fields 14..21) on rebuild.
+    ///
+    /// Each slot's BLP goes in its own Item\TextureComponents\{subdir}\ dir with
+    /// a displayId-unique filename (Custom_{newId}_s{slot}_{base}.blp) — unique
+    /// per slot AND per displayId so MPQ entries never collide (the bug where
+    /// every retexture shared a source-derived BLP name).
+    ///
+    /// slotPngPaths: slot index (0..7) → absolute on-disk recolored PNG path
+    /// (already validated by the caller as living under item_textures_cache).
+    /// </summary>
+    public async Task<RetextureResult> CommitBodyAtlasAsync(
+        uint sourceDisplayId, string itemName, string styleDirection,
+        Dictionary<int, string> slotPngPaths, CancellationToken ct = default)
+    {
+        await EnsureTableAsync();
+        var result = new RetextureResult { DisplayId = sourceDisplayId };
+
+        try
+        {
+            if (slotPngPaths == null || slotPngPaths.Count == 0)
+            {
+                result.Error = "No slot PNGs supplied";
+                return result;
+            }
+
+            // Encode each slot PNG → BLP first, so a single failure aborts before
+            // we allocate a displayId or write any rows. Body-atlas component
+            // textures are uncompressed/alpha (not DXT1) — vanilla stores them
+            // as plain BLP; pass useDxt1:false.
+            var encoded = new List<(int Slot, byte[] Blp)>();
+            foreach (var kv in slotPngPaths.OrderBy(k => k.Key))
+            {
+                int slot = kv.Key;
+                string png = kv.Value;
+                if (!AtlasSlotSubdir.ContainsKey(slot))
+                {
+                    _logger.LogWarning("CommitBodyAtlas: skipping invalid slot {Slot}", slot);
+                    continue;
+                }
+                if (!File.Exists(png))
+                {
+                    _logger.LogWarning("CommitBodyAtlas: slot {Slot} PNG missing: {Png}", slot, png);
+                    continue;
+                }
+
+                // Component textures keep their own native dimensions — re-encode
+                // straight from the recolored PNG (it was decoded from the vanilla
+                // component BLP, so it's already the right size). Decode → BLP.
+                using var bmp = SKBitmap.Decode(png);
+                if (bmp == null)
+                {
+                    _logger.LogWarning("CommitBodyAtlas: decode failed slot {Slot}", slot);
+                    continue;
+                }
+                var blp = _blpWriter.EncodeBitmapToBlp(bmp, false);
+                if (blp == null)
+                {
+                    _logger.LogWarning("CommitBodyAtlas: BLP encode failed slot {Slot}", slot);
+                    continue;
+                }
+                encoded.Add((slot, blp));
+            }
+
+            if (encoded.Count == 0)
+            {
+                result.Error = "No slots encoded to BLP";
+                return result;
+            }
+
+            // One displayId for the whole piece; all slot rows share it.
+            uint newDisplayId = await AllocateDisplayIdAsync();
+
+            using (var conn = _db.Admin())
+            {
+                foreach (var (slot, blp) in encoded)
+                {
+                    string subdir = AtlasSlotSubdir[slot];
+                    string blpName = $"Custom_{newDisplayId}_s{slot}_{SanitizeName(itemName)}.blp";
+                    string blpMpqPath = $@"Item\TextureComponents\{subdir}\{blpName}";
+
+                    await conn.ExecuteAsync(@"
+                        INSERT INTO custom_item_retexture_atlas
+                            (display_id, new_display_id, item_name, slot,
+                             custom_blp_mpq_path, custom_blp, style_direction)
+                        VALUES
+                            (@DisplayId, @NewDisplayId, @ItemName, @Slot,
+                             @BlpMpqPath, @BlpBytes, @Style)",
+                        new
+                        {
+                            DisplayId = sourceDisplayId,
+                            NewDisplayId = newDisplayId,
+                            ItemName = itemName,
+                            Slot = slot,
+                            BlpMpqPath = blpMpqPath,
+                            BlpBytes = blp,
+                            Style = styleDirection
+                        });
+                }
+            }
+
+            _logger.LogInformation(
+                "CommitBodyAtlas: Saved {Slots} slot(s) to DB — displayId {Old}→{New}",
+                encoded.Count, sourceDisplayId, newDisplayId);
+
+            // Register so SuperUI knows about the displayId immediately (clones
+            // model + body textures from source for in-app GLB generation).
+            _dbc.RegisterCustomDisplayEntry(newDisplayId, sourceDisplayId, null, null);
+
+            var rebuildResult = await RebuildPatchMAsync();
+
+            result.PatchMpqPath = rebuildResult.PatchWebPath;
+            result.NewDisplayId = newDisplayId;
+            result.BlpSizeBytes = encoded.Sum(e => e.Blp.Length);
+            result.Success = rebuildResult.Success;
+            if (!rebuildResult.Success)
+                result.Error = rebuildResult.Error;
+
+            _itemTextures.InvalidateCache(sourceDisplayId);
+            _itemTextures.InvalidateCache(newDisplayId);
+
+            _logger.LogInformation(
+                "CommitBodyAtlas: Complete! displayId {Old}→{New}, {Slots} slots",
+                sourceDisplayId, newDisplayId, encoded.Count);
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "CommitBodyAtlas: Failed for displayId {Id}", sourceDisplayId);
+            result.Error = ex.Message;
+            return result;
+        }
+    }
+
+    // Filesystem/MPQ-safe short name for the BLP filename.
+    private static string SanitizeName(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "armor";
+        var chars = raw.Where(c => char.IsLetterOrDigit(c)).ToArray();
+        var s = new string(chars);
+        if (s.Length == 0) return "armor";
+        return s.Length > 24 ? s.Substring(0, 24) : s;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // REBUILD PATCH-M.MPQ — ALL RETEXTURES (legacy section marker)
     // ═══════════════════════════════════════════════════════════════════
 
     public async Task<PatchMRebuildResult> RebuildPatchMAsync()
@@ -402,12 +899,12 @@ public class ItemRetextureService
 
             if (retextures.Count == 0)
             {
-                _logger.LogInformation("Retexture: No retextures in DB, skipping patch-M rebuild");
+                _logger.LogInformation("Retexture: No retextures in DB, skipping patch-4 rebuild");
                 result.Success = true;
                 return result;
             }
 
-            _logger.LogInformation("Retexture: Rebuilding patch-M.MPQ with {Count} retexture(s)",
+            _logger.LogInformation("Retexture: Rebuilding patch-4.MPQ with {Count} retexture(s)",
                 retextures.Count);
 
             // Load clean ItemDisplayInfo.dbc
@@ -426,35 +923,81 @@ public class ItemRetextureService
                 uint origDisplayId = (uint)row.display_id;
                 uint newDisplayId = (uint)row.new_display_id;
                 string blpMpqPath = (string)row.custom_blp_mpq_path;
-                string m2MpqPath = (string)row.custom_m2_mpq_path;
                 byte[]? blpBytes = row.custom_blp as byte[];
-                byte[]? m2Bytes = row.custom_m2 as byte[];
 
                 if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
                     mpqBuilder.AddFile(blpMpqPath, blpBytes);
 
-                if (m2Bytes != null && !string.IsNullOrEmpty(m2MpqPath))
-                    mpqBuilder.AddFile(m2MpqPath, m2Bytes);
-
-                // Clone ItemDisplayInfo.dbc entry
+                // Clone ItemDisplayInfo.dbc entry — DBC-only approach:
+                // ModelName1 stays vanilla, only TextureName1 changes.
                 var sourceRow = displayDbc.GetRow(origDisplayId);
                 if (sourceRow != null && displayDbc.GetRow(newDisplayId) == null)
                 {
                     displayDbc.CloneRow(origDisplayId, newDisplayId);
 
-                    if (!string.IsNullOrEmpty(m2MpqPath))
-                    {
-                        string customM2Filename = Path.GetFileName(m2MpqPath);
-                        uint nameOfs = displayDbc.AddString(customM2Filename);
-                        displayDbc.PatchRow(newDisplayId, 1, nameOfs);
-                    }
-
+                    // Field 3 (TextureName1): custom BLP filename, no ext, no dir.
+                    // Linux Path.GetFileName doesn't split on backslash — normalize first.
                     if (!string.IsNullOrEmpty(blpMpqPath))
                     {
+                        string normalizedBlp = blpMpqPath.Replace('\\', '/');
                         string customTexName = Path.GetFileNameWithoutExtension(
-                            Path.GetFileName(blpMpqPath));
+                            Path.GetFileName(normalizedBlp));
                         uint texOfs = displayDbc.AddString(customTexName);
                         displayDbc.PatchRow(newDisplayId, 3, texOfs);
+                    }
+                }
+
+                result.TotalEntries++;
+            }
+
+            // ── Body-atlas (painted armor) entries ──
+            // One row PER SLOT, grouped by new_display_id. For each group: add
+            // every slot BLP to the MPQ, clone the source ItemDisplayInfo row
+            // once, then patch each slot's m_texture[] field (14 + slot) with
+            // that slot's bare BLP name. Mirrors the weapon loop's clone/AddString
+            // /PatchRow, just multi-field. Separate table, so weapons are untouched.
+            List<dynamic> atlasRows;
+            using (var conn = _db.Admin())
+            {
+                atlasRows = (await conn.QueryAsync(
+                    @"SELECT display_id, new_display_id, slot,
+                             custom_blp_mpq_path, custom_blp
+                      FROM custom_item_retexture_atlas
+                      ORDER BY new_display_id, slot")).ToList();
+            }
+
+            foreach (var grp in atlasRows.GroupBy(r => (uint)r.new_display_id))
+            {
+                uint newDisplayId = grp.Key;
+                uint origDisplayId = (uint)grp.First().display_id;
+
+                // Clone the source row ONCE per displayId (guard against an
+                // already-present row, same as the weapon loop).
+                bool cloned = displayDbc.GetRow(newDisplayId) != null;
+                if (!cloned && displayDbc.GetRow(origDisplayId) != null)
+                {
+                    displayDbc.CloneRow(origDisplayId, newDisplayId);
+                    cloned = true;
+                }
+
+                foreach (var row in grp)
+                {
+                    int slot = (int)(byte)row.slot;
+                    string blpMpqPath = (string)row.custom_blp_mpq_path;
+                    byte[]? blpBytes = row.custom_blp as byte[];
+
+                    if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
+                        mpqBuilder.AddFile(blpMpqPath, blpBytes);
+
+                    // m_texture[slot] is DBC field (14 + slot). Bare name, no ext,
+                    // no dir — client prepends Item\TextureComponents\{subdir}\.
+                    if (cloned && slot >= 0 && slot <= 7 && !string.IsNullOrEmpty(blpMpqPath))
+                    {
+                        string normalizedBlp = blpMpqPath.Replace('\\', '/');
+                        string customTexName = Path.GetFileNameWithoutExtension(
+                            Path.GetFileName(normalizedBlp));
+                        uint texOfs = displayDbc.AddString(customTexName);
+                        displayDbc.PatchRow(newDisplayId, 14 + slot, texOfs);
                     }
                 }
 
@@ -465,12 +1008,12 @@ public class ItemRetextureService
 
             var patchDir = Path.Combine(_env.WebRootPath, "patches", "retexture");
             Directory.CreateDirectory(patchDir);
-            string patchPath = Path.Combine(patchDir, "patch-M.MPQ");
+            string patchPath = Path.Combine(patchDir, "patch-4.MPQ");
 
             bool built = mpqBuilder.Build(patchPath);
             if (!built)
             {
-                result.Error = "Failed to build patch-M.MPQ";
+                result.Error = "Failed to build patch-4.MPQ";
                 return result;
             }
 
@@ -479,17 +1022,17 @@ public class ItemRetextureService
                 ?? _config["SpellCreator:ClientDataPath"];
             if (!string.IsNullOrEmpty(clientDataPath) && Directory.Exists(clientDataPath))
             {
-                string deployedPath = Path.Combine(clientDataPath, "patch-M.MPQ");
+                string deployedPath = Path.Combine(clientDataPath, "patch-4.MPQ");
                 File.Copy(patchPath, deployedPath, overwrite: true);
-                _logger.LogInformation("Retexture: Deployed patch-M.MPQ to {Path} ({Count} retextures)",
+                _logger.LogInformation("Retexture: Deployed patch-4.MPQ to {Path} ({Count} retextures)",
                     deployedPath, result.TotalEntries);
             }
 
-            result.PatchWebPath = "/patches/retexture/patch-M.MPQ";
+            result.PatchWebPath = "/patches/retexture/patch-4.MPQ";
             result.Success = true;
 
             _logger.LogInformation(
-                "Retexture: patch-M.MPQ rebuilt — {Count} retextures, {Files} files, {Size}KB",
+                "Retexture: patch-4.MPQ rebuilt — {Count} retextures, {Files} files, {Size}KB",
                 result.TotalEntries, mpqBuilder.FileCount,
                 new FileInfo(patchPath).Length / 1024);
 
@@ -497,7 +1040,7 @@ public class ItemRetextureService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Retexture: patch-M rebuild failed");
+            _logger.LogError(ex, "Retexture: patch-4 rebuild failed");
             result.Error = ex.Message;
             return result;
         }
@@ -529,6 +1072,19 @@ public class ItemRetextureService
             _dbc.RegisterCustomDisplayEntry(newId, origId, null, null);
             count++;
         }
+
+        // Body-atlas displayIds (one row per slot — register each distinct
+        // new_display_id once) so painted-armor retextures resolve after restart.
+        var atlasRows = await conn.QueryAsync(
+            @"SELECT DISTINCT display_id, new_display_id FROM custom_item_retexture_atlas");
+        int atlasCount = 0;
+        foreach (var row in atlasRows)
+        {
+            _dbc.RegisterCustomDisplayEntry((uint)row.new_display_id, (uint)row.display_id, null, null);
+            atlasCount++;
+        }
+        if (atlasCount > 0)
+            _logger.LogInformation("Retexture: Loaded {Count} body-atlas retextures into DBC cache", atlasCount);
 
         if (count > 0)
             _logger.LogInformation("Retexture: Loaded {Count} existing retextures into DBC cache", count);
@@ -569,8 +1125,15 @@ public class ItemRetextureService
     private async Task<uint> AllocateDisplayIdAsync()
     {
         using var conn = _db.Admin();
+        // MAX across BOTH retexture tables — body-atlas displayIds live in
+        // custom_item_retexture_atlas, so ignoring it would hand out an ID that
+        // collides with an existing painted-armor entry.
         var maxId = await conn.ExecuteScalarAsync<uint?>(
-            "SELECT MAX(new_display_id) FROM custom_item_retexture");
+            @"SELECT MAX(m) FROM (
+                  SELECT MAX(new_display_id) AS m FROM custom_item_retexture
+                  UNION ALL
+                  SELECT MAX(new_display_id) AS m FROM custom_item_retexture_atlas
+              ) t");
 
         uint next = Math.Max((maxId ?? 0) + 1, CUSTOM_DISPLAY_BASE);
 
@@ -631,7 +1194,8 @@ public class ItemRetextureService
                 prompt = userPrompt,
                 system = systemPrompt,
                 stream = false,
-                options = new { temperature = 0.7, num_predict = 150 }
+                keep_alive = "5m",
+                options = new { temperature = 0.7, num_predict = 150, num_ctx = 4096 }
             });
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);

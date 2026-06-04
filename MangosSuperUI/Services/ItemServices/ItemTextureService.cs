@@ -102,7 +102,14 @@ public class ItemTextureService
         // Generate on demand
         try
         {
-            var modelInfo = _dbc.GetItemModelInfo(displayId);
+            // ── Check if this is a custom retexture (displayId 60000+) ──
+            // If so, use the ORIGINAL displayId's M2/textures but swap in
+            // the custom BLP from the DB. This makes the 3D viewer show
+            // the retextured model instead of vanilla.
+            var retexInfo = GetRetextureInfo(displayId);
+            uint resolvedDisplayId = retexInfo?.OrigDisplayId ?? displayId;
+
+            var modelInfo = _dbc.GetItemModelInfo(resolvedDisplayId);
             if (modelInfo == null) return null;
 
             string? modelName = !string.IsNullOrEmpty(modelInfo.Value.ModelName1)
@@ -155,6 +162,61 @@ public class ItemTextureService
                 }
             }
 
+            // ── Inject custom BLP from DB (replaces the vanilla texture
+            //    that was retextured) ──
+            if (retexInfo != null && retexInfo.CustomBlp != null)
+            {
+                // Find which texture slot the retexture replaced by matching
+                // the original texture filename against the M2's texture refs
+                // and the DBC texture names.
+                int injectedSlot = -1;
+                string retexFilename = retexInfo.OrigTexFilename;
+
+                // First: check M2 embedded texture filenames
+                for (int i = 0; i < m2Model.Textures.Count; i++)
+                {
+                    var texRef = m2Model.Textures[i];
+                    if (!string.IsNullOrEmpty(texRef.Filename) &&
+                        Path.GetFileName(texRef.Filename)
+                            .Equals(retexFilename, StringComparison.OrdinalIgnoreCase))
+                    {
+                        injectedSlot = i;
+                        break;
+                    }
+                }
+
+                // Second: check DBC texture names (type-1 skin textures
+                // that aren't stored by filename in the M2)
+                if (injectedSlot < 0)
+                {
+                    string retexBase = Path.GetFileNameWithoutExtension(retexFilename);
+                    if (!string.IsNullOrEmpty(modelInfo.Value.TextureName1) &&
+                        modelInfo.Value.TextureName1.Equals(retexBase, StringComparison.OrdinalIgnoreCase))
+                    {
+                        injectedSlot = FindSkinTextureSlot(m2Model,
+                            new Dictionary<int, byte[]>()); // find the canonical slot
+                    }
+                    else if (!string.IsNullOrEmpty(modelInfo.Value.TextureName2) &&
+                             modelInfo.Value.TextureName2.Equals(retexBase, StringComparison.OrdinalIgnoreCase))
+                    {
+                        injectedSlot = FindSkinTextureSlot2(m2Model,
+                            new Dictionary<int, byte[]>());
+                    }
+                }
+
+                // Third: fallback — replace the first skin/object-skin slot
+                if (injectedSlot < 0)
+                    injectedSlot = FindSkinTextureSlot(m2Model, new Dictionary<int, byte[]>());
+
+                if (injectedSlot >= 0)
+                {
+                    textures[injectedSlot] = retexInfo.CustomBlp;
+                    _logger.LogInformation(
+                        "ItemTexture/GLB: Injected custom BLP into slot {Slot} for retexture displayId {Id} (from {Orig})",
+                        injectedSlot, displayId, retexInfo.OrigDisplayId);
+                }
+            }
+
             if (textures.Count == 0)
             {
                 _logger.LogDebug("ItemTexture: No textures for GLB, displayId {Id}", displayId);
@@ -179,6 +241,216 @@ public class ItemTextureService
             _logger.LogWarning(ex, "ItemTexture: GLB generation failed for displayId {Id}", displayId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Build a TEMPORARY preview GLB for a staged retexture — used by the
+    /// segmented-variation modal so a card can be shown in 3D (and equipped on
+    /// the character) BEFORE anything is committed to the DB or patch-4.MPQ.
+    ///
+    /// Mirrors EnsureGlb's extraction (vanilla M2 + its textures) but injects a
+    /// caller-supplied RECOLORED PNG (encoded to BLP at the vanilla slot's
+    /// dimensions/format) into the resolved object-skin slot, then writes the
+    /// GLB to a throwaway preview directory. NOTHING is persisted: no DB row, no
+    /// patch rebuild, no versioned cache entry. The caller is responsible for
+    /// deleting the returned file when the modal closes (or letting the periodic
+    /// sweep collect it).
+    ///
+    /// Returns the web path to the temp GLB, or null on failure.
+    /// </summary>
+    /// <param name="displayId">The ORIGINAL vanilla displayId being retextured.</param>
+    /// <param name="recoloredPngPath">Disk path to the already-rendered recolor PNG.</param>
+    public string? BuildPreviewGlb(uint displayId, string recoloredPngPath)
+    {
+        if (displayId == 0 || string.IsNullOrEmpty(recoloredPngPath) || !File.Exists(recoloredPngPath))
+            return null;
+
+        try
+        {
+            var modelInfo = _dbc.GetItemModelInfo(displayId);
+            if (modelInfo == null) return null;
+
+            string? modelName = !string.IsNullOrEmpty(modelInfo.Value.ModelName1)
+                ? modelInfo.Value.ModelName1
+                : modelInfo.Value.ModelName2;
+            if (string.IsNullOrEmpty(modelName)) return null;
+
+            var m2Data = FindAndExtractItemM2(modelName);
+            if (m2Data == null) return null;
+
+            var m2Model = M2Reader.Parse(m2Data);
+            if (m2Model == null || !m2Model.IsValid) return null;
+
+            // Extract all vanilla textures the M2 references (same as EnsureGlb).
+            var textures = new Dictionary<int, byte[]>();
+            for (int i = 0; i < m2Model.Textures.Count; i++)
+            {
+                var texRef = m2Model.Textures[i];
+                if (string.IsNullOrEmpty(texRef.Filename)) continue;
+                var blpData = _mpq.ExtractFile(texRef.Filename)
+                            ?? _mpq.ExtractFile(texRef.Filename.ToLowerInvariant());
+                if (blpData != null) textures[i] = blpData;
+            }
+            if (!string.IsNullOrEmpty(modelInfo.Value.TextureName1))
+            {
+                var blpData = FindItemBlp(modelInfo.Value.TextureName1, modelName);
+                if (blpData != null)
+                {
+                    int slot = FindSkinTextureSlot(m2Model, textures);
+                    if (slot >= 0) textures[slot] = blpData;
+                }
+            }
+
+            // Determine the slot the recolor should occupy + its native
+            // dimensions/format, by reading the vanilla texture metadata.
+            int injectSlot = FindSkinTextureSlot(m2Model, new Dictionary<int, byte[]>());
+            int targetW = 0, targetH = 0;
+            bool useDxt1 = false;
+            var texMeta = GetTexturesForDisplay(displayId);
+            var firstTex = texMeta?.Textures.FirstOrDefault();
+            if (firstTex != null)
+            {
+                targetW = firstTex.Width > 0 ? firstTex.Width : 0;
+                targetH = firstTex.Height > 0 ? firstTex.Height : 0;
+                useDxt1 = firstTex.Format == "DXT1";
+            }
+            if (targetW == 0 || targetH == 0) { targetW = 256; targetH = 256; }
+
+            // Honor a super-res'd recolor: when the PNG is larger than the vanilla
+            // slot, encode the BLP at an integer multiple of vanilla (stays power-
+            // of-two, so the M2's normalized UVs sample it cleanly) rather than
+            // throwing the extra resolution away. Native-size PNGs are unchanged.
+            var (encW, encH) = ScaledBlpDims(recoloredPngPath, targetW, targetH);
+
+            // Encode the recolor PNG → BLP, inject it.
+            using (var resized = _blpWriter.ResizePngToBitmap(recoloredPngPath, encW, encH))
+            {
+                if (resized == null) return null;
+                var blpBytes = _blpWriter.EncodeBitmapToBlp(resized, useDxt1);
+                if (blpBytes == null) return null;
+                if (injectSlot >= 0) textures[injectSlot] = blpBytes;
+            }
+
+            // Write to a throwaway preview path (NOT the versioned cache).
+            var previewDir = Path.Combine(_env.WebRootPath, "item_models", "_preview");
+            Directory.CreateDirectory(previewDir);
+            string fileName = $"preview_{displayId}_{Guid.NewGuid():N}.glb";
+            string glbPath = Path.Combine(previewDir, fileName);
+
+            bool ok = GlbWriter.SaveGlb(m2Model, textures, glbPath);
+            if (!ok)
+            {
+                _logger.LogWarning("ItemTexture: preview GLB write failed for displayId {Id}", displayId);
+                return null;
+            }
+
+            _logger.LogInformation("ItemTexture: built preview GLB {File} for displayId {Id}",
+                fileName, displayId);
+            return $"/item_models/_preview/{fileName}";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ItemTexture: BuildPreviewGlb failed for displayId {Id}", displayId);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Choose BLP encode dimensions for a (possibly super-res'd) recolor PNG.
+    /// When the PNG is larger than the vanilla slot, round to the nearest INTEGER
+    /// multiple of vanilla — vanilla item textures are power-of-two, so an integer
+    /// multiple stays power-of-two and the M2's normalized UVs sample it cleanly —
+    /// keeping the higher resolution. Otherwise return vanilla dims unchanged.
+    /// Capped at 1024 per side so a stray large PNG can't balloon the texture.
+    /// Falls back to vanilla dims if the PNG can't be read.
+    /// </summary>
+    private static (int W, int H) ScaledBlpDims(string pngPath, int vanW, int vanH)
+    {
+        if (vanW <= 0 || vanH <= 0) return (vanW, vanH);
+        int pngW;
+        try
+        {
+            using var probe = SkiaSharp.SKBitmap.Decode(pngPath);
+            if (probe == null) return (vanW, vanH);
+            pngW = probe.Width;
+        }
+        catch { return (vanW, vanH); }
+
+        int mult = Math.Max(1, (int)Math.Round((double)pngW / vanW));
+        while (mult > 1 && (vanW * mult > 1024 || vanH * mult > 1024)) mult--;
+        return (vanW * mult, vanH * mult);
+    }
+
+    /// <summary>
+    /// Delete a temp preview GLB previously produced by BuildPreviewGlb. Safe to
+    /// call with a web path ("/item_models/_preview/xxx.glb") or null. Best-effort.
+    /// Also opportunistically sweeps preview GLBs older than 1 hour so abandoned
+    /// previews don't accumulate.
+    /// </summary>
+    public void DeletePreviewGlb(string? webPath)
+    {
+        try
+        {
+            var previewDir = Path.Combine(_env.WebRootPath, "item_models", "_preview");
+
+            if (!string.IsNullOrEmpty(webPath))
+            {
+                var name = Path.GetFileName(webPath.Replace('\\', '/'));
+                var full = Path.Combine(previewDir, name);
+                if (File.Exists(full)) File.Delete(full);
+            }
+
+            // Opportunistic sweep of stale previews (older than 1 hour).
+            if (Directory.Exists(previewDir))
+            {
+                var cutoff = DateTime.UtcNow.AddHours(-1);
+                foreach (var f in Directory.EnumerateFiles(previewDir, "preview_*.glb"))
+                {
+                    try { if (File.GetLastWriteTimeUtc(f) < cutoff) File.Delete(f); }
+                    catch { /* best-effort */ }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogInformation("ItemTexture: DeletePreviewGlb best-effort cleanup note ({Err})", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Lightweight retexture lookup for EnsureGlb — just the fields needed
+    /// to inject the custom BLP into the GLB texture dict.
+    /// Returns null for non-retextured displayIds.
+    /// </summary>
+    private RetextureGlbInfo? GetRetextureInfo(uint displayId)
+    {
+        try
+        {
+            using var conn = _db.Admin();
+            var row = conn.QueryFirstOrDefault(
+                @"SELECT display_id, texture_filename, custom_blp
+                  FROM custom_item_retexture
+                  WHERE new_display_id = @Did
+                  LIMIT 1",
+                new { Did = displayId });
+
+            if (row == null) return null;
+
+            return new RetextureGlbInfo
+            {
+                OrigDisplayId = (uint)row.display_id,
+                OrigTexFilename = (string)(row.texture_filename ?? ""),
+                CustomBlp = row.custom_blp as byte[]
+            };
+        }
+        catch { return null; }
+    }
+
+    private class RetextureGlbInfo
+    {
+        public uint OrigDisplayId { get; set; }
+        public string OrigTexFilename { get; set; } = "";
+        public byte[]? CustomBlp { get; set; }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -585,10 +857,31 @@ public class ItemTextureService
 
     /// <summary>
     /// Invalidate cache for a displayId (after retexture).
+    /// Clears both the in-memory texture cache and the on-disk GLB file
+    /// so the next request regenerates with the updated texture.
     /// </summary>
     public void InvalidateCache(uint displayId)
     {
         _cache.TryRemove(displayId, out _);
+
+        // Also delete the cached GLB so it regenerates with the new texture
+        try
+        {
+            var glbDir = Path.Combine(_env.WebRootPath, "item_models");
+            if (Directory.Exists(glbDir))
+            {
+                // Match both versioned and unversioned filenames
+                foreach (var file in Directory.GetFiles(glbDir, $"{displayId}.*glb"))
+                {
+                    File.Delete(file);
+                    _logger.LogInformation("ItemTexture: Deleted cached GLB {File} for invalidation", Path.GetFileName(file));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ItemTexture: Failed to delete cached GLB for displayId {Id}", displayId);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════

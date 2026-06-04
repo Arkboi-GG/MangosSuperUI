@@ -43,6 +43,7 @@ builder.Services.AddSingleton<SpellConfigService>();
 builder.Services.AddSingleton<SpellTextureService>();
 builder.Services.AddSingleton<SpellRecipeService>();
 builder.Services.AddSingleton<ComfyUIDispatcher>();
+builder.Services.AddSingleton<ComfyUIUpscaler>();
 builder.Services.AddSingleton<VanillaBlpService>();
 builder.Services.AddSingleton<SpellDnaService>();
 builder.Services.AddSingleton<MpqReaderService>();
@@ -50,6 +51,10 @@ builder.Services.AddSingleton<CharacterModelService>();
 builder.Services.AddSingleton<BodyAtlasTextureService>();
 builder.Services.AddSingleton<CacheVersionRegistry>();
 builder.Services.AddSingleton<CharacterSkinCompositor>();
+builder.Services.AddSingleton<PaletteSwapService>();
+builder.Services.AddScoped<VariationRecipeService>();
+builder.Services.AddScoped<TextureSegmentationService>();
+builder.Services.AddSingleton<VramManager>();
 
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();
