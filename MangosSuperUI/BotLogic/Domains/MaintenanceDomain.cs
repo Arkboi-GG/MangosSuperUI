@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Tracking;
 using Microsoft.Extensions.Logging;
 
 namespace MangosSuperUI.BotLogic.Domains;
@@ -111,7 +112,7 @@ public class MaintenanceDomain : IBotDomain
 
             var rezAt = DateTime.UtcNow.AddSeconds(delay);
             bot.CurrentActivity.PhaseData["rez_at_utc"] = rezAt;
-            bot.CurrentActivity.SubPhase = "WaitingToRez";
+            AdvanceTo(bot, "WaitingToRez", "death", WaitOn.RezAt);
 
             float corpseX = bot.CorpseX ?? state.X;
             float corpseY = bot.CorpseY ?? state.Y;
@@ -129,7 +130,7 @@ public class MaintenanceDomain : IBotDomain
 
         // Eating
         bot.CurrentActivity.ContextTag = $"eat:hp{(int)(state.HealthPercent * 100)}";
-        bot.CurrentActivity.SubPhase = "Sitting";
+        AdvanceTo(bot, "Sitting", "eat", WaitOn.Cpp("eat"));
 
         return commands;
     }
@@ -170,7 +171,7 @@ public class MaintenanceDomain : IBotDomain
                         "[BOT-MAINT] {Name} unknown corpse sub-phase '{Sub}', resurrecting now.",
                         bot.Name, subPhase);
                     bot.CurrentActivity.PhaseData["rez_at_utc"] = DateTime.UtcNow;
-                    bot.CurrentActivity.SubPhase = "WaitingToRez";
+                    AdvanceTo(bot, "WaitingToRez");
                     break;
             }
 
@@ -210,7 +211,7 @@ public class MaintenanceDomain : IBotDomain
                 bot.Name);
 
             bot.CurrentActivity.IsInterruptible = true;
-            bot.CurrentActivity.SubPhase = "Alive";
+            AdvanceTo(bot, "Alive");
             bot.CurrentActivity.ContextTag = "corpse:alive";
             bot.NextStrategicEval = DateTime.UtcNow;
 
@@ -254,7 +255,7 @@ public class MaintenanceDomain : IBotDomain
                         "[BOT-MAINT] {Name} rez timer expired. Corpse area is safe — resurrecting in place.",
                         bot.Name);
 
-                    bot.CurrentActivity.SubPhase = "WaitingForResurrect";
+                    AdvanceTo(bot, "WaitingForResurrect");
                     bot.CurrentActivity.PhaseData["resurrect_sent_at"] = DateTime.UtcNow;
                     commands.Add(new BridgeCommand("RESURRECT"));
                 }
@@ -269,7 +270,7 @@ public class MaintenanceDomain : IBotDomain
                         Distance2D(corpseX, corpseY, safeSpot.Value.x, safeSpot.Value.y),
                         safeSpot.Value.x, safeSpot.Value.y);
 
-                    bot.CurrentActivity.SubPhase = "GhostWalkingToSafeSpot";
+                    AdvanceTo(bot, "GhostWalkingToSafeSpot");
                     bot.CurrentActivity.PhaseData["safe_x"] = safeSpot.Value.x;
                     bot.CurrentActivity.PhaseData["safe_y"] = safeSpot.Value.y;
                     bot.CurrentActivity.PhaseData["safe_z"] = safeSpot.Value.z;
@@ -292,7 +293,7 @@ public class MaintenanceDomain : IBotDomain
             _logger.LogWarning(
                 "[BOT-MAINT] {Name} rez_at_utc missing from PhaseData, resurrecting now.",
                 bot.Name);
-            bot.CurrentActivity.SubPhase = "WaitingForResurrect";
+            AdvanceTo(bot, "WaitingForResurrect");
             bot.CurrentActivity.PhaseData["resurrect_sent_at"] = DateTime.UtcNow;
             commands.Add(new BridgeCommand("RESURRECT"));
         }
@@ -336,7 +337,7 @@ public class MaintenanceDomain : IBotDomain
                     bot.Name, Distance2D(state.X, state.Y, bot.CorpseX ?? state.X, bot.CorpseY ?? state.Y));
             }
 
-            bot.CurrentActivity.SubPhase = "WaitingForResurrect";
+            AdvanceTo(bot, "WaitingForResurrect");
             bot.CurrentActivity.PhaseData["resurrect_sent_at"] = DateTime.UtcNow;
             commands.Add(new BridgeCommand("RESURRECT"));
         }
@@ -439,7 +440,7 @@ public class MaintenanceDomain : IBotDomain
                     bot.Name, waitTime);
 
                 bot.CurrentActivity.IsInterruptible = true;
-                bot.CurrentActivity.SubPhase = "Alive";
+                AdvanceTo(bot, "Alive");
                 bot.CorpseX = null;
                 bot.CorpseY = null;
                 bot.CorpseZ = null;
@@ -452,6 +453,22 @@ public class MaintenanceDomain : IBotDomain
     // ════════════════════════════════════════════════════════════════════
     // Helpers
     // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Single sub-phase transition point so the flight recorder sees every move.
+    /// waitingOn lets a phase declare what it's blocked on: the corpse-rez delay is a
+    /// TIMER wait, sitting-to-eat is a CPP recovery wait (longer sweep threshold so a
+    /// normal sit isn't flagged). The RESURRECT / MOVE_TO commands set their own WAIT
+    /// via the command→event map, so those phases stay plain.
+    /// </summary>
+    private void AdvanceTo(BotIdentity bot, string subPhase, string cause = "advance", string? waitingOn = null)
+    {
+        var prev = bot.CurrentActivity.SubPhase;
+        bot.CurrentActivity.SubPhase = subPhase;
+        _logger.LogInformation("[BOT-PHASE] {Name}({Guid}) | {Prev} → {Next}",
+            bot.Name, bot.Guid, prev ?? "null", subPhase);
+        BotTrace.Transition(bot, prev ?? "", subPhase, cause, waitingOn: waitingOn);
+    }
 
     private static float Distance2D(float x1, float y1, float x2, float y2)
     {

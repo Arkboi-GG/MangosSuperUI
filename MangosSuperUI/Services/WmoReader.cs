@@ -287,6 +287,14 @@ public class WmoReader
                 // per-tile liquid_type bits in SMOLTile take priority for rendering.
                 group.GroupLiquid = BitConverter.ToUInt32(data, chunkData + 0x34);
 
+                // MOGP +0x28/0x2A/0x2C — batch type counts. The MOBA batches
+                // are ordered: [0..trans-1] transparent, [trans..trans+int-1]
+                // interior, [trans+int..] exterior. For aerial/editor views,
+                // skip the interior range to hide ceilings, indoor walls, etc.
+                group.TransBatchCount = BitConverter.ToUInt16(data, chunkData + 0x28);
+                group.IntBatchCount = BitConverter.ToUInt16(data, chunkData + 0x2A);
+                group.ExtBatchCount = BitConverter.ToUInt16(data, chunkData + 0x2C);
+
                 // Subchunks start at MOGP data + 68 (0x44)
                 int subPos = chunkData + 68;
                 int mogpEnd = (int)(chunkData + chunkSize);
@@ -569,6 +577,12 @@ public class WmoGroupData
     /// (vanilla WMOs frequently leave this unset and rely on per-tile bits in SMOLTile).
     /// </summary>
     public uint GroupLiquid { get; set; }
+    /// <summary>MOGP +0x28: transparent batch count (rendered first, alpha-blended).</summary>
+    public ushort TransBatchCount { get; set; }
+    /// <summary>MOGP +0x2A: interior batch count (skip for aerial/editor view).</summary>
+    public ushort IntBatchCount { get; set; }
+    /// <summary>MOGP +0x2C: exterior batch count (always visible from outside).</summary>
+    public ushort ExtBatchCount { get; set; }
     public List<(byte flags, byte materialId)> TriMaterials { get; set; } = new();
     public List<ushort> Indices { get; set; } = new();
     public List<(float x, float y, float z)> Vertices { get; set; } = new();

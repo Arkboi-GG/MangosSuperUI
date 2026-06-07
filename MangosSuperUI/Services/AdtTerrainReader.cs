@@ -73,6 +73,31 @@ public static class AdtTerrainReader
     private const int MCLQ_LAYER_SIZE = 4 + 4 + 9 * 9 * 8 + 8 * 8 + 4 + 2 * 38;
 
     // ═══════════════════════════════════════════════════════════════════
+    // STORMLIB INTEGRATION — optional high-performance MPQ reader
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Optional StormLib-based file extractor. When set, ReadFileFromMpqs tries
+    /// this first before falling back to War3Net. MpqReaderService.ExtractFile
+    /// is the intended provider — it handles all vanilla 1.12 MPQ compression
+    /// formats that War3Net cannot (expansion.MPQ, certain patch archives).
+    ///
+    /// War3Net works for Warcraft 3 MPQs and some vanilla WoW archives
+    /// (terrain.MPQ) but silently fails on others — returning null or throwing
+    /// NotSupportedException on .Read(). This caused AQ20, AQ40, and Naxxramas
+    /// to render as green untextured terrain: their ADTs live in archives
+    /// War3Net can't read, so textures, doodads, and WMOs all came back null.
+    ///
+    /// Note: MpqReaderService already skips patch-Z/M/3 at init time (custom
+    /// patches, not vanilla data), so StormLibExtractor is only used for
+    /// non-skipPatchZ reads. The skipPatchZ path (reading original ADTs before
+    /// sculpt patching) falls through to War3Net which can filter per-call.
+    ///
+    /// Set once at startup from the controller/DI layer.
+    /// </summary>
+    public static Func<string, byte[]?>? StormLibExtractor { get; set; }
+
+    // ═══════════════════════════════════════════════════════════════════
     // PUBLIC API — High-level extraction from MPQ
     // ═══════════════════════════════════════════════════════════════════
 
@@ -108,6 +133,33 @@ public static class AdtTerrainReader
     /// </summary>
     public static byte[]? ReadFileFromMpqs(string clientDataPath, string internalPath, bool skipPatchZ = false)
     {
+        // ── Try StormLib first (handles ALL vanilla 1.12 MPQ formats) ──
+        // War3Net works for terrain.MPQ but silently fails on expansion.MPQ
+        // and certain patch archives. StormLib (via MpqReaderService) is the
+        // reference implementation and handles every compression combination.
+        //
+        // Only use StormLib for normal reads. For skipPatchZ (reading the
+        // original ADT before sculpt patching), we must fall through to
+        // War3Net's per-call archive filtering — MpqReaderService already
+        // excludes patch-Z/M/3 at init time, so it can't read patched ADTs
+        // anyway, making it safe for this path too. But the skipPatchZ flag
+        // also filters patch-Z specifically for the sculpt pipeline, and
+        // MpqReaderService doesn't distinguish — so War3Net remains the
+        // fallback for that case.
+        if (!skipPatchZ && StormLibExtractor != null)
+        {
+            try
+            {
+                byte[]? stormResult = StormLibExtractor(internalPath);
+                if (stormResult != null) return stormResult;
+            }
+            catch
+            {
+                // StormLib failed — fall through to War3Net
+            }
+        }
+
+        // ── War3Net fallback (original implementation) ──
         // MPQ load order: patches first (reverse alphabetical), then base archives
         // For terrain data, it's typically in terrain.MPQ but patches could override
         var mpqFiles = GetMpqLoadOrder(clientDataPath);
@@ -1344,6 +1396,11 @@ public static class AdtTerrainReader
 
         chunk.IndexX = (int)BitConverter.ToUInt32(data, mcnkDataStart + 0x04);
         chunk.IndexY = (int)BitConverter.ToUInt32(data, mcnkDataStart + 0x08);
+        // Terrain hole bitmask — uint16 at offset 0x3C in the MCNK header.
+        // Maps a 4×4 grid onto the chunk's 8×8 cell grid; each bit controls
+        // a 2×2 cell block. Used by the client to punch holes in the terrain
+        // where cave/dungeon WMO entrances sit below the ground surface.
+        chunk.Holes = BitConverter.ToUInt16(data, mcnkDataStart + 0x3C);
         int nLayers = (int)BitConverter.ToUInt32(data, mcnkDataStart + 0x0C);
 
         // Sub-chunk offsets are relative to mcnkBase (chunk start including IFF header)
@@ -1678,6 +1735,14 @@ public static class AdtTerrainReader
         public int IndexX { get; set; }
         public int IndexY { get; set; }
         public MclyLayer[] Layers { get; set; } = Array.Empty<MclyLayer>();
+
+        /// <summary>
+        /// Low-resolution terrain hole bitmask from MCNK header offset 0x3C.
+        /// A 4×4 grid mapped onto the 8×8 cell grid — each bit controls a 2×2
+        /// cell block. Use HoletabH/HoletabV lookup (same as VMaNGOS GridMap)
+        /// to test individual cells. Non-zero = at least one cell has a hole.
+        /// </summary>
+        public ushort Holes { get; set; }
 
         /// <summary>
         /// MCLQ liquid layers for this chunk (null = no water, normally 1 layer when present).

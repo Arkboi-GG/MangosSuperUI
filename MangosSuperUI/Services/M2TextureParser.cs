@@ -235,6 +235,76 @@ public static class M2TextureParser
     ///
     /// Returns the number of textures successfully patched.
     /// </summary>
+    /// <summary>
+    /// Patch texture filenames in an M2 binary. If the new path fits in the
+    /// original byte budget, it overwrites in-place. If not, it appends the
+    /// new string to the end of the M2 data and updates the nameOfs pointer.
+    ///
+    /// IMPORTANT: because appending changes the byte[] length, this method
+    /// returns the (potentially resized) M2 data. Callers must use the
+    /// returned array, not the original.
+    /// </summary>
+    public static (byte[] m2Data, int patched) PatchTextureFilenamesResize(
+        byte[] m2Data, Dictionary<int, string> replacements)
+    {
+        var textures = ParseTextures(m2Data);
+        if (textures.Count == 0) return (m2Data, 0);
+
+        int patched = 0;
+        foreach (var kv in replacements)
+        {
+            int texIndex = kv.Key;
+            string newPath = kv.Value;
+
+            if (texIndex < 0 || texIndex >= textures.Count) continue;
+
+            var tex = textures[texIndex];
+            if (tex.EntryOffset <= 0) continue;
+
+            byte[] newBytes = Encoding.ASCII.GetBytes(newPath);
+            int newLenWithNull = newBytes.Length + 1;
+
+            if (tex.ActualByteLength > 0 && newLenWithNull <= tex.ActualByteLength)
+            {
+                // Fits in-place: overwrite at original offset
+                int start = tex.FilenameOffset;
+                Array.Copy(newBytes, 0, m2Data, start, newBytes.Length);
+
+                // Null-pad the remainder
+                for (int i = newBytes.Length; i < tex.ActualByteLength; i++)
+                    m2Data[start + i] = 0;
+
+                // Update nameLen
+                byte[] lenBytes = BitConverter.GetBytes((uint)newLenWithNull);
+                Array.Copy(lenBytes, 0, m2Data, tex.EntryOffset, 4);
+            }
+            else
+            {
+                // Doesn't fit: append to EOF and update nameOfs pointer
+                int appendOffset = m2Data.Length;
+
+                // Grow the array
+                Array.Resize(ref m2Data, m2Data.Length + newLenWithNull);
+
+                // Write new filename at the end
+                Array.Copy(newBytes, 0, m2Data, appendOffset, newBytes.Length);
+                m2Data[appendOffset + newBytes.Length] = 0; // null terminator
+
+                // Update nameLen (at entryOfs + 0)
+                byte[] lenBytes = BitConverter.GetBytes((uint)newLenWithNull);
+                Array.Copy(lenBytes, 0, m2Data, tex.EntryOffset, 4);
+
+                // Update nameOfs (at entryOfs + 4)
+                byte[] ofsBytes = BitConverter.GetBytes((uint)appendOffset);
+                Array.Copy(ofsBytes, 0, m2Data, tex.EntryOffset + 4, 4);
+            }
+
+            patched++;
+        }
+
+        return (m2Data, patched);
+    }
+
     public static int PatchTextureFilenames(byte[] m2Data, Dictionary<int, string> replacements)
     {
         var textures = ParseTextures(m2Data);

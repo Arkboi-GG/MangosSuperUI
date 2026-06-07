@@ -748,29 +748,27 @@ public class ItemsController : Controller
             helmetGeosetVis2 = info.Value.HelmetGeosetVis2,
             // Computed: should equipping this helm hide hair?
             //
-            // Pragmatic open-vs-closed heuristic: closed helms have two
-            // distinct HelmetGeosetVisData rows (different hide patterns
-            // for hair/facial/ears across races), open helms repeat the
-            // same row twice. Verified empirically May 16 2026:
+            // Proper decode via HelmetGeosetVisData.dbc: each row has a
+            // hairFlags bitmask — if bit (1 << raceId) is set, hair is
+            // hidden for that race. v1 is the male row, v2 is the female
+            // row; we check the one matching the requested gender.
             //
-            //   Helm of Wrath    (closed)  v1=248  v2=306   v1 != v2
-            //   Lawbringer       (closed)  v1=248  v2=306   v1 != v2
-            //   PVP Alliance     (closed)  v1=249  v2=305   v1 != v2
-            //   Helm of Might    (open)    v1=247  v2=247   v1 == v2
-            //   Judgement Circlet(open)    v1=245  v2=245   v1 == v2
-            //   Defias mask      (open)    v1=247  v2=247   v1 == v2
+            // This replaces the Session L v1!=v2 heuristic which failed
+            // on helms where both vis IDs point to the same row (e.g.
+            // Dreadnaught Helmet: v1=v2=368, hairFlags=0xFFFFFFFF — a
+            // full closed plate helm that was incorrectly classified as
+            // "open" by the heuristic).
             //
-            // Zero on both is treated as "show hair" — vanilla items
-            // without HelmetGeosetVis assignments shouldn't hide anything.
-            //
-            // The proper decode parses HelmetGeosetVisData.dbc (5 fields:
-            // id, hairFlags, facialFlags[3], earsFlags; each a bitmask
-            // over ChrRaces) and checks (hairFlags >> raceId) & 1 for
-            // each of v1 and v2. Deferred — the heuristic agrees with
-            // the full decode on every known sample and lands in 5 lines
-            // of code vs. a full DBC parser + endpoint wiring.
-            hidesHair = info.Value.HelmetGeosetVis1 != 0
-                     && info.Value.HelmetGeosetVis1 != info.Value.HelmetGeosetVis2,
+            // Verified empirically May 19 2026:
+            //   Row 245 hairFlags=0x00000000 → open (Judgement Circlet)
+            //   Row 247 hairFlags=0x00000000 → open (Helm of Might)
+            //   Row 248 hairFlags=0xFFFFFFBF → closed (Helm of Wrath)
+            //   Row 368 hairFlags=0xFFFFFFFF → closed (Dreadnaught)
+            hidesHair = _dbc.DoesHelmHideHair(
+                gender.Equals("Female", StringComparison.OrdinalIgnoreCase)
+                    ? info.Value.HelmetGeosetVis2
+                    : info.Value.HelmetGeosetVis1,
+                RaceNameToId(race)),
             // Session N diagnostic: m_itemVisual — indexes ItemVisuals.dbc.
             // Non-zero means this item is supposed to render lightning,
             // glow, ribbons, or other visual effects on top of its base
@@ -1105,6 +1103,7 @@ public class ItemsController : Controller
     /// Serves a retexture patch MPQ for download.
     /// </summary>
     [HttpGet]
+    [HttpHead]
     public IActionResult DownloadPatch(string file)
     {
         if (string.IsNullOrWhiteSpace(file)) return BadRequest("File name required");
@@ -1936,6 +1935,118 @@ public class ItemsController : Controller
                    "For shields the relevant entry is the one that marks the grip — usually " +
                    "the first non-zero attachment, typically id 0 or 1.",
         });
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Map race display name to ChrRaces.dbc ID. Used by the
+    /// HelmetGeosetVisData decode to check the correct bit in hairFlags.
+    /// Returns 1 (Human) for unknown race names as a safe default.
+    /// </summary>
+    private static uint RaceNameToId(string raceName) => raceName?.ToLowerInvariant() switch
+    {
+        "human" => 1,
+        "orc" => 2,
+        "dwarf" => 3,
+        "nightelf" => 4,
+        "undead" or "scourge" => 5,
+        "tauren" => 6,
+        "gnome" => 7,
+        "troll" => 8,
+        _ => 1,   // fallback: Human
+    };
+
+    // ── Face texture diagnostic ───────────────────────────────────────
+
+    /// <summary>
+    /// GET /Items/FaceTexture?race=Human&amp;gender=Male&amp;variation=0&amp;color=0&amp;region=lower
+    /// 
+    /// Returns the decoded face BLP as a PNG for the given CharSections
+    /// variation/color. Used by the diagnostic panel to cycle through
+    /// face variations and find which one has open eyes.
+    /// 
+    /// Also: GET /Items/FaceVariations?race=Human&amp;gender=Male
+    /// Returns JSON listing all available (variation, color) combos.
+    /// </summary>
+    [HttpGet]
+    public IActionResult FaceTexture(
+        string race = "Human", string gender = "Male",
+        uint variation = 0, uint color = 0, string region = "lower")
+    {
+        uint raceId = RaceNameToId(race);
+        uint sexId = gender.Equals("Female", StringComparison.OrdinalIgnoreCase) ? 1u : 0u;
+
+        // Find the matching CharSections Face row
+        CharSectionDbc? match = null;
+        foreach (var row in _dbc.CharacterSections)
+        {
+            if (row.Race == raceId && row.Sex == sexId
+                && row.BaseSection == 1  // Face
+                && row.VariationIndex == variation
+                && row.ColorIndex == color)
+            {
+                match = row;
+                break;
+            }
+        }
+        if (match == null)
+            return NotFound(new { error = $"No CharSections Face row for race={race} gender={gender} var={variation} col={color}" });
+
+        string partial = region.Equals("upper", StringComparison.OrdinalIgnoreCase)
+            ? match.TextureName2 : match.TextureName1;
+        if (string.IsNullOrEmpty(partial))
+            return NotFound(new { error = $"Empty texture path for region={region}" });
+
+        var blpBytes = CharacterSkinCompositor.ResolveCharacterTextureBlp(
+            (MpqReaderService)HttpContext.RequestServices.GetService(typeof(MpqReaderService))!,
+            partial, race, gender);
+        if (blpBytes == null)
+            return NotFound(new { error = $"BLP not in MPQ: {partial}" });
+
+        // Decode BLP → PNG
+        try
+        {
+            using var blpStream = new MemoryStream(blpBytes);
+            var blpFile = new War3Net.Drawing.Blp.BlpFile(blpStream);
+            var pixels = blpFile.GetPixels(0, out int w, out int h);
+            if (w == 0 || h == 0) return NotFound(new { error = "BLP decoded to 0×0" });
+
+            using var bmp = new SkiaSharp.SKBitmap(w, h, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Unpremul);
+            System.Runtime.InteropServices.Marshal.Copy(pixels, 0, bmp.GetPixels(), pixels.Length);
+            bmp.NotifyPixelsChanged();
+            using var ms = new MemoryStream();
+            bmp.Encode(ms, SkiaSharp.SKEncodedImageFormat.Png, 100);
+            return File(ms.ToArray(), "image/png");
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// GET /Items/FaceVariations?race=Human&amp;gender=Male
+    /// Returns all (variation, color) combos for Face rows in CharSections.dbc.
+    /// </summary>
+    [HttpGet]
+    public IActionResult FaceVariations(string race = "Human", string gender = "Male")
+    {
+        uint raceId = RaceNameToId(race);
+        uint sexId = gender.Equals("Female", StringComparison.OrdinalIgnoreCase) ? 1u : 0u;
+
+        var rows = _dbc.CharacterSections
+            .Where(r => r.Race == raceId && r.Sex == sexId && r.BaseSection == 1)
+            .OrderBy(r => r.VariationIndex).ThenBy(r => r.ColorIndex)
+            .Select(r => new {
+                variation = r.VariationIndex,
+                color = r.ColorIndex,
+                lower = r.TextureName1,
+                upper = r.TextureName2,
+            })
+            .ToList();
+
+        return Json(new { race, gender, raceId, sexId, count = rows.Count, rows });
     }
 
 }

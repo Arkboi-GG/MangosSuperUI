@@ -31,12 +31,22 @@ public class WorldEditorController : Controller
     private readonly ILogger<WorldEditorController> _logger;
     private readonly IConfiguration _config;
     private readonly ConnectionFactory? _db;
+    private readonly MpqReaderService? _mpqReader;
 
-    public WorldEditorController(IConfiguration config, ILogger<WorldEditorController> logger, ConnectionFactory? db = null)
+    public WorldEditorController(IConfiguration config, ILogger<WorldEditorController> logger,
+        ConnectionFactory? db = null, MpqReaderService? mpqReader = null)
     {
         _config = config;
         _logger = logger;
         _db = db;
+        _mpqReader = mpqReader;
+
+        // Wire StormLib as the primary MPQ reader for AdtTerrainReader.
+        // This fixes AQ20, AQ40, and Naxxramas rendering green: their ADTs
+        // live in MPQ archives (expansion.MPQ) that War3Net can't read.
+        // StormLib handles all vanilla 1.12 compression formats correctly.
+        if (mpqReader != null)
+            AdtTerrainReader.StormLibExtractor = mpqReader.ExtractFile;
     }
 
     public IActionResult Index() => View();
@@ -50,6 +60,7 @@ public class WorldEditorController : Controller
     // File: {mapId:D3}{gridX:D2}{gridY:D2}.map
     private static readonly (string key, string label, int mapId, int gridX, int gridY)[] _terrainPresets =
     {
+        // ── Outdoor zones (mapId 0 = Eastern Kingdoms, 1 = Kalimdor) ──
         ("northshire",  "Northshire Valley",    0, 48, 32),
         ("elwynn",      "Elwynn Forest",        0, 49, 31),
         ("stormwind",   "Stormwind City",       0, 48, 30),
@@ -62,17 +73,90 @@ public class WorldEditorController : Controller
         ("durotar",     "Durotar",              1, 28, 40),
         ("darkshore",   "Darkshore",            1, 19, 30),
         ("stonetalon",  "Stonetalon Mountains", 1, 29, 32),
+
+        // ── Terrain-based dungeons (instances with ADT tiles + WMOs) ──
+        ("shadowfang",     "🏰 Shadowfang Keep",       33, 32, 27),
+        ("deadmines",      "🏰 The Deadmines",         36, 32, 32),
+        ("rfk",            "🏰 Razorfen Kraul",        47, 28, 27),
+        ("rfd",            "🏰 Razorfen Downs",       129, 29, 27),
+        ("scarletm",       "🏰 Scarlet Monastery",    189, 30, 29),
+        ("zulfarrak",      "🏰 Zul'Farrak",           209, 30, 30),
+        ("scholomance",    "🏰 Scholomance",          289, 31, 30),
+        ("stratholme",     "🏰 Stratholme",           329, 25, 38),
+        ("bwl",            "🏰 Blackwing Lair",       469, 45, 33),
+
+        // ── Terrain-based raids ──
+        ("zulgurub",       "🏰 Zul'Gurub",            309, 54, 35),
+        ("aq20",           "🏰 Ruins of Ahn'Qiraj",   509, 49, 28),
+        ("aq40",           "🏰 Temple of Ahn'Qiraj",  531, 48, 28),
+        ("naxxramas",      "🏰 Naxxramas",            533, 25, 39),
     };
 
     [HttpGet]
     public IActionResult Presets()
     {
         string mapsDir = GetMapsDirectory();
+        string clientDataPath = GetClientDataDirectory();
+
+        // Terrain presets (existing behavior)
         var available = _terrainPresets
             .Where(p => System.IO.File.Exists(Path.Combine(mapsDir, VmangosMapParser.BuildFilename(p.mapId, p.gridX, p.gridY))))
-            .Select(p => new { key = p.key, name = p.label })
-            .ToList();
+            .Select(p => new { key = p.key, name = p.label, isDungeon = false })
+            .ToList<object>();
+
+        // Dungeon presets — probe WDT files in the MPQs.
+        // Try the primary folder name first, then aliases.
+        if (!string.IsNullOrEmpty(clientDataPath))
+        {
+            foreach (var (mapId, internalName, displayName) in WdtReader.KnownDungeons)
+            {
+                try
+                {
+                    byte[]? wdtData = TryReadDungeonWdt(clientDataPath, mapId, internalName);
+                    if (wdtData == null) continue;
+
+                    var wdt = WdtReader.Parse(wdtData);
+                    if (wdt == null || !wdt.IsGlobalWmo) continue;
+                    if (string.IsNullOrEmpty(wdt.GlobalWmoPath)) continue;
+
+                    available.Add(new
+                    {
+                        key = $"dungeon:{mapId}",
+                        name = $"\U0001f3f0 {displayName}",
+                        isDungeon = true
+                    });
+                }
+                catch
+                {
+                    // Skip dungeons whose WDT can't be read
+                }
+            }
+        }
+
         return Json(new { success = true, presets = available });
+    }
+
+    /// <summary>
+    /// Try to read a dungeon WDT from MPQs using the primary name and then any aliases.
+    /// Returns the raw WDT bytes or null if not found under any name.
+    /// </summary>
+    private static byte[]? TryReadDungeonWdt(string clientDataPath, int mapId, string primaryName)
+    {
+        // Try primary name
+        byte[]? data = AdtTerrainReader.ReadFileFromMpqs(clientDataPath, WdtReader.BuildWdtPath(primaryName));
+        if (data != null) return data;
+
+        // Try aliases
+        if (WdtReader.KnownDungeonAliases.TryGetValue(mapId, out var aliases))
+        {
+            foreach (var alias in aliases)
+            {
+                data = AdtTerrainReader.ReadFileFromMpqs(clientDataPath, WdtReader.BuildWdtPath(alias));
+                if (data != null) return data;
+            }
+        }
+
+        return null;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -91,6 +175,9 @@ public class WorldEditorController : Controller
         // Full tile: cx=8, cy=8, radius=8 → all 16×16 chunks (0-15)
         // radius=7 from center 8 only reaches chunk 1, missing chunk 0!
         const int cx = 8, cy = 8, radius = 8;
+
+        // Client data path for reading ADT holes from MPQ
+        string clientDataPath = GetClientDataDirectory();
 
         // Pass 1: parse all tiles, find global height range
         var parsed = new Dictionary<(int dx, int dy), VmangosMapParser.TerrainResult>();
@@ -154,18 +241,40 @@ public class WorldEditorController : Controller
                 positions[i * 3 + 2] = origZ + tileOffsetZ;
             }
 
+            // Extract terrain holes from the ADT in the MPQ.
+            // The .map files often have holesOffset=0 (extractor didn't write them),
+            // but the ADT always has the ground truth in MCNK header offset 0x3C.
+            int gxTile = p.gridX + dy;
+            int gyTile = p.gridY + dx;
+            int[]? tileHoles = null;
+            if (!string.IsNullOrEmpty(clientDataPath))
+            {
+                try
+                {
+                    var adt = AdtTerrainReader.ReadFromMpq(clientDataPath, MapIdToName(p.mapId), gxTile, gyTile);
+                    if (adt?.Chunks != null)
+                    {
+                        tileHoles = new int[256];
+                        for (int ci = 0; ci < adt.Chunks.Length && ci < 256; ci++)
+                            tileHoles[ci] = adt.Chunks[ci].Holes;
+                    }
+                }
+                catch { /* ADT not available — no holes */ }
+            }
+
             tiles.Add(new
             {
                 dx,
                 dy,
-                gridX = p.gridX + dy,
-                gridY = p.gridY + dx,
+                gridX = gxTile,
+                gridY = gyTile,
                 positions,
                 indices = tr.Indices,
                 vertsWidth = vertsW,
                 vertsHeight = vertsH,
                 chunksWidth = tr.ChunksWidth,
                 chunksHeight = tr.ChunksHeight,
+                holes = tileHoles
             });
         }
 
@@ -174,6 +283,7 @@ public class WorldEditorController : Controller
             success = true,
             preset,
             label = p.label,
+            mapId = p.mapId,
             tileCount = tiles.Count,
             heightScale = globalHeightScale,
             midHeight = globalMidHeight,
@@ -581,8 +691,14 @@ public class WorldEditorController : Controller
                     _logger.LogWarning("WmoModel: Group parse failed: {Path} ({Size} bytes)", groupPathBS, groupData.Length);
                     continue;
                 }
-                _logger.LogInformation("WmoModel: Group {Idx} — {Verts} verts, {Idxs} indices, {Batches} batches",
-                    gi, group.Vertices.Count, group.Indices.Count, group.Batches.Count);
+
+                // Skip interior groups (SMOGroup::INTERIOR = 0x2000) was attempted
+                // but SW has no interior-flagged groups. The real fix is per-batch
+                // filtering below (transBatchCount / intBatchCount / extBatchCount).
+
+                _logger.LogInformation("WmoModel: Group {Idx} — {Verts} verts, {Idxs} indices, {Batches} batches (trans={Trans} int={Int} ext={Ext})",
+                    gi, group.Vertices.Count, group.Indices.Count, group.Batches.Count,
+                    group.TransBatchCount, group.IntBatchCount, group.ExtBatchCount);
 
                 // Add vertices — WMO is Z-up. Convert to Three.js Y-up + 90° CCW rotation.
                 // Z-up→Y-up: (x, z, -y), then 90° CCW in XZ: (y, z, x)
@@ -629,11 +745,23 @@ public class WorldEditorController : Controller
                     }
                 }
 
-                // Build submeshes from batches (or from per-triangle materials)
+                // Build submeshes from batches (or from per-triangle materials).
+                // MOGP splits MOBA into three ranges in order:
+                //   [0 .. transBatchCount-1]                              = transparent
+                //   [transBatchCount .. transBatchCount+intBatchCount-1]   = interior
+                //   [transBatchCount+intBatchCount .. end]                 = exterior
+                //
+                // ALL batches are included — interior geometry is required for
+                // caves, dungeons, building interiors, and mine shafts. The old
+                // skip-interior approach stripped cave/dungeon walls entirely.
+                // If Stormwind-style ceiling overlap becomes an issue again, add
+                // a per-WMO or camera-height toggle rather than blanket-skipping.
                 if (group.Batches.Count > 0)
                 {
-                    foreach (var batch in group.Batches)
+                    for (int bi = 0; bi < group.Batches.Count; bi++)
                     {
+
+                        var batch = group.Batches[bi];
                         int idxStart = allIndices.Count;
                         int end = (int)Math.Min(batch.IndexStart + batch.IndexCount, group.Indices.Count);
                         for (int i = (int)batch.IndexStart; i < end; i++)
@@ -3397,6 +3525,24 @@ public class WorldEditorController : Controller
             positions[i * 3 + 2] = tr.Positions[i * 3 + 2]; // Z centered
         }
 
+        // Extract terrain holes from the ADT in the MPQ
+        int[]? tileHoles = null;
+        try
+        {
+            string clientDataPath = GetClientDataDirectory();
+            if (!string.IsNullOrEmpty(clientDataPath))
+            {
+                var adt = AdtTerrainReader.ReadFromMpq(clientDataPath, MapIdToName(p.mapId), gx, gy);
+                if (adt?.Chunks != null)
+                {
+                    tileHoles = new int[256];
+                    for (int ci = 0; ci < adt.Chunks.Length && ci < 256; ci++)
+                        tileHoles[ci] = adt.Chunks[ci].Holes;
+                }
+            }
+        }
+        catch { /* ADT not available — no holes */ }
+
         return Json(new
         {
             success = true,
@@ -3407,7 +3553,8 @@ public class WorldEditorController : Controller
             vertsWidth = vertsW,
             vertsHeight = vertsH,
             minHeight = tr.MinHeight,
-            maxHeight = tr.MaxHeight
+            maxHeight = tr.MaxHeight,
+            holes = tileHoles
         });
     }
 
@@ -3647,37 +3794,39 @@ public class WorldEditorController : Controller
                     wmoGroupsHit++;
                     instanceHadLiquid = true;
 
-                    // Per-vertex transform from MLIQ local (Z-up file frame) to mesh space.
-                    // Inputs: (i, j) tile-grid corner indices, height from vertex array.
-                    //   1. WMO Z-up file space:
-                    //        vx_zup = CornerX + i * UNIT
-                    //        vy_zup = CornerY + j * UNIT
-                    //        vz_zup = height
-                    //   2. Geometry's Z-up → Y-up convention (matches WmoModel endpoint
-                    //      vertex transform — line 587-594):  (x,y,z) → (y,z,x)
-                    //        vx_yup_local = vy_zup
-                    //        vy_yup_local = vz_zup
-                    //        vz_yup_local = vx_zup
-                    //   3. Apply qWmo (MODF rotation in Y-up world frame).
+                    // Per-vertex transform from MLIQ local to mesh space.
+                    //
+                    // Noggit reference (wmo_liquid.cpp):
+                    //   Constructor line 34527:
+                    //     pos = (header.pos.x, header.pos.z, -header.pos.y)
+                    //     → transforms MLIQ corner from Z-up file to Y-up local
+                    //   initGeometry line 34610-34612:
+                    //     vertex = (pos.x + UNIT*i, height, pos.z - UNIT*j)
+                    //     → builds vertices in Y-up WMO-local space
+                    //   draw line 34707:
+                    //     applies WMO instance transform matrix (translate + rotate)
+                    //
+                    // We replicate this exactly:
+                    //   1. Transform corner: (CornerX, CornerZ, -CornerY) [Z-up → Y-up]
+                    //   2. Build Y-up local vertex: (cx + i*UNIT, height, cz - j*UNIT)
+                    //   3. Rotate by qWmo (MODF rotation).
                     //   4. Translate by MODF position (already Y-up world).
-                    //   5. World XZ → tile-local cell coord:
-                    //        col = (worldX / GRID_SIZE - gy) * 128
-                    //        row = (worldZ / GRID_SIZE - gx) * 128
-                    //      → meshX = (col - 64) * CELL_SIZE
-                    //      → meshZ = (row - 64) * CELL_SIZE
-                    //      → meshY = (worldY - globalMidHeight) * globalHeightScale
+                    //   5. World XZ → tile-local mesh coords.
+
+                    // Pre-compute transformed corner (same as Noggit constructor)
+                    double cornerLocalX = liq.CornerX;                // X stays X
+                    double cornerLocalY_up = liq.CornerZ;             // Z (height) → Y (up)
+                    double cornerLocalZ = -(double)liq.CornerY;       // Y → -Z
+
                     (float mx, float my, float mz, float wx, float wz) Project(int i, int j)
                     {
                         if (j * liq.XVerts + i >= liq.VertexHeights.Length)
                             return (0, 0, 0, 0, 0);
-                        float vx_zup = liq.CornerX + i * WMO_LIQ_UNIT;
-                        float vy_zup = liq.CornerY + j * WMO_LIQ_UNIT;
-                        float vz_zup = liq.VertexHeights[j * liq.XVerts + i];
 
-                        // Z-up file → Y-up local (same as MOVT vertex transform)
-                        double lx = vy_zup;
-                        double ly = vz_zup;
-                        double lz = vx_zup;
+                        // Y-up WMO-local vertex (matches Noggit initGeometry)
+                        double lx = cornerLocalX + i * WMO_LIQ_UNIT;
+                        double ly = (double)liq.VertexHeights[j * liq.XVerts + i];
+                        double lz = cornerLocalZ - j * WMO_LIQ_UNIT;
 
                         // Rotate by qWmo
                         var (rx, ry, rz) = QuatRotateVec(qWmo, lx, ly, lz);
@@ -4350,6 +4499,12 @@ public class WorldEditorController : Controller
         var addWmos = new List<object>();
         float loadR2 = loadRadius * loadRadius;
 
+        // Large WMOs (e.g. Stormwind) appear in MODF on every ADT tile they
+        // straddle. Without dedup the client renders N overlapping instances
+        // with subtly different mesh-space offsets → floating geometry ghosts.
+        // Key by rounded world-space position + model path.
+        var emittedWmos = new HashSet<string>();
+
         for (int tdy = -maxTileReach; tdy <= maxTileReach; tdy++)
         {
             for (int tdx = -maxTileReach; tdx <= maxTileReach; tdx++)
@@ -4424,6 +4579,18 @@ public class WorldEditorController : Controller
                     }
                     else
                     {
+                        // Dedup WMOs that straddle multiple ADT tiles.
+                        // Model paths may differ in casing across tiles.
+                        string wmoKey = $"{e.Model?.ToLowerInvariant()}|{Math.Round(wx)}|{Math.Round(wz)}";
+                        if (emittedWmos.Contains(wmoKey))
+                        {
+                            _logger.LogInformation(
+                                "NearbyObjects: DEDUP skipped WMO {Model} at wx={WX:F1} wz={WZ:F1} (key={Key})",
+                                e.Model, wx, wz, wmoKey);
+                            continue;
+                        }
+                        emittedWmos.Add(wmoKey);
+
                         addWmos.Add(new
                         {
                             id = e.Id,
@@ -4864,6 +5031,71 @@ public class WorldEditorController : Controller
     // HELPERS
     // ═══════════════════════════════════════════════════════════════
 
+    // ═══════════════════════════════════════════════════════════════
+    // DUNGEON INFO — returns WDT metadata for a dungeon map
+    // ═══════════════════════════════════════════════════════════════
+
+    [HttpGet]
+    public IActionResult DungeonInfo(int mapId)
+    {
+        string clientDataPath = GetClientDataDirectory();
+        if (string.IsNullOrEmpty(clientDataPath))
+            return Json(new { success = false, error = "Client data path not configured" });
+
+        // Find the dungeon in the known list
+        var dungeon = WdtReader.KnownDungeons.FirstOrDefault(d => d.mapId == mapId);
+        if (dungeon.internalName == null)
+            return Json(new { success = false, error = $"Unknown dungeon mapId: {mapId}" });
+
+        try
+        {
+            byte[]? wdtData = TryReadDungeonWdt(clientDataPath, mapId, dungeon.internalName);
+            if (wdtData == null)
+                return Json(new { success = false, error = $"WDT not found for mapId {mapId} (tried primary + aliases)" });
+
+            var wdt = WdtReader.Parse(wdtData);
+            if (wdt == null)
+                return Json(new { success = false, error = "WDT parse failed" });
+
+            if (!wdt.IsGlobalWmo || string.IsNullOrEmpty(wdt.GlobalWmoPath))
+                return Json(new { success = false, error = "Map is not a global-WMO dungeon" });
+
+            var modf = wdt.GlobalWmoPlacement;
+
+            return Json(new
+            {
+                success = true,
+                mapId,
+                name = dungeon.displayName,
+                internalName = dungeon.internalName,
+                isGlobalWmo = true,
+                wmoPath = wdt.GlobalWmoPath,
+                modf = modf == null ? null : new
+                {
+                    posX = modf.PosX,
+                    posY = modf.PosY,
+                    posZ = modf.PosZ,
+                    rotX = modf.RotX,
+                    rotY = modf.RotY,
+                    rotZ = modf.RotZ,
+                    bbMinX = modf.BbMinX,
+                    bbMinY = modf.BbMinY,
+                    bbMinZ = modf.BbMinZ,
+                    bbMaxX = modf.BbMaxX,
+                    bbMaxY = modf.BbMaxY,
+                    bbMaxZ = modf.BbMaxZ,
+                    doodadSet = modf.DoodadSet,
+                    flags = modf.Flags
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "DungeonInfo failed for mapId {MapId}", mapId);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
     private bool TryResolvePreset(string? preset, out (string key, string label, int mapId, int gridX, int gridY) p, out string error)
     {
         p = default; error = "";
@@ -5028,7 +5260,215 @@ public class WorldEditorController : Controller
         return Content(sb.ToString(), "text/plain");
     }
 
-    private static string MapIdToName(int id) => id switch { 0 => "Azeroth", 1 => "Kalimdor", _ => $"Map{id}" };
+    // ═══════════════════════════════════════════════════════════════
+    // DIAGNOSE: Instance tile grid — show all tiles for a mapId
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Diagnostic: for a terrain-based instance preset, probe both the WDT
+    /// (ADT tile existence in MPQ) and the extracted .map files to show the
+    /// full tile grid. Helps debug "only part of the raid loads" issues.
+    /// </summary>
+    [HttpGet]
+    public IActionResult DiagnoseInstanceTiles(string? preset)
+    {
+        if (!TryResolvePreset(preset, out var p, out var error))
+            return Content($"ERROR: {error}", "text/plain");
+
+        string clientDataPath = GetClientDataDirectory();
+        string mapsDir = GetMapsDirectory();
+        string mapName = MapIdToName(p.mapId);
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("=== INSTANCE TILE DIAGNOSTIC ===");
+        sb.AppendLine($"Preset: {preset}  mapId={p.mapId}  mapName={mapName}");
+        sb.AppendLine($"Center tile: gridX={p.gridX}  gridY={p.gridY}");
+        sb.AppendLine();
+
+        // ── 1. Scan .map files on disk ──
+        sb.AppendLine("── .map files (VMaNGOS extracted) ──");
+        var mapTiles = new List<(int gx, int gy)>();
+        for (int gx = 0; gx < 64; gx++)
+        {
+            for (int gy = 0; gy < 64; gy++)
+            {
+                string path = Path.Combine(mapsDir, VmangosMapParser.BuildFilename(p.mapId, gx, gy));
+                if (System.IO.File.Exists(path))
+                    mapTiles.Add((gx, gy));
+            }
+        }
+        sb.AppendLine($"Total .map tiles: {mapTiles.Count}");
+        foreach (var (gx, gy) in mapTiles)
+        {
+            string marker = (gx == p.gridX && gy == p.gridY) ? " ← CENTER" : "";
+            sb.AppendLine($"  ({gx}, {gy}){marker}");
+        }
+        sb.AppendLine();
+
+        // ── 2. Probe WDT from MPQ for ADT tile existence ──
+        sb.AppendLine("── WDT tile grid (ADT existence in MPQ) ──");
+        if (!string.IsNullOrEmpty(clientDataPath))
+        {
+            try
+            {
+                string wdtPath = WdtReader.BuildWdtPath(mapName);
+                byte[]? wdtData = AdtTerrainReader.ReadFileFromMpqs(clientDataPath, wdtPath);
+                if (wdtData == null)
+                {
+                    sb.AppendLine($"  WDT not found: {wdtPath}");
+                    // Try aliases if mapId has them
+                    if (WdtReader.KnownDungeonAliases.TryGetValue(p.mapId, out var aliases))
+                    {
+                        foreach (var alias in aliases)
+                        {
+                            wdtData = AdtTerrainReader.ReadFileFromMpqs(clientDataPath, WdtReader.BuildWdtPath(alias));
+                            if (wdtData != null)
+                            {
+                                sb.AppendLine($"  Found via alias: {alias}");
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (wdtData != null)
+                {
+                    var wdt = WdtReader.Parse(wdtData);
+                    if (wdt != null)
+                    {
+                        sb.AppendLine($"  IsGlobalWmo: {wdt.IsGlobalWmo}");
+                        sb.AppendLine($"  Flags: 0x{wdt.Flags:X8}");
+                        sb.AppendLine($"  TileCount: {wdt.TileCount}");
+                        if (!string.IsNullOrEmpty(wdt.GlobalWmoPath))
+                            sb.AppendLine($"  GlobalWmoPath: {wdt.GlobalWmoPath}");
+                        sb.AppendLine();
+
+                        // Show which tiles exist in WDT
+                        var wdtTiles = new List<(int y, int x)>();
+                        for (int y = 0; y < 64; y++)
+                            for (int x = 0; x < 64; x++)
+                                if (wdt.TileExists[y, x])
+                                    wdtTiles.Add((y, x));
+
+                        sb.AppendLine($"  Existing ADT tiles ({wdtTiles.Count}):");
+                        int minY = 64, maxY = 0, minX = 64, maxX = 0;
+                        foreach (var (y, x) in wdtTiles)
+                        {
+                            string marker = (y == p.gridX && x == p.gridY) ? " ← CENTER" : "";
+                            sb.AppendLine($"    WDT[{y},{x}]{marker}");
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                        }
+                        sb.AppendLine($"  Bounding box: Y=[{minY}..{maxY}]  X=[{minX}..{maxX}]");
+                        int idealCenterY = (minY + maxY) / 2;
+                        int idealCenterX = (minX + maxX) / 2;
+                        sb.AppendLine($"  Ideal center: ({idealCenterY}, {idealCenterX})");
+                        sb.AppendLine();
+
+                        // ── 3. Cross-reference: which WDT tiles have .map files? ──
+                        sb.AppendLine("── Cross-reference ──");
+                        var mapTileSet = new HashSet<(int, int)>(mapTiles);
+                        int haveMap = 0, missingMap = 0;
+                        foreach (var (y, x) in wdtTiles)
+                        {
+                            // WDT [y,x] → .map file uses (gridX=y, gridY=x)
+                            if (mapTileSet.Contains((y, x)))
+                                haveMap++;
+                            else
+                            {
+                                missingMap++;
+                                sb.AppendLine($"  MISSING .map for WDT tile ({y},{x})");
+                            }
+                        }
+                        sb.AppendLine($"  WDT tiles with .map: {haveMap}/{wdtTiles.Count} (missing: {missingMap})");
+
+                        // ── 4. Try reading an ADT to check texture/WMO content ──
+                        sb.AppendLine();
+                        sb.AppendLine("── ADT content probe (first 3 tiles) ──");
+                        int probed = 0;
+                        foreach (var (y, x) in wdtTiles)
+                        {
+                            if (probed >= 3) break;
+                            try
+                            {
+                                var adt = AdtTerrainReader.ReadFromMpq(clientDataPath, mapName, y, x);
+                                if (adt != null)
+                                {
+                                    sb.AppendLine($"  ADT ({y},{x}): textures={adt.Textures.Count} doodads={adt.Doodads?.Count ?? 0} wmos={adt.Wmos?.Count ?? 0} chunks={adt.Chunks?.Length ?? 0}");
+                                    if (adt.Textures.Count > 0)
+                                        sb.AppendLine($"    First texture: {adt.Textures[0]}");
+                                    if (adt.Wmos?.Count > 0)
+                                        sb.AppendLine($"    First WMO: {adt.Wmos[0].ModelPath}");
+                                }
+                                else
+                                {
+                                    sb.AppendLine($"  ADT ({y},{x}): ReadFromMpq returned NULL");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                sb.AppendLine($"  ADT ({y},{x}): ERROR - {ex.Message}");
+                            }
+                            probed++;
+                        }
+                    }
+                    else
+                    {
+                        sb.AppendLine("  WDT parse failed (returned null)");
+                    }
+                }
+                else
+                {
+                    sb.AppendLine("  WDT not found in any MPQ archive");
+                }
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine($"  WDT probe error: {ex.Message}");
+            }
+        }
+        else
+        {
+            sb.AppendLine("  Client data path not configured");
+        }
+
+        return Content(sb.ToString(), "text/plain");
+    }
+
+    private static string MapIdToName(int id) => id switch
+    {
+        0 => "Azeroth",
+        1 => "Kalimdor",
+        33 => "Shadowfang",
+        34 => "StormwindJail",
+        36 => "DeadminesInstance",
+        43 => "WailingCaverns",
+        44 => "Monastery",
+        47 => "RazorfenKraulInstance",
+        48 => "Blackfathom",
+        70 => "Uldaman",
+        90 => "GnomeragonInstance",
+        109 => "SunkenTemple",
+        129 => "RazorfenDowns",
+        189 => "MonasteryInstances",
+        209 => "TanarisInstance",
+        229 => "BlackRockSpire",
+        230 => "BlackrockDepths",
+        249 => "OnyxiaLairInstance",
+        289 => "SchoolofNecromancy",
+        309 => "Zul'gurub",
+        329 => "Stratholme",
+        349 => "Mauradon",
+        389 => "OrgrimmarInstance",
+        409 => "MoltenCore",
+        429 => "DireMaul",
+        469 => "BlackwingLair",
+        509 => "AhnQiraj",
+        531 => "AhnQirajTemple",
+        533 => "Stratholme Raid",
+        _ => $"Map{id}"
+    };
 
     // ═══════════════════════════════════════════════════════════════
     // HELPER: Build active placements + affected tiles from DB

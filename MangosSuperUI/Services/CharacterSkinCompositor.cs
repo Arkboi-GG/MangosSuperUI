@@ -90,6 +90,9 @@ public class CharacterSkinCompositor
                     raceName, genderName);
                 return null;
             }
+            _logger.LogInformation(
+                "CharacterSkinCompositor: base skin decoded {W}x{H} for {Race}/{Gender}",
+                canvas.Width, canvas.Height, raceName, genderName);
 
             // Resolve race ID + gender ID for DBC lookup
             uint raceId = RaceNameToId(raceName);
@@ -121,6 +124,10 @@ public class CharacterSkinCompositor
                     using var bmp = DecodeBlp(lowerBlp);
                     if (bmp != null)
                     {
+                        _logger.LogInformation(
+                            "CharacterSkinCompositor: face_lower BLP decoded {W}x{H} for {Race}/{Gender}, painting into region ({RX},{RY},{RW},{RH})",
+                            bmp.Width, bmp.Height, raceName, genderName,
+                            FACE_LOWER_X, FACE_LOWER_Y, FACE_LOWER_W, FACE_LOWER_H);
                         PaintRegion(canvas, bmp, FACE_LOWER_X, FACE_LOWER_Y, FACE_LOWER_W, FACE_LOWER_H);
                         _logger.LogDebug(
                             "CharacterSkinCompositor: painted face_lower for {Race}/{Gender} from '{Partial}'",
@@ -144,6 +151,10 @@ public class CharacterSkinCompositor
                     using var bmp = DecodeBlp(upperBlp);
                     if (bmp != null)
                     {
+                        _logger.LogInformation(
+                            "CharacterSkinCompositor: face_upper BLP decoded {W}x{H} for {Race}/{Gender}, painting into region ({RX},{RY},{RW},{RH})",
+                            bmp.Width, bmp.Height, raceName, genderName,
+                            FACE_UPPER_X, FACE_UPPER_Y, FACE_UPPER_W, FACE_UPPER_H);
                         PaintRegion(canvas, bmp, FACE_UPPER_X, FACE_UPPER_Y, FACE_UPPER_W, FACE_UPPER_H);
                         _logger.LogDebug(
                             "CharacterSkinCompositor: painted face_upper for {Race}/{Gender} from '{Partial}'",

@@ -35,6 +35,7 @@ builder.Services.AddSingleton<OllamaChatService>();
 builder.Services.AddSingleton<SourceIndexerService>();
 builder.Services.AddSingleton<ZoneSafetyMap>();
 builder.Services.AddSingleton<BotFleetDiagnostics>();
+builder.Services.AddSingleton<BotFlightRecorder>();
 builder.Services.AddSingleton<SpellCreatorService>();
 builder.Services.AddSingleton<BlpWriterService>();
 builder.Services.AddSingleton<PatchBuilderService>();
@@ -58,23 +59,23 @@ builder.Services.AddScoped<ItemRetextureService>();
 
 // Tracking (in-memory, singleton)
 builder.Services.AddSingleton<BotStateTracker>();
-    builder.Services.AddSingleton<BotActivityLog>();
-    builder.Services.AddSingleton<BotRelationships>();
+builder.Services.AddSingleton<BotActivityLog>();
+builder.Services.AddSingleton<BotRelationships>();
 
-    // Data loaders
-    builder.Services.AddSingleton<QuirkLoader>();
-    builder.Services.AddSingleton<SpellProgressionLoader>();
-    builder.Services.AddSingleton<ZoneDataLoader>();
-    builder.Services.AddSingleton<QuestGraphLoader>();
-    builder.Services.AddSingleton<BotBrainDbInit>();
-    builder.Services.AddSingleton<SpellProgressionLoader>();
+// Data loaders
+builder.Services.AddSingleton<QuirkLoader>();
+builder.Services.AddSingleton<SpellProgressionLoader>();
+builder.Services.AddSingleton<ZoneDataLoader>();
+builder.Services.AddSingleton<QuestGraphLoader>();
+builder.Services.AddSingleton<BotBrainDbInit>();
+builder.Services.AddSingleton<SpellProgressionLoader>();
 
-    // Core engine
-    builder.Services.AddSingleton<LiveStateModifiers>();
+// Core engine
+builder.Services.AddSingleton<LiveStateModifiers>();
 
-    // Brain orchestrator (BackgroundService)
-    builder.Services.AddSingleton<BotBrainService>();
-    builder.Services.AddHostedService(sp => sp.GetRequiredService<BotBrainService>());
+// Brain orchestrator (BackgroundService)
+builder.Services.AddSingleton<BotBrainService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BotBrainService>());
 
 
 // ---------- MVC + SignalR ----------
@@ -92,10 +93,10 @@ using (var scope = app.Services.CreateScope())
     registry.SweepAllOnStartup();
 }
 
-    // ---------- Database Bootstrap ----------
-    // Ensures vmangos_admin DB + tables exist before any request can hit AuditService.
-    // Never throws — logs errors and sets AdminDbReady = false for dashboard to display.
-    var dbInit = app.Services.GetRequiredService<DbInitializationService>();
+// ---------- Database Bootstrap ----------
+// Ensures vmangos_admin DB + tables exist before any request can hit AuditService.
+// Never throws — logs errors and sets AdminDbReady = false for dashboard to display.
+var dbInit = app.Services.GetRequiredService<DbInitializationService>();
 await dbInit.InitializeAsync();
 
 // ---------- Pipeline ----------

@@ -1,6 +1,7 @@
 using System.Globalization;
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Domains;
 
@@ -95,12 +96,12 @@ public class TrainingDomain : IBotDomain
             {
                 _logger.LogWarning("[BOT-TRAIN] {Name}: no trainer found for class {Class} on map {Map}",
                     bot.Name, bot.ClassId, state.MapId);
-                bot.CurrentActivity.SubPhase = "Done";
+                AdvanceTo(bot, "Done");
                 bot.HasUnlearnedSpells = false;
                 return commands;
             }
 
-            bot.CurrentActivity.SubPhase = "Traveling";
+            AdvanceTo(bot, "Traveling");
             bot.CurrentActivity.PhaseData["trainer_entry"] = trainer.NpcEntry.ToString();
             bot.CurrentActivity.PhaseData["trainer_name"] = trainer.NpcName;
             bot.CurrentActivity.PhaseData["trainer_x"] = trainer.X.ToString("F1", CultureInfo.InvariantCulture);
@@ -121,7 +122,7 @@ public class TrainingDomain : IBotDomain
         }
 
         // Direct entry into Training (shouldn't happen normally, but handle it)
-        bot.CurrentActivity.SubPhase = "Done";
+        AdvanceTo(bot, "Done");
         return commands;
     }
 
@@ -161,6 +162,10 @@ public class TrainingDomain : IBotDomain
                 };
                 bot.CurrentActivity.PhaseData["trainer_entry"] = trainerEntry.ToString();
 
+                // FLIGHT RECORDER: domain-driven activity switch (DecisionEngine doesn't see this).
+                // TRAIN_AT_NPC below sets owner → WAIT on TRAIN_ACK via the command map.
+                BotTrace.Transition(bot, "Traveling", "WaitingForTrainAck", "arrived_trainer", state: state);
+
                 commands.Add(new BridgeCommand("TRAIN_AT_NPC", new { npc_entry = trainerEntry }));
                 return commands;
             }
@@ -189,7 +194,7 @@ public class TrainingDomain : IBotDomain
         {
             _logger.LogWarning("[BOT-TRAIN] {Name}: TRAIN_ACK timeout — marking done", bot.Name);
             bot.HasUnlearnedSpells = false;
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.CurrentActivity.IsInterruptible = true;
             bot.NextStrategicEval = DateTime.UtcNow;
         }
@@ -226,6 +231,9 @@ public class TrainingDomain : IBotDomain
                 };
                 bot.CurrentActivity.PhaseData["trainer_entry"] = trainerEntry.ToString();
 
+                // FLIGHT RECORDER: domain-driven activity switch (DecisionEngine doesn't see this).
+                BotTrace.Transition(bot, "Traveling", "WaitingForTrainAck", "arrived_trainer", state: state);
+
                 commands.Add(new BridgeCommand("TRAIN_AT_NPC", new { npc_entry = trainerEntry }));
             }
             return commands;
@@ -245,7 +253,7 @@ public class TrainingDomain : IBotDomain
             // TravelingToTrainer toward the same unreachable trainer. The flag gets
             // re-set on next level-up, and TicksSinceLastTrained resets naturally.
             bot.HasUnlearnedSpells = false;
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.CurrentActivity.IsInterruptible = true;
             bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
@@ -270,7 +278,7 @@ public class TrainingDomain : IBotDomain
 
             bot.HasUnlearnedSpells = false;
             bot.TicksSinceLastTrained = 0;
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.CurrentActivity.IsInterruptible = true;
             bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
@@ -281,12 +289,26 @@ public class TrainingDomain : IBotDomain
         {
             _logger.LogWarning("[BOT-TRAIN] {Name}: TRAIN_FAIL — {Data}", bot.Name, evt.Data);
             bot.HasUnlearnedSpells = false;
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.CurrentActivity.IsInterruptible = true;
             bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
         }
 
         return commands;
+    }
+
+    /// <summary>
+    /// Single sub-phase transition point so the flight recorder sees every move.
+    /// Plain transitions stay owner=CS; the MOVE_TO / TRAIN_AT_NPC commands set their
+    /// own WAIT via the command→event map.
+    /// </summary>
+    private void AdvanceTo(BotIdentity bot, string subPhase, string cause = "advance")
+    {
+        var prev = bot.CurrentActivity.SubPhase;
+        bot.CurrentActivity.SubPhase = subPhase;
+        _logger.LogInformation("[BOT-PHASE] {Name}({Guid}) | {Prev} → {Next}",
+            bot.Name, bot.Guid, prev ?? "null", subPhase);
+        BotTrace.Transition(bot, prev ?? "", subPhase, cause);
     }
 }

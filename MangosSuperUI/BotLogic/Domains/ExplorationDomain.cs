@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Domains;
 
@@ -56,6 +57,7 @@ public class ExplorationDomain : IBotDomain
         float newY = state.Y + (float)Math.Sin(angle) * distance;
         var (jitterX, jitterY) = WeightedRoller.Jitter(newX, newY);
 
+        AdvanceTo(bot, "Wandering", "enter_explore");
         return new List<BridgeCommand>
         {
             new BridgeCommand("MOVE_TO", new { mapId = state.MapId, x = jitterX, y = jitterY, z = state.Z })
@@ -79,7 +81,7 @@ public class ExplorationDomain : IBotDomain
                 var (jitterX, jitterY) = WeightedRoller.Jitter(newX, newY);
 
                 commands.Add(new BridgeCommand("MOVE_TO", new { mapId = state.MapId, x = jitterX, y = jitterY, z = state.Z }));
-                bot.CurrentActivity.SubPhase = "Wandering";
+                AdvanceTo(bot, "Wandering");
             }
         }
 
@@ -90,10 +92,22 @@ public class ExplorationDomain : IBotDomain
     {
         if (evt.EventType == "TASK_COMPLETE")
         {
-            bot.CurrentActivity.SubPhase = "Arrived";
+            AdvanceTo(bot, "Arrived");
         }
         return new List<BridgeCommand>();
     }
 
     private static float Lerp(float min, float max, float t) => min + (max - min) * t;
+
+    /// <summary>
+    /// Single sub-phase transition point so the flight recorder sees every move.
+    /// MOVE_TO sets owner → WAIT on TASK_COMPLETE via the command map; arrival flips
+    /// it back. Wandering is short-lived and self-limiting, so no special owner needed.
+    /// </summary>
+    private void AdvanceTo(BotIdentity bot, string subPhase, string cause = "advance")
+    {
+        var prev = bot.CurrentActivity.SubPhase;
+        bot.CurrentActivity.SubPhase = subPhase;
+        BotTrace.Transition(bot, prev ?? "", subPhase, cause);
+    }
 }

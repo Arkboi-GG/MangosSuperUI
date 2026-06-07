@@ -102,7 +102,14 @@ public class ItemTextureService
         // Generate on demand
         try
         {
-            var modelInfo = _dbc.GetItemModelInfo(displayId);
+            // ── Check if this is a custom retexture (displayId 60000+) ──
+            // If so, use the ORIGINAL displayId's M2/textures but swap in
+            // the custom BLP from the DB. This makes the 3D viewer show
+            // the retextured model instead of vanilla.
+            var retexInfo = GetRetextureInfo(displayId);
+            uint resolvedDisplayId = retexInfo?.OrigDisplayId ?? displayId;
+
+            var modelInfo = _dbc.GetItemModelInfo(resolvedDisplayId);
             if (modelInfo == null) return null;
 
             string? modelName = !string.IsNullOrEmpty(modelInfo.Value.ModelName1)
@@ -155,6 +162,61 @@ public class ItemTextureService
                 }
             }
 
+            // ── Inject custom BLP from DB (replaces the vanilla texture
+            //    that was retextured) ──
+            if (retexInfo != null && retexInfo.CustomBlp != null)
+            {
+                // Find which texture slot the retexture replaced by matching
+                // the original texture filename against the M2's texture refs
+                // and the DBC texture names.
+                int injectedSlot = -1;
+                string retexFilename = retexInfo.OrigTexFilename;
+
+                // First: check M2 embedded texture filenames
+                for (int i = 0; i < m2Model.Textures.Count; i++)
+                {
+                    var texRef = m2Model.Textures[i];
+                    if (!string.IsNullOrEmpty(texRef.Filename) &&
+                        Path.GetFileName(texRef.Filename)
+                            .Equals(retexFilename, StringComparison.OrdinalIgnoreCase))
+                    {
+                        injectedSlot = i;
+                        break;
+                    }
+                }
+
+                // Second: check DBC texture names (type-1 skin textures
+                // that aren't stored by filename in the M2)
+                if (injectedSlot < 0)
+                {
+                    string retexBase = Path.GetFileNameWithoutExtension(retexFilename);
+                    if (!string.IsNullOrEmpty(modelInfo.Value.TextureName1) &&
+                        modelInfo.Value.TextureName1.Equals(retexBase, StringComparison.OrdinalIgnoreCase))
+                    {
+                        injectedSlot = FindSkinTextureSlot(m2Model,
+                            new Dictionary<int, byte[]>()); // find the canonical slot
+                    }
+                    else if (!string.IsNullOrEmpty(modelInfo.Value.TextureName2) &&
+                             modelInfo.Value.TextureName2.Equals(retexBase, StringComparison.OrdinalIgnoreCase))
+                    {
+                        injectedSlot = FindSkinTextureSlot2(m2Model,
+                            new Dictionary<int, byte[]>());
+                    }
+                }
+
+                // Third: fallback — replace the first skin/object-skin slot
+                if (injectedSlot < 0)
+                    injectedSlot = FindSkinTextureSlot(m2Model, new Dictionary<int, byte[]>());
+
+                if (injectedSlot >= 0)
+                {
+                    textures[injectedSlot] = retexInfo.CustomBlp;
+                    _logger.LogInformation(
+                        "ItemTexture/GLB: Injected custom BLP into slot {Slot} for retexture displayId {Id} (from {Orig})",
+                        injectedSlot, displayId, retexInfo.OrigDisplayId);
+                }
+            }
+
             if (textures.Count == 0)
             {
                 _logger.LogDebug("ItemTexture: No textures for GLB, displayId {Id}", displayId);
@@ -179,6 +241,42 @@ public class ItemTextureService
             _logger.LogWarning(ex, "ItemTexture: GLB generation failed for displayId {Id}", displayId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Lightweight retexture lookup for EnsureGlb — just the fields needed
+    /// to inject the custom BLP into the GLB texture dict.
+    /// Returns null for non-retextured displayIds.
+    /// </summary>
+    private RetextureGlbInfo? GetRetextureInfo(uint displayId)
+    {
+        try
+        {
+            using var conn = _db.Admin();
+            var row = conn.QueryFirstOrDefault(
+                @"SELECT display_id, texture_filename, custom_blp
+                  FROM custom_item_retexture
+                  WHERE new_display_id = @Did
+                  LIMIT 1",
+                new { Did = displayId });
+
+            if (row == null) return null;
+
+            return new RetextureGlbInfo
+            {
+                OrigDisplayId = (uint)row.display_id,
+                OrigTexFilename = (string)(row.texture_filename ?? ""),
+                CustomBlp = row.custom_blp as byte[]
+            };
+        }
+        catch { return null; }
+    }
+
+    private class RetextureGlbInfo
+    {
+        public uint OrigDisplayId { get; set; }
+        public string OrigTexFilename { get; set; } = "";
+        public byte[]? CustomBlp { get; set; }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -585,10 +683,31 @@ public class ItemTextureService
 
     /// <summary>
     /// Invalidate cache for a displayId (after retexture).
+    /// Clears both the in-memory texture cache and the on-disk GLB file
+    /// so the next request regenerates with the updated texture.
     /// </summary>
     public void InvalidateCache(uint displayId)
     {
         _cache.TryRemove(displayId, out _);
+
+        // Also delete the cached GLB so it regenerates with the new texture
+        try
+        {
+            var glbDir = Path.Combine(_env.WebRootPath, "item_models");
+            if (Directory.Exists(glbDir))
+            {
+                // Match both versioned and unversioned filenames
+                foreach (var file in Directory.GetFiles(glbDir, $"{displayId}.*glb"))
+                {
+                    File.Delete(file);
+                    _logger.LogInformation("ItemTexture: Deleted cached GLB {File} for invalidation", Path.GetFileName(file));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ItemTexture: Failed to delete cached GLB for displayId {Id}", displayId);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════

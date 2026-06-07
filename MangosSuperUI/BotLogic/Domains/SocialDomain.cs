@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Domains;
 
@@ -43,7 +44,7 @@ public class SocialDomain : IBotDomain
     public List<BridgeCommand> OnEnter(BotIdentity bot, BotStateSnapshot state)
     {
         bot.CurrentActivity.ContextTag = $"zone:{state.ZoneId}:social";
-        bot.CurrentActivity.SubPhase = "Loitering";
+        AdvanceTo(bot, "Loitering");
 
         var commands = new List<BridgeCommand>();
 
@@ -126,4 +127,16 @@ public class SocialDomain : IBotDomain
     }
 
     private static float Lerp(float min, float max, float t) => min + (max - min) * t;
+
+    /// <summary>
+    /// Single sub-phase transition point so the flight recorder sees every move.
+    /// Loitering is self-limiting (max-loiter weight decay); emotes are fire-and-forget
+    /// SAY_TEXT with no expected ack, so owner stays CS throughout — correct.
+    /// </summary>
+    private void AdvanceTo(BotIdentity bot, string subPhase, string cause = "advance")
+    {
+        var prev = bot.CurrentActivity.SubPhase;
+        bot.CurrentActivity.SubPhase = subPhase;
+        BotTrace.Transition(bot, prev ?? "", subPhase, cause);
+    }
 }

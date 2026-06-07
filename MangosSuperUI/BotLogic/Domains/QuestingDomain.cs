@@ -222,6 +222,10 @@ public class QuestingDomain : IBotDomain
         bot.CurrentActivity.IsInterruptible = false; // don't let strategic eval interrupt sync
         commands.Add(new BridgeCommand("QUERY_QUEST_STATUS", new { }));
 
+        // FLIGHT RECORDER: entering Questing parks here until C++ answers QUEST_STATUS_ALL.
+        BotTrace.Transition(bot, "", "WaitingForQuestSync", "enter_questing",
+            waitingOn: WaitOn.Event("QUEST_STATUS_ALL"), state: state);
+
         _logger.LogInformation(
             "[BOT-QUEST] {Name}({Guid}) | OnEnter — requesting C++ quest status sync",
             bot.Name, bot.Guid);
@@ -1142,6 +1146,7 @@ public class QuestingDomain : IBotDomain
                 _logger.LogDebug(
                     "[BOT-GROUP] {Name}({Guid}) | Waiting for all group members to turn in before picking new batch",
                     bot.Name, bot.Guid);
+                BotTrace.Wait(bot, WaitOn.GroupTurnedIn, "follower: picking blocked", state);
                 return commands;
             }
 
@@ -1160,6 +1165,7 @@ public class QuestingDomain : IBotDomain
             _logger.LogDebug(
                 "[BOT-GROUP] {Name}({Guid}) | Waiting for all group members to turn in before picking new batch",
                 bot.Name, bot.Guid);
+            BotTrace.Wait(bot, WaitOn.GroupTurnedIn, "grouped: picking blocked", state);
             return commands;
         }
 
@@ -1169,6 +1175,7 @@ public class QuestingDomain : IBotDomain
             _logger.LogDebug(
                 "[BOT-GROUP] {Name}({Guid}) | Pace-setter waiting for group members to finish vendoring/training/eating",
                 bot.Name, bot.Guid);
+            BotTrace.Wait(bot, WaitOn.GroupQuesting, "leader: peers on errands", state);
             return commands;
         }
 
@@ -1370,6 +1377,11 @@ public class QuestingDomain : IBotDomain
         {
             bot.CurrentActivity.ContextTag = "quests:none_available";
             bot.CurrentActivity.SubPhase = "NoQuestsAvailable";
+
+            // FLIGHT RECORDER: the leader's Session 34 dead-end. Capture WHY nothing was safe.
+            BotTrace.Transition(bot, "PickingQuests", "NoQuestsAvailable", "no_safe_quests",
+                detail: $"wrongMap={filteredWrongMap} tooFar={filteredTooFar} unsafe={filteredUnsafe}",
+                state: state);
 
             _logger.LogWarning(
                 "[BOT-WARN] {Name}({Guid}) | PickingQuests: 0 safe quests! " +
@@ -1724,6 +1736,7 @@ public class QuestingDomain : IBotDomain
                     _logger.LogDebug(
                         "[BOT-GROUP] {Name}({Guid}) | All MY objectives done but groupmates still working — waiting",
                         bot.Name, bot.Guid);
+                    BotTrace.Wait(bot, WaitOn.GroupObjectives, "objectives done, holding for peers", state);
                     // Stay in DoingObjectives — keep grinding for XP and shared kill credit
                     return new List<BridgeCommand>();
                 }
@@ -2916,6 +2929,10 @@ public class QuestingDomain : IBotDomain
         bot.CurrentActivity.SubPhase = subPhase;
         _logger.LogInformation("[BOT-PHASE] {Name}({Guid}) | {Prev} → {Next}",
             bot.Name, bot.Guid, prev ?? "null", subPhase);
+
+        // FLIGHT RECORDER: single chokepoint for every sub-phase transition (45 callers).
+        // owner → CS (the bot just decided to move forward); group gates ride along via Emit.
+        BotTrace.Transition(bot, prev ?? "", subPhase, "advance");
     }
 
     private List<BridgeCommand> FallbackToPickingQuests(BotIdentity bot)

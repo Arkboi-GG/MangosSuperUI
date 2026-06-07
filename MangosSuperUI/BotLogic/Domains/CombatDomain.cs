@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Domains;
 
@@ -95,6 +96,13 @@ public class CombatDomain : IBotDomain
     {
         // Update interruptibility based on combat state
         bot.CurrentActivity.IsInterruptible = !state.InCombat;
+
+        // FLIGHT RECORDER: the grind is an indefinite C++ hand-off (SET_TASK kill_count=0),
+        // so there's no TASK_COMPLETE to wait on — owner is CPP, not WAIT. This overrides
+        // the WAIT the SET_TASK command set on entry; emits once, then KILL pings keep it
+        // alive (see OnEvent). Without this the indefinite grind would trip the WAIT sweep.
+        BotTrace.Wait(bot, WaitOn.Cpp("grind"), "grinding", state);
+
         return new List<BridgeCommand>();
     }
 
@@ -106,6 +114,9 @@ public class CombatDomain : IBotDomain
         {
             // Note the kill for activity context
             bot.CurrentActivity.ContextTag = $"zone:{state.ZoneId}:kill:{evt.CreatureEntry}";
+            // FLIGHT RECORDER: a kill is the grind's progress signal — re-arm the CPP sweep
+            // so an actively-killing bot is never flagged; only one that stopped killing trips it.
+            BotTrace.Ping(bot);
         }
         else if (evt.EventType == "TASK_COMPLETE")
         {

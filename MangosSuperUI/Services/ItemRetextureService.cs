@@ -271,45 +271,23 @@ public class ItemRetextureService
             }
 
             // ── Step 6: Build MPQ paths ──
+            // DBC-only approach: no M2 cloning.
+            // The vanilla M2 uses type-1 textures resolved via ItemDisplayInfo.dbc,
+            // not embedded filenames. We just need:
+            //   - Custom BLP in the same directory as the vanilla M2
+            //   - DBC TextureName1 pointing at the custom BLP name (no ext, no dir)
+            //   - DBC ModelName1 unchanged (vanilla M2 from base MPQs)
             string customBlpName = $"Custom_{request.DisplayId}_{Path.GetFileNameWithoutExtension(targetTex.Filename)}.blp";
             string customBlpMpqPath = customBlpName;
-
-            // ── Step 7: Clone M2 with patched texture path ──
-            byte[]? m2Bytes = null;
-            string? m2MpqPath = null;
 
             var modelInfo = texInfo.ModelName;
             if (!string.IsNullOrEmpty(modelInfo))
             {
-                m2Bytes = FindAndExtractItemM2(modelInfo);
-                if (m2Bytes != null)
-                {
-                    string m2BaseName = Path.GetFileNameWithoutExtension(modelInfo);
-                    string m2Dir = GuessM2Directory(modelInfo);
-                    m2MpqPath = $"{m2Dir}Custom_{request.DisplayId}_{m2BaseName}.m2";
-
-                    // BLP in same directory as M2
-                    customBlpMpqPath = $"{m2Dir}{customBlpName}";
-
-                    // Patch texture reference in M2
-                    var texEntries = M2TextureParser.ParseTextures(m2Bytes);
-                    var matchingTex = texEntries.FirstOrDefault(t =>
-                        !string.IsNullOrEmpty(t.Filename) &&
-                        Path.GetFileName(t.Filename).Equals(targetTex.Filename,
-                            StringComparison.OrdinalIgnoreCase));
-
-                    if (matchingTex != null)
-                    {
-                        var replacements = new Dictionary<int, string>
-                        {
-                            [matchingTex.Index] = customBlpMpqPath
-                        };
-                        M2TextureParser.PatchTextureFilenames(m2Bytes, replacements);
-                    }
-                }
+                string m2Dir = GuessM2Directory(modelInfo);
+                customBlpMpqPath = $"{m2Dir}{customBlpName}";
             }
 
-            // ── Step 8: Allocate new displayId and save to DB ──
+            // ── Step 7: Allocate new displayId and save to DB ──
             uint newDisplayId = await AllocateDisplayIdAsync();
 
             using (var conn = _db.Admin())
@@ -321,7 +299,7 @@ public class ItemRetextureService
                          prompt, style_direction)
                     VALUES
                         (@DisplayId, @NewDisplayId, @ItemName, @TexFilename, @TexMpqPath,
-                         @BlpMpqPath, @M2MpqPath, @BlpBytes, @M2Bytes,
+                         @BlpMpqPath, '', @BlpBytes, NULL,
                          @Prompt, @Style)",
                     new
                     {
@@ -331,17 +309,15 @@ public class ItemRetextureService
                         TexFilename = targetTex.Filename,
                         TexMpqPath = targetTex.MpqPath,
                         BlpMpqPath = customBlpMpqPath,
-                        M2MpqPath = m2MpqPath ?? "",
                         BlpBytes = blpBytes,
-                        M2Bytes = m2Bytes,
                         Prompt = prompt,
                         Style = request.StyleDirection
                     });
             }
 
             _logger.LogInformation(
-                "Retexture: Saved to DB — displayId {Old}→{New}, BLP: {Blp}, M2: {M2}",
-                request.DisplayId, newDisplayId, customBlpMpqPath, m2MpqPath ?? "(none)");
+                "Retexture: Saved to DB — displayId {Old}→{New}, BLP: {Blp}",
+                request.DisplayId, newDisplayId, customBlpMpqPath);
 
             // Register in DbcService so SuperUI knows about this displayId immediately
             // Pass null for both model and texture — clones everything from source.
@@ -354,7 +330,7 @@ public class ItemRetextureService
 
             result.PatchMpqPath = rebuildResult.PatchWebPath;
             result.CustomBlpMpqPath = customBlpMpqPath;
-            result.CustomM2MpqPath = m2MpqPath;
+            result.CustomM2MpqPath = null;
             result.NewDisplayId = newDisplayId;
             result.BlpSizeBytes = blpBytes.Length;
             result.Success = rebuildResult.Success;
@@ -362,6 +338,7 @@ public class ItemRetextureService
                 result.Error = rebuildResult.Error;
 
             _itemTextures.InvalidateCache(request.DisplayId);
+            _itemTextures.InvalidateCache(newDisplayId);
 
             _logger.LogInformation(
                 "Retexture: Complete! displayId {Old}→{New}, total retextures in patch: {Count}",
@@ -426,33 +403,25 @@ public class ItemRetextureService
                 uint origDisplayId = (uint)row.display_id;
                 uint newDisplayId = (uint)row.new_display_id;
                 string blpMpqPath = (string)row.custom_blp_mpq_path;
-                string m2MpqPath = (string)row.custom_m2_mpq_path;
                 byte[]? blpBytes = row.custom_blp as byte[];
-                byte[]? m2Bytes = row.custom_m2 as byte[];
 
                 if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
                     mpqBuilder.AddFile(blpMpqPath, blpBytes);
 
-                if (m2Bytes != null && !string.IsNullOrEmpty(m2MpqPath))
-                    mpqBuilder.AddFile(m2MpqPath, m2Bytes);
-
-                // Clone ItemDisplayInfo.dbc entry
+                // Clone ItemDisplayInfo.dbc entry — DBC-only approach:
+                // ModelName1 stays vanilla, only TextureName1 changes.
                 var sourceRow = displayDbc.GetRow(origDisplayId);
                 if (sourceRow != null && displayDbc.GetRow(newDisplayId) == null)
                 {
                     displayDbc.CloneRow(origDisplayId, newDisplayId);
 
-                    if (!string.IsNullOrEmpty(m2MpqPath))
-                    {
-                        string customM2Filename = Path.GetFileName(m2MpqPath);
-                        uint nameOfs = displayDbc.AddString(customM2Filename);
-                        displayDbc.PatchRow(newDisplayId, 1, nameOfs);
-                    }
-
+                    // Field 3 (TextureName1): custom BLP filename, no ext, no dir.
+                    // Linux Path.GetFileName doesn't split on backslash — normalize first.
                     if (!string.IsNullOrEmpty(blpMpqPath))
                     {
+                        string normalizedBlp = blpMpqPath.Replace('\\', '/');
                         string customTexName = Path.GetFileNameWithoutExtension(
-                            Path.GetFileName(blpMpqPath));
+                            Path.GetFileName(normalizedBlp));
                         uint texOfs = displayDbc.AddString(customTexName);
                         displayDbc.PatchRow(newDisplayId, 3, texOfs);
                     }

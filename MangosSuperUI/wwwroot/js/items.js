@@ -38,6 +38,17 @@ $(function () {
 
     // ===================== CONSTANTS =====================
 
+    // Check if patch-M.MPQ exists (retextures available for download)
+    function checkPatchMAvailable() {
+        $.ajax({
+            url: '/Items/DownloadPatch?file=patch-M.MPQ',
+            type: 'HEAD',
+            success: function () { $('#btnDownloadPatchM').show(); },
+            error: function () { $('#btnDownloadPatchM').hide(); }
+        });
+    }
+    checkPatchMAvailable();
+
     var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Artifact'];
     var QUALITY_COLORS = ['#9d9d9d', 'inherit', '#1eff00', '#0070dd', '#a335ee', '#ff8000', '#e6cc80'];
 
@@ -561,6 +572,7 @@ $(function () {
 
                     $('#retextureStatus').html(html);
                     $btn.prop('disabled', false).html('<i class="fa-solid fa-wand-magic-sparkles"></i> Generate Another');
+                    checkPatchMAvailable();
                 } else {
                     $('#retextureStatus').html(
                         '<div style="font-size:11px;color:var(--status-error);">' +
@@ -1498,7 +1510,8 @@ $(function () {
     });
 
     // ── Texture panel toggle ──
-    $('#itemTextureToggle').on('click', function () {
+    $('#itemTextureToggle').on('click', function (e) {
+        if ($(e.target).closest('.btn-download-patch').length) return;
         $(this).toggleClass('collapsed');
         $('#itemTextureBody').toggleClass('collapsed');
     });

@@ -36,6 +36,7 @@ public class BotBrainService : BackgroundService
     private readonly QuestGraphLoader _questGraph;
     private readonly ZoneSafetyMap _safetyMap;
     private readonly BotFleetDiagnostics _diagnostics;
+    private readonly BotFlightRecorder _recorder;
 
     // Per-bot instances
     private readonly ConcurrentDictionary<int, DecisionEngine> _engines = new();
@@ -265,6 +266,7 @@ public class BotBrainService : BackgroundService
         ZoneSafetyMap safetyMap,
         SpellProgressionLoader spellLoader,
         BotFleetDiagnostics diagnostics,
+        BotFlightRecorder recorder,
         ILoggerFactory loggerFactory)
     {
         _bridge = bridge;
@@ -281,6 +283,7 @@ public class BotBrainService : BackgroundService
         _zoneDataLoader = zoneDataLoader;
         _safetyMap = safetyMap;
         _diagnostics = diagnostics;
+        _recorder = recorder;
         _spellLoader = spellLoader;
         _questing = new QuestingDomain(_questGraph, _safetyMap, loggerFactory.CreateLogger<QuestingDomain>(), db, _diagnostics);
         _economy = new EconomyDomain(_zoneDataLoader, loggerFactory.CreateLogger<EconomyDomain>());
@@ -310,6 +313,7 @@ public class BotBrainService : BackgroundService
                 _initializedGuids.Clear();
                 _disconnectedAt.Clear();
                 _diagnostics.ResetSessionCounters();
+                _recorder.ResetSession();
                 _logger.LogInformation("BotBrain: cleared {Count} bot entries on disable — next enable starts clean", count);
             }
         }
@@ -389,6 +393,11 @@ public class BotBrainService : BackgroundService
         // Wire event routing from bridge → brain (avoids circular DI)
         _bridge.SetBrainService(this);
 
+        // Flight recorder: wire the static BotTrace facade so any domain can emit
+        // without a constructor ref, and load the per-guid trace allowlist from bot_settings.
+        BotTrace.Attach(_recorder);
+        await _recorder.LoadSettingsAsync();
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -407,6 +416,14 @@ public class BotBrainService : BackgroundService
 
                 // 4. Fleet diagnostics — flush issues to disk, generate health snapshot if due
                 _diagnostics.TickDiagnostics(_bots, guid =>
+                {
+                    var bs = _bridge.GetBotState(guid);
+                    if (bs == null) return (BotStateSnapshot?)null;
+                    return BotStateSnapshot.FromBridgeState(bs);
+                });
+
+                // 5. Flight recorder — flush timeline + run the auto-stuck sweep (no-op when off)
+                _recorder.TickTrace(_bots, guid =>
                 {
                     var bs = _bridge.GetBotState(guid);
                     if (bs == null) return (BotStateSnapshot?)null;
@@ -728,6 +745,9 @@ public class BotBrainService : BackgroundService
                     questId: bot.ActiveQuestId,
                     detail: stuckReason);
 
+                // FLIGHT RECORDER: capture the stuck activity BEFORE we reset it to Idle.
+                BotTrace.Mark(bot, $"WATCHDOG reset → Idle: {stuckReason}");
+
                 // Clear all transient state that could re-trigger the stuck domain
                 bot.CurrentActivity = new ActivityState
                 {
@@ -851,6 +871,11 @@ public class BotBrainService : BackgroundService
                     }
                 }
 
+                // FLIGHT RECORDER: STATE reconcile. bs.TaskState is the C++ self-report
+                // (IDLE/GRIND...) — already available, so the "C# thinks WAIT but C++ says
+                // IDLE" mismatch works now; Batch 4 enriches TaskState with more detail.
+                BotTrace.State(bot, state, bs.TaskState);
+
                 // Run decision tick
                 var result = await engine.Tick(bot, state);
 
@@ -884,6 +909,7 @@ public class BotBrainService : BackgroundService
 
                     if (hadGrindTask && result.NewActivity != ActivityType.Grinding)
                     {
+                        BotTrace.Command(bot, "SET_TASK", "IDLE-clear (activity change)", state);
                         await _bridge.SendSetTaskIdleAsync(guid);
                     }
                 }
@@ -891,6 +917,7 @@ public class BotBrainService : BackgroundService
                 // Execute resulting commands via bridge
                 foreach (var cmd in result.Commands)
                 {
+                    BotTrace.Command(bot, cmd.Type, state: state);
                     await _bridge.SendToBotAsync(guid, cmd.Type, cmd.Payload);
                 }
 
@@ -939,6 +966,10 @@ public class BotBrainService : BackgroundService
     {
         if (!_bots.TryGetValue(guid, out var bot)) return;
         if (!_engines.TryGetValue(guid, out var engine)) return;
+
+        // FLIGHT RECORDER: the notify arriving. Heuristically matches the open command
+        // (e.g. MOVE_TO→TASK_COMPLETE), computes round-trip latency, flips owner → CS.
+        BotTrace.Event(bot, evt.EventType, evt.Data);
 
         // KILL events always go to economy (shadow loot) regardless of activity
         if (evt.EventType == "KILL")
@@ -1201,7 +1232,10 @@ public class BotBrainService : BackgroundService
             var state = BotStateSnapshot.FromBridgeState(bs);
             var commands = engine.CurrentDomain.OnEvent(bot, state, evt);
             foreach (var cmd in commands)
+            {
+                BotTrace.Command(bot, cmd.Type, "reactive (OnEvent)", state);
                 await _bridge.SendToBotAsync(guid, cmd.Type, cmd.Payload);
+            }
         }
     }
 

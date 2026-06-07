@@ -164,6 +164,8 @@ public class GroupManager
         _logger.LogInformation("[BOT-GROUP] Formed group {GroupId}: leader={Leader}, members=[{Members}]",
             group.GroupId, leaderGuid, string.Join(",", allMembers));
 
+        BotTrace.GroupEvent("form", group.GroupId, leaderGuid, allMembers);
+
         return group;
     }
 
@@ -182,6 +184,8 @@ public class GroupManager
         _logger.LogInformation("[BOT-GROUP] Disbanded group {GroupId} (was: [{Members}])",
             groupId, string.Join(",", group.MemberGuids));
 
+        BotTrace.GroupEvent("disband", groupId, group.LeaderGuid, group.MemberGuids);
+
         return true;
     }
 
@@ -196,6 +200,9 @@ public class GroupManager
 
         _logger.LogInformation("[BOT-GROUP] Removed bot {Guid} from group {GroupId}", botGuid, group.GroupId);
 
+        BotTrace.GroupEvent("remove", group.GroupId, group.LeaderGuid, group.MemberGuids,
+            detail: $"removed={botGuid} remaining=[{string.Join(",", group.MemberGuids)}]");
+
         // If only 1 member left, disband
         if (group.MemberGuids.Count <= 1)
         {
@@ -207,6 +214,8 @@ public class GroupManager
             group.LeaderGuid = group.MemberGuids.Min();
             _logger.LogInformation("[BOT-GROUP] New leader for group {GroupId}: {NewLeader}",
                 group.GroupId, group.LeaderGuid);
+            BotTrace.GroupEvent("promote_leader", group.GroupId, group.LeaderGuid, group.MemberGuids,
+                detail: $"oldLeader={botGuid} newLeader={group.LeaderGuid} — followers must re-enrich");
         }
 
         return true;
@@ -489,6 +498,9 @@ public class GroupManager
                     _logger.LogInformation(
                         "[BOT-GROUP] No-bot-left-behind: added {Name}({Guid}) to group {GroupId} (now {Size} members)",
                         stray.Name, stray.Guid, bestGroup.GroupId, bestGroup.Size);
+
+                    BotTrace.GroupEvent("add_stray", bestGroup.GroupId, bestGroup.LeaderGuid, bestGroup.MemberGuids,
+                        detail: $"added={stray.Guid} ({stray.Name}) now {bestGroup.Size} members");
                 }
             }
         }

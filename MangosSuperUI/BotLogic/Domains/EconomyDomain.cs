@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 using Microsoft.Extensions.Logging;
 
 namespace MangosSuperUI.BotLogic.Domains;
@@ -139,7 +140,7 @@ public class EconomyDomain : IBotDomain
             _logger.LogInformation(
                 "[BOT-ECON] {Name} entered Vendoring but bags nearly empty ({Used}/{Total} used). Skipping.",
                 bot.Name, usedSlots, state.TotalSlots);
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
         }
@@ -149,7 +150,7 @@ public class EconomyDomain : IBotDomain
         {
             _logger.LogWarning("[BOT-ECON] {Name} needs to vendor but no vendor found in zone {Zone} map {Map}",
                 bot.Name, state.ZoneId, state.MapId);
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
         }
@@ -172,7 +173,7 @@ public class EconomyDomain : IBotDomain
             bot.Name, vendor.NpcName, vendor.NpcEntry, vendor.X, vendor.Y, vendor.Z,
             dist, state.FreeSlots, state.TotalSlots);
 
-        bot.CurrentActivity.SubPhase = "TravelingToVendor";
+        AdvanceTo(bot, "TravelingToVendor");
         bot.CurrentActivity.ContextTag = $"vendor:{vendor.NpcName}";
 
         // MOVE_TO with jitter
@@ -230,7 +231,7 @@ public class EconomyDomain : IBotDomain
                     _logger.LogWarning("[BOT-ECON] {Name} unknown sub-phase '{Phase}', resetting",
                         bot.Name, subPhase);
                 }
-                bot.CurrentActivity.SubPhase = "Done";
+                AdvanceTo(bot, "Done");
                 bot.NextStrategicEval = DateTime.UtcNow;
                 break;
         }
@@ -244,7 +245,7 @@ public class EconomyDomain : IBotDomain
 
         if (!bot.VendorNpcEntry.HasValue)
         {
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
         }
@@ -256,7 +257,7 @@ public class EconomyDomain : IBotDomain
         {
             _logger.LogInformation("[BOT-ECON] {Name} arrived at vendor (entry={Entry}, {Dist:F0}yd)",
                 bot.Name, bot.VendorNpcEntry, dist);
-            bot.CurrentActivity.SubPhase = "Selling";
+            AdvanceTo(bot, "Selling");
             // Fall through — send SELL_ITEMS immediately (sub-phase chain)
             commands.AddRange(ProcessSelling(bot, state));
             return commands;
@@ -289,7 +290,7 @@ public class EconomyDomain : IBotDomain
         if (!bot.VendorNpcEntry.HasValue)
         {
             _logger.LogWarning("[BOT-ECON] {Name} in Selling sub-phase but no vendor entry stored", bot.Name);
-            bot.CurrentActivity.SubPhase = "Done";
+            AdvanceTo(bot, "Done");
             bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
         }
@@ -310,7 +311,7 @@ public class EconomyDomain : IBotDomain
             keep_quality = keepQuality
         }));
 
-        bot.CurrentActivity.SubPhase = "WaitingForSellAck";
+        AdvanceTo(bot, "WaitingForSellAck");
         bot.VendorTravelStarted = DateTime.UtcNow; // reuse for sell timeout tracking
 
         return commands;
@@ -323,7 +324,7 @@ public class EconomyDomain : IBotDomain
             (DateTime.UtcNow - bot.VendorTravelStarted.Value).TotalSeconds > 30)
         {
             _logger.LogWarning("[BOT-ECON] {Name} timed out waiting for SELL_ACK, forcing complete", bot.Name);
-            bot.CurrentActivity.SubPhase = "VendorComplete";
+            AdvanceTo(bot, "VendorComplete");
         }
     }
 
@@ -337,7 +338,7 @@ public class EconomyDomain : IBotDomain
 
         // Force immediate strategic re-eval → PendingAction return or weighted roll
         bot.NextStrategicEval = DateTime.UtcNow;
-        bot.CurrentActivity.SubPhase = "Done";
+        AdvanceTo(bot, "Done");
     }
 
     // ======================== Repair Sub-Phases (Session 32) ========================
@@ -353,7 +354,7 @@ public class EconomyDomain : IBotDomain
         if (!bot.VendorNpcEntry.HasValue)
         {
             _logger.LogWarning("[BOT-ECON] {Name} in Repairing sub-phase but no vendor entry stored", bot.Name);
-            bot.CurrentActivity.SubPhase = "VendorComplete";
+            AdvanceTo(bot, "VendorComplete");
             return commands;
         }
 
@@ -365,7 +366,7 @@ public class EconomyDomain : IBotDomain
             npc_entry = bot.VendorNpcEntry.Value
         }));
 
-        bot.CurrentActivity.SubPhase = "WaitingForRepairAck";
+        AdvanceTo(bot, "WaitingForRepairAck");
         bot.VendorTravelStarted = DateTime.UtcNow; // reuse for repair timeout tracking
 
         return commands;
@@ -380,7 +381,7 @@ public class EconomyDomain : IBotDomain
             (DateTime.UtcNow - bot.VendorTravelStarted.Value).TotalSeconds > 15)
         {
             _logger.LogWarning("[BOT-ECON] {Name} timed out waiting for REPAIR_ACK, skipping repair", bot.Name);
-            bot.CurrentActivity.SubPhase = "VendorComplete";
+            AdvanceTo(bot, "VendorComplete");
         }
     }
 
@@ -433,11 +434,11 @@ public class EconomyDomain : IBotDomain
                         // damaged gear from deaths but nothing to vendor.
                         if (ShouldRepair(bot))
                         {
-                            bot.CurrentActivity.SubPhase = "Repairing";
+                            AdvanceTo(bot, "Repairing");
                         }
                         else
                         {
-                            bot.CurrentActivity.SubPhase = "Done";
+                            AdvanceTo(bot, "Done");
                             bot.NextStrategicEval = DateTime.UtcNow;
                         }
                         bot.VendorCooldownUntil = DateTime.UtcNow.AddMinutes(10);
@@ -447,11 +448,11 @@ public class EconomyDomain : IBotDomain
                         // Session 32: repair after selling if vendor supports it
                         if (ShouldRepair(bot))
                         {
-                            bot.CurrentActivity.SubPhase = "Repairing";
+                            AdvanceTo(bot, "Repairing");
                         }
                         else
                         {
-                            bot.CurrentActivity.SubPhase = "VendorComplete";
+                            AdvanceTo(bot, "VendorComplete");
                         }
                     }
                     break;
@@ -463,7 +464,7 @@ public class EconomyDomain : IBotDomain
                     var reason = parts.GetValueOrDefault("reason", "unknown");
 
                     _logger.LogWarning("[BOT-ECON] {Name} SELL_FAIL: {Reason}. Aborting vendor attempt.", bot.Name, reason);
-                    bot.CurrentActivity.SubPhase = "Done";
+                    AdvanceTo(bot, "Done");
                     bot.NextStrategicEval = DateTime.UtcNow;
                     break;
                 }
@@ -491,7 +492,7 @@ public class EconomyDomain : IBotDomain
                         "[BOT-ECON] {Name} REPAIR_ACK: cost {Cost}c, {Total}c remaining.",
                         bot.Name, repairCost, copperAfter);
 
-                    bot.CurrentActivity.SubPhase = "VendorComplete";
+                    AdvanceTo(bot, "VendorComplete");
                     break;
                 }
 
@@ -504,7 +505,7 @@ public class EconomyDomain : IBotDomain
                         bot.Name, reason);
 
                     // Not fatal — just skip repair and continue to VendorComplete
-                    bot.CurrentActivity.SubPhase = "VendorComplete";
+                    AdvanceTo(bot, "VendorComplete");
                     break;
                 }
         }
@@ -609,6 +610,21 @@ public class EconomyDomain : IBotDomain
     }
 
     // ======================== Helpers ========================
+
+    /// <summary>
+    /// Single sub-phase transition point. All SubPhase changes route through here so
+    /// the flight recorder sees every move. Owner stays CS (the bot just decided to
+    /// advance) — the command machinery flips to WAIT when a SELL_ITEMS / REPAIR_AT_NPC /
+    /// MOVE_TO actually goes out, and the matching ack/event clears it back to CS.
+    /// </summary>
+    private void AdvanceTo(BotIdentity bot, string subPhase, string cause = "advance")
+    {
+        var prev = bot.CurrentActivity.SubPhase;
+        bot.CurrentActivity.SubPhase = subPhase;
+        _logger.LogInformation("[BOT-PHASE] {Name}({Guid}) | {Prev} → {Next}",
+            bot.Name, bot.Guid, prev ?? "null", subPhase);
+        BotTrace.Transition(bot, prev ?? "", subPhase, cause);
+    }
 
     private static Dictionary<string, string> ParsePipeDelimited(string? data)
     {

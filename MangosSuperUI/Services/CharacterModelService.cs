@@ -231,6 +231,48 @@ public class CharacterModelService
                 }
             }
 
+            // ── Extract type-0 textures with embedded filenames ──
+            //
+            // Character M2s declare a small texture array (~3-4 entries).
+            // Type-1 (body skin) and type-6 (hair) are resolved above from
+            // DBC/CharSections. Type-0 entries have their BLP path baked
+            // directly into the M2 binary — the WoW client loads them
+            // verbatim. These include the NightElf eye glow BLP and similar
+            // race-specific overlays.
+            //
+            // Without extracting these, the SkinnedGlbWriter has no texture
+            // for submeshes that reference type-0 slots, so they fall through
+            // to the body atlas material — painting body-skin pixels onto
+            // eye geometry, producing the "closed eyes" look.
+            for (int i = 0; i < m2.Textures.Count; i++)
+            {
+                var tex = m2.Textures[i];
+                if (tex.Type != 0 || string.IsNullOrEmpty(tex.Filename))
+                    continue;
+                if (textures.ContainsKey(i))
+                    continue;  // already populated (shouldn't happen for type-0, but defensive)
+
+                var blpData = _mpq.ExtractFile(tex.Filename);
+                if (blpData == null)
+                {
+                    // Try with backslash normalization
+                    blpData = _mpq.ExtractFile(tex.Filename.Replace('/', '\\'));
+                }
+                if (blpData != null)
+                {
+                    textures[i] = blpData;
+                    _logger.LogInformation(
+                        "CharacterModelService: bound type-0 texture slot {Slot} for {Key} from '{Path}'",
+                        i, key, tex.Filename);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "CharacterModelService: type-0 texture not in MPQ for {Key} slot={Slot} path='{Path}'",
+                        key, i, tex.Filename);
+                }
+            }
+
             // Also extract the skin PNG side-by-side for Session C texture compositing.
             // The web canvas compositor reads from /character_textures/skin/<key>Skin00_00.v{N}.png.
             // PNG is versioned independently of the GLB so a BLP-decode

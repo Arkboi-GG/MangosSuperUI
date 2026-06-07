@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 using Microsoft.Extensions.Logging;
 
 namespace MangosSuperUI.BotLogic.Core;
@@ -116,6 +117,10 @@ public class DecisionEngine
 
                 // Clear pending action — it's consumed
                 bot.PendingAction = null;
+
+                // FLIGHT RECORDER: cross-domain return (e.g., vendoring done → resume turn-in)
+                BotTrace.Transition(bot, pending.ReturnTo.ToString(), pending.SubPhase ?? "",
+                    "pending_return", detail: $"quest={pending.QuestId}", state: state);
 
                 // Enter the return domain
                 var returnDomain = _domainMap.TryGetValue(pending.ReturnTo, out var rd) ? rd : CurrentDomain;
@@ -280,6 +285,12 @@ public class DecisionEngine
                 bot.Name, stuckReport.Type, stuckReport.Pattern,
                 stuckReport.Occurrences, stuckReport.Window);
 
+            // FLIGHT RECORDER: pattern-loop signal (complements the recorder's
+            // ownership-freeze sweep — this catches activity ping-ponging).
+            BotTrace.Mark(bot,
+                $"stuck-detector {stuckReport.Type}: {stuckReport.Pattern} x{stuckReport.Occurrences}",
+                state);
+
             // Emit SignalR for dashboard visibility
             // (use existing BotDecision emit pattern)
 
@@ -295,6 +306,9 @@ public class DecisionEngine
             RollValue = rollValue,
             ActivityChanged = selectedActivity != currentActivity.Type
         };
+
+        // FLIGHT RECORDER: the brain's actual decision — full weight vector, winner, roll.
+        BotTrace.Decision(bot, result, wasCritical ? "critical" : "strategic", state);
 
         // ── DIAGNOSTIC: Strategic eval weight breakdown ──
         var topWeights = weights
@@ -359,6 +373,12 @@ public class DecisionEngine
                 StartedAt = DateTime.UtcNow,
                 IsInterruptible = selectedActivity != ActivityType.CorpseRunning
             };
+
+            // FLIGHT RECORDER: strategic activity switch (the domain's OnEnter below
+            // will emit its own sub-phase transition once Batch 3 instruments it).
+            BotTrace.Transition(bot, currentActivity.Type.ToString(), selectedActivity.ToString(),
+                wasCritical ? "critical_switch" : "strategic_switch",
+                detail: $"roll={rollValue:F2}", state: state);
 
             if (_domainMap.TryGetValue(selectedActivity, out var newDomain))
             {

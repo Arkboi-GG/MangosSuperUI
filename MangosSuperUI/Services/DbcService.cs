@@ -57,6 +57,14 @@ public class DbcService
     public IReadOnlyList<CharSectionDbc> CharacterSections { get; private set; }
         = Array.Empty<CharSectionDbc>();
 
+    /// <summary>
+    /// HelmetGeosetVisData.dbc — vanilla 1.12, 6 fields × 24 bytes, ~16 rows.
+    /// Maps helmetGeosetVisID → race-indexed bitmasks for hiding hair, facial
+    /// hair, and ears when a helm is equipped. Used by DoesHelmHideHair().
+    /// </summary>
+    private IReadOnlyDictionary<uint, HelmetGeosetVisEntry> HelmetGeosetVisData { get; set; }
+        = new Dictionary<uint, HelmetGeosetVisEntry>();
+
     // ── Status / diagnostics ──────────────────────────────────────────────
 
     public bool IsLoaded { get; private set; }
@@ -149,6 +157,28 @@ public class DbcService
                 return row;
         }
         return null;
+    }
+
+    /// <summary>
+    /// Check whether a helm's HelmetGeosetVisData row hides hair for a
+    /// given race. Uses the proper DBC decode: field[1] (hairFlags) is a
+    /// bitmask over ChrRaces — if bit (1 &lt;&lt; raceId) is set, that race's
+    /// hair should be suppressed.
+    ///
+    /// Replaces the v1!=v2 heuristic from Session L, which failed on
+    /// helms where both m_helmetGeosetVisID fields point to the same row
+    /// (e.g. Dreadnaught Helmet: v1=v2=368, hairFlags=0xFFFFFFFF).
+    ///
+    /// Vanilla race IDs: 1=Human, 2=Orc, 3=Dwarf, 4=NightElf,
+    /// 5=Undead, 6=Tauren, 7=Gnome, 8=Troll.
+    /// </summary>
+    public bool DoesHelmHideHair(uint helmetGeosetVisId, uint raceId)
+    {
+        if (helmetGeosetVisId == 0)
+            return false;  // no vis row assigned → show hair
+        if (!HelmetGeosetVisData.TryGetValue(helmetGeosetVisId, out var entry))
+            return false;  // unknown row → safe default: show hair
+        return (entry.HairFlags >> (int)raceId & 1) == 1;
     }
 
     /// <summary>
@@ -357,6 +387,7 @@ public class DbcService
             SpellRanges = LoadSpellRange(Path.Combine(DbcPath, "SpellRange.dbc"));
             SpellEntries = LoadSpellEntries(Path.Combine(DbcPath, "Spell.dbc"));
             CharacterSections = LoadCharSections(Path.Combine(DbcPath, "CharSections.dbc"));
+            HelmetGeosetVisData = LoadHelmetGeosetVisData(Path.Combine(DbcPath, "HelmetGeosetVisData.dbc"));
 
             IsLoaded = true;
             _logger.LogInformation("DbcService: Loaded successfully — {Counts}",
@@ -766,6 +797,65 @@ public class DbcService
     }
 
     /// <summary>
+    /// HelmetGeosetVisData.dbc — vanilla 1.12, 6 fields × 24 bytes, ~16 rows.
+    /// Field layout (all uint32, no string fields):
+    ///   [0] m_ID
+    ///   [1] m_hairFlags        — bitmask: bit (1 &lt;&lt; raceId) → hide hair for that race
+    ///   [2] m_facialHairFlags0 — bitmask: hide facial hair (beard)
+    ///   [3] m_facialHairFlags1 — bitmask: hide facial hair (moustache/sideburns)
+    ///   [4] m_facialHairFlags2 — bitmask: hide facial hair (group 3)
+    ///   [5] m_earsFlags        — bitmask: hide ears for that race
+    ///
+    /// Referenced by ItemDisplayInfo.dbc fields [12-13] (m_helmetGeosetVisID).
+    /// Each helm item has two vis IDs; the client picks one based on gender.
+    /// We check v1 (male) via DoesHelmHideHair for the current race.
+    ///
+    /// Verified empirically May 19 2026:
+    ///   Row 245 hairFlags=0x00000000 → circlets/open helms (no hiding)
+    ///   Row 247 hairFlags=0x00000000 → Helm of Might / Defias Mask (open)
+    ///   Row 248 hairFlags=0xFFFFFFBF → Helm of Wrath (closed, all races except Tauren)
+    ///   Row 368 hairFlags=0xFFFFFFFF → Dreadnaught (closed, all races incl Tauren)
+    /// </summary>
+    private Dictionary<uint, HelmetGeosetVisEntry> LoadHelmetGeosetVisData(string filePath)
+    {
+        var dict = new Dictionary<uint, HelmetGeosetVisEntry>();
+        if (!File.Exists(filePath))
+        {
+            _logger.LogWarning("DbcService: HelmetGeosetVisData.dbc not found at {Path}", filePath);
+            LoadedCounts["HelmetGeosetVisData"] = 0;
+            return dict;
+        }
+
+        var (records, _, recordSize) = ReadDbcFile(filePath);
+        int recordCount = records.Length / recordSize;
+
+        if (recordSize != 24)
+        {
+            _logger.LogWarning(
+                "DbcService: HelmetGeosetVisData.dbc recordSize={Size} (expected 24 for vanilla 1.12). " +
+                "Field offsets may be incorrect.", recordSize);
+        }
+
+        for (int i = 0; i < recordCount; i++)
+        {
+            int offset = i * recordSize;
+            uint id = BitConverter.ToUInt32(records, offset + 0);
+            uint hairFlags = BitConverter.ToUInt32(records, offset + 4);
+            uint facial0 = BitConverter.ToUInt32(records, offset + 8);
+            uint facial1 = BitConverter.ToUInt32(records, offset + 12);
+            uint facial2 = BitConverter.ToUInt32(records, offset + 16);
+            uint earsFlags = BitConverter.ToUInt32(records, offset + 20);
+
+            dict[id] = new HelmetGeosetVisEntry(id, hairFlags, facial0, facial1, facial2, earsFlags);
+        }
+
+        LoadedCounts["HelmetGeosetVisData"] = dict.Count;
+        _logger.LogInformation(
+            "DbcService: Parsed {Count} HelmetGeosetVisData entries", dict.Count);
+        return dict;
+    }
+
+    /// <summary>
     /// CharSections.dbc — vanilla 1.12, 10 fields × 40 bytes per record.
     /// Field layout verified against /home/wowvmangos/vmangos/run/data/5875/dbc/CharSections.dbc
     /// (3671 records, 198,838-byte string block)
@@ -979,3 +1069,19 @@ public record CharSectionDbc(
     string TextureName2,
     string TextureName3,
     uint Flags);
+
+/// <summary>
+/// One row of HelmetGeosetVisData.dbc (6 fields, 24 bytes per record).
+/// Each field (except ID) is a bitmask over ChrRaces: bit (1 &lt;&lt; raceId)
+/// indicates the geoset should be hidden for that race.
+///
+/// Vanilla race IDs: 1=Human, 2=Orc, 3=Dwarf, 4=NightElf, 5=Undead,
+/// 6=Tauren, 7=Gnome, 8=Troll.
+/// </summary>
+public record HelmetGeosetVisEntry(
+    uint Id,
+    uint HairFlags,
+    uint FacialHairFlags0,
+    uint FacialHairFlags1,
+    uint FacialHairFlags2,
+    uint EarsFlags);

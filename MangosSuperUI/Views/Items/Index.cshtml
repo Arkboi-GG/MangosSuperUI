@@ -207,6 +207,10 @@
                         <div id="itemTexturePanel" style="display:none; border-top: 1px solid var(--border-light);">
                             <div class="texture-panel-header" id="itemTextureToggle">
                                 <i class="fa-solid fa-palette"></i> Model Textures
+                                <a id="btnDownloadPatchM" href="/Items/DownloadPatch?file=patch-M.MPQ" download="patch-M.MPQ"
+                                   class="btn-download-patch" style="display:none;" title="Download patch-M.MPQ (all retextures)">
+                                    <i class="fa-solid fa-download"></i> patch-M
+                                </a>
                                 <i class="fa-solid fa-chevron-down chevron" style="margin-left:auto;font-size:11px;color:var(--text-muted);transition:transform 0.2s;"></i>
                             </div>
                             <div class="texture-panel-body" id="itemTextureBody">
@@ -442,6 +446,8 @@
         .item-texture-card { position: relative; }
         .item-texture-card:hover .btn-retexture { opacity: 1; }
         .btn-retexture:hover { background: var(--accent-hover); transform: scale(1.1); }
+        .btn-download-patch { margin-left: auto; margin-right: 8px; font-size: 10px; padding: 2px 8px; border-radius: var(--radius-sm); background: var(--bg-input); color: var(--accent); border: 1px solid var(--border); text-decoration: none; white-space: nowrap; transition: background var(--transition-fast), border-color var(--transition-fast); }
+        .btn-download-patch:hover { background: var(--accent-subtle); border-color: var(--accent); }
         .retex-mode-btn.active { border-color: var(--accent); background: var(--accent-subtle); }
         .texture-overlay { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: pointer; animation: fadeIn 0.15s ease-out; }
         .texture-overlay-content { max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; align-items: center; }

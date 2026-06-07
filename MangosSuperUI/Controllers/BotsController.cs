@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Services;
 using MangosSuperUI.Models;
+using MangosSuperUI.BotLogic.Tracking;
 using Dapper;
 
 namespace MangosSuperUI.Controllers;
@@ -11,13 +12,15 @@ public class BotsController : Controller
     private readonly BotBrainService _brain;
     private readonly ConnectionFactory _db;
     private readonly DbcService _dbc;
+    private readonly BotFlightRecorder _recorder;
 
-    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc)
+    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder)
     {
         _bridge = bridge;
         _brain = brain;
         _db = db;
         _dbc = dbc;
+        _recorder = recorder;
     }
 
     public IActionResult Index()
@@ -166,6 +169,27 @@ public class BotsController : Controller
                 isGroupLeader = b.IsGroupLeader
             })
         });
+    }
+
+    // ==================== Flight Recorder API ====================
+
+    /// <summary>
+    /// Toggle verbose lifecycle tracing for a specific set of bot GUIDs.
+    /// Tracing is per-guid: only the listed bots emit timeline records. Persisted to
+    /// bot_settings so it survives a restart. POST {"enabled":true,"guids":[4,5,6,7,8]}.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> SetTrace([FromBody] SetTraceRequest req)
+    {
+        var guids = (req.Guids ?? Array.Empty<int>()).ToList();
+        await _recorder.SetTargetsAsync(guids, req.Enabled);
+        return Json(new { success = true, enabled = _recorder.Enabled, targets = _recorder.Targets });
+    }
+
+    [HttpGet]
+    public IActionResult TraceStatus()
+    {
+        return Json(new { enabled = _recorder.Enabled, targets = _recorder.Targets });
     }
 
     // ==================== Grouping API (Session 31) ====================
@@ -562,4 +586,10 @@ public class FormGroupRequest
 public class DisbandGroupRequest
 {
     public int GroupId { get; set; }
+}
+
+public class SetTraceRequest
+{
+    public bool Enabled { get; set; }
+    public int[] Guids { get; set; } = Array.Empty<int>();
 }
