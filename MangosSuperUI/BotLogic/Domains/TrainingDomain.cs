@@ -311,4 +311,4 @@ public class TrainingDomain : IBotDomain
             bot.Name, bot.Guid, prev ?? "null", subPhase);
         BotTrace.Transition(bot, prev ?? "", subPhase, cause);
     }
-}
+}   
