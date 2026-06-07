@@ -60,6 +60,7 @@
 // mountAttachment(character, 1, weaponScene) and the hilt lands at
 // the hand. Same code path as helms/shoulders.
 
+import * as THREE from 'three';
 import * as dresser from './dresser.js';
 import * as compositor from './compositor.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -125,6 +126,14 @@ const WEAPON_INVENTORY_TYPES = new Set([13, 14, 17, 21, 22, 23, 26, 15, 25, 28])
 // in the first post-fix screenshot. Adding 14 and 23 here completes the
 // offhand routing.
 const LEFT_HAND_INVENTORY_TYPES = new Set([14, 22, 23]);
+
+// Model-bearing ARMOR inventoryTypes — these have standalone M2 models (so
+// BuildPreviewGlb produces a real GLB) but mount on a BONE, not the hand.
+// Body-atlas armor (chest 5, legs 7, feet 8, waist 6, wrist 9, hands 10,
+// back 16, robe 20, tabard 19, shirt 4) has NO standalone model — it paints
+// into the body texture atlas and never produces a mountable preview GLB.
+const HELM_INVENTORY_TYPE = 1;       // → ATTACHMENT_HELM
+const SHOULDER_INVENTORY_TYPE = 3;   // → shoulder bone (left; see below)
 
 // One shared GLTFLoader for the attachment GLB fetches. GLTFLoader is
 // thread-safe for parallel loads via its internal Promise wrapping;
@@ -283,6 +292,195 @@ async function mountAttachmentsFromPayload(character, attachments, inventoryType
         mounted++;
     }
     return mounted;
+}
+
+/**
+ * Mount a STAGED (not-yet-committed) retexture preview GLB onto the character
+ * by URL DIRECTLY, bypassing the displayId → fetchDressing lookup. Used by the
+ * items page retexture flow: the temp preview GLB has no displayId in the DBC,
+ * so the normal equip path can't resolve it.
+ *
+ * Dispatches on inventoryType so the preview lands on the RIGHT body part:
+ *   • weapon/held types (13/14/15/17/21/22/23/25/26/28) → hand / wrist
+ *     (same hand dispatch as a normal weapon equip)
+ *   • helm (1)      → helm attachment (head)
+ *   • shoulder (3)  → shoulder attachment
+ * Originally this was weapon-only and hand-mounted EVERYTHING, so retextured
+ * helms/shoulders appeared in the character's hand — that's the bug this fixes.
+ *
+ * Body-atlas armor (chest/legs/feet/waist/wrist/hands/back/robe/tabard/shirt)
+ * has no standalone model, so it never produces a mountable preview GLB; if one
+ * somehow reaches here we warn and no-op rather than hand-mounting it. (Previewing
+ * a body-atlas retexture on the character needs the texture-paint path — a
+ * separate feature, not an attachment mount.)
+ *
+ * The export name stays `equipWeaponGlbDirect` for backward-compat with the
+ * `window.retexEquipWeaponGlbDirect` alias the items page calls.
+ *
+ * @param {object} character   loader.loadCharacterGlb() result
+ * @param {string} glbUrl      Temp preview GLB url (/item_models/_preview/..)
+ * @param {number} [inventoryType]  Item slot; picks the attachment + (for
+ *                                  weapons) the hand. Defaults to mainhand.
+ * @returns {Promise<boolean>} true if mounted
+ */
+export async function equipWeaponGlbDirect(character, glbUrl, inventoryType) {
+    if (!character || !glbUrl) return false;
+
+    const t = inventoryType ?? 21;   // default: Main Hand
+
+    // Shoulders get both sides. The preview GLB is the LEFT model (ModelName1);
+    // mount it left and a mirrored clone right so the recolored pauldron shows
+    // on BOTH shoulders. Handled separately from the payload path because that
+    // path loads one URL → one attachment.
+    if (t === SHOULDER_INVENTORY_TYPE) {
+        return mountShouldersBothSides(character, glbUrl);
+    }
+
+    let payload;
+    if (WEAPON_INVENTORY_TYPES.has(t)) {
+        payload = { weapon: glbUrl };
+    } else if (t === HELM_INVENTORY_TYPE) {
+        payload = { helm: glbUrl };
+    } else {
+        console.warn('[equip] equipWeaponGlbDirect: inventoryType', t,
+            '— body-atlas slot with no standalone model; preview-on-character not supported for this slot');
+        return false;
+    }
+
+    const mounted = await mountAttachmentsFromPayload(character, payload, t);
+    return mounted > 0;
+}
+
+/**
+ * Mount a shoulder preview GLB on BOTH shoulders: the loaded model on the left
+ * (it's ModelName1 = the left/LShoulder model), and a MIRRORED clone on the
+ * right. Vanilla ships separate L/R shoulder models, so the right bone is not a
+ * mirror transform — we mirror the clone across X (scale.x = -1) to approximate
+ * the right pauldron. DoubleSide keeps the flipped winding from culling the
+ * clone inside-out (its shading may read slightly flat — fine for a recolor
+ * preview, which is about color, not lighting).
+ *
+ * This is an approximation: the faithful right side would come from building
+ * ModelName2 server-side and mounting it. If the right pauldron ever looks
+ * wrong-facing, drop the `scale.x *= -1` line — that's the one knob.
+ *
+ * @param {object} character
+ * @param {string} glbUrl
+ * @returns {Promise<boolean>} true if either side mounted
+ */
+async function mountShouldersBothSides(character, glbUrl) {
+    let gltf;
+    try {
+        gltf = await loadGlb(glbUrl);
+    } catch (err) {
+        console.warn('[equip] shoulder preview load failed:', err);
+        return false;
+    }
+
+    const left = gltf.scene;
+    const okLeft = dresser.mountAttachment(character, ATTACHMENT_SHOULDER_LEFT, left);
+
+    // Mirrored clone for the right shoulder. clone(true) shares materials, so
+    // clone each material before flipping its side — otherwise DoubleSide would
+    // leak back onto the left model's shared material.
+    const right = left.clone(true);
+    right.scale.x *= -1;
+    right.traverse(o => {
+        if (!o.isMesh || !o.material) return;
+        if (Array.isArray(o.material)) {
+            o.material = o.material.map(m => {
+                const c = m.clone(); c.side = THREE.DoubleSide; return c;
+            });
+        } else {
+            const c = o.material.clone(); c.side = THREE.DoubleSide; o.material = c;
+        }
+    });
+    const okRight = dresser.mountAttachment(character, ATTACHMENT_SHOULDER_RIGHT, right);
+
+    if (!okLeft && !okRight)
+        console.warn('[equip] shoulder mount failed — no shoulder attachment nodes on character');
+    return okLeft || okRight;
+}
+
+/**
+ * Paint a STAGED body-armor retexture onto the character by per-slot PNG URLs,
+ * bypassing the displayId → fetchDressing lookup. The body-atlas analog of
+ * equipWeaponGlbDirect: chest/legs/boots/etc. have NO model to mount — they
+ * paint component textures into the shared body atlas (compositor.js). The
+ * server's body-atlas variation endpoint recolors each component slot and
+ * returns the recolored slot URLs; this loads them and repaints the atlas.
+ *
+ * IMPORTANT — composites OVER the current atlas, not a naked base. paintBodyAtlas
+ * REBUILDS the whole atlas from (baseSkin + the layers given). If we passed a
+ * fresh naked default skin plus only THIS piece's slots, it would wipe the
+ * doublet/underwear and every other equipped piece, leaving the character naked
+ * except for this one item. So we read the CURRENT body atlas (skin + doublet +
+ * whatever else is equipped) and use it as the base, overlaying only this
+ * piece's recolored slot regions on top — i.e. swap out just this piece and
+ * leave the rest of the body as-is.
+ *
+ * Geosets are left as-is: if the base item is already equipped its sleeve/leg
+ * geometry is already correct, and we only swap the texture colors. (Pure
+ * recolor preview — no geosetGroup needed.)
+ *
+ * @param {object} character          loader.loadCharacterGlb() result
+ * @param {Object<number,string>} slotUrls  slot index → recolored PNG url
+ * @param {object} [opts]
+ * @param {ImageBitmap} [opts.baseSkin]  Force a specific base (defaults to the
+ *                                       current on-character atlas, then naked).
+ * @returns {Promise<boolean>} true if anything painted
+ */
+export async function equipBodyAtlasRetextureDirect(character, slotUrls, opts = {}) {
+    if (!character || !slotUrls) return false;
+    const layers = await loadSlotImages(slotUrls);
+    if (layers.length === 0) {
+        console.warn('[equip] equipBodyAtlasRetextureDirect: no slot images loaded');
+        return false;
+    }
+    // Base = explicit override → current on-character atlas → naked default.
+    // The current-atlas path is what keeps the rest of the body dressed.
+    const baseSkin = opts.baseSkin
+        ?? getCurrentBodyAtlasImage(character)
+        ?? await loadDefaultSkin(character);
+    compositor.paintBodyAtlas(character, baseSkin, layers);
+    return true;
+}
+
+/**
+ * Read the CURRENT composited body atlas off the character so a single-piece
+ * recolor can be drawn ON TOP of it (preserving the rest of the dressed body)
+ * instead of rebuilding from a naked skin.
+ *
+ * compositor.applyBodyTexture sets the SAME texture on every body-skinned
+ * geoset, so the live atlas lives on the base-body geoset (category 0 /
+ * variant 0). We read that texture's `.image` — an HTMLCanvasElement (when an
+ * atlas has been composited) or the GLB's original Image (before any paint),
+ * both valid ctx.drawImage sources. Hair (cat 0 variant 1+) and ear/scalp
+ * (cat 7) geosets carry DIFFERENT textures, so they're excluded — mirrors
+ * compositor.isBodySkinnedGeoset. Returns null if no body texture is set yet
+ * (caller then falls back to the naked default skin).
+ *
+ * @param {object} character
+ * @returns {HTMLCanvasElement|ImageBitmap|HTMLImageElement|null}
+ */
+function getCurrentBodyAtlasImage(character) {
+    const isBody = (cat, variant) =>
+        cat === 0 ? variant === 0 : (cat === 7 ? false : true);
+    let fallback = null;
+    for (const m of character.geosetList) {
+        const cat = m.userData?.geosetCategory;
+        const variant = m.userData?.geosetVariant;
+        if (typeof cat !== 'number') continue;
+        if (!isBody(cat, variant)) continue;
+        const mats = Array.isArray(m.material) ? m.material : [m.material];
+        for (const mat of mats) {
+            const img = mat?.map?.image;
+            if (!img) continue;
+            if (cat === 0 && variant === 0) return img;   // base body — the real atlas
+            if (fallback === null) fallback = img;        // other body geoset, in case
+        }
+    }
+    return fallback;
 }
 
 /**

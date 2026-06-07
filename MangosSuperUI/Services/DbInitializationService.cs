@@ -200,6 +200,14 @@ public class DbInitializationService
     }
 
     // ==================== DDL Statements ====================
+    //
+    // NOTE: state/changes/action_data columns use LONGTEXT (not the native JSON type)
+    // for cross-engine portability. MySQL did not add the JSON type until 5.7.8, so a
+    // JSON column declaration is a parse error on MySQL 5.6. These columns only ever
+    // store JSON text written/read as strings via Dapper (no server-side JSON_EXTRACT/->>),
+    // so LONGTEXT is behaviorally identical on MySQL 5.6/5.7/8.0 and MariaDB. Existing
+    // installs are unaffected: the C# TableExistsAsync guard skips CREATE when the table
+    // already exists, so their original column types are left untouched.
 
     private const string Sql_AuditLog = @"
         CREATE TABLE audit_log (
@@ -214,8 +222,8 @@ public class DbInitializationService
             target_id       INT UNSIGNED    NULL,
             ra_command      TEXT            NULL,
             ra_response     TEXT            NULL,
-            state_before    JSON            NULL,
-            state_after     JSON            NULL,
+            state_before    LONGTEXT        NULL,
+            state_after     LONGTEXT        NULL,
             is_reversible   TINYINT(1)      NOT NULL DEFAULT 0,
             reverses_id     BIGINT UNSIGNED NULL,
             success         TINYINT(1)      NOT NULL DEFAULT 1,
@@ -236,7 +244,7 @@ public class DbInitializationService
             timestamp       DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
             operator        VARCHAR(64)     NOT NULL DEFAULT 'system',
             config_json     MEDIUMTEXT      NOT NULL,
-            changes         JSON            NULL,
+            changes         LONGTEXT        NULL,
             notes           TEXT            NULL
         ) ENGINE=InnoDB;";
 
@@ -251,7 +259,7 @@ public class DbInitializationService
             executed_at     DATETIME(3)     NULL,
             operator        VARCHAR(64)     NOT NULL DEFAULT 'system',
             action_type     VARCHAR(64)     NOT NULL,
-            action_data     JSON            NOT NULL,
+            action_data     LONGTEXT        NOT NULL,
             status          VARCHAR(16)     NOT NULL DEFAULT 'pending',
             result          TEXT            NULL,
             audit_log_id    BIGINT UNSIGNED NULL

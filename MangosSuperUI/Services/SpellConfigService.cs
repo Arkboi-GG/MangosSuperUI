@@ -1,4 +1,5 @@
 using Dapper;
+using System.Data;
 using System.Text.Json;
 using MangosSuperUI.Models;
 using MangosSuperUI.Controllers;
@@ -13,15 +14,15 @@ namespace MangosSuperUI.Services;
 /// can reproduce every custom spell's visual modifications from stored config.
 ///
 /// Table: custom_spell_meta (auto-created on first use)
-///   entry       INT PRIMARY KEY  — matches spell_template.entry (60000-65000)
-///   source_entry INT             — the vanilla spell this was cloned from
-///   spell_name   VARCHAR(255)    — display name
-///   color_preset VARCHAR(32)     — "shadow", "frost", etc.
-///   phase_params TEXT            — JSON blob of per-phase knobs (PerPhaseParams)
-///   icon_source  VARCHAR(32)     — "comfyui-flux", "existing", etc.
-///   icon_path    VARCHAR(512)    — path to the generated PNG (for rebuild)
-///   created_at   DATETIME        — when the spell was first created
-///   updated_at   DATETIME        — last config change
+///   entry       INT PRIMARY KEY  - matches spell_template.entry (60000-65000)
+///   source_entry INT             - the vanilla spell this was cloned from
+///   spell_name   VARCHAR(255)    - display name
+///   color_preset VARCHAR(32)     - "shadow", "frost", etc.
+///   phase_params TEXT            - JSON blob of per-phase knobs (PerPhaseParams)
+///   icon_source  VARCHAR(32)     - "comfyui-flux", "existing", etc.
+///   icon_path    VARCHAR(512)    - path to the generated PNG (for rebuild)
+///   created_at   DATETIME        - when the spell was first created
+///   updated_at   DATETIME        - last config change
 /// </summary>
 public class SpellConfigService
 {
@@ -58,17 +59,34 @@ public class SpellConfigService
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         ");
 
-        // Add columns if upgrading from earlier schema
-        try
-        {
-            await conn.ExecuteAsync("ALTER TABLE custom_spell_meta ADD COLUMN IF NOT EXISTS name_subtext VARCHAR(255) DEFAULT NULL AFTER spell_name");
-            await conn.ExecuteAsync("ALTER TABLE custom_spell_meta ADD COLUMN IF NOT EXISTS description TEXT DEFAULT NULL AFTER name_subtext");
-            await conn.ExecuteAsync("ALTER TABLE custom_spell_meta ADD COLUMN IF NOT EXISTS tooltip TEXT DEFAULT NULL AFTER description");
-        }
-        catch { /* columns already exist */ }
+        // Add columns if upgrading from an earlier schema.
+        // NOTE: do NOT use "ADD COLUMN IF NOT EXISTS" here - that is MariaDB-only syntax
+        // and is a parse error on every MySQL version (5.6/5.7/8.0). Check
+        // information_schema first so this upgrade path is portable across both engines.
+        if (!await ColumnExistsAsync(conn, "custom_spell_meta", "name_subtext"))
+            await conn.ExecuteAsync("ALTER TABLE custom_spell_meta ADD COLUMN name_subtext VARCHAR(255) DEFAULT NULL AFTER spell_name");
+
+        if (!await ColumnExistsAsync(conn, "custom_spell_meta", "description"))
+            await conn.ExecuteAsync("ALTER TABLE custom_spell_meta ADD COLUMN description TEXT DEFAULT NULL AFTER name_subtext");
+
+        if (!await ColumnExistsAsync(conn, "custom_spell_meta", "tooltip"))
+            await conn.ExecuteAsync("ALTER TABLE custom_spell_meta ADD COLUMN tooltip TEXT DEFAULT NULL AFTER description");
 
         _tableChecked = true;
         _logger.LogInformation("SpellConfig: custom_spell_meta table ensured");
+    }
+
+    /// <summary>
+    /// Portable column-existence check against information_schema. DATABASE() resolves
+    /// to the connection's current schema (mangos), so no DB name needs to be threaded in.
+    /// </summary>
+    private static async Task<bool> ColumnExistsAsync(IDbConnection conn, string table, string column)
+    {
+        var count = await conn.ExecuteScalarAsync<int>(
+            @"SELECT COUNT(*) FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table AND COLUMN_NAME = @column",
+            new { table, column });
+        return count > 0;
     }
 
     /// <summary>Save or update a spell's visual config.</summary>

@@ -17,6 +17,10 @@ public class ItemsController : Controller
     private readonly CharacterModelService _characterModels;
     private readonly BodyAtlasTextureService _bodyAtlas;
     private readonly MpqReaderService _mpq;
+    private readonly PaletteSwapService _palette;
+    private readonly ILogger<ItemsController> _logger;
+    private readonly VariationRecipeService _variations;
+    private readonly ComfyUIUpscaler _upscaler;
 
     // Custom items start at this entry ID
     private const int CUSTOM_RANGE_START = 900000;
@@ -68,7 +72,9 @@ public class ItemsController : Controller
     public ItemsController(ConnectionFactory db, DbcService dbc, AuditService audit,
         IWebHostEnvironment env, ItemTextureService itemTextures, ItemRetextureService retexture,
         CharacterModelService characterModels, BodyAtlasTextureService bodyAtlas,
-        MpqReaderService mpq)
+        MpqReaderService mpq, PaletteSwapService palette, ILogger<ItemsController> logger,
+        VariationRecipeService variations,
+        ComfyUIUpscaler upscaler)
     {
         _db = db;
         _dbc = dbc;
@@ -79,6 +85,10 @@ public class ItemsController : Controller
         _characterModels = characterModels;
         _bodyAtlas = bodyAtlas;
         _mpq = mpq;
+        _palette = palette;
+        _logger = logger;
+        _variations = variations;
+        _upscaler = upscaler;
     }
 
     public IActionResult Index() => View();
@@ -519,6 +529,1137 @@ public class ItemsController : Controller
             return Json(new { success = false, error = ex.Message });
         }
     }
+
+    // ===================== VISION RECOLOR =====================
+
+    /// <summary>
+    /// GET /Items/VisionRecolorStatus
+    /// Checks whether a vision model is configured and available.
+    /// </summary>
+    [HttpGet]
+    public IActionResult VisionRecolorStatus()
+    {
+        return Json(new { available = _palette.IsAvailable });
+    }
+
+    /// <summary>
+    /// POST /Items/VisionRecolorPreview
+    /// Sends texture to vision model with instruction, applies HSL transforms, returns preview.
+    /// Does NOT save to DB or rebuild the patch — just a preview.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> VisionRecolorPreview([FromBody] PaletteSwapRequest request)
+    {
+        if (request.DisplayId == 0)
+            return Json(new { success = false, error = "No displayId" });
+
+        if (!_palette.IsAvailable)
+            return Json(new { success = false, error = "Vision model not configured. Set Ollama Vision Model in Settings." });
+
+        var texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
+        if (texInfo == null)
+            return Json(new { success = false, error = "No textures found" });
+
+        var targetTex = texInfo.Textures.FirstOrDefault(t =>
+            t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
+            || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase));
+        targetTex ??= texInfo.Textures.FirstOrDefault();
+
+        if (targetTex == null || !targetTex.HasPreview)
+            return Json(new { success = false, error = "No texture preview" });
+
+        string previewPath = Path.Combine(_env.WebRootPath,
+            targetTex.PreviewPngPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+
+        if (!System.IO.File.Exists(previewPath))
+            return Json(new { success = false, error = "Preview PNG not found" });
+
+        var outputDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "palette_preview");
+        Directory.CreateDirectory(outputDir);
+        string outputPath = Path.Combine(outputDir, $"recolor_{request.DisplayId}_{Guid.NewGuid():N}.png");
+
+        var outputFile = await _palette.RecolorAndSaveAsync(
+            previewPath, request.Instruction, outputPath, HttpContext.RequestAborted);
+
+        if (outputFile == null)
+            return Json(new { success = false, error = "Vision recolor failed — check server logs" });
+
+        string webPath = $"/item_textures_cache/palette_preview/{Path.GetFileName(outputPath)}";
+        return Json(new { success = true, previewUrl = webPath });
+    }
+
+    /// <summary>
+    /// POST /Items/VisionRecolorRetexture
+    /// Vision-guided recolor, optionally chains to AI, saves to DB, rebuilds patch.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> VisionRecolorRetexture([FromBody] PaletteSwapRequest request)
+    {
+        if (request.DisplayId == 0)
+            return Json(new { success = false, error = "No displayId" });
+
+        if (!_palette.IsAvailable)
+            return Json(new { success = false, error = "Vision model not configured" });
+
+        try
+        {
+            var texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
+            if (texInfo == null)
+                return Json(new { success = false, error = "No textures found" });
+
+            var targetTex = texInfo.Textures.FirstOrDefault(t =>
+                t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
+                || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase));
+            targetTex ??= texInfo.Textures.FirstOrDefault();
+
+            if (targetTex == null || !targetTex.HasPreview)
+                return Json(new { success = false, error = "No texture preview" });
+
+            string previewPath = Path.Combine(_env.WebRootPath,
+                targetTex.PreviewPngPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+
+            // ── TEST MODE: skip brute force, send ORIGINAL straight to Flux ──
+            // Evaluates whether Flux's semantic understanding handles regional
+            // color swaps (wood vs gold) better than per-pixel HSL. Uses a
+            // region-aware prompt built directly (bypassing the Ollama crafter,
+            // which has been deleting materials it shouldn't).
+            if (request.SkipBruteForce)
+            {
+                float testDenoise = request.AIDenoise > 0.01f
+                    ? Math.Clamp(request.AIDenoise, 0.1f, 0.8f)
+                    : 0.5f;
+
+                string fluxPrompt = BuildRegionAwareFluxPrompt(
+                    request.Instruction, targetTex.Filename);
+
+                _logger.LogInformation(
+                    "VisionRecolorRetexture: SkipBruteForce test — denoise={D}, prompt=\"{P}\"",
+                    testDenoise, fluxPrompt);
+
+                var testReq = new RetextureRequest
+                {
+                    DisplayId = request.DisplayId,
+                    ItemName = request.ItemName,
+                    OriginalBlpFilename = targetTex.Filename,
+                    OriginalMpqPath = targetTex.MpqPath,
+                    ModifyExisting = true,            // img2img from original preview
+                    DenoiseStrength = testDenoise,
+                    CustomPrompt = fluxPrompt,         // bypass Ollama crafter
+                };
+
+                var testResult = await _retexture.RetextureAsync(testReq, HttpContext.RequestAborted);
+                return Json(new
+                {
+                    success = testResult.Success,
+                    error = testResult.Error,
+                    prompt = testResult.Prompt,
+                    previewUrl = testResult.GeneratedPngPath,
+                    patchUrl = testResult.PatchMpqPath,
+                    newDisplayId = testResult.NewDisplayId,
+                    originalWidth = testResult.OriginalWidth,
+                    originalHeight = testResult.OriginalHeight,
+                    originalFormat = testResult.OriginalFormat,
+                    blpSize = testResult.BlpSizeBytes,
+                    mode = $"flux_only@{testDenoise:F2}"
+                });
+            }
+
+            // ── STAGE 1: Brute-force palette swap (deterministic draft) ──
+            var recolorDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "palette_swapped");
+            Directory.CreateDirectory(recolorDir);
+            string recoloredPng = Path.Combine(recolorDir, $"recolored_{request.DisplayId}_{Guid.NewGuid():N}.png");
+
+            var recolorResult = await _palette.RecolorAndSaveAsync(
+                previewPath, request.Instruction, recoloredPng, request.Boxes, HttpContext.RequestAborted);
+
+            if (recolorResult == null)
+                return Json(new { success = false, error = "Palette swap (draft) step failed" });
+
+            // ── BruteForceOnly: commit the draft directly, skip Flux ──
+            // Used by variation "Apply" so the committed result matches the
+            // previewed brute-force variant exactly (and is fast).
+            if (request.BruteForceOnly)
+            {
+                var bfReq = new RetextureRequest
+                {
+                    DisplayId = request.DisplayId,
+                    ItemName = request.ItemName,
+                    OriginalBlpFilename = targetTex.Filename,
+                    OriginalMpqPath = targetTex.MpqPath,
+                    StyleDirection = request.Instruction,
+                };
+                var bf = await _retexture.RetextureFromBitmapAsync(
+                    bfReq, recoloredPng, HttpContext.RequestAborted);
+                return Json(new
+                {
+                    success = bf.Success,
+                    error = bf.Error,
+                    prompt = bf.Prompt,
+                    previewUrl = bf.GeneratedPngPath,
+                    patchUrl = bf.PatchMpqPath,
+                    newDisplayId = bf.NewDisplayId,
+                    originalWidth = bf.OriginalWidth,
+                    originalHeight = bf.OriginalHeight,
+                    originalFormat = bf.OriginalFormat,
+                    blpSize = bf.BlpSizeBytes,
+                    mode = "palette_only"
+                });
+            }
+
+            // ── STAGE 2: Flux img2img polish (always runs) ──
+            // The brute-force draft gets the colors mostly right while preserving
+            // the original sculpting. Flux then refines it — fixing family
+            // misclassifications (light brown wrongly recolored, etc.) and
+            // restoring a hand-painted look. The user's instruction is passed
+            // as the style direction so Flux knows the intended palette.
+            //
+            // Denoise: default to a modest value that corrects color errors
+            // without repainting the whole texture. AIDenoise from the request
+            // overrides if the user set the slider.
+            float denoise = request.AIDenoise > 0.01f
+                ? Math.Clamp(request.AIDenoise, 0.1f, 0.8f)
+                : 0.35f;
+
+            var retexRequest = new RetextureRequest
+            {
+                DisplayId = request.DisplayId,
+                ItemName = request.ItemName,
+                OriginalBlpFilename = targetTex.Filename,
+                OriginalMpqPath = targetTex.MpqPath,
+                ModifyExisting = true,
+                DenoiseStrength = denoise,
+                // Pass the user's recolor instruction so the Flux prompt knows
+                // the target palette — this is what lets Flux fix the regions
+                // the brute force got wrong.
+                StyleDirection = string.IsNullOrWhiteSpace(request.StyleDirection)
+                    ? request.Instruction
+                    : request.StyleDirection,
+            };
+
+            // Swap the preview with the recolored draft, run through the normal
+            // retexture pipeline (Flux img2img), then restore the original preview.
+            string backupPath = previewPath + ".bak";
+            System.IO.File.Copy(previewPath, backupPath, true);
+            System.IO.File.Copy(recoloredPng, previewPath, true);
+
+            try
+            {
+                var result = await _retexture.RetextureAsync(retexRequest, HttpContext.RequestAborted);
+
+                // If Flux failed (node offline, timeout), fall back to the
+                // brute-force draft so the user still gets a result.
+                if (!result.Success)
+                {
+                    _logger.LogWarning("VisionRecolorRetexture: Flux polish failed ({Err}), falling back to draft", result.Error);
+                    var draftResult = await _retexture.RetextureFromBitmapAsync(
+                        retexRequest, recoloredPng, HttpContext.RequestAborted);
+                    return Json(new
+                    {
+                        success = draftResult.Success,
+                        error = draftResult.Error,
+                        prompt = draftResult.Prompt,
+                        previewUrl = draftResult.GeneratedPngPath,
+                        patchUrl = draftResult.PatchMpqPath,
+                        newDisplayId = draftResult.NewDisplayId,
+                        originalWidth = draftResult.OriginalWidth,
+                        originalHeight = draftResult.OriginalHeight,
+                        originalFormat = draftResult.OriginalFormat,
+                        blpSize = draftResult.BlpSizeBytes,
+                        mode = "palette_draft_fallback"
+                    });
+                }
+
+                return Json(new
+                {
+                    success = result.Success,
+                    error = result.Error,
+                    prompt = result.Prompt,
+                    previewUrl = result.GeneratedPngPath,
+                    patchUrl = result.PatchMpqPath,
+                    newDisplayId = result.NewDisplayId,
+                    originalWidth = result.OriginalWidth,
+                    originalHeight = result.OriginalHeight,
+                    originalFormat = result.OriginalFormat,
+                    blpSize = result.BlpSizeBytes,
+                    mode = "palette+flux"
+                });
+            }
+            finally
+            {
+                if (System.IO.File.Exists(backupPath))
+                {
+                    System.IO.File.Copy(backupPath, previewPath, true);
+                    System.IO.File.Delete(backupPath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Build a Flux img2img prompt for a direct recolor of an EXISTING weapon
+    /// texture, emphasizing STRUCTURE PRESERVATION and naming material regions
+    /// so Flux's semantic understanding can place colors correctly (e.g. keep
+    /// the wooden handle, recolor only the metal trim).
+    ///
+    /// Deliberately does NOT use negative phrasing like "no brown elements" —
+    /// that tells Flux to delete materials. Instead it frames every swap as a
+    /// material transformation while keeping the object's shapes/details intact.
+    /// </summary>
+    private static string BuildRegionAwareFluxPrompt(string instruction, string textureFilename)
+    {
+        // The instruction itself carries the user's intent; we wrap it in a
+        // structure-preserving frame. We pass the raw instruction through so
+        // Flux sees the exact swaps the user asked for, but contextualize it
+        // as "recolor this existing texture, keep the shapes."
+        return
+            "Recolor this existing World of Warcraft weapon texture (flat 2D UV texture map, " +
+            "hand-painted vanilla 2004 style). PRESERVE the exact shapes, layout, sculpting, " +
+            "shadows, highlights, and all fine details of the original — only change the COLORS " +
+            "of the materials as follows: " +
+            instruction.Trim().TrimEnd('.') + ". " +
+            "Keep any material not mentioned in its original color. Maintain the original " +
+            "light-to-dark shading on every surface so the metal still looks metallic and the " +
+            "wood still looks like wood grain. Flat top-down texture, no perspective, no 3D " +
+            "rendering, no new objects, same composition as the input image.";
+    }
+
+    // ===================== VARIATION MODE =====================
+
+    /// <summary>
+    /// Super-res the recolor SOURCE once (cached per source) so variants render
+    /// at a higher resolution with real, model-invented detail instead of the
+    /// vanilla item's small native size. The recolor is luminance-preserving, so
+    /// the enhanced detail survives the color swap untouched.
+    ///
+    /// Returns a path to the upscaled PNG, or the ORIGINAL source path unchanged
+    /// when upscaling is disabled (no model), the multiplier is 1, ComfyUI is
+    /// offline, or anything fails — so the whole feature degrades cleanly to the
+    /// previous native-resolution behavior. Cached on disk keyed by source name +
+    /// size + multiplier, so a gallery of N variants triggers ONE ComfyUI call.
+    /// </summary>
+    private async Task<string> GetUpscaledSourceAsync(string sourcePngPath, CancellationToken ct)
+    {
+        if (!_upscaler.IsEnabled || _upscaler.SourceMultiplier <= 1)
+            return sourcePngPath;
+        try
+        {
+            var fi = new FileInfo(sourcePngPath);
+            if (!fi.Exists) return sourcePngPath;
+
+            var cacheDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "source_upscaled");
+            Directory.CreateDirectory(cacheDir);
+            // Key on name + byte length + multiplier + denoise radius so a
+            // regenerated source OR a changed denoise setting busts the cache.
+            string key = $"{Path.GetFileNameWithoutExtension(sourcePngPath)}_{fi.Length}_{_upscaler.SourceMultiplier}x_cd{_upscaler.ChromaDenoiseRadius}";
+            string cached = Path.Combine(cacheDir, key + ".png");
+            if (System.IO.File.Exists(cached)) return cached;
+
+            string up = await _upscaler.UpscaleSourceAsync(sourcePngPath, key, ct);
+            // No-op / failure → upscaler returned the original path: use native.
+            if (string.Equals(up, sourcePngPath, StringComparison.OrdinalIgnoreCase)
+                || !System.IO.File.Exists(up))
+                return sourcePngPath;
+
+            try { System.IO.File.Copy(up, cached, overwrite: true); }
+            catch { return up; }   // couldn't cache — still return the upscaled file
+            return cached;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogInformation(
+                "Items: source upscale failed ({Err}), using native source", ex.Message);
+            return sourcePngPath;
+        }
+    }
+
+    /// <summary>
+    /// POST /Items/DetectFamilies
+    /// Returns the color families present in an item's texture (deterministic).
+    /// Used by the variation UI to show what's there and seed recipe generation.
+    /// </summary>
+    [HttpPost]
+    public IActionResult DetectFamilies([FromBody] PaletteSwapRequest request)
+    {
+        if (request.DisplayId == 0)
+            return Json(new { success = false, error = "No displayId" });
+
+        var texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
+        if (texInfo == null) return Json(new { success = false, error = "No textures found" });
+
+        var targetTex = texInfo.Textures.FirstOrDefault(t =>
+            t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
+            || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase))
+            ?? texInfo.Textures.FirstOrDefault();
+        if (targetTex == null || !targetTex.HasPreview)
+            return Json(new { success = false, error = "No texture preview" });
+
+        string previewPath = Path.Combine(_env.WebRootPath,
+            targetTex.PreviewPngPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+
+        var families = _palette.DetectFamilies(previewPath);
+        return Json(new
+        {
+            success = true,
+            families = families.Select(f => new
+            {
+                family = f.Family,
+                percent = Math.Round(f.Percent, 1),
+                meanSat = Math.Round(f.MeanSat, 2),
+                meanLightness = Math.Round(f.MeanLightness, 2)
+            })
+        });
+    }
+
+    /// <summary>
+    /// POST /Items/GenerateVariations
+    /// Generates N coherent recolor variants for a theme. Each recipe runs
+    /// through the brute-force engine; optionally finished with Flux. Returns
+    /// preview URLs + the recipe used for each, plus the assigned newDisplayIds.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> GenerateVariations([FromBody] VariationRequest request)
+    {
+        if (request.DisplayId == 0)
+            return Json(new { success = false, error = "No displayId" });
+
+        int count = Math.Clamp(request.Count <= 0 ? 4 : request.Count, 1, 8);
+
+        var texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
+        if (texInfo == null) return Json(new { success = false, error = "No textures found" });
+
+        var targetTex = texInfo.Textures.FirstOrDefault(t =>
+            t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
+            || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase))
+            ?? texInfo.Textures.FirstOrDefault();
+        if (targetTex == null || !targetTex.HasPreview)
+            return Json(new { success = false, error = "No texture preview" });
+
+        string previewPath = Path.Combine(_env.WebRootPath,
+            targetTex.PreviewPngPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+
+        // 1. Detect families, 2. generate recipes
+        var families = _palette.DetectFamilies(previewPath);
+        var recipes = await _variations.GenerateRecipesAsync(
+            request.Theme, families, count, HttpContext.RequestAborted);
+
+        if (recipes.Count == 0)
+            return Json(new { success = false, error = "Could not generate recipes" });
+
+        // 3. Render each recipe to a PREVIEW png (brute force only — fast).
+        //    Families are detected on the native source (color, not resolution),
+        //    but we recolor a super-res'd copy so the gallery — and the preview/
+        //    commit that reuse this same recolor — render sharp. One cached
+        //    ComfyUI call covers the whole gallery; degrades to native on failure.
+        //    We do NOT save to DB or rebuild the patch here; the user picks a
+        //    variant first, then applies it via the normal precision endpoint.
+        var previewDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "variation_preview");
+        Directory.CreateDirectory(previewDir);
+
+        string recolorSrc = await GetUpscaledSourceAsync(previewPath, HttpContext.RequestAborted);
+
+        var outVariants = new List<object>();
+        foreach (var recipe in recipes)
+        {
+            string outPng = Path.Combine(previewDir,
+                $"var_{request.DisplayId}_{Guid.NewGuid():N}.png");
+            var ok = await _palette.RecolorAndSaveAsync(
+                recolorSrc, recipe.Instruction, outPng, null, HttpContext.RequestAborted);
+            if (ok == null) continue;
+
+            outVariants.Add(new
+            {
+                name = recipe.Name,
+                instruction = recipe.Instruction,
+                swaps = recipe.Swaps,
+                previewUrl = $"/item_textures_cache/variation_preview/{Path.GetFileName(outPng)}"
+            });
+        }
+
+        return Json(new
+        {
+            success = true,
+            theme = request.Theme,
+            detectedFamilies = families.Select(f => new { family = f.Family, percent = Math.Round(f.Percent, 1) }),
+            variants = outVariants
+        });
+    }
+
+    /// <summary>
+    /// POST /Items/GenerateBodyAtlasVariations
+    /// Variations for PAINTED ARMOR (chest, legs, boots, belt, bracers, gloves,
+    /// robe, tabard, cape). These items have no standalone model — they paint a
+    /// set of component textures into the shared character body atlas. So unlike
+    /// GenerateVariations (one model texture → one recolored PNG), this recolors
+    /// EVERY component slot with the same recipe and returns the recolored slot
+    /// URLs per card. The client paints them via equip.equipBodyAtlasRetextureDirect
+    /// → compositor.paintBodyAtlas (the same path normal dressing uses).
+    ///
+    /// Family detection + recipe generation are shared with the weapon path
+    /// (VariationRecipeService), so the marble/obsidian/jewel schemes apply here
+    /// identically — one coherent palette across the whole piece.
+    ///
+    /// Body of request: VariationRequest (displayId, theme, count).
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> GenerateBodyAtlasVariations([FromBody] VariationRequest request)
+    {
+        if (request.DisplayId == 0)
+            return Json(new { success = false, error = "No displayId" });
+
+        int count = Math.Clamp(request.Count <= 0 ? 4 : request.Count, 1, 8);
+
+        // Component textures (slot index → on-disk PNG) for this display.
+        var atlas = await _bodyAtlas.EnsureAtlasTexturesAsync(request.DisplayId);
+        if (atlas == null || atlas.SlotUrls.Count == 0)
+            return Json(new
+            {
+                success = false,
+                error = "No body-atlas textures for this display — not painted armor, or the component BLPs aren't in the MPQ."
+            });
+
+        // Map a web URL (/body_atlas_cache/..) back to its disk path.
+        string DiskOf(string webUrl) => Path.Combine(_env.WebRootPath,
+            webUrl.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+
+        // Detect families on a representative slot (prefer TorsoUpper=3, the
+        // chest; else the lowest-indexed available slot). One recipe is built
+        // from it and applied to every slot so the whole piece recolors coherently.
+        int primarySlot = atlas.SlotUrls.ContainsKey(3)
+            ? 3 : atlas.SlotUrls.Keys.OrderBy(k => k).First();
+        string primaryDisk = DiskOf(atlas.SlotUrls[primarySlot]);
+        if (!System.IO.File.Exists(primaryDisk))
+            return Json(new { success = false, error = "Body-atlas source PNG missing on disk" });
+
+        var families = _palette.DetectFamilies(primaryDisk);
+        var recipes = await _variations.GenerateRecipesAsync(
+            request.Theme, families, count, HttpContext.RequestAborted);
+        if (recipes.Count == 0)
+            return Json(new { success = false, error = "Could not generate recipes" });
+
+        var previewDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "bodyatlas_preview");
+        Directory.CreateDirectory(previewDir);
+
+        // Each recipe → recolor EVERY component slot with that recipe. Returns
+        // per-card { slotUrls (recolored, for on-character paint), previewUrl
+        // (representative thumbnail) }.
+        var outVariants = new List<object>();
+        foreach (var recipe in recipes)
+        {
+            var recoloredSlots = new Dictionary<int, string>();
+            foreach (var (slot, webUrl) in atlas.SlotUrls)
+            {
+                string srcDisk = DiskOf(webUrl);
+                if (!System.IO.File.Exists(srcDisk)) continue;
+                string outName = $"ba_{request.DisplayId}_s{slot}_{Guid.NewGuid():N}.png";
+                string outPng = Path.Combine(previewDir, outName);
+                var ok = await _palette.RecolorAndSaveAsync(
+                    srcDisk, recipe.Instruction, outPng, null, HttpContext.RequestAborted);
+                if (ok == null) continue;
+                recoloredSlots[slot] = $"/item_textures_cache/bodyatlas_preview/{outName}";
+            }
+            if (recoloredSlots.Count == 0) continue;
+
+            string thumb = recoloredSlots.TryGetValue(primarySlot, out var t)
+                ? t : recoloredSlots.Values.First();
+            outVariants.Add(new
+            {
+                name = recipe.Name,
+                swaps = recipe.Swaps,
+                slotUrls = recoloredSlots,   // slot → recolored png (client paints these)
+                previewUrl = thumb           // representative thumbnail for the gallery card
+            });
+        }
+
+        if (outVariants.Count == 0)
+            return Json(new { success = false, error = "Recolor produced no slots" });
+
+        return Json(new
+        {
+            success = true,
+            theme = request.Theme,
+            primarySlot,
+            slots = atlas.SlotUrls.Keys.OrderBy(k => k).ToArray(),
+            detectedFamilies = families.Select(f => new { family = f.Family, percent = Math.Round(f.Percent, 1) }),
+            variants = outVariants
+        });
+    }
+
+
+    /// <summary>
+    /// POST /Items/DeletePreviewGlb
+    /// Clean up a temp preview GLB when the modal closes (and opportunistically
+    /// sweep stale ones). Best-effort; always returns success.
+    /// Body: { glbUrl: "/item_models/_preview/xxx.glb" }
+    /// </summary>
+    [HttpPost]
+    public IActionResult DeletePreviewGlb([FromBody] JsonElement body)
+    {
+        string? glbUrl = body.TryGetProperty("glbUrl", out var g) ? g.GetString() : null;
+        _itemTextures.DeletePreviewGlb(glbUrl);
+        return Json(new { success = true });
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════════
+    // UNIVERSAL PREVIEW + COMMIT (May 2026)
+    // Same preview-on-character / save-to-commit flow as Segmented, for the
+    // Palette / Variations / Scratch / Modify modes. All four converge on
+    // CommitStagedRetexture, which takes the temp PNG produced by the
+    // matching Preview* endpoint and runs it through RetextureFromBitmapAsync
+    // (the same code path the Segmented commit uses) — so the committed
+    // texture is byte-identical to what was previewed on the character.
+    //
+    // Layout:
+    //   PreviewPaletteGlb     — palette swap (+ optional Flux polish/test)
+    //   PreviewFluxGlb        — txt2img / img2img
+    //   PreviewVariationGlb   — apply a chosen Variations gallery card
+    //   CommitStagedRetexture — universal commit (validates pngPath is under
+    //                           wwwroot/item_textures_cache/ to block traversal)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Validate a server-side preview PNG path supplied by the client. The
+    /// client receives the path verbatim from a Preview* endpoint and echoes
+    /// it back on commit, so we must confirm it still resolves under the
+    /// permitted cache root before reading it. Returns the canonical full
+    /// path on success, null on failure.
+    /// </summary>
+    private string? ValidateStagedPngPath(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        try
+        {
+            var cacheRoot = Path.GetFullPath(
+                Path.Combine(_env.WebRootPath, "item_textures_cache"));
+            var full = Path.GetFullPath(raw);
+            if (!full.StartsWith(cacheRoot, StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (!System.IO.File.Exists(full)) return null;
+            // Defensive: only allow PNG files (the only thing Preview* writes).
+            if (!full.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                return null;
+            return full;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Resolve the target texture entry for a retexture request, matching by
+    /// MpqPath first then Filename, falling back to the model's first
+    /// texture. Returns null if no preview exists. Centralizes the lookup
+    /// that every Preview* endpoint does.
+    /// </summary>
+    private (ItemTextureEntry? Tex, string? PreviewPath, string? Error) ResolveTargetTexture(
+        uint displayId, string mpqPath, string filename)
+    {
+        if (displayId == 0) return (null, null, "No displayId");
+        var texInfo = _itemTextures.GetTexturesForDisplay(displayId);
+        if (texInfo == null) return (null, null, "No textures found");
+
+        var targetTex = texInfo.Textures.FirstOrDefault(t =>
+            t.MpqPath.Equals(mpqPath, StringComparison.OrdinalIgnoreCase)
+            || t.Filename.Equals(filename, StringComparison.OrdinalIgnoreCase))
+            ?? texInfo.Textures.FirstOrDefault();
+        if (targetTex == null)
+            return (null, null, "No texture found");
+
+        // Preview is required for palette/segmented/variation/img2img modes but
+        // NOT for Flux txt2img. Return the tex regardless; previewPath stays
+        // null when the preview isn't on disk and callers that need it check.
+        if (!targetTex.HasPreview)
+            return (targetTex, null, null);
+
+        string previewPath = Path.Combine(_env.WebRootPath,
+            targetTex.PreviewPngPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+        if (!System.IO.File.Exists(previewPath))
+            return (targetTex, null, null);
+
+        return (targetTex, previewPath, null);
+    }
+
+    /// <summary>
+    /// Wrap a rendered PNG (already on disk under wwwroot/item_textures_cache/)
+    /// into a throwaway preview GLB and return the response shape the panel
+    /// expects. Centralizes the "build GLB + return urls + pngPath" tail.
+    ///
+    /// (May 2026) **Optional upscaler cleanup pass.** Before wrapping, the PNG
+    /// can go through ComfyUIUpscaler — 4x upscale via a game-texture-trained
+    /// model (PBRify V4 by default), then mipmap-filtered downscale back to
+    /// vanilla dims. The intent was to scrub the salt-and-pepper bleed that
+    /// per-pixel palette swaps inherit from the source BLP's DXT compression
+    /// noise. Cleanup is best-effort: if disabled or failed, the original PNG
+    /// passes through unchanged.
+    ///
+    /// (May 2026) Now gated by <paramref name="skipCleanup"/>. The pass is a
+    /// pure 4x-up→downscale round-trip — it ends back at the source resolution,
+    /// so it can only SOFTEN; it never adds real detail. For the deterministic
+    /// recolor modes (Variations especially) the recolor is luminance-preserving
+    /// and already pixel-sharp, so the round-trip is pointless and visibly hurts.
+    /// Callers on those paths pass skipCleanup:true so the preview — and the BLP
+    /// the commit later encodes from this same PNG — is exactly the recolor.
+    ///
+    /// When the pass DOES run, the cleaned PNG becomes BOTH the staged GLB
+    /// (mounted on the character viewer) AND the file that CommitStagedRetexture
+    /// later BLP-encodes — so what you see is what gets persisted.
+    /// </summary>
+    private async Task<IActionResult> BuildPreviewResponse(uint displayId, string pngPath,
+        string mode, string cacheSubdir, string? extra2DPreviewUrl = null, bool skipCleanup = false)
+    {
+        // ── Upscaler cleanup pass (best-effort, skippable) ──
+        // CleanupAsync returns either a new cleaned PNG path or the original
+        // path if disabled/failed. When skipCleanup is set we bypass it entirely
+        // and the raw recolor PNG flows straight through to the GLB and commit.
+        string cleanedPngPath = skipCleanup
+            ? pngPath
+            : await _upscaler.CleanupAsync(
+                pngPath, $"preview_{displayId}_{mode}", HttpContext.RequestAborted);
+
+        var glbUrl = _itemTextures.BuildPreviewGlb(displayId, cleanedPngPath);
+        if (glbUrl == null)
+            return Json(new { success = false, error = "Preview GLB build failed" });
+
+        // Derive the public URL from the (possibly cleaned) PNG's actual disk
+        // directory rather than the original cacheSubdir hint — when cleanup
+        // ran, the file lives under item_textures_cache/upscale_cleaned/, not
+        // the original subdir.
+        string pngUrl = DerivePublicUrl(cleanedPngPath, cacheSubdir);
+
+        return Json(new
+        {
+            success = true,
+            glbUrl,
+            pngUrl,
+            // pngPath is sent back to the client and echoed on commit. It's
+            // re-validated server-side then (ValidateStagedPngPath) — the
+            // client can't smuggle arbitrary paths through this.
+            pngPath = cleanedPngPath,
+            previewUrl = extra2DPreviewUrl ?? pngUrl,
+            mode
+        });
+    }
+
+    /// <summary>
+    /// Given a PNG path that should live somewhere under wwwroot/, derive its
+    /// public /item_textures_cache/... URL. Falls back to the supplied
+    /// cacheSubdir hint if the path doesn't resolve under wwwroot.
+    /// </summary>
+    private string DerivePublicUrl(string pngPath, string fallbackSubdir)
+    {
+        try
+        {
+            var webRootFull = Path.GetFullPath(_env.WebRootPath);
+            var pngFull = Path.GetFullPath(pngPath);
+            if (pngFull.StartsWith(webRootFull, StringComparison.OrdinalIgnoreCase))
+            {
+                // Strip wwwroot prefix → forward-slash web path
+                var rel = pngFull.Substring(webRootFull.Length).Replace('\\', '/');
+                if (!rel.StartsWith("/")) rel = "/" + rel;
+                return rel;
+            }
+        }
+        catch { /* fall through */ }
+        return $"/item_textures_cache/{fallbackSubdir}/" + Path.GetFileName(pngPath);
+    }
+
+    /// <summary>
+    /// POST /Items/PreviewPaletteGlb
+    /// Run a palette swap (optionally chained to Flux polish, or Flux-only
+    /// test) and return a throwaway GLB url + the PNG url, WITHOUT writing
+    /// the DB row or rebuilding the patch. Mirrors PreviewSegmentedGlb but
+    /// for the Palette mode.
+    /// Body: PaletteSwapRequest (same shape as VisionRecolorRetexture).
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> PreviewPaletteGlb([FromBody] PaletteSwapRequest request)
+    {
+        if (!_palette.IsAvailable)
+            return Json(new { success = false, error = "Vision model not configured" });
+
+        var (targetTex, previewPath, err) = ResolveTargetTexture(
+            request.DisplayId, request.OriginalMpqPath, request.OriginalBlpFilename);
+        if (targetTex == null)
+            return Json(new { success = false, error = err });
+        if (previewPath == null)
+            return Json(new { success = false, error = "Source texture preview not available" });
+
+        try
+        {
+            // ── Flux-only test path ──
+            // Mirrors the SkipBruteForce branch of VisionRecolorRetexture but
+            // stops at "PNG on disk" — no DB, no MPQ. The committed result
+            // (later, on Save) is byte-identical because Commit uses this
+            // same PNG file.
+            if (request.SkipBruteForce)
+            {
+                float testDenoise = request.AIDenoise > 0.01f
+                    ? Math.Clamp(request.AIDenoise, 0.1f, 0.8f) : 0.5f;
+                string fluxPrompt = BuildRegionAwareFluxPrompt(
+                    request.Instruction, targetTex.Filename);
+
+                var skipReq = new RetextureRequest
+                {
+                    DisplayId = request.DisplayId,
+                    ItemName = request.ItemName,
+                    OriginalBlpFilename = targetTex.Filename,
+                    OriginalMpqPath = targetTex.MpqPath,
+                    ModifyExisting = true,            // img2img from original preview
+                    DenoiseStrength = testDenoise,
+                    CustomPrompt = fluxPrompt,         // bypass Ollama crafter
+                };
+                var fluxPngPath = await _retexture.RenderToPngAsync(
+                    skipReq, HttpContext.RequestAborted);
+                if (fluxPngPath == null)
+                    return Json(new { success = false, error = "Flux generation failed" });
+
+                return await BuildPreviewResponse(request.DisplayId, fluxPngPath,
+                    $"flux_only@{testDenoise:F2}", "retexture_resized");
+            }
+
+            // ── Stage 1: brute-force palette swap (always) ──
+            var recolorDir = Path.Combine(_env.WebRootPath,
+                "item_textures_cache", "palette_swapped");
+            Directory.CreateDirectory(recolorDir);
+            string recoloredPng = Path.Combine(recolorDir,
+                $"recolored_{request.DisplayId}_{Guid.NewGuid():N}.png");
+
+            // Recolor the cached SUPER-RES source (same one Variations uses) so a
+            // custom palette swap is just as sharp as a Variations card — the
+            // recolor is luminance-preserving, so the only thing that ever made
+            // palette look soft was running it on the low-res native preview.
+            // Degrades to native on failure. (Skipped on the Flux-chain path
+            // below, which re-renders from the model preview anyway.)
+            string paletteSrc = (request.ChainToAI && !request.BruteForceOnly)
+                ? previewPath
+                : await GetUpscaledSourceAsync(previewPath, HttpContext.RequestAborted);
+
+            // ── LLM-assisted instruction parsing ──
+            // Turn the user's free-text request into a clean family→target swap
+            // map via the LLM (the "AI helps the recolor" path), instead of the
+            // brittle regex parser. The LLM dedupes conflicting families, maps
+            // loose phrases ("a dark stone obsidian" → "obsidian black"), and
+            // covers every detected family. Falls back to the raw instruction
+            // (regex ParseInstruction inside RecolorAndSaveAsync) if the LLM is
+            // unavailable or returns nothing.
+            string recolorInstruction = request.Instruction;
+            try
+            {
+                var fams = _palette.DetectFamilies(paletteSrc);
+                var recipe = await _variations.GenerateSwapsFromInstructionAsync(
+                    request.Instruction, fams, HttpContext.RequestAborted);
+                if (recipe != null && !string.IsNullOrWhiteSpace(recipe.Instruction))
+                    recolorInstruction = recipe.Instruction;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogInformation(
+                    "PreviewPaletteGlb: LLM instruction parse failed ({Err}), using raw instruction",
+                    ex.Message);
+            }
+
+            var recolorResult = await _palette.RecolorAndSaveAsync(
+                paletteSrc, recolorInstruction, recoloredPng,
+                request.Boxes, HttpContext.RequestAborted);
+            if (recolorResult == null)
+                return Json(new { success = false, error = "Palette swap (draft) step failed" });
+
+            // ── BruteForceOnly: GLB straight from the draft, no Flux ──
+            // skipCleanup: the super-res source is already sharp, so the 4x
+            // up→down cleanup round-trip is pointless work (same as Variations).
+            if (request.BruteForceOnly || !request.ChainToAI)
+            {
+                return await BuildPreviewResponse(request.DisplayId, recoloredPng,
+                    "palette_only", "palette_swapped", skipCleanup: true);
+            }
+
+            // ── Stage 2: Flux img2img polish on top of the draft ──
+            float denoise = request.AIDenoise > 0.01f
+                ? Math.Clamp(request.AIDenoise, 0.1f, 0.8f) : 0.35f;
+            string polishStyle = string.IsNullOrWhiteSpace(request.StyleDirection)
+                ? request.Instruction : request.StyleDirection;
+
+            // Same trick the immediate-commit path uses: swap the preview
+            // with the draft, run Flux, restore. We only need the PNG out
+            // (not the BLP/DB/MPQ).
+            string backupPath = previewPath + ".bak";
+            System.IO.File.Copy(previewPath, backupPath, true);
+            System.IO.File.Copy(recoloredPng, previewPath, true);
+            try
+            {
+                var polishReq = new RetextureRequest
+                {
+                    DisplayId = request.DisplayId,
+                    ItemName = request.ItemName,
+                    OriginalBlpFilename = targetTex.Filename,
+                    OriginalMpqPath = targetTex.MpqPath,
+                    ModifyExisting = true,
+                    DenoiseStrength = denoise,
+                    StyleDirection = polishStyle,
+                    // Leave CustomPrompt null → Ollama crafts from polishStyle,
+                    // same as the immediate-commit path does.
+                };
+                var polishedPng = await _retexture.RenderToPngAsync(
+                    polishReq, HttpContext.RequestAborted);
+                if (polishedPng == null)
+                {
+                    // Flux failed — fall back to the draft, same behavior as
+                    // the immediate-commit path.
+                    _logger.LogWarning(
+                        "PreviewPaletteGlb: Flux polish failed, falling back to draft");
+                    return await BuildPreviewResponse(request.DisplayId, recoloredPng,
+                        "palette_draft_fallback", "palette_swapped");
+                }
+                return await BuildPreviewResponse(request.DisplayId, polishedPng,
+                    "palette+flux", "retexture_resized");
+            }
+            finally
+            {
+                if (System.IO.File.Exists(backupPath))
+                {
+                    System.IO.File.Copy(backupPath, previewPath, true);
+                    System.IO.File.Delete(backupPath);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "PreviewPaletteGlb: failed for displayId {Id}",
+                request.DisplayId);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// POST /Items/PreviewFluxGlb
+    /// Run Flux (txt2img or img2img) and return a throwaway GLB url + PNG
+    /// url, WITHOUT writing the DB row or rebuilding the patch. Mirrors the
+    /// scratch/modify path of /Items/Retexture but stops at PNG.
+    /// Body: RetextureRequest (same as /Items/Retexture).
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> PreviewFluxGlb([FromBody] RetextureRequest request)
+    {
+        var (targetTex, _, err) = ResolveTargetTexture(
+            request.DisplayId, request.OriginalMpqPath, request.OriginalBlpFilename);
+        if (targetTex == null)
+            return Json(new { success = false, error = err });
+
+        try
+        {
+            // Normalize the request to the target tex we resolved (handles the
+            // case where the caller passed a non-canonical mpqPath/filename).
+            var req = new RetextureRequest
+            {
+                DisplayId = request.DisplayId,
+                ItemName = request.ItemName,
+                OriginalBlpFilename = targetTex.Filename,
+                OriginalMpqPath = targetTex.MpqPath,
+                ModifyExisting = request.ModifyExisting,
+                DenoiseStrength = request.DenoiseStrength,
+                StyleDirection = request.StyleDirection,
+                CustomPrompt = request.CustomPrompt,
+            };
+            // RenderToPngAsync internally decides img2img vs txt2img based on
+            // ModifyExisting + whether HasPreview holds.
+            var fluxPngPath = await _retexture.RenderToPngAsync(
+                req, HttpContext.RequestAborted);
+            if (fluxPngPath == null)
+                return Json(new { success = false, error = "Flux generation failed or timed out" });
+
+            return await BuildPreviewResponse(request.DisplayId, fluxPngPath,
+                request.ModifyExisting ? "flux_img2img" : "flux_txt2img",
+                "retexture_resized");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "PreviewFluxGlb: failed for displayId {Id}",
+                request.DisplayId);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// POST /Items/PreviewVariationGlb
+    /// Build a throwaway preview GLB for a chosen Variations gallery card.
+    /// The card carries the instruction string (same one used to render the
+    /// gallery thumbnail); we re-render it through the brute-force palette
+    /// swap into a temp PNG and wrap it in a GLB. WITHOUT writing the DB row
+    /// or rebuilding the patch.
+    /// Body: PaletteSwapRequest with Instruction set to the variant's recipe.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> PreviewVariationGlb([FromBody] PaletteSwapRequest request)
+    {
+        if (!_palette.IsAvailable)
+            return Json(new { success = false, error = "Vision model not configured" });
+        if (string.IsNullOrWhiteSpace(request.Instruction))
+            return Json(new { success = false, error = "No variant instruction supplied" });
+
+        var (targetTex, previewPath, err) = ResolveTargetTexture(
+            request.DisplayId, request.OriginalMpqPath, request.OriginalBlpFilename);
+        if (targetTex == null)
+            return Json(new { success = false, error = err });
+        if (previewPath == null)
+            return Json(new { success = false, error = "Source texture preview not available" });
+
+        try
+        {
+            var dir = Path.Combine(_env.WebRootPath,
+                "item_textures_cache", "variation_preview");
+            Directory.CreateDirectory(dir);
+            string outPng = Path.Combine(dir,
+                $"var_{request.DisplayId}_{Guid.NewGuid():N}.png");
+
+            // Recolor the cached super-res source (same one the gallery used) so
+            // the 3D preview — and the BLP the commit encodes from this PNG — is
+            // sharp at the configured multiple. Degrades to native on failure.
+            string recolorSrc = await GetUpscaledSourceAsync(previewPath, HttpContext.RequestAborted);
+
+            var result = await _palette.RecolorAndSaveAsync(
+                recolorSrc, request.Instruction, outPng, request.Boxes,
+                HttpContext.RequestAborted);
+            if (result == null)
+                return Json(new { success = false, error = "Variation render failed" });
+
+            return await BuildPreviewResponse(request.DisplayId, outPng,
+                "variation_preview", "variation_preview", skipCleanup: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "PreviewVariationGlb: failed for displayId {Id}",
+                request.DisplayId);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// POST /Items/CommitStagedRetexture
+    /// Universal commit. Takes a server-side PNG path produced by any
+    /// Preview* endpoint and runs it through RetextureFromBitmapAsync —
+    /// the same code path CommitSegmentedRetexture uses — so the committed
+    /// texture is byte-identical to what was previewed on the character.
+    /// pngPath is validated to live under wwwroot/item_textures_cache/.
+    /// Body: { pngPath, displayId, itemName, originalMpqPath,
+    ///         originalBlpFilename, styleDirection, mode }.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> CommitStagedRetexture([FromBody] JsonElement body)
+    {
+        string? rawPath = body.TryGetProperty("pngPath", out var p) ? p.GetString() : null;
+        var validatedPath = ValidateStagedPngPath(rawPath);
+        if (validatedPath == null)
+            return Json(new { success = false, error = "Invalid or missing preview PNG path" });
+
+        uint displayId = body.TryGetProperty("displayId", out var d) && d.TryGetUInt32(out var v) ? v : 0;
+        string itemName = body.TryGetProperty("itemName", out var n) ? (n.GetString() ?? "") : "";
+        string mpqPath = body.TryGetProperty("originalMpqPath", out var mp) ? (mp.GetString() ?? "") : "";
+        string blpName = body.TryGetProperty("originalBlpFilename", out var bn) ? (bn.GetString() ?? "") : "";
+        string styleDir = body.TryGetProperty("styleDirection", out var s) ? (s.GetString() ?? "") : "";
+        string mode = body.TryGetProperty("mode", out var m) ? (m.GetString() ?? "staged_commit") : "staged_commit";
+
+        var (targetTex, _, err) = ResolveTargetTexture(displayId, mpqPath, blpName);
+        if (targetTex == null)
+            return Json(new { success = false, error = err });
+
+        var req = new RetextureRequest
+        {
+            DisplayId = displayId,
+            ItemName = itemName,
+            OriginalBlpFilename = targetTex.Filename,
+            OriginalMpqPath = targetTex.MpqPath,
+            StyleDirection = string.IsNullOrEmpty(styleDir) ? $"[{mode}]" : styleDir,
+        };
+        var result = await _retexture.RetextureFromBitmapAsync(
+            req, validatedPath, HttpContext.RequestAborted);
+
+        return Json(new
+        {
+            success = result.Success,
+            error = result.Error,
+            previewUrl = result.GeneratedPngPath,
+            patchUrl = result.PatchMpqPath,
+            newDisplayId = result.NewDisplayId,
+            originalWidth = result.OriginalWidth,
+            originalHeight = result.OriginalHeight,
+            originalFormat = result.OriginalFormat,
+            blpSize = result.BlpSizeBytes,
+            mode
+        });
+    }
+
+    /// <summary>
+    /// POST /Items/CommitBodyAtlasRetexture
+    /// Persists a body-atlas (painted armor) retexture to patch-4.MPQ. The
+    /// painted-armor analog of CommitStagedRetexture: instead of one staged PNG
+    /// → one BLP → DBC field 3, it takes the per-slot recolored PNGs (the
+    /// slotUrls a GenerateBodyAtlasVariations card produced and the client
+    /// staged) and commits each as its own component BLP under one new
+    /// displayId, patched into m_texture[0..7]. Every slot URL is validated to
+    /// live under wwwroot/item_textures_cache/ (same guard as the universal
+    /// commit), so the client can't smuggle arbitrary paths.
+    /// Body: { displayId, itemName, styleDirection, slotUrls: { "5":"/..png", .. } }.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> CommitBodyAtlasRetexture([FromBody] JsonElement body)
+    {
+        uint displayId = body.TryGetProperty("displayId", out var d) && d.TryGetUInt32(out var v) ? v : 0;
+        if (displayId == 0)
+            return Json(new { success = false, error = "No displayId" });
+
+        string itemName = body.TryGetProperty("itemName", out var n) ? (n.GetString() ?? "") : "";
+        string styleDir = body.TryGetProperty("styleDirection", out var s) ? (s.GetString() ?? "") : "";
+
+        if (!body.TryGetProperty("slotUrls", out var slotsEl) || slotsEl.ValueKind != JsonValueKind.Object)
+            return Json(new { success = false, error = "No slotUrls supplied" });
+
+        // Map each slot's web URL → validated on-disk PNG path. Reuses
+        // ValidateStagedPngPath: requires the file to canonicalize under
+        // wwwroot/item_textures_cache/ and end in .png. Any slot that fails
+        // validation is skipped (defensive — a missing slot just isn't patched).
+        var slotPngPaths = new Dictionary<int, string>();
+        foreach (var prop in slotsEl.EnumerateObject())
+        {
+            if (!int.TryParse(prop.Name, out int slot)) continue;
+            if (slot < 0 || slot > 7) continue;
+            string? webUrl = prop.Value.GetString();
+            if (string.IsNullOrEmpty(webUrl)) continue;
+            // Web URL (/item_textures_cache/..) → disk path, then validate.
+            string diskPath = Path.Combine(_env.WebRootPath,
+                webUrl.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+            var validated = ValidateStagedPngPath(diskPath);
+            if (validated == null)
+            {
+                _logger.LogWarning("CommitBodyAtlasRetexture: slot {Slot} path failed validation: {Url}", slot, webUrl);
+                continue;
+            }
+            slotPngPaths[slot] = validated;
+        }
+
+        if (slotPngPaths.Count == 0)
+            return Json(new { success = false, error = "No valid slot PNGs (paths must live under item_textures_cache)" });
+
+        var result = await _retexture.CommitBodyAtlasAsync(
+            displayId, itemName, string.IsNullOrEmpty(styleDir) ? "[body-atlas]" : styleDir,
+            slotPngPaths, HttpContext.RequestAborted);
+
+        return Json(new
+        {
+            success = result.Success,
+            error = result.Error,
+            patchUrl = result.PatchMpqPath,
+            newDisplayId = result.NewDisplayId,
+            blpSize = result.BlpSizeBytes,
+            slotsCommitted = slotPngPaths.Count,
+            mode = "bodyatlas"
+        });
+    }
+
 
     // ===================== MODELS =====================
 
@@ -1099,7 +2240,7 @@ public class ItemsController : Controller
     }
 
     /// <summary>
-    /// GET /Items/DownloadPatch?file=patch-M.MPQ
+    /// GET /Items/DownloadPatch?file=patch-4.MPQ
     /// Serves a retexture patch MPQ for download.
     /// </summary>
     [HttpGet]

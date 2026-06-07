@@ -105,7 +105,8 @@ public class SettingsController : Controller
             Ollama = new OllamaConfig
             {
                 BaseUrl = _config["SpellCreator:Ollama:BaseUrl"] ?? "",
-                Model = _config["SpellCreator:Ollama:Model"] ?? ""
+                Model = _config["SpellCreator:Ollama:Model"] ?? "",
+                VisionModel = _config["SpellCreator:Ollama:VisionModel"] ?? ""
             },
             RawBlpPath = _config["SpellCreator:RawBlpPath"] ?? "",
             DataPath = _config["SpellCreator:DataPath"] ?? "",
@@ -291,6 +292,7 @@ public class OllamaConfig
 {
     public string BaseUrl { get; set; } = "";
     public string Model { get; set; } = "";
+    public string VisionModel { get; set; } = "";
 }
 
 public class KestrelConfig
