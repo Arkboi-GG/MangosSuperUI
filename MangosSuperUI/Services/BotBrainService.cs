@@ -60,6 +60,41 @@ public class BotBrainService : BackgroundService
     // Track which bot GUIDs we've already initialized (to detect new connections)
     private readonly HashSet<int> _initializedGuids = new();
 
+    // ── F2 dropped-MOVE_TO recovery (belt-and-suspenders for ARCH §14.1) ──
+    // When C++ reports IDLE while a MOVE_TO is still outstanding, the arrival
+    // notify (MovementInform→TASK_COMPLETE) was dropped or the path ended
+    // silently — the bot is parked, not moving. We re-send the same MOVE_TO.
+    // Only MOVE_TO is tracked: re-sending SET_TASK GRIND would reset C++ kill
+    // credit, so grind stalls (F7) are left to the C++-side kill-credit guard.
+    // Self-contained here so it works for EVERY bot, not just traced ones.
+    private readonly ConcurrentDictionary<int, InFlightMove> _inflight = new();
+    private const double MOVE_RESEND_IDLE_GRACE_SEC = 15.0; // sustained C++ IDLE before first re-send
+    private const double MOVE_RESEND_COOLDOWN_SEC = 15.0; // min gap between re-sends
+    private const int MOVE_RESEND_MAX = 3;    // give up after this → watchdog / strategic eval
+
+    /// <summary>Remember the most recent MOVE_TO per bot so a dropped arrival notify can be re-sent.</summary>
+    private void NoteOutboundCommand(int guid, BridgeCommand cmd)
+    {
+        if (cmd.Type != "MOVE_TO") return;
+        _inflight[guid] = new InFlightMove
+        {
+            Payload = cmd.Payload,
+            SentAt = DateTime.UtcNow,
+            FirstIdleSeen = default,
+            LastResend = DateTime.MinValue,
+            Resends = 0
+        };
+    }
+
+    private sealed class InFlightMove
+    {
+        public Dictionary<string, object> Payload = new();
+        public DateTime SentAt;
+        public DateTime FirstIdleSeen;   // default = not currently observed idle
+        public DateTime LastResend;
+        public int Resends;
+    }
+
     // Fleet-level shared "known-good" destinations — if ANY bot successfully interacted
     // at these coordinates, other bots should NOT blacklist them on MOVE_FAILED.
     // Persisted to vmangos_admin.known_good_destinations so they survive restarts.
@@ -757,6 +792,7 @@ public class BotBrainService : BackgroundService
                 };
                 bot.NextStrategicEval = DateTime.UtcNow;
                 bot.PendingAction = null;
+                _inflight.TryRemove(guid, out _);   // F2 recovery: stale MOVE_TO no longer applies
                 bot.CorpseX = null;
                 bot.CorpseY = null;
                 bot.CorpseZ = null;
@@ -876,6 +912,47 @@ public class BotBrainService : BackgroundService
                 // IDLE" mismatch works now; Batch 4 enriches TaskState with more detail.
                 BotTrace.State(bot, state, bs.TaskState);
 
+                // ── F2 RECOVERY: dropped MOVE_TO arrival notify ───────────
+                // C++ IDLE while a MOVE_TO is still outstanding = the bot is
+                // parked, not moving. Re-send the same MOVE_TO (idempotent: C++
+                // re-paths → arrives+notifies, or emits MOVE_FAILED which the
+                // domain handles). Capped + cooldowned so a wedged dest falls
+                // through to the watchdog. cppState != IDLE (MOVING/GRINDING/...)
+                // means C++ is busy → never fires; grind stalls (F7) are not IDLE
+                // and are intentionally not touched (re-send would reset kills).
+                if (_inflight.TryGetValue(guid, out var inflight))
+                {
+                    if (bs.TaskState == "IDLE")
+                    {
+                        if (inflight.FirstIdleSeen == default) inflight.FirstIdleSeen = now;
+
+                        bool gracePassed = (now - inflight.FirstIdleSeen).TotalSeconds >= MOVE_RESEND_IDLE_GRACE_SEC;
+                        bool cooldownOk = (now - inflight.LastResend).TotalSeconds >= MOVE_RESEND_COOLDOWN_SEC;
+
+                        if (gracePassed && cooldownOk && inflight.Resends < MOVE_RESEND_MAX)
+                        {
+                            inflight.Resends++;
+                            inflight.LastResend = now;
+                            inflight.FirstIdleSeen = now;   // restart the grace window for the next attempt
+
+                            _logger.LogWarning(
+                                "[BOT-RESEND] {Name}({Guid}) | C++ IDLE with MOVE_TO outstanding in {Activity}:{Sub} — " +
+                                "re-sending MOVE_TO (attempt {N}/{Max})",
+                                bot.Name, bot.Guid, bot.CurrentActivity.Type, bot.CurrentActivity.SubPhase ?? "none",
+                                inflight.Resends, MOVE_RESEND_MAX);
+
+                            BotTrace.Mark(bot, $"F2 recovery: re-send MOVE_TO (attempt {inflight.Resends}/{MOVE_RESEND_MAX}, idle)", state);
+                            BotTrace.Command(bot, "MOVE_TO", "resend (dropped-notify recovery)", state);
+                            await _bridge.SendToBotAsync(guid, "MOVE_TO", inflight.Payload);
+                        }
+                    }
+                    else
+                    {
+                        // C++ is doing something (MOVING/GRINDING/...) → not a dropped notify.
+                        inflight.FirstIdleSeen = default;
+                    }
+                }
+
                 // Run decision tick
                 var result = await engine.Tick(bot, state);
 
@@ -901,6 +978,7 @@ public class BotBrainService : BackgroundService
                 // even after C# switched to Vendoring/Training/etc.
                 if (result.ActivityChanged)
                 {
+                    _inflight.TryRemove(guid, out _);   // F2 recovery: prior MOVE_TO belongs to the activity we are leaving
                     var prevType = bot.PreviousActivity?.Type;
                     var prevSubPhase = bot.PreviousActivity?.SubPhase ?? "";
 
@@ -919,6 +997,7 @@ public class BotBrainService : BackgroundService
                 {
                     BotTrace.Command(bot, cmd.Type, state: state);
                     await _bridge.SendToBotAsync(guid, cmd.Type, cmd.Payload);
+                    NoteOutboundCommand(guid, cmd);   // F2 recovery: track MOVE_TO
                 }
 
                 // Log decision
@@ -970,6 +1049,18 @@ public class BotBrainService : BackgroundService
         // FLIGHT RECORDER: the notify arriving. Heuristically matches the open command
         // (e.g. MOVE_TO→TASK_COMPLETE), computes round-trip latency, flips owner → CS.
         BotTrace.Event(bot, evt.EventType, evt.Data);
+
+        // LIVENESS: a progress event proves the bot is still working. Re-arm the stuck
+        // sweep so a long-but-advancing task (e.g. a multi-minute DoingObjectives grind
+        // that streams KILL/LOOT while parked on evt:TASK_COMPLETE) is not mislabeled as
+        // frozen. Ping is a no-op for movement WAITs, so a dropped MOVE_TO arrival — which
+        // emits no further events — still trips the sweep as intended.
+        if (evt.EventType is "KILL" or "LOOT" or "LEVEL_UP" or "QUEST_UPDATE")
+            BotTrace.Ping(bot);
+
+        // F2 recovery: a movement round-trip resolved → drop the tracked MOVE_TO.
+        if (evt.EventType is "TASK_COMPLETE" or "MOVE_FAILED" or "PATH_UNSAFE")
+            _inflight.TryRemove(guid, out _);
 
         // KILL events always go to economy (shadow loot) regardless of activity
         if (evt.EventType == "KILL")
@@ -1235,6 +1326,7 @@ public class BotBrainService : BackgroundService
             {
                 BotTrace.Command(bot, cmd.Type, "reactive (OnEvent)", state);
                 await _bridge.SendToBotAsync(guid, cmd.Type, cmd.Payload);
+                NoteOutboundCommand(guid, cmd);   // F2 recovery: track MOVE_TO
             }
         }
     }

@@ -459,15 +459,27 @@ public class BotFlightRecorder
 
     /// <summary>
     /// Silent liveness touch: re-arms the stuck sweep without emitting a record or
-    /// changing owner. Use on a progress signal during a long CPP phase (e.g. a KILL
-    /// while grinding) so an actively-progressing bot is never flagged — only one that
-    /// has genuinely stopped making progress trips the sweep. No-op unless owner is CPP,
-    /// so it can never mask a WAIT/GROUP/TIMER stall.
+    /// changing owner. Called on a progress signal (KILL/LOOT/LEVEL_UP/QUEST_UPDATE) so an
+    /// actively-working bot is never flagged — only one that has genuinely gone silent trips
+    /// the sweep. Re-arms for:
+    ///   • CPP phases (e.g. a KILL while grinding under cpp:grind), and
+    ///   • non-movement WAITs (e.g. a multi-minute SET_TASK grind in DoingObjectives, which
+    ///     waits on bare evt:TASK_COMPLETE while streaming KILL/LOOT).
+    /// Deliberately a NO-OP for a movement WAIT (an evt: token that includes MOVE_FAILED or
+    /// PATH_UNSAFE): a dropped MOVE_TO arrival produces NO further events, so it must still
+    /// trip — that is the dropped-notify signature. GROUP/TIMER gates are likewise never
+    /// re-armed by unrelated progress events.
     /// </summary>
     public void Ping(BotIdentity bot)
     {
         if (!IsTraced(bot.Guid)) return;
-        if (_state.TryGetValue(bot.Guid, out var ts) && ts.Owner == TraceOwner.CPP)
+        if (!_state.TryGetValue(bot.Guid, out var ts)) return;
+
+        bool isMovementWait = ts.Wait != null &&
+            (ts.Wait.Contains("MOVE_FAILED") || ts.Wait.Contains("PATH_UNSAFE"));
+        bool rearm = ts.Owner == TraceOwner.CPP ||
+                     (ts.Owner == TraceOwner.WAIT && !isMovementWait);
+        if (rearm)
         {
             ts.LastOwnerChange = DateTime.UtcNow;
             ts.StuckReported = false;
