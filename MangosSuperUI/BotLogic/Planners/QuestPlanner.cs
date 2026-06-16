@@ -33,15 +33,17 @@ public sealed class QuestPlanner : IBotPlanner
     private readonly QuestGraphLoader _quests;
     private readonly ILogger<QuestPlanner> _logger;
 
-    private static readonly TimeSpan TravelDeadline   = TimeSpan.FromMinutes(8);   // continuation travel can be long (§4.11)
+    private static readonly TimeSpan TravelDeadline = TimeSpan.FromMinutes(8);   // continuation travel can be long (§4.11)
     private static readonly TimeSpan ObjectiveDeadline = TimeSpan.FromMinutes(4);   // grind kill_count; depleted → escape
-    private static readonly TimeSpan InteractDeadline  = TimeSpan.FromSeconds(20);  // accept/turn-in acks are near-instant
+    private static readonly TimeSpan InteractDeadline = TimeSpan.FromSeconds(20);  // accept/turn-in acks are near-instant
 
     private const float GrindRadius = 60f;
     private const float ForceRadius = 150f;   // bot within this of a failed giver/turn-in ⇒ WMO last leg → force_*
-    private const int   SafetyMargin = 3;     // level-gate = danger_level − margin
-    private const int   DeferMinutes = 15;
-    private const int   AbandonAfterDefers = 3;
+    private const int SafetyMargin = 3;     // level-gate = danger_level − margin
+    private const int DeferMinutes = 15;
+    private const int AbandonAfterDefers = 3;
+    private const int QuestStatusComplete = 3;   // VMaNGOS QUEST_STATUS_COMPLETE
+    private const double LogSyncCapSec = 3;      // wait this long for QUEST_STATUS_ALL before picking blind
 
     public QuestPlanner(QuestGraphLoader quests, ILogger<QuestPlanner> logger)
     {
@@ -65,6 +67,27 @@ public sealed class QuestPlanner : IBotPlanner
         // ── pick ──────────────────────────────────────────────────────────
         if (q == null || q.Node == null)
         {
+            // Sync the C++ quest log once before picking, so we RESUME a quest a death
+            // or restart interrupted instead of re-accepting it. Re-accepting an in-log
+            // quest is rejected by C++ (CanTakeQuest=false → QUEST_INTERACT_FAIL), which
+            // would strand it incomplete forever (the zombie). One QUERY per pick.
+            if (ctx.Step != "sync_log")
+            {
+                ctx.SetStep("sync_log");
+                return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+            }
+
+            // Wait for QUEST_STATUS_ALL (the executor stamps ctx.QuestLogStampUtc when it
+            // lands), capped so a silent/empty log can't wedge the pick. "Stamped at or
+            // after we entered sync_log" == (now − stamp) ≤ time-in-this-step.
+            bool synced = (DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds <= ctx.TimeInStepSec;
+            if (!synced && ctx.TimeInStepSec < LogSyncCapSec)
+                return StepResult.Wait();
+
+            // Resume an in-log quest if one is reachable; else pick a fresh one.
+            var resume = TryResume(ctx);
+            if (resume != null) return resume;
+
             var node = PickFor(ctx);
             if (node == null)
                 return StepResult.Block("no_quests");   // → OnStall → ReselectGoal → grind
@@ -100,12 +123,12 @@ public sealed class QuestPlanner : IBotPlanner
         switch (ctx.Step)
         {
             case "to_objective":     // arrived at the objective area
-            {
-                var obj = ObjectiveAt(node2, q.ObjectiveSlot);
-                if (obj == null) return ToTurnIn(ctx, q);
-                ctx.SetStep("objective");
-                return GrindObjective(obj);
-            }
+                {
+                    var obj = ObjectiveAt(node2, q.ObjectiveSlot);
+                    if (obj == null) return ToTurnIn(ctx, q);
+                    ctx.SetStep("objective");
+                    return GrindObjective(obj, RemainingKills(ctx, q.QuestId, obj));
+                }
             case "objective":        // TASK_COMPLETE = kill_count reached
                 q.ObjectiveSlot++;
                 return ToNextObjectiveOrTurnIn(ctx, q);
@@ -221,7 +244,12 @@ public sealed class QuestPlanner : IBotPlanner
         if (id == null || !_quests.IsLoaded) return null;
         id.PruneExpiredDeferrals();
 
+        // Range gate (OPEN #1): same map + within the level/zone cap. MUST be the same
+        // filter + cap GoalSelector counts, or the bot bounces Questing↔Grinding.
+        float cap = ZoneSafetyMap.GetMaxTravelDistance(id.Level, ctx.ZoneId, 0);
+
         return Pickable(_quests, id)
+            .Where(q => InReach(q, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, cap))
             .OrderBy(q => Dist2(ctx.Pos.X, ctx.Pos.Y, q.Giver!.X, q.Giver!.Y))
             .FirstOrDefault();
     }
@@ -236,16 +264,36 @@ public sealed class QuestPlanner : IBotPlanner
     {
         int raceBit = QuestGraphLoader.RaceToBitmask(id.Race);
         int classBit = QuestGraphLoader.ClassToBitmask(id.ClassId);
+        return graph.GetAvailableQuests(raceBit, classBit, id.Level, id.CompletedQuestIds)
+                    .Where(q => IsPickable(q, id));
+    }
 
-        foreach (var q in graph.GetAvailableQuests(raceBit, classBit, id.Level, id.CompletedQuestIds))
-        {
-            if (q.Giver == null) continue;
-            if (q.ItemObjectives.Length > 0) continue;             // gather quests: later layer
-            if (!q.Objectives.All(o => o.IsCreature)) continue;     // GO objectives: later layer
-            if (id.DeferredQuestIds.ContainsKey(q.QuestId)) continue;
-            if (id.IsPathBlacklisted(q.Giver.X, q.Giver.Y)) continue;
-            yield return q;
-        }
+    /// <summary>
+    /// The per-quest pick predicate. Split out so GoalSelector can count it against an
+    /// already-fetched available set (one graph scan) and report the funnel.
+    /// </summary>
+    public static bool IsPickable(QuestNode q, BotIdentity id)
+        => q.Giver != null
+           && q.ItemObjectives.Length == 0              // gather quests: later layer
+           && q.Objectives.All(o => o.IsCreature)        // GO objectives: later layer
+           && !id.DeferredQuestIds.ContainsKey(q.QuestId)
+           && !id.IsPathBlacklisted(q.Giver.X, q.Giver.Y);
+
+    /// <summary>
+    /// The range gate (OPEN #1): the quest giver must be on the bot's CURRENT map and
+    /// within the level/zone travel cap. Sibling to IsPickable (which has no bot
+    /// position) — applied ALONGSIDE it by BOTH PickFor and GoalSelector so the
+    /// arbitration and the pick can't disagree (the shared-filter invariant). Gating on
+    /// the giver is enough for the kill-only scope: the loader scopes each quest's grind
+    /// center to within ~500yd of its giver, so giver-in-reach ⇒ objective-in-reach.
+    /// cap = ZoneSafetyMap.GetMaxTravelDistance(level, zoneId, 0) — tier 0, no escalation.
+    /// Compute it once per tick and pass it in (it's the same for every quest).
+    /// </summary>
+    public static bool InReach(QuestNode q, float botX, float botY, int botMap, float cap)
+    {
+        if (q.Giver == null || q.Giver.Map != botMap) return false;
+        float dx = botX - q.Giver.X, dy = botY - q.Giver.Y;
+        return dx * dx + dy * dy <= cap * cap;
     }
 
     // ========================================================================
@@ -287,6 +335,98 @@ public sealed class QuestPlanner : IBotPlanner
     }
 
     // ========================================================================
+    // Resume (the zombie-killer): finish an in-log quest instead of re-accepting
+    // ========================================================================
+    // After a death/restart the scratch is gone but the quest is still ACCEPTED in the
+    // C++ log with its kill progress (QUEST_STATUS_ALL told us which). Re-accepting it
+    // fails (CanTakeQuest=false on an in-log quest), so instead pick up where the server
+    // says we are: build the scratch as already-accepted and jump straight to the first
+    // unsatisfied objective (or turn-in). Deferral/blacklist are ignored on purpose —
+    // resuming an accepted quest is how we CLEAR the stuck state; a still-dangerous route
+    // just re-defers via PATH_UNSAFE on the next leg.
+    private StepResult? TryResume(BotContext ctx)
+    {
+        var id = ctx.Identity;
+        var log = ctx.QuestLog;                       // stable snapshot (executor ref-swaps)
+        if (id == null || !_quests.IsLoaded || log.Count == 0) return null;
+
+        float cap = ZoneSafetyMap.GetMaxTravelDistance(id.Level, ctx.ZoneId, 0);
+
+        QuestNode? best = null;
+        int bestStatus = 0;
+        float bestDist = float.MaxValue;
+        foreach (var kv in log)
+        {
+            var node = _quests.GetQuest(kv.Key);
+            if (node?.Giver == null) continue;
+            if (id.CompletedQuestIds.Contains(node.QuestId)) continue;   // already rewarded
+            if (node.ItemObjectives.Length != 0) continue;               // gather: later layer
+            if (!node.Objectives.All(o => o.IsCreature)) continue;        // GO: later layer
+            if (!InReach(node, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, cap)) continue;
+
+            float d = Dist2(ctx.Pos.X, ctx.Pos.Y, node.Giver.X, node.Giver.Y);
+            if (d < bestDist) { best = node; bestStatus = kv.Value.Status; bestDist = d; }
+        }
+        if (best == null) return null;
+
+        var scratch = new QuestScratch { QuestId = best.QuestId, Node = best, Accepted = true };
+        scratch.ActiveQuestIds.Add(best.QuestId);
+        ctx.Quest = scratch;
+
+        // Server says COMPLETE → straight to turn-in.
+        if (bestStatus == QuestStatusComplete)
+        {
+            _logger.LogInformation("[QUEST] {Name} resuming [{Id}] \"{Title}\" → turn-in (server COMPLETE)",
+                ctx.Name, best.QuestId, best.Title);
+            return ToTurnIn(ctx, scratch);
+        }
+
+        // Otherwise resume the first objective slot the server hasn't satisfied.
+        var counts = log[best.QuestId].MobCounts;
+        int slot = FirstUnsatisfiedObjective(best, counts);
+        if (slot < 0)
+        {
+            _logger.LogInformation("[QUEST] {Name} resuming [{Id}] → turn-in (kills already met)",
+                ctx.Name, best.QuestId);
+            return ToTurnIn(ctx, scratch);
+        }
+
+        scratch.ObjectiveSlot = slot;
+        ctx.SetStep("to_objective");
+        var o = best.Objectives[slot];
+        _logger.LogInformation("[QUEST] {Name} resuming [{Id}] \"{Title}\" → obj slot {Slot} ({Cur}/{Req} entry {Entry})",
+            ctx.Name, best.QuestId, best.Title, slot, counts[o.Slot - 1], o.Count, o.CreatureEntry);
+        return MoveTo(o.GrindX, o.GrindY, o.GrindZ, o.GrindMap);
+    }
+
+    // First index into node.Objectives whose server kill count is below the requirement.
+    // Slot (1-4) maps to the C++ m_creatureOrGOcount[Slot-1]. -1 = all satisfied.
+    private static int FirstUnsatisfiedObjective(QuestNode node, int[] counts)
+    {
+        for (int i = 0; i < node.Objectives.Length; i++)
+        {
+            var o = node.Objectives[i];
+            if (!o.IsCreature || o.Count <= 0 || o.GrindRadius <= 0) continue;
+            int done = (o.Slot >= 1 && o.Slot <= counts.Length) ? counts[o.Slot - 1] : 0;
+            if (done < o.Count) return i;
+        }
+        return -1;
+    }
+
+    // Kills still needed for an objective per the synced log (full count if unknown).
+    // Never returns 0 — kill_count=0 means "indefinite grind" to C++.
+    private static int RemainingKills(BotContext ctx, int questId, QuestObjective obj)
+    {
+        if (ctx.QuestLog.TryGetValue(questId, out var e)
+            && obj.Slot >= 1 && obj.Slot <= e.MobCounts.Length)
+        {
+            int remaining = obj.Count - e.MobCounts[obj.Slot - 1];
+            return remaining > 0 ? remaining : 1;
+        }
+        return obj.Count;
+    }
+
+    // ========================================================================
     // Command builders
     // ========================================================================
     private static StepResult MoveTo(QuestNpcLocation loc) => MoveTo(loc.X, loc.Y, loc.Z, loc.Map);
@@ -308,7 +448,7 @@ public sealed class QuestPlanner : IBotPlanner
             expect, InteractDeadline);
     }
 
-    private static StepResult GrindObjective(QuestObjective obj)
+    private static StepResult GrindObjective(QuestObjective obj, int killCount)
         => StepResult.Send(
             new BridgeCommand("SET_TASK", new
             {
@@ -318,7 +458,7 @@ public sealed class QuestPlanner : IBotPlanner
                 z = obj.GrindZ,
                 radius = GrindRadius,
                 creature_entry = obj.CreatureEntry,
-                kill_count = obj.Count
+                kill_count = killCount
             }),
             "TASK_COMPLETE", ObjectiveDeadline);   // kill_count>0 ⇒ C++ acks at N kills
 

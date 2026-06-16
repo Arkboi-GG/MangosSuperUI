@@ -235,16 +235,17 @@ public class ZoneSafetyMap
             };
         }
 
-        // Leveling zones: once the bot has left the starter sub-zone and is
-        // level 5+, it gets full zone access. Elwynn Forest is ~2500yd across
-        // and Stormwind is adjacent — 3000yd covers full zone + city.
+        // Leveling zones: sub-5 bots stay tight (still finishing the intro chain near
+        // spawn). Once level 5+ the bot gets full zone access — a leveling zone is ~2k
+        // across (Elwynn ~2k), so 2200yd covers it end-to-end with no spill into the
+        // higher-level adjacent zones.
         if (botLevel < 5)
             return 800f;
 
         // Full leveling zone access tiers
         return botLevel switch
         {
-            <= 10 => 3000f,   // full starter leveling zone + capital city
+            <= 10 => 2200f,   // full leveling zone end-to-end (Elwynn ~2k); no capital spillover
             <= 15 => 4000f,   // zone + adjacent zones (Westfall, Redridge)
             <= 20 => 5000f,
             <= 30 => 6000f,

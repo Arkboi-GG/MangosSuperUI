@@ -90,6 +90,7 @@ builder.Services.AddSingleton<BotSupervisor>();
 builder.Services.AddSingleton<GoalSelector>();
 builder.Services.AddSingleton<IBotPlanner, GrindPlanner>();
 builder.Services.AddSingleton<IBotPlanner, QuestPlanner>();   // P3: Goal.Questing
+builder.Services.AddSingleton<IBotPlanner, MaintenancePlanner>();
 
 builder.Services.AddSingleton<BotBrain>();
 
@@ -118,6 +119,9 @@ using (var scope = app.Services.CreateScope())
 // Never throws — logs errors and sets AdminDbReady = false for dashboard to display.
 var dbInit = app.Services.GetRequiredService<DbInitializationService>();
 await dbInit.InitializeAsync();
+
+
+await app.Services.GetRequiredService<QuestGraphLoader>().LoadAsync();
 
 // ---------- Pipeline ----------
 if (!app.Environment.IsDevelopment())

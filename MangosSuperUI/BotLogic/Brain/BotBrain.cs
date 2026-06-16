@@ -181,6 +181,7 @@ public sealed class BotBrain
         ctx.Grind = null;
         ctx.Quest = null;
         ctx.Service = null;
+        ctx.Maintenance = null;   // Phase 4 — re-armed by MaintenancePlanner on each fresh death
     }
 
     /// <summary>SET_TASK IDLE — stops the C++ grind patrol (keeps the follow; §4.3).</summary>

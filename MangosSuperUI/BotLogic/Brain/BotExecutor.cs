@@ -105,6 +105,13 @@ public sealed class BotExecutor
                 ctx.LastLevelUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
                 break;
+            case "QUEST_STATUS_ALL":
+                // Authoritative quest-log snapshot (reply to QUERY_QUEST_STATUS). Not a
+                // WAIT ack and not progress — just refresh the cache the QuestPlanner reads
+                // to resume an in-log quest. Ref-swapped so a concurrent planner read is safe.
+                ctx.QuestLog = ParseQuestLog(evt.Data);
+                ctx.QuestLogStampUtc = DateTime.UtcNow;
+                break;
         }
 
         var pending = ctx.Pending;
@@ -184,6 +191,34 @@ public sealed class BotExecutor
     // Pipe-delimited key=value parse (the bridge event-data format). Segments with
     // no '=' (e.g. QUEST_INTERACT_FAIL's leading bare reason) are dropped here and
     // recovered via FirstBareSegment.
+    // QUEST_STATUS_ALL payload (C++ BridgeHandleQueryQuestStatus):
+    //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
+    // status: 1=INCOMPLETE, 3=COMPLETE. Empty payload = no active quests. Builds a
+    // fresh dictionary and returns it (caller ref-swaps ctx.QuestLog atomically).
+    private static Dictionary<int, QuestLogEntry> ParseQuestLog(string? data)
+    {
+        var log = new Dictionary<int, QuestLogEntry>();
+        if (string.IsNullOrWhiteSpace(data)) return log;
+
+        foreach (var part in data.Split('|', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var f = part.Split(':');
+            if (f.Length < 2) continue;
+            if (!int.TryParse(f[0].Trim(), out int qid)) continue;
+            if (!int.TryParse(f[1].Trim(), out int status)) continue;
+
+            var mob = new int[4];
+            if (f.Length >= 3)
+            {
+                var mc = f[2].Split(',');
+                for (int i = 0; i < 4 && i < mc.Length; i++)
+                    int.TryParse(mc[i].Trim(), out mob[i]);
+            }
+            log[qid] = new QuestLogEntry { Status = status, MobCounts = mob };
+        }
+        return log;
+    }
+
     private static Dictionary<string, string> ParsePipe(string? data)
         => string.IsNullOrEmpty(data)
             ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)

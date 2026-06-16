@@ -104,6 +104,29 @@ public sealed class ServiceScratch
     public Dictionary<string, DateTime> Cooldowns { get; } = new();
 }
 
+// Death-recovery scratch (Goal.Maintenance). Transient per death: armed by
+// MaintenancePlanner on the first dead tick, nulled by the brain on goal (re)entry.
+// Death-LOOP state is NOT here (it must survive this reset) — it rides durable
+// BotIdentity fields (LastDeathTime / RecordDeath / PathBlacklist).
+public sealed class MaintenanceScratch
+{
+    public DateTime DeadSinceUtc { get; set; }            // entered recovery — drives the dead-time backstop
+    public DateTime RezAtUtc { get; set; }                // when the corpse-run delay elapses → send RESURRECT
+    public Vec4 DeathPos { get; set; }                    // where we died (death-spot blacklist target on a loop)
+    public bool DeathLoop { get; set; }                   // quick re-death → escalate (blacklist + at_graveyard ride-along)
+    public bool RezSent { get; set; }                     // RESURRECT issued — guards against duplicate sends
+    public bool Escalated { get; set; }                   // death-spot already blacklisted (once per recovery)
+}
+
+// One quest's authoritative server-side state, parsed from QUEST_STATUS_ALL (the
+// C++ reply to QUERY_QUEST_STATUS). Lets the QuestPlanner RESUME an in-log quest
+// after a death/restart instead of re-accepting it (which C++ rejects → zombie).
+public sealed class QuestLogEntry
+{
+    public int Status { get; set; }                       // 1 = INCOMPLETE, 3 = COMPLETE (VMaNGOS QUEST_STATUS)
+    public int[] MobCounts { get; set; } = new int[4];    // per-slot kill counts, indexed by (QuestObjective.Slot - 1)
+}
+
 // ----------------------------- Group (Phase 5) -----------------------------
 // GroupRole is new; GroupDirective already exists in BotIdentity.cs (same Core
 // namespace) with None/Questing/HoldAndGrind/Regroup/GroupErrand — reuse it so
@@ -128,6 +151,11 @@ public sealed class BotContext
     public Goal Goal { get; private set; } = Goal.Idle;   // current high-level intent
     public string Step { get; private set; } = "idle";    // explicit step within the goal
     public Vec4? Target { get; set; }                     // x,y,z,map the brain is driving toward
+
+    // Why the GoalSelector chose the current goal — set every tick by the arbitration so
+    // FleetReport can explain it (e.g. "q av=12 pick=0", "no-identity"). The decision is
+    // first-class observable state, not a throwaway log.
+    public string GoalReason { get; set; } = "";
 
     // ---- THE WAIT — the observability spine ----
     public Outstanding? Pending { get; set; }
@@ -167,6 +195,13 @@ public sealed class BotContext
     public QuestScratch? Quest { get; set; }
     public GrindScratch? Grind { get; set; }
     public ServiceScratch? Service { get; set; }
+    public MaintenanceScratch? Maintenance { get; set; }
+
+    // ---- quest-log cache (refreshed by QUEST_STATUS_ALL; read by QuestPlanner to resume) ----
+    // Reference-swapped by the executor (not mutated in place) so the planner can read a
+    // stable snapshot without locking. Stamp = when it was last refreshed.
+    public Dictionary<int, QuestLogEntry> QuestLog { get; set; } = new();
+    public DateTime QuestLogStampUtc { get; set; }
 
     // ---- group (Phase 5 — empty until then) ----
     public int? GroupId { get; set; }

@@ -97,6 +97,11 @@ public static class FleetReport
             sb.Append("  *STALL ").Append(b.StallReason).Append('(').Append(secs).Append("s)");
         }
 
+        // Why the bot is in this goal (the arbitration's reasoning) — explains a grinding
+        // bot at a glance: "q av=12 pick=0" = quests available but none pass the pick filter.
+        if (!string.IsNullOrEmpty(b.GoalReason))
+            sb.Append("  why=").Append(b.GoalReason);
+
         return sb.ToString();
     }
 
