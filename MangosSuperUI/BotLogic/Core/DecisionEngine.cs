@@ -121,6 +121,10 @@ public class DecisionEngine
                 // FLIGHT RECORDER: cross-domain return (e.g., vendoring done → resume turn-in)
                 BotTrace.Transition(bot, pending.ReturnTo.ToString(), pending.SubPhase ?? "",
                     "pending_return", detail: $"quest={pending.QuestId}", state: state);
+                bot.Story?.Emit(StoryVerb.OVERRIDE, StoryResult.OK,
+                    quest: pending.QuestId.HasValue ? new StoryQuest(pending.QuestId.Value) : null,
+                    reason: "pending_return",
+                    detail: $"→ {pending.ReturnTo}:{pending.SubPhase}");
 
                 // Enter the return domain
                 var returnDomain = _domainMap.TryGetValue(pending.ReturnTo, out var rd) ? rd : CurrentDomain;
@@ -143,6 +147,25 @@ public class DecisionEngine
 
         // Force strategic eval on critical triggers regardless of timer
         bool criticalTrigger = IsCriticalTrigger(bot, state);
+
+        // ── Session 43: directive compliance at TACTICAL cadence (10-30 s) ──
+        // S42 enforced directives only inside strategic evals (3-10 MIN per bot),
+        // leaving minutes of legal non-compliance per cycle — not a team. A
+        // grouped bot whose activity mismatches its directive now triggers the
+        // strategic eval immediately; the enforcement block inside it does the rest.
+        if (!strategicEvalDue && !criticalTrigger && !state.IsDead && bot.PendingAction == null)
+        {
+            var wanted = GetDirectiveActivity(bot);
+            if (wanted.HasValue
+                && wanted.Value != currentActivity.Type
+                && !IsSelfErrand(currentActivity.Type))
+            {
+                _logger.LogDebug(
+                    "[BOT-GROUP] {Name}({Guid}) | directive mismatch ({Cur} → {Want}) — strategic eval forced now",
+                    bot.Name, bot.Guid, currentActivity.Type, wanted.Value);
+                strategicEvalDue = true;
+            }
+        }
 
         // Session 35: Group members are fully autonomous questers — they get their
         // own strategic evals so they can vendor, train, eat independently.
@@ -189,6 +212,9 @@ public class DecisionEngine
         if (bot.HasUnlearnedSpells)
             bot.TicksSinceLastTrained++;
 
+        bot.Story?.Emit(StoryVerb.EVAL, StoryResult.START,
+            reason: wasCritical ? "critical" : "strategic",
+            detail: $"in {currentActivity.Type} {currentActivity.MinutesInState:F1}min");
         var weights = CurrentDomain.EvaluateTransitions(bot, state);
 
         ApplyPersonalityModifiers(weights, bot.Personality);
@@ -215,6 +241,8 @@ public class DecisionEngine
         {
             weights.Clear();
             weights[ActivityType.CorpseRunning] = 100.0f;
+            bot.Story?.Emit(StoryVerb.OVERRIDE, StoryResult.OK,
+                reason: "dead", detail: "→ CorpseRunning (survival)");
         }
 
         // AuctionHouse is a stub — no OnTick, no sub-phases, no commands.
@@ -240,9 +268,61 @@ public class DecisionEngine
             && bot.CurrentActivity.Type != ActivityType.Training)
         {
             weights[ActivityType.TravelingToTrainer] = 15.0f;
+            bot.Story?.Emit(StoryVerb.OVERRIDE, StoryResult.OK,
+                reason: "training_overdue",
+                detail: $"→ TravelingToTrainer (idle {bot.TicksSinceLastTrained} ticks)");
+        }
+
+        // ── Session 42: GroupCoordinator directive enforcement (ARCH §7a) ──
+        // Grouped bots obey the group directive unless an individual hard need
+        // (bags full / low HP / overdue training) wins, they're mid-errand (let
+        // the errand finish — the directive re-applies next eval), or a
+        // PendingAction return is staged. Solo bots and stale directives (>2 min:
+        // disband/restart guard) fall through to the normal roll untouched.
+        // Computed in BotBrainService, ENFORCED here, EXECUTED by domains —
+        // never decided inside a domain (the gotcha-96 trap).
+        bool directiveForced = false;
+        var directiveActivity = GetDirectiveActivity(bot);   // Session 43: followers → Following
+        if (!state.IsDead
+            && directiveActivity.HasValue
+            && !IsSelfErrand(currentActivity.Type)
+            && bot.PendingAction == null)
+        {
+            // Session 44b: maintenance is the GROUP's business now, not the
+            // member's. Bags-full and overdue training used to let a member peel
+            // off solo while the rest held — exactly the "each member its own
+            // mind" noise the coordinator exists to kill. Both are detected by
+            // the BotBrainService macro brain, which routes the WHOLE formation
+            // to the service NPC (GroupErrand directive) and fires the service
+            // interacts itself. The only per-member override left is survival:
+            // critically low HP → eat IN PLACE (MaintenanceDomain doesn't move),
+            // and death is handled by the hard CorpseRunning override above.
+            bool individualNeed = state.HealthPercent < 0.35f;
+
+            if (!individualNeed)
+            {
+                weights.Clear();
+                // Session 43 formation model: followers get Following (C++ MoveFollow
+                // glue, 6 yd, combat-interruptible, opportunistic quest interact);
+                // the leader gets Questing or Grinding-at-anchor per the directive.
+                weights[directiveActivity.Value] = 100.0f;
+                directiveForced = true;
+                bot.Story?.Emit(StoryVerb.DIRECTIVE, StoryResult.OK,
+                    target: new StoryTarget(bot.GroupAnchorX, bot.GroupAnchorY, bot.GroupAnchorZ, bot.GroupAnchorMap),
+                    reason: bot.GroupDirective.ToString(),
+                    detail: $"→ {directiveActivity.Value}");
+                _logger.LogDebug(
+                    "[BOT-GROUP] {Name}({Guid}) | directive {Directive} enforced (anchor {AX:F0},{AY:F0})",
+                    bot.Name, bot.Guid, bot.GroupDirective, bot.GroupAnchorX, bot.GroupAnchorY);
+            }
         }
 
         var (selectedActivity, rollValue) = WeightedRoller.Roll(weights);
+        bot.Story?.Emit(StoryVerb.ROLL, StoryResult.OK,
+            reason: selectedActivity == currentActivity.Type ? "stay" : $"→{selectedActivity}",
+            detail: $"roll={rollValue:F2} | " + string.Join(" ",
+                weights.Where(w => w.Value > 0.001f).OrderByDescending(w => w.Value).Take(5)
+                       .Select(w => $"{w.Key}={w.Value:F2}")));
 
         // ── Session 29: Zone completion gate ──
         // If a "wandering" activity (Exploring, Grinding, Idle) won the roll and
@@ -250,7 +330,9 @@ public class DecisionEngine
         // have >20% of its quests unfinished? If yes, override back to Questing.
         // Vendoring, Training, Eating, CorpseRunning are ERRANDS — always allowed.
         // Only Questing can decide to move zones (when it runs out of local quests).
-        if (selectedActivity != currentActivity.Type && _questGraph.IsLoaded)
+        // Session 42: a directive-forced pick is exempt — the zone gate would flip
+        // a forced HoldAndGrind/Regroup (Grinding) straight back to Questing.
+        if (selectedActivity != currentActivity.Type && _questGraph.IsLoaded && !directiveForced)
         {
             bool isZoneExitActivity =
                 selectedActivity == ActivityType.Exploring ||
@@ -268,6 +350,9 @@ public class DecisionEngine
                         bot.Name, bot.Guid, selectedActivity,
                         state.ZoneId, completionRatio, ZONE_COMPLETION_GATE);
 
+                    bot.Story?.Emit(StoryVerb.OVERRIDE, StoryResult.BLOCK,
+                        reason: "zone_gate",
+                        detail: $"blocked {selectedActivity} — zone {state.ZoneId} {completionRatio:P0} < {ZONE_COMPLETION_GATE:P0} → Questing");
                     selectedActivity = ActivityType.Questing;
                 }
             }
@@ -290,6 +375,8 @@ public class DecisionEngine
             BotTrace.Mark(bot,
                 $"stuck-detector {stuckReport.Type}: {stuckReport.Pattern} x{stuckReport.Occurrences}",
                 state);
+            bot.Story?.Wedge(stuckReport.Type,
+                $"{stuckReport.Pattern} x{stuckReport.Occurrences} in {stuckReport.Window.TotalMinutes:F0}min");
 
             // Emit SignalR for dashboard visibility
             // (use existing BotDecision emit pattern)
@@ -397,6 +484,45 @@ public class DecisionEngine
         return result;
     }
 
+    // ── Session 42: GroupCoordinator (ARCH §7a) ─────────────────────────
+    /// <summary>
+    /// True when the activity is a self-maintenance errand the group directive
+    /// must not interrupt (let it finish; the directive re-applies next eval).
+    /// Mirrors BotBrainService.IsAwayOnErrand — keep the two sets identical.
+    /// </summary>
+    private static bool IsSelfErrand(ActivityType a)
+    {
+        return a == ActivityType.Vendoring
+            || a == ActivityType.TravelingToVendor   // Session 43: real enum value, missed in S42
+            || a == ActivityType.Training
+            || a == ActivityType.TravelingToTrainer
+            || a == ActivityType.Eating
+            || a == ActivityType.CorpseRunning
+            || a == ActivityType.FlightPath;         // Session 43: on a taxi = away
+    }
+
+    // ── Session 43: directive → activity mapping (formation model) ──────
+    /// <summary>
+    /// What activity the group directive demands of THIS bot right now, or null
+    /// when no fresh directive applies (solo, disbanded, stale >2 min).
+    /// Formation rule: FOLLOWERS ALWAYS FOLLOW — the leader is the group's only
+    /// quest-pathing agent. Followers stay glued via C++ MoveFollow (FollowDomain)
+    /// regardless of directive flavor; the leader maps Questing→Questing and
+    /// HoldAndGrind/Regroup→Grinding-at-anchor (CombatDomain, Session 42).
+    /// </summary>
+    private static ActivityType? GetDirectiveActivity(BotIdentity bot)
+    {
+        if (!bot.IsGrouped || bot.GroupDirective == GroupDirective.None)
+            return null;
+        if ((DateTime.UtcNow - bot.GroupDirectiveUtc).TotalSeconds >= 120)
+            return null;
+        if (bot.IsGroupFollower)
+            return ActivityType.Following;
+        return bot.GroupDirective == GroupDirective.Questing
+            ? ActivityType.Questing
+            : ActivityType.Grinding;
+    }
+
     /// <summary>
     /// Zero out weights for any activity whose domain is not operational.
     /// The current activity is never filtered — if the bot is somehow already in
@@ -446,8 +572,13 @@ public class DecisionEngine
         if (state.HealthPercent < 0.25f && bot.CurrentActivity.Type != ActivityType.Eating)
             return true;
 
-        // Bags completely full and not already vendoring — need to sell
-        if (state.FreeSlots == 0 && bot.CurrentActivity.Type != ActivityType.Vendoring)
+        // Bags completely full and not already vendoring — need to sell.
+        // Session 44b: grouped bots with a fresh directive are exempt — the
+        // GroupErrand macro brain detects bags-full at the group level, and the
+        // enforcement block would hold them in formation anyway, so firing this
+        // every tick would just storm strategic evals for the errand's duration.
+        if (state.FreeSlots == 0 && bot.CurrentActivity.Type != ActivityType.Vendoring
+            && GetDirectiveActivity(bot) == null)
             return true;
 
         // Bot stuck in a non-operational domain — escape immediately.

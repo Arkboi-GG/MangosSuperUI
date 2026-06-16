@@ -192,6 +192,25 @@ public class BotsController : Controller
         return Json(new { enabled = _recorder.Enabled, targets = _recorder.Targets });
     }
 
+    // ==================== Story Rider API (StoryRider I4) ====================
+    // Per-bot causal story log. Unlike trace (recorder-owned, DB-persisted), the rider
+    // is per-bot and in-memory, so these route through the brain service. POST
+    // {"enabled":true,"guids":[9]} enables one bot's story_<guid>_<name>.jsonl.
+
+    [HttpPost]
+    public IActionResult SetStory([FromBody] SetStoryRequest req)
+    {
+        var guids = req.Guids ?? Array.Empty<int>();
+        var affected = _brain.SetStoryEnabled(guids, req.Enabled);
+        return Json(new { success = true, enabled = req.Enabled, targets = affected });
+    }
+
+    [HttpGet]
+    public IActionResult StoryStatus()
+    {
+        return Json(new { bots = _brain.GetStoryStatus() });
+    }
+
     // ==================== Grouping API (Session 31) ====================
 
     [HttpPost]
@@ -589,6 +608,12 @@ public class DisbandGroupRequest
 }
 
 public class SetTraceRequest
+{
+    public bool Enabled { get; set; }
+    public int[] Guids { get; set; } = Array.Empty<int>();
+}
+
+public class SetStoryRequest
 {
     public bool Enabled { get; set; }
     public int[] Guids { get; set; } = Array.Empty<int>();

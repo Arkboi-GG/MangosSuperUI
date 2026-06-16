@@ -178,7 +178,41 @@ public class ZoneSafetyMap
     ///   12=Elwynn, 1=Dun Morogh, 14=Durotar, 85=Tirisfal,
     ///   141=Teldrassil, 215=Mulgore
     /// </summary>
-    public static float GetMaxTravelDistance(int botLevel, int zoneId = 0)
+    /// <summary>
+    /// Stuck-aware travel reach. <paramref name="escalationTier"/> widens the radius
+    /// in steps when a bot has been unable to find ANY pickable quest for a while
+    /// (QuestingDomain time-gates the tier off the no-quest streak). Tier 0 == baseline,
+    /// byte-identical to every existing caller. This loosens the SOFT distance guardrail
+    /// only; the HARD guardrail (creature-level path safety: C++ IsPathSafe + the C#
+    /// PathBlacklist) is independent and is NOT affected here. The ceiling is level-bounded
+    /// so escalation can never reach continent-spanning.
+    /// </summary>
+    public static float GetMaxTravelDistance(int botLevel, int zoneId = 0, int escalationTier = 0)
+    {
+        float baseCap = ComputeBaseTravelDistance(botLevel, zoneId);
+        if (escalationTier <= 0)
+            return baseCap;
+
+        // Level-bounded ceiling — escalation widens reach but never past what a bot of
+        // this level should be ranging. Kept TIGHT at low levels: a level 2-3 bot must
+        // stay in its starter valley / the road to the first town, never range the whole
+        // zone (unbounded low-level reach produced the level-2 no_path thrash across east
+        // Elwynn on June 13).
+        float ceiling = botLevel switch
+        {
+            <= 3 => 900f,    // starter sub-zone + road to first town (Northshire -> Goldshire), no further
+            <= 6 => 1600f,   // first town + immediate surroundings
+            <= 10 => 3000f,   // full starter leveling zone + capital
+            <= 20 => 6000f,
+            _ => 15000f
+        };
+
+        // ~900yd per tier — one "hub hop" (Northshire -> Goldshire is ~900yd).
+        float widened = baseCap + escalationTier * 900f;
+        return MathF.Min(widened, ceiling);
+    }
+
+    private static float ComputeBaseTravelDistance(int botLevel, int zoneId)
     {
         // Starter sub-zones: always use tight radius regardless of level.
         // These are small areas where bots should finish the intro chain

@@ -35,6 +35,24 @@ public class MaintenanceDomain : IBotDomain
     // WoW allows resurrection within ~36yd of corpse.
     private const float REZ_OFFSET_DISTANCE = 25f;
 
+    // ── Session 41: death-loop / unpathable-corpse failsafe ──
+    // June-12 run: 3/5 bots lost 4–7.5 h each to die→rez-into-danger→die loops
+    // around no_path ghost-walk dests. Per-guid here because PhaseData does not
+    // survive the CorpseRunning→Eating→CorpseRunning churn and BotIdentity is
+    // out of scope for this fix (move there when that file is next open).
+    private sealed class DeathLoopState
+    {
+        public DateTime LastRespawnUtc;
+        public DateTime FirstDeadUtc;
+        public int QuickDeaths;      // deaths within DEATH_LOOP_WINDOW_SEC of last respawn
+        public int GhostWalkFails;   // MOVE_FAILED during GhostWalkingToSafeSpot
+    }
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DeathLoopState> _deathLoop = new();
+
+    private const float DEATH_LOOP_WINDOW_SEC = 300f;  // re-death within 5 min of respawn = loop candidate
+    private const int DEATH_LOOP_THRESHOLD = 3;     // quick deaths before escalation
+    private const float MAX_DEAD_SECONDS = 300f;  // absolute cap on time spent dead per death
+
     public MaintenanceDomain(Data.ZoneSafetyMap safetyMap, ILogger<MaintenanceDomain> logger)
     {
         _safetyMap = safetyMap;
@@ -102,6 +120,34 @@ public class MaintenanceDomain : IBotDomain
         {
             bot.CurrentActivity.IsInterruptible = false;
 
+            // ── Session 41: death-loop accounting ──
+            // FirstDeadUtc is cleared only by RESPAWN — re-entering CorpseRunning
+            // while it's still set means the rez never happened (e.g. RESURRECT
+            // timeout → forced Alive → eval → straight back here). That is the
+            // SAME death continuing: don't restart the dead-time clock and don't
+            // reset the sampler distrust, or a rez-fail churn defeats both.
+            var dls = _deathLoop.GetOrAdd(bot.Guid.ToString(), _ => new DeathLoopState());
+            bool sameDeath = dls.FirstDeadUtc != default;
+            if (!sameDeath)
+            {
+                dls.FirstDeadUtc = DateTime.UtcNow;
+                if (dls.LastRespawnUtc != default
+                    && (DateTime.UtcNow - dls.LastRespawnUtc).TotalSeconds < DEATH_LOOP_WINDOW_SEC)
+                {
+                    dls.QuickDeaths++;
+                    if (dls.QuickDeaths >= DEATH_LOOP_THRESHOLD)
+                        _logger.LogWarning(
+                            "[BOT-MAINT] {Name} DEATH LOOP — {Count} deaths each within {Window:F0}s of respawn. " +
+                            "Escalating: no ghost walk, graveyard rez requested.",
+                            bot.Name, dls.QuickDeaths, DEATH_LOOP_WINDOW_SEC);
+                }
+                else
+                {
+                    dls.QuickDeaths = 1;
+                    dls.GhostWalkFails = 0;   // fresh context — re-trust the sampler
+                }
+            }
+
             // Calculate fake "corpse run" delay.
             // Personality-modulated: impatient bots rez faster (they'd sprint).
             // Range: 15-45 seconds.
@@ -146,6 +192,23 @@ public class MaintenanceDomain : IBotDomain
         if (bot.CurrentActivity.Type == ActivityType.CorpseRunning)
         {
             var subPhase = bot.CurrentActivity.SubPhase ?? "";
+
+            // ── Session 41: absolute dead-time cap (belt-and-suspenders) ──
+            // Normal cycle is ≤80 s (45 s timer + 15 s walk + 20 s rez timeout);
+            // anything past MAX_DEAD_SECONDS is a wedge we haven't named yet.
+            var dlsCap = _deathLoop.GetOrAdd(bot.Guid.ToString(), _ => new DeathLoopState());
+            if (subPhase != "Alive" && subPhase != "WaitingForResurrect"
+                && dlsCap.FirstDeadUtc != default
+                && (DateTime.UtcNow - dlsCap.FirstDeadUtc).TotalSeconds > MAX_DEAD_SECONDS)
+            {
+                _logger.LogWarning(
+                    "[BOT-MAINT] {Name} dead for >{Cap:F0}s in '{Sub}' — forcing graveyard rez.",
+                    bot.Name, MAX_DEAD_SECONDS, subPhase);
+                AdvanceTo(bot, "WaitingForResurrect");
+                bot.CurrentActivity.PhaseData["resurrect_sent_at"] = DateTime.UtcNow;
+                commands.Add(new BridgeCommand("RESURRECT", new { at_graveyard = 1 }));
+                return commands;
+            }
 
             switch (subPhase)
             {
@@ -203,12 +266,38 @@ public class MaintenanceDomain : IBotDomain
                 bot.CurrentActivity.IsInterruptible = true;
         }
 
+        // ── Session 41: ghost walk failed (no_path safe spot) ──
+        // The sampler picks by ZoneSafetyMap only and never path-checks; near a
+        // mesh hole every pick fails. Don't burn the 15 s timeout — rez now,
+        // and mark the sampler untrusted here so the next death skips the walk.
+        if (evt.EventType == "MOVE_FAILED"
+            && bot.CurrentActivity.Type == ActivityType.CorpseRunning
+            && (bot.CurrentActivity.SubPhase ?? "") == "GhostWalkingToSafeSpot")
+        {
+            var dlsGw = _deathLoop.GetOrAdd(bot.Guid.ToString(), _ => new DeathLoopState());
+            dlsGw.GhostWalkFails++;
+            _logger.LogWarning(
+                "[BOT-MAINT] {Name} ghost walk MOVE_FAILED ({Data}) — rezzing immediately (fail #{N}).",
+                bot.Name, evt.Data ?? "", dlsGw.GhostWalkFails);
+            AdvanceTo(bot, "WaitingForResurrect");
+            bot.CurrentActivity.PhaseData["resurrect_sent_at"] = DateTime.UtcNow;
+            if (dlsGw.GhostWalkFails >= 2 || dlsGw.QuickDeaths >= DEATH_LOOP_THRESHOLD)
+                commands.Add(new BridgeCommand("RESURRECT", new { at_graveyard = 1 }));
+            else
+                commands.Add(new BridgeCommand("RESURRECT"));
+            return commands;
+        }
+
         // RESPAWN: bot is alive again
         if (evt.EventType == "RESPAWN" && bot.CurrentActivity.Type == ActivityType.CorpseRunning)
         {
             _logger.LogInformation(
                 "[BOT-MAINT] {Name} RESPAWN received — alive! Forcing re-eval.",
                 bot.Name);
+
+            var dlsRs = _deathLoop.GetOrAdd(bot.Guid.ToString(), _ => new DeathLoopState());
+            dlsRs.LastRespawnUtc = DateTime.UtcNow;
+            dlsRs.FirstDeadUtc = default;
 
             bot.CurrentActivity.IsInterruptible = true;
             AdvanceTo(bot, "Alive");
@@ -242,6 +331,24 @@ public class MaintenanceDomain : IBotDomain
                 float corpseY = bot.CorpseY ?? state.Y;
                 float corpseZ = bot.CorpseZ ?? state.Z;
                 int corpseMap = bot.CorpseMapId ?? state.MapId;
+
+                // ── Session 41: escalated rez — death loop or untrusted sampler ──
+                // The at_graveyard flag is a forward-compatible ride-along: the
+                // current C++ BridgeHandleResurrect ignores unknown fields (plain
+                // rez-at-corpse, no worse than today); once the RepopAtGraveyard
+                // variant ships, this becomes a true escape from the kill pocket.
+                var dlsEsc = _deathLoop.GetOrAdd(bot.Guid.ToString(), _ => new DeathLoopState());
+                if (dlsEsc.QuickDeaths >= DEATH_LOOP_THRESHOLD || dlsEsc.GhostWalkFails >= 2)
+                {
+                    _logger.LogWarning(
+                        "[BOT-MAINT] {Name} ESCALATED REZ (quickDeaths={QD}, ghostWalkFails={GW}) — " +
+                        "skipping ghost walk, requesting graveyard rez.",
+                        bot.Name, dlsEsc.QuickDeaths, dlsEsc.GhostWalkFails);
+                    AdvanceTo(bot, "WaitingForResurrect");
+                    bot.CurrentActivity.PhaseData["resurrect_sent_at"] = DateTime.UtcNow;
+                    commands.Add(new BridgeCommand("RESURRECT", new { at_graveyard = 1 }));
+                    return commands;
+                }
 
                 // Session 32: Before rezzing, find a safe spot near the corpse.
                 // Check the corpse location itself — if it's safe, rez immediately.

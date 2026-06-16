@@ -56,6 +56,68 @@ public class QuestingDomain : IBotDomain
     private const float OPPORTUNISTIC_OBJECTIVE_RADIUS = 40f;
     private const int SAFETY_MARGIN = 3;
 
+    // Session 36: DoingObjectives no-progress guard. A bot grinding an objective
+    // whose KILL/LOOT stream dries up (spawn depleted, grind task died, stale
+    // current_grind_creature) used to sit in owner=CS limbo until the 20-min
+    // watchdog. Relocate-and-re-grind after DO_NO_PROGRESS_SEC; after
+    // DO_MAX_NOPROGRESS_REARMS unproductive relocations, defer the blocking
+    // quest(s) and re-pick. Turns a ~13-min freeze into a ~90s self-heal.
+    private const double DO_NO_PROGRESS_SEC = 90.0;
+    private const int DO_MAX_NOPROGRESS_REARMS = 3;
+    private const int DO_NOPROGRESS_DEFER_MIN = 15;
+    private const double DO_QUEST_RESYNC_SEC = 6.0;   // S47: min gap between mid-grind QUEST_STATUS re-queries
+
+    // Session 36 (F3): a turn-in NPC that C++ reports unreachable (incomplete_path/
+    // no_path) is a navmesh dead-end, not a level-gated danger. Defer EVERY quest
+    // sharing that turn-in in one shot, for longer, so siblings stop re-routing to
+    // the same unreachable coordinate.
+    private const int F3_TURNIN_DEFER_MIN = 30;
+
+    // ── Session 38: force_* server-side credit for WMO-interior NPCs ─────
+    // C++ BridgeHandleQuestInteract (deployed, verified via "bypassing
+    // proximity" string) supports action "force_accept"/"force_complete":
+    // 300yd NPC search, proximity skipped, ALL eligibility gates intact
+    // (CanRewardQuest / CanTakeQuest / CanAddQuest). We arm it only when a
+    // turn-in/giver path fails on the LAST LEG — bot within
+    // FORCE_INTERACT_TRIGGER_RADIUS 2D of the failed dest — i.e. a
+    // vertical/WMO problem (Brother Neals' bell tower), never a long-range
+    // routing failure. Long-range failures keep the normal cluster-defer so
+    // force can't mask real path bugs or an off-mesh bot.
+    private const float FORCE_INTERACT_TRIGGER_RADIUS = 150f; // bot→failed-dest gate
+    private const float FORCE_INTERACT_NPC_RADIUS = 180f;     // widened interact radius in force mode (C++ searches 300yd)
+    private const int FORCE_MODE_TTL_SEC = 120;               // force mode auto-expires
+
+    // ── Session 44: formation quest-sync leader hold ──
+    // Max seconds the leader waits at a giver/ender for glued followers to match
+    // its accepts/turn-ins (flags computed by the BotBrainService coordinator from
+    // the group quest batch). Timeout-capped so a wedged/ineligible follower can
+    // never freeze the leader (the June-6 lesson); after a timed-out hold the
+    // leader won't re-hold in the same sub-phase for HOLD_GIVEUP_COOLDOWN_SEC.
+    private const double GROUP_HOLD_TIMEOUT_SEC = 45.0;
+    private const double GROUP_HOLD_GIVEUP_COOLDOWN_SEC = 120.0;
+
+    // ── Stuck-aware quest reach (dynamic travel cap, June 13) ──
+    // A bot that filters down to 0 pickable quests starts a "no-quest streak". The
+    // longer it runs, the wider the travel cap (GetMaxTravelDistance escalationTier).
+    // Self-heal for a bad/zero ZoneId collapsing the cap to 800yd and wedging the fleet
+    // in NoQuestsAvailable: tight by default, widens only under proven stuckness, RESETS
+    // the instant a pick succeeds. Distance only — creature path safety stays a hard,
+    // independent gate. Rule A -> B -> C on a time gate.
+    private const double ESC_TIER1_SEC = 90.0;    // A -> B
+    private const double ESC_TIER2_SEC = 240.0;   // B -> C
+    private const double ESC_TIER3_SEC = 480.0;   // C -> max
+    private readonly Dictionary<long, DateTime> _noQuestStreakStartUtc = new();
+
+    private int QuestReachTier(long guid)
+    {
+        if (!_noQuestStreakStartUtc.TryGetValue(guid, out var start)) return 0;
+        double s = (DateTime.UtcNow - start).TotalSeconds;
+        if (s >= ESC_TIER3_SEC) return 3;
+        if (s >= ESC_TIER2_SEC) return 2;
+        if (s >= ESC_TIER1_SEC) return 1;
+        return 0;
+    }
+
     public QuestingDomain(QuestGraphLoader questGraph, ZoneSafetyMap safetyMap,
         ILogger<QuestingDomain> logger, ConnectionFactory db, BotFleetDiagnostics diagnostics)
     {
@@ -124,6 +186,7 @@ public class QuestingDomain : IBotDomain
             weights[ActivityType.Exploring] = 0.5f;
             if (state.HealthPercent < 0.5f || state.ManaPercent < 0.3f)
                 weights[ActivityType.Eating] = 0.6f;
+            bot.Story?.Emit(StoryVerb.EVAL, StoryResult.BLOCK, reason: "no_quests_subphase", detail: "NoQuestsAvailable -> grind 2.0");
             return weights;
         }
 
@@ -164,6 +227,7 @@ public class QuestingDomain : IBotDomain
         {
             stayWeight *= 0.1f;
             weights[ActivityType.Grinding] = 0.8f;
+            bot.Story?.Emit(StoryVerb.EVAL, StoryResult.BLOCK, reason: _questGraph.IsLoaded ? "no_available_quests" : "questgraph_unloaded", detail: $"map={state.MapId} stay*0.1 grind=0.8");
         }
         else
         {
@@ -336,6 +400,22 @@ public class QuestingDomain : IBotDomain
 
                 if (questDist > maxDist)
                 {
+                    // ── Session 45: NEVER drop a READY (server-complete) quest for distance. ──
+                    // Dropping banked turn-ins created the level-2 wedge: the bot cannot
+                    // level without turning in, and cannot turn in because the ender sits
+                    // past GetMaxTravelDistance for its (stuck) level. The cap exists to
+                    // stop low-level bots STARTING far quests; a complete quest is banked
+                    // XP and the walk itself is policed by C++ path safety (PATH_UNSAFE),
+                    // the same authority principle as the §15.26 IsQuestPathSafe removal.
+                    if (aq.ServerComplete)
+                    {
+                        _logger.LogInformation(
+                            "[BOT-QUEST] {Name}({Guid}) | Keeping READY synced quest [{QuestId}] \"{Title}\" despite distance — " +
+                            "turn-in NPC {Dist:F0}yd away (max {Max:F0}yd for level {Level})",
+                            bot.Name, bot.Guid, aq.QuestId, aq.Title, questDist, maxDist, bot.Level);
+                        continue;
+                    }
+
                     _logger.LogWarning(
                         "[BOT-QUEST] {Name}({Guid}) | Dropping synced quest [{QuestId}] \"{Title}\" — " +
                         "nearest NPC is {Dist:F0}yd away (max {Max:F0}yd for level {Level})",
@@ -382,6 +462,83 @@ public class QuestingDomain : IBotDomain
         AdvanceTo(bot, "PickingQuests");
         commands.AddRange(ProcessPickingQuests(bot, state));
         return commands;
+    }
+
+    /// <summary>
+    /// Session 47: lightweight IN-PLACE refresh of KillProgress / ItemProgress /
+    /// ServerComplete on the EXISTING active-quest list from a QUEST_STATUS_ALL
+    /// payload. Unlike RebuildFromQuestSync this does NOT rebuild the list,
+    /// distance-drop, or change sub-phase — safe to call mid-grind. Server-truth
+    /// mob counts (which include group-credited kills the leader never
+    /// self-tapped) overwrite the local self-tap tally. Returns true if any quest
+    /// NEWLY flipped to ServerComplete (caller stops the grind).
+    /// </summary>
+    private bool RefreshProgressFromQuestSync(BotIdentity bot, string payload)
+    {
+        if (string.IsNullOrEmpty(payload)) return false;
+
+        var active = GetActiveQuests(bot);
+        if (active.Count == 0) return false;
+
+        bool newlyComplete = false;
+
+        foreach (var entry in payload.Split('|', StringSplitOptions.RemoveEmptyEntries))
+        {
+            // Format: questId:status:mob1,mob2,mob3,mob4:item1,item2,item3,item4
+            var parts = entry.Split(':');
+            if (parts.Length < 4) continue;
+            if (!int.TryParse(parts[0], out int questId)) continue;
+            if (!int.TryParse(parts[1], out int status)) continue;
+
+            var aq = active.FirstOrDefault(q => q.QuestId == questId);
+            if (aq?.Node == null) continue;
+
+            var mobParts = parts[2].Split(',');
+            int[] mobCounts = new int[4];
+            for (int i = 0; i < 4 && i < mobParts.Length; i++)
+                int.TryParse(mobParts[i], out mobCounts[i]);
+
+            var itemParts = parts[3].Split(',');
+            int[] itemCounts = new int[4];
+            for (int i = 0; i < 4 && i < itemParts.Length; i++)
+                int.TryParse(itemParts[i], out itemCounts[i]);
+
+            // Server truth overwrites the local self-tap count (group credit).
+            if (aq.Node.Objectives != null)
+            {
+                int idx = 0;
+                foreach (var obj in aq.Node.Objectives)
+                {
+                    if (idx >= 4) break;
+                    if (obj.IsCreature) aq.KillProgress[obj.Slot] = mobCounts[idx];
+                    idx++;
+                }
+            }
+            if (aq.Node.ItemObjectives != null)
+            {
+                int idx = 0;
+                foreach (var itemObj in aq.Node.ItemObjectives)
+                {
+                    if (idx >= 4) break;
+                    if (itemCounts[idx] > 0) aq.ItemProgress[itemObj.ItemId] = itemCounts[idx];
+                    idx++;
+                }
+            }
+
+            // VMaNGOS quest status: 1=COMPLETE, 3=INCOMPLETE.
+            bool done = (status == 1) || AllObjectivesComplete(aq);
+            if (done && !aq.ServerComplete)
+            {
+                newlyComplete = true;
+                _logger.LogInformation(
+                    "[BOT-QUEST] {Name}({Guid}) | Mid-grind resync: [{QuestId}] \"{Title}\" server-COMPLETE — stopping grind",
+                    bot.Name, bot.Guid, aq.QuestId, aq.Title);
+            }
+            aq.ServerComplete = done;
+            UpdateQuestProgress(aq);
+        }
+
+        return newlyComplete;
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -509,6 +666,15 @@ public class QuestingDomain : IBotDomain
                 {
                     commands.AddRange(RebuildFromQuestSync(bot, state, evt.Data ?? ""));
                 }
+                // Session 47: mid-grind resync (see HandleKillEvent). Refresh
+                // server-truth progress IN PLACE — no rebuild / drop / re-route —
+                // and if a quest just flipped server-complete, run the
+                // DoingObjectives stop check NOW instead of waiting a tactical tick.
+                else if (bot.CurrentActivity.SubPhase == "DoingObjectives")
+                {
+                    if (RefreshProgressFromQuestSync(bot, evt.Data ?? ""))
+                        commands.AddRange(ProcessDoingObjectives(bot, state));
+                }
                 break;
             case "QUEST_UPDATE":
                 if (evt.QuestStatus == "COMPLETE" && evt.QuestId.HasValue)
@@ -526,13 +692,10 @@ public class QuestingDomain : IBotDomain
                 break;
             case "QUEST_ACCEPT_ACK":
                 {
-                    // C++ sends quest ID in BridgeSendEvent data param → lands in evt.Data
                     int.TryParse(evt.Data ?? "", out int ackId);
                     _logger.LogInformation("[BOT-QUEST] {Name}({Guid}) | ACK: quest {AckId} accepted",
                         bot.Name, bot.Guid, ackId);
 
-                    // React immediately — accept the next quest or advance to objectives.
-                    // Don't wait for the next tactical tick (10-30s).
                     var subPhase = bot.CurrentActivity.SubPhase;
                     if (subPhase == "AcceptingQuests")
                     {
@@ -542,12 +705,10 @@ public class QuestingDomain : IBotDomain
                 }
             case "QUEST_COMPLETE_ACK":
                 {
-                    // C++ sends quest ID in BridgeSendEvent data param → lands in evt.Data
                     int.TryParse(evt.Data ?? "", out int ackId);
                     _logger.LogInformation("[BOT-QUEST] {Name}({Guid}) | ACK: quest {AckId} rewarded",
                         bot.Name, bot.Guid, ackId);
 
-                    // React immediately — turn in the next quest or advance to next phase.
                     var subPhase = bot.CurrentActivity.SubPhase;
                     if (subPhase == "TurningIn")
                     {
@@ -573,8 +734,8 @@ public class QuestingDomain : IBotDomain
             case "USE_GO_FAIL":
                 _logger.LogWarning("[BOT-QUEST] {Name}({Guid}) | USE_GO_FAIL: {Data}",
                     bot.Name, bot.Guid, evt.Data ?? "");
-                // Clear the interaction cooldown so next tick tries a different spot
                 SetPhaseDateTime(bot, "go_last_interact", default);
+                SetPhaseInt(bot, "go_spawn_pin", 0);
                 break;
         }
 
@@ -756,6 +917,8 @@ public class QuestingDomain : IBotDomain
                 float.TryParse(dys, System.Globalization.CultureInfo.InvariantCulture, out destY);
         }
 
+        bot.Story?.Emit(StoryVerb.MOVE_FAIL, StoryResult.BLOCK, reason: "path_unsafe", target: (destX != 0 || destY != 0) ? new StoryTarget(destX, destY, 0, state.MapId) : null, detail: $"subPhase={subPhase}");
+
         // If we're in a travel phase, identify the specific quest that caused the
         // PATH_UNSAFE and defer only that one — not the entire batch.
         // Session 32 fix: was deferring ALL quests in batch, draining the quest pool.
@@ -830,6 +993,7 @@ public class QuestingDomain : IBotDomain
                         questId: aq.QuestId, questTitle: aq.Title,
                         detail: $"path_unsafe shelved (surgical), time-gated {deferMinutes:F0}min (no danger_level)");
                 }
+                bot.Story?.Emit(StoryVerb.DEFER, StoryResult.SKIP, quest: new StoryQuest(aq.QuestId, aq.Title), reason: "path_unsafe", detail: dangerLevel > 0 ? $"until lvl {Math.Max(1, dangerLevel - SAFETY_MARGIN)}" : "10-25min");
             }
 
             int reqLevel = dangerLevel > 0 ? Math.Max(1, dangerLevel - SAFETY_MARGIN) : 0;
@@ -953,6 +1117,117 @@ public class QuestingDomain : IBotDomain
                     float.TryParse(dys, System.Globalization.CultureInfo.InvariantCulture, out destY);
             }
 
+            // ── Session 36 (F3): structural turn-in unreachability ───────────
+            // incomplete_path/no_path to a turn-in NPC is a navmesh dead-end, not a
+            // level-gated danger. Deferring one quest just routes the next sibling to
+            // the SAME unreachable NPC (we re-cycled -9461,16 dozens of times/run).
+            // Defer EVERY active quest turning in at this location in one shot.
+            string mfReason = "";
+            if (!string.IsNullOrEmpty(evt.Data))
+            {
+                var rp = evt.Data.Split('|').Select(s => s.Split('=', 2))
+                    .Where(pp => pp.Length == 2)
+                    .ToDictionary(pp => pp[0].Trim(), pp => pp[1].Trim(), StringComparer.OrdinalIgnoreCase);
+                if (rp.TryGetValue("reason", out var r)) mfReason = r;
+            }
+
+            bot.Story?.Emit(StoryVerb.MOVE_FAIL, StoryResult.FAIL, reason: string.IsNullOrEmpty(mfReason) ? "move_failed" : mfReason, target: (destX != 0 || destY != 0) ? new StoryTarget(destX, destY, 0, state.MapId) : null, detail: $"subPhase={subPhase}");
+
+            if ((mfReason == "incomplete_path" || mfReason == "no_path") && (destX != 0 || destY != 0))
+            {
+                var turnInCluster = activeQuests
+                    .Where(q => !q.TurnedIn && q.Node.TurnIn != null
+                                && Distance2D(destX, destY, q.Node.TurnIn!.X, q.Node.TurnIn!.Y) <= 25f)
+                    .ToList();
+
+                // ── Session 38: last-leg failure → force_* server-side credit ──
+                // Path failed but the bot is essentially AT the NPC. Arm force
+                // mode and route into the normal interact loop instead of
+                // deferring the cluster for the Nth time.
+                float botToDest = Distance2D(state.X, state.Y, destX, destY);
+                if (botToDest <= FORCE_INTERACT_TRIGGER_RADIUS)
+                {
+                    bool anyForceComplete = turnInCluster.Any(q =>
+                        q.Accepted && (q.ServerComplete || AllObjectivesComplete(q)));
+                    bool anyForceAccept = activeQuests.Any(q =>
+                        !q.Accepted && q.Node.Giver != null
+                        && Distance2D(destX, destY, q.Node.Giver!.X, q.Node.Giver!.Y) <= 25f);
+
+                    if (anyForceComplete || anyForceAccept)
+                    {
+                        SetPhaseDateTime(bot, "force_interact_until",
+                            DateTime.UtcNow.AddSeconds(FORCE_MODE_TTL_SEC));
+
+                        _logger.LogWarning(
+                            "[BOT-QUEST] {Name}({Guid}) | MOVE_FAILED {Reason} to ({DestX:F0},{DestY:F0}) " +
+                            "with bot only {Dist:F0}yd away — last-leg/WMO case, engaging force interact " +
+                            "(complete={FC}, accept={FA})",
+                            bot.Name, bot.Guid, mfReason, destX, destY, botToDest,
+                            anyForceComplete, anyForceAccept);
+
+                        _diagnostics.RecordIssue(DiagnosticIssueType.QuestInteractFail, bot,
+                            state.X, state.Y, state.MapId,
+                            detail: $"force mode engaged at ({destX:F0},{destY:F0}) dist={botToDest:F0} reason={mfReason}");
+
+                        if (anyForceComplete)
+                        {
+                            AdvanceTo(bot, "TurningIn");
+                            return ProcessTurningIn(bot, state);
+                        }
+
+                        AdvanceTo(bot, "AcceptingQuests");
+                        return ProcessAcceptingQuests(bot, state);
+                    }
+                }
+
+                if (turnInCluster.Count > 0)
+                {
+                    foreach (var aq in turnInCluster)
+                    {
+                        bot.DeferQuest(aq.QuestId, TimeSpan.FromMinutes(F3_TURNIN_DEFER_MIN));
+                        _diagnostics.RecordIssue(DiagnosticIssueType.QuestDeferred, bot,
+                            state.X, state.Y, state.MapId,
+                            questId: aq.QuestId, questTitle: aq.Title,
+                            detail: $"turn-in unreachable ({mfReason}) at ({destX:F0},{destY:F0}) — deferred {F3_TURNIN_DEFER_MIN}min (cluster)");
+                        bot.Story?.Emit(StoryVerb.DEFER, StoryResult.SKIP, quest: new StoryQuest(aq.QuestId, aq.Title), reason: $"turnin_unreachable_{mfReason}", detail: $"cluster {F3_TURNIN_DEFER_MIN}min");
+                        activeQuests.Remove(aq);
+                    }
+                    SetActiveQuests(bot, activeQuests);
+
+                    _logger.LogWarning(
+                        "[BOT-PATH] {Name}({Guid}) | MOVE_FAILED {Reason} to turn-in ({DestX:F0},{DestY:F0}) — " +
+                        "deferred {N} quest(s) sharing that unreachable NPC for {Min}min ({Remaining} remain)",
+                        bot.Name, bot.Guid, mfReason, destX, destY,
+                        turnInCluster.Count, F3_TURNIN_DEFER_MIN, activeQuests.Count(q => !q.TurnedIn));
+
+                    if (activeQuests.Count > 0)
+                    {
+                        var clTurnIn = GetNearestCompletedTurnIn(bot, state, activeQuests);
+                        if (clTurnIn != null)
+                        {
+                            AdvanceTo(bot, "TravelingToTurnIn");
+                            return new List<BridgeCommand>
+                            {
+                                MakeMoveTo(clTurnIn.Value.x, clTurnIn.Value.y, clTurnIn.Value.z, clTurnIn.Value.map,
+                                    fromX: state.X, fromY: state.Y)
+                            };
+                        }
+
+                        var clObjective = GetNearestObjectiveAcrossQuests(bot, state, activeQuests);
+                        if (clObjective != null)
+                        {
+                            AdvanceTo(bot, "TravelingToObjective");
+                            return new List<BridgeCommand>
+                            {
+                                MakeMoveTo(clObjective.Value.x, clObjective.Value.y, clObjective.Value.z, clObjective.Value.map)
+                            };
+                        }
+                    }
+
+                    return FallbackToPickingQuests(bot);
+                }
+            }
+
             // Find the specific quest whose NPC is closest to the failed destination
             ActiveQuestEntry? culprit = null;
             float bestMatch = 50f; // within 50yd of failed dest = match
@@ -1017,6 +1292,7 @@ public class QuestingDomain : IBotDomain
 
                 // Defer ONLY the culprit quest
                 bot.DeferQuest(culprit.QuestId, TimeSpan.FromMinutes(deferMinutes));
+                bot.Story?.Emit(StoryVerb.DEFER, StoryResult.SKIP, quest: new StoryQuest(culprit.QuestId, culprit.Title), reason: "move_failed", detail: $"surgical {deferMinutes:F0}min");
 
                 _logger.LogWarning(
                     "[BOT-PATH] {Name}({Guid}) | MOVE_FAILED during {SubPhase} — " +
@@ -1069,6 +1345,7 @@ public class QuestingDomain : IBotDomain
                 if (first != null)
                 {
                     bot.DeferQuest(first.QuestId, TimeSpan.FromMinutes(deferMinutes));
+                    bot.Story?.Emit(StoryVerb.DEFER, StoryResult.SKIP, quest: new StoryQuest(first.QuestId, first.Title), reason: "move_failed_no_match", detail: $"{deferMinutes:F0}min");
 
                     _logger.LogWarning(
                         "[BOT-PATH] {Name}({Guid}) | MOVE_FAILED during {SubPhase} — " +
@@ -1209,7 +1486,12 @@ public class QuestingDomain : IBotDomain
         int classBit = QuestGraphLoader.ClassToBitmask(bot.ClassId);
 
         int botMap = state.MapId;
-        float maxDist = ZoneSafetyMap.GetMaxTravelDistance(bot.Level, state.ZoneId);
+        int reachTier = QuestReachTier(bot.Guid);
+        float maxDist = ZoneSafetyMap.GetMaxTravelDistance(bot.Level, state.ZoneId, reachTier);
+        if (reachTier > 0 && _noQuestStreakStartUtc.TryGetValue(bot.Guid, out var _stuckSince))
+            _logger.LogInformation(
+                "[BOT-REACH] {Name}({Guid}) | no pickable quest for {Sec:F0}s -> travel reach tier {Tier} ({Max:F0}yd)",
+                bot.Name, bot.Guid, (DateTime.UtcNow - _stuckSince).TotalSeconds, reachTier, maxDist);
         var existingActive = GetActiveQuests(bot);
         var existingQuestIds = new HashSet<int>(existingActive.Select(q => q.QuestId));
 
@@ -1260,9 +1542,32 @@ public class QuestingDomain : IBotDomain
         var available = _questGraph.GetAvailableQuests(raceBit, classBit, questPickLevel,
             bot.CompletedQuestIds, activeForFilter);
 
+        // ── Session 42: follower quest adoption (ARCH §7a Questing directive) ──
+        // Independent per-bot picking is what tore groups across zones (June 12:
+        // grp1 median spread 3,668yd, 0% heal range). Followers restrict their
+        // pick to the pace-setter's current active quest IDs. Pre-check: if NONE
+        // of the leader's quests are even available to this bot (race-locked
+        // starter quests, prereqs — e.g. grp1's Gnome), drop the restriction
+        // instead of idling; the Regroup directive still caps the drift.
+        HashSet<int>? leaderIds = null;
+        if (bot.IsGroupFollower
+            && bot.GroupLeaderQuestIds is { Count: > 0 }
+            && (DateTime.UtcNow - bot.GroupDirectiveUtc).TotalSeconds < 120)
+        {
+            leaderIds = bot.GroupLeaderQuestIds;
+            if (!available.Any(q => leaderIds.Contains(q.QuestId)))
+            {
+                _logger.LogInformation(
+                    "[BOT-GROUP] {Name}({Guid}) | adoption: none of the leader's {N} active quests " +
+                    "are available to this bot — falling back to own pick",
+                    bot.Name, bot.Guid, leaderIds.Count);
+                leaderIds = null;
+            }
+        }
+
         // ── HARD FILTERS ──
         var safe = new List<QuestNode>();
-        int filteredUnsafe = 0, filteredTooFar = 0, filteredWrongMap = 0;
+        int filteredUnsafe = 0, filteredTooFar = 0, filteredWrongMap = 0, filteredNotLeader = 0;
 
         foreach (var quest in available)
         {
@@ -1270,6 +1575,9 @@ public class QuestingDomain : IBotDomain
             if (quest.Giver.Map != botMap) { filteredWrongMap++; continue; }
             if (bot.DeferredQuestIds.ContainsKey(quest.QuestId)) continue;
             if (existingQuestIds.Contains(quest.QuestId)) continue;
+
+            // Session 42: adoption — followers only take the pace-setter's quests.
+            if (leaderIds != null && !leaderIds.Contains(quest.QuestId)) { filteredNotLeader++; continue; }
 
             float giverDist = Distance2D(state.X, state.Y, quest.Giver.X, quest.Giver.Y);
             if (giverDist > maxDist) { filteredTooFar++; continue; }
@@ -1373,28 +1681,35 @@ public class QuestingDomain : IBotDomain
             safe.Add(quest);
         }
 
+        if (safe.Count > 0)
+            _noQuestStreakStartUtc.Remove(bot.Guid);   // found something pickable — release reach escalation
+
         if (safe.Count == 0)
         {
+            if (!_noQuestStreakStartUtc.ContainsKey(bot.Guid))
+                _noQuestStreakStartUtc[bot.Guid] = DateTime.UtcNow;   // start no-quest streak (drives reach escalation)
+
             bot.CurrentActivity.ContextTag = "quests:none_available";
             bot.CurrentActivity.SubPhase = "NoQuestsAvailable";
 
             // FLIGHT RECORDER: the leader's Session 34 dead-end. Capture WHY nothing was safe.
             BotTrace.Transition(bot, "PickingQuests", "NoQuestsAvailable", "no_safe_quests",
-                detail: $"wrongMap={filteredWrongMap} tooFar={filteredTooFar} unsafe={filteredUnsafe}",
+                detail: $"wrongMap={filteredWrongMap} tooFar={filteredTooFar} unsafe={filteredUnsafe} notLeader={filteredNotLeader}",
                 state: state);
 
             _logger.LogWarning(
                 "[BOT-WARN] {Name}({Guid}) | PickingQuests: 0 safe quests! " +
                 "Level={Level}, Completed={Completed} | " +
-                "(wrongMap={WrongMap}, tooFar={TooFar}, unsafe={Unsafe})",
+                "(wrongMap={WrongMap}, tooFar={TooFar}, unsafe={Unsafe}, notLeader={NotLeader})",
                 bot.Name, bot.Guid, bot.Level, bot.CompletedQuestIds.Count,
-                filteredWrongMap, filteredTooFar, filteredUnsafe);
+                filteredWrongMap, filteredTooFar, filteredUnsafe, filteredNotLeader);
 
             _diagnostics.RecordIssue(DiagnosticIssueType.NoQuestsAvailable, bot,
                 state.X, state.Y, state.MapId,
                 detail: $"wrongMap={filteredWrongMap}, tooFar={filteredTooFar}, unsafe={filteredUnsafe}, " +
-                        $"completed={bot.CompletedQuestIds.Count}, blacklist={bot.PathBlacklist.Count}");
+                        $"notLeader={filteredNotLeader}, completed={bot.CompletedQuestIds.Count}, blacklist={bot.PathBlacklist.Count}");
 
+            bot.Story?.Emit(StoryVerb.NOQUESTS, StoryResult.BLOCK, reason: "no_safe_quests", detail: $"wrongMap={filteredWrongMap} tooFar={filteredTooFar} unsafe={filteredUnsafe} notLeader={filteredNotLeader} completed={bot.CompletedQuestIds.Count} blacklist={bot.PathBlacklist.Count}");
             return commands;
         }
 
@@ -1446,6 +1761,8 @@ public class QuestingDomain : IBotDomain
             safe.Count, filteredUnsafe,
             state.X, state.Y, anchorX, anchorY);
 
+        bot.Story?.Emit(StoryVerb.PICK, StoryResult.OK, quest: new StoryQuest(anchor.QuestId, anchor.Title), detail: $"batch={newEntries.Count} from {safe.Count} safe");
+
         // Navigate to the nearest unaccepted quest giver
         var nearestGiver = newEntries
             .Where(e => !e.Accepted && e.Node.Giver != null)
@@ -1458,7 +1775,10 @@ public class QuestingDomain : IBotDomain
             bot.CurrentActivity.ContextTag = $"quests:batch:{merged.Count}";
             commands.Add(MakeMoveTo(nearestGiver.Node.Giver!.X, nearestGiver.Node.Giver!.Y,
                 nearestGiver.Node.Giver!.Z, nearestGiver.Node.Giver!.Map,
-                fromX: state.X, fromY: state.Y));
+                fromX: state.X, fromY: state.Y)
+                .WithCorr(bot.Story?.Intent(StoryVerb.TRAVEL,
+                    new StoryTarget(nearestGiver.Node.Giver!.X, nearestGiver.Node.Giver!.Y, nearestGiver.Node.Giver!.Z, nearestGiver.Node.Giver!.Map),
+                    new StoryQuest(nearestGiver.QuestId, nearestGiver.Title))));
             ResetStuckDetection(bot, state);
         }
 
@@ -1508,6 +1828,68 @@ public class QuestingDomain : IBotDomain
     // Sub-Phase: AcceptingQuests (batch accept at current NPC)
     // ════════════════════════════════════════════════════════════════════
 
+    // ════════════════════════════════════════════════════════════════════
+    // Session 44: formation quest-sync leader hold
+    // ════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Leader-side hold at the NPC: returns true while the leader should stay
+    /// put because glued followers are still catching up on batch accepts
+    /// (needAccept=true, AcceptingQuests exit) or turn-ins (needAccept=false,
+    /// TurningIn exit). The flags are computed by the BotBrainService
+    /// coordinator from the group quest batch + member ack state; while the
+    /// hold is active the coordinator also re-fans force_accept/force_complete
+    /// to the lagging members every ~10s, and FollowDomain's own opportunistic
+    /// pass keeps trying. Timeout-capped: a class-locked or wedged follower
+    /// can never freeze the leader (the June-6 deadlock lesson). After a
+    /// timed-out hold, no re-hold for GROUP_HOLD_GIVEUP_COOLDOWN_SEC.
+    /// </summary>
+    private bool HoldForFollowers(BotIdentity bot, BotStateSnapshot state, bool needAccept)
+    {
+        bool need = needAccept ? bot.GroupFollowersNeedAccept : bot.GroupFollowersNeedTurnIn;
+        string key = needAccept ? "group_hold_accept_since" : "group_hold_turnin_since";
+        string giveupKey = needAccept ? "group_hold_accept_giveup" : "group_hold_turnin_giveup";
+
+        if (!bot.IsGroupLeader || !need)
+        {
+            // Caught up (or not a leader) — clear hold state so future holds start fresh.
+            SetPhaseDateTime(bot, key, default);
+            SetPhaseDateTime(bot, giveupKey, default);
+            return false;
+        }
+
+        // Recently gave up on this hold class — don't immediately re-hold.
+        var gaveUp = GetPhaseDateTime(bot, giveupKey);
+        if (gaveUp != default && (DateTime.UtcNow - gaveUp).TotalSeconds < GROUP_HOLD_GIVEUP_COOLDOWN_SEC)
+            return false;
+
+        var since = GetPhaseDateTime(bot, key);
+        if (since == default)
+        {
+            since = DateTime.UtcNow;
+            SetPhaseDateTime(bot, key, since);
+            _logger.LogInformation(
+                "[BOT-HOLD] {Name}({Guid}) | holding at NPC for follower {What} (max {Max:F0}s)",
+                bot.Name, bot.Guid, needAccept ? "ACCEPTS" : "TURN-INS", GROUP_HOLD_TIMEOUT_SEC);
+        }
+
+        if ((DateTime.UtcNow - since).TotalSeconds > GROUP_HOLD_TIMEOUT_SEC)
+        {
+            _logger.LogWarning(
+                "[BOT-HOLD] {Name}({Guid}) | follower {What} hold timed out after {Max:F0}s — proceeding without them",
+                bot.Name, bot.Guid, needAccept ? "ACCEPT" : "TURN-IN", GROUP_HOLD_TIMEOUT_SEC);
+            SetPhaseDateTime(bot, key, default);
+            SetPhaseDateTime(bot, giveupKey, DateTime.UtcNow);
+            return false;
+        }
+
+        BotTrace.Wait(bot,
+            needAccept ? WaitOn.GroupQuesting : WaitOn.GroupTurnedIn,
+            needAccept ? "leader: holding for follower accepts" : "leader: holding for follower turn-ins",
+            state);
+        return true;
+    }
+
     /// <summary>
     /// AcceptingQuests: accept ONE quest per tick to avoid rapid-fire QUEST_INTERACT
     /// commands crashing C++. The sub-phase loop in OnTick won't chain through this
@@ -1519,11 +1901,16 @@ public class QuestingDomain : IBotDomain
         var commands = new List<BridgeCommand>();
         var activeQuests = GetActiveQuests(bot);
 
+        // ── Session 38: force mode (see ProcessTurningIn) — force_accept for
+        // WMO-interior givers. All C++ gates (CanTakeQuest/CanAddQuest) intact.
+        bool forceMode = GetPhaseDateTime(bot, "force_interact_until") > DateTime.UtcNow;
+        float interactRadius = forceMode ? FORCE_INTERACT_NPC_RADIUS : 10f;
+
         // Find the FIRST unaccepted quest whose giver is within interact range.
         // C++ requires 15yd (GetCreatureListWithEntryInGrid), so we use 10yd to be safe.
         var toAccept = activeQuests
             .Where(q => !q.Accepted && q.Node.Giver != null
-                        && IsNear(state, q.Node.Giver!.X, q.Node.Giver!.Y, q.Node.Giver!.Map, 10f))
+                        && IsNear(state, q.Node.Giver!.X, q.Node.Giver!.Y, q.Node.Giver!.Map, interactRadius))
             .FirstOrDefault();
 
         if (toAccept != null)
@@ -1537,15 +1924,15 @@ public class QuestingDomain : IBotDomain
                     : "delivery/talk quest";
 
             _logger.LogInformation(
-                "[BOT-QUEST] {Name}({Guid}) | ACCEPTING [{QuestId}] \"{Title}\" | Objectives: {Obj}",
-                bot.Name, bot.Guid, toAccept.QuestId, toAccept.Title, objDesc);
+                "[BOT-QUEST] {Name}({Guid}) | ACCEPTING [{QuestId}] \"{Title}\" | Objectives: {Obj} | force={Force}",
+                bot.Name, bot.Guid, toAccept.QuestId, toAccept.Title, objDesc, forceMode);
 
             commands.Add(new BridgeCommand("QUEST_INTERACT", new
             {
-                action = "accept",
+                action = forceMode ? "force_accept" : "accept",
                 quest_id = toAccept.QuestId,
                 npc_entry = toAccept.Node.Giver!.NpcEntry
-            }));
+            }).WithCorr(bot.Story?.Intent(StoryVerb.ACCEPT, quest: new StoryQuest(toAccept.QuestId, toAccept.Title))));
 
             toAccept.Accepted = true;
 
@@ -1566,8 +1953,14 @@ public class QuestingDomain : IBotDomain
             float dist = Distance2D(state.X, state.Y,
                 nearestUnaccepted.Node.Giver!.X, nearestUnaccepted.Node.Giver!.Y);
 
-            if (dist > 10f)
+            if (dist > interactRadius)
             {
+                if (forceMode)
+                {
+                    // Session 38: force mode never walks (see ProcessTurningIn).
+                    SetPhaseDateTime(bot, "force_interact_until", default);
+                    forceMode = false;
+                }
                 // Too far — go back to TravelingToGiver to walk closer
                 _logger.LogDebug(
                     "[BOT-QUEST] {Name}({Guid}) | AcceptingQuests but {Dist:F1}yd from giver — moving closer",
@@ -1580,6 +1973,15 @@ public class QuestingDomain : IBotDomain
                 return commands;
             }
         }
+
+        // Session 38: leaving the accept loop — drop force mode.
+        if (forceMode) SetPhaseDateTime(bot, "force_interact_until", default);
+
+        // ── Session 44: formation hold — done accepting HERE, but don't walk off
+        // while glued followers still need to accept batch quests offered at this
+        // giver. The coordinator re-fans force_accepts to them while we wait.
+        if (HoldForFollowers(bot, state, needAccept: true))
+            return commands;
 
         // No more quests to accept at this NPC — check for more at other givers
         var moreUnaccepted = activeQuests
@@ -1639,7 +2041,7 @@ public class QuestingDomain : IBotDomain
         {
             AdvanceTo(bot, "DoingObjectives");
             if (target.Value.goEntry > 0)
-                return SendGoInteractTask(bot, target.Value);
+                return SendGoInteractTask(bot, state, target.Value);
             return SendGrindTask(bot, target.Value);
         }
 
@@ -1757,7 +2159,74 @@ public class QuestingDomain : IBotDomain
         foreach (var aq in activeQuests.Where(q => q.Accepted && !q.TurnedIn))
             UpdateQuestProgress(aq);
 
-        return new List<BridgeCommand>();
+        // ── Session 36: no-progress guard ────────────────────────────────
+        // We are "doing objectives" but the current target is not done. A C++
+        // GRIND should be running and KILL/LOOT events refresh do_progress_ts.
+        // If that stamp goes stale, the grind is wedged and this handler would
+        // otherwise return empty forever (owner=CS limbo) until the 20-min
+        // watchdog. Self-heal instead of waiting.
+        var lastProgress = GetPhaseDateTime(bot, "do_progress_ts");
+        if (lastProgress == default)
+        {
+            // First quiet tick — start the clock, do not act yet.
+            SetPhaseDateTime(bot, "do_progress_ts", DateTime.UtcNow);
+            return new List<BridgeCommand>();
+        }
+
+        if ((DateTime.UtcNow - lastProgress).TotalSeconds < DO_NO_PROGRESS_SEC)
+            return new List<BridgeCommand>();
+
+        int rearms = GetPhaseInt(bot, "do_noprogress_rearms");
+
+        if (rearms < DO_MAX_NOPROGRESS_REARMS)
+        {
+            SetPhaseInt(bot, "do_noprogress_rearms", rearms + 1);
+            SetPhaseDateTime(bot, "do_progress_ts", DateTime.UtcNow);
+
+            var next = GetNearestObjectiveAcrossQuests(bot, state, activeQuests);
+            if (next != null)
+            {
+                _logger.LogWarning(
+                    "[BOT-QUEST] {Name}({Guid}) | DoingObjectives made no progress for {Sec:F0}s — " +
+                    "relocating/re-grinding nearest objective ({N}/{Max})",
+                    bot.Name, bot.Guid, DO_NO_PROGRESS_SEC, rearms + 1, DO_MAX_NOPROGRESS_REARMS);
+
+                // Already on the objective → re-arm the grind in place; else walk back.
+                if (IsNear(state, next.Value.x, next.Value.y, next.Value.map, 15f))
+                    return SendGrindTask(bot, next.Value);
+
+                AdvanceTo(bot, "TravelingToObjective");
+                return new List<BridgeCommand> { MakeMoveTo(next.Value.x, next.Value.y, next.Value.z, next.Value.map) };
+            }
+
+            // No reachable objective left — try to close the batch out instead.
+            AdvanceTo(bot, "TravelingToTurnIn");
+            return SendToNearestTurnIn(bot, state);
+        }
+
+        // Relocating did not help: the objective(s) pinning us here are a dead end
+        // for now. Defer the un-turned-in quests with incomplete objectives, reset
+        // the counters, and go do something else.
+        SetPhaseInt(bot, "do_noprogress_rearms", 0);
+        SetPhaseDateTime(bot, "do_progress_ts", default);
+
+        foreach (var aq in activeQuests.Where(q => q.Accepted && !q.TurnedIn
+                                                   && !q.ServerComplete && !AllObjectivesComplete(q)))
+        {
+            bot.DeferQuest(aq.QuestId, TimeSpan.FromMinutes(DO_NOPROGRESS_DEFER_MIN));
+            bot.Story?.Emit(StoryVerb.DEFER, StoryResult.SKIP, quest: new StoryQuest(aq.QuestId, aq.Title), reason: "noprogress", detail: $"{DO_NOPROGRESS_DEFER_MIN}min after relocations");
+            _logger.LogWarning(
+                "[BOT-QUEST] {Name}({Guid}) | DoingObjectives stalled through {Max} relocations — " +
+                "deferring [{QuestId}] \"{Title}\" {Min}min and re-picking",
+                bot.Name, bot.Guid, DO_MAX_NOPROGRESS_REARMS, aq.QuestId, aq.Title, DO_NOPROGRESS_DEFER_MIN);
+
+            _diagnostics.RecordIssue(DiagnosticIssueType.QuestDeferred, bot,
+                state.X, state.Y, state.MapId,
+                questId: aq.QuestId, questTitle: aq.Title,
+                detail: $"doingobjectives no-progress through {DO_MAX_NOPROGRESS_REARMS} relocations — deferred {DO_NOPROGRESS_DEFER_MIN}min");
+        }
+
+        return FallbackToPickingQuests(bot);
     }
 
     /// <summary>
@@ -1796,26 +2265,41 @@ public class QuestingDomain : IBotDomain
             return commands;
         }
 
-        // Throttle: don't send USE_GAMEOBJECT faster than every 3 seconds
-        var lastInteract = GetPhaseDateTime(bot, "go_last_interact");
-        if (lastInteract != default && (DateTime.UtcNow - lastInteract).TotalSeconds < 3.0)
-            return commands;
+        // ── Session 41: pin one spawn until we interact there ──
+        // The old per-call random re-roll oscillated between spawns and (with
+        // the unthrottled walk below) fed the event-rate MOVE_TO loop.
+        int spawnPin = GetPhaseInt(bot, "go_spawn_pin");          // 1-based; 0 = none
+        if (spawnPin < 1 || spawnPin > goSource.SpawnPositions.Count)
+        {
+            var rng = new Random();
+            spawnPin = rng.Next(goSource.SpawnPositions.Count) + 1;
+            SetPhaseInt(bot, "go_spawn_pin", spawnPin);
+        }
+        var spawn = goSource.SpawnPositions[spawnPin - 1];
 
-        // Pick a random spawn position within the cluster
-        var rng = new Random();
-        var spawn = goSource.SpawnPositions[rng.Next(goSource.SpawnPositions.Count)];
-
-        // If we're not close to this spawn, walk to it first
+        // If we're not close to the pinned spawn, walk to it first.
+        // Session 41: the walk gets its own 3 s gate — the old code throttled
+        // only USE_GAMEOBJECT, so arrivals could re-trigger walks at event rate.
         float distToSpawn = Distance2D(state.X, state.Y, spawn.X, spawn.Y);
         if (distToSpawn > 8f)
         {
+            var lastWalk = GetPhaseDateTime(bot, "go_last_walk");
+            if (lastWalk != default && (DateTime.UtcNow - lastWalk).TotalSeconds < 3.0)
+                return commands;
+            SetPhaseDateTime(bot, "go_last_walk", DateTime.UtcNow);
             commands.Add(MakeMoveTo(spawn.X, spawn.Y, spawn.Z, goSource.Map));
             return commands;
         }
 
-        // We're close — send USE_GAMEOBJECT
-        commands.Add(new BridgeCommand("USE_GAMEOBJECT", new { go_entry = goEntry }));
+        // We're close — send USE_GAMEOBJECT (3 s gate) and release the pin so
+        // the next attempt may pick a different spawn.
+        var lastInteract = GetPhaseDateTime(bot, "go_last_interact");
+        if (lastInteract != default && (DateTime.UtcNow - lastInteract).TotalSeconds < 3.0)
+            return commands;
+
+        commands.Add(new BridgeCommand("USE_GAMEOBJECT", new { go_entry = goEntry }).WithCorr(bot.Story?.Intent(StoryVerb.OBJECTIVE, target: new StoryTarget(spawn.X, spawn.Y, spawn.Z, goSource.Map))));
         SetPhaseDateTime(bot, "go_last_interact", DateTime.UtcNow);
+        SetPhaseInt(bot, "go_spawn_pin", 0);
 
         _logger.LogDebug("[BOT-QUEST] {Name}({Guid}) | USE_GAMEOBJECT goEntry={GoEntry} at ({X},{Y})",
             bot.Name, bot.Guid, goEntry, (int)spawn.X, (int)spawn.Y);
@@ -1876,29 +2360,35 @@ public class QuestingDomain : IBotDomain
         var commands = new List<BridgeCommand>();
         var activeQuests = GetActiveQuests(bot);
 
+        // ── Session 38: force mode — armed by HandleMoveFailed last-leg path.
+        // Widens the interact radius (C++ force search = 300yd) and switches
+        // the bridge action to force_complete. TTL'd; cleared on loop exit.
+        bool forceMode = GetPhaseDateTime(bot, "force_interact_until") > DateTime.UtcNow;
+        float interactRadius = forceMode ? FORCE_INTERACT_NPC_RADIUS : 10f;
+
         // Find the FIRST completed quest whose turn-in NPC is within interact range.
         // C++ requires 15yd (GetCreatureListWithEntryInGrid), so we use 10yd to be safe.
         var toTurnIn = activeQuests
             .Where(q => q.Accepted && !q.TurnedIn
                         && (q.ServerComplete || AllObjectivesComplete(q))
                         && q.Node.TurnIn != null
-                        && IsNear(state, q.Node.TurnIn!.X, q.Node.TurnIn!.Y, q.Node.TurnIn!.Map, 10f))
+                        && IsNear(state, q.Node.TurnIn!.X, q.Node.TurnIn!.Y, q.Node.TurnIn!.Map, interactRadius))
             .FirstOrDefault();
 
         if (toTurnIn != null)
         {
             _logger.LogInformation(
                 "[BOT-QUEST] {Name}({Guid}) | COMPLETING [{QuestId}] \"{Title}\" | " +
-                "Rewards: {XP}xp {Money}copper",
+                "Rewards: {XP}xp {Money}copper | force={Force}",
                 bot.Name, bot.Guid, toTurnIn.QuestId, toTurnIn.Title,
-                toTurnIn.Node.RewXP, toTurnIn.Node.RewMoney);
+                toTurnIn.Node.RewXP, toTurnIn.Node.RewMoney, forceMode);
 
             commands.Add(new BridgeCommand("QUEST_INTERACT", new
             {
-                action = "complete",
+                action = forceMode ? "force_complete" : "complete",
                 quest_id = toTurnIn.QuestId,
                 npc_entry = toTurnIn.Node.TurnIn!.NpcEntry
-            }));
+            }).WithCorr(bot.Story?.Intent(StoryVerb.TURNIN, quest: new StoryQuest(toTurnIn.QuestId, toTurnIn.Title))));
 
             toTurnIn.TurnedIn = true;
             bot.CompletedQuestIds.Add(toTurnIn.QuestId);
@@ -1922,8 +2412,16 @@ public class QuestingDomain : IBotDomain
         {
             float dist = Distance2D(state.X, state.Y,
                 nearestCompleted.Node.TurnIn!.X, nearestCompleted.Node.TurnIn!.Y);
-            if (dist > 10f)
+            if (dist > interactRadius)
             {
+                if (forceMode)
+                {
+                    // Session 38: force mode never walks — the walk is exactly
+                    // what just MOVE_FAILED. Drop force and fall through to the
+                    // normal walk-closer (it will fail and re-enter the defer path).
+                    SetPhaseDateTime(bot, "force_interact_until", default);
+                    forceMode = false;
+                }
                 _logger.LogDebug(
                     "[BOT-QUEST] {Name}({Guid}) | TurningIn but {Dist:F1}yd from turn-in NPC — moving closer",
                     bot.Name, bot.Guid, dist);
@@ -1935,6 +2433,16 @@ public class QuestingDomain : IBotDomain
                 return commands;
             }
         }
+
+        // Session 38: leaving the turn-in loop — drop force mode so it cannot
+        // bleed into interactions elsewhere.
+        if (forceMode) SetPhaseDateTime(bot, "force_interact_until", default);
+
+        // ── Session 44: formation hold — done turning in HERE, but don't walk off
+        // while glued followers still hold batch quests this ender rewards. The
+        // coordinator re-fans force_completes to them while we wait.
+        if (HoldForFollowers(bot, state, needAccept: false))
+            return commands;
 
         // No more quests to turn in at this NPC
         var moreTurnIns = GetNearestCompletedTurnIn(bot, state, activeQuests);
@@ -1988,8 +2496,27 @@ public class QuestingDomain : IBotDomain
         bot.CurrentQuestProgress = 0f;
         bot.QuestObjectiveProgress.Clear();
         bot.QuestItemProgress.Clear();
+
+        // ── Session 45: if anything in the batch was NOT turned in, do not wipe
+        // and re-pick — PhaseData.Clear() was destroying the Failed/remaining list
+        // while the server still held those quests (status=COMPLETE, rewarded=0).
+        // The bot then re-picked the same quests and C++ rejected the duplicate
+        // accept with requirements_not_met (already in log) → 30 min defer each.
+        // Resync from server truth instead: RebuildFromQuestSync routes straight
+        // back to TravelingToTurnIn for survivors, or PickingQuests when empty.
+        bool anyRemaining = activeQuests.Any(q => q.Accepted && !q.TurnedIn);
+
         bot.CurrentActivity.PhaseData.Clear();
         bot.ResetDeathCounter();
+
+        if (anyRemaining)
+        {
+            AdvanceTo(bot, "WaitingForQuestSync");
+            bot.CurrentActivity.ContextTag = "quests:resync";
+            bot.CurrentActivity.IsInterruptible = false;
+            BotTrace.Wait(bot, WaitOn.Event("QUEST_STATUS_ALL"), "batch remainder: resyncing", state);
+            return new List<BridgeCommand> { new BridgeCommand("QUERY_QUEST_STATUS", new { }) };
+        }
 
         AdvanceTo(bot, "PickingQuests");
         return ProcessPickingQuests(bot, state);
@@ -2038,6 +2565,31 @@ public class QuestingDomain : IBotDomain
             }
         }
 
+        // Session 36: any kill while doing objectives proves the grind is alive —
+        // refresh the no-progress guard and clear the relocation counter.
+        if (bot.CurrentActivity.SubPhase == "DoingObjectives")
+        {
+            SetPhaseDateTime(bot, "do_progress_ts", DateTime.UtcNow);
+            SetPhaseInt(bot, "do_noprogress_rearms", 0);
+
+            // ── Session 47: mid-grind server-truth resync ──────────────────
+            // The local KillProgress above only counts THIS bot's own taps. In a
+            // group, kills credited by followers (and the leader to them) are
+            // invisible here, so the count crawls and the grind runs to the C++
+            // self-tap GRIND goal instead of stopping when the GROUP finishes
+            // (measured: server-complete +0:00, turn-in +10:30). Throttle a
+            // QUEST_STATUS re-query; the QUEST_STATUS_ALL handler refreshes
+            // ServerComplete from server truth and ProcessDoingObjectives stops
+            // the grind. Solo bots: harmless (their self-tap IS the server count).
+            var lastResync = GetPhaseDateTime(bot, "do_last_resync");
+            if (lastResync == default
+                || (DateTime.UtcNow - lastResync).TotalSeconds >= DO_QUEST_RESYNC_SEC)
+            {
+                SetPhaseDateTime(bot, "do_last_resync", DateTime.UtcNow);
+                return new List<BridgeCommand> { new BridgeCommand("QUERY_QUEST_STATUS", new { }) };
+            }
+        }
+
         return new List<BridgeCommand>();
     }
 
@@ -2082,6 +2634,13 @@ public class QuestingDomain : IBotDomain
                 UpdateQuestProgress(aq);
         }
 
+        // Session 36: item progress while doing objectives = grind alive.
+        if (anyChanged && bot.CurrentActivity.SubPhase == "DoingObjectives")
+        {
+            SetPhaseDateTime(bot, "do_progress_ts", DateTime.UtcNow);
+            SetPhaseInt(bot, "do_noprogress_rearms", 0);
+        }
+
         return new List<BridgeCommand>();
     }
 
@@ -2092,6 +2651,26 @@ public class QuestingDomain : IBotDomain
 
         if (subPhase == "DoingObjectives")
         {
+            // ── Session 41: TASK_COMPLETE conflation guard ──
+            // TASK_COMPLETE fires for BOTH grind-goal-met AND MOVE_TO arrivals.
+            // In GO mode there is no grind task outstanding, so any TASK_COMPLETE
+            // here is a GO-walk arrival. Pre-41 this branch treated it as
+            // goal-met and re-routed to the "next objective" (≈ the bot's own
+            // position); with Session-39 instant acks that closed an event-rate
+            // MOVE_TO loop (June-12 run: 8,491 GO-mode re-entries vs 104 actual
+            // USE_GAMEOBJECTs) which starved the real GO interaction. Route the
+            // arrival into the GO loop so USE_GAMEOBJECT fires immediately.
+            if (GetPhaseInt(bot, "current_go_entry") > 0)
+            {
+                commands.AddRange(OnTick(bot, state));
+                return commands;
+            }
+
+            // No grind armed either → this is a stray movement ack (e.g. a
+            // relocation walk completing). Ignore it; OnTick owns recovery.
+            if (GetPhaseInt(bot, "current_grind_creature") <= 0)
+                return commands;
+
             var activeQuests = GetActiveQuests(bot);
             var next = GetNearestObjectiveAcrossQuests(bot, state, activeQuests);
 
@@ -2151,6 +2730,23 @@ public class QuestingDomain : IBotDomain
                 questId: failedQuestId, questTitle: failedQuest?.Title,
                 detail: $"reason={failReason}, freeSlots={state.FreeSlots}");
 
+            // ── Session 45: a failed interact means the server did NOT reward this
+            // quest. ProcessTurningIn marks TurnedIn + CompletedQuestIds optimistically
+            // on SEND; without this revert a single failed complete makes the quest
+            // permanently invisible to every turn-in query (!q.TurnedIn filters all of
+            // them) while the server still holds it at rewarded=0, and the polluted
+            // CompletedQuestIds leaks into chain prereqs and the S44 fan-out skip.
+            var aqRevert = GetActiveQuests(bot);
+            var revertEntry = aqRevert.FirstOrDefault(q => q.QuestId == failedQuestId);
+            if (revertEntry != null && revertEntry.TurnedIn)
+            {
+                revertEntry.TurnedIn = false;
+                bot.CompletedQuestIds.Remove(failedQuestId);
+                _logger.LogWarning(
+                    "[BOT-QUEST] {Name}({Guid}) | Reverting optimistic turn-in mark on [{QuestId}] after {Reason}",
+                    bot.Name, bot.Guid, failedQuestId, failReason);
+            }
+
             bool isBagsFull = (failReason == "cannot_reward" || failReason == "bags_full")
                               && state.FreeSlots == 0;
 
@@ -2170,6 +2766,27 @@ public class QuestingDomain : IBotDomain
             }
             else if (isNpcNotFound)
             {
+                // ── Session 38: npc_not_found while in force mode ──
+                // Even the C++ 300yd force search missed the NPC, so the
+                // walk-closer retry below is pointless — that walk is exactly
+                // what MOVE_FAILED. Clear force mode and defer instead.
+                if (GetPhaseDateTime(bot, "force_interact_until") > DateTime.UtcNow)
+                {
+                    SetPhaseDateTime(bot, "force_interact_until", default);
+                    _logger.LogWarning(
+                        "[BOT-QUEST] {Name}({Guid}) | npc_not_found during force interact for [{QuestId}] — " +
+                        "clearing force mode, deferring 30min",
+                        bot.Name, bot.Guid, failedQuestId);
+                    bot.DeferQuest(failedQuestId, TimeSpan.FromMinutes(30));
+
+                    var aqForce = GetActiveQuests(bot);
+                    aqForce.RemoveAll(q => q.QuestId == failedQuestId);
+                    SetActiveQuests(bot, aqForce);
+                    if (aqForce.Count == 0)
+                        commands.AddRange(FallbackToPickingQuests(bot));
+                    return commands;
+                }
+
                 // Bot was too far from the NPC — walk closer and retry instead of deferring.
                 // Track retries to avoid infinite loops; after 3 attempts, defer normally.
                 int npcRetries = GetPhaseInt(bot, $"npc_retry_{failedQuestId}");
@@ -2329,6 +2946,8 @@ public class QuestingDomain : IBotDomain
                         bot.Name, bot.Guid, aq.QuestId, aq.Title, dist);
 
                     AdvanceTo(bot, "DoingObjectives");
+                    SetPhaseDateTime(bot, "do_progress_ts", DateTime.UtcNow);   // S36
+                    SetPhaseInt(bot, "do_noprogress_rearms", 0);
                     int remaining = obj.Count - progress;
                     SetPhaseInt(bot, "current_grind_creature", obj.CreatureEntry);
                     // Session 31: Fan-out — pick per-bot spawn instead of centroid
@@ -2373,6 +2992,8 @@ public class QuestingDomain : IBotDomain
                         bot.Name, bot.Guid, aq.QuestId, aq.Title, dist);
 
                     AdvanceTo(bot, "DoingObjectives");
+                    SetPhaseDateTime(bot, "do_progress_ts", DateTime.UtcNow);   // S36
+                    SetPhaseInt(bot, "do_noprogress_rearms", 0);
                     SetPhaseInt(bot, "current_grind_creature", source.CreatureEntry);
                     // Session 31: Fan-out — pick per-bot spawn instead of centroid
                     float gX2 = source.GrindX, gY2 = source.GrindY, gZ2 = source.GrindZ;
@@ -2685,7 +3306,8 @@ public class QuestingDomain : IBotDomain
         var activeQuests = GetActiveQuests(bot);
         var target = GetNearestObjectiveAcrossQuests(bot, state, activeQuests);
         if (target == null) return SendToNearestTurnIn(bot, state);
-        return new List<BridgeCommand> { MakeMoveTo(target.Value.x, target.Value.y, target.Value.z, target.Value.map) };
+        return new List<BridgeCommand> { MakeMoveTo(target.Value.x, target.Value.y, target.Value.z, target.Value.map)
+            .WithCorr(bot.Story?.Intent(StoryVerb.TRAVEL, new StoryTarget(target.Value.x, target.Value.y, target.Value.z, target.Value.map))) };
     }
 
     private List<BridgeCommand> SendToNearestTurnIn(BotIdentity bot, BotStateSnapshot state)
@@ -2694,7 +3316,8 @@ public class QuestingDomain : IBotDomain
         var turnIn = GetNearestCompletedTurnIn(bot, state, activeQuests);
         if (turnIn == null) return new List<BridgeCommand>();
         return new List<BridgeCommand> { MakeMoveTo(turnIn.Value.x, turnIn.Value.y, turnIn.Value.z, turnIn.Value.map,
-            fromX: state.X, fromY: state.Y) };
+            fromX: state.X, fromY: state.Y)
+            .WithCorr(bot.Story?.Intent(StoryVerb.TRAVEL, new StoryTarget(turnIn.Value.x, turnIn.Value.y, turnIn.Value.z, turnIn.Value.map))) };
     }
 
     private List<BridgeCommand> SendGrindTask(BotIdentity bot,
@@ -2702,6 +3325,9 @@ public class QuestingDomain : IBotDomain
     {
         SetPhaseInt(bot, "current_grind_creature", target.creatureEntry);
         SetPhaseInt(bot, "current_go_entry", 0);
+        // Session 36: arming a grind starts the no-progress clock fresh.
+        SetPhaseDateTime(bot, "do_progress_ts", DateTime.UtcNow);
+        SetPhaseInt(bot, "do_noprogress_rearms", 0);
 
         // ── Session 31: Spawn Fan-Out ──
         // Instead of sending the centroid to ALL bots, pick a deterministic
@@ -2714,7 +3340,14 @@ public class QuestingDomain : IBotDomain
         var spawnPositions = GetSpawnPositionsForTarget(bot, target);
         if (spawnPositions != null && spawnPositions.Count > 1)
         {
-            int idx = Math.Abs(bot.Guid.GetHashCode() ^ target.creatureEntry) % spawnPositions.Count;
+            // Session 42: grouped bots seed fan-out with the LEADER's guid so the
+            // whole group shares ONE spawn anchor (same camp, same mobs, heals and
+            // kill credit in range). Different groups still land on different spawns;
+            // solo bots keep the original per-guid scatter.
+            int fanoutSeed = bot.IsGrouped && bot.GroupLeaderGuid.HasValue
+                ? bot.GroupLeaderGuid.Value
+                : bot.Guid;
+            int idx = Math.Abs(fanoutSeed.GetHashCode() ^ target.creatureEntry) % spawnPositions.Count;
             var mySpawn = spawnPositions[idx];
             grindX = mySpawn.X;
             grindY = mySpawn.Y;
@@ -2736,7 +3369,7 @@ public class QuestingDomain : IBotDomain
                 radius = 60.0f,
                 creature_entry = target.creatureEntry,
                 kill_count = target.killCount
-            })
+            }).WithCorr(bot.Story?.Intent(StoryVerb.GRIND, new StoryTarget(grindX, grindY, grindZ, target.map)))
         };
     }
 
@@ -2781,17 +3414,25 @@ public class QuestingDomain : IBotDomain
         return null;
     }
 
-    private List<BridgeCommand> SendGoInteractTask(BotIdentity bot,
+    private List<BridgeCommand> SendGoInteractTask(BotIdentity bot, BotStateSnapshot state,
         (float x, float y, float z, int map, int creatureEntry, int killCount, int goEntry) target)
     {
         SetPhaseInt(bot, "current_grind_creature", 0);
         SetPhaseInt(bot, "current_go_entry", target.goEntry);
+        SetPhaseInt(bot, "go_spawn_pin", 0);
         _logger.LogInformation("[BOT-QUEST] {Name}({Guid}) | GO interaction mode — goEntry={GoEntry}",
             bot.Name, bot.Guid, target.goEntry);
+        // Session 41: if we're already inside the cluster, do NOT MOVE_TO the
+        // center — with Session-39 instant acks that round-trip immediately
+        // re-entered this path (the GO MOVE_TO loop). The next DoingObjectives
+        // tick (or the TASK_COMPLETE GO-mode route) sends USE_GAMEOBJECT.
+        if (IsNear(state, target.x, target.y, target.map, 8f))
+            return new List<BridgeCommand>();
         // First command: move to the GO cluster center, USE_GAMEOBJECT will be sent from DoingObjectives
         return new List<BridgeCommand>
         {
             MakeMoveTo(target.x, target.y, target.z, target.map)
+                .WithCorr(bot.Story?.Intent(StoryVerb.TRAVEL, new StoryTarget(target.x, target.y, target.z, target.map)))
         };
     }
 
@@ -2823,10 +3464,12 @@ public class QuestingDomain : IBotDomain
 
             if (retries >= 3)
             {
+                bot.Story?.Wedge("stuck_3x", $"no move 30s x3 @({state.X:F0},{state.Y:F0})");
                 var activeQuests = GetActiveQuests(bot);
                 foreach (var aq in activeQuests)
                 {
                     bot.DeferQuest(aq.QuestId, TimeSpan.FromMinutes(20));
+                    bot.Story?.Emit(StoryVerb.DEFER, StoryResult.SKIP, quest: new StoryQuest(aq.QuestId, aq.Title), reason: "stuck_3x", detail: "20min");
                     _logger.LogWarning("QuestingDomain: {Name} stuck 3 times on [{QuestId}], deferring",
                         bot.Name, aq.QuestId);
 
@@ -2943,6 +3586,7 @@ public class QuestingDomain : IBotDomain
         bot.QuestItemProgress.Clear();
         bot.CurrentActivity.PhaseData.Clear();
         bot.ResetDeathCounter();
+        bot.Story?.Emit(StoryVerb.FALLBACK, StoryResult.OK, detail: "re-pick");
         AdvanceTo(bot, "PickingQuests");
         return new List<BridgeCommand>();
     }
@@ -3026,6 +3670,7 @@ public class QuestingDomain : IBotDomain
             questId: aq.QuestId, questTitle: aq.Title,
             detail: $"frustration_abandoned after {count} deferrals (no chain, no item reward)");
 
+        bot.Story?.Emit(StoryVerb.ABANDON, StoryResult.OK, quest: new StoryQuest(aq.QuestId, aq.Title), reason: "frustration", detail: $"after {count} deferrals");
         return new BridgeCommand("ABANDON_QUEST", new { quest_id = aq.QuestId });
     }
 }

@@ -16,7 +16,8 @@ public enum ActivityType
     CorpseRunning,
     FlightPath,
     TravelingToQuest,
-    Loitering
+    Loitering,
+    Following      // Session 43: grouped follower glued to the leader (FollowDomain)
 }
 
 public class ActivityState

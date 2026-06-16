@@ -1,4 +1,4 @@
-namespace MangosSuperUI.BotLogic.Core;
+ï»¿namespace MangosSuperUI.BotLogic.Core;
 
 // ======================== DecisionResult ========================
 
@@ -28,6 +28,18 @@ public class BridgeCommand
                 Payload[prop.Name] = prop.GetValue(payloadObj)!;
         }
     }
+
+    /// <summary>
+    /// Story correlation stamp (BotStoryRider). Writes the corr onto the wire payload
+    /// so the C++ outcome can echo it and the story merger can link this command to
+    /// its result. Additive and passive: a null corr is a no-op; nothing else changes.
+    /// Usage: new BridgeCommand("MOVE_TO", payload).WithCorr(bot.Story?.Intent(...));
+    /// </summary>
+    public BridgeCommand WithCorr(string? corr)
+    {
+        if (corr != null) Payload["corr"] = corr;
+        return this;
+    }
 }
 
 // ======================== IBotDomain ========================
@@ -43,7 +55,7 @@ public interface IBotDomain
     /// <summary>
     /// Whether this domain has real logic implemented and should participate in
     /// strategic rolls. When false, DecisionEngine zeros out all weights for this
-    /// domain's activities — the bot will never switch into a non-operational domain.
+    /// domain's activities ï¿½ the bot will never switch into a non-operational domain.
     ///
     /// Domains default to false (stub) and must explicitly override to true when
     /// their logic is built out. This prevents bots from wasting time switching to
@@ -51,7 +63,7 @@ public interface IBotDomain
     /// that emit no commands and leave the bot standing around doing nothing.
     ///
     /// As each domain is built, set IsOperational = true and the decision engine
-    /// starts including it in rolls automatically — no other wiring needed.
+    /// starts including it in rolls automatically ï¿½ no other wiring needed.
     /// </summary>
     bool IsOperational => false;
 

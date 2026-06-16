@@ -103,6 +103,8 @@ public class BotIdentity
     public HashSet<int> KnownSpellIds { get; set; } = new();
     public bool HasUnlearnedSpells { get; set; }
     public int TicksSinceLastTrained { get; set; }
+    public uint TrainingCostNeeded { get; set; } = 0;     // Session 45: full training bill owed at last trainer visit
+    public float GroupAnchorRadius { get; set; } = 10f;   // Session 45: grind radius for the current errand anchor
 
     // --- Shadow inventory (in-memory, flushed to DB periodically) ---
     public List<ShadowInventoryItem> ShadowInventory { get; set; } = new();
@@ -178,6 +180,48 @@ public class BotIdentity
     /// </summary>
     public bool GroupAllMembersQuesting { get; set; } = true;
 
+    // ── Session 42: GroupCoordinator directive (ARCH §7a) ──
+    // Computed once per group per decision pass in BotBrainService and stamped
+    // on every member. DecisionEngine ENFORCES it at strategic eval; domains
+    // EXECUTE it (CombatDomain grinds at the anchor; QuestingDomain adopts the
+    // leader's quests). Domains never DECIDE it — that is the "each domain its
+    // own mind" trap this layer exists to kill.
+
+    /// <summary>What the group should be doing right now. None = solo / coordinator off.</summary>
+    public GroupDirective GroupDirective { get; set; } = GroupDirective.None;
+    /// <summary>Group anchor (= leader's live position). Where HoldAndGrind/Regroup converge.</summary>
+    public float GroupAnchorX { get; set; }
+    public float GroupAnchorY { get; set; }
+    public float GroupAnchorZ { get; set; }
+    public int GroupAnchorMap { get; set; }
+    /// <summary>UTC stamp of the last directive computation. Consumers treat a directive
+    /// older than ~2 min as None (disband/restart staleness guard).</summary>
+    public DateTime GroupDirectiveUtc { get; set; }
+    /// <summary>Session 42 (semantics reworked Session 44): the group's quest BATCH,
+    /// stamped with the directive. S42 stamped the leader's live (not-turned-in) IDs,
+    /// which bricked any follower that missed an accept window: the moment the leader
+    /// turned in a chain head (783), every downstream quest failed CanTakeQuest
+    /// PrevQ=0 forever. S44: the coordinator stamps the per-group BATCH SET instead —
+    /// every quest the leader accepted this run, minus the ones THIS member has
+    /// already turned in or given up on. A quest leaves the batch only when every
+    /// member rewarded it (or gave up: class/race-locked) or the batch TTL expires.
+    /// Followers restrict picking/opportunistic accepts to this set.</summary>
+    public HashSet<int>? GroupLeaderQuestIds { get; set; }
+
+    // ── Session 44: formation quest-sync leader holds ──
+    // Computed by the BotBrainService coordinator on the LEADER's pass only,
+    // from the group quest batch + live member ack state. QuestingDomain's
+    // AcceptingQuests/TurningIn exit points consume these: the leader waits
+    // (timeout-capped, see GROUP_HOLD_TIMEOUT_SEC) at the NPC instead of
+    // sprinting off while glued followers are still mid-accept/turn-in.
+
+    /// <summary>Leader-only. True while some Following member still needs to ACCEPT
+    /// a batch quest whose giver is near the leader's current position.</summary>
+    public bool GroupFollowersNeedAccept { get; set; }
+    /// <summary>Leader-only. True while some Following member that holds a batch quest
+    /// the leader already rewarded still needs to TURN IT IN at a nearby ender.</summary>
+    public bool GroupFollowersNeedTurnIn { get; set; }
+
     // --- Computed helpers ---
     public float XPPercent => XPToNextLevel > 0 ? XP / (float)XPToNextLevel : 0f;
     public bool IsNearLevelUp => XPPercent > 0.85f;
@@ -186,6 +230,18 @@ public class BotIdentity
     public DateTime? VendorCooldownUntil { get; set; }
 
     public StuckDetector StuckDetector { get; set; }
+
+
+
+
+    /// <summary>
+    /// Per-bot causal story emitter (BotStoryRider). Carried here so any code path
+    /// holding the bot can emit its story without threading a ref through every
+    /// signature. Created in BotBrainService.InitializeBotAsync. Nullable + invoked
+    /// null-conditionally at call sites (bot.Story?.Intent(...)) so it is a safe
+    /// no-op before init or when absent. Passive: read + emit only, never alters flow.
+    /// </summary>
+    public Tracking.BotStoryRider? Story { get; set; }
     /// <summary>
     /// Clear expired deferrals. Called during quest selection.
     /// Time-gated deferrals expire by clock. Level-gated deferrals expire
@@ -377,6 +433,23 @@ public class QuestDeferral
 
     public static QuestDeferral TimeBased(DateTime expiresAt) => new() { ExpiresAt = expiresAt };
     public static QuestDeferral LevelBased(int requiredLevel) => new() { RequiredLevel = requiredLevel };
+}
+
+/// <summary>
+/// Session 42: per-group directive computed by the GroupCoordinator in
+/// BotBrainService (ARCH §7a). One value per group per pass, stamped on every member.
+/// </summary>
+public enum GroupDirective
+{
+    None = 0,         // solo bot or coordinator off — normal weighted roll
+    Questing = 1,     // all members present → work the shared batch together
+    HoldAndGrind = 2, // ≥1 member away on an errand → grind at the anchor, don't advance
+    Regroup = 3,      // spread past threshold → converge on the anchor (grind there)
+    GroupErrand = 4   // Session 44b: the TEAM travels to a service stop (trainer/vendor).
+                      // Anchor = the service NPC. Leader anchor-travels there (CombatDomain),
+                      // followers arrive glued, and the BotBrainService macro brain fires
+                      // TRAIN_AT_NPC / SELL_ITEMS / REPAIR_AT_NPC for every member that
+                      // needs it. No member ever leaves the formation for maintenance.
 }
 
 public enum WowRace : int

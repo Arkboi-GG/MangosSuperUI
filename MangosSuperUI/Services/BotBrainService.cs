@@ -1,203 +1,212 @@
 using System.Collections.Concurrent;
+using Dapper;
 using MangosSuperUI.BotLogic.Core;
-using MangosSuperUI.BotLogic.Domains;
+using MangosSuperUI.BotLogic.Brain;
 using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Tracking;
-
-using MangosSuperUI.Hubs;
-using MangosSuperUI.Services;
-using Microsoft.AspNetCore.SignalR;
-using Dapper;
 using MangosSuperUI.Models;
 
 namespace MangosSuperUI.Services;
 
 /// <summary>
-/// The behavioral engine orchestrator. Maintains one DecisionEngine per bot,
-/// subscribes to BotBridgeService events, and drives the decision loop.
+/// The behavioral engine HOST (rebuild — Strategy B, Phase 1).
 ///
-/// Wiring:
-///   - Subscribes to BotBridgeService.BotStates changes (polling via the main loop)
-///   - Routes KILL events to EconomyDomain.ProcessKillLoot (always-on)
-///   - Emits BotDecision via SignalR for dashboard "Brain" panel
-///   - Batches activity log writes via BotActivityLog
-///   - Persists/loads personality via bot_personality table (admin DB)
+/// Ownership is inverted from the old design: this service no longer scatters
+/// control across DecisionEngine + per-domain phase state. It is a thin host that
+///   1. keeps the bridge roster mirrored into BotIdentity (for the dashboard +
+///      grouping, which is rebuilt last) and into BotContext (the new live-state
+///      keystone the spine drives),
+///   2. drives the spine — BotBrain (driver) → BotExecutor (issue + WAIT) →
+///      BotSupervisor (stall) — one BotContext per bot per tick, and
+///   3. prints the FleetReport: one bounded, context-window-sized fleet picture
+///      that replaces grepping six log streams.
+///
+/// Phase 1 is spine, no behavior: every bot is held in Goal.Idle and the only
+/// live correction is the Supervisor's universal deadline rule. Goal selection
+/// and per-goal planners land in Phases 2+ inside BotBrain, untouched here.
+///
+/// Retained for the dashboard / grouping (carved out in their own phases):
+///   GroupManager + group endpoints, BotIdentity roster (AllBots), personality
+///   load/roll/persist, story-rider toggles (demoted — superseded by FleetReport),
+///   GetBotBrainSummary, BrainEnabled.
+/// Shed: DecisionEngine + all domains as the driver, the grouping batch/errand
+///   fan-out, known-good destinations, in-flight MOVE_TO recovery, fleet
+///   diagnostics, and the flight recorder.
+///
+/// The bridge contract is unchanged: it calls SetBrainService(this) and routes
+/// every EVENT/CHAT_RECV through HandleBridgeEventAsync(guid, BotEvent).
 /// </summary>
 public class BotBrainService : BackgroundService
 {
     private readonly BotBridgeService _bridge;
-    private readonly IHubContext<BotBridgeHub> _hub;
     private readonly ConnectionFactory _db;
     private readonly BotStateTracker _tracker;
-    private readonly BotActivityLog _activityLog;
     private readonly QuirkLoader _quirkLoader;
-    private readonly ILogger<BotBrainService> _logger;
-    private readonly OllamaChatService _ollama;
-    private readonly QuestGraphLoader _questGraph;
-    private readonly ZoneSafetyMap _safetyMap;
-    private readonly BotFleetDiagnostics _diagnostics;
-    private readonly BotFlightRecorder _recorder;
-
-    // Per-bot instances
-    private readonly ConcurrentDictionary<int, DecisionEngine> _engines = new();
-    private readonly ConcurrentDictionary<int, BotIdentity> _bots = new();
-
-    // Domain engines (singleton, stateless — per-bot state is in BotIdentity)
-    private readonly QuestingDomain _questing;
-
-    private readonly CombatDomain _combat = new();
-    private readonly EconomyDomain _economy;
-    private readonly SocialDomain _social = new();
-    private readonly ExplorationDomain _exploration = new();
-    private readonly TrainingDomain _training;
-    private readonly MaintenanceDomain _maintenance;
-    private readonly LiveStateModifiers _liveState;
     private readonly BotBrainDbInit _dbInit;
-    private readonly ZoneDataLoader _zoneDataLoader;
-    private readonly SpellProgressionLoader _spellLoader;
+    private readonly ILogger<BotBrainService> _logger;
+    private readonly BotBrain _driver;           // the spine (BotBrain → BotExecutor/BotSupervisor)
     private readonly GroupManager _groupManager;
 
-    // Track which bot GUIDs we've already initialized (to detect new connections)
+    // Roster mirrors. _bots feeds the dashboard + grouping; _contexts is the
+    // live-state the spine drives. One entry per connected bot in both.
+    private readonly ConcurrentDictionary<int, BotIdentity> _bots = new();
+    private readonly ConcurrentDictionary<int, BotContext> _contexts = new();
+
     private readonly HashSet<int> _initializedGuids = new();
+    private readonly ConcurrentDictionary<int, DateTime> _disconnectedAt = new();
 
-    // ── F2 dropped-MOVE_TO recovery (belt-and-suspenders for ARCH §14.1) ──
-    // When C++ reports IDLE while a MOVE_TO is still outstanding, the arrival
-    // notify (MovementInform→TASK_COMPLETE) was dropped or the path ended
-    // silently — the bot is parked, not moving. We re-send the same MOVE_TO.
-    // Only MOVE_TO is tracked: re-sending SET_TASK GRIND would reset C++ kill
-    // credit, so grind stalls (F7) are left to the C++-side kill-credit guard.
-    // Self-contained here so it works for EVERY bot, not just traced ones.
-    private readonly ConcurrentDictionary<int, InFlightMove> _inflight = new();
-    private const double MOVE_RESEND_IDLE_GRACE_SEC = 15.0; // sustained C++ IDLE before first re-send
-    private const double MOVE_RESEND_COOLDOWN_SEC = 15.0; // min gap between re-sends
-    private const int MOVE_RESEND_MAX = 3;    // give up after this → watchdog / strategic eval
+    private volatile bool _brainEnabled = false;
+    private DateTime _lastFleetLog = DateTime.MinValue;
 
-    /// <summary>Remember the most recent MOVE_TO per bot so a dropped arrival notify can be re-sent.</summary>
-    private void NoteOutboundCommand(int guid, BridgeCommand cmd)
+    private const double EVICT_DISCONNECT_SEC = 60.0;
+    private const double FLEET_LOG_INTERVAL_SEC = 30.0;
+
+    public BotBrainService(
+        BotBridgeService bridge,
+        ConnectionFactory db,
+        BotStateTracker tracker,
+        QuirkLoader quirkLoader,
+        BotBrainDbInit dbInit,
+        ILogger<BotBrainService> logger,
+        ILoggerFactory loggerFactory,
+        BotBrain driver)
     {
-        if (cmd.Type != "MOVE_TO") return;
-        _inflight[guid] = new InFlightMove
+        _bridge = bridge;
+        _db = db;
+        _tracker = tracker;
+        _quirkLoader = quirkLoader;
+        _dbInit = dbInit;
+        _logger = logger;
+        _driver = driver;
+        _groupManager = new GroupManager(_db, loggerFactory.CreateLogger<GroupManager>());
+    }
+
+    // ==================== Public API (controller / hub) ====================
+
+    /// <summary>Group manager — exposed for the dashboard controller.</summary>
+    public GroupManager GroupManager => _groupManager;
+
+    /// <summary>
+    /// Whether the spine DRIVES (selects goals, issues commands, supervises).
+    /// When false, bots are still sensed each tick so FleetReport stays live, but
+    /// no command is issued and no stall is raised. Toggling off resets session
+    /// roster state (it re-syncs from the bridge on the next loop). In Phase 1 the
+    /// spine only holds Idle, so this gates nothing visible yet — from Phase 2 it
+    /// gates planner execution.
+    /// </summary>
+    public bool BrainEnabled
+    {
+        get => _brainEnabled;
+        set
         {
-            Payload = cmd.Payload,
-            SentAt = DateTime.UtcNow,
-            FirstIdleSeen = default,
-            LastResend = DateTime.MinValue,
-            Resends = 0
+            _brainEnabled = value;
+            _logger.LogInformation("BotBrain: driving {State}", value ? "ENABLED" : "DISABLED");
+
+            if (!value)
+            {
+                var count = _contexts.Count;
+                _bots.Clear();
+                _contexts.Clear();
+                _initializedGuids.Clear();
+                _disconnectedAt.Clear();
+                _logger.LogInformation("BotBrain: cleared {Count} bot entries on disable — next sync starts clean", count);
+            }
+        }
+    }
+
+    /// <summary>Live BotIdentity roster — consumed by the dashboard (BrainStatus).</summary>
+    public IReadOnlyDictionary<int, BotIdentity> AllBots => _bots;
+
+    public BotIdentity? GetBotIdentity(int guid) =>
+        _bots.TryGetValue(guid, out var bot) ? bot : null;
+
+    public int ActiveBotCount => _contexts.Count;
+
+    /// <summary>
+    /// Story-rider toggle (demoted: superseded by FleetReport, kept for the dashboard).
+    /// Flips each listed bot's rider Enabled flag (null/empty = whole fleet) and returns
+    /// the guids affected. Passive — sets a flag only; nothing emits in the rebuild.
+    /// </summary>
+    public IReadOnlyList<int> SetStoryEnabled(IEnumerable<int>? guids, bool on)
+    {
+        var targets = guids?.ToList();
+        var affected = new List<int>();
+        foreach (var kvp in _bots)
+        {
+            if (targets != null && targets.Count > 0 && !targets.Contains(kvp.Key)) continue;
+            var rider = kvp.Value.Story;
+            if (rider == null) continue;
+            rider.Enabled = on;
+            affected.Add(kvp.Key);
+        }
+        _logger.LogInformation("BotBrain: story rider {State} on {Count} bot(s)", on ? "ENABLED" : "DISABLED", affected.Count);
+        return affected;
+    }
+
+    /// <summary>Read-only story-rider status for the dashboard.</summary>
+    public IReadOnlyList<object> GetStoryStatus()
+    {
+        var list = new List<object>();
+        foreach (var kvp in _bots)
+        {
+            var rider = kvp.Value.Story;
+            if (rider == null) continue;
+            list.Add(new
+            {
+                guid = kvp.Key,
+                name = kvp.Value.Name,
+                enabled = rider.Enabled,
+                dropped = rider.DroppedRecords,
+                lastError = rider.LastError
+            });
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Per-bot brain summary for the dashboard. Shape preserved from the old design
+    /// so the existing UI keeps rendering; the values now reflect the Idle spine.
+    /// </summary>
+    public object? GetBotBrainSummary(int guid)
+    {
+        if (!_bots.TryGetValue(guid, out var bot)) return null;
+        var bs = _bridge.GetBotState(guid);
+        return new
+        {
+            guid = bot.Guid,
+            name = bot.Name,
+            activity = bot.CurrentActivity.Type.ToString(),
+            activityDuration = bot.CurrentActivity.MinutesInState,
+            subPhase = bot.CurrentActivity.SubPhase,
+            contextTag = bot.CurrentActivity.ContextTag,
+            personality = bot.Personality.ToSummary(),
+            tickBase = bot.Personality.DecisionTickBase,
+            nextTick = bot.NextDecisionTick,
+            copper = bs?.Copper ?? 0,
+            freeSlots = bs?.FreeSlots ?? 16,
+            totalSlots = bs?.TotalSlots ?? 16,
+            inventoryCount = bot.ShadowInventory.Count,
+            hasUnlearnedSpells = bot.HasUnlearnedSpells,
+            questProgress = bot.CurrentQuestProgress,
+            activeQuestId = bot.ActiveQuestId,
+            pendingAction = bot.PendingAction != null ? new
+            {
+                returnTo = bot.PendingAction.ReturnTo.ToString(),
+                subPhase = bot.PendingAction.SubPhase,
+                questId = bot.PendingAction.QuestId
+            } : null
         };
     }
 
-    private sealed class InFlightMove
-    {
-        public Dictionary<string, object> Payload = new();
-        public DateTime SentAt;
-        public DateTime FirstIdleSeen;   // default = not currently observed idle
-        public DateTime LastResend;
-        public int Resends;
-    }
+    /// <summary>
+    /// The one-shot fleet picture (§3.6): rollups + one bounded line per bot.
+    /// Exposed for a future endpoint; also logged on an interval (see the loop).
+    /// </summary>
+    public string GetFleetReport() => FleetReport.Render(_contexts.Values.ToList());
 
-    // Fleet-level shared "known-good" destinations — if ANY bot successfully interacted
-    // at these coordinates, other bots should NOT blacklist them on MOVE_FAILED.
-    // Persisted to vmangos_admin.known_good_destinations so they survive restarts.
-    // Key = rounded (X/5*5, Y/5*5).
-    private static readonly HashSet<(int, int)> _knownGoodDestinations = new();
-    private static readonly object _knownGoodLock = new();
+    // -------------------- Grouping (delegates to GroupManager) --------------------
 
-    private static (int, int) RoundDest(float x, float y) => ((int)MathF.Round(x / 5) * 5, (int)MathF.Round(y / 5) * 5);
-
-    private static bool IsKnownGoodDestination(float x, float y)
-    {
-        lock (_knownGoodLock) return _knownGoodDestinations.Contains(RoundDest(x, y));
-    }
-
-    private async Task MarkDestinationGoodAsync(float x, float y, int map, string source)
-    {
-        var key = RoundDest(x, y);
-        bool isNew;
-        lock (_knownGoodLock) isNew = _knownGoodDestinations.Add(key);
-
-        try
-        {
-            using var conn = _db.Admin();
-            await conn.ExecuteAsync(@"
-                INSERT INTO known_good_destinations (grid_x, grid_y, map_id, source, first_seen, last_seen)
-                VALUES (@GridX, @GridY, @Map, @Source, NOW(), NOW())
-                ON DUPLICATE KEY UPDATE last_seen = NOW(), hit_count = hit_count + 1",
-                new { GridX = key.Item1, GridY = key.Item2, Map = map, Source = source });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to persist known-good destination ({X},{Y})", key.Item1, key.Item2);
-        }
-
-        if (isNew)
-            _logger.LogInformation("[BOT-PATH] New known-good destination ({X},{Y}) map={Map} source={Source}",
-                key.Item1, key.Item2, map, source);
-    }
-
-    private async Task LoadKnownGoodDestinationsAsync()
-    {
-        try
-        {
-            using var conn = _db.Admin();
-
-            // Auto-create table if it doesn't exist
-            await conn.ExecuteAsync(@"
-                CREATE TABLE IF NOT EXISTS known_good_destinations (
-                    grid_x INT NOT NULL,
-                    grid_y INT NOT NULL,
-                    map_id INT NOT NULL DEFAULT 0,
-                    source VARCHAR(64) DEFAULT '',
-                    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    hit_count INT DEFAULT 1,
-                    PRIMARY KEY (grid_x, grid_y)
-                )");
-
-            var rows = await conn.QueryAsync<(int grid_x, int grid_y)>(
-                "SELECT grid_x, grid_y FROM known_good_destinations");
-
-            lock (_knownGoodLock)
-            {
-                foreach (var row in rows)
-                    _knownGoodDestinations.Add((row.grid_x, row.grid_y));
-            }
-
-            _logger.LogInformation("BotBrain: loaded {Count} known-good destinations from DB", _knownGoodDestinations.Count);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to load known-good destinations — starting fresh");
-        }
-    }
-
-    // ── Session 31: Grouping mode persistence ──
-
-    private async Task LoadGroupingModeAsync()
-    {
-        try
-        {
-            using var conn = _db.Admin();
-            var value = await conn.QueryFirstOrDefaultAsync<string>(
-                "SELECT setting_value FROM bot_settings WHERE setting_key = 'grouping_mode'");
-
-            if (value != null && int.TryParse(value, out int mode) && Enum.IsDefined(typeof(GroupingMode), mode))
-            {
-                _groupManager.Mode = (GroupingMode)mode;
-                _logger.LogInformation("BotBrain: loaded grouping mode from DB: {Mode}", _groupManager.Mode);
-            }
-            else
-            {
-                _groupManager.Mode = GroupingMode.Off;
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "BotBrain: failed to load grouping mode, defaulting to Off");
-            _groupManager.Mode = GroupingMode.Off;
-        }
-    }
-
-    /// <summary>Set grouping mode from dashboard and persist to DB.</summary>
+    /// <summary>Set grouping mode from the dashboard and persist to DB.</summary>
     public async Task SetGroupingModeAsync(GroupingMode mode)
     {
         _groupManager.Mode = mode;
@@ -218,7 +227,7 @@ public class BotBrainService : BackgroundService
         }
     }
 
-    /// <summary>Form a group from the dashboard. Sends FORM_GROUP to C++ leader.</summary>
+    /// <summary>Form a group from the dashboard. Sends FORM_GROUP to the C++ leader.</summary>
     public async Task<BotGroup?> FormGroupAsync(int leaderGuid, params int[] followerGuids)
     {
         var group = _groupManager.FormGroup(leaderGuid, followerGuids);
@@ -255,7 +264,7 @@ public class BotBrainService : BackgroundService
         await _groupManager.SaveGroupsToDbAsync();
     }
 
-    /// <summary>Auto-form groups from dashboard. Returns formed groups.</summary>
+    /// <summary>Auto-form groups from the dashboard. Returns the formed groups.</summary>
     public async Task<List<BotGroup>> AutoFormGroupsAsync()
     {
         var formed = _groupManager.AutoFormGroups(AllBots,
@@ -276,194 +285,61 @@ public class BotBrainService : BackgroundService
         return formed;
     }
 
-    // Track when each bot was first seen disconnected (for stale eviction)
-    private readonly ConcurrentDictionary<int, DateTime> _disconnectedAt = new();
-
-    // Brain enabled flag (can be toggled from UI)
-    private volatile bool _brainEnabled = false;
-
-
-
-
-    public BotBrainService(
-        BotBridgeService bridge,
-        IHubContext<BotBridgeHub> hub,
-        ConnectionFactory db,
-        BotStateTracker tracker,
-        BotActivityLog activityLog,
-        QuirkLoader quirkLoader,
-        LiveStateModifiers liveState,
-        BotBrainDbInit dbInit,
-        ILogger<BotBrainService> logger,
-        OllamaChatService ollama,
-        QuestGraphLoader questGraph,
-        ZoneDataLoader zoneDataLoader,
-        ZoneSafetyMap safetyMap,
-        SpellProgressionLoader spellLoader,
-        BotFleetDiagnostics diagnostics,
-        BotFlightRecorder recorder,
-        ILoggerFactory loggerFactory)
-    {
-        _bridge = bridge;
-        _hub = hub;
-        _db = db;
-        _tracker = tracker;
-        _activityLog = activityLog;
-        _quirkLoader = quirkLoader;
-        _liveState = liveState;
-        _dbInit = dbInit;
-        _logger = logger;
-        _ollama = ollama;
-        _questGraph = questGraph;
-        _zoneDataLoader = zoneDataLoader;
-        _safetyMap = safetyMap;
-        _diagnostics = diagnostics;
-        _recorder = recorder;
-        _spellLoader = spellLoader;
-        _questing = new QuestingDomain(_questGraph, _safetyMap, loggerFactory.CreateLogger<QuestingDomain>(), db, _diagnostics);
-        _economy = new EconomyDomain(_zoneDataLoader, loggerFactory.CreateLogger<EconomyDomain>());
-        _maintenance = new MaintenanceDomain(_safetyMap, loggerFactory.CreateLogger<MaintenanceDomain>());
-        _training = new TrainingDomain(_spellLoader, loggerFactory.CreateLogger<TrainingDomain>());
-        _groupManager = new GroupManager(_db, loggerFactory.CreateLogger<GroupManager>());
-    }
-
-    // ==================== Public API (for controller/hub) ====================
-
-    /// <summary>Group manager — exposed for dashboard controller.</summary>
-    public GroupManager GroupManager => _groupManager;
-
-    public bool BrainEnabled
-    {
-        get => _brainEnabled;
-        set
-        {
-            _brainEnabled = value;
-            _logger.LogInformation("BotBrain: engine {State}", value ? "ENABLED" : "DISABLED");
-
-            if (!value)
-            {
-                var count = _bots.Count;
-                _bots.Clear();
-                _engines.Clear();
-                _initializedGuids.Clear();
-                _disconnectedAt.Clear();
-                _diagnostics.ResetSessionCounters();
-                _recorder.ResetSession();
-                _logger.LogInformation("BotBrain: cleared {Count} bot entries on disable — next enable starts clean", count);
-            }
-        }
-    }
-
-    public IReadOnlyDictionary<int, BotIdentity> AllBots => _bots;
-
-    public BotIdentity? GetBotIdentity(int guid) =>
-        _bots.TryGetValue(guid, out var bot) ? bot : null;
-
-    public int ActiveBotCount => _bots.Count;
+    // -------------------- Bridge event entry (unchanged contract) --------------------
 
     /// <summary>
-    /// Get the last decision result summary for a bot (for dashboard).
+    /// Routes a bridge EVENT/CHAT_RECV into the spine. Thin in the rebuild: keep the
+    /// dashboard's BotIdentity level fresh, then hand the event to BotBrain → BotExecutor
+    /// for WAIT/ack matching. The old grouping fan-out + economy loot routing are shed
+    /// (grouping → Phase 5, economy → Phase 4).
     /// </summary>
-    public object? GetBotBrainSummary(int guid)
+    public Task HandleBridgeEventAsync(int guid, BotEvent evt)
     {
-        if (!_bots.TryGetValue(guid, out var bot)) return null;
-        var bs = _bridge.GetBotState(guid);
-        return new
-        {
-            guid = bot.Guid,
-            name = bot.Name,
-            activity = bot.CurrentActivity.Type.ToString(),
-            activityDuration = bot.CurrentActivity.MinutesInState,
-            subPhase = bot.CurrentActivity.SubPhase,
-            contextTag = bot.CurrentActivity.ContextTag,
-            personality = bot.Personality.ToSummary(),
-            tickBase = bot.Personality.DecisionTickBase,
-            nextTick = bot.NextDecisionTick,
-            copper = bs?.Copper ?? 0,
-            freeSlots = bs?.FreeSlots ?? 16,
-            totalSlots = bs?.TotalSlots ?? 16,
-            inventoryCount = bot.ShadowInventory.Count,
-            hasUnlearnedSpells = bot.HasUnlearnedSpells,
-            questProgress = bot.CurrentQuestProgress,
-            activeQuestId = bot.ActiveQuestId,
-            pendingAction = bot.PendingAction != null ? new
-            {
-                returnTo = bot.PendingAction.ReturnTo.ToString(),
-                subPhase = bot.PendingAction.SubPhase,
-                questId = bot.PendingAction.QuestId
-            } : null
-        };
+        if (evt.EventType == "LEVEL_UP" && evt.NewLevel > 0 && _bots.TryGetValue(guid, out var bot))
+            bot.Level = evt.NewLevel;
+
+        if (_contexts.TryGetValue(guid, out var ctx))
+            _driver.OnEvent(ctx, evt);
+
+        return Task.CompletedTask;
     }
 
     // ==================== Lifecycle ====================
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("BotBrain: service started (engine disabled by default — enable from dashboard)");
+        _logger.LogInformation("BotBrain: host started (Strategy B spine; driving disabled by default — enable from dashboard)");
 
-        // Initialize DB tables
+        // Tables the retained surface needs (bot_personality, bot_settings, …).
         await _dbInit.InitializeAsync();
 
-        // Load persistent known-good destinations
-        await LoadKnownGoodDestinationsAsync();
-
-        // Load quirk tables
+        // Personality quirk tables (load/roll on connect).
         _quirkLoader.Load();
 
-        // Load quest graph from mangos DB
-        await _questGraph.LoadAsync();
-
-        // Load zone safety map (creature level grid for path safety checks)
-        await _safetyMap.LoadAsync();
-
-        // Load zone data (vendors, innkeepers) from mangos DB
-        await _zoneDataLoader.LoadAsync();
-
-        await _spellLoader.LoadAsync();
-
-        // Load group assignments + grouping mode from DB (Session 31)
+        // Groups + grouping mode from DB.
         await _groupManager.LoadGroupsFromDbAsync();
         await LoadGroupingModeAsync();
 
-        // Wire event routing from bridge → brain (avoids circular DI)
+        // Wire event routing from bridge → brain (breaks the circular DI).
         _bridge.SetBrainService(this);
-
-        // Flight recorder: wire the static BotTrace facade so any domain can emit
-        // without a constructor ref, and load the per-guid trace allowlist from bot_settings.
-        BotTrace.Attach(_recorder);
-        await _recorder.LoadSettingsAsync();
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                // 1. Check for new bot connections
+                // 1. Mirror the bridge roster into BotIdentity + BotContext.
                 await SyncBotRosterAsync();
 
-                // 2. Run decision ticks (only if brain is enabled)
-                if (_brainEnabled)
+                // 2. Drive the spine (sense always; drive+supervise when enabled).
+                await RunBrainTicksAsync();
+
+                // 3. Print the fleet picture on an interval.
+                if (_contexts.Count > 0 &&
+                    (DateTime.UtcNow - _lastFleetLog).TotalSeconds >= FLEET_LOG_INTERVAL_SEC)
                 {
-                    await RunDecisionTicksAsync();
+                    _lastFleetLog = DateTime.UtcNow;
+                    _logger.LogInformation("BotBrain fleet:\n{Report}", GetFleetReport());
                 }
-
-                // 3. Flush activity log
-                await _activityLog.FlushIfDueAsync();
-
-                // 4. Fleet diagnostics — flush issues to disk, generate health snapshot if due
-                _diagnostics.TickDiagnostics(_bots, guid =>
-                {
-                    var bs = _bridge.GetBotState(guid);
-                    if (bs == null) return (BotStateSnapshot?)null;
-                    return BotStateSnapshot.FromBridgeState(bs);
-                });
-
-                // 5. Flight recorder — flush timeline + run the auto-stuck sweep (no-op when off)
-                _recorder.TickTrace(_bots, guid =>
-                {
-                    var bs = _bridge.GetBotState(guid);
-                    if (bs == null) return (BotStateSnapshot?)null;
-                    return BotStateSnapshot.FromBridgeState(bs);
-                });
             }
             catch (Exception ex)
             {
@@ -474,17 +350,16 @@ public class BotBrainService : BackgroundService
         }
     }
 
-    // ==================== Bot Roster Sync ====================
+    // ==================== Roster sync ====================
 
     /// <summary>
-    /// Detect new bot connections from BotBridgeService and initialize BotIdentity + DecisionEngine.
-    /// Also detect disconnections and clean up.
+    /// Detect new bot connections from the bridge and initialize BotIdentity +
+    /// BotContext; detect disconnects and evict after a grace period.
     /// </summary>
     private async Task SyncBotRosterAsync()
     {
         var bridgeStates = _bridge.BotStates;
 
-        // New connections
         foreach (var kvp in bridgeStates)
         {
             int guid = kvp.Key;
@@ -499,38 +374,34 @@ public class BotBrainService : BackgroundService
             }
             else if (_bots.TryGetValue(guid, out var bot))
             {
-                // Update live state from bridge
                 bot.Level = bs.Level;
                 _tracker.UpdatePosition(guid, bs.ZoneId, bs.MapId, bs.X, bs.Y, bs.Z);
             }
         }
 
-        // Detect disconnections — evict after 60s of disconnect
+        // Evict bots that have been gone for the grace window.
         var disconnected = _initializedGuids
             .Where(g => !bridgeStates.ContainsKey(g) || bridgeStates[g].TaskState == "DISCONNECTED")
             .ToList();
 
         foreach (var guid in disconnected)
         {
-            // Record first-seen disconnect time
             _disconnectedAt.TryAdd(guid, DateTime.UtcNow);
 
             if (_disconnectedAt.TryGetValue(guid, out var dcTime) &&
-                (DateTime.UtcNow - dcTime).TotalSeconds >= 60)
+                (DateTime.UtcNow - dcTime).TotalSeconds >= EVICT_DISCONNECT_SEC)
             {
-                // Session 31: Remove from group before evicting
                 _groupManager.RemoveFromGroup(guid);
-
                 _bots.TryRemove(guid, out _);
-                _engines.TryRemove(guid, out _);
+                _contexts.TryRemove(guid, out _);
                 _initializedGuids.Remove(guid);
                 _disconnectedAt.TryRemove(guid, out _);
                 _tracker.Remove(guid);
-                _logger.LogInformation("BotBrain: evicted stale bot {Guid} (disconnected 60s+)", guid);
+                _logger.LogInformation("BotBrain: evicted stale bot {Guid} (disconnected {Sec}s+)", guid, (int)EVICT_DISCONNECT_SEC);
             }
         }
 
-        // Clear disconnect timer for bots that reconnected
+        // Clear the disconnect timer for any bot that reconnected.
         var reconnected = _disconnectedAt.Keys
             .Where(g => bridgeStates.ContainsKey(g) && bridgeStates[g].TaskState != "DISCONNECTED")
             .ToList();
@@ -538,12 +409,42 @@ public class BotBrainService : BackgroundService
             _disconnectedAt.TryRemove(guid, out _);
     }
 
+    // ==================== Spine driver ====================
+
     /// <summary>
-    /// Initialize a new bot from HELLO data. Load or roll personality, create DecisionEngine.
+    /// One pass over the fleet. Every bot with a real STATE is sensed (so FleetReport
+    /// stays live even when driving is off); when driving is enabled, BotBrain runs the
+    /// full tick — Sense → hold Idle (Phase 1) → Supervisor deadline check.
+    /// </summary>
+    private async Task RunBrainTicksAsync()
+    {
+        foreach (var kvp in _contexts)
+        {
+            var bs = _bridge.GetBotState(kvp.Key);
+            if (bs == null || bs.TaskState == "DISCONNECTED") continue;
+
+            // Gate on the first real STATE; HELLO carries placeholder health/position.
+            if (!bs.HasReceivedState) continue;
+
+            var snap = BotStateSnapshot.FromBridgeState(bs);
+
+            if (_brainEnabled)
+                await _driver.TickAsync(kvp.Value, snap);   // runs Sense → hold Idle → Supervise
+            else
+                kvp.Value.Sense(snap);                        // disabled: still sense so FleetReport stays live
+        }
+    }
+
+    // ==================== Bot init ====================
+
+    /// <summary>
+    /// Initialize a new bot: load or roll personality, build the BotIdentity (dashboard +
+    /// grouping), seed the BotContext (the spine's live state), enrich group membership,
+    /// and auto-register in characters.playerbot for restart persistence.
     /// </summary>
     private async Task InitializeBotAsync(int guid, BotState bs)
     {
-        // Try to load persisted personality from admin DB
+        // Try to load persisted personality from the admin DB.
         BotPersonality? personality = null;
         try
         {
@@ -576,19 +477,12 @@ public class BotBrainService : BackgroundService
             _logger.LogWarning(ex, "BotBrain: failed to load personality for bot {Guid} — will roll new", guid);
         }
 
-        // Roll new personality if not persisted
+        // Roll a new personality if none persisted.
         if (personality == null)
         {
             personality = PersonalityRoller.Roll(_quirkLoader.AllQuirks.ToList());
             await PersistPersonalityAsync(guid, personality);
-            _logger.LogInformation("BotBrain: rolled new personality for {Name} (guid={Guid}): " +
-                "Pat={Pat:F2} Gre={Gre:F2} Cur={Cur:F2} Soc={Soc:F2} Agg={Agg:F2} Eff={Eff:F2} " +
-                "style={Style} temp={Temp} quirks=[{Quirks}]",
-                bs.Name, guid,
-                personality.Patience, personality.Greed, personality.Curiosity,
-                personality.Sociability, personality.Aggression, personality.Efficiency,
-                personality.ChatStyle, personality.Temperament,
-                string.Join(",", personality.Quirks.Select(q => q.Id)));
+            _logger.LogInformation("BotBrain: rolled new personality for {Name} (guid={Guid})", bs.Name, guid);
         }
 
         var bot = new BotIdentity
@@ -603,36 +497,26 @@ public class BotBrainService : BackgroundService
             CurrentActivity = new ActivityState { Type = ActivityType.Idle, StartedAt = DateTime.UtcNow },
             NextDecisionTick = DateTime.UtcNow.AddSeconds(2)
         };
-
         bot.StuckDetector = new StuckDetector();
+        bot.Story = new BotStoryRider(bot);   // demoted: toggleable but inert in the rebuild
 
         _bots[guid] = bot;
 
-        var domains = new Dictionary<ActivityType, IBotDomain>
+        // Seed the spine's live state. Sensory fills in on the first STATE tick.
+        _contexts[guid] = new BotContext
         {
-            { ActivityType.Questing, _questing },
-            { ActivityType.TravelingToQuest, _questing },
-            { ActivityType.Grinding, _combat },
-            { ActivityType.Vendoring, _economy },
-            { ActivityType.TravelingToVendor, _economy },
-            { ActivityType.AuctionHouse, _economy },
-            { ActivityType.Exploring, _exploration },
-            { ActivityType.Socializing, _social },
-            { ActivityType.Loitering, _social },
-            { ActivityType.TravelingToTrainer, _training },
-            { ActivityType.Training, _training },
-            { ActivityType.Eating, _maintenance },
-            { ActivityType.CorpseRunning, _maintenance },
-            { ActivityType.Idle, _questing },
+            Guid = guid,
+            Name = bs.Name,
+            Level = bs.Level,
+            Identity = bot          // P3: durable roster back-ref for the quest planner
         };
 
-        _engines[guid] = new DecisionEngine(bot, domains, _liveState, _questGraph, _logger);
         _tracker.UpdatePosition(guid, bs.ZoneId, bs.MapId, bs.X, bs.Y, bs.Z);
 
-        // Stamp group membership onto the new bot (from DB-loaded groups)
+        // Stamp group membership (from DB-loaded groups).
         _groupManager.EnrichBotIdentity(bot);
 
-        // Auto-register in characters.playerbot for restart persistence
+        // Auto-register in characters.playerbot for restart persistence.
         try
         {
             using var charConn = _db.Characters();
@@ -660,7 +544,6 @@ public class BotBrainService : BackgroundService
             }
             else
             {
-                // Update position/level on reconnect
                 await charConn.ExecuteAsync(@"
                     UPDATE playerbot SET name=@Name, level=@Level, map=@Map,
                            position_x=@X, position_y=@Y, position_z=@Z
@@ -681,769 +564,36 @@ public class BotBrainService : BackgroundService
         {
             _logger.LogWarning(ex, "BotBrain: failed to auto-register bot {Guid} in playerbot table", guid);
         }
-
-        // Hydrate completed quests from character_queststatus
-        await HydrateQuestStateAsync(bot);
     }
 
-    // ==================== Decision Loop ====================
+    // ==================== Grouping mode load ====================
 
-    private async Task RunDecisionTicksAsync()
-    {
-        var now = DateTime.UtcNow;
-
-        // Session 31: Process leaders before followers so quest picks are available
-        IEnumerable<int> tickOrder;
-        if (_groupManager.Mode != GroupingMode.Off)
-        {
-            tickOrder = _engines.Keys
-                .OrderByDescending(g => _groupManager.IsLeader(g))
-                .ThenBy(g => g);
-        }
-        else
-        {
-            tickOrder = _engines.Keys;
-        }
-
-        foreach (var guid in tickOrder)
-        {
-            if (!_engines.TryGetValue(guid, out var engine)) continue;
-
-            if (!_bots.TryGetValue(guid, out var bot)) continue;
-
-            // Check if this bot's tick interval has elapsed
-            if (now < bot.NextDecisionTick) continue;
-
-            // Get bridge state
-            var bs = _bridge.GetBotState(guid);
-            if (bs == null || bs.TaskState == "DISCONNECTED") continue;
-
-            // ── GATE: Don't tick until at least one real STATE message has arrived ──
-            // HELLO creates BotState with placeholder Health=100/MaxHealth=100 but
-            // IsDead, FreeSlots, position etc. may not reflect reality. The first
-            // real STATE from C++ arrives ~5s after connect. Without this gate,
-            // critical triggers fire on stale/default data and bots roll into
-            // CorpseRunning or Eating before they've ever moved.
-            if (!bs.HasReceivedState)
-            {
-                // Push the tick forward so we don't log-spam "skipped" every 250ms
-                bot.NextDecisionTick = now.AddSeconds(1);
-                continue;
-            }
-
-            // ── WATCHDOG: Kick bots stuck in a domain for an unreasonable duration ──
-            // If a bot is stuck in CorpseRunning/Eating/any domain far beyond what's
-            // normal, force-reset to Idle. This catches initialization bugs, missing
-            // events (RESPAWN never arrived), corrupt PhaseData, and any other failure
-            // mode that leaves a bot spinning in a domain forever.
-            var activity = bot.CurrentActivity;
-            float stuckMinutes = (float)activity.MinutesInState;
-
-            bool isStuck = false;
-            string stuckReason = "";
-
-            // CorpseRunning: max timer is 45s + 20s timeout = 65s. 2 min is generous.
-            if (activity.Type == ActivityType.CorpseRunning && stuckMinutes > 2.0f)
-            {
-                isStuck = true;
-                stuckReason = $"CorpseRunning for {stuckMinutes:F1}min (max expected: ~1.1min)";
-            }
-            // Eating: eat to 80% HP / 60% MP. Should never take > 2 min even from 1% HP.
-            else if (activity.Type == ActivityType.Eating && stuckMinutes > 3.0f)
-            {
-                isStuck = true;
-                stuckReason = $"Eating for {stuckMinutes:F1}min (max expected: ~1min)";
-            }
-            // Vendoring sub-phases: travel + sell + return should be < 5 min total.
-            else if ((activity.Type == ActivityType.Vendoring || activity.Type == ActivityType.TravelingToVendor)
-                     && stuckMinutes > 8.0f)
-            {
-                isStuck = true;
-                stuckReason = $"{activity.Type} for {stuckMinutes:F1}min (max expected: ~5min)";
-            }
-            // Generic: any activity stuck > 20 min with high tick count = something is wrong.
-            else if (stuckMinutes > 20.0f && activity.TicksInState > 60)
-            {
-                isStuck = true;
-                stuckReason = $"{activity.Type}:{activity.SubPhase ?? "none"} for {stuckMinutes:F1}min, " +
-                              $"{activity.TicksInState} ticks — probable stuck";
-            }
-
-            if (isStuck)
-            {
-                _logger.LogWarning(
-                    "[BOT-WATCHDOG] {Name}({Guid}) STUCK: {Reason}. Force-resetting to Idle.",
-                    bot.Name, bot.Guid, stuckReason);
-
-                _diagnostics.RecordIssue(DiagnosticIssueType.WatchdogReset, bot,
-                    bs.X, bs.Y, bs.MapId,
-                    questId: bot.ActiveQuestId,
-                    detail: stuckReason);
-
-                // FLIGHT RECORDER: capture the stuck activity BEFORE we reset it to Idle.
-                BotTrace.Mark(bot, $"WATCHDOG reset → Idle: {stuckReason}");
-
-                // Clear all transient state that could re-trigger the stuck domain
-                bot.CurrentActivity = new ActivityState
-                {
-                    Type = ActivityType.Idle,
-                    StartedAt = DateTime.UtcNow,
-                    IsInterruptible = true
-                };
-                bot.NextStrategicEval = DateTime.UtcNow;
-                bot.PendingAction = null;
-                _inflight.TryRemove(guid, out _);   // F2 recovery: stale MOVE_TO no longer applies
-                bot.CorpseX = null;
-                bot.CorpseY = null;
-                bot.CorpseZ = null;
-                bot.CorpseMapId = null;
-
-                // Clear any C++ grind task that might still be running
-                await _bridge.SendSetTaskIdleAsync(guid);
-
-                // Emit watchdog event to dashboard
-                await _hub.Clients.All.SendAsync("BotDecision", new
-                {
-                    guid,
-                    name = bot.Name,
-                    decision = $"[WATCHDOG] {stuckReason} → reset to Idle",
-                    newActivity = "Idle",
-                    activityChanged = true,
-                    weights = new Dictionary<string, double>(),
-                    roll = 0.0,
-                    timestamp = DateTime.UtcNow
-                });
-
-                // Schedule next tick soon so the fresh strategic eval fires quickly
-                bot.NextDecisionTick = now.AddSeconds(2);
-                continue; // skip this tick, let the next one do a clean strategic eval
-            }
-
-            // ── Normal decision tick ──
-            try
-            {
-                var state = BotStateSnapshot.FromBridgeState(bs);
-
-                // Enrich snapshot
-                state.XP = bot.XP;
-                state.XPToNextLevel = bot.XPToNextLevel;
-                state.IsNearTown = BotStateTracker.IsNearTown(state.ZoneId);
-                state.NearbyBotCount = _tracker.GetBotsWithinRange(state.X, state.Y, state.MapId, 50f);
-
-                // ── Session 35: Band of Brothers — group state stamped on ALL members ──
-                // Every grouped bot is a fully autonomous quester. The group synchronizes
-                // via flags stamped here that QuestingDomain reads at its sync gates.
-                state.GroupId = bot.GroupId;
-                state.GroupLeaderGuid = bot.GroupLeaderGuid;
-
-                if (_groupManager.Mode != GroupingMode.Off && bot.GroupId.HasValue)
-                {
-                    var group = _groupManager.GetGroup(bot.Guid);
-                    if (group != null)
-                    {
-                        // ── Min member level (used by pace-setter for quest selection) ──
-                        int minLevel = bot.Level;
-                        foreach (var mg in group.MemberGuids)
-                            if (_bots.TryGetValue(mg, out var m))
-                                minLevel = Math.Min(minLevel, m.Level);
-                        bot.GroupMinMemberLevel = minLevel;
-
-                        // ── All objectives done? (gate: DoingObjectives → TravelingToTurnIn) ──
-                        // A member counts as "done" if:
-                        //   - Not in Questing at all (vendoring/training/eating — don't block)
-                        //   - In Questing but all their quest objectives are complete
-                        //   - Disconnected/unknown (don't block the living)
-                        bool allObjectivesDone = true;
-                        foreach (var mg in group.MemberGuids)
-                        {
-                            if (!_bots.TryGetValue(mg, out var member)) continue;
-                            var mAct = member.CurrentActivity.Type;
-                            // Non-questing activities don't block the objective gate
-                            if (mAct != ActivityType.Questing) continue;
-                            var memberQuests = _questing.GetActiveQuests(member);
-                            if (memberQuests.Count == 0) continue;
-                            if (!memberQuests.All(q => q.TurnedIn || q.ServerComplete
-                                || _questing.AllObjectivesCompletePublic(q)))
-                            {
-                                allObjectivesDone = false;
-                                break;
-                            }
-                        }
-                        bot.GroupAllObjectivesDone = allObjectivesDone;
-
-                        // ── All turned in? (gate: BatchComplete → PickingQuests) ──
-                        // A member counts as "turned in" if:
-                        //   - Has no active quests with pending turn-ins
-                        //   - Is not in Questing (vendoring etc — will turn in when they return)
-                        //     BUT: if they're NOT questing, they might still have pending turn-ins
-                        //     from before they left. So we check quest state regardless.
-                        bool allTurnedIn = true;
-                        foreach (var mg in group.MemberGuids)
-                        {
-                            if (!_bots.TryGetValue(mg, out var member)) continue;
-                            var memberQuests = _questing.GetActiveQuests(member);
-                            if (memberQuests.Any(q => !q.TurnedIn
-                                && (q.ServerComplete || _questing.AllObjectivesCompletePublic(q))))
-                            {
-                                allTurnedIn = false;
-                                break;
-                            }
-                        }
-                        bot.GroupAllMembersTurnedIn = allTurnedIn;
-
-                        // ── All members questing? (soft gate: don't advance while someone is away) ──
-                        bool allQuesting = true;
-                        foreach (var mg in group.MemberGuids)
-                        {
-                            if (!_bots.TryGetValue(mg, out var member)) continue;
-                            var mAct = member.CurrentActivity.Type;
-                            if (mAct != ActivityType.Questing && mAct != ActivityType.Idle)
-                            {
-                                allQuesting = false;
-                                break;
-                            }
-                        }
-                        bot.GroupAllMembersQuesting = allQuesting;
-                    }
-                }
-
-                // FLIGHT RECORDER: STATE reconcile. bs.TaskState is the C++ self-report
-                // (IDLE/GRIND...) — already available, so the "C# thinks WAIT but C++ says
-                // IDLE" mismatch works now; Batch 4 enriches TaskState with more detail.
-                BotTrace.State(bot, state, bs.TaskState);
-
-                // ── F2 RECOVERY: dropped MOVE_TO arrival notify ───────────
-                // C++ IDLE while a MOVE_TO is still outstanding = the bot is
-                // parked, not moving. Re-send the same MOVE_TO (idempotent: C++
-                // re-paths → arrives+notifies, or emits MOVE_FAILED which the
-                // domain handles). Capped + cooldowned so a wedged dest falls
-                // through to the watchdog. cppState != IDLE (MOVING/GRINDING/...)
-                // means C++ is busy → never fires; grind stalls (F7) are not IDLE
-                // and are intentionally not touched (re-send would reset kills).
-                if (_inflight.TryGetValue(guid, out var inflight))
-                {
-                    if (bs.TaskState == "IDLE")
-                    {
-                        if (inflight.FirstIdleSeen == default) inflight.FirstIdleSeen = now;
-
-                        bool gracePassed = (now - inflight.FirstIdleSeen).TotalSeconds >= MOVE_RESEND_IDLE_GRACE_SEC;
-                        bool cooldownOk = (now - inflight.LastResend).TotalSeconds >= MOVE_RESEND_COOLDOWN_SEC;
-
-                        if (gracePassed && cooldownOk && inflight.Resends < MOVE_RESEND_MAX)
-                        {
-                            inflight.Resends++;
-                            inflight.LastResend = now;
-                            inflight.FirstIdleSeen = now;   // restart the grace window for the next attempt
-
-                            _logger.LogWarning(
-                                "[BOT-RESEND] {Name}({Guid}) | C++ IDLE with MOVE_TO outstanding in {Activity}:{Sub} — " +
-                                "re-sending MOVE_TO (attempt {N}/{Max})",
-                                bot.Name, bot.Guid, bot.CurrentActivity.Type, bot.CurrentActivity.SubPhase ?? "none",
-                                inflight.Resends, MOVE_RESEND_MAX);
-
-                            BotTrace.Mark(bot, $"F2 recovery: re-send MOVE_TO (attempt {inflight.Resends}/{MOVE_RESEND_MAX}, idle)", state);
-                            BotTrace.Command(bot, "MOVE_TO", "resend (dropped-notify recovery)", state);
-                            await _bridge.SendToBotAsync(guid, "MOVE_TO", inflight.Payload);
-                        }
-                    }
-                    else
-                    {
-                        // C++ is doing something (MOVING/GRINDING/...) → not a dropped notify.
-                        inflight.FirstIdleSeen = default;
-                    }
-                }
-
-                // Run decision tick
-                var result = await engine.Tick(bot, state);
-
-                // ── DIAGNOSTIC: One-line bot status per tick ──
-                var subPhase = bot.CurrentActivity.SubPhase ?? "none";
-                var ctx = bot.CurrentActivity.ContextTag ?? "";
-                var nextStrat = bot.NextStrategicEval > DateTime.UtcNow
-                    ? $"{(bot.NextStrategicEval - DateTime.UtcNow).TotalSeconds:F0}s"
-                    : "NOW";
-                _logger.LogInformation(
-                    "[BOT] {Name}({Guid}) | {Activity}:{SubPhase} | {Context} | " +
-                    "Pos=({X:F0},{Y:F0}) HP={HP:P0} | Tick#{Tick} | NextStrat={NextStrat} | " +
-                    "Cmds={CmdCount} | {Reason}",
-                    bot.Name, bot.Guid,
-                    bot.CurrentActivity.Type, subPhase, ctx,
-                    state.X, state.Y, state.HealthPercent,
-                    bot.CurrentActivity.TicksInState, nextStrat,
-                    result.Commands.Count, result.Reason);
-
-                // If transitioning AWAY from an activity that may have a C++ grind task
-                // running, clear it. Both Grinding and Questing (DoingObjective sub-phase)
-                // use SET_TASK GRIND — if we don't clear it, the bot keeps killing autonomously
-                // even after C# switched to Vendoring/Training/etc.
-                if (result.ActivityChanged)
-                {
-                    _inflight.TryRemove(guid, out _);   // F2 recovery: prior MOVE_TO belongs to the activity we are leaving
-                    var prevType = bot.PreviousActivity?.Type;
-                    var prevSubPhase = bot.PreviousActivity?.SubPhase ?? "";
-
-                    bool hadGrindTask = prevType == ActivityType.Grinding
-                        || (prevType == ActivityType.Questing && (prevSubPhase == "DoingObjective" || prevSubPhase == "DoingObjectives"));
-
-                    if (hadGrindTask && result.NewActivity != ActivityType.Grinding)
-                    {
-                        BotTrace.Command(bot, "SET_TASK", "IDLE-clear (activity change)", state);
-                        await _bridge.SendSetTaskIdleAsync(guid);
-                    }
-                }
-
-                // Execute resulting commands via bridge
-                foreach (var cmd in result.Commands)
-                {
-                    BotTrace.Command(bot, cmd.Type, state: state);
-                    await _bridge.SendToBotAsync(guid, cmd.Type, cmd.Payload);
-                    NoteOutboundCommand(guid, cmd);   // F2 recovery: track MOVE_TO
-                }
-
-                // Log decision
-                _activityLog.LogDecision(guid, result);
-                if (result.ActivityChanged)
-                {
-                    _activityLog.LogActivityEnd(guid, bot.PreviousActivity!);
-                }
-
-                // Emit to dashboard via SignalR
-                await _hub.Clients.All.SendAsync("BotDecision", new
-                {
-                    guid,
-                    name = bot.Name,
-                    decision = result.Reason,
-                    newActivity = result.NewActivity.ToString(),
-                    activityChanged = result.ActivityChanged,
-                    weights = result.WeightBreakdown.ToDictionary(
-                        kv => kv.Key.ToString(),
-                        kv => Math.Round(kv.Value, 3)),
-                    roll = Math.Round(result.RollValue, 3),
-                    timestamp = DateTime.UtcNow
-                });
-
-                // Schedule next tick (with per-bot jitter)
-                float tickInterval = bot.Personality.DecisionTickBase;
-                tickInterval *= WeightedRoller.Range(0.8f, 1.2f);
-                bot.NextDecisionTick = now.AddSeconds(tickInterval);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "BotBrain: decision tick failed for bot {Guid} ({Name})", guid, bot.Name);
-                bot.NextDecisionTick = now.AddSeconds(5); // retry after 5s
-            }
-        }
-    }
-
-    // ==================== Event Handling ====================
-
-    /// <summary>
-    /// Called externally when BotBridgeService receives an EVENT from C++.
-    /// Routes to appropriate domain handlers.
-    /// </summary>
-    public async Task HandleBridgeEventAsync(int guid, BotEvent evt)
-    {
-        if (!_bots.TryGetValue(guid, out var bot)) return;
-        if (!_engines.TryGetValue(guid, out var engine)) return;
-
-        // FLIGHT RECORDER: the notify arriving. Heuristically matches the open command
-        // (e.g. MOVE_TO→TASK_COMPLETE), computes round-trip latency, flips owner → CS.
-        BotTrace.Event(bot, evt.EventType, evt.Data);
-
-        // LIVENESS: a progress event proves the bot is still working. Re-arm the stuck
-        // sweep so a long-but-advancing task (e.g. a multi-minute DoingObjectives grind
-        // that streams KILL/LOOT while parked on evt:TASK_COMPLETE) is not mislabeled as
-        // frozen. Ping is a no-op for movement WAITs, so a dropped MOVE_TO arrival — which
-        // emits no further events — still trips the sweep as intended.
-        if (evt.EventType is "KILL" or "LOOT" or "LEVEL_UP" or "QUEST_UPDATE")
-            BotTrace.Ping(bot);
-
-        // F2 recovery: a movement round-trip resolved → drop the tracked MOVE_TO.
-        if (evt.EventType is "TASK_COMPLETE" or "MOVE_FAILED" or "PATH_UNSAFE")
-            _inflight.TryRemove(guid, out _);
-
-        // KILL events always go to economy (shadow loot) regardless of activity
-        if (evt.EventType == "KILL")
-        {
-            // Only run probabilistic shadow loot if we DON'T have real loot coming.
-            // The LOOT event (from C++ DoAutoLoot) will arrive shortly after KILL
-            // with actual items. If C++ looting is active, skip the shadow roll.
-            // For now, keep shadow loot as fallback — it will be superseded by
-            // the LOOT event's ProcessLootEvent call which replaces shadow items
-            // from the same creature.
-            int estLevel = Math.Max(1, bot.Level + WeightedRoller.RangeInt(-2, 1));
-            _economy.ProcessKillLoot(bot, evt.CreatureEntry, estLevel);
-        }
-
-        // LOOT — real items looted from C++ DoAutoLoot (replaces shadow economy guessing)
-        if (evt.EventType == "LOOT" && !string.IsNullOrEmpty(evt.Data))
-        {
-            // ProcessLootEvent handles both QuestItemProgress updates and shadow inventory
-            _economy.ProcessLootEvent(bot, evt.Data);
-            bot.VendorCooldownUntil = null;
-        }
-
-        // LEVEL_UP — flag for training, clear deferrals/blacklists (bot is stronger now)
-        if (evt.EventType == "LEVEL_UP")
-        {
-            bot.StuckDetector?.Reset();
-            bot.Level = evt.NewLevel;
-            bot.HasUnlearnedSpells = true;
-            bot.ClearAllDeferrals();
-            bot.ClearPathBlacklist();
-            bot.VendorCooldownUntil = null;
-            _liveState.InvalidateCache(guid);
-        }
-
-        // PATH_UNSAFE — C++ rejected a MOVE_TO because the mmap path crossed
-        // through high-level creature spawns. Blacklist the destination so C# stops
-        // trying it. Format: "dest_x=1234.5|dest_y=-5678.9|dest_z=100.0|unsafe_x=...|danger_level=25|bot_level=5"
-        if (evt.EventType == "PATH_UNSAFE" && !string.IsNullOrEmpty(evt.Data))
-        {
-            var parts = evt.Data.Split('|')
-                .Select(s => s.Split('=', 2))
-                .Where(p => p.Length == 2)
-                .ToDictionary(p => p[0].Trim(), p => p[1].Trim(), StringComparer.OrdinalIgnoreCase);
-
-            float destX = 0, destY = 0, destZ = 0;
-            float unsafeX = 0, unsafeY = 0;
-            int dangerLevel = 0, botLevel = 0;
-
-            if (parts.TryGetValue("dest_x", out var dxs))
-                float.TryParse(dxs, System.Globalization.CultureInfo.InvariantCulture, out destX);
-            if (parts.TryGetValue("dest_y", out var dys))
-                float.TryParse(dys, System.Globalization.CultureInfo.InvariantCulture, out destY);
-            if (parts.TryGetValue("dest_z", out var dzs))
-                float.TryParse(dzs, System.Globalization.CultureInfo.InvariantCulture, out destZ);
-            if (parts.TryGetValue("unsafe_x", out var uxs))
-                float.TryParse(uxs, System.Globalization.CultureInfo.InvariantCulture, out unsafeX);
-            if (parts.TryGetValue("unsafe_y", out var uys))
-                float.TryParse(uys, System.Globalization.CultureInfo.InvariantCulture, out unsafeY);
-            if (parts.TryGetValue("danger_level", out var dls))
-                int.TryParse(dls, out dangerLevel);
-            if (parts.TryGetValue("bot_level", out var bls))
-                int.TryParse(bls, out botLevel);
-
-            bot.AddPathBlacklist(destX, destY, dangerLevel);
-
-            _logger.LogWarning(
-                "[BOT-PATH] {Name}({Guid}) PATH_UNSAFE — dest=({DestX:F0},{DestY:F0},{DestZ:F0}) " +
-                "danger at ({UnsafeX:F0},{UnsafeY:F0}) level={DangerLevel} (bot level={BotLevel}) | " +
-                "Blacklisted ({Count} total)",
-                bot.Name, bot.Guid, destX, destY, destZ,
-                unsafeX, unsafeY, dangerLevel, botLevel,
-                bot.PathBlacklist.Count);
-
-            _diagnostics.RecordIssue(DiagnosticIssueType.PathUnsafe, bot,
-                destX, destY, 0,
-                detail: $"danger_level={dangerLevel} at ({unsafeX:F0},{unsafeY:F0}), blacklist={bot.PathBlacklist.Count}");
-
-            // Flag if bot is getting boxed in
-            if (bot.PathBlacklist.Count >= 10)
-                _diagnostics.RecordIssue(DiagnosticIssueType.PathBlacklistFull, bot,
-                    destX, destY, 0,
-                    detail: $"{bot.PathBlacklist.Count} blacklisted destinations — bot may be boxed in");
-        }
-
-        // MOVE_FAILED — C++ could not pathfind to destination (PATHFIND_NOPATH/INCOMPLETE).
-        // Without this handler, bots stuck in a nudge loop re-sending MOVE_TO to the same
-        // unreachable destination until the 8-min watchdog fires. Session 26 fix.
-        // Format: "dest_x=1234.5|dest_y=-5678.9|dest_z=100.0"
-        if (evt.EventType == "MOVE_FAILED")
-        {
-            float destX = 0, destY = 0, destZ = 0;
-
-            if (!string.IsNullOrEmpty(evt.Data))
-            {
-                var parts = evt.Data.Split('|')
-                    .Select(s => s.Split('=', 2))
-                    .Where(p => p.Length == 2)
-                    .ToDictionary(p => p[0].Trim(), p => p[1].Trim(), StringComparer.OrdinalIgnoreCase);
-
-                if (parts.TryGetValue("dest_x", out var dxs))
-                    float.TryParse(dxs, System.Globalization.CultureInfo.InvariantCulture, out destX);
-                if (parts.TryGetValue("dest_y", out var dys))
-                    float.TryParse(dys, System.Globalization.CultureInfo.InvariantCulture, out destY);
-                if (parts.TryGetValue("dest_z", out var dzs))
-                    float.TryParse(dzs, System.Globalization.CultureInfo.InvariantCulture, out destZ);
-            }
-
-            // Blacklist the unreachable destination — UNLESS another bot has
-            // successfully reached it (fleet-level shared knowledge).
-            if (IsKnownGoodDestination(destX, destY))
-            {
-                _logger.LogInformation(
-                    "[BOT-PATH] {Name}({Guid}) MOVE_FAILED to KNOWN-GOOD dest ({DestX:F0},{DestY:F0}) — " +
-                    "NOT blacklisting, will retry from different angle",
-                    bot.Name, bot.Guid, destX, destY);
-            }
-            else
-            {
-                bot.AddPathBlacklist(destX, destY, 0);
-
-                _logger.LogWarning(
-                    "[BOT-PATH] {Name}({Guid}) MOVE_FAILED — dest=({DestX:F0},{DestY:F0},{DestZ:F0}) | " +
-                    "Blacklisted ({Count} total). Bot was in {Activity}:{SubPhase}",
-                    bot.Name, bot.Guid, destX, destY, destZ,
-                    bot.PathBlacklist.Count,
-                    bot.CurrentActivity.Type, bot.CurrentActivity.SubPhase);
-
-                _diagnostics.RecordIssue(DiagnosticIssueType.PathUnsafe, bot,
-                    destX, destY, 0,
-                    detail: $"MOVE_FAILED (unreachable destination), blacklist={bot.PathBlacklist.Count}, " +
-                            $"activity={bot.CurrentActivity.Type}:{bot.CurrentActivity.SubPhase}");
-            }
-        }
-
-        if (evt.EventType == "TRAIN_ACK")
-        {
-            _logger.LogInformation("[BOT-TRAIN] {Name}({Guid}) TRAIN_ACK: {Data}",
-            bot.Name, bot.Guid, evt.Data);
-
-            // Clear the training pressure — bot visited the trainer, 
-            // whatever was learnable has been learned. If the bot levels
-            // again, LEVEL_UP will re-set HasUnlearnedSpells to true.
-            bot.HasUnlearnedSpells = false;
-            bot.TicksSinceLastTrained = 0;
-        }
-        if (evt.EventType == "TRAIN_FAIL")
-        {
-            _logger.LogWarning("[BOT-TRAIN] {Name}({Guid}) TRAIN_FAIL: {Data}",
-                bot.Name, bot.Guid, evt.Data);
-
-            // Reset training pressure — don't keep retrying a trainer
-            // that can't be found. Next LEVEL_UP will re-trigger.
-            bot.HasUnlearnedSpells = false;
-            bot.TicksSinceLastTrained = 0;
-        }
-
-        // Fleet-level known-good destinations: when ANY bot successfully interacts with
-        // an NPC or GO, mark that location so other bots don't blacklist it on MOVE_FAILED.
-        if (evt.EventType is "TRAIN_ACK" or "QUEST_ACCEPT_ACK" or "QUEST_COMPLETE_ACK"
-            or "SELL_ACK" or "USE_GO_ACK")
-        {
-            var successState = _bridge.GetBotState(guid);
-            if (successState != null)
-            {
-                _ = MarkDestinationGoodAsync(successState.X, successState.Y,
-                    successState.MapId, $"{evt.EventType}:{bot.Name}");
-            }
-        }
-
-
-        // DEATH — store corpse position on BotIdentity (survives domain switch to CorpseRunning).
-        // C++ now sends: DEATH "x=123.4|y=456.7|z=78.9|map=0"
-        // MaintenanceDomain.OnEnter reads bot.CorpseX/Y/Z/CorpseMapId to send MOVE_TO corpse.
-        if (evt.EventType == "DEATH" && !string.IsNullOrEmpty(evt.Data))
-        {
-            var parts = evt.Data.Split('|')
-                .Select(s => s.Split('=', 2))
-                .Where(p => p.Length == 2)
-                .ToDictionary(p => p[0].Trim(), p => p[1].Trim(), StringComparer.OrdinalIgnoreCase);
-
-            if (parts.TryGetValue("x", out var xs) && float.TryParse(xs, System.Globalization.CultureInfo.InvariantCulture, out float dx))
-                bot.CorpseX = dx;
-            if (parts.TryGetValue("y", out var ys) && float.TryParse(ys, System.Globalization.CultureInfo.InvariantCulture, out float dy))
-                bot.CorpseY = dy;
-            if (parts.TryGetValue("z", out var zs) && float.TryParse(zs, System.Globalization.CultureInfo.InvariantCulture, out float dz))
-                bot.CorpseZ = dz;
-            if (parts.TryGetValue("map", out var ms) && int.TryParse(ms, out int dm))
-                bot.CorpseMapId = dm;
-
-            _logger.LogInformation(
-                "BotBrain: {Name} DEATH — corpse at ({X:F1},{Y:F1},{Z:F1}) map={Map}",
-                bot.Name, bot.CorpseX, bot.CorpseY, bot.CorpseZ, bot.CorpseMapId);
-
-            var issueType = bot.DeathsSinceQuestStart >= 3
-                ? DiagnosticIssueType.DeathLoop
-                : DiagnosticIssueType.Death;
-            _diagnostics.RecordIssue(issueType, bot,
-                bot.CorpseX ?? 0, bot.CorpseY ?? 0, bot.CorpseMapId ?? 0,
-                questId: bot.ActiveQuestId,
-                detail: $"deaths_since_quest_start={bot.DeathsSinceQuestStart}, " +
-                        $"activity={bot.CurrentActivity.Type}:{bot.CurrentActivity.SubPhase}");
-        }
-
-        // CHAT_RECV — generate LLM response via Ollama
-        if (evt.EventType == "CHAT_RECV" && !string.IsNullOrEmpty(evt.Message))
-        {
-            // Don't reply to other bots — only real players
-            bool senderIsBot = _bots.Values.Any(b => b.Name == evt.Sender);
-            if (senderIsBot)
-                return;
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    var reply = await _ollama.GetChatResponseAsync(
-                        bot.Name,
-                        ClassIdToName(bot.ClassId),
-                        bot.Level,
-                        bot.Personality.Temperament,
-                        bot.Personality.ChatStyle,
-                        evt.Sender,
-                        evt.Message);
-
-                    if (!string.IsNullOrEmpty(reply))
-                    {
-                        // Whisper back if whispered, channel if channel, say otherwise
-                        if (evt.ChatType == "whisper")
-                        {
-                            await _bridge.SendSayTextAsync(guid, reply, 7, evt.Sender);
-                        }
-                        else if (evt.ChatType == "channel" && !string.IsNullOrEmpty(evt.ChannelName))
-                        {
-                            await _bridge.SendSayTextAsync(guid, reply, 14, channel: evt.ChannelName);
-                        }
-                        else
-                        {
-                            await _bridge.SendSayTextAsync(guid, reply, 0);
-                        }
-
-                        _logger.LogInformation("BotBrain: {BotName} replied to {Sender} via Ollama: \"{Reply}\"",
-                            bot.Name, evt.Sender, reply);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("BotBrain: Ollama returned no reply for {BotName}", bot.Name);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "BotBrain: Ollama chat error for {BotName}", bot.Name);
-                }
-            });
-        }
-
-        // Route to current domain
-        var bs = _bridge.GetBotState(guid);
-        if (bs != null)
-        {
-            var state = BotStateSnapshot.FromBridgeState(bs);
-            var commands = engine.CurrentDomain.OnEvent(bot, state, evt);
-            foreach (var cmd in commands)
-            {
-                BotTrace.Command(bot, cmd.Type, "reactive (OnEvent)", state);
-                await _bridge.SendToBotAsync(guid, cmd.Type, cmd.Payload);
-                NoteOutboundCommand(guid, cmd);   // F2 recovery: track MOVE_TO
-            }
-        }
-    }
-
-    // ==================== Helpers ====================
-
-    private static string ClassIdToName(int classId) => classId switch
-    {
-        1 => "Warrior",
-        2 => "Paladin",
-        3 => "Hunter",
-        4 => "Rogue",
-        5 => "Priest",
-        7 => "Shaman",
-        8 => "Mage",
-        9 => "Warlock",
-        11 => "Druid",
-        _ => "Adventurer"
-    };
-
-    /// <summary>
-    /// On bot connect, query character_queststatus to populate CompletedQuestIds
-    /// and HydratedActiveQuests. CompletedQuestIds only gets rewarded=1 quests.
-    /// HydratedActiveQuests gets in-progress quests (rewarded=0) with their
-    /// mob_count/item_count progress so QuestingDomain can verify objectives
-    /// are truly done before marking ServerComplete.
-    ///
-    /// VMaNGOS character_queststatus.status values:
-    ///   0 = NONE (quest available but not accepted)
-    ///   1 = INCOMPLETE (accepted, objectives not done)
-    ///   3 = COMPLETE (objectives done, ready to turn in)
-    ///   6 = FAILED
-    /// rewarded: 0 = not turned in, 1 = turned in and reward given
-    /// </summary>
-    private async Task HydrateQuestStateAsync(BotIdentity bot)
+    private async Task LoadGroupingModeAsync()
     {
         try
         {
-            using var conn = _db.Characters();
-            var rows = await conn.QueryAsync<dynamic>(
-                @"SELECT quest, status, rewarded,
-                         mob_count1, mob_count2, mob_count3, mob_count4,
-                         item_count1, item_count2, item_count3, item_count4
-                  FROM character_queststatus WHERE guid = @Guid",
-                new { Guid = bot.Guid });
+            using var conn = _db.Admin();
+            var value = await conn.QueryFirstOrDefaultAsync<string>(
+                "SELECT setting_value FROM bot_settings WHERE setting_key = 'grouping_mode'");
 
-            int completed = 0;
-            int active = 0;
-            int skippedDupes = 0;
-            var activeQuests = new List<HydratedQuest>();
-            var seenQuestIds = new HashSet<int>();
-
-            // Pass 1: collect all rewarded quest IDs first.
-            // DB can have duplicate rows per quest (observed: quest 182 x2).
-            // A quest with row A (rewarded=1) and row B (rewarded=0) must NOT
-            // end up in the active list — the rewarded row is authoritative.
-            foreach (var row in rows)
+            if (value != null && int.TryParse(value, out int mode) && Enum.IsDefined(typeof(GroupingMode), mode))
             {
-                int questId = (int)(uint)row.quest;
-                int rewarded = (int)(byte)row.rewarded;
-                if (rewarded == 1)
-                {
-                    bot.CompletedQuestIds.Add(questId);
-                    completed++;
-                }
+                _groupManager.Mode = (GroupingMode)mode;
+                _logger.LogInformation("BotBrain: loaded grouping mode from DB: {Mode}", _groupManager.Mode);
             }
-
-            // Pass 2: collect active quests, skipping anything already rewarded or duplicate
-            foreach (var row in rows)
+            else
             {
-                int questId = (int)(uint)row.quest;
-                int status = (int)(uint)row.status;
-                int rewarded = (int)(byte)row.rewarded;
-
-                if (rewarded == 1) continue;                          // already handled in pass 1
-                if (!seenQuestIds.Add(questId)) { skippedDupes++; continue; } // duplicate row
-                if (bot.CompletedQuestIds.Contains(questId)) continue;        // rewarded via another row
-
-                if (status == 1 || status == 3)
-                {
-                    if (_questGraph.IsLoaded && _questGraph.GetQuest(questId) != null)
-                    {
-                        activeQuests.Add(new HydratedQuest
-                        {
-                            QuestId = questId,
-                            Status = status,
-                            MobCounts = new[]
-                            {
-                                (int)(uint)row.mob_count1, (int)(uint)row.mob_count2,
-                                (int)(uint)row.mob_count3, (int)(uint)row.mob_count4
-                            },
-                            ItemCounts = new[]
-                            {
-                                (int)(uint)row.item_count1, (int)(uint)row.item_count2,
-                                (int)(uint)row.item_count3, (int)(uint)row.item_count4
-                            }
-                        });
-                        active++;
-                    }
-                }
+                _groupManager.Mode = GroupingMode.Off;
             }
-
-            if (activeQuests.Count > 0)
-                bot.HydratedActiveQuests = activeQuests;
-
-            _logger.LogInformation(
-                "BotBrain: hydrated quest state for {Name} (guid={Guid}) — {Completed} completed, {Active} active" +
-                (skippedDupes > 0 ? ", {Dupes} duplicate rows skipped" : ""),
-                bot.Name, bot.Guid, completed, active, skippedDupes);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "BotBrain: failed to hydrate quest state for bot {Guid}", bot.Guid);
+            _logger.LogWarning(ex, "BotBrain: failed to load grouping mode, defaulting to Off");
+            _groupManager.Mode = GroupingMode.Off;
         }
     }
 
-    // ==================== Persistence ====================
+    // ==================== Personality persistence ====================
 
     private async Task PersistPersonalityAsync(int guid, BotPersonality p)
     {

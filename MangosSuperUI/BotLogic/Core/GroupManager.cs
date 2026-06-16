@@ -528,6 +528,9 @@ public class GroupManager
     /// </summary>
     public void EnrichBotIdentity(BotIdentity bot)
     {
+        var prevGroup = bot.GroupId;
+        var prevLeader = bot.GroupLeaderGuid;
+
         var group = GetGroup(bot.Guid);
         if (group != null)
         {
@@ -538,6 +541,21 @@ public class GroupManager
         {
             bot.GroupId = null;
             bot.GroupLeaderGuid = null;
+        }
+
+        // STORY: per-bot grouping arc — emitted only on an actual change, since this
+        // runs every tick for every bot. The null-narrowing local keeps the disabled
+        // path to two field reads + a bool check (no string work, no nullable warning).
+        var story = bot.Story;
+        if (story != null && story.Enabled
+            && (bot.GroupId != prevGroup || bot.GroupLeaderGuid != prevLeader))
+        {
+            if (bot.GroupId == null)
+                story.Note($"left group {prevGroup} (now solo)");
+            else if (prevGroup == null)
+                story.Note($"joined group {bot.GroupId} as {(bot.IsGroupLeader ? "leader" : "follower")} (leader={bot.GroupLeaderGuid})");
+            else
+                story.Note($"group {bot.GroupId}: now {(bot.IsGroupLeader ? "leader" : "follower")} (leader {prevLeader}→{bot.GroupLeaderGuid})");
         }
     }
 

@@ -41,6 +41,15 @@ public class EconomyDomain : IBotDomain
 
     public bool IsOperational => true;
 
+    // ── Vendor drag guard (June 13) ──
+    // A bags-full bot used to commit to GetNearestVendor's pick with NO distance cap
+    // and re-send MOVE_TO forever, so a far/unpathable vendor dragged the bot — and,
+    // with formation-follow, the whole group — across the map (grp2's 5,400yd march).
+    // Cap the commit distance, and give up + cooldown a trip that never arrives.
+    private const float VENDOR_MAX_TRAVEL = 3000f;          // don't START a march past this
+    private const double VENDOR_TRAVEL_GIVEUP_SEC = 480.0;  // abandon a trip that never arrives (~3000yd + margin)
+    private const double VENDOR_GIVEUP_COOLDOWN_SEC = 300.0;// after a give-up/skip, don't retry vendoring this long
+
     // ======================== Domain Transitions ========================
 
     public Dictionary<ActivityType, float> EvaluateTransitions(BotIdentity bot, BotStateSnapshot state)
@@ -133,6 +142,17 @@ public class EconomyDomain : IBotDomain
     {
         var commands = new List<BridgeCommand>();
 
+        // Vendor give-up cooldown: a recent far/unpathable vendor was abandoned — don't
+        // immediately re-march to it. Quest (and keep moving) until the cooldown clears.
+        if (bot.VendorCooldownUntil.HasValue && DateTime.UtcNow < bot.VendorCooldownUntil.Value)
+        {
+            _logger.LogInformation("[BOT-ECON] {Name} vendor on give-up cooldown ({Sec:F0}s left) — skipping vendoring",
+                bot.Name, (bot.VendorCooldownUntil.Value - DateTime.UtcNow).TotalSeconds);
+            AdvanceTo(bot, "Done");
+            bot.NextStrategicEval = DateTime.UtcNow;
+            return commands;
+        }
+
         // --- Pre-flight check: do we actually have items to sell? ---
         uint usedSlots = state.TotalSlots - state.FreeSlots;
         if (usedSlots <= 2)
@@ -162,11 +182,26 @@ public class EconomyDomain : IBotDomain
         bot.VendorZ = vendor.Z;
         bot.VendorMapId = vendor.MapId;
         bot.VendorTravelStarted = DateTime.UtcNow;
+        // Trip deadline does NOT reset on MOVE_TO re-send (unlike VendorTravelStarted),
+        // so an unreachable vendor is abandoned instead of dragged toward forever.
+        bot.CurrentActivity.PhaseData["vendor_deadline"] = DateTime.UtcNow.AddSeconds(VENDOR_TRAVEL_GIVEUP_SEC);
 
         // Session 32: store whether this vendor can repair
         bot.CurrentActivity.PhaseData["vendor_can_repair"] = vendor.CanRepair;
 
         float dist = Distance2D(state.X, state.Y, vendor.X, vendor.Y);
+
+        // Don't commit to a continent-crossing march — the formation follows the leader.
+        // If even the nearest vendor is absurdly far, skip and quest until one is in range.
+        if (dist > VENDOR_MAX_TRAVEL)
+        {
+            _logger.LogWarning("[BOT-ECON] {Name} nearest vendor \"{VendorName}\" is {Dist:F0}yd (> {Max:F0}yd cap) — skipping vendoring, will retry when closer",
+                bot.Name, vendor.NpcName, dist, VENDOR_MAX_TRAVEL);
+            bot.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VENDOR_GIVEUP_COOLDOWN_SEC);
+            AdvanceTo(bot, "Done");
+            bot.NextStrategicEval = DateTime.UtcNow;
+            return commands;
+        }
 
         _logger.LogInformation(
             "[BOT-ECON] {Name} traveling to vendor \"{VendorName}\" (entry={Entry}) at ({X:F0},{Y:F0},{Z:F0}), {Dist:F0}yd away. FreeSlots={Free}/{Total}",
@@ -260,6 +295,20 @@ public class EconomyDomain : IBotDomain
             AdvanceTo(bot, "Selling");
             // Fall through — send SELL_ITEMS immediately (sub-phase chain)
             commands.AddRange(ProcessSelling(bot, state));
+            return commands;
+        }
+
+        // Give up on a vendor we can't reach (far/unpathable) rather than re-sending
+        // MOVE_TO forever and dragging the formation. The deadline is set at travel
+        // start and does NOT reset on re-send.
+        if (bot.CurrentActivity.PhaseData.TryGetValue("vendor_deadline", out var _dlObj)
+            && _dlObj is DateTime _dl && DateTime.UtcNow > _dl)
+        {
+            _logger.LogWarning("[BOT-ECON] {Name} giving up on vendor (entry={Entry}, {Dist:F0}yd, never arrived in {Sec:F0}s) — abandoning",
+                bot.Name, bot.VendorNpcEntry, dist, VENDOR_TRAVEL_GIVEUP_SEC);
+            bot.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VENDOR_GIVEUP_COOLDOWN_SEC);
+            AdvanceTo(bot, "Done");
+            bot.NextStrategicEval = DateTime.UtcNow;
             return commands;
         }
 

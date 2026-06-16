@@ -6,6 +6,8 @@ using System.Diagnostics.Metrics;
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Tracking;
+using MangosSuperUI.BotLogic.Brain;
+using MangosSuperUI.BotLogic.Planners;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -77,6 +79,19 @@ builder.Services.AddSingleton<SpellProgressionLoader>();
 
 // Core engine
 builder.Services.AddSingleton<LiveStateModifiers>();
+
+// Brain spine (Strategy B rebuild): executor + supervisor + driver
+builder.Services.AddSingleton<BotExecutor>();
+builder.Services.AddSingleton<BotSupervisor>();
+
+// Brain planners (Phase 2 — Grinding): goal selector + per-goal planners (IBotPlanner).
+// BotBrain self-assembles the Goal→planner map from the registered IBotPlanner set;
+// adding a goal in P3+ is one more AddSingleton<IBotPlanner, …>() here.
+builder.Services.AddSingleton<GoalSelector>();
+builder.Services.AddSingleton<IBotPlanner, GrindPlanner>();
+builder.Services.AddSingleton<IBotPlanner, QuestPlanner>();   // P3: Goal.Questing
+
+builder.Services.AddSingleton<BotBrain>();
 
 // Brain orchestrator (BackgroundService)
 builder.Services.AddSingleton<BotBrainService>();
