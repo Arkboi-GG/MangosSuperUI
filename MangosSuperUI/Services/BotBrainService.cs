@@ -204,6 +204,249 @@ public class BotBrainService : BackgroundService
     /// </summary>
     public string GetFleetReport() => FleetReport.Render(_contexts.Values.ToList());
 
+    // ==================== Live spine state (UI: the "Live" tab) ====================
+    // The structured, per-bot projection of BotContext — the same picture FleetReport
+    // renders as text, but as JSON the dashboard can render and tick client-side. This
+    // is the spine's live state (Goal/Step/why/WAIT/Failure/timers/typed scratch), NOT
+    // the old DecisionEngine summary that GetBotBrainSummary serves.
+
+    /// <summary>Structured live state for one bot, or null if it has no live context.</summary>
+    public object? GetLiveState(int guid) =>
+        _contexts.TryGetValue(guid, out var ctx) ? ProjectLive(ctx) : null;
+
+    /// <summary>Structured live state for the whole fleet (stalled first, then by name).</summary>
+    public IReadOnlyList<object> GetLiveFleet() =>
+        _contexts.Values
+            .OrderByDescending(c => c.Stalled)
+            .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(ProjectLive)
+            .ToList();
+
+    private static object ProjectLive(BotContext c)
+    {
+        var now = DateTime.UtcNow;
+        return new
+        {
+            guid = c.Guid,
+            name = c.Name,
+            level = c.Level,
+
+            // intent
+            goal = c.Goal.ToString(),
+            step = c.Step,
+            why = c.GoalReason,
+
+            // timers
+            timeInGoalSec = (int)c.TimeInGoalSec,
+            timeInStepSec = (int)c.TimeInStepSec,
+            noProgressSec = (int)c.TimeSinceProgressSec,
+            lastKillSec = AgoOrNull(c.LastKillUtc, now),
+            lastQuestSec = AgoOrNull(c.LastQuestAdvanceUtc, now),
+            lastLevelSec = AgoOrNull(c.LastLevelUtc, now),
+
+            // sensory
+            hpPct = (int)Math.Round(c.HpPct * 100),
+            manaPct = (int)Math.Round(c.ManaPct * 100),
+            pos = new { x = c.Pos.X, y = c.Pos.Y, z = c.Pos.Z },
+            mapId = c.MapId,
+            zoneId = c.ZoneId,
+            durability = c.Durability,
+            freeSlots = c.FreeSlots,
+            copper = c.Copper,
+            inCombat = c.InCombat,
+            dead = c.Dead,
+
+            // where it's driving
+            target = c.Target.HasValue
+                ? new { x = c.Target.Value.X, y = c.Target.Value.Y, z = c.Target.Value.Z, map = c.Target.Value.Map }
+                : null,
+            distToTarget = c.Target.HasValue ? (int?)(int)c.DistToTarget : null,
+
+            // THE WAIT — the spine
+            pending = c.Pending == null ? null : new
+            {
+                cmd = c.Pending.CommandType,
+                expect = c.Pending.ExpectedEvent,
+                ageSec = (int)c.Pending.AgeSec,
+                secsToDeadline = (int)Math.Round((c.Pending.DeadlineUtc - now).TotalSeconds),
+                isObjectiveGrind = c.Pending.IsObjectiveGrind,
+                interruptible = c.Pending.RescanAtUtc.HasValue
+            },
+
+            // last negative outcome
+            failure = c.Failure == null ? null : new
+            {
+                cmd = c.Failure.CommandType,
+                reason = c.Failure.Reason,
+                ageSec = (int)c.Failure.AgeSec,
+                dest = c.Failure.Dest.HasValue
+                    ? new { x = c.Failure.Dest.Value.X, y = c.Failure.Dest.Value.Y, z = c.Failure.Dest.Value.Z, map = c.Failure.Dest.Value.Map }
+                    : null,
+                danger = c.Failure.DangerLevel,
+                questId = c.Failure.QuestId
+            },
+
+            // supervisor verdict
+            stall = c.Stalled
+                ? new { reason = c.StallReason, sinceSec = (int)(now - c.StalledSinceUtc).TotalSeconds }
+                : null,
+
+            // the active goal's typed scratch only
+            scratch = ProjectScratch(c, now)
+        };
+    }
+
+    // Recovery > vendor errand > quest batch > grind. Only one goal's scratch is live.
+    private static object ProjectScratch(BotContext c, DateTime now)
+    {
+        if (c.Maintenance is { } m)
+        {
+            string phase =
+                !m.RezSent ? "rez-wait"
+                : c.Dead ? "resurrecting"
+                : (m.RelocateSent && !m.RelocateDone) ? "relocate"
+                : (m.IdleFired && !m.HealDone) ? "heal"
+                : m.HealDone ? "done"
+                : "post-rez";
+
+            return new
+            {
+                kind = "maintenance",
+                phase,
+                deathLoop = m.DeathLoop,
+                escalated = m.Escalated,
+                rezSent = m.RezSent,
+                relocateSent = m.RelocateSent,
+                relocateDone = m.RelocateDone,
+                healDone = m.HealDone,
+                deadForSec = m.DeadSinceUtc == default ? (int?)null : (int)(now - m.DeadSinceUtc).TotalSeconds,
+                rezInSec = m.RezAtUtc == default ? (int?)null : (int)Math.Round((m.RezAtUtc - now).TotalSeconds)
+            };
+        }
+
+        if (c.Service is { } sv && sv.Phase != VendorPhase.None)
+        {
+            return new
+            {
+                kind = "vendor",
+                phase = sv.Phase.ToString(),
+                npcEntry = sv.TargetNpcEntry,
+                canRepair = sv.CanRepair,
+                startedSec = sv.StartedUtc == default ? (int?)null : (int)(now - sv.StartedUtc).TotalSeconds,
+                target = new { x = sv.TargetPos.X, y = sv.TargetPos.Y, z = sv.TargetPos.Z, map = sv.TargetPos.Map }
+            };
+        }
+
+        if (c.Quest is { } q && q.Batch.Count > 0)
+        {
+            return new
+            {
+                kind = "quest",
+                count = q.Batch.Count,
+                activeId = q.Active?.QuestId ?? 0,
+                activeSlot = q.ActiveSlot,
+                batch = q.Batch.Select(bq => new
+                {
+                    id = bq.QuestId,
+                    title = bq.Node?.Title ?? "",
+                    accepted = bq.Accepted,
+                    turnedIn = bq.TurnedIn,
+                    deferred = bq.Deferred,
+                    failed = bq.Failed,
+                    force = bq.ForceMode
+                }).ToList(),
+                active = ProjectActiveQuest(c)
+            };
+        }
+
+        if (c.Grind is { } g)
+        {
+            return new
+            {
+                kind = "grind",
+                creatureEntry = g.CreatureEntry,
+                killGoal = g.KillGoal,
+                killCount = g.KillCount,
+                radius = g.Radius,
+                center = new { x = g.AreaCenter.X, y = g.AreaCenter.Y, z = g.AreaCenter.Z, map = g.AreaCenter.Map }
+            };
+        }
+
+        return new { kind = "none" };
+    }
+
+    // The active quest's human-readable detail: title, where to accept / hand in, and
+    // each objective with its resolved name, required/current counts, and world coords.
+    // Names come straight from the quest graph (TargetName/ItemName/CreatureName/GoName) —
+    // no DB hit. Kill "have" counts come from the QUEST_STATUS_ALL cache (slot-1 indexed).
+    private static object? ProjectActiveQuest(BotContext c)
+    {
+        var aq = c.Quest?.Active;
+        var node = aq?.Node;
+        if (aq == null || node == null) return null;
+
+        c.QuestLog.TryGetValue(aq.QuestId, out var log);
+        var objectives = new List<object>();
+
+        // kill / interact objectives
+        for (int i = 0; i < node.Objectives.Length; i++)
+        {
+            var o = node.Objectives[i];
+            int have = (log != null && o.Slot >= 1 && o.Slot <= 4) ? log.MobCounts[o.Slot - 1] : 0;
+            objectives.Add(new
+            {
+                slot = o.Slot,
+                kind = o.IsGameObject ? "interact" : "kill",
+                name = !string.IsNullOrEmpty(o.TargetName) ? o.TargetName
+                       : o.IsGameObject ? ("Object #" + o.GameObjectEntry) : ("Creature #" + o.CreatureEntry),
+                entry = o.IsGameObject ? o.GameObjectEntry : o.CreatureEntry,
+                need = o.Count,
+                have = (int?)have,
+                from = (string?)null,
+                x = o.GrindX,
+                y = o.GrindY,
+                map = o.GrindMap,
+                active = i == c.Quest!.ActiveSlot
+            });
+        }
+
+        // item-gather objectives (no live "have" — QUEST_STATUS_ALL cache holds only mob counts)
+        foreach (var it in node.ItemObjectives)
+        {
+            var src = it.BestDropSource;
+            var go = it.BestGoSource;
+            objectives.Add(new
+            {
+                slot = it.Slot,
+                kind = "gather",
+                name = !string.IsNullOrEmpty(it.ItemName) ? it.ItemName : ("Item #" + it.ItemId),
+                entry = it.ItemId,
+                need = it.Count,
+                have = (int?)null,
+                from = src?.CreatureName ?? go?.GoName,
+                x = src?.GrindX ?? go?.X ?? 0f,
+                y = src?.GrindY ?? go?.Y ?? 0f,
+                map = src?.GrindMap ?? go?.Map ?? c.MapId,
+                active = false
+            });
+        }
+
+        return new
+        {
+            id = aq.QuestId,
+            title = node.Title,
+            level = node.QuestLevel,
+            giver = node.Giver == null ? null
+                : new { name = node.Giver.Name, x = node.Giver.X, y = node.Giver.Y, map = node.Giver.Map },
+            turnIn = node.TurnIn == null ? null
+                : new { name = node.TurnIn.Name, x = node.TurnIn.X, y = node.TurnIn.Y, map = node.TurnIn.Map },
+            objectives
+        };
+    }
+
+    private static int? AgoOrNull(DateTime utc, DateTime now)
+        => utc == default ? (int?)null : (int)(now - utc).TotalSeconds;
+
     // -------------------- Grouping (delegates to GroupManager) --------------------
 
     /// <summary>Set grouping mode from the dashboard and persist to DB.</summary>

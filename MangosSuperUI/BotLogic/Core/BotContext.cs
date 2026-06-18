@@ -48,7 +48,22 @@ public sealed class Outstanding
     public string CommandType { get; init; } = "";
     public string ExpectedEvent { get; init; } = "";
     public DateTime SentUtc { get; init; }
-    public DateTime DeadlineUtc { get; init; }
+    public DateTime DeadlineUtc { get; set; }   // settable so the executor can PUSH it on KILL — progress-extending objective deadline (§6B.2)
+
+    // True when this WAIT is an ENRICHED objective MOVE_TO (§4): a MOVE_TO that carries
+    // creature_entry/kill_count, so C++ travels then GRINDS IN PLACE under one WAIT. The
+    // initial deadline (TravelDeadline) covers the travel leg; once the bot arrives and
+    // starts killing, the executor's KILL-push rolls the deadline forward on each kill —
+    // exactly as it does for a SET_TASK grind — so a long grind never false-fails on the
+    // travel ceiling. Set in BotExecutor.IssueAsync from the command payload.
+    public bool IsObjectiveGrind { get; init; }
+
+    // When set, this WAIT is an INTERRUPTIBLE leg (a quest trek): while it's still
+    // pending, BotBrain calls the planner's Rescan on this cadence WITHOUT clearing the
+    // WAIT, so newly-discovered work en route can preempt a long journey. Null = not
+    // interruptible (the default — most legs ride to their ack/deadline untouched).
+    // Settable so the brain can push it forward when the planner chooses to keep waiting.
+    public DateTime? RescanAtUtc { get; set; }
 
     public double AgeSec => (DateTime.UtcNow - SentUtc).TotalSeconds;
     public bool Expired => DateTime.UtcNow > DeadlineUtc;
@@ -76,14 +91,47 @@ public sealed class WaitFailure
 // --------------------- Typed goal scratch (§3.4) ---------------------------
 // TYPED per goal — never an untyped bag. This is what replaces PhaseData.
 // Only the active goal's scratch is populated; the rest stay null.
+
+// One quest inside the batch. CARRIED — accepted in the C++ quest log with its
+// partial kill progress — until it is rewarded, goes grey (out-leveled), or, for
+// the span of a single sweep, gets shelved (far outlier or a failed leg). The
+// durable truth is the C++ log + QUEST_STATUS_ALL; this list is rebuilt from it
+// on every (re)entry to Questing, so shelving survives goal bounces for free.
+public sealed class BatchQuest
+{
+    public int QuestId { get; init; }
+    public QuestNode Node { get; init; } = null!;
+    public bool Accepted { get; set; }      // in the log (resumed) or QUEST_ACCEPT_ACK'd this run
+    public bool TurnedIn { get; set; }       // QUEST_COMPLETE_ACK seen — dropped from the batch next derive
+    public bool Deferred { get; set; }       // far outlier THIS sweep: skip; cleared on reprocess
+    public bool Failed { get; set; }         // a leg failed THIS sweep: skip, keep accepted; cleared on fresh BuildBatch
+    public bool ForceMode { get; set; }      // WMO-interior NPC: interact via force_*
+}
+
+// Batch quest scratch (§ P3 batching). Drives ALL quests the bot accepted in the
+// current sweep, not one at a time:
+//   gather → accept-all → objective-sweep (nearest-first, outlier-shelved) →
+//   turn-in-all → reprocess (follow-ups + new locals re-evaluated) → ↺
 public sealed class QuestScratch
 {
-    public int QuestId { get; set; }
-    public QuestNode? Node { get; set; }                  // the quest being worked (from QuestGraphLoader)
-    public bool Accepted { get; set; }                    // QUEST_ACCEPT_ACK received
-    public bool ForceMode { get; set; }                   // WMO-interior NPC: interact via force_* (proximity bypassed)
-    public int ObjectiveSlot { get; set; }                // cursor into Node.Objectives for the kill objective in progress
-    public List<int> ActiveQuestIds { get; } = new();     // FleetReport q=[...] display
+    // The carried batch. Rebuilt from the C++ quest log on (re)entry.
+    public List<BatchQuest> Batch { get; } = new();
+
+    // The quest whose leg armed the current WAIT (to_giver/accept/to_objective/
+    // to_turnin/turnin). Cleared when that leg's outcome is applied.
+    public BatchQuest? Active { get; set; }
+    public int ActiveSlot { get; set; }                  // objective index within Active.Node.Objectives
+
+    // En-route re-gather throttle: re-scan for new local givers once the bot has
+    // moved this far from where we last gathered (so a hub passed mid-sweep is caught).
+    public Vec3 LastGatherPos { get; set; }
+
+    // FleetReport display — the live batch ids.
+    public List<int> ActiveQuestIds { get; } = new();
+
+    // ---- back-compat read shims (anything that peeked the old single-quest scratch) ----
+    public int QuestId => Active?.QuestId ?? (Batch.Count > 0 ? Batch[0].QuestId : 0);
+    public QuestNode? Node => Active?.Node ?? (Batch.Count > 0 ? Batch[0].Node : null);
 }
 
 public sealed class GrindScratch
@@ -95,6 +143,10 @@ public sealed class GrindScratch
     public int KillCount { get; set; }
 }
 
+// Stage of a vendor/repair errand (driven by MaintenancePlanner under Goal.Maintenance,
+// on ctx.Service). None = no errand in flight (the GoalSelector hold keys off this).
+public enum VendorPhase { None, Route, Sell, Repair }
+
 public sealed class ServiceScratch
 {
     public int TargetNpcEntry { get; set; }               // vendor or trainer
@@ -102,20 +154,42 @@ public sealed class ServiceScratch
     public List<int> ToLearn { get; } = new();            // spell ids queued to train
     public long GoldNeeded { get; set; }                  // > 0 when gold-blocked
     public Dictionary<string, DateTime> Cooldowns { get; } = new();
+
+    // ── Vendor/repair errand (MaintenancePlanner) ──
+    public VendorPhase Phase { get; set; }                // route → sell → repair → done
+    public bool CanRepair { get; set; }                   // selected vendor has UNIT_NPC_FLAG_REPAIR
+    public DateTime StartedUtc { get; set; }              // trip start — drives the never-arrived give-up
 }
 
 // Death-recovery scratch (Goal.Maintenance). Transient per death: armed by
 // MaintenancePlanner on the first dead tick, nulled by the brain on goal (re)entry.
-// Death-LOOP state is NOT here (it must survive this reset) — it rides durable
-// BotIdentity fields (LastDeathTime / RecordDeath / PathBlacklist).
+// Death-LOOP detection is NOT here (it must survive this reset) — it rides durable
+// BotIdentity fields (LastDeathTime / LastDeathLocation / RecordDeath / PathBlacklist).
+//
+// Recovery is a three-phase machine: REZ (corpse-run delay → RESURRECT; at_graveyard on
+// a same-spot loop), then RELOCATE (a best-effort 25yd MOVE_TO to safer ground when the
+// rez cell has hostile spawns — ported from the old MaintenanceDomain.FindSafeRezSpot,
+// but run while ALIVE since a ghost can't move on this binary), then HEAL-TO-FULL
+// (SET_TASK IDLE + poll STATE.health). The heal phase is the survival fix: C++ rezzes the
+// bot at 50% HP, and a TASKED bot only tops off below 40% while the grind patrol breaks
+// the eat channel — so re-engaging at 50% is the death spiral. An IDLE bot below 100%
+// eats every tick and never wanders, so we hold it IDLE until ~full, THEN release.
 public sealed class MaintenanceScratch
 {
     public DateTime DeadSinceUtc { get; set; }            // entered recovery — drives the dead-time backstop
     public DateTime RezAtUtc { get; set; }                // when the corpse-run delay elapses → send RESURRECT
     public Vec4 DeathPos { get; set; }                    // where we died (death-spot blacklist target on a loop)
-    public bool DeathLoop { get; set; }                   // quick re-death → escalate (blacklist + at_graveyard ride-along)
+    public bool DeathLoop { get; set; }                   // quick SAME-SPOT re-death → escalate (blacklist + at_graveyard port)
     public bool RezSent { get; set; }                     // RESURRECT issued — guards against duplicate sends
-    public bool Escalated { get; set; }                   // death-spot already blacklisted (once per recovery)
+    public bool Escalated { get; set; }                   // death-spot blacklisted + at_graveyard sent (once per recovery)
+
+    // ── Post-rez phases (alive) ──
+    public bool Rezzed { get; set; }                      // bot was seen ALIVE after RESURRECT — a later dead tick = a re-death → re-arm
+    public bool RelocateSent { get; set; }                // safe-spot MOVE_TO issued once (best-effort, ported FindSafeRezSpot)
+    public bool RelocateDone { get; set; }                // relocate finished or skipped → heal next
+    public bool IdleFired { get; set; }                   // SET_TASK IDLE sent once for the heal phase
+    public DateTime HealSinceUtc { get; set; }            // heal phase entered — drives the heal timeout backstop
+    public bool HealDone { get; set; }                    // healed (or timed out) → recovery releases to the GoalSelector
 }
 
 // One quest's authoritative server-side state, parsed from QUEST_STATUS_ALL (the
@@ -188,6 +262,7 @@ public sealed class BotContext
     public float ManaPct { get; set; } = 1f;
     public int FreeSlots { get; set; }
     public long Copper { get; set; }
+    public int Durability { get; set; } = 100;            // min equipped-slot durability % (100 = full); drives the repair errand
     public bool InCombat { get; set; }
     public bool Dead { get; set; }
 
@@ -245,6 +320,7 @@ public sealed class BotContext
         ManaPct = snap.ManaPercent;
         FreeSlots = (int)snap.FreeSlots;
         Copper = snap.Copper;
+        Durability = (int)snap.Durability;
         InCombat = snap.InCombat;
         Dead = snap.IsDead;
     }

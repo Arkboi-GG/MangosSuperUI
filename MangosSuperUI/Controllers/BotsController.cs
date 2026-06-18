@@ -13,14 +13,16 @@ public class BotsController : Controller
     private readonly ConnectionFactory _db;
     private readonly DbcService _dbc;
     private readonly BotFlightRecorder _recorder;
+    private readonly BotLogBuffer _log;
 
-    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder)
+    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log)
     {
         _bridge = bridge;
         _brain = brain;
         _db = db;
         _dbc = dbc;
         _recorder = recorder;
+        _log = log;
     }
 
     public IActionResult Index()
@@ -168,6 +170,39 @@ public class BotsController : Controller
                 groupId = b.GroupId,
                 isGroupLeader = b.IsGroupLeader
             })
+        });
+    }
+
+    // ==================== Live Spine State (Live tab) ====================
+    // Structured per-bot BotContext projection for the dashboard's Live tab — the
+    // spine's real-time state (Goal/Step/why/WAIT/Failure/timers/typed scratch),
+    // distinct from the old DecisionEngine summary in BrainState.
+
+    [HttpGet("Bots/LiveState/{guid}")]
+    public IActionResult LiveState(int guid)
+    {
+        var live = _brain.GetLiveState(guid);
+        if (live == null)
+            return Json(new { guid, error = "No live context for this bot" });
+        return Json(live);
+    }
+
+    [HttpGet]
+    public IActionResult LiveFleet()
+    {
+        return Json(new { bots = _brain.GetLiveFleet() });
+    }
+
+    // Per-bot brain log slice for the Live tab. Polled only while a bot is being watched.
+    // name = the bot's name (whole-word filter); after = the client's last-seen seq cursor.
+    [HttpGet]
+    public IActionResult LiveLog(string? name, long after = 0)
+    {
+        var (lines, lastSeq) = _log.Query(name, after);
+        return Json(new
+        {
+            lastSeq,
+            lines = lines.Select(l => new { seq = l.Seq, t = l.Utc, msg = l.Message })
         });
     }
 

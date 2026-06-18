@@ -24,6 +24,14 @@ public sealed class BotExecutor
     private readonly BotBridgeService _bridge;
     private readonly ILogger<BotExecutor> _logger;
 
+    // Progress-extending objective deadline (§6B.2). A kill-objective grind is
+    // SET_TASK {kill_count=N} + a WAIT on TASK_COMPLETE. Each KILL while that WAIT is
+    // pending pushes its deadline to now + this, so the objective fails only on a
+    // NO-kill gap (like GrindPlanner's KILL-recency), never on wall-clock. Matches the
+    // 120s grind liveness window. Tunable; must comfortably exceed mob respawn (Echo
+    // Ridge workers = 180s, but pass-2 'kill anything' keeps the gap far under this).
+    private static readonly TimeSpan ObjectiveKillGrace = TimeSpan.FromSeconds(120);
+
     public BotExecutor(BotBridgeService bridge, ILogger<BotExecutor> logger)
     {
         _bridge = bridge;
@@ -40,12 +48,19 @@ public sealed class BotExecutor
     public async Task IssueAsync(BotContext ctx, BridgeCommand cmd, string expectedEvent, TimeSpan deadline)
     {
         var now = DateTime.UtcNow;
+
+        // An ENRICHED objective MOVE_TO (§4) carries creature_entry/kill_count: C++ travels
+        // then grinds in place under this one WAIT. Flag it so the KILL-push in OnEvent rolls
+        // its deadline forward once the grind starts (the travel deadline only covers travel).
+        bool objectiveGrind = cmd.Type == "MOVE_TO" && cmd.Payload.ContainsKey("creature_entry");
+
         ctx.Pending = new Outstanding
         {
             CommandType = cmd.Type,
             ExpectedEvent = expectedEvent,
             SentUtc = now,
-            DeadlineUtc = now + deadline
+            DeadlineUtc = now + deadline,
+            IsObjectiveGrind = objectiveGrind
         };
 
         // Capture the destination so FleetReport can show distance-to-target.
@@ -94,6 +109,15 @@ public sealed class BotExecutor
             case "KILL":
                 ctx.LastKillUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
+                // Refresh the objective-grind deadline on progress so a slow-but-killing
+                // bot (L1-2 vs L3 Echo-Ridge workers) is never false-failed mid-grind.
+                // Covers BOTH grind shapes: a SET_TASK {kill_count=N} grind AND a §4 enriched
+                // MOVE_TO that has arrived and is grinding in place (IsObjectiveGrind). A plain
+                // MOVE_TO travel WAIT (no creature_entry) is NOT extended by a kill landed in
+                // transit. The indefinite GrindPlanner grind arms no WAIT (IssueNoWaitAsync) so
+                // ctx.Pending is null there — this never fires for it.
+                if (ctx.Pending is { } objWait && (objWait.CommandType == "SET_TASK" || objWait.IsObjectiveGrind))
+                    objWait.DeadlineUtc = DateTime.UtcNow + ObjectiveKillGrace;
                 break;
             case "QUEST_UPDATE":
             case "QUEST_ACCEPT_ACK":

@@ -26,6 +26,10 @@ public class BotStateSnapshot
     public uint TotalSlots { get; set; } = 16;
     public uint Copper { get; set; } = 0;
 
+    // Min equipped-slot durability % (100 = full / no damageable gear). Added to STATE
+    // alongside the at_graveyard rez; drives the durability-repair errand.
+    public uint Durability { get; set; } = 100;
+
     // Computed
     public float HealthPercent => MaxHealth > 0 ? Health / (float)MaxHealth : 1f;
     public float ManaPercent => MaxMana > 0 ? Mana / (float)MaxMana : 1f;
@@ -73,6 +77,7 @@ public class BotStateSnapshot
             FreeSlots = bs.FreeSlots,
             TotalSlots = bs.TotalSlots,
             Copper = bs.Copper,
+            Durability = bs.Durability,
             ServerQuestId = bs.QuestId,
             ServerQuestStatus = bs.QuestStatus
         };

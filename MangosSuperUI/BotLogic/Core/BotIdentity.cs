@@ -46,6 +46,16 @@ public class BotIdentity
     public HashSet<int> CompletedQuestIds { get; set; } = new();
 
     /// <summary>
+    /// Quests abandoned because they went GREY (out-leveled — the vanilla gray
+    /// level formula on the quest's level). Distance never drops a quest and danger
+    /// never drops a quest; greying is the ONLY drop (batching policy). Unlike a
+    /// deferral this NEVER clears — the bot only levels up, so a grey quest stays
+    /// grey. Excluded from picks (QuestPlanner.IsPickable) and never resumed into a
+    /// batch. Survives reconnect like CompletedQuestIds.
+    /// </summary>
+    public HashSet<int> AbandonedGreyQuestIds { get; set; } = new();
+
+    /// <summary>
     /// Quests hydrated from character_queststatus on reconnect that are still
     /// in the bot's quest log (accepted but not yet rewarded). QuestingDomain.OnEnter
     /// consumes this to rebuild the ActiveQuestEntry batch, then clears it.
@@ -73,6 +83,17 @@ public class BotIdentity
     /// Cleared on level-up (fresh start, new capabilities).
     /// </summary>
     public Dictionary<int, int> QuestDeferralCounts { get; set; } = new();
+
+    /// <summary>
+    /// Overflow-grind attempts per quest. The server still reports a kill quest INCOMPLETE
+    /// (status != 3) even though our local QuestNode counts are all met — our requirement is
+    /// stale/under (a quest_template patch override the graph loaded at patch=0 doesn't carry)
+    /// or the quest has an objective our graph doesn't model. QuestPlanner keeps killing past
+    /// our count so the server can credit it, BOUNDED by this counter — past the cap it durably
+    /// defers the quest instead of grinding forever. Cleared on turn-in / grey-abandon.
+    /// Key = questId, Value = overflow grinds issued since the last reset.
+    /// </summary>
+    public Dictionary<int, int> QuestOverflowGrinds { get; set; } = new();
 
     // --- Path blacklist (destinations rejected by C++ IsPathSafe) ---
     /// <summary>
@@ -277,6 +298,19 @@ public class BotIdentity
     {
         int requiredLevel = Math.Max(1, dangerLevel - safetyMargin);
         DeferredQuestIds[questId] = QuestDeferral.LevelBased(requiredLevel);
+    }
+
+    /// <summary>
+    /// Drop a quest because it went grey (out-leveled). Adds it to the permanent
+    /// skip set and clears any stale deferral bookkeeping so it can't be re-picked.
+    /// The QuestPlanner emits ABANDON_QUEST to C++ when the quest was accepted.
+    /// </summary>
+    public void AbandonGrey(int questId)
+    {
+        AbandonedGreyQuestIds.Add(questId);
+        DeferredQuestIds.Remove(questId);
+        QuestDeferralCounts.Remove(questId);
+        QuestOverflowGrinds.Remove(questId);
     }
 
     /// <summary>

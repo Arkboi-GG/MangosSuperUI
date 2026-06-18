@@ -121,6 +121,9 @@ public class BotStatePayload
 
     [JsonPropertyName("questStatus")]
     public uint QuestStatus { get; set; } = 0;
+
+    [JsonPropertyName("durability")]
+    public uint Durability { get; set; } = 100;   // min equipped-slot durability % (100 = full / no damageable gear)
 }
 
 public class BotEventPayload
@@ -288,6 +291,7 @@ public class BotState
     public DateTime LastUpdate { get; set; }
     public uint QuestId { get; set; } = 0;
     public uint QuestStatus { get; set; } = 0;
+    public uint Durability { get; set; } = 100;   // min equipped-slot durability % from STATE (100 = full)
     // BotState class — add:
     public bool HasReceivedState { get; set; } = false;
 }
@@ -549,6 +553,7 @@ public class BotBridgeService : BackgroundService
         bs.LastUpdate = DateTime.UtcNow;
         bs.QuestId = state.QuestId;
         bs.QuestStatus = state.QuestStatus;
+        bs.Durability = state.Durability;
         bs.HasReceivedState = true;
 
         BotStates[conn.Guid] = bs;

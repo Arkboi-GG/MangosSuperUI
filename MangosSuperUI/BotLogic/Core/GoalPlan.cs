@@ -137,4 +137,17 @@ public interface IBotPlanner
 
     /// <summary>Supervisor calls when progress stops: what corrective action to force.</summary>
     StallAction OnStall(BotContext ctx);
+
+    /// <summary>
+    /// Soft re-plan for an INTERRUPTIBLE in-flight leg (a leg whose WAIT carries
+    /// Outstanding.RescanAtUtc — currently a quest objective trek). BotBrain (step 3c)
+    /// calls this on a cadence WHILE the WAIT is still pending, so a planner can fold in
+    /// work discovered en route and PREEMPT a long journey. Return one of:
+    ///   • Issue / Dispatch → the brain swaps the WAIT to this new command (preempt),
+    ///   • Continue (the default) → keep waiting; the brain leaves the journey running
+    ///     (no re-path stutter) and pushes the next rescan.
+    /// Default is a no-op, so only planners with interruptible legs (QuestPlanner)
+    /// override it. The planner owns its own cost throttle (e.g. moved-≥Nyd) inside.
+    /// </summary>
+    StepResult Rescan(BotContext ctx, BotStateSnapshot snap) => StepResult.Wait();
 }

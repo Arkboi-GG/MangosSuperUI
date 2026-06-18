@@ -17,6 +17,11 @@ namespace MangosSuperUI.BotLogic.Brain;
 // rule. On goal change it stops a leaving grind patrol (SET_TASK IDLE), resets
 // the goal scratch, and clears any WAIT. A grind carries no WAIT, so it can never
 // false-stall (§6.3); the planner's KILL-recency owns "no mobs → reselect."
+//
+// Soft re-plan (§ batching trek): step 3c lets an INTERRUPTIBLE leg (a quest
+// trek — Outstanding.RescanAtUtc set) be re-evaluated on a cadence while its WAIT
+// is still pending, so quests discovered en route can preempt a long journey
+// without a re-path stutter. Default legs (RescanAtUtc null) are untouched.
 // ============================================================================
 public sealed class BotBrain
 {
@@ -25,6 +30,12 @@ public sealed class BotBrain
     private readonly GoalSelector _selector;
     private readonly IReadOnlyDictionary<Goal, IBotPlanner> _planners;
     private readonly ILogger<BotBrain> _logger;
+
+    // Cadence for the step-3c soft re-plan of an interruptible leg. This is just the
+    // "look again" interval — the real cost gate is the planner's own moved-≥Nyd throttle
+    // inside Rescan, so a stationary grind that happens to carry RescanAtUtc no-ops cheaply.
+    // BotTuning candidate.
+    private static readonly TimeSpan RescanInterval = TimeSpan.FromSeconds(10);
 
     public BotBrain(
         BotExecutor executor,
@@ -80,6 +91,28 @@ public sealed class BotBrain
                 Utc = DateTime.UtcNow
             };
             _executor.ClearPending(ctx);
+        }
+
+        // 3c. Soft re-plan for an interruptible in-flight leg (a quest trek). While a
+        //     WAIT is still pending and the planner asked to be re-looked-at on a cadence
+        //     (RescanAtUtc due), peek WITHOUT clearing it. If the planner PREEMPTS
+        //     (Issue/Dispatch — it folded in closer work), swap the WAIT to the new
+        //     command; if it keeps waiting (Continue), leave the journey running — no
+        //     re-path stutter — and push the next rescan. Skipped when a failure is
+        //     already pending (3b owns that) or the leg isn't interruptible (RescanAtUtc null).
+        var p = ctx.Pending;
+        if (p != null && ctx.Failure == null && p.RescanAtUtc is DateTime due && DateTime.UtcNow >= due)
+        {
+            var rescan = planner.Rescan(ctx, snap);
+            if (rescan is StepResult.Issue or StepResult.Dispatch)
+            {
+                _executor.ClearPending(ctx);
+                await DispatchStepAsync(ctx, rescan);
+                _supervisor.Check(ctx, snap);
+                return;
+            }
+            if (ctx.Pending != null)
+                ctx.Pending.RescanAtUtc = DateTime.UtcNow + RescanInterval;
         }
 
         // 4. Act only when nothing is outstanding. A pending failure (a negated or

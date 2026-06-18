@@ -67,6 +67,17 @@ $(function () {
     var maxTimelineEntries = 100;
     var inventoryCache = {};  // guid → inventory data from /Bots/Inventory
 
+    // Live tab (real-time BotContext feed)
+    var detailTab = 'overview';   // 'overview' | 'live'
+    var livePollTimer = null;     // 5s server poll
+    var liveTickTimer = null;     // 1s client-side age ticker
+    var liveData = null;          // last /Bots/LiveState payload
+    var liveGuid = null;          // guid liveData belongs to
+    var liveFetchedAt = 0;        // Date.now() of last fetch (for age offset)
+    var liveScaffoldGuid = null;  // guid the live DOM scaffold was built for
+    var liveLogTimer = null;      // 2s per-bot log poll
+    var liveLogSeq = 0;           // last-seen log sequence cursor
+
     // ===================== SIGNALR =====================
     function initConnection() {
         connection = new signalR.HubConnectionBuilder()
@@ -104,6 +115,7 @@ $(function () {
                 $('#detailEmpty').show();
                 $('#detailPanel').empty();
                 stopBrainPoll();
+                stopLivePoll();
             }
         });
 
@@ -139,6 +151,7 @@ $(function () {
                             $('#detailEmpty').show();
                             $('#detailPanel').empty();
                             stopBrainPoll();
+                            stopLivePoll();
                         }
                     }
                 }, 30000);
@@ -338,19 +351,388 @@ $(function () {
     function renderDetail() {
         if (!selectedGuid) {
             $('#detailEmpty').show();
+            stopLivePoll();
             return;
         }
         $('#detailEmpty').hide();
 
         var s = botStates[selectedGuid];
-        var brain = botBrains[selectedGuid];
         if (!s) return;
 
+        // Tab scaffold — Overview keeps everything that was here; Live is the real-time feed.
+        var scaffold =
+            '<div class="bt-detail-tabs">' +
+            '<div class="bt-detail-tab' + (detailTab === 'overview' ? ' active' : '') + '" data-dtab="overview">' +
+            '<i class="fa-solid fa-id-card" style="margin-right:5px;"></i>Overview</div>' +
+            '<div class="bt-detail-tab' + (detailTab === 'live' ? ' active' : '') + '" data-dtab="live">' +
+            '<i class="fa-solid fa-satellite-dish" style="margin-right:5px;"></i>Live' +
+            '<span class="bt-live-dot"></span></div>' +
+            '</div>' +
+            '<div id="detailTabBody"></div>';
+        $('#detailPanel').html(scaffold);
+
+        renderActiveDetailTab();
+        ensureLivePoll();
+    }
+
+    function renderActiveDetailTab() {
+        if (!selectedGuid) return;
+        var s = botStates[selectedGuid];
+        if (!s) return;
+
+        if (detailTab === 'live') {
+            renderLiveTab(s);
+            return;
+        }
+        var brain = botBrains[selectedGuid];
         try { renderDetailInner(s, brain); }
         catch (ex) {
             console.error('renderDetail crashed for guid ' + selectedGuid + ':', ex);
-            $('#detailPanel').html('<div style="color:#f7768e;padding:16px;">Detail render error: ' + esc(ex.message) + '</div>');
+            $('#detailTabBody').html('<div style="color:#f7768e;padding:16px;">Detail render error: ' + esc(ex.message) + '</div>');
         }
+    }
+
+    // ===================== LIVE TAB (real-time BotContext feed) =====================
+
+    var GOAL_COLOR = {
+        Idle: '#5f6b7a', Questing: '#7aa2f7', Grinding: '#f7768e', Vendoring: '#e0af68',
+        Training: '#bb9af7', Maintenance: '#ff9e64', Following: '#73daca',
+        Exploring: '#2ac3de', Socializing: '#9ece6a'
+    };
+
+    function startLivePoll() {
+        // New bot? drop stale payload so we show "connecting" not the last bot's data.
+        if (liveGuid !== selectedGuid) {
+            liveData = null; liveGuid = selectedGuid;
+            liveLogSeq = 0; liveScaffoldGuid = null;
+        }
+        stopLivePoll();
+        fetchLive();                                  // immediate
+        fetchLiveLog();                               // immediate log pull
+        livePollTimer = setInterval(fetchLive, 5000); // server refresh
+        liveLogTimer = setInterval(fetchLiveLog, 2000); // log feed
+        liveTickTimer = setInterval(function () {     // client-side age ticking between polls
+            if (detailTab === 'live' && selectedGuid && liveData) renderLiveTab(botStates[selectedGuid]);
+        }, 1000);
+    }
+
+    // (Re)start only when needed — avoids an extra fetch on every incidental re-render.
+    function ensureLivePoll() {
+        if (detailTab !== 'live') { stopLivePoll(); return; }
+        if (livePollTimer && liveGuid === selectedGuid) return;
+        startLivePoll();
+    }
+
+    function stopLivePoll() {
+        if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
+        if (liveTickTimer) { clearInterval(liveTickTimer); liveTickTimer = null; }
+        if (liveLogTimer) { clearInterval(liveLogTimer); liveLogTimer = null; }
+    }
+
+    function fetchLive() {
+        if (!selectedGuid || !connected) return;
+        var g = selectedGuid;
+        $.getJSON('/Bots/LiveState/' + g, function (data) {
+            if (selectedGuid !== g) return;           // selection moved on while in flight
+            if (!data || data.error) {
+                liveData = null;
+                if (detailTab === 'live') renderLiveTab(botStates[g]);
+                return;
+            }
+            liveData = data;
+            liveGuid = g;
+            liveFetchedAt = Date.now();
+            if (detailTab === 'live') renderLiveTab(botStates[g]);
+        });
+    }
+
+    function fetchLiveLog() {
+        if (!selectedGuid || !connected || detailTab !== 'live') return;
+        var g = selectedGuid;
+        var st = botStates[g];
+        if (!st || !st.name) return;
+        $.getJSON('/Bots/LiveLog', { name: st.name, after: liveLogSeq }, function (data) {
+            if (selectedGuid !== g || detailTab !== 'live') return;
+            if (!data) return;
+            if (typeof data.lastSeq === 'number') liveLogSeq = data.lastSeq;
+            var $box = $('#liveLogBox');
+            if ($box.length === 0) return;
+            if (data.lines && data.lines.length) {
+                var el = $box[0];
+                var nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 48;
+                var add = '';
+                for (var i = 0; i < data.lines.length; i++) add += logLineHtml(data.lines[i]);
+                $box.append(add);
+                var kids = $box.children();
+                if (kids.length > 400) kids.slice(0, kids.length - 400).remove();
+                if (nearBottom) el.scrollTop = el.scrollHeight;
+                $('#liveLogMeta').text('(' + $box.children().length + ')');
+            }
+        });
+    }
+
+    function logLineHtml(l) {
+        var t = '';
+        try { t = new Date(l.t).toLocaleTimeString(); } catch (e) { t = ''; }
+        var m = l.msg || '';
+        var c = 'var(--text-secondary)';
+        if (/STALL|no_path|MOVE_FAILED|PATH_UNSAFE|negated|deferring|shelving|_FAIL|cross_map/i.test(m)) c = '#f7768e';
+        else if (/LEVEL_UP|completed|GRIND finished|rewarded|grey-drop/i.test(m)) c = '#9ece6a';
+        else if (/RESURRECT|RESPAWN|DEATH|relocate|heal|graveyard|REPAIR|SELL/i.test(m)) c = '#ff9e64';
+        else if (/\[QUEST\]|batch|seeding|QUEST_/i.test(m)) c = '#7aa2f7';
+        else if (/KILL/i.test(m)) c = 'var(--text-muted)';
+        return '<div class="bt-live-logline"><span class="bt-live-logt">' + t + '</span> ' +
+            '<span style="color:' + c + ';">' + esc(m) + '</span></div>';
+    }
+
+    // seconds offset since last fetch — lets ages tick up / countdowns tick down live
+    function liveOff() { return Math.max(0, Math.floor((Date.now() - liveFetchedAt) / 1000)); }
+    function ageUp(n) { return (n == null) ? null : (n + liveOff()); }
+    function ageDn(n) { return (n == null) ? null : (n - liveOff()); }
+    function secs(n) { return (n == null) ? '—' : (n + 's'); }
+    function clk(sec, goodUnder, warnUnder) {
+        // color a "time since" by health: low good, high bad
+        var c = sec == null ? 'var(--text-muted)' : (sec < goodUnder ? '#9ece6a' : (sec < warnUnder ? '#e0af68' : '#f7768e'));
+        return '<span style="color:' + c + ';">' + secs(sec) + '</span>';
+    }
+    function chip(text, color, bg) {
+        return '<span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700;' +
+            'color:' + color + ';background:' + (bg || 'rgba(122,162,247,0.12)') + ';margin-right:4px;">' + esc(text) + '</span>';
+    }
+    function statBox(label, val, color) {
+        return '<div class="bt-live-stat"><div class="bt-live-stat-val" style="color:' + (color || 'var(--text-primary)') + ';">' +
+            val + '</div><div class="bt-live-stat-lbl">' + esc(label) + '</div></div>';
+    }
+
+    // 2D distance from the bot to a world point, or null if a different map (cross-map dist is meaningless).
+    function objDist(d, o) {
+        if (!d || !o || o.map !== d.mapId) return null;
+        var dx = d.pos.x - o.x, dy = d.pos.y - o.y;
+        return Math.round(Math.sqrt(dx * dx + dy * dy));
+    }
+    function distTag(d, o) {
+        var dist = objDist(d, o);
+        if (dist != null) return '<span class="bt-live-obj-dist">' + dist + 'y</span>';
+        if (o && o.map !== d.mapId) return '<span class="bt-live-obj-dist">map ' + o.map + '</span>';
+        return '';
+    }
+    function questNpcRow(label, icon, npc, d, color) {
+        return '<div class="bt-live-obj"><i class="fa-solid ' + icon + '" style="color:' + color + ';width:14px;"></i> ' +
+            '<span style="color:var(--text-muted);">' + label + ':</span> ' +
+            '<span class="bt-live-obj-name">' + esc(npc.name || '?') + '</span>' + distTag(d, npc) + '</div>';
+    }
+
+    function renderLiveTab(s) {
+        var $body = $('#detailTabBody');
+        if ($body.length === 0) return;
+
+        var d = liveData;
+        if (!d || liveGuid !== selectedGuid) {
+            liveScaffoldGuid = null;
+            $body.html('<div style="padding:24px;text-align:center;color:var(--text-muted);">' +
+                '<i class="fa-solid fa-satellite-dish fa-fade" style="font-size:20px;margin-bottom:8px;display:block;"></i>' +
+                'Connecting to live feed…<div style="font-size:11px;margin-top:4px;">(brain engine must be ON)</div></div>');
+            return;
+        }
+
+        var goalColor = GOAL_COLOR[d.goal] || 'var(--accent)';
+        var html = '';
+
+        // --- Goal / Step banner ---
+        html += '<div class="bt-live-banner" style="border-left:3px solid ' + goalColor + ';">';
+        html += '<div class="bt-live-goal" style="color:' + goalColor + ';">' + esc(d.goal) +
+            '<span class="bt-live-step"> / ' + esc(d.step) + '</span></div>';
+        if (d.why) html += '<div class="bt-live-why">why = ' + esc(d.why) + '</div>';
+        html += '<div class="bt-live-badges">';
+        if (d.dead) html += chip('DEAD', '#fff', 'rgba(247,118,142,0.8)');
+        if (d.inCombat) html += chip('IN COMBAT', '#f7768e', 'rgba(247,118,142,0.15)');
+        if (d.goal === 'Idle' && d.why && d.why !== 'idle')
+            html += chip('↻ reselecting', '#ff9e64', 'rgba(255,158,100,0.15)');
+        html += chip('L' + d.level, 'var(--text-secondary)', 'rgba(255,255,255,0.06)');
+        html += chip('zone ' + d.zoneId + ' · map ' + d.mapId, 'var(--text-muted)', 'rgba(255,255,255,0.04)');
+        html += '</div></div>';
+
+        // --- Vitals strip ---
+        var durColor = d.durability < 30 ? '#f7768e' : (d.durability < 60 ? '#e0af68' : '#9ece6a');
+        var bagColor = d.freeSlots <= 0 ? '#f7768e' : (d.freeSlots <= 2 ? '#e0af68' : '#9ece6a');
+        html += '<div class="bt-live-stats">';
+        html += statBox('HP', d.hpPct + '%', d.hpPct < 35 ? '#f7768e' : '#9ece6a');
+        if (d.manaPct > 0 && d.manaPct < 100) html += statBox('MP', d.manaPct + '%', '#7aa2f7');
+        html += statBox('Durability', d.durability + '%', durColor);
+        html += statBox('Free bags', d.freeSlots, bagColor);
+        html += statBox('Gold', formatGold(d.copper), '#e0af68');
+        html += '</div>';
+
+        // --- THE WAIT (hero signal) ---
+        html += '<div class="bt-live-card">';
+        html += '<div class="bt-live-card-h"><i class="fa-solid fa-hourglass-half"></i> Outstanding command</div>';
+        if (d.pending) {
+            var age = ageUp(d.pending.ageSec);
+            var dl = ageDn(d.pending.secsToDeadline);
+            var dlColor = dl == null ? 'var(--text-muted)' : (dl > 60 ? '#9ece6a' : (dl > 15 ? '#e0af68' : '#f7768e'));
+            html += '<div class="bt-live-wait">';
+            html += '<span class="bt-live-wait-cmd">' + esc(d.pending.cmd) + '</span>';
+            html += ' <span style="color:var(--text-muted);">→ waiting</span> ';
+            html += '<span class="bt-live-wait-evt">' + esc(d.pending.expect) + '</span>';
+            html += ' <span style="color:var(--text-muted);">(' + secs(age) + ')</span>';
+            html += '<span style="float:right;color:' + dlColor + ';font-weight:700;">deadline ' + secs(dl) + '</span>';
+            html += '</div><div class="bt-live-badges" style="margin-top:6px;">';
+            if (d.pending.isObjectiveGrind) html += chip('objective grind', '#f7768e', 'rgba(247,118,142,0.15)');
+            if (d.pending.interruptible) html += chip('interruptible trek', '#73daca', 'rgba(115,218,202,0.15)');
+            if (d.distToTarget != null) html += chip('tgt ' + d.distToTarget + 'y', '#7aa2f7', 'rgba(122,162,247,0.12)');
+            html += '</div>';
+        } else {
+            html += '<div style="color:var(--text-muted);font-size:12px;">— none (between commands)</div>';
+        }
+        html += '</div>';
+
+        // --- Failure (only if present) ---
+        if (d.failure) {
+            html += '<div class="bt-live-card" style="border-color:rgba(247,118,142,0.4);background:rgba(247,118,142,0.06);">';
+            html += '<div class="bt-live-card-h" style="color:#f7768e;"><i class="fa-solid fa-triangle-exclamation"></i> Last failure</div>';
+            html += '<div style="font-size:12px;">' + esc(d.failure.cmd) + ' ← <span style="color:#f7768e;font-weight:700;">' +
+                esc(d.failure.reason) + '</span> <span style="color:var(--text-muted);">(' + secs(ageUp(d.failure.ageSec)) + ')</span>';
+            if (d.failure.danger > 0) html += ' ' + chip('danger ' + d.failure.danger, '#ff9e64', 'rgba(255,158,100,0.15)');
+            if (d.failure.questId) html += ' ' + chip('quest #' + d.failure.questId, '#e0af68', 'rgba(224,175,104,0.12)');
+            html += '</div></div>';
+        }
+
+        // --- Stall (only if present) ---
+        if (d.stall) {
+            html += '<div class="bt-live-card" style="border-color:rgba(247,118,142,0.5);background:rgba(247,118,142,0.1);">';
+            html += '<div style="color:#f7768e;font-weight:700;font-size:12px;"><i class="fa-solid fa-ban" style="margin-right:5px;"></i>STALLED — ' +
+                esc(d.stall.reason) + ' (' + secs(ageUp(d.stall.sinceSec)) + ')</div></div>';
+        }
+
+        // --- Progress clocks ---
+        html += '<div class="bt-live-card">';
+        html += '<div class="bt-live-card-h"><i class="fa-solid fa-gauge-high"></i> Progress</div>';
+        html += '<div class="bt-live-rows">';
+        html += liveRow('In goal', secs(ageUp(d.timeInGoalSec)));
+        html += liveRow('In step', secs(ageUp(d.timeInStepSec)));
+        html += liveRow('No progress', clk(ageUp(d.noProgressSec), 30, 120));
+        html += liveRow('Last kill', clk(ageUp(d.lastKillSec), 30, 120));
+        html += liveRow('Last quest advance', clk(ageUp(d.lastQuestSec), 120, 600));
+        html += liveRow('Last level', secs(ageUp(d.lastLevelSec)));
+        html += '</div></div>';
+
+        // --- Active scratch ---
+        html += renderLiveScratch(d.scratch, d);
+
+        // --- Position footer ---
+        html += '<div class="bt-live-foot">pos ' + Math.round(d.pos.x) + ', ' + Math.round(d.pos.y) + ', ' + Math.round(d.pos.z) +
+            ' @ map ' + d.mapId + ' &nbsp;·&nbsp; refreshed ' + liveOff() + 's ago</div>';
+
+        // Lay the scaffold once per bot so the log panel (appended incrementally by the
+        // 2s poll) survives the 1s state re-render. Then update only the state region.
+        if (liveScaffoldGuid !== selectedGuid) {
+            $body.html(
+                '<div id="liveState"></div>' +
+                '<div class="bt-live-card" id="liveLogCard">' +
+                '<div class="bt-live-card-h"><i class="fa-solid fa-terminal"></i> Live log ' +
+                '<span id="liveLogMeta" style="font-weight:400;color:var(--text-muted);"></span></div>' +
+                '<div id="liveLogBox" class="bt-live-log"></div>' +
+                '</div>');
+            liveScaffoldGuid = selectedGuid;
+        }
+        $('#liveState').html(html);
+    }
+
+    function liveRow(label, valHtml) {
+        return '<div class="bt-live-row"><span class="bt-live-row-lbl">' + esc(label) + '</span>' +
+            '<span class="bt-live-row-val">' + valHtml + '</span></div>';
+    }
+
+    function renderLiveScratch(sc, d) {
+        if (!sc || sc.kind === 'none') {
+            return '<div class="bt-live-card"><div class="bt-live-card-h"><i class="fa-solid fa-list-check"></i> Task</div>' +
+                '<div style="color:var(--text-muted);font-size:12px;">No active task scratch.</div></div>';
+        }
+        var html = '<div class="bt-live-card">';
+
+        if (sc.kind === 'quest') {
+            html += '<div class="bt-live-card-h"><i class="fa-solid fa-scroll"></i> Quest — ' + sc.count + ' in batch ' +
+                chip(d.step, 'var(--text-secondary)', 'rgba(255,255,255,0.06)') + '</div>';
+
+            // Active quest detail — title, objectives (active highlighted), where to accept / hand in.
+            var aq = sc.active;
+            if (aq) {
+                html += '<div class="bt-live-active">';
+                html += '<div class="bt-live-active-t">★ ' + esc(aq.title || ('#' + aq.id)) +
+                    ' <span style="color:var(--text-muted);font-weight:400;">#' + aq.id + (aq.level ? ' · L' + aq.level : '') + '</span></div>';
+
+                if (aq.objectives && aq.objectives.length) {
+                    for (var oi = 0; oi < aq.objectives.length; oi++) {
+                        var o = aq.objectives[oi];
+                        var icon = o.kind === 'kill' ? 'fa-khanda' : (o.kind === 'gather' ? 'fa-hand-holding' : 'fa-hand-pointer');
+                        var done = (o.have != null && o.need > 0 && o.have >= o.need);
+                        var cnt = (o.have != null) ? (o.have + '/' + o.need) : ('×' + o.need);
+                        var cntColor = done ? '#9ece6a' : (o.active ? '#e0af68' : 'var(--text-secondary)');
+                        html += '<div class="bt-live-obj' + (o.active ? ' active' : '') + '">';
+                        html += '<i class="fa-solid ' + icon + '" style="width:14px;"></i> ';
+                        html += '<span class="bt-live-obj-cnt" style="color:' + cntColor + ';">' + cnt + '</span> ';
+                        html += '<span class="bt-live-obj-name">' + esc(o.name) + '</span>';
+                        if (o.kind === 'gather' && o.from) html += ' <span style="color:var(--text-muted);">from ' + esc(o.from) + '</span>';
+                        html += distTag(d, o);
+                        html += '</div>';
+                    }
+                }
+
+                if (aq.giver) html += questNpcRow('Accept', 'fa-circle-question', aq.giver, d, '#7aa2f7');
+                if (aq.turnIn) html += questNpcRow('Turn in', 'fa-flag-checkered', aq.turnIn, d, '#9ece6a');
+                html += '</div>';
+            }
+
+            // Full batch — id + title, active row highlighted.
+            html += '<div class="bt-live-qlist">';
+            for (var i = 0; i < sc.batch.length; i++) {
+                var q = sc.batch[i];
+                var col = '#7aa2f7', tag = 'fa-circle-dot';
+                if (q.turnedIn) { col = '#9ece6a'; tag = 'fa-circle-check'; }
+                else if (q.failed) { col = '#f7768e'; tag = 'fa-circle-xmark'; }
+                else if (q.deferred) { col = '#e0af68'; tag = 'fa-circle-pause'; }
+                else if (q.force) { col = '#bb9af7'; tag = 'fa-bolt'; }
+                else if (q.accepted) { col = '#73daca'; tag = 'fa-circle-dot'; }
+                var isActive = (sc.activeId && q.id === sc.activeId);
+                html += '<div class="bt-live-qrow' + (isActive ? ' active' : '') + '">' +
+                    '<i class="fa-solid ' + tag + '" style="color:' + col + ';width:14px;"></i> ' +
+                    '<span class="bt-live-qid">#' + q.id + '</span> ' +
+                    '<span class="bt-live-qtitle">' + esc(q.title || '(unknown)') + '</span></div>';
+            }
+            html += '</div>';
+        } else if (sc.kind === 'grind') {
+            html += '<div class="bt-live-card-h"><i class="fa-solid fa-khanda"></i> Grind</div>';
+            html += '<div class="bt-live-rows">';
+            html += liveRow('Creature entry', sc.creatureEntry || 'any');
+            html += liveRow('Kills', sc.killCount + (sc.killGoal > 0 ? ' / ' + sc.killGoal : ' (indefinite)'));
+            html += liveRow('Radius', Math.round(sc.radius) + 'y');
+            html += '</div>';
+        } else if (sc.kind === 'maintenance') {
+            var phaseColor = { 'rez-wait': '#ff9e64', 'resurrecting': '#ff9e64', 'relocate': '#e0af68', 'heal': '#9ece6a', 'done': '#73daca', 'post-rez': '#7aa2f7' };
+            html += '<div class="bt-live-card-h" style="color:#ff9e64;"><i class="fa-solid fa-kit-medical"></i> Recovery</div>';
+            html += '<div class="bt-live-badges" style="margin-bottom:6px;">';
+            html += chip(sc.phase.toUpperCase(), '#1a1b26', (phaseColor[sc.phase] || '#ff9e64'));
+            if (sc.deathLoop) html += chip('death loop', '#f7768e', 'rgba(247,118,142,0.15)');
+            if (sc.escalated) html += chip('graveyard port', '#bb9af7', 'rgba(187,154,247,0.15)');
+            html += '</div><div class="bt-live-rows">';
+            if (sc.deadForSec != null) html += liveRow('Dead for', secs(ageUp(sc.deadForSec)));
+            if (sc.rezInSec != null && sc.rezInSec > -3600) html += liveRow('Rez in', secs(ageDn(sc.rezInSec)));
+            html += liveRow('Relocate', sc.relocateDone ? 'done' : (sc.relocateSent ? 'in progress' : 'pending'));
+            html += liveRow('Heal', sc.healDone ? 'done' : 'pending');
+            html += '</div>';
+        } else if (sc.kind === 'vendor') {
+            html += '<div class="bt-live-card-h" style="color:#e0af68;"><i class="fa-solid fa-store"></i> Vendor errand</div>';
+            html += '<div class="bt-live-badges" style="margin-bottom:6px;">';
+            html += chip(sc.phase.toUpperCase(), '#1a1b26', '#e0af68');
+            if (sc.canRepair) html += chip('repairs', '#9ece6a', 'rgba(158,206,106,0.15)');
+            html += '</div><div class="bt-live-rows">';
+            html += liveRow('Vendor NPC', '#' + sc.npcEntry);
+            if (sc.startedSec != null) html += liveRow('Trip time', secs(ageUp(sc.startedSec)));
+            html += '</div>';
+        }
+
+        html += '</div>';
+        return html;
     }
 
     function renderDetailInner(s, brain) {
@@ -473,7 +855,7 @@ $(function () {
         html += '<div class="bt-section"><div class="bt-section-header"><span><i class="fa-solid fa-clock-rotate-left" style="color:var(--accent);margin-right:6px;"></i>Activity Timeline</span></div>';
         html += '<div class="bt-section-body"><div class="bt-timeline" id="timeline"></div></div></div>';
 
-        $('#detailPanel').html(html);
+        $('#detailTabBody').html(html);
         renderTimeline(selectedGuid);
     }
 
@@ -936,6 +1318,17 @@ $(function () {
         }
     });
 
+    // Detail-panel tab switching (Overview | Live)
+    $(document).on('click', '.bt-detail-tab', function () {
+        var t = $(this).data('dtab');
+        if (t === detailTab) return;
+        detailTab = t;
+        $('.bt-detail-tab').removeClass('active');
+        $(this).addClass('active');
+        renderActiveDetailTab();
+        ensureLivePoll();
+    });
+
     // ===================== COMMAND BAR =====================
 
     $('#cmdType').on('change', function () {
@@ -1334,6 +1727,58 @@ $(function () {
             '.bt-inv-count { position: absolute; bottom: 0; right: 0; background: rgba(0,0,0,0.8);' +
             '  color: #fff; font-size: 10px; font-weight: 700; line-height: 1; padding: 1px 3px;' +
             '  border-radius: 3px; min-width: 14px; text-align: center; pointer-events: none; }'
+        )
+        .appendTo('head');
+
+    // Live tab + detail tab styles
+    $('<style>')
+        .text(
+            '.bt-detail-tabs { display:flex;gap:0;border-bottom:1px solid var(--border-light,#414868);position:sticky;top:0;background:var(--bg-card,#1a1b26);z-index:2; }' +
+            '.bt-detail-tab { padding:9px 18px;font-size:12px;font-weight:600;color:var(--text-muted,#5f6b7a);cursor:pointer;border-bottom:2px solid transparent;text-transform:uppercase;letter-spacing:0.5px;user-select:none; }' +
+            '.bt-detail-tab:hover { color:var(--text-secondary,#a9b1d6); }' +
+            '.bt-detail-tab.active { color:var(--accent,#7aa2f7);border-bottom-color:var(--accent,#7aa2f7); }' +
+            '.bt-live-dot { display:inline-block;width:6px;height:6px;border-radius:50%;background:#9ece6a;margin-left:6px;vertical-align:middle;animation:btLivePulse 1.6s ease-in-out infinite; }' +
+            '@keyframes btLivePulse { 0%,100%{opacity:0.35;} 50%{opacity:1;} }' +
+            '#detailTabBody { padding:14px 16px; }' +
+            '.bt-live-banner { padding:10px 12px;background:var(--bg-card-alt,#24283b);border-radius:6px;margin-bottom:10px; }' +
+            '.bt-live-goal { font-size:17px;font-weight:800;letter-spacing:0.3px; }' +
+            '.bt-live-step { font-size:14px;font-weight:500;color:var(--text-secondary,#a9b1d6); }' +
+            '.bt-live-why { font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:var(--text-muted,#5f6b7a);margin-top:3px; }' +
+            '.bt-live-badges { margin-top:7px; }' +
+            '.bt-live-stats { display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap; }' +
+            '.bt-live-stat { flex:1;min-width:64px;background:var(--bg-card-alt,#24283b);border-radius:6px;padding:7px 4px;text-align:center; }' +
+            '.bt-live-stat-val { font-size:16px;font-weight:800;line-height:1.1; }' +
+            '.bt-live-stat-lbl { font-size:9px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted,#5f6b7a);margin-top:2px; }' +
+            '.bt-live-card { background:var(--bg-card-alt,#24283b);border:1px solid var(--border-light,#414868);border-radius:6px;padding:9px 11px;margin-bottom:9px; }' +
+            '.bt-live-card-h { font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-secondary,#a9b1d6);margin-bottom:7px; }' +
+            '.bt-live-card-h i { color:var(--accent,#7aa2f7);margin-right:5px; }' +
+            '.bt-live-wait { font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.5; }' +
+            '.bt-live-wait-cmd { color:var(--text-primary,#c0caf5);font-weight:700; }' +
+            '.bt-live-wait-evt { color:#7aa2f7;font-weight:700; }' +
+            '.bt-live-rows { display:flex;flex-direction:column;gap:3px; }' +
+            '.bt-live-row { display:flex;justify-content:space-between;font-size:12px; }' +
+            '.bt-live-row-lbl { color:var(--text-muted,#5f6b7a); }' +
+            '.bt-live-row-val { font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--text-primary,#c0caf5); }' +
+            '.bt-live-chips, .bt-live-badges { display:flex;flex-wrap:wrap;gap:4px; }' +
+            '.bt-live-qchip { font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px; }' +
+            '.bt-live-active { background:rgba(122,162,247,0.06);border:1px solid rgba(122,162,247,0.25);border-radius:5px;padding:8px 10px;margin-bottom:8px; }' +
+            '.bt-live-active-t { font-size:13px;font-weight:700;color:var(--text-primary,#c0caf5);margin-bottom:6px; }' +
+            '.bt-live-obj { font-size:12px;line-height:1.7;display:flex;align-items:center;gap:2px;flex-wrap:wrap; }' +
+            '.bt-live-obj i { color:var(--text-muted,#5f6b7a); }' +
+            '.bt-live-obj.active { background:rgba(224,175,104,0.10);border-radius:4px;padding:1px 5px;margin:1px -5px; }' +
+            '.bt-live-obj.active i { color:#e0af68; }' +
+            '.bt-live-obj-cnt { font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700; }' +
+            '.bt-live-obj-name { color:var(--text-secondary,#a9b1d6); }' +
+            '.bt-live-obj-dist { margin-left:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#7aa2f7;padding-left:8px; }' +
+            '.bt-live-qlist { display:flex;flex-direction:column;gap:1px; }' +
+            '.bt-live-qrow { display:flex;align-items:center;gap:6px;font-size:12px;padding:2px 4px;border-radius:3px; }' +
+            '.bt-live-qrow.active { background:rgba(115,218,202,0.10); }' +
+            '.bt-live-qid { font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--text-muted,#5f6b7a);font-size:11px; }' +
+            '.bt-live-qtitle { color:var(--text-secondary,#a9b1d6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }' +
+            '.bt-live-log { max-height:240px;overflow-y:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;background:rgba(0,0,0,0.25);border-radius:4px;padding:6px 8px; }' +
+            '.bt-live-logline { white-space:pre-wrap;word-break:break-word; }' +
+            '.bt-live-logt { color:var(--text-muted,#5f6b7a);margin-right:6px; }' +
+            '.bt-live-foot { font-size:10px;color:var(--text-muted,#5f6b7a);text-align:right;margin-top:2px; }'
         )
         .appendTo('head');
 

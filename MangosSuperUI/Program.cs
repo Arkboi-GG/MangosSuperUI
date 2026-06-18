@@ -13,6 +13,12 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Host.UseSystemd();  // ← sends watchdog heartbeats + handles SIGTERM gracefully
 
+// ---------- Brain log buffer (in-memory ring, fed to the Bots "Live" tab on demand) ----------
+var botLogBuffer = new BotLogBuffer();
+builder.Services.AddSingleton(botLogBuffer);
+builder.Logging.AddProvider(new BotLogBufferProvider(botLogBuffer));
+builder.Logging.AddFilter<BotLogBufferProvider>("MangosSuperUI", LogLevel.Debug);
+
 // ---------- Additional Config Source ----------
 builder.Configuration.AddJsonFile("server-config.json", optional: true, reloadOnChange: true);
 
@@ -122,6 +128,7 @@ await dbInit.InitializeAsync();
 
 
 await app.Services.GetRequiredService<QuestGraphLoader>().LoadAsync();
+await app.Services.GetRequiredService<ZoneSafetyMap>().LoadAsync();
 
 // ---------- Pipeline ----------
 if (!app.Environment.IsDevelopment())
