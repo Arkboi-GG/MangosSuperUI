@@ -124,11 +124,24 @@ public class ZoneDataLoader
     /// </summary>
     public NpcLocation? GetNearestVendor(int zoneId, int mapId, float x, float y, int botLevel = 60)
     {
-        if (!_vendorsByMap.TryGetValue(mapId, out var vendors))
+        if (!_vendorsByMap.TryGetValue(mapId, out var vendors) || vendors.Count == 0)
+        {
+            _logger.LogWarning("[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} → NULL: no vendors loaded on this map", zoneId, mapId, botLevel);
             return null;
+        }
 
         float maxDist = ZoneSafetyMap.GetMaxTravelDistance(botLevel, zoneId);
         float maxDistSq = maxDist * maxDist;
+
+        // Absolute closest on the map regardless of cap — so a cap-driven null can SAY how far
+        // the nearest vendor actually was vs the cap that rejected it (the candidate-1 tell).
+        NpcLocation? closest = null;
+        float closestDistSq = float.MaxValue;
+        foreach (var v in vendors)
+        {
+            float dsq = DistSq(v.X, v.Y, x, y);
+            if (dsq < closestDistSq) { closestDistSq = dsq; closest = v; }
+        }
 
         var inRange = vendors
             .Where(v => DistSq(v.X, v.Y, x, y) <= maxDistSq)
@@ -136,21 +149,39 @@ public class ZoneDataLoader
             .ToList();
 
         if (inRange.Count == 0)
+        {
+            _logger.LogWarning(
+                "[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} cap={Cap:F0}yd mapVendors={N} → NULL: nothing in range; CLOSEST {Name} (entry={Entry}) @ {Dist:F0}yd > cap",
+                zoneId, mapId, botLevel, maxDist, vendors.Count,
+                closest?.NpcName ?? "?", closest?.NpcEntry ?? 0,
+                closest != null ? MathF.Sqrt(closestDistSq) : -1f);
             return null;
+        }
 
         var nearest = inRange[0];
         float nearestDistSq = DistSq(nearest.X, nearest.Y, x, y);
 
         // If nearest can already repair, perfect
         if (nearest.CanRepair)
+        {
+            _logger.LogInformation(
+                "[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} cap={Cap:F0}yd mapVendors={N} inRange={R} → {Name} (entry={Entry}) @ {Dist:F0}yd repair=Y",
+                zoneId, mapId, botLevel, maxDist, vendors.Count, inRange.Count,
+                nearest.NpcName, nearest.NpcEntry, MathF.Sqrt(nearestDistSq));
             return nearest;
+        }
 
         // Look for a repair vendor within 1.5x the distance of the nearest vendor.
         // A bot shouldn't walk 3x as far just for repair, but a small detour is worth it.
         float repairThresholdSq = nearestDistSq * 2.25f; // 1.5x distance → 2.25x squared
         var nearestRepair = inRange.FirstOrDefault(v => v.CanRepair && DistSq(v.X, v.Y, x, y) <= repairThresholdSq);
+        var chosen = nearestRepair ?? nearest;
 
-        return nearestRepair ?? nearest;
+        _logger.LogInformation(
+            "[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} cap={Cap:F0}yd mapVendors={N} inRange={R} → {Name} (entry={Entry}) @ {Dist:F0}yd repair={Rep}",
+            zoneId, mapId, botLevel, maxDist, vendors.Count, inRange.Count,
+            chosen.NpcName, chosen.NpcEntry, MathF.Sqrt(DistSq(chosen.X, chosen.Y, x, y)), chosen.CanRepair ? "Y" : "N");
+        return chosen;
     }
 
     /// <summary>

@@ -3,6 +3,7 @@ using MangosSuperUI.Services;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Tracking;
 using Dapper;
+using System.Text.RegularExpressions;
 
 namespace MangosSuperUI.Controllers;
 
@@ -199,10 +200,229 @@ public class BotsController : Controller
     public IActionResult LiveLog(string? name, long after = 0)
     {
         var (lines, lastSeq) = _log.Query(name, after);
+        var list = lines.ToList();
+        var msgs = EnrichCreatureNames(list.Select(l => l.Message ?? "").ToList());
         return Json(new
         {
             lastSeq,
-            lines = lines.Select(l => new { seq = l.Seq, t = l.Utc, msg = l.Message })
+            lines = list.Select((l, i) => new { seq = l.Seq, t = l.Utc, msg = msgs[i] })
+        });
+    }
+
+    // ---- creature-name enrichment for the live log ----
+    // The KILL event (and friends) log creatures by number only — creature_entry /
+    // creature_guid (AIBOTAI_REFERENCE §SendKillEvent). "guid 38" tells you nothing on its
+    // own, so we resolve the number to a name here: entries via creature_template, spawn
+    // guids via creature→creature_template, appending " (Name)" after the token. Names are
+    // static, so resolutions are cached for the process lifetime — after warm-up the 2s
+    // poll hits the DB zero times. Bare entry/guid only resolve on a creature-context line
+    // so a bot/player guid never gets mislabelled; creature_entry/creature_guid always do.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> _creatureEntryNames = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, string> _creatureGuidNames = new();
+    private static readonly Regex _entryTok = new(@"\b(?<pre>creature_entry|c_entry|entry)\s*[=:]?\s*(?<n>\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex _guidTok = new(@"\b(?<pre>creature_guid|guid)\s*[=:]?\s*(?<n>\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex _creatureCtx = new(@"KILL|creature|\bmob\b|victim|loot|grind|\btag\b|attack|target|slay|objective", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private List<string> EnrichCreatureNames(List<string> msgs)
+    {
+        var needEntries = new HashSet<int>();
+        var needGuids = new HashSet<int>();
+        foreach (var msg in msgs)
+        {
+            bool ctx = _creatureCtx.IsMatch(msg);
+            foreach (Match m in _entryTok.Matches(msg))
+            {
+                var pre = m.Groups["pre"].Value.ToLowerInvariant();
+                if (pre == "entry" && !ctx) continue;                 // bare 'entry' needs creature context
+                if (int.TryParse(m.Groups["n"].Value, out var n) && !_creatureEntryNames.ContainsKey(n)) needEntries.Add(n);
+            }
+            foreach (Match m in _guidTok.Matches(msg))
+            {
+                var pre = m.Groups["pre"].Value.ToLowerInvariant();
+                if (pre == "guid" && !ctx) continue;                  // bare 'guid' needs creature context
+                if (int.TryParse(m.Groups["n"].Value, out var n) && !_creatureGuidNames.ContainsKey(n)) needGuids.Add(n);
+            }
+        }
+
+        if (needEntries.Count > 0 || needGuids.Count > 0)
+        {
+            try
+            {
+                using var conn = _db.Mangos();
+                if (needEntries.Count > 0)
+                {
+                    var rows = conn.Query("SELECT entry, name FROM creature_template WHERE entry IN @ids AND patch = 0",
+                        new { ids = needEntries });
+                    foreach (var r in rows) _creatureEntryNames[Convert.ToInt32(r.entry)] = (string)(r.name ?? "");
+                    foreach (var id in needEntries) _creatureEntryNames.TryAdd(id, "");   // negative cache (unknown id)
+                }
+                if (needGuids.Count > 0)
+                {
+                    var rows = conn.Query(@"SELECT c.guid AS guid, ct.name AS name
+                                            FROM creature c
+                                            JOIN creature_template ct ON ct.entry = c.id AND ct.patch = 0
+                                            WHERE c.guid IN @ids",
+                        new { ids = needGuids });
+                    foreach (var r in rows) _creatureGuidNames[Convert.ToInt32(r.guid)] = (string)(r.name ?? "");
+                    foreach (var id in needGuids) _creatureGuidNames.TryAdd(id, "");
+                }
+            }
+            catch { /* schema/DB hiccup → leave lines unenriched rather than break the feed */ }
+        }
+
+        var outList = new List<string>(msgs.Count);
+        foreach (var msg in msgs) outList.Add(RewriteCreatureLine(msg));
+        return outList;
+    }
+
+    private string RewriteCreatureLine(string msg)
+    {
+        bool ctx = _creatureCtx.IsMatch(msg);
+        msg = _guidTok.Replace(msg, m => DecorateCreature(m, ctx, true));
+        msg = _entryTok.Replace(msg, m => DecorateCreature(m, ctx, false));
+        return msg;
+    }
+
+    private string DecorateCreature(Match m, bool ctx, bool isGuid)
+    {
+        var pre = m.Groups["pre"].Value.ToLowerInvariant();
+        bool bare = isGuid ? (pre == "guid") : (pre == "entry");
+        if (bare && !ctx) return m.Value;
+        if (!int.TryParse(m.Groups["n"].Value, out var n)) return m.Value;
+        var map = isGuid ? _creatureGuidNames : _creatureEntryNames;
+        if (!map.TryGetValue(n, out var nm) || string.IsNullOrEmpty(nm)) return m.Value;
+        return m.Value + " (" + nm + ")";
+    }
+
+    // Quantized "what did this bot just do" report, computed over the in-memory log
+    // ring for ONE bot (the cocktail's bounded-output philosophy, on demand from the UI).
+    // Counts/distributions only — no raw dump. Category regexes mirror the live-log
+    // colorizer so the census keys off strings already proven live this session.
+    [HttpGet]
+    public IActionResult BotReport(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return Json(new { error = "name required" });
+
+        // Pull the WHOLE buffered window for this bot (Query defaults to max=200 — that cap
+        // is what made the report mirror only the visible log tail). int.MaxValue → the ring
+        // trims nothing; we get every line the buffer still holds for this name.
+        var (lines, _) = _log.Query(name, 0, int.MaxValue);
+        var rows = lines.ToList();
+        int total = rows.Count;
+
+        if (total == 0)
+            return Json(new { name, total = 0, empty = true });
+
+        DateTime firstUtc = rows[0].Utc, lastUtc = rows[^1].Utc;
+        foreach (var l in rows)
+        {
+            if (l.Utc < firstUtc) firstUtc = l.Utc;
+            if (l.Utc > lastUtc) lastUtc = l.Utc;
+        }
+        long spanSec = (long)Math.Max(0, (lastUtc - firstUtc).TotalSeconds);
+
+        // The FleetReport heartbeat names every bot in one line, so the per-bot name
+        // filter catches it here too. It's not a per-bot event — fold it out of the
+        // census/signatures (counted separately) so a single bot's real activity shows.
+        // Two shapes leak in: the per-bot census (repeats pick=) and the goals-rollup
+        // ("FLEET N bots @ … goals: Questing=…"). Catch both.
+        bool IsFleet(string? m)
+        {
+            if (string.IsNullOrEmpty(m)) return false;
+            if (Regex.IsMatch(m, @"\bFLEET\b", RegexOptions.IgnoreCase)) return true;
+            return Regex.Matches(m, "pick=").Count >= 2;
+        }
+        var fleetLines = rows.Count(r => IsFleet(r.Message));
+        var perBot = rows.Where(r => !IsFleet(r.Message)).ToList();
+
+        int Count(string pattern)
+        {
+            var re = new Regex(pattern, RegexOptions.IgnoreCase);
+            int n = 0;
+            foreach (var l in perBot) if (re.IsMatch(l.Message ?? "")) n++;
+            return n;
+        }
+
+        // Word-boundary KILL is deliberately strict (per BOT_RUN_DIAGNOSTICS).
+        int kills = Count(@"\bKILL\b");
+        int completions = Count(@"completed \[");
+        int rewarded = Count(@"\brewarded\b");
+        int grindFinished = Count(@"GRIND finished");
+        int levelUps = Count(@"LEVEL_UP");
+        int resurrects = Count(@"RESURRECT");
+        int deaths = Count(@"\bDEATH\b|\bDIED\b");
+        int relocates = Count(@"\brelocate\b");
+        int stalls = Count(@"\bSTALL");
+        int noPath = Count(@"no_path|MOVE_FAILED|PATHFIND_NOPATH");
+        int pathUnsafe = Count(@"PATH_UNSAFE");
+        int shelvings = Count(@"shelving \[|deferring");
+        int overflow = Count(@"overflow grind");
+        int questEvents = Count(@"\[QUEST\]|QUEST_|seeding|\bbatch\b");
+        int repairs = Count(@"\bREPAIR\b");
+        int sells = Count(@"\bSELL\b");
+
+        // Top repeated line signatures (≤12). Normalize: drop the leading bot name,
+        // collapse digit runs to '#', squeeze whitespace — so "KILL Kobold (3)" and
+        // "KILL Kobold (7)" fold into one signature with a count.
+        var sigCounts = new Dictionary<string, int>();
+        var nameRe = new Regex(@"^\s*" + Regex.Escape(name) + @"\b[:\s-]*", RegexOptions.IgnoreCase);
+        var numRe = new Regex(@"\d+");
+        var wsRe = new Regex(@"\s+");
+        foreach (var l in perBot)
+        {
+            var m = l.Message ?? "";
+            m = nameRe.Replace(m, "");
+            m = numRe.Replace(m, "#");
+            m = wsRe.Replace(m, " ").Trim();
+            if (m.Length > 90) m = m.Substring(0, 90);
+            if (m.Length == 0) continue;
+            sigCounts[m] = sigCounts.TryGetValue(m, out var c) ? c + 1 : 1;
+        }
+        var top = sigCounts
+            .OrderByDescending(kv => kv.Value)
+            .Take(12)
+            .Select(kv => new { sig = kv.Key, n = kv.Value })
+            .ToList();
+
+        return Json(new
+        {
+            name,
+            total,
+            botLines = perBot.Count,
+            fleetLines,
+            spanSec,
+            firstUtc,
+            lastUtc,
+            census = new
+            {
+                kills,
+                completions,
+                rewarded,
+                grindFinished,
+                levelUps,
+                resurrects,
+                deaths,
+                relocates,
+                stalls,
+                noPath,
+                pathUnsafe,
+                shelvings,
+                overflow,
+                questEvents,
+                repairs,
+                sells
+            },
+            // Health proxies straight out of BOT_RUN_DIAGNOSTICS:
+            //   kills vs completions  → tag-credit contention (Issue 5)
+            //   resurrects vs kills   → death-spiral (Issue 1)
+            health = new
+            {
+                killsVsCompletions = completions == 0 ? (kills > 0 ? "kills, 0 credit" : "idle") : $"{kills}k / {completions}c",
+                deathSpiral = kills > 0 && resurrects > kills,
+                rezPerKill = kills > 0 ? Math.Round((double)resurrects / kills, 2) : (double?)null
+            },
+            top
         });
     }
 

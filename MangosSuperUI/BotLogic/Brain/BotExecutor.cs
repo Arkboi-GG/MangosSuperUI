@@ -217,7 +217,7 @@ public sealed class BotExecutor
     // recovered via FirstBareSegment.
     // QUEST_STATUS_ALL payload (C++ BridgeHandleQueryQuestStatus):
     //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
-    // status: 1=INCOMPLETE, 3=COMPLETE. Empty payload = no active quests. Builds a
+    // status: COMPLETE=1, INCOMPLETE=3 (VMaNGOS enum — counterintuitive). Empty payload = no active quests. Builds a
     // fresh dictionary and returns it (caller ref-swaps ctx.QuestLog atomically).
     private static Dictionary<int, QuestLogEntry> ParseQuestLog(string? data)
     {
@@ -238,7 +238,16 @@ public sealed class BotExecutor
                 for (int i = 0; i < 4 && i < mc.Length; i++)
                     int.TryParse(mc[i].Trim(), out mob[i]);
             }
-            log[qid] = new QuestLogEntry { Status = status, MobCounts = mob };
+
+            var item = new int[4];
+            if (f.Length >= 4)
+            {
+                var ic = f[3].Split(',');
+                for (int i = 0; i < 4 && i < ic.Length; i++)
+                    int.TryParse(ic[i].Trim(), out item[i]);
+            }
+
+            log[qid] = new QuestLogEntry { Status = status, MobCounts = mob, ItemCounts = item };
         }
         return log;
     }

@@ -129,6 +129,11 @@ await dbInit.InitializeAsync();
 
 await app.Services.GetRequiredService<QuestGraphLoader>().LoadAsync();
 await app.Services.GetRequiredService<ZoneSafetyMap>().LoadAsync();
+// Vendor/innkeeper NPC cache — backs MaintenancePlanner.GetNearestVendor. Was registered
+// as a singleton but its LoadAsync was never invoked at boot, so _vendorsByMap stayed empty
+// and every vendor lookup returned null ("no vendors loaded on this map"). Load it here, same
+// as the other startup loaders.
+await app.Services.GetRequiredService<ZoneDataLoader>().LoadAsync();
 
 // ---------- Pipeline ----------
 if (!app.Environment.IsDevelopment())

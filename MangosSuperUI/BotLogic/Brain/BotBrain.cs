@@ -154,7 +154,14 @@ public sealed class BotBrain
     /// </summary>
     private async Task EnterGoalAsync(BotContext ctx, Goal goal)
     {
-        if (ctx.Goal == Goal.Grinding)
+        // Stop a leaving C++ grind patrol so the next goal can actually drive the bot. BOTH
+        // Grinding AND Questing run the autonomous C++ grind/objective patrol (an enriched
+        // MOVE_TO that travels then grinds in place). A fresh PLAIN MOVE_TO — e.g. the vendor
+        // route — does NOT cancel that in-place grind on the C++ side, so the bot keeps fighting
+        // its grind pocket and never travels (observed: a vendor route from Questing moved ~24yd
+        // in 120s while killing the same mobs, then tripped its leg deadline → giveup). SET_TASK
+        // IDLE clears the patrol; the new goal re-arms its own task in PlanNext.
+        if (ctx.Goal == Goal.Grinding || ctx.Goal == Goal.Questing)
             await _executor.IssueNoWaitAsync(ctx, IdleTask());   // stop the autonomous patrol
 
         ctx.SetGoal(goal, "enter");

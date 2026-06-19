@@ -197,8 +197,9 @@ public sealed class MaintenanceScratch
 // after a death/restart instead of re-accepting it (which C++ rejects → zombie).
 public sealed class QuestLogEntry
 {
-    public int Status { get; set; }                       // 1 = INCOMPLETE, 3 = COMPLETE (VMaNGOS QUEST_STATUS)
+    public int Status { get; set; }                       // VMaNGOS QUEST_STATUS — COMPLETE=1, INCOMPLETE=3 (counterintuitive; NONE=0, UNAVAILABLE=2)
     public int[] MobCounts { get; set; } = new int[4];    // per-slot kill counts, indexed by (QuestObjective.Slot - 1)
+    public int[] ItemCounts { get; set; } = new int[4];   // per-slot item counts, indexed by (QuestItemReq.Slot - 1)
 }
 
 // ----------------------------- Group (Phase 5) -----------------------------

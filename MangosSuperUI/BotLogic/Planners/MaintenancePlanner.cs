@@ -76,10 +76,18 @@ public sealed class MaintenancePlanner : IBotPlanner
     // EconomyDomain took the same singleton). Returns entry + coords + a CanRepair flag.
     private readonly ZoneDataLoader _zoneData;
 
-    public MaintenancePlanner(ZoneSafetyMap safetyMap, ZoneDataLoader zoneData)
+    // Injected: the [VENDOR] narration channel. The vendor errand used to die silent —
+    // GiveUp logged nothing and a 1-tick bags-full bounce never showed in the 30s
+    // FleetReport snapshot. This logs every stage (trigger / route / arrive+dist / sell /
+    // repair / finish / giveup) so one run says exactly where the loop drops. ILogger<T>
+    // is DI-resolved automatically — no Program.cs registration change.
+    private readonly ILogger<MaintenancePlanner> _log;
+
+    public MaintenancePlanner(ZoneSafetyMap safetyMap, ZoneDataLoader zoneData, ILogger<MaintenancePlanner> log)
     {
         _safetyMap = safetyMap;
         _zoneData = zoneData;
+        _log = log;
     }
 
     // Short "corpse-run" delay before rezzing: long enough for a leashing mob to
@@ -327,15 +335,29 @@ public sealed class MaintenancePlanner : IBotPlanner
         if (sv == null || sv.Phase == VendorPhase.None)
         {
             if (!NeedsVendor(ctx))
-                return StepResult.Complete();   // durability/slots already fine → release
+            {
+                _log.LogInformation("[VENDOR] {Name} release: NeedsVendor=false (bag={Bag} dur={Dur} cooldownUntil={CD})",
+                    ctx.Name, ctx.FreeSlots, ctx.Durability, ctx.Identity?.VendorCooldownUntil);
+                return StepResult.Complete();   // durability/slots already fine / on cooldown → release
+            }
+
+            // [VENDOR] point 1 — the trigger fired and we ENTERED the errand. This is the
+            // thing the 30s snapshot could never confirm: proof the vendor branch runs.
+            _log.LogInformation("[VENDOR] {Name} guid={Guid} trigger bag={Bag} dur={Dur} z={Zone} pos=({X:F0},{Y:F0})@{Map} lvl={Lvl}",
+                ctx.Name, ctx.Guid, ctx.FreeSlots, ctx.Durability, ctx.ZoneId, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.Level);
 
             var vendor = _zoneData.GetNearestVendor(ctx.ZoneId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y, ctx.Level);
             if (vendor == null)
-                return GiveUp(ctx, "no vendor in zone");
+                return GiveUp(ctx, "no vendor in zone");   // ZoneDataLoader logs the cap/closest that drove the null
 
             var target = new Vec4(vendor.X, vendor.Y, vendor.Z, vendor.MapId);
-            if (ctx.Pos.Dist2D(target.Pos) > VendorMaxTravelYards)
+            float startDist = ctx.Pos.Dist2D(target.Pos);
+            if (startDist > VendorMaxTravelYards)
+            {
+                _log.LogInformation("[VENDOR] {Name} nearest {Vendor} @ {Dist:F0}yd past policy cap {Cap:F0} → giveup",
+                    ctx.Name, vendor.NpcName, startDist, VendorMaxTravelYards);
                 return GiveUp(ctx, "nearest vendor past travel cap");
+            }
 
             sv = ctx.Service = new ServiceScratch
             {
@@ -346,6 +368,10 @@ public sealed class MaintenancePlanner : IBotPlanner
                 StartedUtc = DateTime.UtcNow
             };
             ctx.SetStep("vendor_route");
+            // [VENDOR] point 2 — route armed. NpcEntry/dist/repair lets the run show whether
+            // the chosen target is the convenient one or a far/interior pick.
+            _log.LogInformation("[VENDOR] {Name} route → {Vendor} (entry={Entry}) @ {Dist:F0}yd repair={Rep}",
+                ctx.Name, vendor.NpcName, vendor.NpcEntry, startDist, vendor.CanRepair);
             return MoveToVendor(sv);
         }
 
@@ -365,19 +391,39 @@ public sealed class MaintenancePlanner : IBotPlanner
     private StepResult RouteStep(BotContext ctx, ServiceScratch sv, WaitFailure? failure)
     {
         if (failure != null)
+        {
+            _log.LogInformation("[VENDOR] {Name} route FAILED reason={Reason} (target entry={Entry} @ ({TX:F0},{TY:F0})) → giveup",
+                ctx.Name, failure.Reason, sv.TargetNpcEntry, sv.TargetPos.X, sv.TargetPos.Y);
             return GiveUp(ctx, $"route {failure.Reason}");
+        }
 
-        if (ctx.Pos.Dist2D(sv.TargetPos.Pos) <= VendorArriveYards)
+        float dist = ctx.Pos.Dist2D(sv.TargetPos.Pos);
+
+        if (dist <= VendorArriveYards)
         {
             sv.Phase = VendorPhase.Sell;
             ctx.SetStep("vendor_sell");
+            // [VENDOR] point 3 — arrived. The arrival distance vs the 15yd gate is the whole
+            // ballgame for "reached the vendor but never sold": if we only ever log this with
+            // dist hugging the gate, the bot is squeaking in; if we NEVER log it, see the
+            // 'never arrived' line below for the closest approach it managed.
+            _log.LogInformation("[VENDOR] {Name} ARRIVED dist={Dist:F1}yd (gate {Gate}) → SELL_ITEMS entry={Entry} keepQ={Q} bag={Bag} dur={Dur}",
+                ctx.Name, dist, VendorArriveYards, sv.TargetNpcEntry, SellKeepQuality, ctx.FreeSlots, ctx.Durability);
             var cmd = new BridgeCommand("SELL_ITEMS", new { npc_entry = sv.TargetNpcEntry, keep_quality = SellKeepQuality });
             return StepResult.Send(cmd, "SELL_ACK", TimeSpan.FromSeconds(VendorAckDeadlineSec));
         }
 
         if ((DateTime.UtcNow - sv.StartedUtc).TotalSeconds > VendorRouteGiveupSec)
+        {
+            _log.LogInformation("[VENDOR] {Name} NEVER ARRIVED — closest approach {Dist:F1}yd (gate {Gate}) after {Sec:F0}s (target entry={Entry}) → giveup",
+                ctx.Name, dist, VendorArriveYards, (DateTime.UtcNow - sv.StartedUtc).TotalSeconds, sv.TargetNpcEntry);
             return GiveUp(ctx, "never arrived");
+        }
 
+        // Still en route — capped MovePoint completes short, send another leg. Logging the
+        // per-leg distance shows whether the bot is closing on the vendor or stuck off it.
+        _log.LogInformation("[VENDOR] {Name} route leg done dist={Dist:F1}yd > gate {Gate} → another MOVE_TO ({Sec:F0}s/{Budget:F0}s)",
+            ctx.Name, dist, VendorArriveYards, (DateTime.UtcNow - sv.StartedUtc).TotalSeconds, VendorRouteGiveupSec);
         return MoveToVendor(sv);   // another leg toward the vendor
     }
 
@@ -385,6 +431,11 @@ public sealed class MaintenancePlanner : IBotPlanner
     // gear may be wrecked from deaths — else finish.
     private StepResult SellStep(BotContext ctx, ServiceScratch sv)
     {
+        // [VENDOR] point 4 — SELL_ACK (or its 30s deadline) landed. bag AFTER the sell is the
+        // tell for "vendored but freed nothing" (all-protected / all-kept-quality bags): if
+        // bag is still 0 here, the sell ran but didn't help → the bot re-triggers after cooldown.
+        _log.LogInformation("[VENDOR] {Name} SELL done bag={Bag} dur={Dur} canRepair={Rep} → {Next}",
+            ctx.Name, ctx.FreeSlots, ctx.Durability, sv.CanRepair, sv.CanRepair ? "REPAIR_AT_NPC" : "finish");
         if (sv.CanRepair)
         {
             sv.Phase = VendorPhase.Repair;
@@ -409,6 +460,11 @@ public sealed class MaintenancePlanner : IBotPlanner
         if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorDoneCooldownSec);
         ctx.Service = null;
         ctx.SetStep("vendor_done");
+        // [VENDOR] point 5 — reached the END of the errand cleanly. If bag is STILL 0 / dur
+        // still low here, the trip completed but accomplished nothing (→ it'll re-trigger
+        // after the done-cooldown). This is the success path's narration.
+        _log.LogInformation("[VENDOR] {Name} FINISH (done cooldown {Sec}s) bag={Bag} dur={Dur}",
+            ctx.Name, VendorDoneCooldownSec, ctx.FreeSlots, ctx.Durability);
         return StepResult.Complete();
     }
 
@@ -419,6 +475,12 @@ public sealed class MaintenancePlanner : IBotPlanner
         if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorGiveupCooldownSec);
         ctx.Service = null;
         ctx.SetStep($"vendor_giveup:{why}");
+        // [VENDOR] point 6 — THE silent killer, now loud. This is the line that was never
+        // emitted before: every reason the errand bails (no vendor / past cap / route
+        // failure / never arrived) lands here with the cooldown it just set, so the next run
+        // says exactly WHY the loop never reaches the end. Warning level so it can't be missed.
+        _log.LogWarning("[VENDOR] {Name} GIVEUP why='{Why}' (cooldown {Sec}s) bag={Bag} dur={Dur} z={Zone} pos=({X:F0},{Y:F0})@{Map} lvl={Lvl}",
+            ctx.Name, why, VendorGiveupCooldownSec, ctx.FreeSlots, ctx.Durability, ctx.ZoneId, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.Level);
         return StepResult.Complete();
     }
 

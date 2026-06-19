@@ -77,6 +77,11 @@ $(function () {
     var liveScaffoldGuid = null;  // guid the live DOM scaffold was built for
     var liveLogTimer = null;      // 2s per-bot log poll
     var liveLogSeq = 0;           // last-seen log sequence cursor
+    var liveQuestTimer = null;    // 4s per-bot server quest-status poll
+    var liveQuestMap = {};        // questId → server queststatus row (authoritative kill credit)
+    var liveQuestGuid = null;     // guid liveQuestMap belongs to
+    var liveLastFleetAt = 0;      // wall-clock of last fleet heartbeat shown in this bot's log
+    var FLEET_MIN_MS = 90000;     // show the fleet census at most once per ~90s per bot
 
     // ===================== SIGNALR =====================
     function initConnection() {
@@ -405,12 +410,16 @@ $(function () {
         if (liveGuid !== selectedGuid) {
             liveData = null; liveGuid = selectedGuid;
             liveLogSeq = 0; liveScaffoldGuid = null;
+            liveQuestMap = {}; liveQuestGuid = null;
+            liveLastFleetAt = 0;
         }
         stopLivePoll();
         fetchLive();                                  // immediate
         fetchLiveLog();                               // immediate log pull
+        fetchLiveQuestStatus();                       // immediate server quest credit pull
         livePollTimer = setInterval(fetchLive, 5000); // server refresh
         liveLogTimer = setInterval(fetchLiveLog, 2000); // log feed
+        liveQuestTimer = setInterval(fetchLiveQuestStatus, 4000); // server kill-credit truth
         liveTickTimer = setInterval(function () {     // client-side age ticking between polls
             if (detailTab === 'live' && selectedGuid && liveData) renderLiveTab(botStates[selectedGuid]);
         }, 1000);
@@ -427,6 +436,7 @@ $(function () {
         if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
         if (liveTickTimer) { clearInterval(liveTickTimer); liveTickTimer = null; }
         if (liveLogTimer) { clearInterval(liveLogTimer); liveLogTimer = null; }
+        if (liveQuestTimer) { clearInterval(liveQuestTimer); liveQuestTimer = null; }
     }
 
     function fetchLive() {
@@ -461,8 +471,21 @@ $(function () {
                 var el = $box[0];
                 var nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 48;
                 var add = '';
-                for (var i = 0; i < data.lines.length; i++) add += logLineHtml(data.lines[i]);
-                $box.append(add);
+                for (var i = 0; i < data.lines.length; i++) {
+                    var ln = data.lines[i];
+                    // The FleetReport heartbeat names every bot, so the server's name filter
+                    // hands it to this single-bot feed every tick. Keep it (it's a useful
+                    // fleet pulse) but throttle to ~once/90s so it can't bury this bot's lines.
+                    if (isFleetLine(ln.msg)) {
+                        var now = Date.now();
+                        if (now - liveLastFleetAt < FLEET_MIN_MS) continue;
+                        liveLastFleetAt = now;
+                        add += logLineHtml(ln, true);
+                    } else {
+                        add += logLineHtml(ln);
+                    }
+                }
+                if (add) $box.append(add);
                 var kids = $box.children();
                 if (kids.length > 400) kids.slice(0, kids.length - 400).remove();
                 if (nearBottom) el.scrollTop = el.scrollHeight;
@@ -471,7 +494,74 @@ $(function () {
         });
     }
 
-    function logLineHtml(l) {
+    // Pull the authoritative kill credit (character_queststatus.mob_count*) for the
+    // watched bot. The live BotContext objective `have` has NO per-kill feed — C++ only
+    // emits QUEST_UPDATE on accept/reward/abandon (AIBOTAI_REFERENCE §SendQuestUpdateEvent)
+    // — so the spine's projected count sits at its seed (0) until turn-in. The DB count is
+    // ground truth, and surfacing it makes "0/10 but it's killing" self-diagnosing: if the
+    // server count is also 0 while kills land, that's the tag-credit bug, not a display gap.
+    function fetchLiveQuestStatus() {
+        if (!selectedGuid || !connected || detailTab !== 'live') return;
+        var g = selectedGuid;
+        $.getJSON('/Bots/QuestStatus', { guid: g }, function (data) {
+            if (selectedGuid !== g || detailTab !== 'live') return;
+            if (!data || data.error || !data.quests) return;
+            var map = {};
+            for (var i = 0; i < data.quests.length; i++) map[data.quests[i].questId] = data.quests[i];
+            liveQuestMap = map;
+            liveQuestGuid = g;
+            if (liveData) renderLiveTab(botStates[g]);
+        });
+    }
+
+    // index of the n-th (0-based) non-zero entry in a required-count array, or -1
+    function nthNonzero(arr, n) {
+        if (!arr) return -1;
+        var seen = 0;
+        for (var i = 0; i < arr.length; i++) {
+            if (arr[i] > 0) { if (seen === n) return i; seen++; }
+        }
+        return -1;
+    }
+
+    // Map one live objective to its authoritative server slot. killIdx/itemIdx are the
+    // running per-kind ordinals so the k-th kill objective pairs with the k-th non-zero
+    // mob slot — exact for single-objective quests, best-effort (positional) otherwise.
+    function serverObjFor(questId, o, killIdx, itemIdx) {
+        var row = liveQuestMap[questId];
+        if (!row) return null;
+        if (o.kind === 'kill') {
+            var slot = nthNonzero(row.mobRequired, killIdx);
+            if (slot < 0) return null;
+            return { have: row.mobCounts[slot], need: row.mobRequired[slot], status: row.status };
+        }
+        if (o.kind === 'gather') {
+            var s2 = nthNonzero(row.itemRequired, itemIdx);
+            if (s2 < 0) return null;
+            return { have: row.itemCounts[s2], need: row.itemRequired[s2], status: row.status };
+        }
+        return null;
+    }
+
+    function reEscape(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+    function wholeWord(hay, word) {
+        if (!word) return false;
+        return new RegExp('\\b' + reEscape(word) + '\\b').test(hay);
+    }
+    // A fleet heartbeat names many bots in one line. Detect it from the live roster:
+    // ≥3 bot names is unambiguous; ≥2 names plus a census token catches small fleets
+    // without flagging an ordinary grouping/assist line that merely mentions one ally.
+    function isFleetLine(m) {
+        if (!m) return false;
+        var seen = 0;
+        for (var g in botStates) {
+            var nm = botStates[g] && botStates[g].name;
+            if (nm && wholeWord(m, nm)) { seen++; if (seen >= 3) return true; }
+        }
+        return seen >= 2 && /pick=|av=|why=/.test(m);
+    }
+
+    function logLineHtml(l, isFleet) {
         var t = '';
         try { t = new Date(l.t).toLocaleTimeString(); } catch (e) { t = ''; }
         var m = l.msg || '';
@@ -481,7 +571,8 @@ $(function () {
         else if (/RESURRECT|RESPAWN|DEATH|relocate|heal|graveyard|REPAIR|SELL/i.test(m)) c = '#ff9e64';
         else if (/\[QUEST\]|batch|seeding|QUEST_/i.test(m)) c = '#7aa2f7';
         else if (/KILL/i.test(m)) c = 'var(--text-muted)';
-        return '<div class="bt-live-logline"><span class="bt-live-logt">' + t + '</span> ' +
+        var tag = isFleet ? '<span class="bt-live-fleet-tag" title="fleet heartbeat (throttled to ~90s)">fleet</span> ' : '';
+        return '<div class="bt-live-logline">' + tag + '<span class="bt-live-logt">' + t + '</span> ' +
             '<span style="color:' + c + ';">' + esc(m) + '</span></div>';
     }
 
@@ -522,6 +613,210 @@ $(function () {
             '<span class="bt-live-obj-name">' + esc(npc.name || '?') + '</span>' + distTag(d, npc) + '</div>';
     }
 
+    // ===================== "RIGHT NOW" NARRATIVE =====================
+    // The payload has goal/step/pending/target/scratch/timers but makes you fuse them in
+    // your head. These helpers synthesize a plain-English story: what the bot is doing,
+    // where it's going (the MOVE_TO target, named by matching the driven-to coords to the
+    // scratch's known waypoints), why, and what to watch for next.
+
+    // Objectives augmented with the server-authoritative kill credit (same override the
+    // objective panel uses), so the story's progress matches what's shown below it.
+    function objsWithServerHave(aq) {
+        var out = [], killIdx = 0, itemIdx = 0;
+        if (!aq || !aq.objectives) return out;
+        for (var i = 0; i < aq.objectives.length; i++) {
+            var o = aq.objectives[i];
+            var srv = serverObjFor(aq.id, o, killIdx, itemIdx);
+            if (o.kind === 'kill') killIdx++; else if (o.kind === 'gather') itemIdx++;
+            out.push({
+                name: o.name, kind: o.kind, from: o.from, x: o.x, y: o.y, map: o.map, active: o.active,
+                have: (srv != null) ? srv.have : o.have,
+                need: (srv != null && srv.need > 0) ? srv.need : o.need
+            });
+        }
+        return out;
+    }
+
+    // Named, located waypoints the spine knows from the active scratch.
+    function liveWaypoints(d) {
+        var pts = [], sc = d.scratch;
+        if (!sc) return pts;
+        if (sc.kind === 'quest' && sc.active) {
+            var aq = sc.active;
+            if (aq.objectives) for (var i = 0; i < aq.objectives.length; i++) {
+                var o = aq.objectives[i];
+                // For a gather-from-creature objective the bot drives to the SOURCE creature,
+                // so name that (with the item as context) rather than the item itself.
+                var lbl = (o.kind === 'gather' && o.from) ? (o.from + ' (for ' + o.name + ')') : o.name;
+                pts.push({ label: lbl, kind: 'objective', active: !!o.active, x: o.x, y: o.y, map: o.map });
+            }
+            if (aq.giver) pts.push({ label: aq.giver.name, kind: 'giver', x: aq.giver.x, y: aq.giver.y, map: aq.giver.map });
+            if (aq.turnIn) pts.push({ label: aq.turnIn.name, kind: 'turnin', x: aq.turnIn.x, y: aq.turnIn.y, map: aq.turnIn.map });
+        } else if (sc.kind === 'vendor' && sc.target) {
+            pts.push({ label: sc.canRepair ? 'repair vendor' : 'vendor', kind: 'vendor', x: sc.target.x, y: sc.target.y, map: sc.target.map });
+        } else if (sc.kind === 'grind' && sc.center) {
+            pts.push({ label: 'grind area', kind: 'grind', x: sc.center.x, y: sc.center.y, map: sc.center.map });
+        }
+        return pts;
+    }
+
+    // Name the current MOVE_TO destination by matching driven-to coords to a waypoint;
+    // nearest wins (target IS the dest coord, so the match is near-exact). Falls back to
+    // objective-grind/step hints, else null (caller shows coords).
+    function liveDest(d) {
+        var t = d.target, pts = liveWaypoints(d);
+        if (t) {
+            var best = null, bestD = Infinity;
+            for (var i = 0; i < pts.length; i++) {
+                var p = pts[i];
+                if (p.map !== t.map) continue;
+                var dx = p.x - t.x, dy = p.y - t.y, dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < bestD) { bestD = dist; best = p; }
+            }
+            if (best && bestD <= 25) return { label: best.label, kind: best.kind };
+        }
+        if (d.pending && d.pending.isObjectiveGrind) {
+            for (var j = 0; j < pts.length; j++) if (pts[j].kind === 'objective' && pts[j].active) return { label: pts[j].label, kind: 'objective' };
+            for (var k = 0; k < pts.length; k++) if (pts[k].kind === 'objective') return { label: pts[k].label, kind: 'objective' };
+        }
+        var st = (d.step || '').toLowerCase();
+        if (/accept|giver/.test(st)) for (var a = 0; a < pts.length; a++) if (pts[a].kind === 'giver') return pts[a];
+        if (/turnin/.test(st)) for (var b = 0; b < pts.length; b++) if (pts[b].kind === 'turnin') return pts[b];
+        return null;
+    }
+
+    function humanWhy(w) {
+        if (!w) return '';
+        if (/^in-quest/.test(w)) return 'already mid-quest';
+        if (/graph-loading/.test(w)) return 'quest graph still loading';
+        if (/no-identity/.test(w)) return 'no identity assigned yet';
+        var m = w.match(/q av=(\d+) pick=(\d+)/);
+        if (m) return 'picked from ' + m[1] + ' available quest' + (m[1] === '1' ? '' : 's');
+        return w;
+    }
+
+    function composeStory(d) {
+        var sc = d.scratch || {};
+        var dest = liveDest(d);
+
+        // ---- DOING ----
+        var doing;
+        if (d.dead || sc.kind === 'maintenance') {
+            var ph = sc.phase || '';
+            doing = ph === 'resurrecting' ? 'Resurrecting'
+                : ph === 'relocate' ? 'Walking back from the graveyard'
+                : ph === 'heal' ? 'Healing up after a death'
+                : ph === 'rez-wait' ? 'Dead — waiting to resurrect'
+                : 'Recovering from a death';
+        } else if (sc.kind === 'vendor') {
+            doing = sc.canRepair ? 'On a repair/vendor run' : 'On a vendor run';
+        } else if (d.goal === 'Questing') {
+            var st = (d.step || '').toLowerCase();
+            doing = /objective/.test(st) ? 'Working a quest objective'
+                : /accept|giver/.test(st) ? 'Going to pick up a quest'
+                : /turnin/.test(st) ? 'Going to turn in a quest'
+                : 'Questing';
+        } else if (d.goal === 'Grinding') doing = 'Grinding mobs';
+        else if (d.goal === 'Training') doing = 'Training new skills';
+        else if (d.goal === 'Following') doing = 'Following the group';
+        else if (d.goal === 'Idle') doing = (d.why && d.why !== 'idle') ? 'Idle — about to pick its next move' : 'Idle';
+        else doing = d.goal;
+        if (d.inCombat) doing += ' (fighting right now)';
+
+        // ---- GOING TO ----
+        var going;
+        if (d.pending) {
+            var p = d.pending;
+            if (p.cmd === 'MOVE_TO') {
+                var where = dest ? dest.label : 'a waypoint';
+                var dist = (d.distToTarget != null) ? (', ' + d.distToTarget + 'y out') : '';
+                going = 'heading to <b>' + esc(where) + '</b>' + dist + (p.isObjectiveGrind ? ' to grind it down' : '');
+            } else if (p.cmd === 'QUEST_INTERACT') {
+                going = 'talking to <b>' + esc(dest ? dest.label : 'the questgiver') + '</b>';
+            } else if (p.cmd === 'SET_TASK') going = 'grinding in place';
+            else if (p.cmd === 'TAKE_FLIGHT') going = 'taking a flight path';
+            else going = esc(p.cmd) + ', waiting on ' + esc(p.expect);
+        } else {
+            going = 'between commands — deciding what to do next';
+        }
+
+        // ---- WHY ----
+        var why = null;
+        if (sc.kind === 'quest' && sc.active) {
+            var aq = sc.active;
+            var objs = objsWithServerHave(aq);
+            var ao = null;
+            for (var i = 0; i < objs.length; i++) if (objs[i].active) { ao = objs[i]; break; }
+            if (!ao && objs.length) ao = objs[0];
+            var prog = '';
+            if (ao && ao.have != null && ao.need) prog = ' — ' + ao.have + '/' + ao.need + ' ' + esc(ao.name);
+            else if (ao) prog = ' — needs ' + esc(ao.name);
+            why = 'For <b>' + esc(aq.title || ('#' + aq.id)) + '</b> (#' + aq.id + ')' + prog;
+            if (sc.count > 1) {
+                var done = 0, deferred = 0, failed = 0;
+                for (var b = 0; b < sc.batch.length; b++) {
+                    if (sc.batch[b].turnedIn) done++; else if (sc.batch[b].deferred) deferred++; else if (sc.batch[b].failed) failed++;
+                }
+                var ex = [];
+                if (done) ex.push(done + ' done');
+                if (deferred) ex.push(deferred + ' deferred');
+                if (failed) ex.push(failed + ' failed');
+                why += '. Quest ' + (sc.activeSlot + 1) + ' of ' + sc.count + ' in the batch' + (ex.length ? ' (' + ex.join(', ') + ')' : '');
+            } else {
+                why += '. Only quest in the batch right now';
+            }
+        } else if (sc.kind === 'grind') {
+            why = 'Grinding ' + (sc.creatureEntry ? 'creature #' + sc.creatureEntry : 'nearby mobs') +
+                (sc.killGoal > 0 ? ' — ' + sc.killCount + '/' + sc.killGoal + ' killed' : ' to level up / earn gold');
+        } else if (sc.kind === 'vendor') {
+            why = sc.canRepair ? 'Gear durability or bags need attention' : 'Bags need clearing';
+        } else if (sc.kind === 'maintenance') {
+            why = 'It died' + (sc.deathLoop ? ' repeatedly (death loop)' : '') + ' and must recover before doing anything else';
+        } else if (d.why) {
+            why = 'Reason: ' + esc(humanWhy(d.why));
+        }
+
+        // ---- WATCH NEXT ----
+        var next = [];
+        if (sc.kind === 'maintenance') {
+            if (sc.rezInSec != null && sc.rezInSec > 0) next.push('resurrects in ~' + ageDn(sc.rezInSec) + 's');
+            if (sc.deathLoop) next.push('death loop — will escalate to a graveyard port');
+            else if (sc.phase === 'relocate') next.push('then walks back to where it died');
+        }
+        if (sc.kind === 'quest' && sc.active) {
+            var oo = objsWithServerHave(sc.active), allDone = true, anyKill = false;
+            for (var i2 = 0; i2 < oo.length; i2++) {
+                var o2 = oo[i2];
+                if (o2.have != null && o2.need) {
+                    anyKill = true;
+                    if (o2.have < o2.need) { allDone = false; var rem = o2.need - o2.have; if (rem <= 3) next.push(rem + ' more ' + esc(o2.name) + ' to go'); }
+                }
+            }
+            if (anyKill && allDone) next.push('objective done — heading to turn in' + (sc.active.turnIn ? ' to ' + esc(sc.active.turnIn.name) : ''));
+        }
+        var np = ageUp(d.noProgressSec);
+        if (np != null && np >= 30 && !d.dead) next.push('no progress for ' + np + 's — reselects if it passes ~120s');
+        if (d.failure && ageUp(d.failure.ageSec) < 60) next.push('last move failed (' + esc(d.failure.reason) + ') — recovering');
+        if (d.freeSlots <= 2) next.push('bags almost full — vendor run likely soon');
+        if (d.durability < 30) next.push('durability low — repair trip likely soon');
+        var dl2 = d.pending ? ageDn(d.pending.secsToDeadline) : null;
+        if (dl2 != null && dl2 <= 30 && dl2 > -3600) next.push('command deadline in ' + dl2 + 's');
+
+        return { doing: doing, going: going, why: why, next: next };
+    }
+
+    function renderStoryCard(d) {
+        var s = composeStory(d);
+        var html = '<div class="bt-live-card bt-story">';
+        html += '<div class="bt-live-card-h"><i class="fa-solid fa-book-open"></i> Right now</div>';
+        html += '<div class="bt-story-lead">' + s.doing + ' · ' + s.going + '.</div>';
+        if (s.why) html += '<div class="bt-story-why">' + s.why + '.</div>';
+        if (s.next && s.next.length)
+            html += '<div class="bt-story-next"><span class="bt-story-next-h">Next</span> ' + s.next.slice(0, 3).join(' &nbsp;·&nbsp; ') + '</div>';
+        html += '</div>';
+        return html;
+    }
+
     function renderLiveTab(s) {
         var $body = $('#detailTabBody');
         if ($body.length === 0) return;
@@ -552,6 +847,9 @@ $(function () {
         html += chip('zone ' + d.zoneId + ' · map ' + d.mapId, 'var(--text-muted)', 'rgba(255,255,255,0.04)');
         html += '</div></div>';
 
+        // --- "Right now" narrative (synthesizes the state below into plain English) ---
+        html += renderStoryCard(d);
+
         // --- Vitals strip ---
         var durColor = d.durability < 30 ? '#f7768e' : (d.durability < 60 ? '#e0af68' : '#9ece6a');
         var bagColor = d.freeSlots <= 0 ? '#f7768e' : (d.freeSlots <= 2 ? '#e0af68' : '#9ece6a');
@@ -572,7 +870,9 @@ $(function () {
             var dlColor = dl == null ? 'var(--text-muted)' : (dl > 60 ? '#9ece6a' : (dl > 15 ? '#e0af68' : '#f7768e'));
             html += '<div class="bt-live-wait">';
             html += '<span class="bt-live-wait-cmd">' + esc(d.pending.cmd) + '</span>';
-            html += ' <span style="color:var(--text-muted);">→ waiting</span> ';
+            var pdest = liveDest(d);
+            if (pdest) html += ' <span style="color:var(--text-muted);">→</span> <span class="bt-live-wait-dest">' + esc(pdest.label) + '</span>';
+            html += ' <span style="color:var(--text-muted);">· waiting</span> ';
             html += '<span class="bt-live-wait-evt">' + esc(d.pending.expect) + '</span>';
             html += ' <span style="color:var(--text-muted);">(' + secs(age) + ')</span>';
             html += '<span style="float:right;color:' + dlColor + ';font-weight:700;">deadline ' + secs(dl) + '</span>';
@@ -625,12 +925,16 @@ $(function () {
 
         // Lay the scaffold once per bot so the log panel (appended incrementally by the
         // 2s poll) survives the 1s state re-render. Then update only the state region.
-        if (liveScaffoldGuid !== selectedGuid) {
+        // Rebuild also when the scaffold node is gone — switching to Overview overwrites
+        // #detailTabBody, so returning to Live for the SAME bot finds no #liveState to fill.
+        if (liveScaffoldGuid !== selectedGuid || $('#liveState').length === 0) {
             $body.html(
                 '<div id="liveState"></div>' +
                 '<div class="bt-live-card" id="liveLogCard">' +
                 '<div class="bt-live-card-h"><i class="fa-solid fa-terminal"></i> Live log ' +
-                '<span id="liveLogMeta" style="font-weight:400;color:var(--text-muted);"></span></div>' +
+                '<span id="liveLogMeta" style="font-weight:400;color:var(--text-muted);"></span>' +
+                '<button id="btnBotReport" class="bt-report-btn" title="Quantized report from this bot\'s buffered log">' +
+                '<i class="fa-solid fa-bolt"></i> Report</button></div>' +
                 '<div id="liveLogBox" class="bt-live-log"></div>' +
                 '</div>');
             liveScaffoldGuid = selectedGuid;
@@ -662,17 +966,33 @@ $(function () {
                     ' <span style="color:var(--text-muted);font-weight:400;">#' + aq.id + (aq.level ? ' · L' + aq.level : '') + '</span></div>';
 
                 if (aq.objectives && aq.objectives.length) {
+                    var killIdx = 0, itemIdx = 0;
                     for (var oi = 0; oi < aq.objectives.length; oi++) {
                         var o = aq.objectives[oi];
                         var icon = o.kind === 'kill' ? 'fa-khanda' : (o.kind === 'gather' ? 'fa-hand-holding' : 'fa-hand-pointer');
-                        var done = (o.have != null && o.need > 0 && o.have >= o.need);
-                        var cnt = (o.have != null) ? (o.have + '/' + o.need) : ('×' + o.need);
+
+                        // Authoritative server kill credit overrides the spine's un-fed `have`
+                        // (no per-kill QUEST_UPDATE → projected count sticks at its seed).
+                        var srv = serverObjFor(aq.id, o, killIdx, itemIdx);
+                        if (o.kind === 'kill') killIdx++; else if (o.kind === 'gather') itemIdx++;
+                        var have = (srv != null) ? srv.have : o.have;
+                        var need = (srv != null && srv.need > 0) ? srv.need : o.need;
+
+                        var done = (have != null && need > 0 && have >= need);
+                        var cnt = (have != null) ? (have + '/' + need) : ('×' + need);
                         var cntColor = done ? '#9ece6a' : (o.active ? '#e0af68' : 'var(--text-secondary)');
                         html += '<div class="bt-live-obj' + (o.active ? ' active' : '') + '">';
                         html += '<i class="fa-solid ' + icon + '" style="width:14px;"></i> ';
                         html += '<span class="bt-live-obj-cnt" style="color:' + cntColor + ';">' + cnt + '</span> ';
+                        if (srv != null) html += '<span class="bt-live-obj-srv" title="live server kill credit (character_queststatus.mob_count)">srv</span> ';
                         html += '<span class="bt-live-obj-name">' + esc(o.name) + '</span>';
                         if (o.kind === 'gather' && o.from) html += ' <span style="color:var(--text-muted);">from ' + esc(o.from) + '</span>';
+                        // No-credit flag: actively grinding this kill, killed in the last 90s,
+                        // server credit still 0 → real tag-credit contention, not a display gap.
+                        if (o.kind === 'kill' && o.active && srv != null && have === 0 && need > 0 &&
+                            d.lastKillSec != null && ageUp(d.lastKillSec) < 90) {
+                            html += ' ' + chip('no quest credit', '#ff9e64', 'rgba(255,158,100,0.15)');
+                        }
                         html += distTag(d, o);
                         html += '</div>';
                     }
@@ -1508,6 +1828,89 @@ $(function () {
         loadModalTab(tab);
     });
 
+    // ===================== BOT REPORT (quantized, on-the-spot) =====================
+    // Pulls /Bots/BotReport for the watched bot and renders a bounded, counts-only
+    // snapshot of what that one bot's buffered log shows — the cocktail, on demand.
+
+    $('body').append(
+        '<div class="br-overlay" id="botReportModal">' +
+        '<div class="br-modal">' +
+        '<div class="br-header"><span id="brTitle"><i class="fa-solid fa-bolt"></i> Bot report</span>' +
+        '<button class="br-close" id="brClose"><i class="fa-solid fa-xmark"></i></button></div>' +
+        '<div class="br-body" id="brBody"></div>' +
+        '</div></div>'
+    );
+    $('#brClose').on('click', function () { $('#botReportModal').removeClass('active'); });
+    $('#botReportModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
+    $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#botReportModal').removeClass('active'); });
+
+    $(document).on('click', '#btnBotReport', function (e) {
+        e.stopPropagation();
+        openBotReport();
+    });
+
+    function openBotReport() {
+        var g = selectedGuid;
+        var st = g ? botStates[g] : null;
+        if (!st || !st.name) return;
+        $('#brTitle').html('<i class="fa-solid fa-bolt"></i> Report — ' + esc(st.name));
+        $('#brBody').html('<div class="br-loading"><i class="fa-solid fa-spinner fa-spin"></i> reading buffered log…</div>');
+        $('#botReportModal').addClass('active');
+        $.getJSON('/Bots/BotReport', { name: st.name }, function (data) {
+            if (!data || data.error) { $('#brBody').html('<div class="br-loading">' + esc((data && data.error) || 'no data') + '</div>'); return; }
+            $('#brBody').html(renderBotReport(data));
+        }).fail(function () { $('#brBody').html('<div class="br-loading">request failed</div>'); });
+    }
+
+    function renderBotReport(d) {
+        if (d.empty || !d.total) return '<div class="br-loading">log buffer empty for this bot</div>';
+        var c = d.census || {};
+        var h = d.health || {};
+
+        var html = '<div class="br-meta">' + (d.botLines != null ? d.botLines : d.total) + ' bot lines' +
+            (d.fleetLines ? ' · ' + d.fleetLines + ' fleet heartbeats folded out' : '') +
+            ' · ' + (d.spanSec || 0) + 's window</div>';
+
+        // Health banner — the two diagnostics proxies up top.
+        var spiral = h.deathSpiral;
+        html += '<div class="br-health' + (spiral ? ' bad' : '') + '">' +
+            '<span><b>' + (h.killsVsCompletions || '—') + '</b> kills/credit</span>' +
+            '<span>rez/kill <b>' + (h.rezPerKill != null ? h.rezPerKill : '—') + '</b></span>' +
+            (spiral ? '<span class="br-flag">death spiral</span>' : '') +
+            ((c.kills > 0 && c.completions === 0) ? '<span class="br-flag">kills, 0 credit</span>' : '') +
+            '</div>';
+
+        // Census grid — bounded, counts only.
+        var cells = [
+            ['kills', c.kills, '#9ece6a'], ['completions', c.completions, '#9ece6a'],
+            ['rewarded', c.rewarded, '#9ece6a'], ['grind done', c.grindFinished, '#9ece6a'],
+            ['level-ups', c.levelUps, '#bb9af7'], ['quest evts', c.questEvents, '#7aa2f7'],
+            ['resurrects', c.resurrects, '#ff9e64'], ['deaths', c.deaths, '#f7768e'],
+            ['relocates', c.relocates, '#ff9e64'], ['repairs', c.repairs, '#ff9e64'],
+            ['sells', c.sells, '#ff9e64'], ['overflow', c.overflow, '#e0af68'],
+            ['shelvings', c.shelvings, '#e0af68'], ['stalls', c.stalls, '#f7768e'],
+            ['no-path', c.noPath, '#f7768e'], ['path-unsafe', c.pathUnsafe, '#f7768e']
+        ];
+        html += '<div class="br-grid">';
+        for (var i = 0; i < cells.length; i++) {
+            var n = cells[i][1] || 0;
+            html += '<div class="br-cell"><div class="br-cell-n" style="color:' + (n > 0 ? cells[i][2] : 'var(--text-muted)') + ';">' +
+                n + '</div><div class="br-cell-l">' + cells[i][0] + '</div></div>';
+        }
+        html += '</div>';
+
+        // Top repeated signatures (≤12).
+        if (d.top && d.top.length) {
+            html += '<div class="br-sec-h">Top repeated lines</div><div class="br-top">';
+            for (var t = 0; t < d.top.length; t++) {
+                html += '<div class="br-top-row"><span class="br-top-n">' + d.top[t].n + '</span>' +
+                    '<span class="br-top-sig">' + esc(d.top[t].sig) + '</span></div>';
+            }
+            html += '</div>';
+        }
+        return html;
+    }
+
     // Open modal on double-click of roster card (single click keeps existing detail panel)
     $(document).on('dblclick', '.bt-roster-card', function () {
         var guid = parseInt($(this).data('guid'));
@@ -1775,10 +2178,45 @@ $(function () {
             '.bt-live-qrow.active { background:rgba(115,218,202,0.10); }' +
             '.bt-live-qid { font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--text-muted,#5f6b7a);font-size:11px; }' +
             '.bt-live-qtitle { color:var(--text-secondary,#a9b1d6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }' +
-            '.bt-live-log { max-height:240px;overflow-y:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;background:rgba(0,0,0,0.25);border-radius:4px;padding:6px 8px; }' +
+            '.bt-live-log { max-height:240px;overflow-y:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;background:#000;border:1px solid var(--border-light,#414868);border-radius:4px;padding:6px 8px; }' +
             '.bt-live-logline { white-space:pre-wrap;word-break:break-word; }' +
             '.bt-live-logt { color:var(--text-muted,#5f6b7a);margin-right:6px; }' +
-            '.bt-live-foot { font-size:10px;color:var(--text-muted,#5f6b7a);text-align:right;margin-top:2px; }'
+            '.bt-live-foot { font-size:10px;color:var(--text-muted,#5f6b7a);text-align:right;margin-top:2px; }' +
+            '.bt-live-obj-srv { font-family:ui-monospace,Menlo,Consolas,monospace;font-size:9px;font-weight:700;color:#73daca;background:rgba(115,218,202,0.12);padding:0 4px;border-radius:3px;letter-spacing:0.5px; }' +
+            '.bt-live-fleet-tag { font-size:9px;font-weight:700;color:#bb9af7;background:rgba(187,154,247,0.14);padding:0 4px;border-radius:3px;margin-right:4px;letter-spacing:0.5px; }' +
+            '.bt-story { background:linear-gradient(180deg,rgba(122,162,247,0.08),rgba(122,162,247,0.02));border-color:rgba(122,162,247,0.30); }' +
+            '.bt-story-lead { font-size:13px;line-height:1.55;color:var(--text-primary,#c0caf5); }' +
+            '.bt-story-why { font-size:12px;line-height:1.55;color:var(--text-secondary,#a9b1d6);margin-top:5px; }' +
+            '.bt-story-next { font-size:12px;line-height:1.5;color:var(--text-secondary,#a9b1d6);margin-top:7px; }' +
+            '.bt-story-next-h { color:#bb9af7;font-weight:700;text-transform:uppercase;font-size:10px;letter-spacing:0.6px;margin-right:6px; }' +
+            '.bt-story b { color:var(--text-primary,#c0caf5);font-weight:700; }' +
+            '.bt-live-wait-dest { color:var(--text-primary,#c0caf5);font-weight:700; }' +
+            '.bt-report-btn { float:right;font-size:10px;font-weight:700;cursor:pointer;background:rgba(187,154,247,0.12);border:1px solid rgba(187,154,247,0.35);border-radius:4px;color:#bb9af7;padding:1px 8px;text-transform:none;letter-spacing:0; }' +
+            '.bt-report-btn:hover { background:rgba(187,154,247,0.22); }' +
+            '.bt-report-btn i { color:#bb9af7;margin-right:3px; }' +
+            '.br-overlay { position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:5500;display:none;align-items:center;justify-content:center; }' +
+            '.br-overlay.active { display:flex; }' +
+            '.br-modal { background:var(--bg-card,#1a1b26);border:1px solid var(--border-light,#414868);border-radius:10px;width:90vw;max-width:560px;max-height:86vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,0.55);overflow:hidden; }' +
+            '.br-header { display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border-light,#414868);font-weight:700;font-size:14px;color:var(--text-primary,#c0caf5); }' +
+            '.br-header i { color:#bb9af7;margin-right:6px; }' +
+            '.br-close { background:none;border:none;color:var(--text-muted,#5f6b7a);font-size:16px;cursor:pointer; }' +
+            '.br-close:hover { color:var(--text-primary,#c0caf5); }' +
+            '.br-body { padding:14px 16px;overflow-y:auto; }' +
+            '.br-loading { text-align:center;padding:34px;color:var(--text-muted,#5f6b7a);font-size:13px; }' +
+            '.br-meta { font-size:11px;color:var(--text-muted,#5f6b7a);margin-bottom:10px;font-family:ui-monospace,Menlo,Consolas,monospace; }' +
+            '.br-health { display:flex;gap:14px;align-items:center;flex-wrap:wrap;background:rgba(115,218,202,0.06);border:1px solid rgba(115,218,202,0.25);border-radius:6px;padding:9px 12px;margin-bottom:12px;font-size:12px;color:var(--text-secondary,#a9b1d6); }' +
+            '.br-health.bad { background:rgba(247,118,142,0.07);border-color:rgba(247,118,142,0.35); }' +
+            '.br-health b { color:var(--text-primary,#c0caf5); }' +
+            '.br-flag { font-size:10px;font-weight:700;color:#ff9e64;background:rgba(255,158,100,0.15);padding:1px 8px;border-radius:10px; }' +
+            '.br-grid { display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:14px; }' +
+            '.br-cell { background:var(--bg-card-alt,#24283b);border:1px solid var(--border-light,#414868);border-radius:6px;padding:8px 4px;text-align:center; }' +
+            '.br-cell-n { font-size:18px;font-weight:800;line-height:1.1;font-family:ui-monospace,Menlo,Consolas,monospace; }' +
+            '.br-cell-l { font-size:9px;text-transform:uppercase;letter-spacing:0.4px;color:var(--text-muted,#5f6b7a);margin-top:3px; }' +
+            '.br-sec-h { font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-secondary,#a9b1d6);margin:4px 0 7px; }' +
+            '.br-top { display:flex;flex-direction:column;gap:2px; }' +
+            '.br-top-row { display:flex;gap:8px;align-items:baseline;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px; }' +
+            '.br-top-n { min-width:30px;text-align:right;color:#bb9af7;font-weight:700; }' +
+            '.br-top-sig { color:var(--text-secondary,#a9b1d6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }'
         )
         .appendTo('head');
 

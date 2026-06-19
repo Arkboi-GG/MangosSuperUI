@@ -33,8 +33,9 @@ namespace MangosSuperUI.BotLogic.Planners;
 // The carried set's durable truth is the C++ log + QUEST_STATUS_ALL; the batch
 // scratch is rebuilt from it on (re)entry, so shelving survives goal bounces.
 //
-// Scope (v1): kill-objective and no-objective quests. Item/GO/escort quests are
-// filtered at pick time (a later layer).
+// Scope: kill, no-objective, and creature-sourced item quests (incl. kill+item). An item
+// objective is driven as a grind leg on its best drop creature (auto-loot credits the drop).
+// GO-interact and GO-sourced items are phase 2 (a USE_GAMEOBJECT leg); escort needs C++ FOLLOW.
 // ============================================================================
 public sealed class QuestPlanner : IBotPlanner
 {
@@ -49,7 +50,7 @@ public sealed class QuestPlanner : IBotPlanner
     private const int SafetyMargin = 3;         // level-gate = danger_level - margin
     private const int DeferMinutes = 15;
     private const int AbandonAfterDefers = 3;
-    private const int QuestStatusComplete = 3;  // VMaNGOS QUEST_STATUS_COMPLETE
+    private const int QuestStatusComplete = 1;  // VMaNGOS QUEST_STATUS_COMPLETE
     private const double LogSyncCapSec = 3;     // wait this long for QUEST_STATUS_ALL before proceeding blind
 
     // -- Overflow grind (server-authoritative completion) --
@@ -243,24 +244,23 @@ public sealed class QuestPlanner : IBotPlanner
             }
         }
 
-        // -- 2. OBJECTIVE sweep -- nearest unmet objective, far outliers shelved --
+        // -- 2. OBJECTIVE sweep -- nearest unmet GRIND LEG (kill or creature-drop item), outliers shelved --
         var withObj = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && HasUnmet(ctx, b)).ToList();
         var candidates = withObj.Where(b => !b.Deferred).ToList();
         if (candidates.Count > 0)
         {
             TagOutliers(ctx, candidates);                       // shelve far quests for this sweep
             var live = candidates.Where(b => !b.Deferred).ToList();
-            var pick = NearestObjective(ctx, live);
+            var pick = NearestLeg(ctx, live);
             if (pick != null)
             {
                 q.Active = pick.Value.Quest;
-                q.ActiveSlot = pick.Value.Slot;
+                q.ActiveSlot = 0;                               // legs aren't slot-routed (item legs live in ItemObjectives)
                 ctx.SetStep("to_objective");
-                var o = pick.Value.Obj;
                 // §4 enriched MOVE_TO: carry creature_entry/grind_radius/kill_count so C++ engages the
                 // mob on approach and grinds in place (ScanApproachTarget → ConvertMoveToGrindInPlace),
-                // never marching to / teleporting into the deep loader coord. One TASK_COMPLETE = done.
-                return MoveToObjective(o, RemainingKills(ctx, pick.Value.Quest.QuestId, o));
+                // never marching to / teleporting into the deep loader coord. One TASK_COMPLETE = the leg.
+                return MoveToObjectiveLeg(pick.Value.Leg);
             }
         }
 
@@ -490,8 +490,8 @@ public sealed class QuestPlanner : IBotPlanner
             if (id.CompletedQuestIds.Contains(node.QuestId)) continue;     // already rewarded
             if (id.AbandonedGreyQuestIds.Contains(node.QuestId)) continue; // greyed out
             if (id.DeferredQuestIds.ContainsKey(node.QuestId)) continue;   // R21: backing off (level/time defer) — don't re-resume into a churn
-            if (node.ItemObjectives.Length != 0) continue;                 // gather: later layer
-            if (!node.Objectives.All(o => o.IsCreature)) continue;          // GO: later layer
+            if (!node.Objectives.All(o => o.IsCreature)) continue;                       // GO-interact objectives: phase 2
+            if (!node.ItemObjectives.All(it => it.BestDropSource != null)) continue;     // GO-sourced/unresolved items: phase 2
             if (q.Batch.Any(b => b.QuestId == node.QuestId)) continue;
             q.Batch.Add(new BatchQuest { QuestId = node.QuestId, Node = node, Accepted = true });
         }
@@ -572,8 +572,8 @@ public sealed class QuestPlanner : IBotPlanner
 
     public static bool IsPickable(QuestNode q, BotIdentity id)
         => q.Giver != null
-           && q.ItemObjectives.Length == 0              // gather quests: later layer
-           && q.Objectives.All(o => o.IsCreature)        // GO objectives: later layer
+           && q.Objectives.All(o => o.IsCreature)                       // GO-interact objectives: phase 2
+           && q.ItemObjectives.All(it => it.BestDropSource != null)     // creature-sourced items only; GO-sourced/unresolved: phase 2
            && !id.DeferredQuestIds.ContainsKey(q.QuestId)
            && !id.AbandonedGreyQuestIds.Contains(q.QuestId)
            && !id.IsPathBlacklisted(q.Giver.X, q.Giver.Y);
@@ -627,12 +627,10 @@ public sealed class QuestPlanner : IBotPlanner
     private float QuestReach(BotContext ctx, BatchQuest b)
     {
         float worst = 0f;
-        foreach (var o in b.Node.Objectives)
+        foreach (var leg in UnmetLegs(ctx, b))
         {
-            if (!o.IsCreature || o.Count <= 0) continue;
-            if (RawRemaining(ctx, b.QuestId, o) <= 0) continue;
-            if (o.GrindMap != ctx.MapId) return float.MaxValue;   // cross-map objective = maximally far
-            float d = Dist2(ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY);
+            if (leg.Map != ctx.MapId) return float.MaxValue;   // cross-map leg = maximally far
+            float d = Dist2(ctx.Pos.X, ctx.Pos.Y, leg.X, leg.Y);
             if (d > worst) worst = d;
         }
         return worst;
@@ -659,27 +657,52 @@ public sealed class QuestPlanner : IBotPlanner
         }
     }
 
-    private (BatchQuest Quest, int Slot, QuestObjective Obj)? NearestObjective(BotContext ctx, List<BatchQuest> live)
+    // A drivable grind leg: kill CreatureEntry at (X,Y,Z) until Count is owed. Count is
+    // kills-owed for a kill objective, or items-owed for a creature-sourced item objective
+    // (routed to the item's best drop creature). The §4 enriched MOVE_TO is identical for
+    // both — C++ grinds the entry and auto-loots; the server credits kills AND drops.
+    private readonly record struct GrindLeg(int CreatureEntry, float X, float Y, float Z, int Map, int Count);
+
+    // The unmet grind legs of a quest THIS tick: one per still-short kill objective + one per
+    // still-short creature-sourced item objective. GO-interact objectives and GO-sourced items
+    // are phase 2 (not emitted → not driven here).
+    private IEnumerable<GrindLeg> UnmetLegs(BotContext ctx, BatchQuest b)
     {
-        (BatchQuest, int, QuestObjective)? best = null;
+        foreach (var o in b.Node.Objectives)
+        {
+            if (!o.IsCreature || o.Count <= 0) continue;
+            int rem = RawRemaining(ctx, b.QuestId, o);
+            if (rem <= 0) continue;
+            yield return new GrindLeg(o.CreatureEntry, o.GrindX, o.GrindY, o.GrindZ, o.GrindMap, rem);
+        }
+        foreach (var it in b.Node.ItemObjectives)
+        {
+            if (it.Count <= 0) continue;
+            int rem = RawItemRemaining(ctx, b.QuestId, it);
+            if (rem <= 0) continue;
+            var src = it.BestDropSource;                       // creature-sourced only (GO-sourced = phase 2)
+            if (src == null || src.SpawnCount <= 0) continue;
+            yield return new GrindLeg(src.CreatureEntry, src.GrindX, src.GrindY, src.GrindZ, src.GrindMap, rem);
+        }
+    }
+
+    // Nearest same-map unmet leg across the live batch.
+    private (BatchQuest Quest, GrindLeg Leg)? NearestLeg(BotContext ctx, List<BatchQuest> live)
+    {
+        (BatchQuest, GrindLeg)? best = null;
         float bestD = float.MaxValue;
         foreach (var b in live)
-        {
-            for (int i = 0; i < b.Node.Objectives.Length; i++)
+            foreach (var leg in UnmetLegs(ctx, b))
             {
-                var o = b.Node.Objectives[i];
-                if (!o.IsCreature || o.Count <= 0) continue;
-                if (o.GrindMap != ctx.MapId) continue;
-                if (RawRemaining(ctx, b.QuestId, o) <= 0) continue;
-                float d = Dist2(ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY);
-                if (d < bestD) { bestD = d; best = (b, i, o); }
+                if (leg.Map != ctx.MapId) continue;
+                float d = Dist2(ctx.Pos.X, ctx.Pos.Y, leg.X, leg.Y);
+                if (d < bestD) { bestD = d; best = (b, leg); }
             }
-        }
         return best;
     }
 
     // Overflow target: the nearest same-map creature slot among quests the server still calls
-    // INCOMPLETE despite our local counts being met. Unlike NearestObjective it does NOT gate on
+    // INCOMPLETE despite our local counts being met. Unlike the §2 leg picker it does NOT gate on
     // RawRemaining > 0 (by definition all slots are already model-met here) — we re-grind to push
     // the server's credit past our stale count.
     private (BatchQuest Quest, int Slot, QuestObjective Obj)? NearestCreatureSlot(BotContext ctx, List<BatchQuest> set)
@@ -703,8 +726,7 @@ public sealed class QuestPlanner : IBotPlanner
     // ========================================================================
     // Quest-log readers
     // ========================================================================
-    private bool HasUnmet(BotContext ctx, BatchQuest b)
-        => b.Node.Objectives.Any(o => o.IsCreature && o.Count > 0 && RawRemaining(ctx, b.QuestId, o) > 0);
+    private bool HasUnmet(BotContext ctx, BatchQuest b) => UnmetLegs(ctx, b).Any();
 
     private bool IsComplete(BotContext ctx, BatchQuest b)
         => ctx.QuestLog.TryGetValue(b.QuestId, out var e) && e.Status == QuestStatusComplete;
@@ -717,11 +739,13 @@ public sealed class QuestPlanner : IBotPlanner
         return o.Count;
     }
 
-    // kill_count for C++ (never 0 -- 0 means "indefinite grind").
-    private static int RemainingKills(BotContext ctx, int questId, QuestObjective obj)
+    // Items still owed for a creature-sourced item objective (server ItemCounts authoritative).
+    // Full count if unknown.
+    private static int RawItemRemaining(BotContext ctx, int questId, QuestItemReq it)
     {
-        int r = RawRemaining(ctx, questId, obj);
-        return r > 0 ? r : 1;
+        if (ctx.QuestLog.TryGetValue(questId, out var e) && it.Slot >= 1 && it.Slot <= e.ItemCounts.Length)
+            return it.Count - e.ItemCounts[it.Slot - 1];
+        return it.Count;
     }
 
     // ========================================================================
@@ -794,7 +818,7 @@ public sealed class QuestPlanner : IBotPlanner
     // it IsObjectiveGrind, so the KILL-push rolls the deadline to now+120s on each kill — it fails
     // only on a 120s no-kill gap once grinding, or the travel ceiling before the first kill. A
     // genuinely all-deep-past-the-50yd-mouth objective therefore shelves at the deadline (bounded),
-    // it never loops. kill_count is RemainingKills (>=1; 0 = an indefinite C++ grind that never acks).
+    // it never loops. kill_count is the remaining count (>=1; 0 = an indefinite C++ grind that never acks).
     private static StepResult MoveToObjective(QuestObjective obj, int killCount)
         => StepResult.Send(
             new BridgeCommand("MOVE_TO", new
@@ -806,6 +830,23 @@ public sealed class QuestPlanner : IBotPlanner
                 creature_entry = obj.CreatureEntry,
                 grind_radius = GrindRadius,
                 kill_count = killCount
+            }),
+            "TASK_COMPLETE", TravelDeadline);   // IsObjectiveGrind => KILL-push tightens to 120s no-kill
+
+    // §4 enriched MOVE_TO for a grind leg (kill or creature-drop item). kill_count = remaining
+    // (never 0 — 0 = an indefinite C++ grind that never acks). For an item leg the count is the
+    // items still owed; an unlucky drop streak just re-derives another leg after the TASK_COMPLETE.
+    private static StepResult MoveToObjectiveLeg(GrindLeg leg)
+        => StepResult.Send(
+            new BridgeCommand("MOVE_TO", new
+            {
+                mapId = leg.Map,
+                x = leg.X,
+                y = leg.Y,
+                z = leg.Z,
+                creature_entry = leg.CreatureEntry,
+                grind_radius = GrindRadius,
+                kill_count = leg.Count > 0 ? leg.Count : 1
             }),
             "TASK_COMPLETE", TravelDeadline);   // IsObjectiveGrind => KILL-push tightens to 120s no-kill
 
