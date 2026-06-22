@@ -591,24 +591,65 @@ public class QuestGraphLoader
         return (avgX, avgY, avgZ, radius);
     }
 
+    /// <summary>
+    /// Snap an aggregated grind center to the REAL cluster spawn nearest the centroid.
+    /// The bare AggregateSpawns average can land in an areaId-0 void pocket between spawns —
+    /// entry 822 / quest 52: the average of 48 ring-arranged "Young Forest Bear" spawns is
+    /// unzoned void 129yd off the nearest bear, so the bot marches there, can't path to the
+    /// mobs across the seam, dies @areaId 0, and loops. A real spawn row is walkable + zoned
+    /// by construction, so the snapped center can never be areaId 0. Nearest-to-centroid keeps
+    /// the center maximally representative; the C++ approach-scan + 50→200yd rescan ladder
+    /// works outward to the rest of the cluster. Falls back to the centroid only if the cluster
+    /// is empty (defensive — resolved callers always pass a non-empty cluster).
+    /// </summary>
+    private static (float x, float y, float z) SnapToNearestSpawn(
+        (float x, float y, float z, float radius) agg, List<CreatureSpawn> cluster)
+    {
+        if (cluster == null || cluster.Count == 0) return (agg.x, agg.y, agg.z);
+        var snap = cluster[0];
+        float bestSq = float.MaxValue;
+        foreach (var s in cluster)
+        {
+            float dx = s.X - agg.x, dy = s.Y - agg.y;
+            float dsq = dx * dx + dy * dy;
+            if (dsq < bestSq) { bestSq = dsq; snap = s; }
+        }
+        return (snap.X, snap.Y, snap.Z);
+    }
+
     /// <summary>Apply aggregated spawn data to a quest objective.</summary>
+    /// <remarks>
+    /// The grind CENTER is snapped to the real spawn nearest the centroid (SnapToNearestSpawn),
+    /// never the bare AggregateSpawns average, which can be an areaId-0 void pocket between spawns
+    /// (the entry-822 death loop). GrindRadius stays the cluster spread, so the C++ grind still
+    /// covers the whole cluster from the snapped center.
+    /// </remarks>
     private static void ApplyToObjective(QuestObjective obj, string name, int map,
         (float x, float y, float z, float radius) agg,
         List<CreatureSpawn>? clusterSpawns = null)
     {
         obj.TargetName = name;
         obj.GrindMap = map;
-        obj.GrindX = agg.x;
-        obj.GrindY = agg.y;
-        obj.GrindZ = agg.z;
         obj.GrindRadius = agg.radius;
 
-        // Session 31: Preserve individual spawn positions for fan-out
         if (clusterSpawns != null && clusterSpawns.Count > 0)
         {
+            var c = SnapToNearestSpawn(agg, clusterSpawns);   // areaId-0 guard
+            obj.GrindX = c.x;
+            obj.GrindY = c.y;
+            obj.GrindZ = c.z;
+
+            // Session 31: Preserve individual spawn positions for fan-out
             obj.SpawnPositions = clusterSpawns
                 .Select(s => (s.X, s.Y, s.Z))
                 .ToList();
+        }
+        else
+        {
+            // No cluster detail (shouldn't happen for a resolved objective) — fall back to centroid.
+            obj.GrindX = agg.x;
+            obj.GrindY = agg.y;
+            obj.GrindZ = agg.z;
         }
     }
 
@@ -790,11 +831,12 @@ public class QuestGraphLoader
                 if (bestSource != null && bestCluster != null)
                 {
                     var agg = AggregateSpawns(bestCluster);
+                    var c = SnapToNearestSpawn(agg, bestCluster);   // areaId-0 guard (same as kill objectives)
                     bestSource.SpawnCount = bestCluster.Count;
                     bestSource.GrindMap = bestClusterMap;
-                    bestSource.GrindX = agg.x;
-                    bestSource.GrindY = agg.y;
-                    bestSource.GrindZ = agg.z;
+                    bestSource.GrindX = c.x;
+                    bestSource.GrindY = c.y;
+                    bestSource.GrindZ = c.z;
                     bestSource.GrindRadius = agg.radius;
                     // Session 31: Preserve individual spawn positions for fan-out
                     bestSource.SpawnPositions = bestCluster

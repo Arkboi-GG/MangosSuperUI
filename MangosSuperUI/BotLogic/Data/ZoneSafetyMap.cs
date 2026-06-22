@@ -28,7 +28,9 @@ public class ZoneSafetyMap
 
     // Grid resolution: 100×100 yard cells. Vanilla maps are ~17,000 yards across.
     // That's ~170×170 = ~29,000 cells per map — trivial memory.
-    private const float CELL_SIZE = 100f;
+    // Public so callers (FindSafeRezSpot) can step their sampling at grid granularity:
+    // sampling finer than CELL_SIZE just re-reads the same cell.
+    public const float CELL_SIZE = 100f;
 
     // WoW coordinate space: roughly -17066 to 17066 on each axis.
     // We offset by COORD_OFFSET to make all indices positive.
@@ -72,6 +74,20 @@ public class ZoneSafetyMap
         var (ix, iy) = WorldToGrid(x, y);
         if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) return 0;
         return grid[ix, iy].AvgLevel;
+    }
+
+    /// <summary>
+    /// Get the number of known creature spawns in the cell containing the given world
+    /// position. Returns 0 if no creatures are known in that cell (or no grid for the map).
+    /// This is spawn DENSITY: a high count means a pack/field, even when every mob in it is
+    /// trivially low level. A level-only metric is blind to death-by-dogpile; this is not.
+    /// </summary>
+    public int GetSpawnCount(int mapId, float x, float y)
+    {
+        if (!_grids.TryGetValue(mapId, out var grid)) return 0;
+        var (ix, iy) = WorldToGrid(x, y);
+        if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) return 0;
+        return grid[ix, iy].SpawnCount;
     }
 
     /// <summary>

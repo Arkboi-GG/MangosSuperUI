@@ -1,4 +1,4 @@
-// MangosSuperUI — Bot Tuner JS (BotBridge + BotBrain SignalR client)
+// MangosSuperUI — Bot Monitor JS (BotBridge + BotBrain SignalR client)
 // Session 25: Stale bot cleanup — AllBots purges old entries, BotDisconnected auto-removes after 30s
 
 $(function () {
@@ -427,7 +427,10 @@ $(function () {
 
     // (Re)start only when needed — avoids an extra fetch on every incidental re-render.
     function ensureLivePoll() {
-        if (detailTab !== 'live') { stopLivePoll(); return; }
+        // Poll the realtime spine for ANY selected bot — the Overview "Current quest"
+        // section reads the same liveData/liveQuestMap the Live tab does. The heavy
+        // live-LOG poll still self-gates to the Live tab (see fetchLiveLog).
+        if (!selectedGuid) { stopLivePoll(); return; }
         if (livePollTimer && liveGuid === selectedGuid) return;
         startLivePoll();
     }
@@ -447,12 +450,14 @@ $(function () {
             if (!data || data.error) {
                 liveData = null;
                 if (detailTab === 'live') renderLiveTab(botStates[g]);
+                else updateDetailQuest();
                 return;
             }
             liveData = data;
             liveGuid = g;
             liveFetchedAt = Date.now();
             if (detailTab === 'live') renderLiveTab(botStates[g]);
+            else updateDetailQuest();
         });
     }
 
@@ -501,16 +506,17 @@ $(function () {
     // ground truth, and surfacing it makes "0/10 but it's killing" self-diagnosing: if the
     // server count is also 0 while kills land, that's the tag-credit bug, not a display gap.
     function fetchLiveQuestStatus() {
-        if (!selectedGuid || !connected || detailTab !== 'live') return;
+        if (!selectedGuid || !connected) return;
         var g = selectedGuid;
         $.getJSON('/Bots/QuestStatus', { guid: g }, function (data) {
-            if (selectedGuid !== g || detailTab !== 'live') return;
+            if (selectedGuid !== g) return;
             if (!data || data.error || !data.quests) return;
             var map = {};
             for (var i = 0; i < data.quests.length; i++) map[data.quests[i].questId] = data.quests[i];
             liveQuestMap = map;
             liveQuestGuid = g;
-            if (liveData) renderLiveTab(botStates[g]);
+            if (detailTab === 'live') { if (liveData) renderLiveTab(botStates[g]); }
+            else updateDetailQuest();
         });
     }
 
@@ -705,17 +711,17 @@ $(function () {
             var ph = sc.phase || '';
             doing = ph === 'resurrecting' ? 'Resurrecting'
                 : ph === 'relocate' ? 'Walking back from the graveyard'
-                : ph === 'heal' ? 'Healing up after a death'
-                : ph === 'rez-wait' ? 'Dead — waiting to resurrect'
-                : 'Recovering from a death';
+                    : ph === 'heal' ? 'Healing up after a death'
+                        : ph === 'rez-wait' ? 'Dead — waiting to resurrect'
+                            : 'Recovering from a death';
         } else if (sc.kind === 'vendor') {
             doing = sc.canRepair ? 'On a repair/vendor run' : 'On a vendor run';
         } else if (d.goal === 'Questing') {
             var st = (d.step || '').toLowerCase();
             doing = /objective/.test(st) ? 'Working a quest objective'
                 : /accept|giver/.test(st) ? 'Going to pick up a quest'
-                : /turnin/.test(st) ? 'Going to turn in a quest'
-                : 'Questing';
+                    : /turnin/.test(st) ? 'Going to turn in a quest'
+                        : 'Questing';
         } else if (d.goal === 'Grinding') doing = 'Grinding mobs';
         else if (d.goal === 'Training') doing = 'Training new skills';
         else if (d.goal === 'Following') doing = 'Following the group';
@@ -1088,7 +1094,8 @@ $(function () {
                 '<i class="fa-solid fa-route" style="margin-right:4px;"></i>' +
                 '<span style="color:var(--text-secondary);">' + esc(brain.activity || '') + '</span>' +
                 ' → <span style="color:#7aa2f7;">' + esc(brain.subPhase) + '</span>';
-            if (brain.activeQuestId) html += ' <span style="color:#e0af68;">(Quest #' + brain.activeQuestId + ')</span>';
+            // (Quest # moved to the realtime "Current quest" section below — the brain
+            //  summary's activeQuestId is stale; the spine scratch is the live truth.)
             if (brain.contextTag) html += ' <span style="color:var(--text-muted);">' + esc(brain.contextTag) + '</span>';
             html += '</div>';
         }
@@ -1103,6 +1110,11 @@ $(function () {
         }
 
         html += '</div></div>';
+
+        // --- Current quest (realtime spine + server kill-credit; filled by the live poll) ---
+        html += '<div class="bt-section"><div class="bt-section-header"><span>' +
+            '<i class="fa-solid fa-scroll" style="color:#e0af68;margin-right:6px;"></i>Current quest</span></div>' +
+            '<div class="bt-section-body"><div id="detailQuest"></div></div></div>';
 
         // --- Personality Section ---
         if (brain && brain.personality) {
@@ -1177,6 +1189,78 @@ $(function () {
 
         $('#detailTabBody').html(html);
         renderTimeline(selectedGuid);
+        updateDetailQuest();   // fill the realtime "Current quest" section
+    }
+
+    // ---- Overview "Current quest": realtime quest progress — the same spine scratch +
+    // server kill-credit the Live tab renders — written into the stable #detailQuest
+    // container so the 4-5s polls refresh it in place without rebuilding the Overview panel.
+    function updateDetailQuest() {
+        var $box = $('#detailQuest');
+        if ($box.length === 0) return;            // not on Overview / panel not built yet
+        $box.html(renderDetailQuestHtml());
+    }
+
+    function renderDetailQuestHtml() {
+        var d = liveData;
+        if (!d || liveGuid !== selectedGuid) {
+            return '<div style="font-size:11px;color:var(--text-muted);">' +
+                '<i class="fa-solid fa-satellite-dish fa-fade" style="margin-right:5px;"></i>' +
+                'connecting to live feed… (brain engine must be ON)</div>';
+        }
+
+        var goalColor = GOAL_COLOR[d.goal] || 'var(--accent)';
+        var head = '<div style="font-size:12px;margin-bottom:6px;">' +
+            '<span style="color:' + goalColor + ';font-weight:700;">' + esc(d.goal) + '</span>' +
+            '<span style="color:var(--text-muted);"> / ' + esc(d.step) + '</span>' +
+            (d.why ? '<span style="color:var(--text-muted);margin-left:8px;">why = ' + esc(d.why) + '</span>' : '') +
+            '</div>';
+
+        var sc = d.scratch;
+        if (!sc || sc.kind !== 'quest' || !sc.active) {
+            return head + '<div style="font-size:11px;color:var(--text-muted);">No active quest objective right now.</div>';
+        }
+
+        var aq = sc.active;
+        var html = head + '<div class="bt-live-active">';
+        html += '<div class="bt-live-active-t">★ ' + esc(aq.title || ('#' + aq.id)) +
+            ' <span style="color:var(--text-muted);font-weight:400;">#' + aq.id + (aq.level ? ' · L' + aq.level : '') + '</span></div>';
+
+        if (aq.objectives && aq.objectives.length) {
+            var killIdx = 0, itemIdx = 0;
+            for (var oi = 0; oi < aq.objectives.length; oi++) {
+                var o = aq.objectives[oi];
+                var icon = o.kind === 'kill' ? 'fa-khanda' : (o.kind === 'gather' ? 'fa-hand-holding' : 'fa-hand-pointer');
+                // Authoritative server kill credit overrides the spine's un-fed `have`.
+                var srv = serverObjFor(aq.id, o, killIdx, itemIdx);
+                if (o.kind === 'kill') killIdx++; else if (o.kind === 'gather') itemIdx++;
+                var have = (srv != null) ? srv.have : o.have;
+                var need = (srv != null && srv.need > 0) ? srv.need : o.need;
+                var done = (have != null && need > 0 && have >= need);
+                var cnt = (have != null) ? (have + '/' + need) : ('×' + need);
+                var cntColor = done ? '#9ece6a' : (o.active ? '#e0af68' : 'var(--text-secondary)');
+                html += '<div class="bt-live-obj' + (o.active ? ' active' : '') + '">';
+                html += '<i class="fa-solid ' + icon + '" style="width:14px;"></i> ';
+                html += '<span class="bt-live-obj-cnt" style="color:' + cntColor + ';">' + cnt + '</span> ';
+                if (srv != null) html += '<span class="bt-live-obj-srv" title="live server kill credit (character_queststatus.mob_count)">srv</span> ';
+                html += '<span class="bt-live-obj-name">' + esc(o.name) + '</span>';
+                if (o.kind === 'gather' && o.from) html += ' <span style="color:var(--text-muted);">from ' + esc(o.from) + '</span>';
+                html += distTag(d, o);
+                html += '</div>';
+            }
+        }
+        if (aq.giver) html += questNpcRow('Accept', 'fa-circle-question', aq.giver, d, '#7aa2f7');
+        if (aq.turnIn) html += questNpcRow('Turn in', 'fa-flag-checkered', aq.turnIn, d, '#9ece6a');
+        html += '</div>';
+
+        if (sc.batch && sc.batch.length) {
+            var doneN = 0;
+            for (var bi = 0; bi < sc.batch.length; bi++) if (sc.batch[bi].turnedIn) doneN++;
+            html += '<div style="font-size:11px;color:var(--text-muted);margin-top:6px;">batch: ' +
+                sc.batch.length + ' quest' + (sc.batch.length === 1 ? '' : 's') +
+                (doneN ? ' · ' + doneN + ' turned in' : '') + '</div>';
+        }
+        return html;
     }
 
     // --- Economy strip (updates live from STATE) ---
@@ -1843,6 +1927,133 @@ $(function () {
     $('#brClose').on('click', function () { $('#botReportModal').removeClass('active'); });
     $('#botReportModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
     $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#botReportModal').removeClass('active'); });
+
+    // ===================== ADD BOTS MODAL (quick .bot addai spawner) =====================
+    // Alliance classes only (no Shaman). Spawns via POST /Bots/AddBots → the server runs
+    // `.bot addai <class>` once per entry over RA. Default preset = 2× each class, for fast reruns.
+    var ADD_BOT_CLASSES = ['warrior', 'paladin', 'hunter', 'rogue', 'priest', 'mage', 'warlock', 'druid'];
+    // Class color + iconography pulled from the subject's own world (vanilla WoW class colors).
+    var ADD_BOT_META = {
+        warrior: { color: '#C79C6E', icon: 'fa-shield-halved' },
+        paladin: { color: '#F58CBA', icon: 'fa-hammer' },
+        hunter: { color: '#ABD473', icon: 'fa-crosshairs' },
+        rogue: { color: '#FFF569', icon: 'fa-user-ninja' },
+        priest: { color: '#FFFFFF', icon: 'fa-hands-praying' },
+        mage: { color: '#69CCF0', icon: 'fa-hat-wizard' },
+        warlock: { color: '#9482C9', icon: 'fa-skull' },
+        druid: { color: '#FF7D0A', icon: 'fa-paw' }
+    };
+    var addBotCounts = {};
+    ADD_BOT_CLASSES.forEach(function (c) { addBotCounts[c] = 2; });
+
+    $('head').append(
+        '<style>' +
+        '.ab-overlay{position:fixed;inset:0;background:rgba(10,11,20,0.62);backdrop-filter:blur(2px);display:none;align-items:center;justify-content:center;z-index:1000;}' +
+        '.ab-overlay.active{display:flex;animation:abFade .14s ease;}' +
+        '@keyframes abFade{from{opacity:0}to{opacity:1}}' +
+        '@keyframes abPop{from{transform:translateY(8px) scale(.985);opacity:.5}to{transform:none;opacity:1}}' +
+        '.ab-modal{background:var(--bg-card,#1a1b26);border:1px solid var(--border-light,#414868);border-radius:14px;width:92vw;max-width:540px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,0.6);overflow:hidden;animation:abPop .16s cubic-bezier(.2,.8,.2,1);}' +
+        '.ab-header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid var(--border-light,#414868);background:linear-gradient(135deg,rgba(122,162,247,0.14),rgba(187,154,247,0.05));}' +
+        '.ab-hleft{display:flex;align-items:center;}' +
+        '.ab-hicon{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:rgba(122,162,247,0.16);color:var(--accent,#7aa2f7);font-size:15px;margin-right:11px;}' +
+        '.ab-htxt{display:flex;flex-direction:column;gap:2px;}' +
+        '.ab-htxt b{font-size:15px;font-weight:700;letter-spacing:.2px;}' +
+        '.ab-htxt span{font-size:11px;color:var(--text-muted,#787c99);}' +
+        '.ab-close{background:none;border:none;color:var(--text-muted,#787c99);cursor:pointer;font-size:17px;line-height:1;padding:4px 6px;border-radius:6px;transition:all .12s;}' +
+        '.ab-close:hover{color:var(--text-secondary,#c0caf5);background:rgba(255,255,255,0.06);}' +
+        '.ab-body{padding:14px 18px;overflow-y:auto;}' +
+        '.ab-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}' +
+        '.ab-card{position:relative;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px 10px 15px;border-radius:10px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);overflow:hidden;transition:opacity .14s,box-shadow .14s,border-color .14s;}' +
+        '.ab-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--cc,#7aa2f7);opacity:.45;transition:opacity .14s;}' +
+        '.ab-card.on{box-shadow:0 2px 14px rgba(0,0,0,0.28);}' +
+        '.ab-card.on::before{opacity:1;}' +
+        '.ab-card.off{opacity:.48;}' +
+        '.ab-cname{display:flex;align-items:center;gap:9px;min-width:0;}' +
+        '.ab-cname i{font-size:14px;width:18px;text-align:center;}' +
+        '.ab-cname b{font-size:13px;font-weight:600;text-transform:capitalize;letter-spacing:.2px;}' +
+        '.ab-step{display:inline-flex;align-items:center;gap:6px;flex:none;}' +
+        '.ab-step button{width:24px;height:24px;border-radius:6px;border:1px solid var(--border-light,#414868);background:var(--bg-card,#1a1b26);color:var(--text-secondary,#c0caf5);cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .12s;}' +
+        '.ab-step button:hover{border-color:var(--cc,#7aa2f7);color:#fff;}' +
+        '.ab-step .ab-cnt{min-width:18px;text-align:center;font-weight:700;font-size:13px;font-variant-numeric:tabular-nums;}' +
+        '.ab-foot{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-top:1px solid var(--border-light,#414868);gap:10px;background:rgba(0,0,0,0.12);}' +
+        '.ab-presets{display:flex;gap:6px;}' +
+        '.ab-preset{font-size:11px;padding:5px 10px;cursor:pointer;background:transparent;border:1px solid var(--border-light,#414868);border-radius:7px;color:var(--text-muted,#787c99);transition:all .12s;}' +
+        '.ab-preset:hover{color:var(--text-secondary,#c0caf5);border-color:var(--accent,#7aa2f7);}' +
+        '.ab-spawn{font-size:13px;font-weight:600;padding:9px 18px;border:none;border-radius:9px;cursor:pointer;color:#fff;display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,var(--accent,#7aa2f7),#bb9af7);box-shadow:0 4px 14px rgba(122,162,247,0.35);transition:transform .12s,box-shadow .12s,filter .12s;}' +
+        '.ab-spawn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(122,162,247,0.45);}' +
+        '.ab-spawn:active{transform:translateY(0);}' +
+        '.ab-spawn:disabled{filter:grayscale(.4) brightness(.78);cursor:default;transform:none;box-shadow:none;}' +
+        '.ab-tot{font-weight:700;font-variant-numeric:tabular-nums;}' +
+        '</style>'
+    );
+
+    $('body').append(
+        '<div class="ab-overlay" id="addBotsModal">' +
+        '<div class="ab-modal">' +
+        '<div class="ab-header">' +
+        '<div class="ab-hleft"><div class="ab-hicon"><i class="fa-solid fa-user-plus"></i></div>' +
+        '<div class="ab-htxt"><b>Add Bots</b><span>Quick-spawn alliance bots for a rerun</span></div></div>' +
+        '<button class="ab-close" id="abClose"><i class="fa-solid fa-xmark"></i></button></div>' +
+        '<div class="ab-body"><div class="ab-grid" id="abRows"></div></div>' +
+        '<div class="ab-foot">' +
+        '<div class="ab-presets">' +
+        '<button class="ab-preset" data-ab-preset="0">Clear</button>' +
+        '<button class="ab-preset" data-ab-preset="1">1× each</button>' +
+        '<button class="ab-preset" data-ab-preset="2">2× each</button>' +
+        '</div>' +
+        '<button class="ab-spawn" id="abSpawn"><i class="fa-solid fa-bolt"></i> Spawn <span class="ab-tot" id="abTotal">0</span></button>' +
+        '</div></div></div>'
+    );
+
+    function renderAddBotCards() {
+        var html = '', total = 0;
+        for (var i = 0; i < ADD_BOT_CLASSES.length; i++) {
+            var c = ADD_BOT_CLASSES[i], n = addBotCounts[c] || 0, m = ADD_BOT_META[c];
+            total += n;
+            html += '<div class="ab-card ' + (n > 0 ? 'on' : 'off') + '" style="--cc:' + m.color + ';">' +
+                '<span class="ab-cname"><i class="fa-solid ' + m.icon + '" style="color:' + m.color + ';"></i><b>' + c + '</b></span>' +
+                '<span class="ab-step">' +
+                '<button data-ab-dec="' + c + '">−</button>' +
+                '<span class="ab-cnt">' + n + '</span>' +
+                '<button data-ab-inc="' + c + '">+</button>' +
+                '</span></div>';
+        }
+        $('#abRows').html(html);
+        $('#abTotal').text(total);
+        $('#abSpawn').prop('disabled', total === 0);
+    }
+
+    $('#btnAddBots').on('click', function () { renderAddBotCards(); $('#addBotsModal').addClass('active'); });
+    $('#abClose').on('click', function () { $('#addBotsModal').removeClass('active'); });
+    $('#addBotsModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
+    $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#addBotsModal').removeClass('active'); });
+
+    $(document).on('click', '[data-ab-inc]', function () {
+        var c = $(this).attr('data-ab-inc'); addBotCounts[c] = Math.min(20, (addBotCounts[c] || 0) + 1); renderAddBotCards();
+    });
+    $(document).on('click', '[data-ab-dec]', function () {
+        var c = $(this).attr('data-ab-dec'); addBotCounts[c] = Math.max(0, (addBotCounts[c] || 0) - 1); renderAddBotCards();
+    });
+    $(document).on('click', '[data-ab-preset]', function () {
+        var v = parseInt($(this).attr('data-ab-preset'), 10) || 0;
+        ADD_BOT_CLASSES.forEach(function (c) { addBotCounts[c] = v; });
+        renderAddBotCards();
+    });
+
+    $('#abSpawn').on('click', function () {
+        var classes = [];
+        ADD_BOT_CLASSES.forEach(function (c) { for (var i = 0; i < (addBotCounts[c] || 0); i++) classes.push(c); });
+        if (!classes.length) { showToast('Pick at least one bot', true); return; }
+        var $btn = $(this).prop('disabled', true);
+        $.ajax({ url: '/Bots/AddBots', method: 'POST', contentType: 'application/json', data: JSON.stringify({ classes: classes }) })
+            .done(function (res) {
+                if (res && res.success) showToast('Spawning ' + classes.length + ' bot(s) — ' + (res.sent != null ? res.sent : classes.length) + ' command(s) sent');
+                else showToast('Add bots failed: ' + ((res && res.error) || 'unknown'), true);
+                $('#addBotsModal').removeClass('active');
+            })
+            .fail(function (xhr) { showToast('Add Bots endpoint not wired yet (' + xhr.status + ')', true); })
+            .always(function () { $btn.prop('disabled', false); });
+    });
 
     $(document).on('click', '#btnBotReport', function (e) {
         e.stopPropagation();

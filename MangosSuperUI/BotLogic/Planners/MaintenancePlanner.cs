@@ -12,15 +12,26 @@ namespace MangosSuperUI.BotLogic.Planners;
 //     held while ctx.Service is in flight. Recovery always wins; after a heal the planner
 //     falls through to the vendor check, so a death that wrecks gear chains heal → repair.
 //
-// The C++ contract (verified in AiBotAI::UpdateAI + BridgeHandleResurrect, DEPLOYED
-// continuation binary with the at_graveyard rez change applied):
+// The C++ contract (verified against AiBotAI::UpdateAI + MoveToDestination +
+// BridgeHandleResurrect, DEPLOYED continuation binary):
 //   • on death: BuildPlayerRepop() → ghost AT THE CORPSE, emit DEATH x|y|z|map, return.
-//     There is NO auto-revive — every subsequent dead tick is a bare return,
-//     "wait for C# RESURRECT".
-//   • RESURRECT → ResurrectPlayer(0.5f) + SpawnCorpseBones() IN PLACE at 50% HP.
-//   • RESURRECT {at_graveyard:1} → RepopAtGraveyard() (relocate the ghost to the map's
-//     nearest faction graveyard) THEN ResurrectPlayer(0.5f) there. This is now a REAL
-//     teleport escape — the binary honors the flag (the prior "no-op on S36" is stale).
+//     The bot's OWN task pipeline is dead (the death block returns before the TASK_MOVE_TO
+//     resume logic) — BUT that is NOT the same as "can't move". BridgeRecv() runs BEFORE
+//     the death block, MoveToDestination has NO IsDead guard (only IsInCombat), and the
+//     subsequent dead tick is a bare return (no StopMoving). So a bridge MOVE_TO issued to
+//     a ghost reaches me->GetMotionMaster()->MovePoint(...) and the MotionMaster drives the
+//     ghost — independent of the bare-returning UpdateAI. A ghost is invulnerable, so this
+//     repositioning carries ZERO death risk.
+//   • RESURRECT → ResurrectPlayer(0.5f) + SpawnCorpseBones() IN PLACE at the unit's current
+//     pos, 50% HP. No teleport, no rez-radius limit → wherever the ghost stops is where it
+//     rezzes. This is the whole mechanism behind ghost-walk-then-rez.
+//   • RESURRECT {at_graveyard:1} → (UPDATED C++ contract) NearTeleportTo the INVULNERABLE
+//     ghost to the nearest faction graveyard, emit GRAVEYARD_PORT, stay DEAD. The planner
+//     then sends a plain RESURRECT to rez at the graveyard. NearTeleportTo is the proven
+//     seam-cross primitive (queued + applied by PlayerBotAI::UpdateAI's pending-teleport
+//     handler) — NOT the old RepopAtGraveyard()+same-tick-rez race that revived on the corpse.
+//     Used as the death-loop / no_path-pocket escape (ghost-walk can't climb out of a navmesh
+//     pocket; teleport ignores the mesh).
 //   • the OOC eat gate (DrinkAndEat) only fires during a task below 40% HP, but an IDLE
 //     bot below 100% eats EVERY tick and returns before it can wander → it sits and
 //     heals to full. So C# heals a bot with SET_TASK IDLE + polling STATE.health.
@@ -28,36 +39,44 @@ namespace MangosSuperUI.BotLogic.Planners;
 // The recovery is a THREE-PHASE machine, all of it in PlanNext (the brain has no
 // EscalateRez handler; the planner only returns Issue/Fire/Wait/Done):
 //
-//   ── REZ ──
+//   ── ARM ──
 //   arm       first dead tick — record the death (durable, BotIdentity), capture the
-//             death spot, decide loop vs isolated, set a short "corpse-run" delay. Wait.
-//   rez_wait  delay elapses → RESURRECT, WAIT on RESPAWN. On a SAME-SPOT loop (a quick
-//             re-death within the window AND within DeathLoopRadius of the last death):
-//             blacklist the kill pocket AND send {at_graveyard:1} so C++ ports the ghost
-//             to a graveyard before rezzing — the geometric escape from a death trap.
-//   rez_sent  WAIT on RESPAWN. A missed deadline comes back as ctx.Failure(deadline) →
-//             re-issue, hard-escalated.
+//             death spot, decide loop vs isolated (bump DeathLoopStreak), blacklist the
+//             pocket on a loop (steers QuestPlanner; does NOT move the bot), set a short
+//             "corpse-run" delay. Wait.
 //
-//   ── RELOCATE (ported from MaintenanceDomain.FindSafeRezSpot) ──
-//   relocate  next STATE clears ctx.Dead. If the rez cell has hostile spawns (per
-//             ZoneSafetyMap) and we did NOT graveyard-rez, MOVE_TO the safest of 8
-//             sampled directions ~25yd out before healing — a 50%-HP bot eating next to
-//             the mob that killed it just dies again. Best-effort and ONCE: on
-//             TASK_COMPLETE / no_path / deadline we proceed to heal regardless. The old
-//             domain ghost-walked THEN rezzed; that can't work (a dead bot bare-returns
-//             every tick — it can't run a task), so we rez first and relocate ALIVE.
-//             Skipped when the cell is clear or we already ported to a (safe) graveyard.
+//   ── ESCAPE ──
+//   graveyard_port  STILL DEAD. If DeathLoopStreak >= GraveyardAfterStreak (died more than
+//             twice in the same pocket inside the 5-min window) the ghost-walk can't help —
+//             a no_path pocket needs a teleport. Send RESURRECT{at_graveyard:1}; C++ ports
+//             the ghost and emits GRAVEYARD_PORT; we then plain-RESURRECT at the graveyard.
+//   ghost_walk  Otherwise: sample ZoneSafetyMap around the corpse; MOVE_TO the safest cell
+//             (outward in CELL_SIZE rings). The ghost is invulnerable, so it walks through the
+//             pack with no death risk; on TASK_COMPLETE / deadline / PATH_UNSAFE we stop and
+//             rez wherever it got to. Cell already clear (FindSafeRezSpot==null) → skip the
+//             walk, rez here. moved= in the [GHOST] log IS the empirical test of whether
+//             MovePoint moves a ghost (~offset = yes; ~0 = no → a no_path pocket; the
+//             graveyard escalation above is the answer once it loops).
+//
+//   ── REZ ──
+//   rez_sent  RESURRECT (plain, in place at the safe ghost / graveyard pos), WAIT on RESPAWN.
+//             A missed deadline comes back as ctx.Failure(deadline) → re-issue.
 //
 //   ── HEAL-TO-FULL (the survival fix) ──
 //   heal      recovery does NOT release yet: rezzing at 50% and re-engaging is the death
 //             spiral. Fire SET_TASK IDLE once, hold, and poll STATE.health; release to the
 //             GoalSelector at RezHealTarget (and ~full mana for mana classes). A timeout
 //             backstop covers a mob respawning on the corpse and gating DrinkAndEat.
-//   GoalSelector keeps the bot in Maintenance through relocate+heal (RezSent && !HealDone).
+//   GoalSelector keeps the bot in Maintenance through ghost-walk+heal (RezSent && !HealDone,
+//   and Dead while ghost-walking).
 //
 // Intentionally DROPPED:
-//   • the old GHOST-walk-then-rez — a ghost never runs a task on this binary; we relocate
-//     ALIVE after rez instead (same FindSafeRezSpot sampling, applied post-rez).
+//   • the alive-relocate (rez-first-then-move-at-50%-HP) — it died mid-hop in the pack.
+//     The ghost-walk above does the same FindSafeRezSpot sampling but PRE-rez, as an
+//     invulnerable ghost, so the move can't be interrupted by death.
+//   • the OLD {at_graveyard:1} impl (RepopAtGraveyard + same-tick rez) — it raced and landed
+//     on the corpse. The C++ branch is now NearTeleportTo-the-ghost-then-rez (see contract
+//     above), so {at_graveyard:1} is back IN USE as the death-loop escape.
 //   • eating itself stays autonomous C++ (DrinkAndEat) — we only HOLD the bot IDLE so it
 //     can finish eating before re-engaging.
 //
@@ -116,6 +135,17 @@ public sealed class MaintenancePlanner : IBotPlanner
     // of +6 gives ~3 levels of breathing room before it retries whatever pocket killed it.
     private const int DeathSpotDangerGate = 6;
 
+    // ── Graveyard escalation (the no_path-pocket / death-march escape) ──
+    // Ghost-walk can't climb out of a navmesh pocket — Hide proved it: streak 0→6, with
+    // moved=0 on every single walk. So once we KNOW we're trapped, stop walking and teleport
+    // out. DeathLoopStreak counts consecutive SAME-SPOT deaths inside DeathLoopWindowSec
+    // (5 min); streak==2 is the 3rd such death — i.e. "died more than twice in < 5 min".
+    // (streak>=1 would port on the 2nd death; streak>=2 on the 3rd. Tune here.) The graveyard
+    // is a safe town hub that also has an armorer, so this fixes the dur-cratered death-march
+    // in the same move.
+    private const int GraveyardAfterStreak = 2;
+    private const double GraveyardPortDeadlineSec = 10;  // wait for GRAVEYARD_PORT ack, else fall back to rez-in-place
+
     // ── Heal-to-full phase ──
     // Hold the just-rezzed bot IDLE until it has eaten/drunk back to ~full before
     // releasing it to the GoalSelector. RezHealTarget is short of 100% so a single
@@ -125,12 +155,19 @@ public sealed class MaintenancePlanner : IBotPlanner
     private const float RezHealManaTarget = 0.85f;   // mana fraction (1f for melee → always ok)
     private const double HealTimeoutSec = 60;      // backstop: a mob on the corpse gates DrinkAndEat (combat) → don't wedge
 
-    // ── Relocate phase (ported FindSafeRezSpot) ──
-    private const float RezOffsetYards = 25f;   // sample distance for the safe spot (within WoW's ~36yd rez radius)
-    private const double RelocateDeadlineSec = 15;    // best-effort relocate MOVE_TO ceiling before we heal anyway
+    // ── Relocate phase (cell-aware safe-rez sampling, ported from FindSafeRezSpot) ──
+    // The rez sampler walks OUTWARD in grid-cell steps (ZoneSafetyMap.CELL_SIZE = 100yd) and
+    // scores candidates by spawn DENSITY, not just creature level. Sampling finer than a cell
+    // just re-reads the death cell (the bug that pinned bots in a uniform kobold field), and a
+    // level-only metric is blind to death-by-dogpile from a trivial-but-dense pack.
+    private const float RezSearchBaseYards = 200f;   // fresh death searches ≥2 cells out — enough to clear a single-cell pack
+    private const float RezSearchStepYards = 100f;   // +1 cell of search radius per same-spot loop (DeathLoopStreak)
+    private const float RezSearchMaxYards = 450f;    // cap on how far we'll ghost-walk to clear a field (~30s ghost run)
+    private const double GhostWalkDeadlineSec = 45;   // ghost-walk MOVE_TO ceiling (raised: a 200–450yd clear walk needs >30s)
 
     // ── Vendor / repair errand (ported EconomyDomain) ──
     private const int DurabilityVendorThreshold = 30;    // min equipped durability % before we break for a vendor (mirror GoalSelector)
+    private const int RepairRequiredBelowDurability = 70;   // below this durability %, the vendor lookup is HARD-FILTERED to repair-capable NPCs (no sell-only detour) — force the armorer
     private const float VendorMaxTravelYards = 3000f; // don't START a march past this — quest until one is closer
     private const double VendorRouteGiveupSec = 480;  // abandon a trip that never arrives (~3000yd + margin)
     private const double VendorLegDeadlineSec = 120;  // per-MOVE_TO leg ceiling (capped paths re-send; a truly stuck leg gives up)
@@ -146,10 +183,10 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         var id = ctx.Identity;
 
-        // Consume any negative outcome. While in Maintenance the only WAIT is the
-        // RESURRECT→RESPAWN one (the heal phase fires IDLE with NO wait), and the only
-        // failure that can reach here is its deadline (the brain's expired-WAIT block) —
-        // a cue to re-issue, escalated.
+        // Consume any negative outcome. While in Maintenance the WAITs are the RESURRECT→
+        // RESPAWN one and the graveyard-port→GRAVEYARD_PORT one (the heal phase fires IDLE
+        // with NO wait), and the only failure that reaches here is a deadline (the brain's
+        // expired-WAIT block) — a cue to re-issue / fall through.
         var failure = ctx.Failure;
         ctx.Failure = null;
 
@@ -158,16 +195,14 @@ public sealed class MaintenancePlanner : IBotPlanner
         {
             var rm = ctx.Maintenance;
 
-            // Death-recovery in flight takes priority — finish relocate → heal first.
+            // Death-recovery in flight takes priority — heal first. Repositioning happens
+            // PRE-rez (ghost-walk or graveyard port), so by the time we're alive the bot is
+            // already on safe ground — nothing to relocate, just heal.
             if (rm != null && rm.RezSent)
             {
                 rm.Rezzed = true;                        // came back alive after a RESURRECT — a later dead tick is a re-death
                 if (!rm.HealDone)
-                {
-                    if (!rm.RelocateDone)
-                        return RelocateOrHeal(ctx, rm);  // step off a hostile rez cell (best-effort)
                     return HealToFull(ctx, rm);          // hold IDLE, eat back to ~full
-                }
                 // Healed. Gear may be wrecked from the death — fall through to the vendor
                 // errand (durability/bags are re-checked there; it no-ops if we're fine).
             }
@@ -197,8 +232,19 @@ public sealed class MaintenancePlanner : IBotPlanner
                              && (DateTime.UtcNow - id.LastDeathTime).TotalSeconds < DeathLoopWindowSec
                              && SameSpotAsLastDeath(id.LastDeathLocation, ctx);
 
+            // Escalation counter: a loop death pushes the relocate further next rez; a death
+            // somewhere new means the last relocate worked → reset. Bump BEFORE RecordDeath
+            // (which overwrites LastDeathLocation) using the loop verdict computed above.
+            if (id != null) id.DeathLoopStreak = deathLoop ? id.DeathLoopStreak + 1 : 0;
+
             var deathPos = new Vec4(ctx.Pos.X, ctx.Pos.Y, ctx.Pos.Z, ctx.MapId);
             id?.RecordDeath(deathPos.X, deathPos.Y, deathPos.Map);  // durable; also feeds QuestPlanner shelving
+
+            // On a same-spot loop, blacklist the pocket so the QuestPlanner stops ROUTING
+            // back here until the bot out-levels it (clears at danger-3). This only steers
+            // future quest selection — it does NOT move the bot; the ghost-walk below does.
+            if (deathLoop)
+                id?.AddPathBlacklist(deathPos.X, deathPos.Y, ctx.Level + DeathSpotDangerGate);
 
             ctx.Maintenance = new MaintenanceScratch
             {
@@ -209,115 +255,171 @@ public sealed class MaintenancePlanner : IBotPlanner
             };
             ctx.Service = null;   // drop any in-flight vendor trip — recovery owns the bot; re-evaluate after heal
             ctx.SetStep("rez_wait");
+            _log.LogInformation("[REZ] {Name} DEATH @ ({X:F0},{Y:F0})@{Map} loop={Loop} streak={Streak} (deaths={Deaths})",
+                ctx.Name, deathPos.X, deathPos.Y, deathPos.Map, deathLoop, id?.DeathLoopStreak ?? 0, id?.DeathsSinceQuestStart ?? 0);
             return StepResult.Wait();
         }
 
         var m = ctx.Maintenance;
 
-        // RESURRECT WAIT blew its deadline (RESPAWN never arrived) → re-issue, hard-escalate.
+        // RESURRECT WAIT blew its deadline (RESPAWN never arrived) → re-issue.
         if (failure != null && m.RezSent)
-        {
-            m.DeathLoop = true;
-            return SendResurrect(ctx, m, escalate: true);
-        }
+            return SendResurrect(ctx, m);
 
         // Already sent and waiting (Pending cleared but STATE not yet alive) — don't
         // spam a second RESURRECT; the WAIT / next STATE resolves it.
         if (m.RezSent)
             return StepResult.Wait();
 
-        // Absolute dead-time backstop.
+        // Absolute dead-time backstop → rez now, wherever we are.
         if ((DateTime.UtcNow - m.DeadSinceUtc).TotalSeconds > MaxDeadSec)
-            return SendResurrect(ctx, m, escalate: true);
+            return SendResurrect(ctx, m);
 
-        // Still waiting out the corpse-run delay.
+        // ── GRAVEYARD ESCALATION ──
+        // Died more than twice in the same pocket inside the 5-min window. Ghost-walk can't
+        // climb out of a no_path pocket, so skip it: C++ ports the INVULNERABLE ghost to the
+        // nearest faction graveyard (RESURRECT{at_graveyard:1} → NearTeleportTo, the proven
+        // seam-cross primitive — NOT the old RepopAtGraveyard race), emits GRAVEYARD_PORT, and
+        // stays dead. We then send a plain RESURRECT to rez there. RelocateSent/RelocateDone are
+        // reused as the port phase flags (same as ghost-walk — no scratch change). Runs BEFORE
+        // the corpse-run delay below: we're leaving the pocket, not popping up in it.
+        bool useGraveyard = (id?.DeathLoopStreak ?? 0) >= GraveyardAfterStreak;
+        if (useGraveyard)
+        {
+            if (!m.RelocateSent)
+                return SendGraveyardPort(ctx, m);
+
+            if (!m.RelocateDone)
+            {
+                // GRAVEYARD_PORT acked, OR the port WAIT failed/deadlined. Either way rez now:
+                // on success at the graveyard, on failure in place (never worse than today). If
+                // the teleport fired it has already landed — PlayerBotAI::UpdateAI applies
+                // pending teleports at the TOP of the tick, before BridgeRecv processes this
+                // RESURRECT, so the rez can't beat the port.
+                m.RelocateDone = true;
+                _log.LogInformation("[GRAVE] {Name} port {Why} — rez @ ({X:F0},{Y:F0})@{Map} streak={Streak}",
+                    ctx.Name, failure != null ? "FAILED/deadline (rez in place)" : "done",
+                    ctx.Pos.X, ctx.Pos.Y, ctx.MapId, id?.DeathLoopStreak ?? 0);
+            }
+
+            return SendResurrect(ctx, m);
+        }
+
+        // Still waiting out the corpse-run delay (lets a leashing mob wander off before we
+        // pop up at 50% HP IN PLACE — only relevant to the ghost-walk path below).
         if (DateTime.UtcNow < m.RezAtUtc)
             return StepResult.Wait();
 
-        // Delay elapsed → resurrect (graveyard-escalated if this is a same-spot loop).
-        return SendResurrect(ctx, m, escalate: m.DeathLoop);
+        // ── GHOST-WALK (the fix): reposition the INVULNERABLE ghost to safe ground, THEN
+        // rez there. A ghost takes no damage and mobs ignore it, so this can't die mid-move
+        // the way the old alive-relocate did. C++ has NO IsDead guard on the MOVE_TO path
+        // (MoveToDestination only gates on IsInCombat) and BridgeRecv() runs BEFORE the death
+        // block's early return, so a MOVE_TO issued now reaches the ghost's MotionMaster;
+        // plain RESURRECT then revives IN PLACE at the ghost's current pos (no teleport, no
+        // rez-radius limit). RelocateSent/RelocateDone are reused as the ghost-walk phase
+        // flags (no new scratch field needed). ──
+        if (!m.RelocateSent)
+        {
+            int streak = Math.Max(1, id?.DeathLoopStreak ?? 1);
+            // Search radius — NOT the old 25yd×streak offset. Even a fresh death searches
+            // ≥2 cells out so it can clear a single-cell pack; same-spot loops widen it by a
+            // cell each. FindSafeRezSpot walks outward in CELL_SIZE rings and returns the
+            // nearest low-density cell, so distance is driven by "is it actually clear", not
+            // by streak (a wide field scatters deaths → streak never climbed → bot stayed put).
+            float searchYards = Math.Min(RezSearchBaseYards + RezSearchStepYards * (streak - 1), RezSearchMaxYards);
+            var spot = FindSafeRezSpot(ctx.Pos.X, ctx.Pos.Y, ctx.Pos.Z, ctx.MapId, searchYards);
+            if (spot == null)
+            {
+                // Cell already clear (or no safety grid loaded) — nothing to walk to; rez here.
+                _log.LogInformation("[GHOST] {Name} cell clear @ ({X:F0},{Y:F0}) (search {Search:F0} streak {Streak}) -> rez in place",
+                    ctx.Name, ctx.Pos.X, ctx.Pos.Y, searchYards, streak);
+                m.RelocateSent = true;
+                m.RelocateDone = true;
+                return SendResurrect(ctx, m);
+            }
+
+            var safe = spot.Value;
+            m.RelocateSent = true;
+            ctx.SetStep("ghost_walk");
+            _log.LogInformation("[GHOST] {Name} ghost-walk -> ({SX:F0},{SY:F0}) search {Search:F0} streak {Streak} | ghostPos=({X:F0},{Y:F0}) deathPos=({DX:F0},{DY:F0})",
+                ctx.Name, safe.X, safe.Y, searchYards, streak, ctx.Pos.X, ctx.Pos.Y, m.DeathPos.X, m.DeathPos.Y);
+            // Plain (un-enriched) MOVE_TO so C++ emits TASK_COMPLETE on arrival — issued WHILE DEAD.
+            var cmd = new BridgeCommand("MOVE_TO", new { mapId = ctx.MapId, x = safe.X, y = safe.Y, z = safe.Z });
+            return StepResult.Send(cmd, "TASK_COMPLETE", TimeSpan.FromSeconds(GhostWalkDeadlineSec));
+        }
+
+        // Ghost-walk resolved — TASK_COMPLETE (arrived), or a deadline / PATH_UNSAFE /
+        // MOVE_FAILED came back as a failure. Either way we rez at wherever the ghost now
+        // stands. moved= IS the empirical verdict: ~offset => MovePoint moves a ghost (Kaj
+        // escapes); ~0 => it doesn't, and the graveyard escalation above is the answer once it loops.
+        if (!m.RelocateDone)
+        {
+            m.RelocateDone = true;
+            float dx = ctx.Pos.X - m.DeathPos.X, dy = ctx.Pos.Y - m.DeathPos.Y;
+            float moved = MathF.Sqrt(dx * dx + dy * dy);
+            _log.LogInformation("[GHOST] {Name} ghost-walk done ({Why}) — ghostPos=({X:F0},{Y:F0}) deathPos=({DX:F0},{DY:F0}) moved={Moved:F0}yd",
+                ctx.Name, failure != null ? "deadline/abort" : "arrived",
+                ctx.Pos.X, ctx.Pos.Y, m.DeathPos.X, m.DeathPos.Y, moved);
+        }
+
+        // Rez in place at the (now-safe) ghost position.
+        return SendResurrect(ctx, m);
     }
 
-    // ── Relocate: step a just-rezzed bot off a hostile cell before it heals ──
-    // Ported from MaintenanceDomain.FindSafeRezSpot, but run ALIVE (post-rez) instead of
-    // ghost-walked pre-rez — a dead bot can't move on this binary. Best-effort and ONCE:
-    // the moment a relocate MOVE_TO has been issued, the next time we land here (its
-    // outcome consumed at the top of PlanNext) we fall through to heal, win or lose.
-    private StepResult RelocateOrHeal(BotContext ctx, MaintenanceScratch m)
-    {
-        // Already issued the relocate MOVE_TO — its ack / no_path / deadline came and went;
-        // we don't retry. Proceed to heal.
-        if (m.RelocateSent)
-        {
-            m.RelocateDone = true;
-            return HealToFull(ctx, m);
-        }
-
-        // A graveyard rez already dropped the bot on safe ground — no relocate needed.
-        if (m.Escalated)
-        {
-            m.RelocateDone = true;
-            return HealToFull(ctx, m);
-        }
-
-        // Sample the safety grid around where we rezzed. Null = the cell has no hostile
-        // spawns (or no safety data loaded) → safe to heal in place.
-        var spot = FindSafeRezSpot(ctx.Pos.X, ctx.Pos.Y, ctx.Pos.Z, ctx.MapId);
-        if (spot == null)
-        {
-            m.RelocateDone = true;
-            return HealToFull(ctx, m);
-        }
-
-        var safe = spot.Value;
-        m.RelocateSent = true;
-        ctx.SetStep("relocate");
-        var cmd = new BridgeCommand("MOVE_TO", new { mapId = ctx.MapId, x = safe.X, y = safe.Y, z = safe.Z });
-        return StepResult.Send(cmd, "TASK_COMPLETE", TimeSpan.FromSeconds(RelocateDeadlineSec));
-    }
-
-    // Sample 8 directions at RezOffsetYards and return the safest (lowest max creature
-    // level) — or null if the current cell already has no hostile spawns / no grid loaded.
-    // Faithful to the old MaintenanceDomain sampler, minus the ghost-walk framing.
-    private Vec4? FindSafeRezSpot(float x, float y, float z, int mapId)
+    // Walk OUTWARD in grid-cell rings and return the nearest low-density cell to ghost-walk
+    // to — or null if the death cell already has no hostile spawns / no grid loaded.
+    //
+    // Two things the old sampler got wrong, both fixed here:
+    //   (1) It sampled at 25yd while the grid is CELL_SIZE (100yd) — every sample fell in the
+    //      SAME cell as the corpse, so no direction ever read different, and it fell through to
+    //      "step 25yd east" straight back into the pack. We now step in CELL_SIZE increments so
+    //      each ring lands in genuinely different cells.
+    //   (2) It scored by creature LEVEL only — blind to a dense pack of trivial mobs (the kobold
+    //      field that dogpiled L7 bots). We score by spawn DENSITY first (level as tiebreak).
+    //
+    // <paramref name="maxSearchYards"/> bounds how far we'll send the (invulnerable) ghost.
+    private Vec4? FindSafeRezSpot(float x, float y, float z, int mapId, float maxSearchYards)
     {
         if (!_safetyMap.IsLoaded)
             return null;
 
-        int hereMax = _safetyMap.GetMaxCreatureLevel(mapId, x, y);
-        if (hereMax == 0)
+        int hereCount = _safetyMap.GetSpawnCount(mapId, x, y);
+        if (hereCount == 0)
             return null;   // no hostile spawns in this cell — heal in place
 
-        int bestLevel = hereMax;
-        float bestX = x, bestY = y;
-        bool foundBetter = false;
+        int hereLevel = _safetyMap.GetMaxCreatureLevel(mapId, x, y);
 
-        for (int dir = 0; dir < 8; dir++)
-        {
-            float angle = dir * MathF.PI / 4f;                  // N, NE, E, ... NW
-            float tx = x + MathF.Cos(angle) * RezOffsetYards;
-            float ty = y + MathF.Sin(angle) * RezOffsetYards;
-            int lvl = _safetyMap.GetMaxCreatureLevel(mapId, tx, ty);
-            if (lvl < bestLevel) { bestLevel = lvl; bestX = tx; bestY = ty; foundBetter = true; }
-        }
+        // Best-effort fallback: the least-dense (then lowest-level) candidate seen so far, in
+        // case no fully-empty cell is reachable within maxSearchYards.
+        Vec4? best = null;
+        int bestCount = hereCount;
+        int bestLevel = hereLevel;
 
-        if (!foundBetter)
+        float step = ZoneSafetyMap.CELL_SIZE;   // 100yd — one grid cell, so rings hit new cells
+        for (float r = step; r <= maxSearchYards; r += step)
         {
-            // No safer direction — prefer any EMPTY cell; else just step 25yd east to put
-            // distance between us and whatever killed us (forces a re-path, buys eat time).
             for (int dir = 0; dir < 8; dir++)
             {
-                float angle = dir * MathF.PI / 4f;
-                float tx = x + MathF.Cos(angle) * RezOffsetYards;
-                float ty = y + MathF.Sin(angle) * RezOffsetYards;
-                if (_safetyMap.GetMaxCreatureLevel(mapId, tx, ty) == 0)
-                    return new Vec4(tx, ty, z, mapId);
+                float angle = dir * MathF.PI / 4f;                  // N, NE, E, ... NW
+                float tx = x + MathF.Cos(angle) * r;
+                float ty = y + MathF.Sin(angle) * r;
+
+                int cnt = _safetyMap.GetSpawnCount(mapId, tx, ty);
+                if (cnt == 0)
+                    return new Vec4(tx, ty, z, mapId);   // empty cell — walk here now
+
+                int lvl = _safetyMap.GetMaxCreatureLevel(mapId, tx, ty);
+                if (cnt < bestCount || (cnt == bestCount && lvl < bestLevel))
+                {
+                    bestCount = cnt; bestLevel = lvl;
+                    best = new Vec4(tx, ty, z, mapId);
+                }
             }
-            bestX = x + RezOffsetYards;
-            bestY = y;
         }
 
-        return new Vec4(bestX, bestY, z, mapId);
+        // No fully-clear cell within range — take the least-dense one found (don't over-walk
+        // the ghost back toward the field). null if nothing beat the death cell.
+        return best;
     }
 
     // ── Vendor / repair errand (ported from EconomyDomain, on the WAIT spine) ──
@@ -346,9 +448,12 @@ public sealed class MaintenancePlanner : IBotPlanner
             _log.LogInformation("[VENDOR] {Name} guid={Guid} trigger bag={Bag} dur={Dur} z={Zone} pos=({X:F0},{Y:F0})@{Map} lvl={Lvl}",
                 ctx.Name, ctx.Guid, ctx.FreeSlots, ctx.Durability, ctx.ZoneId, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.Level);
 
-            var vendor = _zoneData.GetNearestVendor(ctx.ZoneId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y, ctx.Level);
+            // Below the repair floor a sell-only vendor is useless — hard-require an armorer
+            // so the bot can't keep walking to the nearest food vendor while durability latches.
+            bool requireRepair = ctx.Durability < RepairRequiredBelowDurability;
+            var vendor = _zoneData.GetNearestVendor(ctx.ZoneId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y, ctx.Level, requireRepair);
             if (vendor == null)
-                return GiveUp(ctx, "no vendor in zone");   // ZoneDataLoader logs the cap/closest that drove the null
+                return GiveUp(ctx, requireRepair ? "no repair vendor in range (dur low)" : "no vendor in zone");   // ZoneDataLoader logs the cap/closest that drove the null
 
             var target = new Vec4(vendor.X, vendor.Y, vendor.Z, vendor.MapId);
             float startDist = ctx.Pos.Dist2D(target.Pos);
@@ -542,32 +647,40 @@ public sealed class MaintenancePlanner : IBotPlanner
         return (dx * dx + dy * dy) <= DeathLoopRadiusYards * DeathLoopRadiusYards;
     }
 
-    private static StepResult SendResurrect(BotContext ctx, MaintenanceScratch m, bool escalate)
+    // Plain, in-place rez. The ghost-walk (or the graveyard port) already moved us to safe
+    // ground, so ResurrectPlayer revives at the unit's current pos — we come back exactly
+    // where the ghost stopped (the safe cell, or the graveyard after a port).
+    private StepResult SendResurrect(BotContext ctx, MaintenanceScratch m)
     {
-        if (escalate && !m.Escalated)
-        {
-            m.Escalated = true;
-            // Blacklist the kill pocket so the QuestPlanner stops ROUTING here until the
-            // bot out-levels it (IsPathBlacklisted clears at danger-3). The graveyard port
-            // below physically MOVES the bot out; the blacklist keeps it from walking back.
-            ctx.Identity?.AddPathBlacklist(m.DeathPos.X, m.DeathPos.Y, ctx.Level + DeathSpotDangerGate);
-        }
-
         m.RezSent = true;
         ctx.SetStep("rez_sent");
 
-        // On a same-spot loop, escalate to a GRAVEYARD rez: C++ honors {at_graveyard:1}
-        // by RepopAtGraveyard() (relocate the ghost to the map's nearest faction graveyard)
-        // then rezzing there — the geometric escape from a death trap. Plain RESURRECT
-        // rezzes in place at the corpse (50% HP) for an isolated death.
-        var cmd = escalate
-            ? new BridgeCommand("RESURRECT", new { at_graveyard = 1 })
-            : new BridgeCommand("RESURRECT");
+        var cmd = new BridgeCommand("RESURRECT");
 
-        // WAIT on RESPAWN: C++ revives (in place, or at the graveyard) at 50% HP and emits
-        // it; the executor acks by event type, the next STATE clears isDead, and the
-        // heal-to-full phase takes over before the GoalSelector reselects.
+        _log.LogInformation("[REZ] {Name} RESURRECT (in place) streak={Streak} @ ({X:F0},{Y:F0})@{Map}",
+            ctx.Name, ctx.Identity?.DeathLoopStreak ?? 0, ctx.Pos.X, ctx.Pos.Y, ctx.MapId);
+
+        // WAIT on RESPAWN: C++ revives in place at 50% HP and emits it; the executor acks by
+        // event type, the next STATE clears isDead, and heal-to-full takes over before the
+        // GoalSelector reselects.
         return StepResult.Send(cmd, "RESPAWN", TimeSpan.FromSeconds(RespawnDeadlineSec));
+    }
+
+    // Graveyard escalation: tell C++ to port the invulnerable ghost to the nearest faction
+    // graveyard. C++ uses NearTeleportTo (the proven seam-cross primitive — NOT the old
+    // RepopAtGraveyard race), stays dead, and emits GRAVEYARD_PORT. On that ack the planner
+    // sends a plain RESURRECT (SendResurrect) to rez at the graveyard. A missed ack falls
+    // through to the !RelocateDone branch → rez in place, so the worst case is exactly today.
+    private StepResult SendGraveyardPort(BotContext ctx, MaintenanceScratch m)
+    {
+        m.RelocateSent = true;
+        ctx.SetStep("graveyard_port");
+
+        _log.LogInformation("[GRAVE] {Name} graveyard port (streak={Streak} >= {Thresh}) from ({X:F0},{Y:F0})@{Map}",
+            ctx.Name, ctx.Identity?.DeathLoopStreak ?? 0, GraveyardAfterStreak, ctx.Pos.X, ctx.Pos.Y, ctx.MapId);
+
+        var cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1 });
+        return StepResult.Send(cmd, "GRAVEYARD_PORT", TimeSpan.FromSeconds(GraveyardPortDeadlineSec));
     }
 
     // The rez timer, the RESPAWN WAIT, and the heal poll all own liveness, so this goal is

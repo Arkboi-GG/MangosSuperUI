@@ -1,10 +1,10 @@
 @{
-    ViewData["Title"] = "Bot Tuner";
+    ViewData["Title"] = "Bot Monitor";
 }
 
 @section Styles {
     <style>
-        /* ====== Bot Tuner ====== */
+        /* ====== Bot Monitor ====== */
 
         /* --- Header Stats --- */
         .bt-stat {
@@ -572,10 +572,13 @@
     <div class="main-content">
         <div class="content-header d-flex align-items-start justify-content-between">
             <div>
-                <h1><i class="fa-solid fa-brain" style="color: var(--accent);"></i> Bot Tuner</h1>
+                <h1><i class="fa-solid fa-brain" style="color: var(--accent);"></i> Bot Monitor</h1>
                 <p>Behavioral engine dashboard — personality, decisions, and economy</p>
             </div>
             <div class="d-flex align-items-center gap-3">
+                <button id="btnAddBots" class="btn-accent" style="font-size:11px;padding:4px 10px;height:26px;white-space:nowrap;" title="Quick-spawn bots via .bot addai">
+                    <i class="fa-solid fa-user-plus"></i> Add Bots
+                </button>
                 <span class="bt-stat" title="Tracked bots">
                     <i class="fa-solid fa-robot"></i> <span class="bt-stat-val" id="statTracked">0</span>
                 </span>

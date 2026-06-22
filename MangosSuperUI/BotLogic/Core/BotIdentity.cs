@@ -120,6 +120,15 @@ public class BotIdentity
     /// <summary>UTC time of last death.</summary>
     public DateTime LastDeathTime { get; set; }
 
+    /// <summary>
+    /// Consecutive same-spot deaths (each death within DeathLoopRadius of the previous one).
+    /// Drives the ESCALATING relocate offset in MaintenancePlanner — each loop death pushes
+    /// the post-rez relocate further out so a bot buried in a pack eventually clears aggro.
+    /// Bumped on a loop death, reset to 0 on a death somewhere new (the last relocate worked)
+    /// or on ResetDeathCounter (picked a quest / changed activity). A live-run knob.
+    /// </summary>
+    public int DeathLoopStreak { get; set; }
+
     // --- Spell/training tracking ---
     public HashSet<int> KnownSpellIds { get; set; } = new();
     public bool HasUnlearnedSpells { get; set; }
@@ -404,6 +413,7 @@ public class BotIdentity
     public void ResetDeathCounter()
     {
         DeathsSinceQuestStart = 0;
+        DeathLoopStreak = 0;
     }
 
     /// <summary>

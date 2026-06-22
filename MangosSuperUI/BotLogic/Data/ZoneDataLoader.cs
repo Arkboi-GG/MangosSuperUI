@@ -69,7 +69,13 @@ public class ZoneDataLoader
                     Z = v.position_z,
                     NpcEntry = v.npc_entry,
                     NpcName = v.npc_name,
-                    CanRepair = (v.npc_flags & 4096) != 0 // UNIT_NPC_FLAG_REPAIR
+                    // VMaNGOS / 1.12-client npc_flags layout: REPAIR (armorer) = 0x4000 (16384).
+                    // 0x1000 (4096) is AUCTIONEER in vanilla — the "repair = 4096" value is the
+                    // TBC/WotLK convention and is WRONG here. Using 4096 tagged auctioneers as
+                    // repair-capable and EVERY real armorer as CanRepair=false, so no bot ever
+                    // repaired fleet-wide (durability latched <30 and looped the vendor errand).
+                    // VENDOR=128 and INNKEEPER=65536 (above/below) are correct for this layout.
+                    CanRepair = (v.npc_flags & 0x4000) != 0 // UNIT_NPC_FLAG_REPAIR (16384)
                 });
                 vendorCount++;
             }
@@ -119,10 +125,20 @@ public class ZoneDataLoader
     /// the distance of the absolute nearest vendor — this way bots get their gear
     /// repaired as part of normal vendoring without traveling much further.
     ///
+    /// When <paramref name="requireRepair"/> is true the lookup is HARD-FILTERED to
+    /// repair-capable vendors only (the 1.5x convenience preference is bypassed) and
+    /// returns null if none are in range. Used by the durability errand: below a
+    /// durability floor a sell-only vendor is useless, so a soft 1.5x preference (which
+    /// loses whenever the bot is standing next to a closer food vendor) is not enough —
+    /// the bot must be sent to an armorer or not vendor at all. Repair NPCs that are
+    /// cached carry the vendor flag too, so selling greys still works at the chosen one.
+    ///
     /// Session 26 fix: previously returned ANY vendor on same map with no distance cap.
     /// Session 32: repair vendor preference added.
+    /// 2026-06-20: requireRepair hard-filter added (the 1.5x window never reached the
+    /// armorer when a food vendor was closer; durability latched and looped the errand).
     /// </summary>
-    public NpcLocation? GetNearestVendor(int zoneId, int mapId, float x, float y, int botLevel = 60)
+    public NpcLocation? GetNearestVendor(int zoneId, int mapId, float x, float y, int botLevel = 60, bool requireRepair = false)
     {
         if (!_vendorsByMap.TryGetValue(mapId, out var vendors) || vendors.Count == 0)
         {
@@ -156,6 +172,29 @@ public class ZoneDataLoader
                 closest?.NpcName ?? "?", closest?.NpcEntry ?? 0,
                 closest != null ? MathF.Sqrt(closestDistSq) : -1f);
             return null;
+        }
+
+        // Durability-forced repair: a sell-only vendor can't fix cratered gear, so when the
+        // caller demands repair we ignore the convenience preference entirely and hard-filter
+        // to repair-capable vendors. inRange is already nearest-first, so the first CanRepair
+        // is the nearest armorer; if there is none in range we return null (the errand gives up
+        // and re-tries later rather than looping a vendor that can never repair).
+        if (requireRepair)
+        {
+            var nearestRepairOnly = inRange.FirstOrDefault(v => v.CanRepair);
+            if (nearestRepairOnly == null)
+            {
+                _logger.LogWarning(
+                    "[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} cap={Cap:F0}yd mapVendors={N} inRange={R} requireRepair → NULL: no repair-capable vendor in range",
+                    zoneId, mapId, botLevel, maxDist, vendors.Count, inRange.Count);
+                return null;
+            }
+            _logger.LogInformation(
+                "[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} cap={Cap:F0}yd mapVendors={N} inRange={R} requireRepair → {Name} (entry={Entry}) @ {Dist:F0}yd repair=Y",
+                zoneId, mapId, botLevel, maxDist, vendors.Count, inRange.Count,
+                nearestRepairOnly.NpcName, nearestRepairOnly.NpcEntry,
+                MathF.Sqrt(DistSq(nearestRepairOnly.X, nearestRepairOnly.Y, x, y)));
+            return nearestRepairOnly;
         }
 
         var nearest = inRange[0];

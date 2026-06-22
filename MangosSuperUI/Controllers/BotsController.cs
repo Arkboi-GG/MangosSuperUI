@@ -15,8 +15,9 @@ public class BotsController : Controller
     private readonly DbcService _dbc;
     private readonly BotFlightRecorder _recorder;
     private readonly BotLogBuffer _log;
+    private readonly RaService _ra;
 
-    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log)
+    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra)
     {
         _bridge = bridge;
         _brain = brain;
@@ -24,11 +25,58 @@ public class BotsController : Controller
         _dbc = dbc;
         _recorder = recorder;
         _log = log;
+        _ra = ra;
     }
 
     public IActionResult Index()
     {
         return View();
+    }
+
+    // ==================== Add bots (RA console: .bot addai <class>) ====================
+    // Quick-spawn helper for reruns. The Bot Monitor "Add Bots" modal POSTs a flat class
+    // list; we fire `.bot addai <class>` once per entry over RA (serialized inside RaService).
+    // Classes are STRICTLY whitelisted — these tokens are concatenated into a live console
+    // command, so an unknown token is rejected up front rather than passed through.
+    private static readonly HashSet<string> _addBotClasses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "warrior", "paladin", "hunter", "rogue", "priest", "mage", "warlock", "druid"
+    };
+
+    [HttpPost]
+    public async Task<IActionResult> AddBots([FromBody] AddBotsRequest req)
+    {
+        var classes = req?.Classes ?? Array.Empty<string>();
+        if (classes.Length == 0)
+            return Json(new { success = false, error = "No classes specified" });
+        if (classes.Length > 50)
+            return Json(new { success = false, error = "Too many at once (max 50)" });
+
+        // Validate EVERY token against the whitelist before sending anything.
+        var invalid = classes.Where(c => string.IsNullOrWhiteSpace(c) || !_addBotClasses.Contains(c.Trim())).ToList();
+        if (invalid.Count > 0)
+            return Json(new { success = false, error = "Unknown class(es): " + string.Join(", ", invalid) });
+
+        var results = new List<object>();
+        int sent = 0;
+        foreach (var raw in classes)
+        {
+            var cls = raw.Trim().ToLowerInvariant();
+            try
+            {
+                var resp = await _ra.SendCommandAsync($".bot addai {cls}");
+                sent++;
+                results.Add(new { cls, ok = true, response = resp });
+            }
+            catch (Exception ex)
+            {
+                // RA likely dropped — report what got through and stop.
+                results.Add(new { cls, ok = false, error = ex.Message });
+                return Json(new { success = false, error = $"RA send failed after {sent}: {ex.Message}", sent, results });
+            }
+        }
+
+        return Json(new { success = true, sent, results });
     }
 
     // ==================== REST API ====================
@@ -872,4 +920,11 @@ public class SetStoryRequest
 {
     public bool Enabled { get; set; }
     public int[] Guids { get; set; } = Array.Empty<int>();
+}
+
+public class AddBotsRequest
+{
+    // Flat list of class tokens (e.g. ["priest","priest","mage"]); the modal expands its
+    // per-class counts before posting. Validated against the alliance whitelist server-side.
+    public string[]? Classes { get; set; }
 }
