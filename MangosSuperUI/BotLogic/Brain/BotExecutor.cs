@@ -174,14 +174,17 @@ public sealed class BotExecutor
                         && pending.CommandType == "MOVE_TO";
         bool interactFail = evt.EventType == "QUEST_INTERACT_FAIL"
                             && pending.CommandType == "QUEST_INTERACT";
-        if (!moveFail && !interactFail) return false;
+        bool trainFail = evt.EventType == "TRAIN_FAIL"
+                            && pending.CommandType == "TRAIN_AT_NPC";
+        if (!moveFail && !interactFail && !trainFail) return false;
 
         var kv = ParsePipe(evt.Data);
 
         // PATH_UNSAFE carries no reason= field; QUEST_INTERACT_FAIL leads with a bare
-        // reason segment (no key); MOVE_FAILED uses reason=<code>.
+        // reason segment (no key); TRAIN_FAIL is a flat fail; MOVE_FAILED uses reason=<code>.
         string reason =
             evt.EventType == "PATH_UNSAFE" ? "path_unsafe"
+            : evt.EventType == "TRAIN_FAIL" ? "train_fail"
             : kv.TryGetValue("reason", out var r) ? r
             : FirstBareSegment(evt.Data);
 

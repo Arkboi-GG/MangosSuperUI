@@ -146,6 +146,30 @@ public sealed class MaintenancePlanner : IBotPlanner
     private const int GraveyardAfterStreak = 2;
     private const double GraveyardPortDeadlineSec = 10;  // wait for GRAVEYARD_PORT ack, else fall back to rez-in-place
 
+    // ── Per-quest death attribution (the macro-loop exit) ──
+    // A death WHILE QUESTING is blamed on the quest the bot was working (the brain stamps
+    // ctx.DeathBlameQuestId at the death transition). At QuestFailCap attributed failures the quest
+    // is durably deferred so the bot stops walking back into the kill. Cap = 1: shelve on the FIRST
+    // death — if the content is killing you, back off now and grind; the 60-min defer brings it back
+    // when the bot is a level or two stronger. The unified streak (BotIdentity.QuestFailStreak) is
+    // also bumped by a hard MOVE failure in QuestPlanner, so death + no_path share one cap. (The
+    // SAME-SPOT physical loop that triggers the graveyard port is a SEPARATE axis — DeathLoopStreak.)
+    private const int QuestFailCap = 1;
+    private const int QuestDeathDeferMinutes = 60;
+
+    // ── Death-cluster escape (goal-agnostic) ──
+    // A bot chain-dying at a lethal AREA (e.g. murlocs in a lake) during a vendor errand or grind
+    // threads between BOTH existing nets: attribution is Questing-gated (no active quest to blame),
+    // and the graveyard escalation is same-spot (30yd) + short-window (300s) gated while these deaths
+    // are spread ~100yd and spaced by the vendor route timeout, so DeathLoopStreak resets to 0 each
+    // time. This catches it on raw frequency: ≥ RecentDeathClusterCap deaths in RecentDeathWindowSec
+    // — ANY spot, ANY goal — forces the graveyard port (teleport out of the area; a town graveyard has
+    // an armorer so the repair errand can finally complete, then it heals + grinds somewhere safe).
+    // The window is LONGER than a full vendor cycle (VendorRouteGiveupSec=480) so timeout-spaced deaths
+    // still accumulate. Separate axis from DeathLoopStreak. RecentDeaths clears on any port.
+    private const int RecentDeathClusterCap = 3;
+    private const double RecentDeathWindowSec = 600;   // 10 min — must exceed VendorRouteGiveupSec (480)
+
     // ── Heal-to-full phase ──
     // Hold the just-rezzed bot IDLE until it has eaten/drunk back to ~full before
     // releasing it to the GoalSelector. RezHealTarget is short of 100% so a single
@@ -240,23 +264,57 @@ public sealed class MaintenancePlanner : IBotPlanner
             var deathPos = new Vec4(ctx.Pos.X, ctx.Pos.Y, ctx.Pos.Z, ctx.MapId);
             id?.RecordDeath(deathPos.X, deathPos.Y, deathPos.Map);  // durable; also feeds QuestPlanner shelving
 
+            // Goal-agnostic death-cluster: count deaths in the rolling window (any spot, any goal).
+            // At the cap this forces the graveyard port below even when DeathLoop is false — the
+            // murloc-lake / vendor-errand chain that DeathLoopStreak and Questing attribution both miss.
+            int recentDeaths = id?.RecordRecentDeathAndCount(RecentDeathWindowSec) ?? 0;
+            bool deathCluster = recentDeaths >= RecentDeathClusterCap;
+
             // On a same-spot loop, blacklist the pocket so the QuestPlanner stops ROUTING
             // back here until the bot out-levels it (clears at danger-3). This only steers
             // future quest selection — it does NOT move the bot; the ghost-walk below does.
             if (deathLoop)
                 id?.AddPathBlacklist(deathPos.X, deathPos.Y, ctx.Level + DeathSpotDangerGate);
 
+            // ── Attribute this death to the quest the bot was working (the macro-loop exit) ──
+            // The brain stamped ctx.DeathBlameQuestId at the death transition (it had ctx.Quest
+            // before the scratch reset; we don't). Bump the unified per-quest fail streak; at the
+            // cap, durably DEFER that quest so the bot won't be routed back to the kill — and clear
+            // the streak. With cap=1 this shelves on the first death: the death→graveyard→walk-back
+            // →die loop can't form because the quest is gone from the pickable/resumable set before
+            // the bot can return. No blame id (died grinding, or between legs) → nothing to do.
+            if (id != null && ctx.DeathBlameQuestId is int blamed)
+            {
+                int fails = id.QuestFailStreak.GetValueOrDefault(blamed, 0) + 1;
+                id.QuestFailStreak[blamed] = fails;
+                if (fails >= QuestFailCap)
+                {
+                    id.DeferQuest(blamed, TimeSpan.FromMinutes(QuestDeathDeferMinutes));
+                    id.QuestFailStreak.Remove(blamed);
+                    _log.LogInformation("[REZ] {Name} shelving quest [{Q}] {Min}min — {N} death(s) attributed (won't route back)",
+                        ctx.Name, blamed, QuestDeathDeferMinutes, fails);
+                }
+                else
+                {
+                    _log.LogInformation("[REZ] {Name} death blamed on quest [{Q}] (streak {N}/{Cap})",
+                        ctx.Name, blamed, fails, QuestFailCap);
+                }
+            }
+            ctx.DeathBlameQuestId = null;
+
             ctx.Maintenance = new MaintenanceScratch
             {
                 DeadSinceUtc = DateTime.UtcNow,
                 RezAtUtc = DateTime.UtcNow.AddSeconds(RezDelayBaseSec + (ctx.Guid % RezDelayJitterSec)),
                 DeathPos = deathPos,
-                DeathLoop = deathLoop
+                DeathLoop = deathLoop,
+                DeathCluster = deathCluster
             };
             ctx.Service = null;   // drop any in-flight vendor trip — recovery owns the bot; re-evaluate after heal
             ctx.SetStep("rez_wait");
-            _log.LogInformation("[REZ] {Name} DEATH @ ({X:F0},{Y:F0})@{Map} loop={Loop} streak={Streak} (deaths={Deaths})",
-                ctx.Name, deathPos.X, deathPos.Y, deathPos.Map, deathLoop, id?.DeathLoopStreak ?? 0, id?.DeathsSinceQuestStart ?? 0);
+            _log.LogInformation("[REZ] {Name} DEATH @ ({X:F0},{Y:F0})@{Map} loop={Loop} streak={Streak} recent={Recent}{Cluster} (deaths={Deaths})",
+                ctx.Name, deathPos.X, deathPos.Y, deathPos.Map, deathLoop, id?.DeathLoopStreak ?? 0,
+                recentDeaths, deathCluster ? " CLUSTER" : "", id?.DeathsSinceQuestStart ?? 0);
             return StepResult.Wait();
         }
 
@@ -276,14 +334,15 @@ public sealed class MaintenancePlanner : IBotPlanner
             return SendResurrect(ctx, m);
 
         // ── GRAVEYARD ESCALATION ──
-        // Died more than twice in the same pocket inside the 5-min window. Ghost-walk can't
-        // climb out of a no_path pocket, so skip it: C++ ports the INVULNERABLE ghost to the
-        // nearest faction graveyard (RESURRECT{at_graveyard:1} → NearTeleportTo, the proven
-        // seam-cross primitive — NOT the old RepopAtGraveyard race), emits GRAVEYARD_PORT, and
-        // stays dead. We then send a plain RESURRECT to rez there. RelocateSent/RelocateDone are
-        // reused as the port phase flags (same as ghost-walk — no scratch change). Runs BEFORE
-        // the corpse-run delay below: we're leaving the pocket, not popping up in it.
-        bool useGraveyard = (id?.DeathLoopStreak ?? 0) >= GraveyardAfterStreak;
+        // Two triggers, same escape: (1) DeathLoopStreak — died >2× in the SAME pocket inside the
+        // 5-min window (the no_path-pocket case ghost-walk can't climb out of); or (2) DeathCluster —
+        // ≥N deaths in the rolling window regardless of spot/goal (the murloc-lake / vendor-errand
+        // chain that streak + Questing-attribution both miss). Either way C++ ports the INVULNERABLE
+        // ghost to the nearest faction graveyard (RESURRECT{at_graveyard:1} → NearTeleportTo, the
+        // proven seam-cross primitive — NOT the old RepopAtGraveyard race), emits GRAVEYARD_PORT, and
+        // stays dead. We then send a plain RESURRECT to rez there. RelocateSent/RelocateDone are reused
+        // as the port phase flags. Runs BEFORE the corpse-run delay below: we're leaving the area now.
+        bool useGraveyard = (id?.DeathLoopStreak ?? 0) >= GraveyardAfterStreak || m.DeathCluster;
         if (useGraveyard)
         {
             if (!m.RelocateSent)
@@ -676,8 +735,15 @@ public sealed class MaintenancePlanner : IBotPlanner
         m.RelocateSent = true;
         ctx.SetStep("graveyard_port");
 
-        _log.LogInformation("[GRAVE] {Name} graveyard port (streak={Streak} >= {Thresh}) from ({X:F0},{Y:F0})@{Map}",
-            ctx.Name, ctx.Identity?.DeathLoopStreak ?? 0, GraveyardAfterStreak, ctx.Pos.X, ctx.Pos.Y, ctx.MapId);
+        // Fresh rolling window at the new location: we're leaving the lethal area, so a death soon
+        // after the port is a new problem, not a continuation of this cluster.
+        ctx.Identity?.RecentDeaths.Clear();
+
+        _log.LogInformation("[GRAVE] {Name} graveyard port ({Why}) from ({X:F0},{Y:F0})@{Map} streak={Streak}",
+            ctx.Name,
+            m.DeathCluster ? $"death-cluster ≥{RecentDeathClusterCap}/{RecentDeathWindowSec / 60:F0}min"
+                           : $"streak={ctx.Identity?.DeathLoopStreak ?? 0} >= {GraveyardAfterStreak}",
+            ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.Identity?.DeathLoopStreak ?? 0);
 
         var cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1 });
         return StepResult.Send(cmd, "GRAVEYARD_PORT", TimeSpan.FromSeconds(GraveyardPortDeadlineSec));

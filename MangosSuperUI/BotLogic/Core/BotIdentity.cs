@@ -95,6 +95,17 @@ public class BotIdentity
     /// </summary>
     public Dictionary<int, int> QuestOverflowGrinds { get; set; } = new();
 
+    /// <summary>
+    /// Per-quest cumulative FAILURE streak driving the durable death/no_path shelve (the
+    /// macro-loop exit). Bumped by an attributed DEATH (MaintenancePlanner, via
+    /// BotContext.DeathBlameQuestId) and by a hard MOVE failure on the quest's objective
+    /// (QuestPlanner.DeferAcceptedQuest). At QuestFailCap the quest is durably deferred (~60 min)
+    /// and the streak is cleared, so the bot stops walking back into the kill / re-resuming an
+    /// unreachable quest. Also cleared on turn-in and grey-abandon. Transient (in-memory).
+    /// Key = questId, Value = failures attributed since the last clear.
+    /// </summary>
+    public Dictionary<int, int> QuestFailStreak { get; set; } = new();
+
     // --- Path blacklist (destinations rejected by C++ IsPathSafe) ---
     /// <summary>
     /// Destinations that C++ PATH_UNSAFE rejected because the mmap path crossed
@@ -259,6 +270,24 @@ public class BotIdentity
 
     public DateTime? VendorCooldownUntil { get; set; }
 
+    /// <summary>
+    /// Suppress Questing until this UTC time. The bot has shelved its way out of all in-reach
+    /// content (everything currently deferred), so instead of oscillating quest⇄grind at tick
+    /// speed it COMMITS to grinding for a fixed window to actually gain levels — the returning
+    /// 60-min defers then bring that content back when the bot is a level or two stronger. Set by
+    /// QuestPlanner when the batch exhausts WITH active deferrals; honored by GoalSelector (which
+    /// still lets death/heal/vendor recovery preempt). Expires by clock. Null = no lock.
+    /// </summary>
+    public DateTime? GrindLockUntil { get; set; }
+
+    /// <summary>
+    /// Suppress the Training goal until this UTC time. Set by TrainingPlanner on a give-up
+    /// (trainer unreachable / TRAIN_FAIL / timeout) so a bot doesn't immediately re-trek toward
+    /// the same unreachable trainer. Cleared on LEVEL_UP (new spells justify a fresh attempt) and
+    /// lapses by clock. Null = no cooldown.
+    /// </summary>
+    public DateTime? TrainCooldownUntil { get; set; }
+
     public StuckDetector StuckDetector { get; set; }
 
 
@@ -405,6 +434,29 @@ public class BotIdentity
         DeathsSinceQuestStart++;
         LastDeathLocation = (x, y, map);
         LastDeathTime = DateTime.UtcNow;
+    }
+
+    /// <summary>
+    /// Rolling timestamps of recent deaths — ANY spot, ANY goal — for the goal-agnostic
+    /// death-cluster escape (MaintenancePlanner). Distinct from DeathLoopStreak (same-spot,
+    /// 30yd / 300s, the no_path-pocket detector): this catches a bot chain-dying at a lethal AREA
+    /// (e.g. murlocs in a lake) during a vendor errand or grind, where the deaths are spread out
+    /// and timeout-spaced so DeathLoopStreak never trips and Questing-gated attribution never fires.
+    /// Cleared on any graveyard port (fresh window at the new location). Transient (in-memory).
+    /// </summary>
+    public List<DateTime> RecentDeaths { get; set; } = new();
+
+    /// <summary>
+    /// Record a death for the rolling cluster detector and return how many deaths have landed
+    /// within the last <paramref name="windowSec"/> seconds (this one included). Prunes older entries.
+    /// </summary>
+    public int RecordRecentDeathAndCount(double windowSec)
+    {
+        var now = DateTime.UtcNow;
+        RecentDeaths.Add(now);
+        var cutoff = now.AddSeconds(-windowSec);
+        RecentDeaths.RemoveAll(t => t < cutoff);
+        return RecentDeaths.Count;
     }
 
     /// <summary>

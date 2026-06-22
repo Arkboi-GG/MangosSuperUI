@@ -161,6 +161,17 @@ public sealed class ServiceScratch
     public DateTime StartedUtc { get; set; }              // trip start — drives the never-arrived give-up
 }
 
+// Trainer errand scratch (driven by TrainingPlanner under Goal.Training, on ctx.Train).
+// Non-null = a training trip is in flight (the GoalSelector hold keys off this, exactly
+// like the vendor hold keys off ctx.Service). Nulled by the brain on goal change, or by
+// TrainingPlanner on done / give-up.
+public sealed class TrainScratch
+{
+    public int TrainerEntry { get; set; }                 // class trainer NPC entry (TRAIN_AT_NPC target)
+    public Vec4 TrainerPos { get; set; }                  // where to MOVE_TO
+    public DateTime StartedUtc { get; set; }              // trip start
+}
+
 // Death-recovery scratch (Goal.Maintenance). Transient per death: armed by
 // MaintenancePlanner on the first dead tick, nulled by the brain on goal (re)entry.
 // Death-LOOP detection is NOT here (it must survive this reset) — it rides durable
@@ -180,6 +191,7 @@ public sealed class MaintenanceScratch
     public DateTime RezAtUtc { get; set; }                // when the corpse-run delay elapses → send RESURRECT
     public Vec4 DeathPos { get; set; }                    // where we died (death-spot blacklist target on a loop)
     public bool DeathLoop { get; set; }                   // quick SAME-SPOT re-death → escalate (blacklist + at_graveyard port)
+    public bool DeathCluster { get; set; }                // goal-agnostic: ≥N deaths in the rolling window (any spot/goal) → force the graveyard port even when DeathLoop is false
     public bool RezSent { get; set; }                     // RESURRECT issued — guards against duplicate sends
     public bool Escalated { get; set; }                   // death-spot blacklisted + at_graveyard sent (once per recovery)
 
@@ -238,6 +250,13 @@ public sealed class BotContext
     // ---- last negative outcome (set by the executor when a WAIT is negated; consumed by the brain) ----
     public WaitFailure? Failure { get; set; }
 
+    // ---- death attribution (set by the brain at the death transition; consumed by MaintenancePlanner) ----
+    // When the bot dies while Questing, BotBrain.EnterGoalAsync stamps the active quest id here
+    // BEFORE ResetScratch wipes ctx.Quest, so MaintenancePlanner can count the death against that
+    // quest and shelve it (the macro-loop exit). NOT goal scratch — survives the scratch reset.
+    // Consumed + cleared by MaintenancePlanner on the first dead tick. Null = no blame pending.
+    public int? DeathBlameQuestId { get; set; }
+
     // ---- progress ----
     public DateTime LastProgressUtc { get; set; } = DateTime.UtcNow;  // last forward motion of ANY kind
     public DateTime LastKillUtc { get; set; }
@@ -272,6 +291,7 @@ public sealed class BotContext
     public GrindScratch? Grind { get; set; }
     public ServiceScratch? Service { get; set; }
     public MaintenanceScratch? Maintenance { get; set; }
+    public TrainScratch? Train { get; set; }              // Goal.Training — trainer trip (TrainingPlanner)
 
     // ---- quest-log cache (refreshed by QUEST_STATUS_ALL; read by QuestPlanner to resume) ----
     // Reference-swapped by the executor (not mutated in place) so the planner can read a

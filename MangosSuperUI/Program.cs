@@ -81,7 +81,6 @@ builder.Services.AddSingleton<SpellProgressionLoader>();
 builder.Services.AddSingleton<ZoneDataLoader>();
 builder.Services.AddSingleton<QuestGraphLoader>();
 builder.Services.AddSingleton<BotBrainDbInit>();
-builder.Services.AddSingleton<SpellProgressionLoader>();
 
 // Core engine
 builder.Services.AddSingleton<LiveStateModifiers>();
@@ -97,6 +96,7 @@ builder.Services.AddSingleton<GoalSelector>();
 builder.Services.AddSingleton<IBotPlanner, GrindPlanner>();
 builder.Services.AddSingleton<IBotPlanner, QuestPlanner>();   // P3: Goal.Questing
 builder.Services.AddSingleton<IBotPlanner, MaintenancePlanner>();
+builder.Services.AddSingleton<IBotPlanner, TrainingPlanner>();   // Goal.Training — class-trainer trip
 
 builder.Services.AddSingleton<BotBrain>();
 
@@ -134,6 +134,12 @@ await app.Services.GetRequiredService<ZoneSafetyMap>().LoadAsync();
 // and every vendor lookup returned null ("no vendors loaded on this map"). Load it here, same
 // as the other startup loaders.
 await app.Services.GetRequiredService<ZoneDataLoader>().LoadAsync();
+
+// Class-trainer location cache — backs TrainingPlanner.GetNearestTrainer. Like ZoneDataLoader
+// above, registered as a singleton but its LoadAsync must be invoked here or _trainersByClass
+// stays empty and every training trip gives up ("no-loader" / "no-trainer-in-range"). Confirm the
+// "[SpellProgression] Loaded N trainer spawns across M classes" line at boot.
+await app.Services.GetRequiredService<SpellProgressionLoader>().LoadAsync();
 
 // ---------- Pipeline ----------
 if (!app.Environment.IsDevelopment())

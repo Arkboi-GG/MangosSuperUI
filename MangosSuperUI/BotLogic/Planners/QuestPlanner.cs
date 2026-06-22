@@ -71,6 +71,17 @@ public sealed class QuestPlanner : IBotPlanner
     private const float NpcReachYards = 10f;    // close enough to interact without a fresh MOVE_TO (C++ searches 15yd)
     private const int MaxReachTier = 3;         // widening scan: 0 = local hub (baseline cap); each tier adds ~900yd (one hub-hop), bounded by ZoneSafetyMap's level-aware ceiling. A bot that has drained the local hub scans OUTWARD for the next level-appropriate hub instead of grinding in place.
 
+    // -- Macro-loop exit (durable shelve + commit-to-grind) --
+    // A hard MOVE failure on an accepted quest's objective bumps the SAME unified per-quest fail
+    // streak as an attributed death (BotIdentity.QuestFailStreak, also written by MaintenancePlanner).
+    // At QuestFailCap the quest is durably deferred for DurableDeferMinutes (the bot stops re-resuming
+    // → re-failing it); below the cap it takes the shorter escalating sweep-defer (transient blips).
+    // When the batch then exhausts WITH active deferrals, GrindLock the bot for GrindLockMinutes so it
+    // grinds for levels instead of oscillating quest⇄grind at tick speed (the spin backoff).
+    private const int QuestFailCap = 1;          // death + no_path share this cap (mirror MaintenancePlanner)
+    private const int DurableDeferMinutes = 60;  // the at-cap durable shelve window
+    private const int GrindLockMinutes = 60;     // commit-to-grind window on a deferral-driven batch exhaust
+
     public QuestPlanner(QuestGraphLoader quests, ILogger<QuestPlanner> logger)
     {
         _quests = quests;
@@ -154,6 +165,7 @@ public sealed class QuestPlanner : IBotPlanner
                     ctx.Identity?.CompletedQuestIds.Add(q.Active.QuestId);
                     ctx.Identity?.QuestDeferralCounts.Remove(q.Active.QuestId);
                     ctx.Identity?.QuestOverflowGrinds.Remove(q.Active.QuestId);
+                    ctx.Identity?.QuestFailStreak.Remove(q.Active.QuestId);   // beat the quest → forget its fail history
                     _logger.LogInformation("[QUEST] {Name} completed [{Id}] \"{Title}\"",
                         ctx.Name, q.Active.QuestId, q.Active.Node.Title);
                     q.Batch.Remove(q.Active);
@@ -345,8 +357,20 @@ public sealed class QuestPlanner : IBotPlanner
         }
 
         // -- 5. nothing to accept / work / turn in / discover -> batch exhausted --
-        // The carried set (incl. any Failed-this-sweep quests still in the C++ log) is
-        // resumed on the next entry to Questing. Drop to grind.
+        // The carried set (incl. any Failed-this-sweep quests still in the C++ log) is resumed on
+        // the next entry to Questing. If we got here BY SHELVING (there are active deferrals), the
+        // in-reach content is all death/no_path-shelved — commit to grinding for a window so the bot
+        // gains levels instead of oscillating quest⇄grind at tick speed (the spin backoff). A
+        // genuinely quest-less bot (nothing deferred) skips the lock and grinds via normal
+        // arbitration, so it still folds in a quest as it wanders into a fresh hub.
+        var lockId = ctx.Identity;
+        if (lockId != null && lockId.DeferredQuestIds.Count > 0
+            && !(lockId.GrindLockUntil is DateTime gl && DateTime.UtcNow < gl))
+        {
+            lockId.GrindLockUntil = DateTime.UtcNow.AddMinutes(GrindLockMinutes);
+            _logger.LogInformation("[QUEST] {Name} batch exhausted with {N} deferred — grind-lock {Min}min (commit to leveling)",
+                ctx.Name, lockId.DeferredQuestIds.Count, GrindLockMinutes);
+        }
         ctx.Quest = null;
         return StepResult.Block("no_quests");
     }
@@ -460,14 +484,38 @@ public sealed class QuestPlanner : IBotPlanner
         var id = ctx.Identity;
         if (id != null)
         {
-            int prior = id.QuestDeferralCounts.GetValueOrDefault(bq.QuestId, 0);
-            bool valuable = bq.Node.IsPartOfChain || bq.Node.HasItemReward;
-            bool frustrated = !valuable && prior + 1 >= AbandonAfterDefers;
-            id.DeferQuest(bq.QuestId, TimeSpan.FromMinutes(frustrated ? 60 : DeferMinutes));
+            // Unified fail streak: a hard MOVE failure on this quest's objective counts toward the
+            // SAME durable shelve as an attributed death (MaintenancePlanner bumps the same map). At
+            // the cap the quest is shelved for the long window so the bot stops re-resuming →
+            // re-failing it (the no_path churn); below the cap it takes the shorter escalating
+            // sweep-defer for transient reachability blips. With QuestFailCap=1 the first hard
+            // failure goes straight to the durable shelve.
+            int fails = id.QuestFailStreak.GetValueOrDefault(bq.QuestId, 0) + 1;
+            id.QuestFailStreak[bq.QuestId] = fails;
+
+            if (fails >= QuestFailCap)
+            {
+                id.DeferQuest(bq.QuestId, TimeSpan.FromMinutes(DurableDeferMinutes));
+                id.QuestFailStreak.Remove(bq.QuestId);
+                _logger.LogInformation("[QUEST] {Name} shelving [{Id}] ({Reason}, durable {Min}min, kept accepted) — {N} fail(s)",
+                    ctx.Name, bq.QuestId, reason, DurableDeferMinutes, fails);
+            }
+            else
+            {
+                int prior = id.QuestDeferralCounts.GetValueOrDefault(bq.QuestId, 0);
+                bool valuable = bq.Node.IsPartOfChain || bq.Node.HasItemReward;
+                bool frustrated = !valuable && prior + 1 >= AbandonAfterDefers;
+                id.DeferQuest(bq.QuestId, TimeSpan.FromMinutes(frustrated ? 60 : DeferMinutes));
+                _logger.LogInformation("[QUEST] {Name} shelving [{Id}] ({Reason}, deferred, kept accepted)",
+                    ctx.Name, bq.QuestId, reason);
+            }
+        }
+        else
+        {
+            _logger.LogInformation("[QUEST] {Name} shelving [{Id}] ({Reason}, deferred, kept accepted)",
+                ctx.Name, bq.QuestId, reason);
         }
         bq.Failed = true;   // carried in the log; resume skips it while the deferral holds
-        _logger.LogInformation("[QUEST] {Name} shelving [{Id}] ({Reason}, deferred, kept accepted)",
-            ctx.Name, bq.QuestId, reason);
     }
 
     // ========================================================================
@@ -576,7 +624,9 @@ public sealed class QuestPlanner : IBotPlanner
            && q.ItemObjectives.All(it => it.BestDropSource != null)     // creature-sourced items only; GO-sourced/unresolved: phase 2
            && !id.DeferredQuestIds.ContainsKey(q.QuestId)
            && !id.AbandonedGreyQuestIds.Contains(q.QuestId)
-           && !id.IsPathBlacklisted(q.Giver.X, q.Giver.Y);
+           && !IsGrey(q, id.Level)                                       // grey-filter hole: GoalSelector's pick must agree with BuildBatch's grey-reject, else pick>0 / batch=0 → the quest⇄grind tick-spin
+           && !id.IsPathBlacklisted(q.Giver.X, q.Giver.Y)
+           && q.Objectives.All(o => !id.IsPathBlacklisted(o.GrindX, o.GrindY));   // back off a death pocket as an AREA: a kill objective in a blacklisted cell is unpickable, not just its giver
 
     /// <summary>
     /// Range gate (OPEN #1): giver on the bot's map within the level/zone travel cap.

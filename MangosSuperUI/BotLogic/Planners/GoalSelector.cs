@@ -24,6 +24,14 @@ public sealed class GoalSelector
     // Crater this and the bot breaks for a vendor (mirrors MaintenancePlanner's gate).
     private const int DurabilityVendorThreshold = 30;
 
+    // Minimum copper before a training trip. The REAL affordability gate is in C++ (TRAIN_AT_NPC
+    // only buys ranks the bot can pay for), and what it can't afford waits for the next LEVEL_UP's
+    // gold — so this only needs to avoid a pointless trek for a stone-broke bot far from a trainer.
+    // Kept at 0 for now: low-level bots run single-digit copper, the starting trainer is steps away,
+    // and untrained is why they can't kill — so always attempt when flagged. Raise it later only if
+    // far-from-trainer high-level bots start making wasted trips.
+    private const long TrainGoldFloor = 0;
+
     public GoalSelector(QuestGraphLoader quests)
     {
         _quests = quests;
@@ -64,6 +72,16 @@ public sealed class GoalSelector
             return Goal.Maintenance;
         }
 
+        // Training errand hold — keep the bot in Training while a trainer trip is in flight
+        // (ctx.Train), exactly as the vendor hold pins it. Without this the goal would flip on the
+        // next Select mid-trip and ResetScratch would wipe the errand. Cleared when TrainingPlanner
+        // nulls ctx.Train (done / give-up).
+        if (ctx.Goal == Goal.Training && ctx.Train != null)
+        {
+            ctx.GoalReason = "training";
+            return Goal.Training;
+        }
+
         // Self-maintenance trigger — cratered durability (gear about to break) or no free
         // bag slots (can't loot) routes the bot to a vendor via MaintenancePlanner's vendor
         // branch. Cooldown-gated (set on give-up / completion) so a borderline reading can't
@@ -75,6 +93,32 @@ public sealed class GoalSelector
         {
             ctx.GoalReason = ctx.Durability < DurabilityVendorThreshold ? "repair" : "bags-full";
             return Goal.Maintenance;
+        }
+
+        // Training trigger — the bot has unlearned class spells AND enough gold to buy something.
+        // A broke bot does NOT trek (it'd learn nothing): it keeps questing/grinding to earn, and
+        // trains once it can afford it / after the next LEVEL_UP re-flags new spells. Cooldown-gated
+        // so an unreachable-trainer / TRAIN_FAIL trip doesn't immediately re-fire. Sits AFTER survival
+        // (dead/heal/vendor) and BEFORE grind-lock + questing, so spells are learned before the bot
+        // commits to more fighting (the whole point — spell-starved bots can't kill).
+        if (ctx.Identity is { HasUnlearnedSpells: true } tid
+            && !(tid.TrainCooldownUntil is DateTime tcd && DateTime.UtcNow < tcd)
+            && ctx.Copper >= TrainGoldFloor)
+        {
+            ctx.GoalReason = "train";
+            return Goal.Training;
+        }
+
+        // Grind-lock: questing has shelved its way out of all in-reach content (everything
+        // currently deferred), so the bot COMMITS to grinding for a window to gain levels rather
+        // than oscillating quest⇄grind at tick speed. Sits AFTER the dead/heal/vendor holds above
+        // (recovery still preempts a locked grind) and AHEAD of "stay the course" so it overrides
+        // a stale live quest. Set by QuestPlanner on a deferral-driven batch exhaust; expires by
+        // clock (level-ups do NOT cut it short — the bot earns its hour of XP).
+        if (ctx.Identity?.GrindLockUntil is DateTime gl && DateTime.UtcNow < gl)
+        {
+            ctx.GoalReason = $"grind-lock {(int)Math.Ceiling((gl - DateTime.UtcNow).TotalMinutes)}m";
+            return Goal.Grinding;
         }
 
         // Stay the course on a live quest.

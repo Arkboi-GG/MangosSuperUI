@@ -154,6 +154,14 @@ public sealed class BotBrain
     /// </summary>
     private async Task EnterGoalAsync(BotContext ctx, Goal goal)
     {
+        // Death attribution: if we're leaving Questing because the bot DIED, stamp the quest it was
+        // working so MaintenancePlanner can count this death against it (and shelve it at the cap —
+        // the macro-loop exit). MUST read ctx.Quest BEFORE ResetScratch wipes it. Active is the
+        // quest whose leg armed the in-flight WAIT — set throughout a to_objective trek — so it's
+        // the killer. No Active (died between legs) → no blame, never a false attribution.
+        if (goal == Goal.Maintenance && ctx.Dead && ctx.Goal == Goal.Questing && ctx.Quest?.Active is { } dying)
+            ctx.DeathBlameQuestId = dying.QuestId;
+
         // Stop a leaving C++ grind patrol so the next goal can actually drive the bot. BOTH
         // Grinding AND Questing run the autonomous C++ grind/objective patrol (an enriched
         // MOVE_TO that travels then grinds in place). A fresh PLAIN MOVE_TO — e.g. the vendor
@@ -222,6 +230,7 @@ public sealed class BotBrain
         ctx.Quest = null;
         ctx.Service = null;
         ctx.Maintenance = null;   // Phase 4 — re-armed by MaintenancePlanner on each fresh death
+        ctx.Train = null;         // re-armed by TrainingPlanner on each trainer trip
     }
 
     /// <summary>SET_TASK IDLE — stops the C++ grind patrol (keeps the follow; §4.3).</summary>

@@ -539,7 +539,15 @@ public class BotBrainService : BackgroundService
     public Task HandleBridgeEventAsync(int guid, BotEvent evt)
     {
         if (evt.EventType == "LEVEL_UP" && evt.NewLevel > 0 && _bots.TryGetValue(guid, out var bot))
+        {
             bot.Level = evt.NewLevel;
+            // A level-up unlocks new class spells → flag the bot to visit a trainer (gold-gated in
+            // GoalSelector). Clear any training cooldown so a fresh level justifies a retry even if a
+            // recent trainer trip gave up. TrainingPlanner buys what the bot can afford and re-clears
+            // the flag; what it can't afford waits for the next level-up's gold.
+            bot.HasUnlearnedSpells = true;
+            bot.TrainCooldownUntil = null;
+        }
 
         if (_contexts.TryGetValue(guid, out var ctx))
             _driver.OnEvent(ctx, evt);
@@ -738,10 +746,36 @@ public class BotBrainService : BackgroundService
             Level = bs.Level,
             Personality = personality,
             CurrentActivity = new ActivityState { Type = ActivityType.Idle, StartedAt = DateTime.UtcNow },
-            NextDecisionTick = DateTime.UtcNow.AddSeconds(2)
+            NextDecisionTick = DateTime.UtcNow.AddSeconds(2),
+            // Train up on connect: post-rebuild the fleet never ran the trainer pass, so most bots
+            // are spell-starved. Flag it on; GoalSelector gold-gates the actual trip, and a fully
+            // trained bot just learns 0 and clears the flag (one cheap no-op trip).
+            HasUnlearnedSpells = true
         };
         bot.StuckDetector = new StuckDetector();
         bot.Story = new BotStoryRider(bot);   // demoted: toggleable but inert in the rebuild
+
+        // Hydrate the durable completed-quest set from the character DB so a restart does NOT
+        // re-offer already-rewarded quests (which inflates `av`, re-seeds finished content, and
+        // makes chain prereqs read as un-done so follow-ups never unlock). rewarded=1 is the
+        // TURN-IN flag -- deliberately NOT status==1 (COMPLETE-but-not-handed-in), so a quest
+        // still waiting at its ender stays resumable. character_queststatus is in the CHARACTERS
+        // db; guid is the character lowguid == the bot guid.
+        try
+        {
+            using var qsConn = _db.Characters();
+            var rewarded = await qsConn.QueryAsync<int>(
+                "SELECT quest FROM character_queststatus WHERE guid = @Guid AND rewarded = 1",
+                new { Guid = guid });
+            foreach (var qid in rewarded)
+                bot.CompletedQuestIds.Add(qid);
+            _logger.LogInformation("BotBrain: hydrated {Count} completed quests for {Name} (guid={Guid})",
+                bot.CompletedQuestIds.Count, bs.Name, guid);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "BotBrain: failed to hydrate completed quests for bot {Guid}", guid);
+        }
 
         _bots[guid] = bot;
 
