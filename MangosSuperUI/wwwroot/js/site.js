@@ -81,7 +81,7 @@
             spells: ['spells', 'patch', 'visuallab'],
             world: ['worldmap', 'worldeditor'],
             content: ['items', 'gameobjects', 'loottuner', 'instances', 'lootifier'],
-            bots: ['bots-dashboard'],
+            bots: ['bots-fleet', 'bots-dashboard'],
             data: ['database', 'sourcemap'],
             downloads: ['downloads-page']
         }
@@ -344,7 +344,7 @@
             server: 'Server',
             spells: 'Spells',
             content: 'Content',
-            bots: 'AI Bots',
+            bots: 'Bots',
             data: 'Data',
             downloads: 'Downloads & Uploads'
         };
@@ -371,7 +371,8 @@
             instances: { icon: 'fa-dungeon', label: 'Instance Loot' },
             lootifier: { icon: 'fa-dragon', label: 'ARPG Lootifier' },
             'downloads-page': { icon: 'fa-arrow-down-to-line', label: 'Downloads' },
-            'bots-dashboard': { icon: 'fa-robot', label: 'AI Bots' },
+            'bots-fleet': { icon: 'fa-tower-broadcast', label: 'Fleet View' },
+            'bots-dashboard': { icon: 'fa-robot', label: 'IBot Monitor' },
             database: { icon: 'fa-database', label: 'Database Explorer' },
             sourcemap: { icon: 'fa-sitemap', label: 'Source Map' }
         };
@@ -537,7 +538,7 @@
             server: 'Server',
             spells: 'Spells',
             content: 'Content',
-            bots: 'AI Bots',
+            bots: 'Bots',
             data: 'Data',
             downloads: 'Downloads & Uploads'
         };

@@ -44,7 +44,7 @@ public sealed class BotBrain
     // regardless of Pending/Failure/goal.
     private const double WedgeCeilingSec = 150;   // no real progress this long → wedged
     private const int WedgeFailCap = 8;     // …or this many back-to-back negated WAITs (fast fail-loop)
-    private const double WedgeBackoffSec = 60;    // park this long, then resume + relocate to a fresh cell
+    private const double WedgeBackoffSec = 5;    // park this long, then resume + relocate to a fresh cell
 
     public BotBrain(
         BotExecutor executor,

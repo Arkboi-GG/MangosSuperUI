@@ -34,6 +34,14 @@ public sealed class BotExecutor
     // Ridge workers = 180s, but pass-2 'kill anything' keeps the gap far under this).
     private static readonly TimeSpan ObjectiveKillGrace = TimeSpan.FromSeconds(120);
 
+    // Premature-arrival guard (npc_not_found fix). A PLAIN travel MOVE_TO's TASK_COMPLETE is accepted
+    // as an arrival only when the bot is within this of the dest. Acks match by event TYPE (no corr),
+    // so a duplicate / previous-leg TASK_COMPLETE in the pipe would otherwise ack a just-issued travel
+    // leg early — the bot "arrives" hundreds of yards out and QuestPlanner fires QUEST_INTERACT from the
+    // wrong spot. Comfortably above the C++ 5yd arrival threshold, well under any real miss. Objective
+    // grinds are EXEMPT (IsObjectiveGrind): their "GRIND finished" legitimately completes away from dest.
+    private const float ArrivalGateYards = 20f;
+
     public BotExecutor(BotBridgeService bridge, ZoneSafetyMap safety, ILogger<BotExecutor> logger)
     {
         _bridge = bridge;
@@ -67,14 +75,26 @@ public sealed class BotExecutor
         };
 
         // Capture the destination so FleetReport can show distance-to-target.
+        Vec4? moveTgt = null;
         if (cmd.Type == "MOVE_TO")
         {
-            var tgt = ExtractTarget(cmd);
-            if (tgt != null) ctx.Target = tgt;
+            moveTgt = ExtractTarget(cmd);
+            if (moveTgt != null) ctx.Target = moveTgt;
         }
 
-        _logger.LogDebug("[EXEC] {Name} issue {Type} expect={Expect} deadline={Sec}s",
-            ctx.Name, cmd.Type, expectedEvent, deadline.TotalSeconds);
+        // Instrumentation: a travel MOVE_TO logs dest + bot pos + distance; a QUEST_INTERACT logs the
+        // npc_entry + bot pos. A premature/stale arrival ack (interact fired far from the NPC) is then a
+        // one-line grep: "issue MOVE_TO -> (X,Y)" followed by "issue QUEST_INTERACT npc=N from (px,py)"
+        // with (px,py) nowhere near (X,Y). Everything else logs exactly as before.
+        if (cmd.Type == "MOVE_TO" && moveTgt is { } mt)
+            _logger.LogDebug("[EXEC] {Name} issue MOVE_TO -> ({X:F0},{Y:F0}) from ({PX:F0},{PY:F0}) d={D:F0} expect={Expect} deadline={Sec}s",
+                ctx.Name, mt.X, mt.Y, ctx.Pos.X, ctx.Pos.Y, ctx.DistToTarget, expectedEvent, deadline.TotalSeconds);
+        else if (cmd.Type == "QUEST_INTERACT")
+            _logger.LogDebug("[EXEC] {Name} issue QUEST_INTERACT npc={Npc} from ({PX:F0},{PY:F0}) expect={Expect} deadline={Sec}s",
+                ctx.Name, cmd.Payload.TryGetValue("npc_entry", out var ne) ? ne : "?", ctx.Pos.X, ctx.Pos.Y, expectedEvent, deadline.TotalSeconds);
+        else
+            _logger.LogDebug("[EXEC] {Name} issue {Type} expect={Expect} deadline={Sec}s",
+                ctx.Name, cmd.Type, expectedEvent, deadline.TotalSeconds);
 
         await _bridge.SendToBotAsync(ctx.Guid, cmd.Type, cmd.Payload);
     }
@@ -166,6 +186,21 @@ public sealed class BotExecutor
                          && string.Equals(evt.EventType, pending.ExpectedEvent, StringComparison.OrdinalIgnoreCase);
         if (!typeMatch) return false;
 
+        // Stale/duplicate TASK_COMPLETE guard (premature-arrival fix). A PLAIN travel MOVE_TO only
+        // truly completes when the bot is AT the dest. Because acks match by type only (no corr), a
+        // duplicate or previous-leg TASK_COMPLETE in the pipe would otherwise ack a just-issued travel
+        // leg early — the bot "arrives" hundreds of yards out and the QuestPlanner fires QUEST_INTERACT
+        // from the wrong spot (npc_not_found). Objective grinds are EXEMPT: their "GRIND finished"
+        // TASK_COMPLETE legitimately fires away from the dest (C++ grinds at the mouth/scan hit).
+        if (pending.CommandType == "MOVE_TO" && !pending.IsObjectiveGrind
+            && string.Equals(evt.EventType, "TASK_COMPLETE", StringComparison.OrdinalIgnoreCase)
+            && ctx.DistToTarget >= 0 && ctx.DistToTarget > ArrivalGateYards)
+        {
+            _logger.LogDebug("[EXEC] {Name} ignoring stale TASK_COMPLETE — {D:F0}yd from dest, not arrived",
+                ctx.Name, ctx.DistToTarget);
+            return false;   // keep waiting for the real arrival
+        }
+
         _logger.LogDebug("[EXEC] {Name} ack {Type} via {Evt}",
             ctx.Name, pending.CommandType, evt.EventType);
 
@@ -189,7 +224,18 @@ public sealed class BotExecutor
                             && pending.CommandType == "QUEST_INTERACT";
         bool trainFail = evt.EventType == "TRAIN_FAIL"
                             && pending.CommandType == "TRAIN_AT_NPC";
-        if (!moveFail && !interactFail && !trainFail) return false;
+        // Vendor errand fails: SELL_FAIL/REPAIR_FAIL negate the SELL_ITEMS/REPAIR_AT_NPC WAIT
+        // instead of burning the full 30s SELL_ACK/REPAIR_ACK deadline. The cases are
+        // vendor_not_found / npc_not_found (the chosen NPC isn't in the world — a runtime
+        // despawn / pool rotation that slipped past ZoneDataLoader's load-time event-gate
+        // filter) and not_enough_gold (the bot is broke). Both carry reason=<code>, so the
+        // reason flows through the kv.TryGetValue("reason") branch below unchanged; the
+        // MaintenancePlanner decides phantom-giveup vs finish from failure.Reason.
+        bool sellFail = evt.EventType == "SELL_FAIL"
+                            && pending.CommandType == "SELL_ITEMS";
+        bool repairFail = evt.EventType == "REPAIR_FAIL"
+                            && pending.CommandType == "REPAIR_AT_NPC";
+        if (!moveFail && !interactFail && !trainFail && !sellFail && !repairFail) return false;
 
         var kv = ParsePipe(evt.Data);
 

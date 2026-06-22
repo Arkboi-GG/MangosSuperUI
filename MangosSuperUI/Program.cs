@@ -99,6 +99,7 @@ builder.Services.AddSingleton<IBotPlanner, MaintenancePlanner>();
 builder.Services.AddSingleton<IBotPlanner, TrainingPlanner>();   // Goal.Training — class-trainer trip
 
 builder.Services.AddSingleton<BotBrain>();
+builder.Services.AddSingleton<BotDiagnosticsService>();
 
 // Brain orchestrator (BackgroundService)
 builder.Services.AddSingleton<BotBrainService>();

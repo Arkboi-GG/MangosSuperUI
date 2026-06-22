@@ -7,7 +7,7 @@ using System.Text.RegularExpressions;
 
 namespace MangosSuperUI.Controllers;
 
-public class BotsController : Controller
+public partial class BotsController : Controller
 {
     private readonly BotBridgeService _bridge;
     private readonly BotBrainService _brain;

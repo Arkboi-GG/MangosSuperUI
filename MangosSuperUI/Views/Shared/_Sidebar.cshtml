@@ -220,10 +220,16 @@
                 <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
             </div>
             <ul class="sidebar-nav sidebar-nav-collapsible">
+                <li class="sidebar-nav-item" data-nav-key="bots-fleet">
+                    <a asp-controller="Bots" asp-action="Fleet" class="@(currentController.Equals("Bots", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("Fleet", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
+                        <i class="fa-solid fa-tower-broadcast"></i>
+                        Fleet View
+                    </a>
+                </li>
                 <li class="sidebar-nav-item" data-nav-key="bots-dashboard">
-                    <a asp-controller="Bots" asp-action="Index" class="@NavClass("Bots")">
+                    <a asp-controller="Bots" asp-action="Index" class="@(currentController.Equals("Bots", StringComparison.OrdinalIgnoreCase) && !currentAction.Equals("Fleet", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
                         <i class="fa-solid fa-robot"></i>
-                        AI Bots
+                        IBot Monitor
                     </a>
                 </li>
             </ul>

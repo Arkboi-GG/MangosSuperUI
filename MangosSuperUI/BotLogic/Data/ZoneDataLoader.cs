@@ -12,6 +12,20 @@ namespace MangosSuperUI.BotLogic.Data;
 /// Session 8 fix: VMaNGOS creature table has no 'zone' column. Vendors and
 /// innkeepers are now indexed by map ID, and lookups use map + distance instead
 /// of zone. GetNearestVendor searches all vendors on the same map within range.
+///
+/// 2026-06-22 (vendor_not_found fix): some cached vendors carry the vendor flag and
+/// have a 'creature' spawn row, but the WORLD only materializes them while a game
+/// event runs (Darkmoon Faire — Flik entry=14860, Professor Thaddeus Paleo entry=14847,
+/// both gated by game_event_creature event 4/5). With the faire down, those creatures
+/// are NOT in the world, so the C++ SELL handler finds no live creature near the bot
+/// and emits SELL_FAIL reason=vendor_not_found. The planner WAITs on SELL_ACK, so that
+/// mismatch just burns the 30s deadline — a wasted trip every time the phantom is the
+/// nearest vendor. We now LEFT JOIN game_event_creature at load and tag each spawn's
+/// EventGated; GetNearestVendor skips event-gated spawns when routing. The data stays
+/// cached (not deleted) — only the routing pool excludes them. game_event_creature.event
+/// is SIGNED: a POSITIVE event = "spawns only while the event is active" (the phantom
+/// case); a NEGATIVE event = "present normally, despawns DURING the event" — those are
+/// normally-present and MUST stay routable, so the gate is event > 0 only.
 /// </summary>
 public class ZoneDataLoader
 {
@@ -46,19 +60,34 @@ public class ZoneDataLoader
             // Load vendor NPC locations (npc_flags & 128 = vendor)
             // VMaNGOS creature table has: map, position_x/y/z but NO zone column.
             // We index by map and do distance-based lookups.
+            //
+            // LEFT JOIN game_event_creature (keyed by creature.guid, one row per gated
+            // spawn) to learn whether THIS spawn is conditional. gec.event is signed:
+            //   > 0  → spawns only while that event is active (Darkmoon vendors when the
+            //          faire is DOWN are not in the world → phantom). Tag EventGated.
+            //   < 0  → present normally, despawns DURING the event → still routable.
+            //   NULL → no gate → routable.
+            // We carry the raw event value through as event_gate and derive EventGated below.
             var vendors = await conn.QueryAsync<NpcLocationRow>(@"
                 SELECT c.map, c.position_x, c.position_y, c.position_z,
-                       ct.entry AS npc_entry, ct.name AS npc_name, ct.npc_flags
+                       ct.entry AS npc_entry, ct.name AS npc_name, ct.npc_flags,
+                       gec.event AS event_gate
                 FROM creature c
                 INNER JOIN creature_template ct ON c.id = ct.entry
+                LEFT JOIN game_event_creature gec ON gec.guid = c.guid
                 WHERE ct.npc_flags & 128 = 128
                   AND ct.patch = (SELECT MAX(patch) FROM creature_template ct2 WHERE ct2.entry = ct.entry)");
 
             int vendorCount = 0;
+            int vendorGated = 0;
             foreach (var v in vendors)
             {
                 if (!_vendorsByMap.ContainsKey(v.map))
                     _vendorsByMap[v.map] = new List<NpcLocation>();
+
+                // Positive event id = spawn-only-when-active → phantom while the event is down.
+                bool gated = v.event_gate.HasValue && v.event_gate.Value > 0;
+                if (gated) vendorGated++;
 
                 _vendorsByMap[v.map].Add(new NpcLocation
                 {
@@ -75,23 +104,32 @@ public class ZoneDataLoader
                     // repair-capable and EVERY real armorer as CanRepair=false, so no bot ever
                     // repaired fleet-wide (durability latched <30 and looped the vendor errand).
                     // VENDOR=128 and INNKEEPER=65536 (above/below) are correct for this layout.
-                    CanRepair = (v.npc_flags & 0x4000) != 0 // UNIT_NPC_FLAG_REPAIR (16384)
+                    CanRepair = (v.npc_flags & 0x4000) != 0, // UNIT_NPC_FLAG_REPAIR (16384)
+                    // Event-gated spawn (positive game_event_creature.event) — cached for
+                    // visibility but excluded from GetNearestVendor routing (phantom while
+                    // the event is down). See the class note + the 2026-06-22 vendor fix.
+                    EventGated = gated
                 });
                 vendorCount++;
             }
 
-            // Load innkeepers (npc_flags & 65536 = innkeeper) as town anchors
+            // Load innkeepers (npc_flags & 65536 = innkeeper) as town anchors.
+            // Same event-gate join: a faire/event innkeeper would be a phantom town anchor.
             var innkeepers = await conn.QueryAsync<NpcLocationRow>(@"
                 SELECT c.map, c.position_x, c.position_y, c.position_z,
-                       ct.entry AS npc_entry, ct.name AS npc_name, ct.npc_flags
+                       ct.entry AS npc_entry, ct.name AS npc_name, ct.npc_flags,
+                       gec.event AS event_gate
                 FROM creature c
                 INNER JOIN creature_template ct ON c.id = ct.entry
+                LEFT JOIN game_event_creature gec ON gec.guid = c.guid
                 WHERE ct.npc_flags & 65536 = 65536
                   AND ct.patch = (SELECT MAX(patch) FROM creature_template ct2 WHERE ct2.entry = ct.entry)");
 
             int innkeeperCount = 0;
             foreach (var i in innkeepers)
             {
+                bool gated = i.event_gate.HasValue && i.event_gate.Value > 0;
+
                 if (!_townAnchorsByMap.ContainsKey(i.map))
                     _townAnchorsByMap[i.map] = new List<NpcLocation>();
 
@@ -103,15 +141,16 @@ public class ZoneDataLoader
                     Y = i.position_y,
                     Z = i.position_z,
                     NpcEntry = i.npc_entry,
-                    NpcName = i.npc_name
+                    NpcName = i.npc_name,
+                    EventGated = gated
                 });
                 innkeeperCount++;
             }
 
             _loaded = true;
             _logger.LogInformation(
-                "ZoneDataLoader: cached {VCount} vendors across {VMaps} maps, {ICount} innkeepers across {IMaps} maps",
-                vendorCount, _vendorsByMap.Count, innkeeperCount, _townAnchorsByMap.Count);
+                "ZoneDataLoader: cached {VCount} vendors ({VGated} event-gated, skipped when routing) across {VMaps} maps, {ICount} innkeepers across {IMaps} maps",
+                vendorCount, vendorGated, _vendorsByMap.Count, innkeeperCount, _townAnchorsByMap.Count);
         }
         catch (Exception ex)
         {
@@ -137,12 +176,26 @@ public class ZoneDataLoader
     /// Session 32: repair vendor preference added.
     /// 2026-06-20: requireRepair hard-filter added (the 1.5x window never reached the
     /// armorer when a food vendor was closer; durability latched and looped the errand).
+    /// 2026-06-22: event-gated spawns excluded from routing (Darkmoon phantoms — Flik /
+    /// Thaddeus — that emit SELL_FAIL vendor_not_found and burn the 30s SELL_ACK deadline).
     /// </summary>
     public NpcLocation? GetNearestVendor(int zoneId, int mapId, float x, float y, int botLevel = 60, bool requireRepair = false)
     {
-        if (!_vendorsByMap.TryGetValue(mapId, out var vendors) || vendors.Count == 0)
+        if (!_vendorsByMap.TryGetValue(mapId, out var allVendors) || allVendors.Count == 0)
         {
             _logger.LogWarning("[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} → NULL: no vendors loaded on this map", zoneId, mapId, botLevel);
+            return null;
+        }
+
+        // Event-gated spawns are cached for visibility but the world only materializes them
+        // while their game event runs. Routing to one that isn't spawned wastes the trip and
+        // eats a 30s SELL_ACK deadline on vendor_not_found. Drop them from the routing pool —
+        // the faire camp is no loss against the ~490 always-on vendors.
+        var vendors = allVendors.Where(v => !v.EventGated).ToList();
+        if (vendors.Count == 0)
+        {
+            _logger.LogWarning("[VENDOR] lookup z={Zone} map={Map} lvl={Lvl} → NULL: {Total} vendors on map but all event-gated (phantom)",
+                zoneId, mapId, botLevel, allVendors.Count);
             return null;
         }
 
@@ -225,6 +278,7 @@ public class ZoneDataLoader
 
     /// <summary>
     /// Is the bot near a town? (Within 150 yards of an innkeeper on same map.)
+    /// Event-gated innkeepers (phantom town anchors) are excluded.
     /// </summary>
     public bool IsNearTown(int zoneId, int mapId, float x, float y)
     {
@@ -232,13 +286,14 @@ public class ZoneDataLoader
             return false;
 
         float nearRange = 150f * 150f; // 150 yards squared
-        return anchors.Any(a => DistSq(a.X, a.Y, x, y) < nearRange);
+        return anchors.Any(a => !a.EventGated && DistSq(a.X, a.Y, x, y) < nearRange);
     }
 
     /// <summary>
     /// Get a random interesting point near the bot's current position.
     /// Uses vendor/innkeeper locations on the same map as POIs.
     /// Falls back to all map POIs if mapId has entries.
+    /// Event-gated spawns are excluded (a phantom POI sends the bot nowhere useful).
     /// </summary>
     public NpcLocation? GetRandomPointOfInterest(int zoneId, int mapId = -1)
     {
@@ -248,18 +303,18 @@ public class ZoneDataLoader
         {
             // Prefer same-map POIs
             if (_vendorsByMap.TryGetValue(mapId, out var vendors))
-                candidates.AddRange(vendors);
+                candidates.AddRange(vendors.Where(v => !v.EventGated));
             if (_townAnchorsByMap.TryGetValue(mapId, out var anchors))
-                candidates.AddRange(anchors);
+                candidates.AddRange(anchors.Where(a => !a.EventGated));
         }
 
         // Fallback: try all maps (original behavior for callers without mapId)
         if (candidates.Count == 0)
         {
             foreach (var list in _vendorsByMap.Values)
-                candidates.AddRange(list);
+                candidates.AddRange(list.Where(v => !v.EventGated));
             foreach (var list in _townAnchorsByMap.Values)
-                candidates.AddRange(list);
+                candidates.AddRange(list.Where(a => !a.EventGated));
         }
 
         if (candidates.Count == 0) return null;
@@ -284,6 +339,9 @@ internal class NpcLocationRow
     public int npc_entry { get; set; }
     public string npc_name { get; set; } = "";
     public int npc_flags { get; set; }
+    // game_event_creature.event for this spawn's guid (NULL = no gate). Signed:
+    // > 0 = spawn-only-when-active (phantom while down); < 0 = despawn-during-event.
+    public int? event_gate { get; set; }
 }
 
 public class NpcLocation
@@ -296,6 +354,11 @@ public class NpcLocation
     public int NpcEntry { get; set; }
     public string NpcName { get; set; } = "";
     public bool CanRepair { get; set; }
+    // True when this spawn only exists while a game event runs (positive
+    // game_event_creature.event). Cached but excluded from routing so the bot is
+    // never sent to a creature the world hasn't materialized (the vendor_not_found
+    // phantom — Darkmoon Flik/Thaddeus while the faire is down).
+    public bool EventGated { get; set; }
 }
 
 public class ZoneInfo

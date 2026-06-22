@@ -67,7 +67,6 @@ public sealed class QuestPlanner : IBotPlanner
     private const float BatchRadius = 100f;     // cluster radius around a hub: fold these givers into the batch
     private const int BatchCap = 8;             // max quests carried at once (well under the 20-slot log cap)
     private const float GatherRescanYards = 50f;// re-gather for new local givers once moved this far mid-sweep
-    private const float OutlierFactor = 2f;     // shelve a quest whose reach >= this x the mean reach of the others
     private const float NpcReachYards = 10f;    // close enough to interact without a fresh MOVE_TO (C++ searches 15yd)
     private const int MaxReachTier = 3;         // widening scan: 0 = local hub (baseline cap); each tier adds ~900yd (one hub-hop), bounded by ZoneSafetyMap's level-aware ceiling. A bot that has drained the local hub scans OUTWARD for the next level-appropriate hub instead of grinding in place.
 
@@ -78,9 +77,20 @@ public sealed class QuestPlanner : IBotPlanner
     // → re-failing it); below the cap it takes the shorter escalating sweep-defer (transient blips).
     // When the batch then exhausts WITH active deferrals, GrindLock the bot for GrindLockMinutes so it
     // grinds for levels instead of oscillating quest⇄grind at tick speed (the spin backoff).
-    private const int QuestFailCap = 1;          // death + no_path share this cap (mirror MaintenancePlanner)
+    private const int QuestFailCap = 3;          // death + no_path share this cap (mirror MaintenancePlanner) -- was 1; one death over-shelved bots into grind-lock
     private const int DurableDeferMinutes = 20;  // the at-cap durable shelve window
     private const int GrindLockMinutes = 20;     // commit-to-grind window on a deferral-driven batch exhaust
+
+    // -- Red gate (acquisition ceiling; mirrors the grey FLOOR) --
+    // A quest whose level is more than RedMargin above the bot is "red" (too hard) and must NOT be
+    // NEWLY ACQUIRED. This is the missing upper bound: IsGrey drops out-leveled quests, but nothing
+    // stopped an L9 bot from SEEDING an L12 Westfall quest (givers open well below quest level), so a
+    // storm-emptied batch got refilled with next-zone, over-level work while in-progress local quests
+    // sat shelved. Applied at ACQUISITION only (IsPickable) -- a red quest already in the C++ log is
+    // still resumed (step 1 of BuildBatch) so we never abandon committed progress; we just stop GRABBING
+    // new reds. Vanilla "red" begins at +5 (GetRedLevel); +4 keeps a one-level safety cushion for a bot
+    // that is actively leveling and will reach the quest band within a kill or two.
+    private const int RedMargin = 4;            // newly-acquire only quests whose level <= botLevel + this
 
     public QuestPlanner(QuestGraphLoader quests, ILogger<QuestPlanner> logger)
     {
@@ -135,7 +145,16 @@ public sealed class QuestPlanner : IBotPlanner
                     break;
                 }
             case "to_giver":
-                if (q.Active != null) { ctx.SetStep("accept"); return Interact(q.Active, accept: true); }
+                // Gate the accept on ACTUAL proximity. The travel leg's TASK_COMPLETE can be a stale or
+                // duplicate ack (matches by type, no corr) that lands while the bot is still en route —
+                // firing the accept from far away returns npc_not_found. Not actually at the giver →
+                // re-issue the travel instead of a doomed interact. The executor's ArrivalGate normally
+                // absorbs this; this is the planner-side backstop.
+                if (q.Active?.Node.Giver is { } gv)
+                {
+                    if (AtNpc(ctx, gv)) { ctx.SetStep("accept"); return Interact(q.Active, accept: true); }
+                    return MoveTo(gv);
+                }
                 break;
             case "accept":
                 if (q.Active != null) { q.Active.Accepted = true; q.Active = null; }
@@ -157,7 +176,14 @@ public sealed class QuestPlanner : IBotPlanner
                 ctx.SetStep("obj_sync");
                 return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
             case "to_turnin":
-                if (q.Active != null) { ctx.SetStep("turnin"); return Interact(q.Active, accept: false); }
+                // Same proximity gate as to_giver: a stale/duplicate travel ack must not fire the turn-in
+                // from far away (npc_not_found). Re-travel if we're not actually at the ender.
+                if (q.Active != null)
+                {
+                    var npc = TurnInNpc(q.Active);
+                    if (AtNpc(ctx, npc)) { ctx.SetStep("turnin"); return Interact(q.Active, accept: false); }
+                    return MoveTo(npc);
+                }
                 break;
             case "turnin":
                 if (q.Active != null)
@@ -221,156 +247,170 @@ public sealed class QuestPlanner : IBotPlanner
 
     // ========================================================================
     // Derive -- the four-phase priority machine. One action per call.
+    // ITERATIVE (bounded for-loop, hard pass cap) so a runaway re-derive can NEVER grow the stack:
+    // the cap-outlier that was re-deferred every pass (StackOverflow that took the host down) now
+    // degrades to a bounded loop that exits to grind. Logic fix is in phase 4 -- reprocess only on
+    // genuinely-new locals (added), never on TagOutliers' STABLE cap-deferrals.
     // ========================================================================
     private StepResult Derive(BotContext ctx, QuestScratch q)
     {
-        // -- 0. grey drop (the ONLY drop) -- one ABANDON per tick for accepted greys --
-        var greyAccepted = q.Batch.FirstOrDefault(b => b.Accepted && !b.TurnedIn && IsGrey(b.Node, ctx.Level));
-        if (greyAccepted != null)
+        const int MaxDerivePasses = 16;   // legit reprocess is <= BatchCap overflow give-ups + 1 gather; 16 = headroom
+        for (int pass = 0; pass < MaxDerivePasses; pass++)
         {
-            _logger.LogInformation("[QUEST] {Name} grey-drop [{Id}] \"{Title}\" (qlvl {Lvl}, bot {Bot})",
-                ctx.Name, greyAccepted.QuestId, greyAccepted.Node.Title,
-                QuestLevelOf(greyAccepted.Node), ctx.Level);
-            ctx.Identity?.AbandonGrey(greyAccepted.QuestId);
-            q.Batch.Remove(greyAccepted);
-            return StepResult.Fire(new BridgeCommand("ABANDON_QUEST", new { quest_id = greyAccepted.QuestId }));
-        }
-        // Un-accepted greys never enter the batch (filtered in GatherLocals); drop any that slipped in.
-        q.Batch.RemoveAll(b => !b.Accepted && IsGrey(b.Node, ctx.Level));
-
-        // En-route discovery: fold in new local givers once the bot has moved enough.
-        if (ctx.Pos.Dist2D(q.LastGatherPos) > GatherRescanYards)
-            GatherLocals(ctx, q);
-
-        // -- 1. ACCEPT phase -- visit unaccepted givers nearest-first --
-        var toAccept = q.Batch.Where(b => !b.Accepted && !b.Failed && b.Node.Giver != null).ToList();
-        if (toAccept.Count > 0)
-        {
-            var bq = Nearest(ctx, toAccept, b => (b.Node.Giver!.X, b.Node.Giver!.Y, b.Node.Giver!.Map));
-            if (bq != null)
+            // -- 0. grey drop (the ONLY drop) -- one ABANDON per tick for accepted greys --
+            var greyAccepted = q.Batch.FirstOrDefault(b => b.Accepted && !b.TurnedIn && IsGrey(b.Node, ctx.Level));
+            if (greyAccepted != null)
             {
-                q.Active = bq;
-                if (AtNpc(ctx, bq.Node.Giver!)) { ctx.SetStep("accept"); return Interact(bq, accept: true); }
-                ctx.SetStep("to_giver");
-                return MoveTo(bq.Node.Giver!);
+                _logger.LogInformation("[QUEST] {Name} grey-drop [{Id}] \"{Title}\" (qlvl {Lvl}, bot {Bot})",
+                    ctx.Name, greyAccepted.QuestId, greyAccepted.Node.Title,
+                    QuestLevelOf(greyAccepted.Node), ctx.Level);
+                ctx.Identity?.AbandonGrey(greyAccepted.QuestId);
+                q.Batch.Remove(greyAccepted);
+                return StepResult.Fire(new BridgeCommand("ABANDON_QUEST", new { quest_id = greyAccepted.QuestId }));
             }
-        }
+            // Un-accepted greys never enter the batch (filtered in GatherLocals); drop any that slipped in.
+            q.Batch.RemoveAll(b => !b.Accepted && IsGrey(b.Node, ctx.Level));
 
-        // -- 2. OBJECTIVE sweep -- nearest unmet GRIND LEG (kill or creature-drop item), outliers shelved --
-        var withObj = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && HasUnmet(ctx, b)).ToList();
-        var candidates = withObj.Where(b => !b.Deferred).ToList();
-        if (candidates.Count > 0)
-        {
-            TagOutliers(ctx, candidates);                       // shelve far quests for this sweep
-            var live = candidates.Where(b => !b.Deferred).ToList();
-            var pick = NearestLeg(ctx, live);
-            if (pick != null)
+            // En-route discovery: fold in new local givers once the bot has moved enough.
+            if (ctx.Pos.Dist2D(q.LastGatherPos) > GatherRescanYards)
+                GatherLocals(ctx, q);
+
+            // -- 1. ACCEPT phase -- visit unaccepted givers nearest-first --
+            var toAccept = q.Batch.Where(b => !b.Accepted && !b.Failed && b.Node.Giver != null).ToList();
+            if (toAccept.Count > 0)
             {
-                q.Active = pick.Value.Quest;
-                q.ActiveSlot = 0;                               // legs aren't slot-routed (item legs live in ItemObjectives)
-                ctx.SetStep("to_objective");
-                // §4 enriched MOVE_TO: carry creature_entry/grind_radius/kill_count so C++ engages the
-                // mob on approach and grinds in place (ScanApproachTarget → ConvertMoveToGrindInPlace),
-                // never marching to / teleporting into the deep loader coord. One TASK_COMPLETE = the leg.
-                return MoveToObjectiveLeg(pick.Value.Leg);
-            }
-        }
-
-        // -- 2b. OVERFLOW grind -- the SERVER still reports this kill quest INCOMPLETE even
-        //      though our local counts are all met. Our QuestNode.Count is stale/under (a
-        //      quest_template patch override the graph loaded at patch=0 doesn't carry) or the
-        //      quest has an objective our graph doesn't model. Keep killing past our count so
-        //      the server can credit it -- BOUNDED by MaxOverflowGrinds, then durably defer
-        //      (we can't finish it with this data; back off instead of looping forever). This
-        //      is the server-authoritative completion the cannot_reward flood was missing.
-        var stuck = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed
-                                       && b.Node.HasKillObjectives
-                                       && !IsComplete(ctx, b)
-                                       && !HasUnmet(ctx, b)).ToList();
-        if (stuck.Count > 0)
-        {
-            var oPick = NearestCreatureSlot(ctx, stuck);
-            if (oPick != null)
-            {
-                var bq = oPick.Value.Quest;
-                var o = oPick.Value.Obj;
-                var id = ctx.Identity;
-                int tries = id?.QuestOverflowGrinds.GetValueOrDefault(bq.QuestId, 0) ?? 0;
-
-                if (tries >= MaxOverflowGrinds)
+                var bq = Nearest(ctx, toAccept, b => (b.Node.Giver!.X, b.Node.Giver!.Y, b.Node.Giver!.Map));
+                if (bq != null)
                 {
-                    id?.QuestOverflowGrinds.Remove(bq.QuestId);
-                    id?.DeferQuest(bq.QuestId, TimeSpan.FromMinutes(OverflowDeferMinutes));
-                    bq.Failed = true;   // carried in the log; resume skips it while deferred
-                    _logger.LogInformation("[QUEST] {Name} can't complete [{Id}] \"{Title}\" — server INCOMPLETE after {N} overflow grinds (stale count / unmodeled objective); deferring {Min}min",
-                        ctx.Name, bq.QuestId, bq.Node.Title, tries, OverflowDeferMinutes);
-                    q.Active = null;
-                    return Derive(ctx, q);
+                    q.Active = bq;
+                    if (AtNpc(ctx, bq.Node.Giver!)) { ctx.SetStep("accept"); return Interact(bq, accept: true); }
+                    ctx.SetStep("to_giver");
+                    return MoveTo(bq.Node.Giver!);
                 }
-
-                if (id != null) id.QuestOverflowGrinds[bq.QuestId] = tries + 1;
-                q.Active = bq;
-                q.ActiveSlot = oPick.Value.Slot;
-                ctx.SetStep("to_objective");
-                _logger.LogInformation("[QUEST] {Name} overflow grind [{Id}] slot {Slot} (server still INCOMPLETE past our count, try {N}/{Max})",
-                    ctx.Name, bq.QuestId, o.Slot, tries + 1, MaxOverflowGrinds);
-                return MoveToObjective(o, OverflowChunk);
             }
-        }
 
-        // -- 3. TURN-IN -- every quest the server says is done, nearest-first (after
-        //      objectives, before any far trek). Ready = server COMPLETE (status 3) OR the
-        //      quest has NO kill/item objectives at all. The second clause is for a
-        //      NO-OBJECTIVE quest (783): it sits at status INCOMPLETE until you hand it in,
-        //      so we walk to the ender and the turn-in interaction completes+rewards it.
-        //      CRITICAL: the no-objective clause is gated to !HasObjectives, NOT !HasUnmet.
-        //      A kill quest must reach server status==3 — turning in on a local "all kills
-        //      met" tally is the cannot_reward flood (quest 21: our count says 12/12 done,
-        //      server still says INCOMPLETE → reward refused forever). Server is authoritative;
-        //      overflow grind (2b) drives a stale-count quest to real completion. !Failed
-        //      avoids retrying a turn-in that already bounced this sweep.
-        var complete = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed
-                                          && (IsComplete(ctx, b) || !b.Node.HasObjectives)).ToList();
-        if (complete.Count > 0)
-        {
-            var bq = Nearest(ctx, complete, b => { var l = TurnInNpc(b); return (l.X, l.Y, l.Map); });
-            if (bq != null)
+            // -- 2. OBJECTIVE sweep -- nearest unmet GRIND LEG (kill or creature-drop item), outliers shelved --
+            var withObj = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && HasUnmet(ctx, b)).ToList();
+            var candidates = withObj.Where(b => !b.Deferred).ToList();
+            if (candidates.Count > 0)
             {
-                q.Active = bq;
-                var npc = TurnInNpc(bq);
-                if (AtNpc(ctx, npc)) { ctx.SetStep("turnin"); return Interact(bq, accept: false); }
-                ctx.SetStep("to_turnin");
-                return MoveTo(npc);
+                TagOutliers(ctx, candidates);                       // shelve only quests whose objectives fall outside the allowed range
+                var live = candidates.Where(b => !b.Deferred).ToList();
+                var pick = NearestLeg(ctx, live);
+                if (pick != null)
+                {
+                    q.Active = pick.Value.Quest;
+                    q.ActiveSlot = 0;                               // legs aren't slot-routed (item legs live in ItemObjectives)
+                    ctx.SetStep("to_objective");
+                    // §4 enriched MOVE_TO: carry creature_entry/grind_radius/kill_count so C++ engages the
+                    // mob on approach and grinds in place (ScanApproachTarget → ConvertMoveToGrindInPlace),
+                    // never marching to / teleporting into the deep loader coord. One TASK_COMPLETE = the leg.
+                    return MoveToObjectiveLeg(pick.Value.Leg);
+                }
             }
+
+            // -- 2b. OVERFLOW grind -- the SERVER still reports this kill quest INCOMPLETE even
+            //      though our local counts are all met. Our QuestNode.Count is stale/under (a
+            //      quest_template patch override the graph loaded at patch=0 doesn't carry) or the
+            //      quest has an objective our graph doesn't model. Keep killing past our count so
+            //      the server can credit it -- BOUNDED by MaxOverflowGrinds, then durably defer
+            //      (we can't finish it with this data; back off instead of looping forever). This
+            //      is the server-authoritative completion the cannot_reward flood was missing.
+            var stuck = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed
+                                           && b.Node.HasKillObjectives
+                                           && !IsComplete(ctx, b)
+                                           && !HasUnmet(ctx, b)).ToList();
+            if (stuck.Count > 0)
+            {
+                var oPick = NearestCreatureSlot(ctx, stuck);
+                if (oPick != null)
+                {
+                    var bq = oPick.Value.Quest;
+                    var o = oPick.Value.Obj;
+                    var id = ctx.Identity;
+                    int tries = id?.QuestOverflowGrinds.GetValueOrDefault(bq.QuestId, 0) ?? 0;
+
+                    if (tries >= MaxOverflowGrinds)
+                    {
+                        id?.QuestOverflowGrinds.Remove(bq.QuestId);
+                        id?.DeferQuest(bq.QuestId, TimeSpan.FromMinutes(OverflowDeferMinutes));
+                        bq.Failed = true;   // carried in the log; resume skips it while deferred
+                        _logger.LogInformation("[QUEST] {Name} can't complete [{Id}] \"{Title}\" — server INCOMPLETE after {N} overflow grinds (stale count / unmodeled objective); deferring {Min}min",
+                            ctx.Name, bq.QuestId, bq.Node.Title, tries, OverflowDeferMinutes);
+                        q.Active = null;
+                        continue;
+                    }
+
+                    if (id != null) id.QuestOverflowGrinds[bq.QuestId] = tries + 1;
+                    q.Active = bq;
+                    q.ActiveSlot = oPick.Value.Slot;
+                    ctx.SetStep("to_objective");
+                    _logger.LogInformation("[QUEST] {Name} overflow grind [{Id}] slot {Slot} (server still INCOMPLETE past our count, try {N}/{Max})",
+                        ctx.Name, bq.QuestId, o.Slot, tries + 1, MaxOverflowGrinds);
+                    return MoveToObjective(o, OverflowChunk);
+                }
+            }
+
+            // -- 3. TURN-IN -- every quest the server says is done, nearest-first (after
+            //      objectives, before any far trek). Ready = server COMPLETE (status 3) OR the
+            //      quest has NO kill/item objectives at all. The second clause is for a
+            //      NO-OBJECTIVE quest (783): it sits at status INCOMPLETE until you hand it in,
+            //      so we walk to the ender and the turn-in interaction completes+rewards it.
+            //      CRITICAL: the no-objective clause is gated to !HasObjectives, NOT !HasUnmet.
+            //      A kill quest must reach server status==3 — turning in on a local "all kills
+            //      met" tally is the cannot_reward flood (quest 21: our count says 12/12 done,
+            //      server still says INCOMPLETE → reward refused forever). Server is authoritative;
+            //      overflow grind (2b) drives a stale-count quest to real completion. !Failed
+            //      avoids retrying a turn-in that already bounced this sweep.
+            var complete = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed
+                                              && (IsComplete(ctx, b) || !b.Node.HasObjectives)).ToList();
+            if (complete.Count > 0)
+            {
+                var bq = Nearest(ctx, complete, b => { var l = TurnInNpc(b); return (l.X, l.Y, l.Map); });
+                if (bq != null)
+                {
+                    q.Active = bq;
+                    var npc = TurnInNpc(bq);
+                    if (AtNpc(ctx, npc)) { ctx.SetStep("turnin"); return Interact(bq, accept: false); }
+                    ctx.SetStep("to_turnin");
+                    return MoveTo(npc);
+                }
+            }
+
+            // -- 4. REPROCESS -- re-gather (follow-ups + new locals) and clear the sweep's
+            //      deferrals so the far quest competes fresh. If anything changes, re-derive
+            //      once: with closer locals the far one re-defers; with nothing closer it is
+            //      no longer an outlier and gets worked (the lone-far trek). Terminates.
+            bool added = GatherLocals(ctx, q);
+            if (added)
+            {
+                foreach (var b in q.Batch) b.Deferred = false;
+                continue;
+            }
+
+            // -- 5. nothing to accept / work / turn in / discover -> batch exhausted --
+            // The carried set (incl. any Failed-this-sweep quests still in the C++ log) is resumed on
+            // the next entry to Questing. If we got here BY SHELVING (there are active deferrals), the
+            // in-reach content is all death/no_path-shelved — commit to grinding for a window so the bot
+            // gains levels instead of oscillating quest⇄grind at tick speed (the spin backoff). A
+            // genuinely quest-less bot (nothing deferred) skips the lock and grinds via normal
+            // arbitration, so it still folds in a quest as it wanders into a fresh hub.
+            var lockId = ctx.Identity;
+            if (lockId != null && lockId.DeferredQuestIds.Count > 0
+                && !(lockId.GrindLockUntil is DateTime gl && DateTime.UtcNow < gl))
+            {
+                lockId.GrindLockUntil = DateTime.UtcNow.AddMinutes(GrindLockMinutes);
+                _logger.LogInformation("[QUEST] {Name} batch exhausted with {N} deferred — grind-lock {Min}min (commit to leveling)",
+                    ctx.Name, lockId.DeferredQuestIds.Count, GrindLockMinutes);
+            }
+            ctx.Quest = null;
+            return StepResult.Block("no_quests");
         }
 
-        // -- 4. REPROCESS -- re-gather (follow-ups + new locals) and clear the sweep's
-        //      deferrals so the far quest competes fresh. If anything changes, re-derive
-        //      once: with closer locals the far one re-defers; with nothing closer it is
-        //      no longer an outlier and gets worked (the lone-far trek). Terminates.
-        bool added = GatherLocals(ctx, q);
-        bool anyDeferred = q.Batch.Any(b => b.Deferred);
-        if (added || anyDeferred)
-        {
-            foreach (var b in q.Batch) b.Deferred = false;
-            return Derive(ctx, q);
-        }
-
-        // -- 5. nothing to accept / work / turn in / discover -> batch exhausted --
-        // The carried set (incl. any Failed-this-sweep quests still in the C++ log) is resumed on
-        // the next entry to Questing. If we got here BY SHELVING (there are active deferrals), the
-        // in-reach content is all death/no_path-shelved — commit to grinding for a window so the bot
-        // gains levels instead of oscillating quest⇄grind at tick speed (the spin backoff). A
-        // genuinely quest-less bot (nothing deferred) skips the lock and grinds via normal
-        // arbitration, so it still folds in a quest as it wanders into a fresh hub.
-        var lockId = ctx.Identity;
-        if (lockId != null && lockId.DeferredQuestIds.Count > 0
-            && !(lockId.GrindLockUntil is DateTime gl && DateTime.UtcNow < gl))
-        {
-            lockId.GrindLockUntil = DateTime.UtcNow.AddMinutes(GrindLockMinutes);
-            _logger.LogInformation("[QUEST] {Name} batch exhausted with {N} deferred — grind-lock {Min}min (commit to leveling)",
-                ctx.Name, lockId.DeferredQuestIds.Count, GrindLockMinutes);
-        }
+        // Pass cap hit -- a re-derive ran away (should not happen with the phase-4 gate). Exit to grind
+        // rather than spin: any future loop-class regression becomes a logged no-op, never an SOE.
+        _logger.LogWarning("[QUEST] {Name} derive exceeded {Max} passes -- exhausting to grind (recursion guard)",
+            ctx.Name, MaxDerivePasses);
         ctx.Quest = null;
         return StepResult.Block("no_quests");
     }
@@ -625,6 +665,7 @@ public sealed class QuestPlanner : IBotPlanner
            && !id.DeferredQuestIds.ContainsKey(q.QuestId)
            && !id.AbandonedGreyQuestIds.Contains(q.QuestId)
            && !IsGrey(q, id.Level)                                       // grey-filter hole: GoalSelector's pick must agree with BuildBatch's grey-reject, else pick>0 / batch=0 → the quest⇄grind tick-spin
+           && !IsRed(q, id.Level)                                        // acquisition ceiling: don't NEWLY grab an over-level (red) quest -- e.g. an L9 bot seeding an L12 Westfall quest. Already-accepted reds resume via BuildBatch step 1 (this filters NEW picks only, and GoalSelector shares it so goal==pick).
            && !id.IsPathBlacklisted(q.Giver.X, q.Giver.Y)
            && q.Objectives.All(o => !id.IsPathBlacklisted(o.GrindX, o.GrindY));   // back off a death pocket as an AREA: a kill objective in a blacklisted cell is unpickable, not just its giver
 
@@ -686,23 +727,48 @@ public sealed class QuestPlanner : IBotPlanner
         return worst;
     }
 
-    // Shelve (Deferred = true) any candidate whose reach >= OutlierFactor x the MEAN reach
-    // of the OTHERS -- so the far one doesn't inflate its own threshold. With <2 candidates,
-    // or once only far ones remain (all ~equal), nothing is an outlier -> they get worked.
+    // Shelve (Deferred = true for this sweep) ONLY a quest that would take the bot OUTSIDE its
+    // current allowed travel range — i.e. its FARTHEST unmet objective is beyond GetMaxTravelDistance
+    // for this level/zone (tier-0 baseline, ~2200yd pre-10). A quest whose objectives are ALL within
+    // range is never shelved here, no matter how many it has or how much nearer another quest happens
+    // to be: NearestLeg already orders nearest-first, so an in-range quest simply becomes "#2" and gets
+    // worked. (Replaces the old relative 2x-mean-of-others rule, which shelved trivially-reachable
+    // quests — e.g. a 375yd objective next to a 5yd one — and dropped bots into needless grinding.)
     private void TagOutliers(BotContext ctx, List<BatchQuest> candidates)
     {
-        if (candidates.Count < 2) return;
-        var reach = candidates.ToDictionary(b => b, b => QuestReach(ctx, b));
+        var id = ctx.Identity;
+        if (id == null) return;
+        float cap = ZoneSafetyMap.GetMaxTravelDistance(id.Level, ctx.ZoneId, 0);   // the current allowed range
         foreach (var b in candidates)
         {
-            var others = candidates.Where(o => o != b).Select(o => reach[o]).Where(r => r > 0f).ToList();
-            if (others.Count == 0) continue;
-            float mean = others.Average();
-            if (reach[b] >= OutlierFactor * mean)
+            float reach = QuestReach(ctx, b);   // distance to the FARTHEST unmet objective (cross-map = MaxValue)
+            if (reach > cap)
             {
                 b.Deferred = true;
-                _logger.LogDebug("[QUEST] {Name} shelving far quest [{Id}] reach={R:F0} (2x mean {M:F0})",
-                    ctx.Name, b.QuestId, reach[b], mean);
+                _logger.LogDebug("[QUEST] {Name} shelving out-of-range quest [{Id}] reach={R:F0} (cap {Cap:F0})",
+                    ctx.Name, b.QuestId, reach, cap);
+            }
+        }
+
+        // Red-deprioritize: an already-ACCEPTED over-level (red) quest -- e.g. an L9 bot that grabbed an
+        // L12 Westfall quest before the IsRed acquisition gate, then got death-ported INTO Westfall so its
+        // red objective is now the NEAREST leg -- otherwise keeps pulling the bot deeper into over-level
+        // content ahead of its in-range Elwynn work. We never ABANDON it (carry policy: only grey drops),
+        // so it stays in the log and resumes once the bot levels into its band. We only SWEEP-DEFER it here,
+        // and ONLY while at least one non-red in-range quest remains to work this sweep -- so a bot that has
+        // nothing BUT a red still works the red rather than idling. Mirrors the out-of-range shelve above.
+        var nonRedLive = candidates.Any(b => !b.Deferred && !IsRed(b.Node, id.Level));
+        if (nonRedLive)
+        {
+            foreach (var b in candidates)
+            {
+                if (b.Deferred) continue;
+                if (IsRed(b.Node, id.Level))
+                {
+                    b.Deferred = true;
+                    _logger.LogInformation("[QUEST] {Name} deprioritizing accepted red quest [{Id}] \"{Title}\" (qlvl {Lvl}, bot {Bot}) — working in-level quests first",
+                        ctx.Name, b.QuestId, b.Node.Title, QuestLevelOf(b.Node), id.Level);
+                }
             }
         }
     }
@@ -817,6 +883,16 @@ public sealed class QuestPlanner : IBotPlanner
         if (pl <= 39) return pl - 5 - pl / 10;
         if (pl <= 59) return pl - 1 - pl / 5;
         return pl - 9;
+    }
+
+    // Red = too far ABOVE the bot to newly acquire (the acquisition ceiling, mirror of IsGrey).
+    // Scaling/unknown-level quests (ql <= 0) are never red-blocked, same as the grey side. Gates
+    // ACQUISITION only (IsPickable) -- a red already in the log is resumed, never abandoned for being red.
+    private static bool IsRed(QuestNode n, int botLevel)
+    {
+        int ql = QuestLevelOf(n);
+        if (ql <= 0) return false;                    // scaling / unknown level -> never block
+        return ql > botLevel + RedMargin;
     }
 
     // ========================================================================

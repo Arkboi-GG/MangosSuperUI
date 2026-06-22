@@ -1,0 +1,871 @@
+@{
+    ViewData["Title"] = "Fleet View";
+}
+
+@section Styles {
+    <style>
+        /* ====== Fleet View — fleet-wide error triage board ====== */
+
+        .fv-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        /* --- Controls strip --- */
+        .fv-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            background: var(--bg-card);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 8px 12px;
+        }
+
+            .fv-controls .fv-spacer {
+                flex: 1;
+            }
+
+        .fv-live-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--status-online);
+            display: inline-block;
+            box-shadow: 0 0 0 0 rgba(34,197,94,0.5);
+            animation: fvPulse 2s infinite;
+        }
+
+            .fv-live-dot.paused {
+                background: var(--text-muted);
+                animation: none;
+                box-shadow: none;
+            }
+
+        @@keyframes fvPulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(34,197,94,0.45);
+            }
+
+            70% {
+                box-shadow: 0 0 0 6px rgba(34,197,94,0);
+            }
+
+            100% {
+                box-shadow: 0 0 0 0 rgba(34,197,94,0);
+            }
+        }
+
+        .fv-meta {
+            font-size: 11px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+            .fv-meta b {
+                color: var(--text-secondary);
+                font-weight: 600;
+            }
+
+        /* --- KPI tiles --- */
+        .fv-kpis {
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .fv-kpi {
+            background: var(--bg-card);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 12px 14px;
+            position: relative;
+            overflow: hidden;
+        }
+
+            .fv-kpi::before {
+                content: '';
+                position: absolute;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                width: 3px;
+                background: var(--accent);
+            }
+
+            .fv-kpi.bad::before {
+                background: #f7768e;
+            }
+
+            .fv-kpi.warn::before {
+                background: #e0af68;
+            }
+
+        .fv-kpi-val {
+            font-size: 26px;
+            font-weight: 800;
+            line-height: 1.05;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.01em;
+        }
+
+            .fv-kpi-val.sm {
+                font-size: 17px;
+                font-weight: 700;
+            }
+
+        .fv-kpi-label {
+            font-size: 9.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--text-muted);
+            margin-top: 4px;
+            font-weight: 600;
+        }
+
+        .fv-kpi-sub {
+            font-size: 10px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        /* --- Filter chips --- */
+        .fv-chips {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .fv-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 9px;
+            border-radius: 11px;
+            border: 1px solid var(--border-medium);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+            transition: all var(--transition-fast);
+        }
+
+            .fv-chip:hover {
+                border-color: var(--accent);
+            }
+
+            .fv-chip .fv-chip-dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+            }
+
+            .fv-chip .fv-chip-n {
+                font-variant-numeric: tabular-nums;
+                opacity: 0.85;
+            }
+
+            .fv-chip.off {
+                opacity: 0.4;
+            }
+
+        /* --- Main grid: feed + rails --- */
+        .fv-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 320px;
+            gap: 12px;
+            align-items: start;
+        }
+
+            .fv-grid > * {
+                min-width: 0;
+            }
+
+        @@media (max-width: 1200px) {
+            .fv-grid {
+                grid-template-columns: minmax(0, 1fr);
+            }
+        }
+
+        .fv-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+        }
+
+        .fv-card-head {
+            padding: 9px 13px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-light);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+            .fv-card-head .fv-count {
+                font-weight: 600;
+                color: var(--text-secondary);
+            }
+
+        /* --- Incident feed (compact, expandable rows) --- */
+        .fv-feed-wrap {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            min-width: 0;
+        }
+
+        .fv-feed {
+            max-height: 188px;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+
+        .fv-feed-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 12px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+            .fv-feed-toolbar input {
+                font-size: 12px;
+                height: 28px;
+                width: 160px;
+            }
+
+        .fv-inc {
+            border-bottom: 1px solid var(--border-light);
+            overflow: hidden;
+        }
+
+        .fv-inc-row {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            min-width: 0;
+            padding: 5px 12px 5px 9px;
+            border-left: 3px solid transparent;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+            .fv-inc-row:hover {
+                background: var(--bg-card-alt);
+            }
+
+        .fv-inc-chev {
+            font-size: 9px;
+            color: var(--text-muted);
+            width: 9px;
+            flex-shrink: 0;
+            transition: transform 0.15s ease;
+        }
+
+        .fv-inc.open .fv-inc-chev {
+            transform: rotate(90deg);
+        }
+
+        .fv-inc-time {
+            font-family: 'Consolas','Courier New',monospace;
+            font-size: 10.5px;
+            color: var(--text-muted);
+            width: 54px;
+            flex-shrink: 0;
+        }
+
+        .fv-inc-cat {
+            font-size: 9.5px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+            padding: 2px 6px;
+            border-radius: 3px;
+            white-space: nowrap;
+            flex-shrink: 0;
+            min-width: 92px;
+            text-align: center;
+        }
+
+        .fv-inc-bot {
+            width: 116px;
+            flex-shrink: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+            .fv-inc-bot .lvl {
+                color: var(--text-muted);
+                font-weight: 400;
+                font-size: 10px;
+                margin-left: 4px;
+            }
+
+        .fv-inc-msg {
+            flex: 1;
+            min-width: 0;
+            font-family: 'Consolas','Courier New',monospace;
+            font-size: 11px;
+            color: #c8d0da;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .fv-inc-hint {
+            flex-shrink: 0;
+            display: flex;
+            gap: 7px;
+            color: var(--text-muted);
+            font-size: 10px;
+        }
+
+            .fv-inc-hint i {
+                opacity: 0.8;
+            }
+
+        .fv-inc-body {
+            display: none;
+            padding: 2px 12px 11px 33px;
+        }
+
+        .fv-inc.open .fv-inc-body {
+            display: block;
+        }
+
+        .fv-inc-full {
+            font-family: 'Consolas','Courier New',monospace;
+            font-size: 11px;
+            color: #c8d0da;
+            word-break: break-word;
+            line-height: 1.5;
+            background: #0f1319;
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+
+        .fv-inc-ctx {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px 14px;
+            margin-top: 8px;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+            .fv-inc-ctx b {
+                color: var(--text-secondary);
+                font-weight: 600;
+            }
+
+        .fv-ctx-pos {
+            font-family: 'Consolas','Courier New',monospace;
+            color: #7aa2f7;
+            cursor: pointer;
+        }
+
+            .fv-ctx-pos:hover {
+                text-decoration: underline;
+            }
+
+        /* --- Rail panels --- */
+        .fv-rail {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .fv-bars {
+            padding: 10px 13px;
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+        }
+
+        .fv-bar-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+        }
+
+        .fv-bar-label {
+            width: 118px;
+            flex-shrink: 0;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .fv-bar-track {
+            flex: 1;
+            height: 7px;
+            border-radius: 4px;
+            background: var(--bg-card-alt);
+            overflow: hidden;
+        }
+
+        .fv-bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.35s ease;
+        }
+
+        .fv-bar-val {
+            width: 30px;
+            text-align: right;
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* --- Tables (hotspots, leaderboard) --- */
+        .fv-bottom {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 12px;
+        }
+
+            .fv-bottom > * {
+                min-width: 0;
+            }
+
+        @@media (max-width: 1000px) {
+            .fv-bottom {
+                grid-template-columns: minmax(0, 1fr);
+            }
+        }
+
+        .fv-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+            .fv-table th {
+                text-align: left;
+                font-size: 9.5px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: var(--text-muted);
+                font-weight: 700;
+                padding: 7px 12px;
+                border-bottom: 1px solid var(--border-light);
+            }
+
+            .fv-table td {
+                padding: 7px 12px;
+                border-bottom: 1px solid var(--border-light);
+                color: var(--text-secondary);
+                vertical-align: middle;
+            }
+
+            .fv-table tr:last-child td {
+                border-bottom: none;
+            }
+
+            .fv-table tr.fv-clickable {
+                cursor: pointer;
+            }
+
+                .fv-table tr.fv-clickable:hover td {
+                    background: var(--bg-card-alt);
+                }
+
+            .fv-table .fv-num {
+                font-variant-numeric: tabular-nums;
+                font-weight: 700;
+                color: var(--text-primary);
+            }
+
+        .fv-coord {
+            font-family: 'Consolas','Courier New',monospace;
+            color: #7aa2f7;
+        }
+
+        .fv-mini-cats {
+            display: inline-flex;
+            gap: 3px;
+        }
+
+        .fv-mini-cat {
+            width: 8px;
+            height: 8px;
+            border-radius: 2px;
+        }
+
+        .fv-lvlpill {
+            font-size: 9.5px;
+            color: var(--text-muted);
+            border: 1px solid var(--border-light);
+            border-radius: 8px;
+            padding: 0 6px;
+            margin-left: 5px;
+        }
+
+        /* --- Empty / loading --- */
+        .fv-empty {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            color: var(--text-muted);
+            padding: 50px 20px;
+        }
+
+            .fv-empty i {
+                font-size: 38px;
+                margin-bottom: 12px;
+                opacity: 0.5;
+            }
+
+            .fv-empty .fv-empty-title {
+                font-size: 15px;
+                color: var(--text-secondary);
+                font-weight: 600;
+            }
+
+            .fv-empty .fv-empty-sub {
+                font-size: 12.5px;
+                margin-top: 6px;
+                max-width: 420px;
+                line-height: 1.5;
+            }
+
+        .fv-feed::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .fv-feed::-webkit-scrollbar-thumb {
+            background: var(--border-medium);
+            border-radius: 3px;
+        }
+
+        /* --- Report modal --- */
+        .fv-modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.55);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+            .fv-modal-overlay.active {
+                display: flex;
+            }
+
+        .fv-modal {
+            background: var(--bg-card);
+            border: 1px solid var(--border-medium);
+            border-radius: var(--radius-md);
+            width: min(880px, 94vw);
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        }
+
+        .fv-modal-head {
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--border-light);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+            .fv-modal-head h3 {
+                margin: 0;
+                font-size: 15px;
+                color: var(--text-primary);
+            }
+
+            .fv-modal-head .fv-modal-x {
+                background: none;
+                border: none;
+                color: var(--text-muted);
+                cursor: pointer;
+                font-size: 16px;
+            }
+
+        .fv-modal-body {
+            padding: 14px 18px;
+            overflow-y: auto;
+        }
+
+        .fv-modal-hint {
+            font-size: 12.5px;
+            color: var(--text-secondary);
+            margin: 0 0 10px;
+            line-height: 1.5;
+        }
+
+        .fv-report-text {
+            width: 100%;
+            height: 48vh;
+            resize: vertical;
+            font-family: 'Consolas','Courier New',monospace;
+            font-size: 11px;
+            line-height: 1.5;
+            background: #0f1319;
+            color: #c8d0da;
+            border: 1px solid var(--border-light);
+            border-radius: 6px;
+            padding: 10px 12px;
+            white-space: pre;
+            overflow: auto;
+        }
+
+        .fv-modal-foot {
+            padding: 12px 18px;
+            border-top: 1px solid var(--border-light);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .fv-opts {
+            display: flex;
+            gap: 14px;
+            align-items: center;
+        }
+
+        .fv-opt {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+        }
+
+            .fv-opt input {
+                margin: 0;
+            }
+
+        /* --- Pop-out feed overlay (reuses the modal shell) --- */
+        .fv-modal.lg {
+            width: min(1100px, 95vw);
+            height: 88vh;
+        }
+
+            .fv-modal.lg .fv-modal-body {
+                flex: 1;
+                padding: 0;
+                display: flex;
+                flex-direction: column;
+                min-height: 0;
+            }
+
+        .fv-big-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 14px;
+            border-bottom: 1px solid var(--border-light);
+            flex-shrink: 0;
+        }
+
+        .fv-feed-big {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            min-height: 0;
+        }
+
+            .fv-feed-big::-webkit-scrollbar {
+                width: 6px;
+            }
+
+            .fv-feed-big::-webkit-scrollbar-thumb {
+                background: var(--border-medium);
+                border-radius: 3px;
+            }
+    </style>
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header d-flex align-items-start justify-content-between">
+            <div>
+                <h1><i class="fa-solid fa-tower-broadcast" style="color: var(--accent);"></i> Fleet View</h1>
+                <p>Fleet-wide error triage — every fault threaded to the command, position, and target behind it</p>
+            </div>
+            <div class="d-flex align-items-center gap-3">
+                <span class="fv-meta" id="fvWindowMeta">—</span>
+                <span class="status-dot offline" id="fvBridge"></span>
+                <span id="fvBridgeText" style="font-weight:500;font-size:13px;">Connecting…</span>
+            </div>
+        </div>
+
+        <div class="content-body">
+            <div class="fv-wrap">
+
+                <!-- Controls -->
+                <div class="fv-controls">
+                    <span class="fv-live-dot" id="fvLiveDot" title="Auto-refreshing"></span>
+                    <button class="btn-outline-subtle" id="fvPause" style="font-size:11px;padding:3px 10px;height:28px;">
+                        <i class="fa-solid fa-pause"></i> Pause
+                    </button>
+                    <button class="btn-outline-subtle" id="fvRefresh" style="font-size:11px;padding:3px 10px;height:28px;">
+                        <i class="fa-solid fa-rotate"></i> Refresh
+                    </button>
+                    <div style="display:inline-flex;align-items:center;gap:6px;">
+                        <label style="color:var(--text-muted);font-size:11px;margin:0;">Every</label>
+                        <select id="fvInterval" class="form-input" style="width:auto;font-size:11px;padding:2px 6px;height:28px;">
+                            <option value="2000">2s</option>
+                            <option value="4000" selected>4s</option>
+                            <option value="8000">8s</option>
+                            <option value="15000">15s</option>
+                        </select>
+                    </div>
+                    <button class="btn-accent" id="fvReport" style="font-size:11px;padding:3px 12px;height:28px;white-space:nowrap;" title="Build a paste-ready quantized report">
+                        <i class="fa-solid fa-clipboard-list"></i> Quantized Report
+                    </button>
+                    <span class="fv-spacer"></span>
+                    <button class="btn-outline-subtle" id="fvClearFilters" style="font-size:11px;padding:3px 10px;height:28px;display:none;">
+                        <i class="fa-solid fa-filter-circle-xmark"></i> Clear filters
+                    </button>
+                    <span class="fv-meta" id="fvUpdated">never</span>
+                </div>
+
+                <!-- KPI tiles -->
+                <div class="fv-kpis" id="fvKpis">
+                    <div class="fv-kpi"><div class="fv-kpi-val" id="kpiErrors">0</div><div class="fv-kpi-label">Errors &amp; warnings</div><div class="fv-kpi-sub" id="kpiErrorsSub">&nbsp;</div></div>
+                    <div class="fv-kpi"><div class="fv-kpi-val" id="kpiRate">0</div><div class="fv-kpi-label">Per minute</div><div class="fv-kpi-sub" id="kpiRateSub">&nbsp;</div></div>
+                    <div class="fv-kpi"><div class="fv-kpi-val" id="kpiBots">0</div><div class="fv-kpi-label">Bots affected</div><div class="fv-kpi-sub" id="kpiBotsSub">&nbsp;</div></div>
+                    <div class="fv-kpi"><div class="fv-kpi-val sm" id="kpiTopCat">—</div><div class="fv-kpi-label">Top fault</div><div class="fv-kpi-sub" id="kpiTopCatSub">&nbsp;</div></div>
+                    <div class="fv-kpi"><div class="fv-kpi-val sm" id="kpiHotspot">—</div><div class="fv-kpi-label">Worst hotspot</div><div class="fv-kpi-sub" id="kpiHotspotSub">&nbsp;</div></div>
+                    <div class="fv-kpi"><div class="fv-kpi-val sm" id="kpiWorstBot">—</div><div class="fv-kpi-label">Worst bot</div><div class="fv-kpi-sub" id="kpiWorstBotSub">&nbsp;</div></div>
+                </div>
+
+                <!-- Category chips -->
+                <div class="fv-chips" id="fvChips"></div>
+
+                <!-- Feed + rails -->
+                <div class="fv-grid">
+                    <div class="fv-card fv-feed-wrap">
+                        <div class="fv-card-head">
+                            <span><i class="fa-solid fa-list-timeline" style="margin-right:6px;color:var(--accent);"></i>Incident feed</span>
+                            <span class="fv-count"><span id="fvFeedCount">0 shown</span> · <a href="#" id="fvPopOut" style="color:var(--accent);"><i class="fa-solid fa-up-right-and-down-left-from-center" style="font-size:10px;"></i> pop out</a></span>
+                        </div>
+                        <div class="fv-feed-toolbar">
+                            <input type="text" class="form-input" id="fvBotFilter" placeholder="Filter by bot name…" />
+                            <span class="fv-meta">click a row to expand · click a coord to copy</span>
+                        </div>
+                        <div class="fv-feed" id="fvFeed">
+                            <div class="fv-empty"><i class="fa-solid fa-spinner fa-spin"></i><div class="fv-empty-title">Loading fleet telemetry…</div></div>
+                        </div>
+                    </div>
+
+                    <div class="fv-rail">
+                        <div class="fv-card">
+                            <div class="fv-card-head"><span><i class="fa-solid fa-chart-simple" style="margin-right:6px;color:var(--accent);"></i>Faults by type</span></div>
+                            <div class="fv-bars" id="fvCatBars"><div style="color:var(--text-muted);font-size:12px;">—</div></div>
+                        </div>
+                        <div class="fv-card">
+                            <div class="fv-card-head"><span><i class="fa-solid fa-diagram-predecessor" style="margin-right:6px;color:var(--accent);"></i>What preceded the fault</span></div>
+                            <div class="fv-bars" id="fvPreBars"><div style="color:var(--text-muted);font-size:12px;">—</div></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Hotspots + leaderboard -->
+                <div class="fv-bottom">
+                    <div class="fv-card">
+                        <div class="fv-card-head"><span><i class="fa-solid fa-location-crosshairs" style="margin-right:6px;color:var(--accent);"></i>Error hotspots</span><span class="fv-count">100-yd cells</span></div>
+                        <div style="overflow-x:auto;"><table class="fv-table" id="fvHotspots"><tbody><tr><td style="color:var(--text-muted);">—</td></tr></tbody></table></div>
+                    </div>
+                    <div class="fv-card">
+                        <div class="fv-card-head"><span><i class="fa-solid fa-ranking-star" style="margin-right:6px;color:var(--accent);"></i>Bot leaderboard</span><span class="fv-count">by fault count</span></div>
+                        <div style="overflow-x:auto;"><table class="fv-table" id="fvLeaderboard"><tbody><tr><td style="color:var(--text-muted);">—</td></tr></tbody></table></div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Report-for-Claude modal ===== -->
+<div class="fv-modal-overlay" id="fvReportOverlay">
+    <div class="fv-modal">
+        <div class="fv-modal-head">
+            <h3><i class="fa-solid fa-clipboard-list" style="color:var(--accent);margin-right:6px;"></i>Quantized fleet report</h3>
+            <button class="fv-modal-x" id="fvReportClose"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="fv-modal-body">
+            <p class="fv-modal-hint">A paste-ready snapshot of the <b>current in-memory window</b>. For the full bounded journald digest, append it below — the quantizer runs inside the service, so nothing has to be run by hand.</p>
+            <div class="fv-opts" style="margin-bottom:10px;">
+                <label class="fv-opt"><input type="checkbox" id="fvOptIncidents" checked> Full incident log</label>
+                <label class="fv-opt"><input type="checkbox" id="fvOptTimelines" checked> Per-bot timelines</label>
+                <label class="fv-opt"><input type="checkbox" id="fvOptFilters"> Respect active filters</label>
+            </div>
+            <div class="fv-opts" style="margin-bottom:10px;gap:8px;flex-wrap:wrap;">
+                <input type="number" class="form-input" id="fvDigestPid" placeholder="PID (auto)" style="width:110px;font-size:11px;height:28px;" />
+                <button class="btn-outline-subtle" id="fvDigestRun" style="font-size:11px;padding:3px 10px;height:28px;">
+                    <i class="fa-solid fa-terminal"></i> Append run digest
+                </button>
+                <input type="text" class="form-input" id="fvDigestBot" placeholder="Bot name" style="width:130px;font-size:11px;height:28px;" />
+                <button class="btn-outline-subtle" id="fvDigestBotRun" style="font-size:11px;padding:3px 10px;height:28px;">
+                    <i class="fa-solid fa-magnifying-glass-chart"></i> Append bot digest
+                </button>
+                <span class="fv-meta" id="fvDigestMeta"></span>
+            </div>
+            <textarea class="fv-report-text" id="fvReportText" readonly spellcheck="false"></textarea>
+        </div>
+        <div class="fv-modal-foot">
+            <button class="btn-accent" id="fvReportCopy"><i class="fa-solid fa-copy"></i> Copy</button>
+            <button class="btn-outline-subtle" id="fvReportDownload"><i class="fa-solid fa-download"></i> Download .md</button>
+            <span class="fv-spacer"></span>
+            <span class="fv-meta" id="fvReportMeta"></span>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Pop-out incident feed overlay ===== -->
+<div class="fv-modal-overlay" id="fvFeedOverlay">
+    <div class="fv-modal lg">
+        <div class="fv-modal-head">
+            <h3><i class="fa-solid fa-list-timeline" style="color:var(--accent);margin-right:6px;"></i>Incident feed</h3>
+            <div style="display:flex;align-items:center;gap:14px;">
+                <a href="#" id="fvBigExpand" style="font-size:12px;color:var(--text-muted);">expand all</a>
+                <button class="fv-modal-x" id="fvFeedClose"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+        </div>
+        <div class="fv-big-toolbar">
+            <input type="text" class="form-input" id="fvBigFilter" placeholder="Filter by bot name…" style="width:200px;font-size:12px;height:30px;" />
+            <span class="fv-count" id="fvBigCount" style="font-size:11px;color:var(--text-secondary);">0 shown</span>
+            <span class="fv-spacer"></span>
+            <span class="fv-meta">click a row to expand · click a coord to copy</span>
+        </div>
+        <div class="fv-modal-body">
+            <div class="fv-feed-big" id="fvFeedBig"></div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/js/fleet.js" asp-append-version="true"></script>
+}
