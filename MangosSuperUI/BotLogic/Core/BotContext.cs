@@ -265,6 +265,35 @@ public sealed class BotContext
     public float LastPosDelta { get; set; }
     public Vec3 LastPosRef { get; set; }                  // ping-pong / no-progress detection
 
+    // ---- no-progress circuit breaker (brain-owned; the universal silent/fast-stall net) ----
+    // ConsecutiveFailures: negated WAITs since the last success — a fast fail-loop (e.g. relocate
+    // MOVE_FAILED no_path at 1Hz) that the slow no-progress clock would take too long to catch.
+    // Reset on any positive ack / kill (OnGrindProgress / the executor's ack path).
+    public int ConsecutiveFailures { get; set; }
+
+    // Recently-tried grind cell centers (cell granularity) that produced no kills. The breaker records
+    // the current spot here on a wedge so the next forced relocation goes somewhere NEW, not back onto
+    // the same grid-"good"-but-dead cell. Cleared on a real KILL/level (OnGrindProgress).
+    private readonly List<(int X, int Y)> _deadGrindCells = new();
+    public void RecordDeadGrindCell(float x, float y)
+    {
+        var k = ((int)MathF.Round(x / 100f), (int)MathF.Round(y / 100f));
+        _deadGrindCells.Remove(k);
+        _deadGrindCells.Add(k);
+        while (_deadGrindCells.Count > 8) _deadGrindCells.RemoveAt(0);
+    }
+    public bool IsDeadGrindCell(float x, float y)
+    {
+        var k = ((int)MathF.Round(x / 100f), (int)MathF.Round(y / 100f));
+        return _deadGrindCells.Contains(k);
+    }
+    /// <summary>A real kill/level — the area works, so forget the dead-cell history and the fail streak.</summary>
+    public void OnGrindProgress()
+    {
+        _deadGrindCells.Clear();
+        ConsecutiveFailures = 0;
+    }
+
     // ---- step / goal timing ----
     public DateTime GoalSinceUtc { get; private set; } = DateTime.UtcNow;
     public DateTime StepSinceUtc { get; private set; } = DateTime.UtcNow;

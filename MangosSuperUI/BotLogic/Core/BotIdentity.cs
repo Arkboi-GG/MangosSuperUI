@@ -281,12 +281,40 @@ public class BotIdentity
     public DateTime? GrindLockUntil { get; set; }
 
     /// <summary>
+    /// Set by the brain's no-progress circuit breaker (BotBrain.TryBreakWedgeAsync) when a bot has made
+    /// zero real progress for too long OR is in a fast fail-loop (e.g. relocate MOVE_FAILED no_path at
+    /// 1Hz, the off-mesh case). GoalSelector returns Idle while this is in the future so the bot PARKS
+    /// instead of thrashing; on lapse it resumes and relocates to a fresh cell. Recovery (dead/heal/
+    /// vendor) still preempts. Expires by clock. Null = not parked.
+    /// </summary>
+    public DateTime? WedgeBackoffUntil { get; set; }
+
+    /// <summary>
     /// Suppress the Training goal until this UTC time. Set by TrainingPlanner on a give-up
     /// (trainer unreachable / TRAIN_FAIL / timeout) so a bot doesn't immediately re-trek toward
     /// the same unreachable trainer. Cleared on LEVEL_UP (new spells justify a fresh attempt) and
     /// lapses by clock. Null = no cooldown.
     /// </summary>
     public DateTime? TrainCooldownUntil { get; set; }
+
+    // --- Grind relocation (aware-grind: leave a barren/grey/contested spot for a level-appropriate cell) ---
+    // Durable HERE (not on GrindScratch) because the no-kills reselect bounces through Idle and
+    // ResetScratch wipes ctx.Grind every cycle. GrindPlanner.IsProgressing returns true while
+    // GrindRelocating so the move advances tick-to-tick without an Idle bounce mid-flight.
+    public bool GrindRelocating { get; set; }
+    public bool GrindRelocatePatrolStopped { get; set; }   // SET_TASK IDLE sent for this relocate
+    public bool GrindRelocateMoveIssued { get; set; }      // MOVE_TO issued for this relocate
+    public float GrindRelocateX { get; set; }
+    public float GrindRelocateY { get; set; }
+    public float GrindRelocateZ { get; set; }
+
+    /// <summary>Clear all grind-relocation phase flags (relocate finished or aborted).</summary>
+    public void ClearGrindRelocate()
+    {
+        GrindRelocating = false;
+        GrindRelocatePatrolStopped = false;
+        GrindRelocateMoveIssued = false;
+    }
 
     public StuckDetector StuckDetector { get; set; }
 

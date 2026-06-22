@@ -37,6 +37,15 @@ public sealed class BotBrain
     // BotTuning candidate.
     private static readonly TimeSpan RescanInterval = TimeSpan.FromSeconds(10);
 
+    // ── No-progress circuit breaker (the universal silent/fast-stall net) ──
+    // LastProgressUtc advances ONLY on a real ack/kill/quest/level. A silent no-kill grind and a fast
+    // fail-loop (negated <1s, never marks progress) both FREEZE it; the Supervisor's deadline rule only
+    // catches a slow hang (a WAIT past its deadline), so these slip through. This fires every tick,
+    // regardless of Pending/Failure/goal.
+    private const double WedgeCeilingSec = 150;   // no real progress this long → wedged
+    private const int WedgeFailCap = 8;     // …or this many back-to-back negated WAITs (fast fail-loop)
+    private const double WedgeBackoffSec = 60;    // park this long, then resume + relocate to a fresh cell
+
     public BotBrain(
         BotExecutor executor,
         BotSupervisor supervisor,
@@ -61,6 +70,9 @@ public sealed class BotBrain
     {
         // 1. Read snapshot → refresh sensory.
         ctx.Sense(snap);
+
+        // 1b. No-progress circuit breaker. Fires before goal/plan so a wedged bot is parked, not driven.
+        if (await TryBreakWedgeAsync(ctx)) return;
 
         // 2. Select the goal. On a change: stop a leaving grind patrol, reset the
         //    goal scratch, clear any WAIT, stamp the new goal.
@@ -140,6 +152,51 @@ public sealed class BotBrain
         _supervisor.Check(ctx, snap);
     }
 
+    /// <summary>
+    /// No-progress circuit breaker. Trips when the bot has made no REAL progress for WedgeCeilingSec
+    /// (LastProgressUtc — kills/acks only) OR is in a fast fail-loop (WedgeFailCap back-to-back negated
+    /// WAITs, e.g. relocate MOVE_FAILED no_path at tick speed when the bot is off the navmesh). On trip:
+    /// stop whatever's in flight, record the current grind cell as DEAD so the next relocation goes
+    /// somewhere new, and PARK on a backoff (GoalSelector holds Idle) so it stops thrashing. A real kill
+    /// clears the streak + dead-cell history (BotContext.OnGrindProgress). There is no live-teleport in
+    /// the bridge, so a genuinely off-mesh bot can only be parked + probed slowly here — un-wedging it is
+    /// the C++ snap-to-poly job. Returns true if it acted (the tick is spent).
+    /// </summary>
+    private async Task<bool> TryBreakWedgeAsync(BotContext ctx)
+    {
+        var id = ctx.Identity;
+        if (id?.WedgeBackoffUntil is DateTime parked && DateTime.UtcNow < parked)
+            return false;   // already parked — let the backoff hold; GoalSelector keeps it Idle
+
+        bool wedged = ctx.TimeSinceProgressSec > WedgeCeilingSec || ctx.ConsecutiveFailures >= WedgeFailCap;
+        if (!wedged) return false;
+
+        double noProg = ctx.TimeSinceProgressSec;
+        int fails = ctx.ConsecutiveFailures;
+
+        _executor.ClearPending(ctx);
+        ctx.Failure = null;
+        ctx.ConsecutiveFailures = 0;
+        id?.ClearGrindRelocate();
+        if (ctx.Goal == Goal.Grinding)
+            ctx.RecordDeadGrindCell(ctx.Pos.X, ctx.Pos.Y);   // don't drop back onto this dead spot
+
+        if (id != null)
+        {
+            id.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(WedgeBackoffSec);
+            // Future-stamp the progress clock to the park END so the bot gets a fresh full window on
+            // resume (the idle park itself isn't "no progress" to be punished for).
+            ctx.LastProgressUtc = id.WedgeBackoffUntil.Value;
+        }
+
+        _logger.LogWarning(
+            "[BRAIN] {Name} WEDGE (noProg={T:F0}s fails={F}) — park {P}s then relocate fresh (goal {G} @ {Pos})",
+            ctx.Name, noProg, fails, WedgeBackoffSec, ctx.Goal, ctx.Pos);
+
+        await EnterGoalAsync(ctx, Goal.Idle);   // next tick reselects; parks while the backoff holds
+        return true;
+    }
+
     /// <summary>Route an inbound bridge event for this bot through the executor's ack matching.</summary>
     public void OnEvent(BotContext ctx, BotEvent evt)
     {
@@ -174,6 +231,7 @@ public sealed class BotBrain
 
         ctx.SetGoal(goal, "enter");
         ResetScratch(ctx);                                       // each goal re-arms its own scratch in PlanNext
+        if (goal != Goal.Grinding) ctx.Identity?.ClearGrindRelocate();   // a half-done relocate doesn't survive a goal change
         _executor.ClearPending(ctx);
         ctx.Failure = null;                                      // stale negative outcome doesn't carry across goals
     }

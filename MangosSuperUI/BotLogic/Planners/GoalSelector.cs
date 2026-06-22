@@ -109,6 +109,16 @@ public sealed class GoalSelector
             return Goal.Training;
         }
 
+        // Wedge backoff: the no-progress breaker parked this bot (no real progress / fast fail-loop /
+        // off-mesh). Sit Idle until it lapses, then resume — it relocates to a fresh cell. Sits AFTER the
+        // dead/heal/vendor recovery holds above (recovery still preempts a parked bot) and ahead of the
+        // rest. Expires by clock.
+        if (ctx.Identity?.WedgeBackoffUntil is DateTime wb && DateTime.UtcNow < wb)
+        {
+            ctx.GoalReason = $"wedge-backoff {(int)Math.Ceiling((wb - DateTime.UtcNow).TotalSeconds)}s";
+            return Goal.Idle;
+        }
+
         // Grind-lock: questing has shelved its way out of all in-reach content (everything
         // currently deferred), so the bot COMMITS to grinding for a window to gain levels rather
         // than oscillating quest⇄grind at tick speed. Sits AFTER the dead/heal/vendor holds above

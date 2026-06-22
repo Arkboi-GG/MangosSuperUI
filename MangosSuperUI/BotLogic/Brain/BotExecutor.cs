@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.Services;
 
 namespace MangosSuperUI.BotLogic.Brain;
@@ -22,6 +23,7 @@ namespace MangosSuperUI.BotLogic.Brain;
 public sealed class BotExecutor
 {
     private readonly BotBridgeService _bridge;
+    private readonly ZoneSafetyMap _safety;
     private readonly ILogger<BotExecutor> _logger;
 
     // Progress-extending objective deadline (§6B.2). A kill-objective grind is
@@ -32,9 +34,10 @@ public sealed class BotExecutor
     // Ridge workers = 180s, but pass-2 'kill anything' keeps the gap far under this).
     private static readonly TimeSpan ObjectiveKillGrace = TimeSpan.FromSeconds(120);
 
-    public BotExecutor(BotBridgeService bridge, ILogger<BotExecutor> logger)
+    public BotExecutor(BotBridgeService bridge, ZoneSafetyMap safety, ILogger<BotExecutor> logger)
     {
         _bridge = bridge;
+        _safety = safety;
         _logger = logger;
     }
 
@@ -107,17 +110,25 @@ public sealed class BotExecutor
         switch (evt.EventType)
         {
             case "KILL":
-                ctx.LastKillUtc = DateTime.UtcNow;
-                ctx.MarkProgress();
-                // Refresh the objective-grind deadline on progress so a slow-but-killing
-                // bot (L1-2 vs L3 Echo-Ridge workers) is never false-failed mid-grind.
-                // Covers BOTH grind shapes: a SET_TASK {kill_count=N} grind AND a §4 enriched
-                // MOVE_TO that has arrived and is grinding in place (IsObjectiveGrind). A plain
-                // MOVE_TO travel WAIT (no creature_entry) is NOT extended by a kill landed in
-                // transit. The indefinite GrindPlanner grind arms no WAIT (IssueNoWaitAsync) so
-                // ctx.Pending is null there — this never fires for it.
-                if (ctx.Pending is { } objWait && (objWait.CommandType == "SET_TASK" || objWait.IsObjectiveGrind))
-                    objWait.DeadlineUtc = DateTime.UtcNow + ObjectiveKillGrace;
+                // Only a REAL kill is progress. A critter/grey kill (e.g. a chicken in a farmyard) must
+                // NOT advance LastKillUtc or reset the stall nets — counting it masked the no-kills
+                // reselect AND the no-progress breaker (the farmyard-grind-forever bug). Server-side
+                // quest kill credit is unaffected (TASK_COMPLETE is authoritative in C++).
+                if (_safety.IsRealKill(evt.CreatureEntry, ctx.Level))
+                {
+                    ctx.LastKillUtc = DateTime.UtcNow;
+                    ctx.MarkProgress();
+                    ctx.OnGrindProgress();   // a real kill: clear the fail streak + dead-cell history
+                    // Refresh the objective-grind deadline on progress so a slow-but-killing bot is
+                    // never false-failed mid-grind (enriched MOVE_TO or SET_TASK {kill_count=N}).
+                    if (ctx.Pending is { } objWait && (objWait.CommandType == "SET_TASK" || objWait.IsObjectiveGrind))
+                        objWait.DeadlineUtc = DateTime.UtcNow + ObjectiveKillGrace;
+                }
+                else
+                {
+                    _logger.LogDebug("[EXEC] {Name} trash kill entry={Entry} (critter/grey) — not progress",
+                        ctx.Name, evt.CreatureEntry);
+                }
                 break;
             case "QUEST_UPDATE":
             case "QUEST_ACCEPT_ACK":
@@ -128,6 +139,7 @@ public sealed class BotExecutor
             case "LEVEL_UP":
                 ctx.LastLevelUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
+                ctx.OnGrindProgress();
                 break;
             case "QUEST_STATUS_ALL":
                 // Authoritative quest-log snapshot (reply to QUERY_QUEST_STATUS). Not a
@@ -159,6 +171,7 @@ public sealed class BotExecutor
 
         ctx.Pending = null;
         ctx.MarkProgress();
+        ctx.ConsecutiveFailures = 0;   // a real ack breaks any fail streak
         return true;
     }
 
@@ -212,6 +225,7 @@ public sealed class BotExecutor
             ctx.Name, pending.CommandType, evt.EventType, reason);
 
         ctx.Pending = null;   // NB: no MarkProgress — a failure is not progress.
+        ctx.ConsecutiveFailures++;   // feeds the brain's fast fail-loop breaker
         return true;
     }
 

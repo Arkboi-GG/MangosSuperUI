@@ -79,8 +79,8 @@ public sealed class QuestPlanner : IBotPlanner
     // When the batch then exhausts WITH active deferrals, GrindLock the bot for GrindLockMinutes so it
     // grinds for levels instead of oscillating quest⇄grind at tick speed (the spin backoff).
     private const int QuestFailCap = 1;          // death + no_path share this cap (mirror MaintenancePlanner)
-    private const int DurableDeferMinutes = 60;  // the at-cap durable shelve window
-    private const int GrindLockMinutes = 60;     // commit-to-grind window on a deferral-driven batch exhaust
+    private const int DurableDeferMinutes = 20;  // the at-cap durable shelve window
+    private const int GrindLockMinutes = 20;     // commit-to-grind window on a deferral-driven batch exhaust
 
     public QuestPlanner(QuestGraphLoader quests, ILogger<QuestPlanner> logger)
     {

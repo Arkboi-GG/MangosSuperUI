@@ -41,6 +41,11 @@ public class ZoneSafetyMap
     // Only maps with spawns get an entry.
     private readonly Dictionary<int, CellData[,]> _grids = new();
 
+    // entry → (max level, is-critter). For "real kill" gating: the KILL event carries only the entry,
+    // and without this a CHICKEN kill (critter, 0 XP) counts as progress and resets every stall net.
+    private readonly Dictionary<int, (int MaxLevel, bool Critter)> _byEntry = new();
+    private const int CREATURE_TYPE_CRITTER = 8;   // VMaNGOS creature_template.type
+
     private bool _loaded;
     public bool IsLoaded => _loaded;
 
@@ -88,6 +93,77 @@ public class ZoneSafetyMap
         var (ix, iy) = WorldToGrid(x, y);
         if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) return 0;
         return grid[ix, iy].SpawnCount;
+    }
+
+    /// <summary>
+    /// Find the nearest cell worth GRINDING for level-appropriate XP. Box-scans cells within
+    /// maxRadiusYards of (botX,botY) and keeps the best-scoring one that is: populated but not a
+    /// dogpile, average level in [L-lowOffset, L+highOffset] (XP, not grey, not a wall), max level
+    /// <= L+dangerCeil (no red mob lurking), and not caller-vetoed. Returns null if none qualify.
+    ///
+    /// Cells already exclude critters / guards / service NPCs (load filter 995478 | 1026), so a
+    /// populated cell is a genuine aggressive pack -- this is why steering here fixes the
+    /// "kill-anything finds a chicken in a farmyard" spin (chickens are NO_AGGRO -> never in a cell).
+    /// </summary>
+    /// <summary>
+    /// Is killing this creature REAL progress for a bot of the given level? False for critters
+    /// (chickens/rabbits — 0 XP) and clearly-grey mobs (maxLevel <= botLevel - greyBand). Unknown
+    /// entries default TRUE (don't punish what we can't classify). Drives the C# progress/stall nets
+    /// only — NOT quest completion (that stays server-authoritative via TASK_COMPLETE).
+    /// </summary>
+    public bool IsRealKill(int entry, int botLevel, int greyBand = 7)
+    {
+        if (entry <= 0) return true;
+        if (!_byEntry.TryGetValue(entry, out var c)) return true;
+        if (c.Critter) return false;
+        if (c.MaxLevel <= Math.Max(1, botLevel - greyBand)) return false;
+        return true;
+    }
+
+    public GrindCell? FindGrindCell(
+        int mapId, float botX, float botY, int botLevel, float maxRadiusYards,
+        int lowOffset = 5, int highOffset = 2, int dangerCeil = 3,
+        int minSpawn = 1, int maxSpawn = 40,
+        Func<float, float, bool>? reject = null)
+    {
+        if (!_grids.TryGetValue(mapId, out var grid)) return null;
+
+        int loLvl = Math.Max(1, botLevel - lowOffset);
+        int hiLvl = botLevel + highOffset;
+        int ceilLvl = botLevel + dangerCeil;
+        float maxRadSq = maxRadiusYards * maxRadiusYards;
+
+        var (cx, cy) = WorldToGrid(botX, botY);
+        int reach = Math.Max(1, (int)(maxRadiusYards / CELL_SIZE) + 1);
+
+        GrindCell? best = null;
+        float bestScore = float.MinValue;
+
+        for (int ix = Math.Max(0, cx - reach); ix <= Math.Min(GRID_DIM - 1, cx + reach); ix++)
+            for (int iy = Math.Max(0, cy - reach); iy <= Math.Min(GRID_DIM - 1, cy + reach); iy++)
+            {
+                var cell = grid[ix, iy];
+                if (cell.SpawnCount < minSpawn || cell.SpawnCount > maxSpawn) continue;
+                if (cell.MaxLevel > ceilLvl) continue;                          // a red mob lives here
+                if (cell.AvgLevel < loLvl || cell.AvgLevel > hiLvl) continue;   // grey or too hot on average
+
+                float wx = ix * CELL_SIZE - COORD_OFFSET + CELL_SIZE * 0.5f;
+                float wy = iy * CELL_SIZE - COORD_OFFSET + CELL_SIZE * 0.5f;
+                float dsq = (wx - botX) * (wx - botX) + (wy - botY) * (wy - botY);
+                if (dsq > maxRadSq) continue;
+                if (reject != null && reject(wx, wy)) continue;
+
+                float dist = MathF.Sqrt(dsq);
+                float levelFit = 1f - MathF.Abs(cell.AvgLevel - botLevel) / 10f;        // 1.0 on-level
+                float score = -dist + levelFit * 60f + MathF.Min(cell.SpawnCount, 8) * 3f; // nearest, on-level, decent density
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = new GrindCell(wx, wy, cell.AvgLevel, cell.MaxLevel, cell.SpawnCount, dist);
+                }
+            }
+
+        return best;
     }
 
     /// <summary>
@@ -359,6 +435,19 @@ public class ZoneSafetyMap
                 _grids[mapId] = grid;
             }
 
+            // Creature classifier — ALL creatures by entry (includes critters/no-aggro, unlike the grid
+            // query above) so a trash kill can be RECOGNIZED. Same DB/patch as the grid.
+            var ctRows = await conn.QueryAsync<dynamic>(@"
+                SELECT entry, level_max AS MaxLevel, type AS CType
+                FROM creature_template
+                WHERE patch = 0 AND level_max > 0");
+            foreach (var r in ctRows)
+            {
+                int entry = Convert.ToInt32(r.entry);
+                _byEntry[entry] = (Convert.ToInt32(r.MaxLevel), Convert.ToInt32(r.CType) == CREATURE_TYPE_CRITTER);
+            }
+            _logger.LogInformation("ZoneSafetyMap: classified {N} creature entries (critter/level)", _byEntry.Count);
+
             _loaded = true;
             sw.Stop();
 
@@ -398,4 +487,13 @@ public class ZoneSafetyMap
         public int Count;
         public int MaxLevel;
     }
+}
+
+/// <summary>A grind-worthy cell: world center + the cell's level/density + distance from the bot.</summary>
+public readonly struct GrindCell
+{
+    public readonly float X, Y, AvgLevel, DistYards;
+    public readonly int MaxLevel, SpawnCount;
+    public GrindCell(float x, float y, float avg, int max, int spawn, float dist)
+    { X = x; Y = y; AvgLevel = avg; MaxLevel = max; SpawnCount = spawn; DistYards = dist; }
 }
