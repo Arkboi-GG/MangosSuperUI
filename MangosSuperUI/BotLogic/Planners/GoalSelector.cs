@@ -62,6 +62,18 @@ public sealed class GoalSelector
             return Goal.Maintenance;
         }
 
+        // Teleport-assist round-trip in flight — hold the CURRENT goal so nothing preempts the short
+        // hop-in / do-business / hop-back. Set by a planner (Training / Maintenance) when a final
+        // approach to a service NPC no_paths in the vicinity. Sits AFTER dead/heal (which null
+        // ctx.Teleport on their preempting goal change) and AHEAD of every trigger below, so a
+        // durability emergency / grind-lock can't yank the bot mid-warp — it fires next tick once the
+        // round-trip releases. ctx.Teleport is only ever set while ctx.Goal is the planner's goal.
+        if (ctx.Teleport != null)
+        {
+            ctx.GoalReason = $"teleport:{ctx.Teleport.Phase}";
+            return ctx.Goal;
+        }
+
         // Vendor/repair errand hold — keep the bot in Maintenance while a vendor trip is
         // in flight (ctx.Service), exactly as the heal-hold pins it post-rez. Without this
         // the goal would flip on the next Select mid-trip and ResetScratch would wipe the
@@ -93,6 +105,20 @@ public sealed class GoalSelector
         {
             ctx.GoalReason = ctx.Durability < DurabilityVendorThreshold ? "repair" : "bags-full";
             return Goal.Maintenance;
+        }
+
+        // Group execution directive (grouping §3.2) — the god bot stamped a shared objective for this
+        // bot's group this tick. Work it as a TEAM (Questing → the QuestPlanner group consult drives
+        // the shared mob; the combat directive focus-fires it). Sits AFTER the survival hard-needs
+        // (dead / heal / teleport / vendor) so a dying or broke-gear member still peels, and BEFORE
+        // solo training / grind-lock / questing so a GROUPED bot never wanders off to train or grind
+        // ALONE while the team has work — group training/vendoring are coordinator errands (next
+        // increment). This is also why a grouped bot no longer solo-trains at spawn: the shared
+        // objective preempts the training trigger below.
+        if (ctx.ExecDirective.IsActive)
+        {
+            ctx.GoalReason = "group-obj";
+            return Goal.Questing;
         }
 
         // Training trigger — the bot has unlearned class spells AND enough gold to buy something.

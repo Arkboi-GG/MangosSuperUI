@@ -46,6 +46,7 @@ public class BotBrainService : BackgroundService
     private readonly ILogger<BotBrainService> _logger;
     private readonly BotBrain _driver;           // the spine (BotBrain → BotExecutor/BotSupervisor)
     private readonly GroupManager _groupManager;
+    private readonly QuestGraphLoader _quests;    // the shared quest graph -> handed to the god-bot pre-pass for union objective selection
 
     // Roster mirrors. _bots feeds the dashboard + grouping; _contexts is the
     // live-state the spine drives. One entry per connected bot in both.
@@ -69,7 +70,8 @@ public class BotBrainService : BackgroundService
         BotBrainDbInit dbInit,
         ILogger<BotBrainService> logger,
         ILoggerFactory loggerFactory,
-        BotBrain driver)
+        BotBrain driver,
+        QuestGraphLoader quests)
     {
         _bridge = bridge;
         _db = db;
@@ -78,6 +80,7 @@ public class BotBrainService : BackgroundService
         _dbInit = dbInit;
         _logger = logger;
         _driver = driver;
+        _quests = quests;
         _groupManager = new GroupManager(_db, loggerFactory.CreateLogger<GroupManager>());
     }
 
@@ -255,6 +258,14 @@ public class BotBrainService : BackgroundService
             copper = c.Copper,
             inCombat = c.InCombat,
             dead = c.Dead,
+
+            // combat directive (grouping §3.6) -- the coordinator's per-tick stamp. Assist = this bot
+            // is focus-firing the anchor member's victim (anchorGuid == self => this bot IS the anchor;
+            // the team assists it). anchorGuid joins to a name client-side from the same fleet list,
+            // like classId. null = solo / unstamped.
+            combat = c.CombatDirective.IsActive
+                ? new { mode = c.CombatDirective.Mode.ToString(), anchorGuid = c.CombatDirective.AnchorGuid }
+                : null,
 
             // where it's driving
             target = c.Target.HasValue
@@ -669,6 +680,15 @@ public class BotBrainService : BackgroundService
     /// </summary>
     private async Task RunBrainTicksAsync()
     {
+        // Grouping pre-pass (§3.2): the "god bot" stamps each grouped member's BotContext BEFORE the
+        // per-bot ticks, so each tick consults a fresh stamp. Two seams: the combat directive
+        // (Assist(anchor)) and the EXECUTION directive -- the union-chosen shared objective the team
+        // grinds together, gated on all eligible holders finishing (needs the quest graph). Pure
+        // decision+stamp -- it issues NO commands; the spine emits COMBAT_DIRECTIVE on change (BotBrain
+        // step 1a) and the QuestPlanner consults the exec stamp. Only when driving; sensing-only skips it.
+        if (_brainEnabled)
+            GroupCoordinator.Update(_contexts, _groupManager, _quests);
+
         foreach (var kvp in _contexts)
         {
             var bs = _bridge.GetBotState(kvp.Key);
@@ -747,12 +767,17 @@ public class BotBrainService : BackgroundService
             Personality = personality,
             CurrentActivity = new ActivityState { Type = ActivityType.Idle, StartedAt = DateTime.UtcNow },
             NextDecisionTick = DateTime.UtcNow.AddSeconds(2),
-            // Train up on connect: post-rebuild the fleet never ran the trainer pass, so most bots
-            // are spell-starved. Flag it on; GoalSelector gold-gates the actual trip, and a fully
-            // trained bot just learns 0 and clears the flag (one cheap no-op trip).
-            HasUnlearnedSpells = true
+            // Train-up-on-connect catch-up for the post-rebuild fleet (mid-level bots that never ran the
+            // trainer pass are spell-starved) — but NOT for a fresh L1. An L1's trainables are trivial (most
+            // starting spells are auto-granted), and flagging it makes every fresh spawn bee-line the trainer
+            // before it ever quests: the GoalSelector training trigger outranks questing, so the whole fleet
+            // routes to the (crowded / interior-pocket) trainer, wedges, and never leaves L1. An L1 quests
+            // first and is re-flagged at its first LEVEL_UP (which catches the real L2+ ranks). Higher-level
+            // connects still catch up immediately; the trainer-wedge give-up in BotBrain.TryBreakWedgeAsync
+            // is the backstop if any trainer trip can't complete. Raise the floor if you ever want L1s to
+            // train pre-quest.
+            HasUnlearnedSpells = bs.Level > 1
         };
-        bot.StuckDetector = new StuckDetector();
         bot.Story = new BotStoryRider(bot);   // demoted: toggleable but inert in the rebuild
 
         // Hydrate the durable completed-quest set from the character DB so a restart does NOT

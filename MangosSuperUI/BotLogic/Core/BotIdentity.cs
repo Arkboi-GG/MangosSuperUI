@@ -197,29 +197,13 @@ public class BotIdentity
     /// </summary>
     public int? GroupMinMemberLevel { get; set; }
 
-    /// <summary>
-    /// Session 35: True if ALL group members have completed their current quest
-    /// objectives (kill/collect). Every member checks this — when false, the bot
-    /// stays in DoingObjectives grinding for XP while groupmates catch up.
-    /// Stamped by BotBrainService every tick for ALL grouped bots.
-    /// </summary>
-    public bool GroupAllObjectivesDone { get; set; } = true;
-
-    /// <summary>
-    /// Session 35: True if ALL group members have turned in all completed quests
-    /// in their current batch. Every member checks this — when false, the bot
-    /// waits in BatchComplete/PickingQuests. This is the core "same pace" gate.
-    /// Stamped by BotBrainService every tick for ALL grouped bots.
-    /// </summary>
-    public bool GroupAllMembersTurnedIn { get; set; } = true;
-
-    /// <summary>
-    /// Session 35: True if ALL group members are in the Questing activity.
-    /// When false, at least one member is vendoring/training/eating — the group
-    /// keeps doing objectives or waits at PickingQuests rather than advancing.
-    /// Stamped by BotBrainService every tick for ALL grouped bots.
-    /// </summary>
-    public bool GroupAllMembersQuesting { get; set; } = true;
+    // ── §3.5 (grouping rebuild): the GroupAll* boolean gate-flags were REMOVED here. ──
+    // GroupAllObjectivesDone / GroupAllMembersTurnedIn / GroupAllMembersQuesting were the
+    // exact miscountable stored-flag shape that deadlocked the old leader -- a stored bool
+    // drifting from reality (Grinding miscounted as not-questing). The new GroupCoordinator
+    // computes every gate as a LIVE POLL over ground-truth member state each tick, with a
+    // timeout + a liveness escape -- never a flag (§3.5). Nothing reads these now; their
+    // stamper, the old BotBrainService god-brain, was removed in the rebuild.
 
     // ── Session 42: GroupCoordinator directive (ARCH §7a) ──
     // Computed once per group per decision pass in BotBrainService and stamped
@@ -315,8 +299,6 @@ public class BotIdentity
         GrindRelocatePatrolStopped = false;
         GrindRelocateMoveIssued = false;
     }
-
-    public StuckDetector StuckDetector { get; set; }
 
 
 

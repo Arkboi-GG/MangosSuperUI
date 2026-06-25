@@ -159,6 +159,7 @@ public sealed class ServiceScratch
     public VendorPhase Phase { get; set; }                // route → sell → repair → done
     public bool CanRepair { get; set; }                   // selected vendor has UNIT_NPC_FLAG_REPAIR
     public DateTime StartedUtc { get; set; }              // trip start — drives the never-arrived give-up
+    public int RouteFails { get; set; }                   // consecutive no_paths on the vendor route leg — drives the teleport-assist (TeleportAssist.AfterNoPaths)
 }
 
 // Trainer errand scratch (driven by TrainingPlanner under Goal.Training, on ctx.Train).
@@ -170,6 +171,7 @@ public sealed class TrainScratch
     public int TrainerEntry { get; set; }                 // class trainer NPC entry (TRAIN_AT_NPC target)
     public Vec4 TrainerPos { get; set; }                  // where to MOVE_TO
     public DateTime StartedUtc { get; set; }              // trip start
+    public int ApproachFails { get; set; }                // consecutive no_paths on the to_trainer leg — drives the teleport-assist (TeleportAssist.AfterNoPaths)
 }
 
 // Death-recovery scratch (Goal.Maintenance). Transient per death: armed by
@@ -204,6 +206,27 @@ public sealed class MaintenanceScratch
     public bool HealDone { get; set; }                    // healed (or timed out) → recovery releases to the GoalSelector
 }
 
+// ---------------------- Teleport-assist round-trip (final-NPC-approach) ----------------------
+// When a final-approach MOVE_TO to a service NPC (trainer / vendor / repair) repeatedly no_paths
+// while the bot is already in the vicinity — a nav-dead pocket at the NPC (building interior, bad
+// mesh stitch) — the planner teleports the bot the last few yards to the NPC, lets it do its
+// business at real proximity, then teleports it BACK to where it came from. The whole round-trip
+// rides ctx.Teleport (non-null = a hop is committed/in-flight; the GoalSelector pins the goal while
+// it is). The approach no_path COUNT lives on the planner scratch (TrainScratch.ApproachFails /
+// ServiceScratch.RouteFails); THIS object exists only once a hop is COMMITTED. Nulled by the brain
+// on a death/preempt goal change (recovery owns the bot), and by the planner on return. C++ side:
+// BridgeHandleTeleport (NearTeleportTo + TELEPORT_ACK x|y|z|map, max_dist-capped). It shares the
+// generic teleport primitive the hearth will use. Orchestration: Planners/TeleportAssist.
+public enum TpPhase { Outbound, AtTarget, Inbound }
+
+public sealed class TeleportTrip
+{
+    public Vec4 Anchor { get; init; }     // on-mesh return point — the bot's pos when the hop was committed (it pathed there, so it's reachable)
+    public Vec4 Target { get; init; }     // the NPC coord we hopped to
+    public TpPhase Phase { get; set; }    // Outbound (hopping in) → AtTarget (doing business) → Inbound (hopping back)
+    public bool Failed { get; set; }      // the business failed at the NPC — return anyway, THEN give up (never strand the bot in the pocket)
+}
+
 // One quest's authoritative server-side state, parsed from QUEST_STATUS_ALL (the
 // C++ reply to QUERY_QUEST_STATUS). Lets the QuestPlanner RESUME an in-log quest
 // after a death/restart instead of re-accepting it (which C++ rejects → zombie).
@@ -219,6 +242,80 @@ public sealed class QuestLogEntry
 // namespace) with None/Questing/HoldAndGrind/Regroup/GroupErrand — reuse it so
 // BotContext.Directive and BotIdentity.GroupDirective share one source of truth.
 public enum GroupRole { None, Leader, Member }
+
+// ----------------------- Combat directive (grouping §3.6) ------------------
+// The per-member combat seam -- mirror of the C++ CombatDirective struct on AiBotAI
+// (NONE=0, ASSIST=1). The god bot (GroupCoordinator pre-pass) stamps this each tick
+// alongside the execution directive (§3.2); the emit half fires it as COMBAT_DIRECTIVE
+// (BridgeContracts.Combat). v1 carries ONLY Mode + AnchorGuid. Re-stamped every tick,
+// idempotent (§3.8.4): assign Assist(anchor) to drive focus-fire, None to clear -- there
+// is no in-place mutation, the stamp is replaced wholesale (mirrors the C++ Clear()).
+//
+// RESERVED as documented intent, NOT declared (the dead-field discipline §3.6): Role
+// (holder/escort), FocusGuid (explicit target lock), InterruptGuid (kick target),
+// MoveToAllyGuid (formation pull). They arrive as NEW wire keys when their behaviour
+// ships -- never as speculative dead props now.
+public enum CombatMode { None = 0, Assist = 1 }
+
+public readonly record struct CombatDirective
+{
+    public CombatMode Mode { get; }
+    public int AnchorGuid { get; }      // low GUID of the anchor member to assist (mirrors C++ anchorGuidLow)
+
+    public CombatDirective(CombatMode mode, int anchorGuid)
+    {
+        Mode = mode;
+        AnchorGuid = anchorGuid;
+    }
+
+    /// <summary>A non-None mode currently stamped (mirrors C++ IsActive()).</summary>
+    public bool IsActive => Mode != CombatMode.None;
+
+    /// <summary>The cleared seam -- solo / unstamped. Emitted as mode=none.</summary>
+    public static readonly CombatDirective None = new(CombatMode.None, 0);
+
+    /// <summary>Stamp assist focus-fire on the given anchor member.</summary>
+    public static CombatDirective Assist(int anchorGuid) => new(CombatMode.Assist, anchorGuid);
+}
+
+// ----------------------- Execution directive (grouping §3.2) ---------------
+// The per-member EXECUTION seam -- the god bot (GroupCoordinator pre-pass) stamps ONE shared kill
+// objective on EVERY present group member each tick: the union-chosen objective the whole group
+// works together (creature_entry + coords), keyed by quest+slot so the coordinator can read each
+// holder's remaining count off its quest log. There is no leader and no follower -- all members are
+// peers grinding the SAME mob (the combat directive focus-fires it). A "holder" is simply a member
+// whose log contains the quest; a member ineligible for it (e.g. a warrior on a priest quest) still
+// helps but never gates completion. The objective stays stamped until every eligible holder is done.
+// Re-stamped every tick; value-equality drives the "objective changed" re-issue guard (mirrors
+// CombatDirective). None = no group objective this tick -> the member runs its own batch (accept /
+// turn-in / pick), so accept + turn-in stay per-member while the OBJECTIVE is shared and gated.
+public enum ExecMode { None = 0, Objective = 1 }
+
+public readonly record struct ExecDirective
+{
+    public ExecMode Mode { get; }
+    public int QuestId { get; }          // the group quest this objective belongs to
+    public int Slot { get; }             // QuestObjective.Slot (1-4) -- to read each holder's own remaining
+    public int CreatureEntry { get; }    // the mob to kill (the enriched-MOVE_TO target)
+    public float X { get; }
+    public float Y { get; }
+    public float Z { get; }
+    public int Map { get; }
+    public int AnchorGuid { get; }       // the reference member (stable "nearest" origin; whose credit the count nominally feeds)
+
+    public ExecDirective(ExecMode mode, int questId, int slot, int creatureEntry,
+        float x, float y, float z, int map, int anchorGuid)
+    {
+        Mode = mode; QuestId = questId; Slot = slot; CreatureEntry = creatureEntry;
+        X = x; Y = y; Z = z; Map = map; AnchorGuid = anchorGuid;
+    }
+
+    public bool IsActive => Mode != ExecMode.None;
+    public static readonly ExecDirective None = new(ExecMode.None, 0, 0, 0, 0f, 0f, 0f, 0, 0);
+    public static ExecDirective Objective(int questId, int slot, int creatureEntry,
+        float x, float y, float z, int map, int anchorGuid)
+        => new(ExecMode.Objective, questId, slot, creatureEntry, x, y, z, map, anchorGuid);
+}
 
 // =============================== BotContext =================================
 public sealed class BotContext
@@ -322,6 +419,14 @@ public sealed class BotContext
     public MaintenanceScratch? Maintenance { get; set; }
     public TrainScratch? Train { get; set; }              // Goal.Training — trainer trip (TrainingPlanner)
 
+    // ---- teleport-assist round-trip (final-NPC-approach; cross-goal, not goal scratch) ----
+    // Non-null = a TELEPORT_TO hop-in / do-business / hop-back is committed for the current goal's
+    // service-NPC approach. Set by a planner (TrainingPlanner / MaintenancePlanner) when the
+    // final-approach MOVE_TO no_paths in the vicinity; nulled by the planner on return or by the
+    // brain's ResetScratch on a death/preempt goal change. The GoalSelector holds the goal while
+    // it's set so nothing interrupts the short round-trip.
+    public TeleportTrip? Teleport { get; set; }
+
     // ---- quest-log cache (refreshed by QUEST_STATUS_ALL; read by QuestPlanner to resume) ----
     // Reference-swapped by the executor (not mutated in place) so the planner can read a
     // stable snapshot without locking. Stamp = when it was last refreshed.
@@ -334,6 +439,27 @@ public sealed class BotContext
     public int? LeaderGuid { get; set; }
     public GroupDirective Directive { get; set; } = GroupDirective.None;
     public Vec4? Anchor { get; set; }
+
+    // The per-member combat seam (grouping §3.6) -- the god bot re-stamps this each tick
+    // (Assist(anchor) / None) and the emit half fires it as COMBAT_DIRECTIVE. Mirror of the
+    // C++ m_combatDirective; a transient per-tick stamp, so it lives HERE on the live context,
+    // not on durable BotIdentity. Default None = solo / unstamped (a no-op seam).
+    public CombatDirective CombatDirective { get; set; } = CombatDirective.None;
+
+    // The combat seam the spine last EMITTED to C++ (BotBrain step 1a). The coordinator re-stamps
+    // CombatDirective every tick (idempotent), but the wire only fires when it differs from this --
+    // keeping COMBAT_DIRECTIVE at brain-cadence, not per-tick traffic (§3.8.4 / §1). Value-equality
+    // on the record struct drives that change check.
+    public CombatDirective LastEmittedCombat { get; set; } = CombatDirective.None;
+
+    // The group EXECUTION directive (grouping §3.2) -- the god bot's per-tick shared-objective stamp
+    // (the union-chosen kill objective; None = no group objective this tick). Consumed IN-PROCESS by
+    // this bot's own QuestPlanner consult (not a wire command), so unlike CombatDirective it needs no
+    // LastEmitted WIRE marker -- but the no-WAIT group grind uses LastGroupExec to re-issue the leg
+    // only when the objective CHANGES (value-equality on the record struct), keeping the bridge quiet
+    // while the member grinds the same stamped objective.
+    public ExecDirective ExecDirective { get; set; } = ExecDirective.None;
+    public ExecDirective LastGroupExec { get; set; } = ExecDirective.None;
 
     // ----------------------------- helpers ---------------------------------
     public double TimeInGoalSec => (DateTime.UtcNow - GoalSinceUtc).TotalSeconds;

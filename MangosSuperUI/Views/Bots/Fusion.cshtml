@@ -1,0 +1,1117 @@
+@{
+    Layout = null;
+    ViewData["Title"] = "Bot Fusion";
+}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>SuperUI Fusion — Bots</title>
+
+    <!-- FontAwesome. If this box is ever offline, swap for your local copy at ~/lib/fontawesome/css/all.min.css -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+
+    <style>
+            /* ============================================================
+                       Theme — MangosSuperUI (Tokyo Night). Owned in-page so the
+                       surface is fully self-contained inside the WebView2 embed
+                       (no dependency on _Layout / site.css resolving).
+                       ============================================================ */
+            :root {
+                --bg: #0a0e14;
+                --bg-2: #0d1117;
+                --bg-card: #11161f;
+                --bg-card-alt: #161b26;
+                --bg-elevated: #1a2030;
+                --border-light: rgba(255,255,255,0.06);
+                --border-medium: rgba(255,255,255,0.11);
+                --text-primary: #c8d0da;
+                --text-secondary: #9aa5b4;
+                --text-muted: #5c6773;
+                --accent: #7aa2f7;
+                --accent-light: #a9c1ff;
+                --accent-subtle: rgba(122,162,247,0.14);
+                --status-online: #9ece6a;
+                --status-offline: #f7768e;
+                --warn: #e0af68;
+                --danger: #f7768e;
+                --radius-sm: 5px;
+                --radius-md: 8px;
+                --radius-lg: 12px;
+                --transition-fast: 120ms ease;
+                /* WoW class colors (vanilla) */
+                --class-warrior: #C79C6E;
+                --class-paladin: #F58CBA;
+                --class-hunter: #ABD473;
+                --class-rogue: #FFF569;
+                --class-priest: #FFFFFF;
+                --class-shaman: #0070DE;
+                --class-mage: #69CCF0;
+                --class-warlock: #9482C9;
+                --class-druid: #FF7D0A;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            html, body {
+                margin: 0;
+                height: 100%;
+                overflow: hidden;
+            }
+
+            body {
+                background: var(--bg);
+                color: var(--text-primary);
+                font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+                font-size: 13px;
+                -webkit-font-smoothing: antialiased;
+            }
+
+            ::-webkit-scrollbar {
+                width: 9px;
+                height: 9px;
+            }
+
+            ::-webkit-scrollbar-track {
+                background: transparent;
+            }
+
+            ::-webkit-scrollbar-thumb {
+                background: var(--border-medium);
+                border-radius: 5px;
+            }
+
+                ::-webkit-scrollbar-thumb:hover {
+                    background: var(--text-muted);
+                }
+
+            /* ============================================================
+                       Layout — wrap the client hole on all four sides.
+                         top  spans full width
+                         left / right are full-height rails
+                         center = the hole (transparent; the native client shows through)
+                         bottom = live feed band, beneath the hole only
+                       ============================================================ */
+            .fusion {
+                display: grid;
+                grid-template-columns: 300px 1fr 348px;
+                grid-template-rows: 54px 1fr 188px;
+                grid-template-areas:
+                    "top    top    top"
+                    "left   center right"
+                    "left   bottom right";
+                height: 100vh;
+                width: 100vw;
+                gap: 8px;
+                padding: 8px;
+            }
+
+                .fusion.client-max {
+                    grid-template-columns: 1fr;
+                    grid-template-rows: 1fr;
+                    grid-template-areas: "center";
+                    gap: 0;
+                    padding: 0;
+                }
+
+                    .fusion.client-max .pane-top,
+                    .fusion.client-max .pane-left,
+                    .fusion.client-max .pane-right,
+                    .fusion.client-max .pane-bottom {
+                        display: none;
+                    }
+
+            .pane {
+                background: var(--bg-card);
+                border: 1px solid var(--border-light);
+                border-radius: var(--radius-md);
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+                min-height: 0;
+            }
+
+            .pane-top {
+                grid-area: top;
+                flex-direction: row;
+                align-items: center;
+                gap: 14px;
+                padding: 0 14px;
+            }
+
+            .pane-left {
+                grid-area: left;
+            }
+
+            .pane-right {
+                grid-area: right;
+            }
+
+            .pane-bottom {
+                grid-area: bottom;
+            }
+
+            /* The hole — purely a measured placeholder. The native WoW client is
+                       positioned over this rect by the shell; we keep it transparent and
+                       draw only a thin frame + corner ticks so an un-embedded browser tab
+                       still shows where the client would sit. */
+            .pane-center {
+                grid-area: center;
+                position: relative;
+                background: transparent;
+                border: 1px solid var(--border-medium);
+                border-radius: var(--radius-md);
+            }
+
+            #client-viewport {
+                position: absolute;
+                inset: 0;
+            }
+
+            .hole-hint {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: var(--text-muted);
+                font-size: 12px;
+                letter-spacing: .3px;
+                pointer-events: none;
+                gap: 8px;
+            }
+
+            .fusion.embedded .hole-hint {
+                display: none;
+            }
+
+            .corner {
+                position: absolute;
+                width: 16px;
+                height: 16px;
+                border-color: var(--accent);
+                opacity: .45;
+                pointer-events: none;
+            }
+
+                .corner.tl {
+                    top: -1px;
+                    left: -1px;
+                    border-top: 2px solid;
+                    border-left: 2px solid;
+                    border-top-left-radius: var(--radius-md);
+                }
+
+                .corner.tr {
+                    top: -1px;
+                    right: -1px;
+                    border-top: 2px solid;
+                    border-right: 2px solid;
+                    border-top-right-radius: var(--radius-md);
+                }
+
+                .corner.bl {
+                    bottom: -1px;
+                    left: -1px;
+                    border-bottom: 2px solid;
+                    border-left: 2px solid;
+                    border-bottom-left-radius: var(--radius-md);
+                }
+
+                .corner.br {
+                    bottom: -1px;
+                    right: -1px;
+                    border-bottom: 2px solid;
+                    border-right: 2px solid;
+                    border-bottom-right-radius: var(--radius-md);
+                }
+
+            /* ---- top bar ---- */
+            .brand {
+                display: flex;
+                align-items: center;
+                gap: 9px;
+                font-weight: 700;
+                letter-spacing: .3px;
+            }
+
+                .brand i {
+                    color: var(--accent);
+                }
+
+                .brand small {
+                    color: var(--text-muted);
+                    font-weight: 500;
+                }
+
+            .kpis {
+                display: flex;
+                gap: 8px;
+            }
+
+            .kpi {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                padding: 5px 11px;
+                background: var(--bg-card-alt);
+                border: 1px solid var(--border-light);
+                border-radius: var(--radius-sm);
+                font-size: 12px;
+                white-space: nowrap;
+            }
+
+                .kpi i {
+                    color: var(--text-muted);
+                }
+
+                .kpi b {
+                    color: var(--text-primary);
+                    font-size: 13px;
+                }
+
+                .kpi.warnish b {
+                    color: var(--warn);
+                }
+
+                .kpi.danger b {
+                    color: var(--danger);
+                }
+
+            .top-actions {
+                margin-left: auto;
+                display: flex;
+                gap: 7px;
+                align-items: center;
+            }
+
+            .btn {
+                display: inline-flex;
+                align-items: center;
+                gap: 7px;
+                padding: 6px 12px;
+                border-radius: var(--radius-sm);
+                border: 1px solid var(--border-medium);
+                background: var(--bg-card-alt);
+                color: var(--text-secondary);
+                font-size: 12px;
+                cursor: pointer;
+                transition: var(--transition-fast);
+                font-family: inherit;
+            }
+
+                .btn:hover {
+                    color: var(--text-primary);
+                    border-color: var(--accent);
+                    background: var(--bg-elevated);
+                }
+
+                .btn.accent {
+                    background: var(--accent-subtle);
+                    border-color: var(--accent);
+                    color: var(--accent-light);
+                }
+
+                .btn.on {
+                    background: rgba(158,206,106,0.16);
+                    border-color: var(--status-online);
+                    color: var(--status-online);
+                }
+
+                .btn.off {
+                    background: rgba(247,118,142,0.14);
+                    border-color: var(--status-offline);
+                    color: var(--status-offline);
+                }
+
+                .btn:disabled {
+                    opacity: .5;
+                    cursor: default;
+                }
+
+                .btn.icon {
+                    padding: 6px 9px;
+                }
+
+            /* ---- pane headers ---- */
+            .pane-head {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 9px 12px;
+                border-bottom: 1px solid var(--border-light);
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: .7px;
+                color: var(--text-muted);
+                font-weight: 700;
+                flex-shrink: 0;
+            }
+
+                .pane-head .count {
+                    margin-left: auto;
+                    color: var(--text-secondary);
+                    font-weight: 600;
+                }
+
+            .pane-body {
+                overflow-y: auto;
+                flex: 1;
+                min-height: 0;
+            }
+
+            /* ---- roster ---- */
+            .roster-tools {
+                display: flex;
+                gap: 6px;
+                padding: 8px 10px;
+                border-bottom: 1px solid var(--border-light);
+            }
+
+                .roster-tools input {
+                    flex: 1;
+                    background: var(--bg-2);
+                    border: 1px solid var(--border-light);
+                    border-radius: var(--radius-sm);
+                    color: var(--text-primary);
+                    padding: 5px 9px;
+                    font-size: 12px;
+                    font-family: inherit;
+                }
+
+                    .roster-tools input:focus {
+                        outline: none;
+                        border-color: var(--accent);
+                    }
+
+            .bot-row {
+                display: flex;
+                align-items: center;
+                gap: 9px;
+                padding: 8px 11px;
+                cursor: pointer;
+                border-bottom: 1px solid var(--border-light);
+                transition: var(--transition-fast);
+            }
+
+                .bot-row:hover {
+                    background: var(--bg-card-alt);
+                }
+
+                .bot-row.sel {
+                    background: var(--accent-subtle);
+                    box-shadow: inset 2px 0 0 var(--accent);
+                }
+
+            .bot-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--text-muted);
+                flex-shrink: 0;
+            }
+
+                .bot-dot.alive {
+                    background: var(--status-online);
+                }
+
+                .bot-dot.combat {
+                    background: var(--warn);
+                    box-shadow: 0 0 6px var(--warn);
+                }
+
+                .bot-dot.dead {
+                    background: var(--status-offline);
+                }
+
+            .bot-main {
+                flex: 1;
+                min-width: 0;
+            }
+
+            .bot-name {
+                font-weight: 600;
+                font-size: 13px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .bot-sub {
+                font-size: 11px;
+                color: var(--text-muted);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .bot-act {
+                font-size: 10px;
+                padding: 2px 6px;
+                border-radius: 4px;
+                background: var(--bg-elevated);
+                color: var(--text-secondary);
+                flex-shrink: 0;
+            }
+
+            .grp-badge {
+                font-size: 10px;
+                padding: 1px 5px;
+                border-radius: 4px;
+                background: rgba(122,162,247,.16);
+                color: var(--accent-light);
+                margin-left: 4px;
+            }
+
+                .grp-badge.leader {
+                    background: rgba(224,175,104,.18);
+                    color: var(--warn);
+                }
+
+            /* ---- focused bot ---- */
+            .focus-empty {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100%;
+                color: var(--text-muted);
+                gap: 10px;
+                padding: 20px;
+                text-align: center;
+            }
+
+                .focus-empty i {
+                    font-size: 28px;
+                    opacity: .5;
+                }
+
+            .focus-id {
+                padding: 11px 13px 9px;
+                border-bottom: 1px solid var(--border-light);
+            }
+
+            .focus-name {
+                font-size: 16px;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+
+            .grp-cycle {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                margin-left: auto;
+            }
+
+            .gcbtn {
+                width: 22px;
+                height: 22px;
+                line-height: 1;
+                border-radius: 5px;
+                border: 1px solid var(--border-medium);
+                background: var(--bg-card-alt);
+                color: var(--text-secondary);
+                cursor: pointer;
+                font-size: 15px;
+                font-weight: 700;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                transition: var(--transition-fast);
+                font-family: inherit;
+            }
+
+                .gcbtn:hover {
+                    color: var(--accent-light);
+                    border-color: var(--accent);
+                }
+
+            .gclabel {
+                font-size: 11px;
+                font-weight: 700;
+                padding: 2px 8px;
+                border-radius: 10px;
+                cursor: pointer;
+                background: var(--accent-subtle);
+                color: var(--accent-light);
+                border: 1px solid transparent;
+            }
+
+                .gclabel:hover {
+                    border-color: var(--accent);
+                }
+
+            .focus-meta {
+                font-size: 11px;
+                color: var(--text-muted);
+                margin-top: 3px;
+            }
+
+            .class-tag {
+                font-size: 11px;
+                font-weight: 700;
+                padding: 1px 6px;
+                border-radius: 4px;
+                background: rgba(255,255,255,.06);
+            }
+
+            .vitals {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 6px;
+                padding: 10px 12px;
+            }
+
+            .vital {
+                background: var(--bg-2);
+                border: 1px solid var(--border-light);
+                border-radius: var(--radius-sm);
+                padding: 6px 9px;
+            }
+
+                .vital .lbl {
+                    font-size: 9px;
+                    text-transform: uppercase;
+                    letter-spacing: .5px;
+                    color: var(--text-muted);
+                }
+
+                .vital .val {
+                    font-size: 14px;
+                    font-weight: 700;
+                    margin-top: 1px;
+                }
+
+            .bar {
+                height: 4px;
+                border-radius: 3px;
+                background: var(--bg-elevated);
+                margin-top: 5px;
+                overflow: hidden;
+            }
+
+                .bar > span {
+                    display: block;
+                    height: 100%;
+                    border-radius: 3px;
+                }
+
+            .tabs {
+                display: flex;
+                border-bottom: 1px solid var(--border-light);
+                flex-shrink: 0;
+            }
+
+            .tab {
+                flex: 1;
+                text-align: center;
+                padding: 8px 4px;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: .5px;
+                color: var(--text-muted);
+                cursor: pointer;
+                border-bottom: 2px solid transparent;
+                transition: var(--transition-fast);
+            }
+
+                .tab:hover {
+                    color: var(--text-secondary);
+                }
+
+                .tab.active {
+                    color: var(--accent-light);
+                    border-bottom-color: var(--accent);
+                }
+
+            .tab-body {
+                overflow-y: auto;
+                flex: 1;
+                min-height: 0;
+                padding: 11px 12px;
+            }
+
+            .spine-goal {
+                font-size: 18px;
+                font-weight: 800;
+                letter-spacing: .3px;
+            }
+
+                .spine-goal small {
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: var(--text-secondary);
+                }
+
+            .spine-why {
+                font-size: 12px;
+                color: var(--text-muted);
+                margin-top: 3px;
+                font-style: italic;
+            }
+
+            .kv {
+                display: flex;
+                justify-content: space-between;
+                gap: 10px;
+                padding: 5px 0;
+                border-bottom: 1px solid var(--border-light);
+                font-size: 12px;
+            }
+
+                .kv .k {
+                    color: var(--text-muted);
+                }
+
+                .kv .v {
+                    color: var(--text-primary);
+                    font-weight: 600;
+                    text-align: right;
+                }
+
+            .chip {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                font-size: 11px;
+                padding: 2px 8px;
+                border-radius: 10px;
+                background: var(--bg-elevated);
+                color: var(--text-secondary);
+                margin: 2px 3px 2px 0;
+            }
+
+                .chip.bad {
+                    background: rgba(247,118,142,.15);
+                    color: var(--danger);
+                }
+
+                .chip.warn {
+                    background: rgba(224,175,104,.15);
+                    color: var(--warn);
+                }
+
+            .section-label {
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: .6px;
+                color: var(--text-muted);
+                margin: 12px 0 6px;
+                font-weight: 700;
+            }
+
+            .census-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 5px;
+            }
+
+            .census-cell {
+                background: var(--bg-2);
+                border: 1px solid var(--border-light);
+                border-radius: var(--radius-sm);
+                padding: 6px 9px;
+            }
+
+                .census-cell .n {
+                    font-size: 16px;
+                    font-weight: 800;
+                }
+
+                .census-cell .t {
+                    font-size: 9px;
+                    text-transform: uppercase;
+                    letter-spacing: .5px;
+                    color: var(--text-muted);
+                }
+
+            .qrow {
+                padding: 7px 0;
+                border-bottom: 1px solid var(--border-light);
+            }
+
+                .qrow .qt {
+                    font-size: 12px;
+                    font-weight: 600;
+                    display: flex;
+                    gap: 6px;
+                    align-items: center;
+                }
+
+                .qrow .qm {
+                    font-size: 11px;
+                    color: var(--text-muted);
+                    margin-top: 2px;
+                }
+
+            .q-state {
+                font-size: 9px;
+                padding: 1px 5px;
+                border-radius: 3px;
+                flex-shrink: 0;
+            }
+
+                .q-state.done {
+                    background: rgba(158,206,106,.18);
+                    color: var(--status-online);
+                }
+
+                .q-state.prog {
+                    background: rgba(122,162,247,.16);
+                    color: var(--accent-light);
+                }
+
+            /* ---- live feed (bottom) ---- */
+            .feed-tabs {
+                display: flex;
+                gap: 4px;
+                margin-left: auto;
+            }
+
+                .feed-tabs .ft {
+                    font-size: 10px;
+                    padding: 3px 9px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    color: var(--text-muted);
+                    border: 1px solid transparent;
+                }
+
+                    .feed-tabs .ft.active {
+                        color: var(--accent-light);
+                        border-color: var(--accent);
+                        background: var(--accent-subtle);
+                    }
+
+            .feed {
+                font-family: 'Cascadia Code','Consolas',monospace;
+                font-size: 11.5px;
+                line-height: 1.55;
+                padding: 6px 12px;
+            }
+
+                .feed .ln {
+                    display: flex;
+                    gap: 9px;
+                    padding: 1px 0;
+                }
+
+                    .feed .ln .ts {
+                        color: var(--text-muted);
+                        flex-shrink: 0;
+                    }
+
+                    .feed .ln .nm {
+                        color: var(--accent);
+                        flex-shrink: 0;
+                    }
+
+                    .feed .ln .mg {
+                        color: var(--text-secondary);
+                        word-break: break-word;
+                    }
+
+                    .feed .ln.err .mg {
+                        color: var(--danger);
+                    }
+
+                    .feed .ln.warn .mg {
+                        color: var(--warn);
+                    }
+
+            /* ---- group view ---- */
+            .gmember {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 7px 12px;
+                border-bottom: 1px solid var(--border-light);
+                cursor: pointer;
+            }
+
+                .gmember:hover {
+                    background: var(--bg-card-alt);
+                }
+
+                .gmember .mn {
+                    flex: 1;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+
+            .gmini-bar {
+                width: 54px;
+                height: 5px;
+                border-radius: 3px;
+                background: var(--bg-elevated);
+                overflow: hidden;
+            }
+
+                .gmini-bar > span {
+                    display: block;
+                    height: 100%;
+                    background: var(--status-online);
+                }
+
+            /* ---- modals ---- */
+            .modal-scrim {
+                position: fixed;
+                inset: 0;
+                background: rgba(5,8,13,.78);
+                backdrop-filter: blur(2px);
+                display: none;
+                align-items: center;
+                justify-content: center;
+                z-index: 50;
+            }
+
+                .modal-scrim.open {
+                    display: flex;
+                }
+
+            .modal {
+                background: var(--bg-card);
+                border: 1px solid var(--border-medium);
+                border-radius: var(--radius-lg);
+                box-shadow: 0 24px 70px rgba(0,0,0,.6);
+                display: flex;
+                flex-direction: column;
+                max-height: 92vh;
+            }
+
+            .modal-head {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 13px 16px;
+                border-bottom: 1px solid var(--border-light);
+            }
+
+                .modal-head h2 {
+                    margin: 0;
+                    font-size: 15px;
+                    font-weight: 700;
+                }
+
+                .modal-head .btn {
+                    margin-left: auto;
+                }
+
+            .modal-body {
+                padding: 16px;
+                overflow: auto;
+            }
+
+            #mapModal .modal {
+                width: 94vw;
+                height: 92vh;
+            }
+
+            #mapModal .modal-body {
+                padding: 0;
+                flex: 1;
+            }
+
+            #mapFrame {
+                width: 100%;
+                height: 100%;
+                border: 0;
+                border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+                background: var(--bg);
+            }
+
+            #addModal .modal {
+                width: 440px;
+            }
+
+            .class-pick {
+                display: grid;
+                grid-template-columns: repeat(2,1fr);
+                gap: 8px;
+            }
+
+                .class-pick .cp {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    gap: 8px;
+                    background: var(--bg-2);
+                    border: 1px solid var(--border-light);
+                    border-radius: var(--radius-sm);
+                    padding: 7px 10px;
+                }
+
+                    .class-pick .cp label {
+                        font-weight: 600;
+                    }
+
+                    .class-pick .cp input {
+                        width: 54px;
+                        background: var(--bg-card);
+                        border: 1px solid var(--border-medium);
+                        border-radius: 4px;
+                        color: var(--text-primary);
+                        padding: 3px 6px;
+                        font-family: inherit;
+                    }
+
+            .toast {
+                position: fixed;
+                bottom: 16px;
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 80;
+                background: var(--bg-elevated);
+                border: 1px solid var(--border-medium);
+                border-radius: var(--radius-md);
+                padding: 10px 16px;
+                font-size: 12.5px;
+                box-shadow: 0 10px 30px rgba(0,0,0,.5);
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 200ms ease, transform 200ms ease;
+            }
+
+                .toast.show {
+                    opacity: 1;
+                    transform: translateX(-50%) translateY(-4px);
+                }
+
+                .toast.ok {
+                    border-color: var(--status-online);
+                }
+
+                .toast.err {
+                    border-color: var(--status-offline);
+                }
+
+            .muted {
+                color: var(--text-muted);
+            }
+
+            .empty-note {
+                padding: 18px;
+                text-align: center;
+                color: var(--text-muted);
+                font-size: 12px;
+            }
+    </style>
+</head>
+<body>
+    <div class="fusion" id="root">
+
+        <!-- ============ TOP ============ -->
+        <div class="pane pane-top">
+            <div class="brand"><i class="fa-solid fa-brain"></i> Bot Fusion <small>· SuperUI</small></div>
+            <div class="kpis">
+                <div class="kpi"><i class="fa-solid fa-robot"></i> <b id="kTracked">0</b> tracked</div>
+                <div class="kpi"><i class="fa-solid fa-plug"></i> <b id="kConnected">0</b> live</div>
+                <div class="kpi"><i class="fa-solid fa-brain"></i> <b id="kBrains">0</b> brains</div>
+                <div class="kpi" id="kErrWrap"><i class="fa-solid fa-triangle-exclamation"></i> <b id="kErr">0</b>/min</div>
+                <div class="kpi"><i class="fa-solid fa-people-group"></i> <b id="kGroups">0</b> groups</div>
+            </div>
+            <div class="top-actions">
+                <button class="btn" id="btnBrain"><i class="fa-solid fa-power-off"></i> <span id="brainLbl">Brain</span></button>
+                <button class="btn" id="btnGroupMode"><i class="fa-solid fa-diagram-project"></i> <span id="gmLbl">Grouping: —</span></button>
+                <button class="btn" id="btnAutoForm"><i class="fa-solid fa-wand-magic-sparkles"></i> Auto-Form</button>
+                <button class="btn" id="btnAdd"><i class="fa-solid fa-user-plus"></i> Add Bots</button>
+                <button class="btn accent" id="btnMap"><i class="fa-solid fa-map-location-dot"></i> Map</button>
+                <button class="btn icon" id="btnMax" title="Maximize client (Ctrl+Alt+H)"><i class="fa-solid fa-expand"></i></button>
+            </div>
+        </div>
+
+        <!-- ============ LEFT — roster ============ -->
+        <div class="pane pane-left">
+            <div class="pane-head"><i class="fa-solid fa-list"></i> Roster <span class="count" id="rosterCount">0</span></div>
+            <div class="roster-tools"><input id="rosterFilter" placeholder="Filter by name / class…" /></div>
+            <div class="pane-body" id="roster"></div>
+        </div>
+
+        <!-- ============ CENTER — the hole ============ -->
+        <div class="pane-center">
+            <div id="client-viewport"></div>
+            <div class="corner tl"></div><div class="corner tr"></div>
+            <div class="corner bl"></div><div class="corner br"></div>
+            <div class="hole-hint"><i class="fa-solid fa-gamepad"></i> Live client renders here</div>
+        </div>
+
+        <!-- ============ RIGHT — focused bot / group ============ -->
+        <div class="pane pane-right" id="focusPane">
+            <div class="focus-empty" id="focusEmpty">
+                <i class="fa-solid fa-hand-pointer"></i>
+                <div>Select a bot from the roster<br>to watch its live telemetry.</div>
+            </div>
+            <div id="focusContent" style="display:none; flex:1; min-height:0; flex-direction:column;">
+                <div class="focus-id">
+                    <div class="focus-name" id="fName">—</div>
+                    <div class="focus-meta" id="fMeta">—</div>
+                </div>
+                <div class="vitals" id="fVitals"></div>
+                <div class="tabs" id="fTabs">
+                    <div class="tab active" data-tab="live">Live</div>
+                    <div class="tab" data-tab="report">Report</div>
+                    <div class="tab" data-tab="quests">Quests</div>
+                    <div class="tab" data-tab="bags">Bags</div>
+                    <div class="tab" data-tab="group">Group</div>
+                </div>
+                <div class="tab-body" id="fTabBody"></div>
+            </div>
+        </div>
+
+        <!-- ============ BOTTOM — live feed ============ -->
+        <div class="pane pane-bottom">
+            <div class="pane-head">
+                <i class="fa-solid fa-stream"></i> Live Feed
+                <div class="feed-tabs">
+                    <div class="ft active" data-feed="bot">Focused bot</div>
+                    <div class="ft" data-feed="group">Group</div>
+                    <div class="ft" data-feed="fleet">Fleet incidents</div>
+                </div>
+            </div>
+            <div class="pane-body feed" id="feed"></div>
+        </div>
+    </div>
+
+    <!-- ============ MAP MODAL (reuses /Bots/Map via iframe) ============ -->
+    <div class="modal-scrim" id="mapModal">
+        <div class="modal">
+            <div class="modal-head">
+                <i class="fa-solid fa-map-location-dot" style="color:var(--accent)"></i>
+                <h2>Fleet Map</h2>
+                <button class="btn" data-close="mapModal"><i class="fa-solid fa-xmark"></i> Close</button>
+            </div>
+            <div class="modal-body"><iframe id="mapFrame" data-src="/Bots/Map"></iframe></div>
+        </div>
+    </div>
+
+    <!-- ============ ADD BOTS MODAL ============ -->
+    <div class="modal-scrim" id="addModal">
+        <div class="modal">
+            <div class="modal-head">
+                <i class="fa-solid fa-user-plus" style="color:var(--accent)"></i>
+                <h2>Add Bots</h2>
+                <button class="btn" data-close="addModal"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-body">
+                <div class="muted" style="margin-bottom:10px;font-size:12px;">Spawns via <code>.bot addai &lt;class&gt;</code> over RA. Max 50 per batch.</div>
+                <div class="class-pick" id="classPick"></div>
+                <div style="display:flex;gap:8px;margin-top:14px;">
+                    <button class="btn accent" id="btnAddGo" style="flex:1;justify-content:center;"><i class="fa-solid fa-plus"></i> Spawn selected</button>
+                    <button class="btn" data-close="addModal">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="~/js/fusion.js" asp-append-version="true"></script>
+</body>
+</html>

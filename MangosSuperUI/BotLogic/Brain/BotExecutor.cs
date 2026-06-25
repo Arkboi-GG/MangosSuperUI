@@ -168,6 +168,23 @@ public sealed class BotExecutor
                 ctx.QuestLog = ParseQuestLog(evt.Data);
                 ctx.QuestLogStampUtc = DateTime.UtcNow;
                 break;
+            case "TELEPORT_ACK":
+                // Teleport-assist: the bot was relocated (NearTeleportTo). Update Pos from the ack
+                // payload (x|y|z|map) IMMEDIATELY so the planner sees DistToTarget≈0 and fires the
+                // interaction THIS cycle — the 5 s STATE cadence would otherwise lag the new pos and
+                // the planner would re-issue a MOVE_TO from the stale position. Not progress-stamped
+                // here; the generic positive-ack path below clears the TELEPORT_TO WAIT + MarkProgress.
+                {
+                    var tk = ParsePipe(evt.Data);
+                    if (tk.TryGetValue("x", out var txs) && tk.TryGetValue("y", out var tys))
+                    {
+                        float tz = tk.TryGetValue("z", out var tzs) ? ParseF(tzs) : ctx.Pos.Z;
+                        ctx.Pos = new Vec3(ParseF(txs), ParseF(tys), tz);
+                        if (tk.TryGetValue("map", out var tms) && int.TryParse(tms, out var tmap))
+                            ctx.MapId = tmap;
+                    }
+                }
+                break;
         }
 
         var pending = ctx.Pending;
@@ -235,7 +252,12 @@ public sealed class BotExecutor
                             && pending.CommandType == "SELL_ITEMS";
         bool repairFail = evt.EventType == "REPAIR_FAIL"
                             && pending.CommandType == "REPAIR_AT_NPC";
-        if (!moveFail && !interactFail && !trainFail && !sellFail && !repairFail) return false;
+        // Teleport-assist: TELEPORT_FAIL (bad_payload / dead / cross_map / too_far) negates the
+        // TELEPORT_TO WAIT so the planner abandons the hop (Outbound) / completes anyway (Inbound)
+        // immediately instead of burning the 10 s TELEPORT_ACK deadline. Carries reason=<code>.
+        bool teleportFail = evt.EventType == "TELEPORT_FAIL"
+                            && pending.CommandType == "TELEPORT_TO";
+        if (!moveFail && !interactFail && !trainFail && !sellFail && !repairFail && !teleportFail) return false;
 
         var kv = ParsePipe(evt.Data);
 

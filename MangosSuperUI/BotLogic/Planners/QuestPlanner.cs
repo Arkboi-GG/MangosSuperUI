@@ -52,6 +52,8 @@ public sealed class QuestPlanner : IBotPlanner
     private const int AbandonAfterDefers = 3;
     private const int QuestStatusComplete = 1;  // VMaNGOS QUEST_STATUS_COMPLETE
     private const double LogSyncCapSec = 3;     // wait this long for QUEST_STATUS_ALL before proceeding blind
+    private const double GroupSyncSec = 5;      // group consult: re-QUERY the log at most this often so the god bot's all-eligible-done gate sees server truth (shared kill-credit advances counts with no local ack)
+    private const int GroupGrindSentinel = 9999;// group consult: kill_count for the shared-objective grind -- a ceiling never reached (no-WAIT), so C++ grinds the mob indefinitely until the god bot moves the objective. NOT 0 (0 can insta-complete the enriched leg)
 
     // -- Overflow grind (server-authoritative completion) --
     // When the SERVER still reports a kill quest INCOMPLETE (status != 3) but our local
@@ -106,6 +108,16 @@ public sealed class QuestPlanner : IBotPlanner
     // ========================================================================
     public StepResult PlanNext(BotContext ctx, BotStateSnapshot snap)
     {
+        // Group execution directive (grouping §3.2): the god bot stamped ONE shared objective for the
+        // whole team this tick. Drive THAT objective instead of this bot's own batch -- every member
+        // runs the same coords and the combat directive focus-fires the same mob. The god bot keeps
+        // the objective stamped until every eligible holder is done (its server-count gate), so no
+        // member runs ahead. None => fall through to the normal solo batch (accept / turn in / pick).
+        // We deliberately leave ctx.Quest untouched: when the stamp clears, the solo path resumes the
+        // SAME batch from the live log (turning in anything the team just completed).
+        if (ctx.ExecDirective.IsActive)
+            return DriveGroup(ctx);
+
         // A negated/expired WAIT surfaced a failure -> recover (batch-aware).
         if (ctx.Failure != null)
             return Recover(ctx);
@@ -975,6 +987,66 @@ public sealed class QuestPlanner : IBotPlanner
                 kill_count = leg.Count > 0 ? leg.Count : 1
             }),
             "TASK_COMPLETE", TravelDeadline);   // IsObjectiveGrind => KILL-push tightens to 120s no-kill
+
+    // ========================================================================
+    // Group execution (the god bot's shared objective)
+    // ========================================================================
+    // Self-contained: drive the ONE objective the god bot stamped on the whole team. Every member --
+    // holder or helper -- runs the SAME indefinite grind at the shared coords (the combat directive
+    // focus-fires the same mob), and the member's quest log is refreshed on a cadence so the
+    // coordinator's "all eligible holders done" gate sees server truth. There is NO per-member count
+    // here: shared group kill-credit advances every holder together, and the god bot clears the stamp
+    // (objective satisfied for the team) -> we fall back to the solo batch, which turns in whatever
+    // just completed. Deliberately no counted WAIT: a holder whose credit arrived from a teammate's
+    // kill would never fire its OWN TASK_COMPLETE and would lock.
+    private StepResult DriveGroup(BotContext ctx)
+    {
+        var d = ctx.ExecDirective;
+
+        // A leg failed under the directive -> drop it; the god bot re-stamps / re-picks next tick (it
+        // owns recovery). A dying member already peeled to Maintenance via the GoalSelector hard-need
+        // before reaching here, so this is the benign "couldn't path to the mob right now" case.
+        if (ctx.Failure != null)
+        {
+            ctx.Failure = null;
+            ctx.LastGroupExec = ExecDirective.None;   // force a fresh leg next tick
+            return StepResult.Wait();
+        }
+
+        // Keep the log fresh on a cadence so the coordinator's gate sees server-credited kills (shared
+        // group credit advances counts with no local ack). The no-WAIT grind below lets this re-run.
+        if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
+            return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+
+        // (Re)issue the shared objective ONLY when it changes (value-equality) -- a member already
+        // grinding the same mob stays quiet on the bridge; the god bot moving the objective (or picking
+        // a new one) re-fires. The grind is indefinite (sentinel count, no WAIT): C++ travels to the
+        // coords then grinds the creature in place until we redirect or the stamp clears.
+        if (ctx.ExecDirective != ctx.LastGroupExec)
+        {
+            ctx.SetStep("grp_obj");
+            ctx.LastGroupExec = d;
+            return GroupObjectiveLeg(d);
+        }
+        return StepResult.Wait();
+    }
+
+    // The shared-objective grind: enriched MOVE_TO (travel to the coords, then grind the creature in
+    // place) with a sentinel kill_count never reached -> indefinite. Fire = no WAIT, so DriveGroup
+    // keeps re-evaluating each tick (refresh cadence + change guard) and the unmatched "GRIND finished"
+    // never lands. Completion is the COORDINATOR's server-count gate, not a local count.
+    private static StepResult GroupObjectiveLeg(ExecDirective d)
+        => StepResult.Fire(
+            new BridgeCommand("MOVE_TO", new
+            {
+                mapId = d.Map,
+                x = d.X,
+                y = d.Y,
+                z = d.Z,
+                creature_entry = d.CreatureEntry,
+                grind_radius = GrindRadius,
+                kill_count = GroupGrindSentinel
+            }));
 
     private static StepResult Interact(BatchQuest b, bool accept)
     {

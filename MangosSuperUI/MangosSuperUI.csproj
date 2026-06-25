@@ -41,10 +41,14 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<Compile Remove="BotLogic\Domains\**" />
+		<Content Remove="BotLogic\Domains\**" />
 		<Content Remove="wwwroot\item_models\**" />
 		<Content Remove="wwwroot\minimap\**" />
 		<Content Remove="wwwroot\models\**" />
 		<Content Remove="wwwroot\icons\**" />
+		<EmbeddedResource Remove="BotLogic\Domains\**" />
+		<None Remove="BotLogic\Domains\**" />
 	</ItemGroup>
 
 

@@ -49,17 +49,75 @@ public sealed class TrainingPlanner : IBotPlanner
     public StepResult PlanNext(BotContext ctx, BotStateSnapshot snap)
     {
         var id = ctx.Identity;
+        var t = ctx.Train;
 
-        // A negated/expired WAIT surfaced a failure → give up this trip (back to questing/grinding).
-        // Covers route MOVE_FAILED/PATH_UNSAFE, TRAIN_FAIL (executor negates it), and any deadline.
+        // (A) Consume a failure: a teleport-assist hop fail, an approach no_path (→ teleport-assist),
+        //     or anything else (→ give up the trip).
         if (ctx.Failure != null)
         {
-            var reason = ctx.Failure.Reason;
+            var f = ctx.Failure;
             ctx.Failure = null;
-            return GiveUp(ctx, $"fail:{reason}");
+
+            // The TELEPORT_TO hop ITSELF failed/deadlined (CommandType distinguishes it from a
+            // TRAIN_FAIL, which flows to the give-up below and returns-to-anchor via GiveUp).
+            if (f.CommandType == "TELEPORT_TO" && ctx.Teleport is { } tpf)
+            {
+                var phase = tpf.Phase;
+                bool wasFailed = tpf.Failed;
+                ctx.Teleport = null;
+                if (phase == TpPhase.Inbound)
+                {
+                    // Business already attempted; just couldn't get home (the bot is at the trainer —
+                    // a safe town NPC). Exit per the trip outcome.
+                    ctx.Train = null;
+                    return wasFailed ? GiveUp(ctx, $"teleport-return:{f.Reason}") : StepResult.Complete();
+                }
+                return GiveUp(ctx, $"teleport:{f.Reason}");   // couldn't hop to the trainer
+            }
+
+            // A no_path on the final approach to the trainer, in the vicinity → teleport the last
+            // few yards instead of giving up. The first no_path retries (continuation travel may
+            // close it); the second, within reach, teleports.
+            if (t != null && ctx.Step == "to_trainer" && TeleportAssist.IsApproachNoPath(f))
+            {
+                t.ApproachFails++;
+                switch (TeleportAssist.Decide(t.ApproachFails, ctx.Pos, t.TrainerPos, ctx.MapId))
+                {
+                    case TeleportAssist.TpDecision.Teleport:
+                        _log.LogInformation("[TRAIN] {Name} trainer unreachable ({N}× no_path, {D:F0}yd) — TELEPORT_TO entry={Entry}",
+                            ctx.Name, t.ApproachFails, ctx.Pos.Dist2D(t.TrainerPos.Pos), t.TrainerEntry);
+                        return StepResult.Send(TeleportAssist.BeginOutbound(ctx, t.TrainerPos), "TELEPORT_ACK", TeleportAssist.AckDeadline);
+                    case TeleportAssist.TpDecision.Retry:
+                        return RouteToTrainer(t);   // one more chance to path closer
+                                                    // TpDecision.GiveUp → fall through (NPC genuinely far — not a final-approach pocket)
+                }
+            }
+
+            return GiveUp(ctx, $"fail:{f.Reason}");
         }
 
-        var t = ctx.Train;
+        // (B) Advance a committed teleport-assist round-trip (TELEPORT_ACK arrivals).
+        if (ctx.Teleport is { Phase: TpPhase.Outbound })
+        {
+            // Hopped to the trainer — the executor already set ctx.Pos from the ack, so we're AT it.
+            ctx.Teleport.Phase = TpPhase.AtTarget;
+            ctx.SetStep("train");
+            _log.LogInformation("[TRAIN] {Name} teleported in → TRAIN_AT_NPC entry={Entry}", ctx.Name, t!.TrainerEntry);
+            return StepResult.Send(
+                new BridgeCommand("TRAIN_AT_NPC", new { npc_entry = t.TrainerEntry }),
+                "TRAIN_ACK", TrainAckDeadline);
+        }
+        if (ctx.Teleport is { Phase: TpPhase.Inbound } tpr)
+        {
+            // Returned to the pre-teleport anchor. The flag was cleared at TRAIN_ACK on success; a
+            // failed train set Failed and gives up here (after the safe return) instead of finishing.
+            bool failed = tpr.Failed;
+            ctx.Teleport = null;
+            if (failed) return GiveUp(ctx, "train failed at trainer (returned)");
+            ctx.Train = null;
+            _log.LogInformation("[TRAIN] {Name} trained + returned to anchor — done (cu={Cu})", ctx.Name, ctx.Copper);
+            return StepResult.Complete();
+        }
 
         // First entry → find the nearest class trainer on this map. None in range → give up.
         if (t == null)
@@ -102,6 +160,13 @@ public sealed class TrainingPlanner : IBotPlanner
                     id.HasUnlearnedSpells = false;
                     id.TicksSinceLastTrained = 0;
                 }
+                // If we teleported into a final-approach pocket, return to the anchor BEFORE finishing
+                // — the bot's next goal would otherwise try to MOVE_TO out of the same pocket and no_path.
+                if (ctx.Teleport is { Phase: TpPhase.AtTarget })
+                {
+                    _log.LogInformation("[TRAIN] {Name} trained (cu={Cu}) — teleporting back to anchor", ctx.Name, ctx.Copper);
+                    return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
+                }
                 _log.LogInformation("[TRAIN] {Name} trained (cu={Cu}) — done", ctx.Name, ctx.Copper);
                 ctx.Train = null;
                 return StepResult.Complete();
@@ -117,16 +182,31 @@ public sealed class TrainingPlanner : IBotPlanner
         }
 
         ctx.SetStep("to_trainer");
-        return StepResult.Send(
+        return RouteToTrainer(t);
+    }
+
+    // The MOVE_TO to the trainer — issued on first entry, on a teleport-assist retry, and on resume.
+    private static StepResult RouteToTrainer(TrainScratch t)
+        => StepResult.Send(
             new BridgeCommand("MOVE_TO", new { mapId = t.TrainerPos.Map, x = t.TrainerPos.X, y = t.TrainerPos.Y, z = t.TrainerPos.Z }),
             "TASK_COMPLETE", RouteDeadline);
-    }
 
     // Abort the trip: clear HasUnlearnedSpells so it does NOT re-loop toward the same unreachable
     // trainer, set a cooldown, drop the scratch. The flag re-arms on the next LEVEL_UP, and the
     // cooldown lapses, so the bot retries later from wherever it then is.
     private StepResult GiveUp(BotContext ctx, string why)
     {
+        // If we teleported into the trainer and the trip is now failing, return to the anchor FIRST
+        // (never strand the bot in the nav pocket it teleported into — its next MOVE_TO out would
+        // no_path). The Inbound completion re-enters GiveUp with ctx.Teleport cleared and runs the
+        // real give-up below.
+        if (ctx.Teleport is { Phase: TpPhase.AtTarget } tp)
+        {
+            tp.Failed = true;
+            _log.LogInformation("[TRAIN] {Name} give-up at trainer ({Why}) — teleporting back to anchor first", ctx.Name, why);
+            return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
+        }
+
         if (ctx.Identity is { } id)
         {
             id.HasUnlearnedSpells = false;

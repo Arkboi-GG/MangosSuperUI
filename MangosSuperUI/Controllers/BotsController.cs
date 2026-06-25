@@ -89,7 +89,14 @@ public partial class BotsController : Controller
         {
             connected = _bridge.ConnectedCount,
             totalTracked = _bridge.TotalTracked,
-            bots
+            bots,
+            // Per-bot group membership for the dashboards' visual grouping (Map cohesion overlay,
+            // Fleet leaderboard badge, roster badge). Group identity lives on BotIdentity in the brain,
+            // not on the bridge BotState, so it's joined here by guid. Non-breaking: the existing `bots`
+            // array is untouched — consumers that don't need groups just ignore this.
+            groups = _brain.AllBots.Values
+                .Where(b => b.GroupId > 0)
+                .Select(b => new { guid = b.Guid, groupId = b.GroupId, isGroupLeader = b.IsGroupLeader })
         });
     }
 

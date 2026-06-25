@@ -72,8 +72,6 @@ builder.Services.AddScoped<ItemRetextureService>();
 
 // Tracking (in-memory, singleton)
 builder.Services.AddSingleton<BotStateTracker>();
-builder.Services.AddSingleton<BotActivityLog>();
-builder.Services.AddSingleton<BotRelationships>();
 
 // Data loaders
 builder.Services.AddSingleton<QuirkLoader>();
@@ -81,9 +79,6 @@ builder.Services.AddSingleton<SpellProgressionLoader>();
 builder.Services.AddSingleton<ZoneDataLoader>();
 builder.Services.AddSingleton<QuestGraphLoader>();
 builder.Services.AddSingleton<BotBrainDbInit>();
-
-// Core engine
-builder.Services.AddSingleton<LiveStateModifiers>();
 
 // Brain spine (Strategy B rebuild): executor + supervisor + driver
 builder.Services.AddSingleton<BotExecutor>();

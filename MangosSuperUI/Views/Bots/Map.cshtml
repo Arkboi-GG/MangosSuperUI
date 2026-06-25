@@ -1,0 +1,1160 @@
+@{
+    ViewData["Title"] = "Bot Map Viewer";
+}
+
+@*
+    ─────────────────────────────────────────────────────────────────────────
+    LEAFLET LOAD — paths match the World Map page exactly:
+        ~/lib/leaflet/leaflet.min.css  +  ~/lib/leaflet/leaflet.min.js
+    (NOTE: the files are *.min.*, not leaflet.css/leaflet.js. If leaflet.css is
+    missing, the global `img { max-width:100% }` squeezes every minimap tile
+    smaller than its cell — tiles scatter with black gaps and the zoom control
+    renders as a bare "+ −". That's a missing-CSS symptom, not a projection bug.)
+    ─────────────────────────────────────────────────────────────────────────
+*@
+
+@section Styles {
+    <link rel="stylesheet" href="~/lib/leaflet/leaflet.min.css" />
+    <style>
+        /* ====== Bot Map Viewer — spatial fleet triage ====== */
+        .bm-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        /* controls strip */
+        .bm-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            background: var(--bg-card);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 8px 12px;
+        }
+
+        .bm-spacer {
+            flex: 1;
+        }
+
+        .bm-live-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--status-online);
+            display: inline-block;
+            animation: bmPulse 2s infinite;
+        }
+
+            .bm-live-dot.paused {
+                background: var(--text-muted);
+                animation: none;
+            }
+
+        @@keyframes bmPulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(34,197,94,0.45);
+            }
+
+            70% {
+                box-shadow: 0 0 0 6px rgba(34,197,94,0);
+            }
+
+            100% {
+                box-shadow: 0 0 0 0 rgba(34,197,94,0);
+            }
+        }
+
+        .bm-meta {
+            font-size: 11px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .bm-dim {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        .bm-map-btns {
+            display: inline-flex;
+            gap: 4px;
+        }
+
+        .bm-map-btn {
+            font-size: 11px;
+            padding: 3px 10px;
+            height: 28px;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-medium);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all var(--transition-fast);
+        }
+
+            .bm-map-btn:hover:not(:disabled) {
+                border-color: var(--accent);
+            }
+
+            .bm-map-btn.active {
+                border-color: var(--accent);
+                background: var(--accent-light);
+                color: var(--text-primary);
+            }
+
+            .bm-map-btn:disabled {
+                opacity: 0.4;
+                cursor: not-allowed;
+            }
+
+        /* KPI tiles */
+        .bm-kpis {
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0,1fr));
+            gap: 10px;
+        }
+
+        .bm-kpi {
+            background: var(--bg-card);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 10px 12px;
+            position: relative;
+            overflow: hidden;
+        }
+
+            .bm-kpi::before {
+                content: '';
+                position: absolute;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                width: 3px;
+                background: var(--accent);
+            }
+
+            .bm-kpi.bad::before {
+                background: #f7768e;
+            }
+
+            .bm-kpi.warn::before {
+                background: #e0af68;
+            }
+
+        .bm-kpi-val {
+            font-size: 24px;
+            font-weight: 800;
+            line-height: 1.05;
+            color: var(--text-primary);
+            font-variant-numeric: tabular-nums;
+        }
+
+            .bm-kpi-val.sm {
+                font-size: 16px;
+                font-weight: 700;
+            }
+
+        .bm-kpi-label {
+            font-size: 9.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--text-muted);
+            margin-top: 4px;
+            font-weight: 600;
+        }
+
+        .bm-kpi-sub {
+            font-size: 10px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .bm-coord {
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* stage: rail + map */
+        .bm-stage {
+            display: grid;
+            grid-template-columns: 290px 1fr;
+            gap: 12px;
+            height: calc(100vh - 330px);
+            min-height: 460px;
+        }
+
+        .bm-rail {
+            background: var(--bg-card);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 10px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .bm-rail-sec-title {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .bm-tog-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .bm-tog {
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 9px;
+            border-radius: 11px;
+            border: 1px solid var(--border-medium);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+            transition: all var(--transition-fast);
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+            .bm-tog:hover {
+                border-color: var(--accent);
+            }
+
+            .bm-tog.off {
+                opacity: 0.42;
+            }
+
+            .bm-tog .dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+            }
+
+        .bm-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .bm-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 11px;
+            border: 1px solid var(--border-medium);
+            background: var(--bg-card);
+            cursor: pointer;
+            user-select: none;
+            transition: all var(--transition-fast);
+        }
+
+            .bm-chip:hover {
+                border-color: var(--accent);
+            }
+
+            .bm-chip.off {
+                opacity: 0.4;
+            }
+
+        .bm-chip-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+        }
+
+        .bm-chip-lbl {
+            color: var(--text-secondary);
+        }
+
+        .bm-chip-n {
+            font-variant-numeric: tabular-nums;
+            opacity: 0.85;
+        }
+
+        /* bot list */
+        .bm-botsearch {
+            margin-bottom: 6px;
+        }
+
+        .bm-botlist {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            max-height: 38vh;
+            overflow-y: auto;
+        }
+
+        .bm-bl-row {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            padding: 4px 6px;
+            border-radius: 5px;
+            cursor: pointer;
+            border: 1px solid transparent;
+            transition: all var(--transition-fast);
+        }
+
+            .bm-bl-row:hover {
+                background: var(--bg-card-alt);
+            }
+
+            .bm-bl-row.sel {
+                border-color: var(--accent);
+                background: var(--accent-light);
+            }
+
+            .bm-bl-row.off {
+                opacity: 0.5;
+            }
+
+        .bm-bl-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .bm-bl-name {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-primary);
+            flex: 1;
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .bm-bl-lvl {
+            font-size: 10px;
+            color: var(--text-muted);
+            flex-shrink: 0;
+        }
+
+        .bm-bl-badge {
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            padding: 1px 5px;
+            border-radius: 3px;
+            background: rgba(141,150,160,0.14);
+            color: var(--text-muted);
+            flex-shrink: 0;
+        }
+
+            .bm-bl-badge.dead {
+                background: rgba(247,118,142,0.16);
+                color: #f7768e;
+            }
+
+            .bm-bl-badge.stall {
+                background: rgba(224,175,104,0.16);
+                color: #e0af68;
+            }
+
+        .bm-bl-faults {
+            font-size: 11px;
+            font-weight: 700;
+            color: #f7768e;
+            flex-shrink: 0;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* map */
+        .bm-mapwrap {
+            position: relative;
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+
+        #botmap {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        .bm-map-overlay {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(15,18,24,0.82);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 4px 8px;
+            font-size: 11px;
+            color: var(--text-secondary);
+            pointer-events: none;
+        }
+
+        .bm-legend {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            z-index: 600;
+            background: rgba(15,18,24,0.86);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 7px 9px;
+            font-size: 10.5px;
+            color: var(--text-secondary);
+            max-width: 230px;
+        }
+
+            .bm-legend .lg-row {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                margin: 2px 0;
+            }
+
+            .bm-legend .lg-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                flex-shrink: 0;
+            }
+
+            .bm-legend .lg-ring {
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                border: 1.5px solid #f7768e;
+                background: rgba(247,118,142,0.16);
+                flex-shrink: 0;
+            }
+
+            .bm-legend .lg-pin {
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                border: 2px solid #69CCF0;
+                background: #69CCF0;
+                flex-shrink: 0;
+            }
+
+            .bm-legend .lg-note {
+                margin-top: 5px;
+                color: var(--text-muted);
+                font-size: 9.5px;
+                line-height: 1.3;
+            }
+
+        .bm-map-empty {
+            position: absolute;
+            inset: 0;
+            z-index: 650;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            color: var(--text-muted);
+            background: rgba(10,14,20,0.55);
+            pointer-events: none;
+            padding: 20px;
+        }
+
+            .bm-map-empty i {
+                font-size: 40px;
+                margin-bottom: 10px;
+            }
+
+        .bm-empty-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .bm-empty-sub {
+            font-size: 12px;
+            margin-top: 4px;
+            max-width: 360px;
+        }
+
+        /* live-bot pin (divIcon) */
+        .bm-pin-wrap {
+            background: transparent;
+            border: none;
+        }
+
+        .bm-pin {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        .bm-pin-dot {
+            width: 13px;
+            height: 13px;
+            border-radius: 50%;
+            border: 2px solid #fff;
+            flex-shrink: 0;
+            box-shadow: 0 0 0 1px rgba(0,0,0,0.6);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 9px;
+            color: #1a1e28;
+            line-height: 1;
+        }
+
+        .bm-pin.sel .bm-pin-dot {
+            width: 15px;
+            height: 15px;
+            box-shadow: 0 0 0 2px var(--accent), 0 0 8px rgba(0,0,0,0.7);
+        }
+
+        .bm-pin-label {
+            margin-left: 4px;
+            font-size: 10px;
+            font-weight: 700;
+            color: #e6edf6;
+            white-space: nowrap;
+            text-shadow: 0 1px 3px #000, 0 0 2px #000;
+            pointer-events: none;
+        }
+
+        .bm-pin-pulse .bm-pin-dot {
+            animation: bmPinPulse 1.4s infinite;
+        }
+
+        @@keyframes bmPinPulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(247,118,142,0.6);
+            }
+
+            70% {
+                box-shadow: 0 0 0 7px rgba(247,118,142,0);
+            }
+
+            100% {
+                box-shadow: 0 0 0 0 rgba(247,118,142,0);
+            }
+        }
+
+        /* hotspot count label */
+        .bm-hot-label {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            color: #fff;
+            font-weight: 800;
+            font-size: 11px;
+            text-shadow: 0 1px 3px #000, 0 0 2px #000;
+        }
+
+        /* defence-in-depth: never let a global img{max-width:100%} squeeze the
+                   minimap tile overlays smaller than their bounds (the gappy-scatter bug) */
+        .leaflet-container img.leaflet-image-layer,
+        #botmap img {
+            max-width: none !important;
+            max-height: none !important;
+        }
+
+        /* dark Leaflet popups/tooltips — explicit light colours (theme vars don't
+                   reliably resolve inside the floating popup pane, which rendered values dark) */
+        .bm-popup .leaflet-popup-content-wrapper, .leaflet-tooltip {
+            background: #11151c;
+            color: #d8e0ec;
+            border: 1px solid var(--border-medium);
+            border-radius: var(--radius-md);
+        }
+
+        .bm-popup .leaflet-popup-tip {
+            background: #11151c;
+            border: 1px solid var(--border-medium);
+        }
+
+        .bm-popup .leaflet-popup-content {
+            margin: 9px 11px;
+            font-size: 12px;
+            line-height: 1.4;
+            color: #d8e0ec;
+        }
+
+        .bm-popup a.leaflet-popup-close-button {
+            color: #8b95a7;
+        }
+
+            .bm-popup a.leaflet-popup-close-button:hover {
+                color: #eef2f8;
+            }
+
+        .leaflet-tooltip {
+            font-size: 11px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+        }
+
+        .leaflet-tooltip-top:before, .leaflet-tooltip-bottom:before {
+            border-top-color: var(--border-medium);
+            border-bottom-color: var(--border-medium);
+        }
+
+        .bm-pop-head {
+            display: flex;
+            flex-direction: column;
+            gap: 1px;
+            padding-bottom: 6px;
+            margin-bottom: 6px;
+            border-bottom: 1px solid;
+        }
+
+            .bm-pop-head span {
+                font-size: 10.5px;
+                color: #9aa4b4;
+            }
+
+        .bm-pop-kv {
+            display: flex;
+            gap: 8px;
+            justify-content: space-between;
+            font-size: 11.5px;
+            margin: 2px 0;
+        }
+
+            .bm-pop-kv > span {
+                color: #8b95a7;
+            }
+
+            .bm-pop-kv > b {
+                color: #eef2f8;
+                font-weight: 600;
+                text-align: right;
+            }
+
+        .bm-pop-msg {
+            margin-top: 6px;
+            padding-top: 6px;
+            border-top: 1px solid var(--border-light);
+            font-size: 11px;
+            color: #c4cddb;
+            word-break: break-word;
+        }
+
+        .bm-pop-act {
+            margin-top: 7px;
+            font-size: 11px;
+        }
+
+            .bm-pop-act a {
+                color: #7aa2f7;
+            }
+
+        /* ── Export button state ── */
+        #bmExport.has {
+            border-color: var(--accent);
+            color: var(--text-primary);
+        }
+
+        #bmExport.flash {
+            border-color: #9ece6a;
+        }
+
+        /* ── Modals (cluster inspect + export) ── */
+        .bm-modal-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 3000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(6,9,14,0.72);
+            padding: 24px;
+        }
+
+        .bm-modal {
+            background: var(--bg-card);
+            border: 1px solid var(--border-medium);
+            border-radius: var(--radius-md);
+            width: 560px;
+            max-width: 100%;
+            max-height: 86vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 24px 60px rgba(0,0,0,0.55);
+        }
+
+            .bm-modal.lg {
+                width: 760px;
+            }
+
+        .bm-modal-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+            .bm-modal-head h3 {
+                margin: 0;
+                font-size: 15px;
+                color: var(--text-primary);
+            }
+
+        .bm-modal-sub {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 3px;
+        }
+
+        .bm-modal-x {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 16px;
+            padding: 2px 6px;
+        }
+
+            .bm-modal-x:hover {
+                color: var(--text-primary);
+            }
+
+        .bm-modal-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--border-light);
+            flex-wrap: wrap;
+        }
+
+        .bm-modal-body {
+            padding: 12px 16px;
+            overflow-y: auto;
+        }
+
+        .bm-modal-foot {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+            border-top: 1px solid var(--border-light);
+        }
+
+        /* ── Cluster bot rows ── */
+        .bm-clu-bot {
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            margin-bottom: 6px;
+            overflow: hidden;
+        }
+
+        .bm-clu-bot-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            cursor: pointer;
+            transition: background var(--transition-fast);
+        }
+
+            .bm-clu-bot-head:hover {
+                background: var(--bg-card-alt);
+            }
+
+        .bm-clu-caret {
+            color: var(--text-muted);
+            font-size: 10px;
+            transition: transform var(--transition-fast);
+            width: 10px;
+        }
+
+        .bm-clu-bot.open .bm-clu-caret {
+            transform: rotate(90deg);
+        }
+
+        .bm-clu-name {
+            flex: 1;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .bm-clu-live {
+            font-size: 10px;
+            color: var(--text-secondary);
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-light);
+            padding: 1px 6px;
+            border-radius: 9px;
+        }
+
+        .bm-clu-fcount {
+            font-size: 11px;
+            font-weight: 700;
+            color: #f7768e;
+            font-variant-numeric: tabular-nums;
+            min-width: 16px;
+            text-align: right;
+        }
+
+        .bm-clu-incs {
+            display: none;
+            padding: 4px 10px 8px 28px;
+        }
+
+        .bm-clu-bot.open .bm-clu-incs {
+            display: block;
+        }
+
+        .bm-clu-inc {
+            position: relative;
+            padding: 5px 0 5px 26px;
+            border-top: 1px solid var(--border-light);
+            font-size: 11px;
+        }
+
+            .bm-clu-inc:first-child {
+                border-top: none;
+            }
+
+        .bm-clu-inc-t {
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+            margin-right: 7px;
+        }
+
+        .bm-clu-inc-cat {
+            font-weight: 700;
+            margin-right: 7px;
+        }
+
+        .bm-clu-inc-where a {
+            color: #7aa2f7;
+            margin-right: 7px;
+        }
+
+        .bm-clu-inc-after {
+            color: var(--text-secondary);
+            margin-right: 7px;
+        }
+
+        .bm-clu-inc-tgt {
+            color: var(--text-muted);
+        }
+
+        .bm-clu-inc-msg {
+            color: var(--text-secondary);
+            margin-top: 2px;
+            word-break: break-word;
+        }
+
+        .bm-pin-btn {
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-medium);
+            color: var(--text-secondary);
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all var(--transition-fast);
+            white-space: nowrap;
+        }
+
+            .bm-pin-btn:hover {
+                border-color: var(--accent);
+                color: var(--text-primary);
+            }
+
+            .bm-pin-btn.sm {
+                position: absolute;
+                left: 0;
+                top: 4px;
+                padding: 1px 5px;
+            }
+
+        /* ── Export list ── */
+        .bm-exp-lbl {
+            display: block;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+
+        .bm-exp-list {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 26vh;
+            overflow-y: auto;
+        }
+
+        .bm-exp-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 8px;
+            border: 1px solid var(--border-light);
+            border-radius: 6px;
+        }
+
+        .bm-exp-kind {
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            padding: 1px 6px;
+            border-radius: 3px;
+            background: rgba(122,162,247,0.14);
+            color: #7aa2f7;
+        }
+
+            .bm-exp-kind.cluster {
+                background: rgba(247,118,142,0.14);
+                color: #f7768e;
+            }
+
+            .bm-exp-kind.bot {
+                background: rgba(158,206,106,0.14);
+                color: #9ece6a;
+            }
+
+        .bm-exp-label {
+            flex: 1;
+            font-size: 12px;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .bm-exp-meta {
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        .bm-exp-x {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 12px;
+            padding: 0 2px;
+        }
+
+            .bm-exp-x:hover {
+                color: #f7768e;
+            }
+
+        .bm-exp-preview {
+            width: 100%;
+            min-height: 180px;
+            max-height: 34vh;
+            resize: vertical;
+            font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+            font-size: 11px;
+            line-height: 1.45;
+            color: var(--text-secondary);
+            background: #0f131a;
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 9px 11px;
+        }
+
+        .bm-rail::-webkit-scrollbar, .bm-botlist::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .bm-rail::-webkit-scrollbar-thumb, .bm-botlist::-webkit-scrollbar-thumb {
+            background: var(--border-medium);
+            border-radius: 2px;
+        }
+    </style>
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header d-flex align-items-start justify-content-between">
+            <div>
+                <h1><i class="fa-solid fa-location-crosshairs" style="color: var(--accent);"></i> Bot Map Viewer</h1>
+                <p>Where the fleet is and where it's failing — faults, hotspots, and live bot positions on the world map</p>
+            </div>
+            <div class="d-flex align-items-center gap-3">
+                <span class="bm-meta" id="bmShown">—</span>
+                <span class="status-dot offline" id="bmBridge"></span>
+                <span id="bmBridgeText" style="font-weight:500;font-size:13px;">Connecting…</span>
+            </div>
+        </div>
+
+        <div class="content-body">
+            <div class="bm-wrap">
+
+                <!-- Controls -->
+                <div class="bm-controls">
+                    <span class="bm-live-dot" id="bmLiveDot" title="Auto-refreshing"></span>
+                    <button class="btn-outline-subtle" id="bmPause" style="font-size:11px;padding:3px 10px;height:28px;"><i class="fa-solid fa-pause"></i> Pause</button>
+                    <button class="btn-outline-subtle" id="bmRefresh" style="font-size:11px;padding:3px 10px;height:28px;"><i class="fa-solid fa-rotate"></i> Refresh</button>
+                    <div style="display:inline-flex;align-items:center;gap:6px;">
+                        <label style="color:var(--text-muted);font-size:11px;margin:0;">Every</label>
+                        <select id="bmInterval" class="form-input" style="width:auto;font-size:11px;padding:2px 6px;height:28px;">
+                            <option value="2000">2s</option>
+                            <option value="4000" selected>4s</option>
+                            <option value="8000">8s</option>
+                            <option value="15000">15s</option>
+                        </select>
+                    </div>
+                    <span class="bm-map-btns">
+                        <button class="bm-map-btn active" data-map="Azeroth">Eastern Kingdoms</button>
+                        <button class="bm-map-btn" data-map="Kalimdor">Kalimdor</button>
+                    </span>
+                    <span class="bm-spacer"></span>
+                    <span class="bm-meta" id="bmExportFlash" style="opacity:0;transition:opacity .2s;color:#9ece6a;font-weight:600;"></span>
+                    <button class="btn-outline-subtle" id="bmExport" style="font-size:11px;padding:3px 12px;height:28px;white-space:nowrap;" title="Open the context export to copy a debug packet"><i class="fa-solid fa-clipboard-list"></i> Export (<span id="bmExportN">0</span>)</button>
+                    <button class="btn-outline-subtle" id="bmClear" style="font-size:11px;padding:3px 10px;height:28px;display:none;"><i class="fa-solid fa-filter-circle-xmark"></i> Clear filters</button>
+                    <span class="bm-meta" id="bmUpdated">never</span>
+                </div>
+
+                <!-- KPI tiles -->
+                <div class="bm-kpis">
+                    <div class="bm-kpi"><div class="bm-kpi-val" id="bmKErr">0</div><div class="bm-kpi-label">Errors &amp; warnings</div><div class="bm-kpi-sub" id="bmKErrSub">&nbsp;</div></div>
+                    <div class="bm-kpi"><div class="bm-kpi-val" id="bmKRate">0</div><div class="bm-kpi-label">Per minute</div><div class="bm-kpi-sub" id="bmKRateSub">&nbsp;</div></div>
+                    <div class="bm-kpi"><div class="bm-kpi-val" id="bmKBots">0</div><div class="bm-kpi-label">Bots affected</div><div class="bm-kpi-sub" id="bmKBotsSub">&nbsp;</div></div>
+                    <div class="bm-kpi"><div class="bm-kpi-val sm" id="bmKCat">—</div><div class="bm-kpi-label">Top fault</div><div class="bm-kpi-sub" id="bmKCatSub">&nbsp;</div></div>
+                    <div class="bm-kpi" id="bmKHotTile" title="Jump to hotspot"><div class="bm-kpi-val sm" id="bmKHot">—</div><div class="bm-kpi-label">Worst hotspot</div><div class="bm-kpi-sub" id="bmKHotSub">&nbsp;</div></div>
+                    <div class="bm-kpi" id="bmKBotTile" title="Isolate this bot"><div class="bm-kpi-val sm" id="bmKBot">—</div><div class="bm-kpi-label">Worst bot</div><div class="bm-kpi-sub" id="bmKBotSub">&nbsp;</div></div>
+                </div>
+
+                <!-- Stage -->
+                <div class="bm-stage">
+                    <!-- Left rail: filters + bot list -->
+                    <div class="bm-rail">
+                        <div>
+                            <div class="bm-rail-sec-title">Layers</div>
+                            <div class="bm-tog-row">
+                                <span class="bm-tog" data-layer="incidents"><i class="fa-solid fa-circle" style="font-size:7px;"></i> Faults</span>
+                                <span class="bm-tog" data-layer="hotspots"><i class="fa-regular fa-circle"></i> Hotspots</span>
+                                <span class="bm-tog" data-layer="bots"><i class="fa-solid fa-location-dot"></i> Live bots</span>
+                                <span class="bm-tog off" data-layer="trails"><i class="fa-solid fa-route"></i> Trails</span>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="bm-rail-sec-title">Severity</div>
+                            <div class="bm-tog-row">
+                                <span class="bm-tog bm-tier-tog" data-tier="error"><span class="dot" style="background:#f7768e;"></span> Errors</span>
+                                <span class="bm-tog bm-tier-tog" data-tier="warn"><span class="dot" style="background:#e0af68;"></span> Warnings</span>
+                                <span class="bm-tog bm-tier-tog off" data-tier="info"><span class="dot" style="background:#7aa2f7;"></span> Info</span>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="bm-rail-sec-title">Fault type</div>
+                            <div class="bm-chips" id="bmCats"><div class="bm-dim">—</div></div>
+                        </div>
+                        <div style="flex:1;display:flex;flex-direction:column;min-height:0;">
+                            <div class="bm-rail-sec-title">
+                                <span>Bots</span>
+                                <span style="display:flex;gap:8px;align-items:center;">
+                                    <span class="bm-meta" id="bmBotSelMeta">all bots</span>
+                                    <a href="#" id="bmBotAll" style="color:var(--accent);font-size:10px;">all</a>
+                                </span>
+                            </div>
+                            <input type="text" class="form-input bm-botsearch" id="bmBotSearch" placeholder="Filter bots…" style="font-size:12px;height:30px;" />
+                            <div class="bm-botlist" id="bmBotList"><div class="bm-dim" style="padding:8px;">—</div></div>
+                            <div class="bm-meta" style="margin-top:6px;">click = isolate · shift-click = multi-select</div>
+                        </div>
+                    </div>
+
+                    <!-- Map -->
+                    <div class="bm-mapwrap">
+                        <div id="botmap"></div>
+                        <div class="bm-map-overlay"><i class="fa-solid fa-crosshairs"></i> <span id="bmCoord">—</span></div>
+                        <div class="bm-legend">
+                            <div class="lg-row"><span class="lg-dot" style="background:#f7768e;"></span> fault (colour = type)</div>
+                            <div class="lg-row"><span class="lg-ring"></span> hotspot (size = count)</div>
+                            <div class="lg-row"><span class="lg-pin"></span> live bot (colour = class)</div>
+                            <div class="lg-note">Dead/stalled bots pulse. Select a bot to see its target/fail lines &amp; trail. Unknown-map faults are shown on the current map.</div>
+                        </div>
+                        <div class="bm-map-empty" id="bmMapEmpty">
+                            <i class="fa-solid fa-satellite-dish"></i>
+                            <div class="bm-empty-title">No telemetry yet</div>
+                            <div class="bm-empty-sub">Enable the engine on the IBot Monitor, then run a session.</div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Cluster inspect modal ===== -->
+<div class="bm-modal-overlay" id="bmClusterOverlay">
+    <div class="bm-modal">
+        <div class="bm-modal-head">
+            <div>
+                <h3><i class="fa-solid fa-location-crosshairs" style="color:var(--accent);margin-right:6px;"></i>Cluster <span id="bmCluTitle">—</span></h3>
+                <div class="bm-modal-sub" id="bmCluMeta">—</div>
+            </div>
+            <button class="bm-modal-x" id="bmCluClose"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="bm-modal-toolbar">
+            <button class="btn-accent" id="bmCluPinAll" style="font-size:11px;padding:4px 12px;height:28px;"><i class="fa-solid fa-thumbtack"></i> Pin whole cluster</button>
+            <span class="bm-meta">click a bot to expand its faults · pin a cluster, a bot, or a single incident</span>
+        </div>
+        <div class="bm-modal-body" id="bmCluBody"></div>
+    </div>
+</div>
+
+<!-- ===== Context export modal ===== -->
+<div class="bm-modal-overlay" id="bmExportOverlay">
+    <div class="bm-modal lg">
+        <div class="bm-modal-head">
+            <div>
+                <h3><i class="fa-solid fa-clipboard-list" style="color:var(--accent);margin-right:6px;"></i>Context export</h3>
+                <div class="bm-modal-sub"><span id="bmExportCount">0 items</span> · paste this back into the chat</div>
+            </div>
+            <button class="bm-modal-x" id="bmExportClose"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="bm-modal-body">
+            <label class="bm-exp-lbl">Your note <span class="bm-dim">— sets the framing for Claude</span></label>
+            <textarea class="form-input" id="bmExportNote" rows="3" placeholder="e.g. these L2–4 bots keep dying at the Goldshire bridge and never graveyard-port — what's wrong?"></textarea>
+            <label class="bm-exp-lbl" style="margin-top:10px;">Pinned items</label>
+            <div class="bm-exp-list" id="bmExportList"></div>
+            <label class="bm-exp-lbl" style="margin-top:10px;">Markdown <span class="bm-dim">— this is what Copy puts on your clipboard</span></label>
+            <textarea class="bm-exp-preview" id="bmExportPreview" readonly spellcheck="false"></textarea>
+        </div>
+        <div class="bm-modal-foot">
+            <button class="btn-accent" id="bmExportCopy"><i class="fa-solid fa-copy"></i> Copy</button>
+            <button class="btn-outline-subtle" id="bmExportDownload"><i class="fa-solid fa-download"></i> Download .md</button>
+            <span class="bm-spacer"></span>
+            <button class="btn-outline-subtle" id="bmExportClear"><i class="fa-solid fa-trash"></i> Clear pins</button>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/lib/leaflet/leaflet.min.js"></script>
+    <script src="~/js/botmap.js" asp-append-version="true"></script>
+}

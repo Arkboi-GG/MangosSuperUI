@@ -45,6 +45,7 @@ public sealed class BotBrain
     private const double WedgeCeilingSec = 150;   // no real progress this long → wedged
     private const int WedgeFailCap = 8;     // …or this many back-to-back negated WAITs (fast fail-loop)
     private const double WedgeBackoffSec = 5;    // park this long, then resume + relocate to a fresh cell
+    private const double TrainWedgeCooldownSec = 300;   // a trainer-route wedge defers Training this long (mirrors TrainingPlanner give-up) so the bot quests instead of re-bee-lining
 
     public BotBrain(
         BotExecutor executor,
@@ -70,6 +71,18 @@ public sealed class BotBrain
     {
         // 1. Read snapshot → refresh sensory.
         ctx.Sense(snap);
+
+        // 1a. Combat-directive overlay (grouping §3.6). The GroupCoordinator pre-pass already
+        //     stamped ctx.CombatDirective this tick (Assist(anchor) / None). Emit COMBAT_DIRECTIVE
+        //     to C++ ONLY when the stamp changed since we last told it -- the coordinator re-stamps
+        //     every tick (idempotent) but the wire stays brain-cadence, not per-tick traffic
+        //     (§3.8.4 / §1). Fire-and-forget, no WAIT (like SET_TASK), and orthogonal to Pending --
+        //     so it runs ahead of the wedge/goal machinery and regardless of any in-flight leg.
+        if (ctx.CombatDirective != ctx.LastEmittedCombat)
+        {
+            await _executor.IssueNoWaitAsync(ctx, BridgeCommand.Combat(ctx.CombatDirective));
+            ctx.LastEmittedCombat = ctx.CombatDirective;
+        }
 
         // 1b. No-progress circuit breaker. Fires before goal/plan so a wedged bot is parked, not driven.
         if (await TryBreakWedgeAsync(ctx)) return;
@@ -181,6 +194,17 @@ public sealed class BotBrain
         if (ctx.Goal == Goal.Grinding)
             ctx.RecordDeadGrindCell(ctx.Pos.X, ctx.Pos.Y);   // don't drop back onto this dead spot
 
+        // A wedge while routing to a trainer is the L1 bum-rush loop: with HasUnlearnedSpells set, the
+        // GoalSelector training trigger re-fires on every reselect and the bot bee-lines the (unreachable /
+        // crowded / interior-pocket) trainer again the instant the backoff lapses — never questing, never
+        // levelling. Stamp a give-up cooldown (same window as TrainingPlanner's own give-up) so the trigger
+        // is gated and the bot falls through to questing; it re-attempts the trainer after the cooldown, by
+        // then questing-travelled to a possibly-reachable one. HasUnlearnedSpells is left SET on purpose —
+        // the bot still owes the training, it's deferred, not abandoned. This also destaggers a crowd: each
+        // bot cools down at a slightly different time and drifts off to quest, thinning the trainer pileup.
+        if (ctx.Goal == Goal.Training && id != null)
+            id.TrainCooldownUntil = DateTime.UtcNow.AddSeconds(TrainWedgeCooldownSec);
+
         if (id != null)
         {
             id.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(WedgeBackoffSec);
@@ -289,6 +313,7 @@ public sealed class BotBrain
         ctx.Service = null;
         ctx.Maintenance = null;   // Phase 4 — re-armed by MaintenancePlanner on each fresh death
         ctx.Train = null;         // re-armed by TrainingPlanner on each trainer trip
+        ctx.Teleport = null;      // abandon any in-flight teleport-assist round-trip on a goal change (death/preempt owns the bot)
     }
 
     /// <summary>SET_TASK IDLE — stops the C++ grind patrol (keeps the follow; §4.3).</summary>

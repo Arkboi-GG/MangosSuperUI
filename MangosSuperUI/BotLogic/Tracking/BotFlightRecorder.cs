@@ -321,22 +321,6 @@ public class BotFlightRecorder
         Emit(bot, ts, TraceKind.Transition, state, from: from, to: to, cause: cause, detail: detail);
     }
 
-    /// <summary>A strategic-eval result: full weight vector + winner + why.</summary>
-    public void Decision(BotIdentity bot, DecisionResult result, string cause, BotStateSnapshot? state = null)
-    {
-        if (!IsTraced(bot.Guid)) return;
-        var ts = _state.GetOrAdd(bot.Guid, _ => new TraceState());
-        SetOwner(ts, TraceOwner.CS, null);
-
-        var weights = string.Join(" ", result.WeightBreakdown
-            .OrderByDescending(kv => kv.Value)
-            .Select(kv => $"{kv.Key}={kv.Value:0.00}"));
-        var detail = $"win={result.NewActivity} roll={result.RollValue:0.000} reason={result.Reason} | {weights}";
-
-        Emit(bot, ts, TraceKind.Decision, state,
-            to: result.NewActivity.ToString(), cause: cause, detail: detail);
-    }
-
     /// <summary>
     /// C# sent a bridge command. Registers an open command for heuristic event
     /// matching, flips owner → WAIT. Returns the correlation id.
@@ -607,9 +591,12 @@ public class BotFlightRecorder
             Y = pos.Item2,
             Z = pos.Item3,
             Map = pos.Item4,
-            GObj = bot.IsGrouped ? bot.GroupAllObjectivesDone : null,
-            GTurn = bot.IsGrouped ? bot.GroupAllMembersTurnedIn : null,
-            GQuest = bot.IsGrouped ? bot.GroupAllMembersQuesting : null,
+            // §3.5: the GroupAll* gate-flags were removed (the miscountable stored-flag shape).
+            // This recorder is orphaned, slated for the diagnostics retirement (§5); nulling these
+            // keeps it compiling until then. Nothing reads its output.
+            GObj = null,
+            GTurn = null,
+            GQuest = null,
             CppState = cppState,
             Mismatch = mismatch
         };
@@ -704,9 +691,6 @@ public static class BotTrace
     public static void Transition(BotIdentity bot, string from, string to, string cause,
         string? waitingOn = null, string detail = "", BotStateSnapshot? state = null)
         => _r?.Transition(bot, from, to, cause, waitingOn, detail, state);
-
-    public static void Decision(BotIdentity bot, DecisionResult result, string cause, BotStateSnapshot? state = null)
-        => _r?.Decision(bot, result, cause, state);
 
     public static int Command(BotIdentity bot, string cmdType, string detail = "", BotStateSnapshot? state = null)
         => _r?.Command(bot, cmdType, detail, state) ?? 0;

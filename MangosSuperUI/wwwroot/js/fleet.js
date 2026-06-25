@@ -20,6 +20,17 @@ $(function () {
     // ---- state ----
     var data = null;            // last FleetDiagnostics payload
     var classOf = {};           // guid -> classId (from States)
+    var groupOf = {};           // guid -> groupId (from States .groups)
+    var leaderOf = {};          // guid -> true if group leader
+    // Deterministic per-group colour, shared across Map / Fleet / roster: groupId is a stable int, so
+    // index a fixed palette by it — group #3 is the same colour everywhere, every poll.
+    var GROUP_COLORS = ['#7aa2f7', '#bb9af7', '#9ece6a', '#e0af68', '#f7768e', '#2ac3de', '#ff9e64', '#7dcfff', '#73daca', '#c0caf5', '#d7a65f', '#9d7cd8'];
+    function groupColor(gid) { return gid > 0 ? GROUP_COLORS[(gid - 1) % GROUP_COLORS.length] : null; }
+    function grpBadge(guid) {
+        var gid = groupOf[guid]; if (!gid) return '';
+        var c = groupColor(gid);
+        return '<span title="group ' + gid + (leaderOf[guid] ? ' (leader)' : '') + '" style="display:inline-block;margin-left:6px;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;color:' + c + ';background:' + c + '22;border:1px solid ' + c + '66;">' + (leaderOf[guid] ? '\u2605' : '') + 'G' + gid + '</span>';
+    }
     var timer = null;
     var intervalMs = 4000;
     var paused = false;
@@ -51,6 +62,8 @@ $(function () {
             classOf = {};
             var bots = (d && d.bots) || [];
             for (var i = 0; i < bots.length; i++) classOf[bots[i].guid] = bots[i].classId;
+            groupOf = {}; leaderOf = {};
+            ((d && d.groups) || []).forEach(function (g) { groupOf[g.guid] = g.groupId; if (g.isGroupLeader) leaderOf[g.guid] = true; });
             var conn = (d && d.connected) || 0;
             var tracked = (d && d.totalTracked) || bots.length;
             setBridge(conn > 0, conn + ' connected · ' + tracked + ' tracked');
@@ -188,6 +201,7 @@ $(function () {
             mix += '</span>';
             rows += '<tr class="fv-clickable" data-bot="' + esc(b.name) + '">' +
                 '<td><span style="color:var(--text-primary);font-weight:600;">' + esc(b.name) + '</span>' +
+                grpBadge(b.guid) +
                 (clsName ? '<span class="bt-class-badge ' + (CLASS_CSS[cls] || '') + '" style="font-size:9px;margin-left:6px;padding:1px 5px;border-radius:3px;">' + clsName + '</span>' : '') +
                 '<span class="fv-lvlpill">L' + b.level + '</span></td>' +
                 '<td>' + mix + '</td>' +

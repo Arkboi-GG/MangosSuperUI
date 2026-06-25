@@ -341,7 +341,7 @@ $(function () {
             '<span class="bt-roster-dot ' + dotCls + '"></span>' +
             '<div class="bt-roster-info">' +
             '<div class="bt-roster-name">' + esc(s.name) + '</div>' +
-            '<div class="bt-roster-meta">L' + (s.level || 0) + ' ' + raceName + ' <span class="bt-class-badge ' + (CLASS_CSS[s.classId] || '') + '">' + className + '</span>' +
+            '<div class="bt-roster-meta">L' + (s.level || 0) + ' ' + raceName + ' <span class="bt-class-badge ' + (CLASS_CSS[s.classId] || '') + '">' + className + '</span>' + groupBadgeHtml(guid) +
             ' <span style="color:#e0af68;margin-left:4px;">' + goldStr + '</span></div>' +
             '</div>' +
             '<span class="bt-roster-activity ' + actCls + '">' + actText + '</span>'
@@ -847,6 +847,14 @@ $(function () {
         html += '<div class="bt-live-badges">';
         if (d.dead) html += chip('DEAD', '#fff', 'rgba(247,118,142,0.8)');
         if (d.inCombat) html += chip('IN COMBAT', '#f7768e', 'rgba(247,118,142,0.15)');
+        if (d.combat) {
+            if (d.combat.anchorGuid === d.guid)
+                html += chip('⚔ ANCHOR', '#7dcfff', 'rgba(125,207,255,0.15)');
+            else {
+                var anc = botStates[d.combat.anchorGuid];
+                html += chip('⚔ assist → ' + esc(anc ? anc.name : ('#' + d.combat.anchorGuid)), '#7dcfff', 'rgba(125,207,255,0.15)');
+            }
+        }
         if (d.goal === 'Idle' && d.why && d.why !== 'idle')
             html += chip('↻ reselecting', '#ff9e64', 'rgba(255,158,100,0.15)');
         html += chip('L' + d.level, 'var(--text-secondary)', 'rgba(255,255,255,0.06)');
@@ -1641,8 +1649,24 @@ $(function () {
         });
     }
 
+    // Deterministic per-group colour + roster badge, shared scheme with Map / Fleet (groupId is a
+    // stable int -> fixed palette index, so a group is the same colour on every page and poll).
+    var GROUP_COLORS = ['#7aa2f7', '#bb9af7', '#9ece6a', '#e0af68', '#f7768e', '#2ac3de', '#ff9e64', '#7dcfff', '#73daca', '#c0caf5', '#d7a65f', '#9d7cd8'];
+    var groupOf = {}, leaderOf = {};   // guid -> groupId / leader (rebuilt from BrainStatus below)
+    function groupColor(gid) { return gid > 0 ? GROUP_COLORS[(gid - 1) % GROUP_COLORS.length] : null; }
+    function groupBadgeHtml(guid) {
+        var gid = groupOf[guid]; if (!gid) return '';
+        var c = groupColor(gid);
+        return ' <span title="group ' + gid + (leaderOf[guid] ? ' (leader)' : '') + '" class="bt-group-badge" style="display:inline-block;padding:0 5px;border-radius:3px;font-size:10px;font-weight:700;color:' + c + ';background:' + c + '22;border:1px solid ' + c + '66;">' + (leaderOf[guid] ? '\u2605' : '') + 'G' + gid + '</span>';
+    }
+
     function updateGroupingUI(data) {
         var groups = data.groups || [];
+        // Rebuild the guid -> group lookup the roster cards read for their colour badge.
+        groupOf = {}; leaderOf = {};
+        groups.forEach(function (g) {
+            (g.memberGuids || []).forEach(function (mg) { groupOf[mg] = g.groupId; if (mg === g.leaderGuid) leaderOf[mg] = true; });
+        });
         var $list = $('#groupList');
         $('#groupCount').text(groups.length);
         if (groups.length === 0) {

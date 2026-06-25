@@ -81,7 +81,7 @@
             spells: ['spells', 'patch', 'visuallab'],
             world: ['worldmap', 'worldeditor'],
             content: ['items', 'gameobjects', 'loottuner', 'instances', 'lootifier'],
-            bots: ['bots-fleet', 'bots-dashboard'],
+            bots: ['bots-fleet', 'bots-map', 'bots-dashboard'],
             data: ['database', 'sourcemap'],
             downloads: ['downloads-page']
         }
@@ -372,6 +372,7 @@
             lootifier: { icon: 'fa-dragon', label: 'ARPG Lootifier' },
             'downloads-page': { icon: 'fa-arrow-down-to-line', label: 'Downloads' },
             'bots-fleet': { icon: 'fa-tower-broadcast', label: 'Fleet View' },
+            'bots-map': { icon: 'fa-location-crosshairs', label: 'Bot Map Viewer' },
             'bots-dashboard': { icon: 'fa-robot', label: 'IBot Monitor' },
             database: { icon: 'fa-database', label: 'Database Explorer' },
             sourcemap: { icon: 'fa-sitemap', label: 'Source Map' }

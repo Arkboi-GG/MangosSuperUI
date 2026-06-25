@@ -389,6 +389,46 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         var sv = ctx.Service;
 
+        // ── Teleport-assist: the TELEPORT_TO hop ITSELF failed/deadlined ──
+        // CommandType distinguishes a teleport fail from a SELL_FAIL/REPAIR_FAIL (those flow to
+        // SellStep/RepairStep, which return-to-anchor via GiveUp/GiveUpPhantom). Outbound fail →
+        // couldn't reach the vendor → give up. Inbound fail → business is done and the bot is at a
+        // (safe) town vendor, just couldn't get home → exit per the trip outcome.
+        if (failure != null && failure.CommandType == "TELEPORT_TO" && ctx.Teleport is { } tpf)
+        {
+            var phase = tpf.Phase;
+            bool wasFailed = tpf.Failed;
+            ctx.Teleport = null;
+            if (phase == TpPhase.Inbound)
+                return wasFailed ? GiveUp(ctx, $"tp-return:{failure.Reason}") : FinishVendor(ctx);
+            return GiveUp(ctx, $"teleport:{failure.Reason}");
+        }
+
+        // ── Teleport-assist round-trip advance (TELEPORT_ACK arrivals) ──
+        // Outbound → AtTarget: the executor set ctx.Pos from the ack, so we're AT the vendor — begin
+        // selling. Inbound: returned to the pre-teleport anchor → finish (or give up if the trip failed).
+        // AtTarget falls through to the phase switch, which drives sell/repair at real proximity.
+        if (sv != null && ctx.Teleport is { } tp)
+        {
+            if (tp.Phase == TpPhase.Outbound)
+            {
+                tp.Phase = TpPhase.AtTarget;
+                sv.Phase = VendorPhase.Sell;
+                ctx.SetStep("vendor_sell");
+                _log.LogInformation("[VENDOR] {Name} teleported in → SELL_ITEMS entry={Entry} keepQ={Q} bag={Bag} dur={Dur}",
+                    ctx.Name, sv.TargetNpcEntry, SellKeepQuality, ctx.FreeSlots, ctx.Durability);
+                var cmd = new BridgeCommand("SELL_ITEMS", new { npc_entry = sv.TargetNpcEntry, keep_quality = SellKeepQuality });
+                return StepResult.Send(cmd, "SELL_ACK", TimeSpan.FromSeconds(VendorAckDeadlineSec));
+            }
+            if (tp.Phase == TpPhase.Inbound)
+            {
+                bool failed = tp.Failed;
+                ctx.Teleport = null;
+                return failed ? GiveUp(ctx, "vendor failed at npc (returned)") : FinishVendor(ctx);
+            }
+            // AtTarget → fall through to the sell/repair phase switch below.
+        }
+
         // Not started — confirm we still need it and pick the nearest (repair-biased) vendor.
         if (sv == null || sv.Phase == VendorPhase.None)
         {
@@ -453,6 +493,24 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         if (failure != null)
         {
+            // Teleport-assist: a no_path on the final approach to the vendor, in the vicinity → hop
+            // the last few yards instead of giving up (the vendor sits in a nav-dead pocket MOVE_TO
+            // can't reach the last yards into). First no_path retries; the second, within reach, warps.
+            if (TeleportAssist.IsApproachNoPath(failure))
+            {
+                sv.RouteFails++;
+                switch (TeleportAssist.Decide(sv.RouteFails, ctx.Pos, sv.TargetPos, ctx.MapId))
+                {
+                    case TeleportAssist.TpDecision.Teleport:
+                        _log.LogInformation("[VENDOR] {Name} vendor unreachable ({N}× no_path, {D:F0}yd) — TELEPORT_TO entry={Entry}",
+                            ctx.Name, sv.RouteFails, ctx.Pos.Dist2D(sv.TargetPos.Pos), sv.TargetNpcEntry);
+                        return StepResult.Send(TeleportAssist.BeginOutbound(ctx, sv.TargetPos), "TELEPORT_ACK", TeleportAssist.AckDeadline);
+                    case TeleportAssist.TpDecision.Retry:
+                        return MoveToVendor(sv);   // one more chance to path closer
+                                                   // TpDecision.GiveUp → fall through (vendor genuinely far — not a final-approach pocket)
+                }
+            }
+
             _log.LogInformation("[VENDOR] {Name} route FAILED reason={Reason} (target entry={Entry} @ ({TX:F0},{TY:F0})) → giveup",
                 ctx.Name, failure.Reason, sv.TargetNpcEntry, sv.TargetPos.X, sv.TargetPos.Y);
             return GiveUp(ctx, $"route {failure.Reason}");
@@ -544,10 +602,26 @@ public sealed class MaintenancePlanner : IBotPlanner
         return StepResult.Send(cmd, "TASK_COMPLETE", TimeSpan.FromSeconds(VendorLegDeadlineSec));
     }
 
+    // Teleport-assist: if we teleported INTO this vendor (final-approach pocket), hop back to the
+    // anchor BEFORE actually exiting — never strand the bot in the pocket (its next goal's MOVE_TO out
+    // would no_path). Returns the return-teleport step when a return is owed (the Inbound completion
+    // in VendorStep then re-enters the real exit with ctx.Teleport cleared), else null. tripFailed
+    // rides ctx.Teleport.Failed so the Inbound completion finishes vs gives up correctly.
+    private static StepResult? ReturnIfTeleported(BotContext ctx, bool tripFailed)
+    {
+        if (ctx.Teleport is { Phase: TpPhase.AtTarget } tp)
+        {
+            tp.Failed = tripFailed;
+            return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
+        }
+        return null;
+    }
+
     // Trip done — short cooldown so STATE (durability/slots) can refresh before the trigger
     // re-evaluates, clear the errand, release to the GoalSelector.
     private StepResult FinishVendor(BotContext ctx)
     {
+        if (ReturnIfTeleported(ctx, tripFailed: false) is { } ret) return ret;   // hop home first if we teleported in
         if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorDoneCooldownSec);
         ctx.Service = null;
         ctx.SetStep("vendor_done");
@@ -563,6 +637,7 @@ public sealed class MaintenancePlanner : IBotPlanner
     // while before retrying instead of re-rolling the same far vendor every tick.
     private StepResult GiveUp(BotContext ctx, string why)
     {
+        if (ReturnIfTeleported(ctx, tripFailed: true) is { } ret) return ret;   // hop home first if we teleported in
         if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorGiveupCooldownSec);
         ctx.Service = null;
         ctx.SetStep($"vendor_giveup:{why}");
@@ -585,6 +660,7 @@ public sealed class MaintenancePlanner : IBotPlanner
     // visible in one grep instead of hiding among the policy give-ups.
     private StepResult GiveUpPhantom(BotContext ctx, string why)
     {
+        if (ReturnIfTeleported(ctx, tripFailed: true) is { } ret) return ret;   // hop home first if we teleported in
         if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorPhantomCooldownSec);
         ctx.Service = null;
         ctx.SetStep($"vendor_phantom:{why}");
