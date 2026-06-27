@@ -278,17 +278,16 @@ public readonly record struct CombatDirective
     public static CombatDirective Assist(int anchorGuid) => new(CombatMode.Assist, anchorGuid);
 }
 
-// ----------------------- Execution directive (grouping §3.2) ---------------
-// The per-member EXECUTION seam -- the god bot (GroupCoordinator pre-pass) stamps ONE shared kill
-// objective on EVERY present group member each tick: the union-chosen objective the whole group
-// works together (creature_entry + coords), keyed by quest+slot so the coordinator can read each
-// holder's remaining count off its quest log. There is no leader and no follower -- all members are
-// peers grinding the SAME mob (the combat directive focus-fires it). A "holder" is simply a member
+// ----------------------- Execution directive (grouping §7.1) ---------------
+// The shared KILL-OBJECTIVE payload -- the enriched-grind target (creature_entry + coords), keyed by
+// quest+slot so the coordinator can read each holder's remaining count off its quest log. Originally
+// the whole per-member execution stamp; as of the central-driver build it is the EMBEDDED payload that
+// GroupOrder carries in its Objective / HoldAtAnchor phases (GroupOrder is now the per-member stamp --
+// see GroupPlan.cs). UNCHANGED in shape: still a readonly record struct with value-equality and the
+// same Objective(...) factory the coordinator builds the shared mob with. A "holder" is simply a member
 // whose log contains the quest; a member ineligible for it (e.g. a warrior on a priest quest) still
-// helps but never gates completion. The objective stays stamped until every eligible holder is done.
-// Re-stamped every tick; value-equality drives the "objective changed" re-issue guard (mirrors
-// CombatDirective). None = no group objective this tick -> the member runs its own batch (accept /
-// turn-in / pick), so accept + turn-in stay per-member while the OBJECTIVE is shared and gated.
+// helps but never gates completion -- the gate reads each holder's OWN server count. None = no kill
+// objective (every phase except Objective / HoldAtAnchor), and the cleared GroupOrder.Objective.
 public enum ExecMode { None = 0, Objective = 1 }
 
 public readonly record struct ExecDirective
@@ -452,14 +451,18 @@ public sealed class BotContext
     // on the record struct drives that change check.
     public CombatDirective LastEmittedCombat { get; set; } = CombatDirective.None;
 
-    // The group EXECUTION directive (grouping §3.2) -- the god bot's per-tick shared-objective stamp
-    // (the union-chosen kill objective; None = no group objective this tick). Consumed IN-PROCESS by
-    // this bot's own QuestPlanner consult (not a wire command), so unlike CombatDirective it needs no
-    // LastEmitted WIRE marker -- but the no-WAIT group grind uses LastGroupExec to re-issue the leg
-    // only when the objective CHANGES (value-equality on the record struct), keeping the bridge quiet
-    // while the member grinds the same stamped objective.
-    public ExecDirective ExecDirective { get; set; } = ExecDirective.None;
-    public ExecDirective LastGroupExec { get; set; } = ExecDirective.None;
+    // The group ORDER (grouping §7.1) -- the god bot's (GroupCoordinator pre-pass) per-tick per-member
+    // stamp. It GENERALIZES the old kill-only ExecDirective stamp (which carried only the shared mob) to
+    // the full §3 phase machine: the phase the whole group is in this tick, the target NPC for the
+    // travel / accept / turn-in / errand phases, and the embedded ExecDirective kill objective for the
+    // Objective / HoldAtAnchor phases (see GroupPlan.cs). Consumed IN-PROCESS by this bot's own
+    // QuestPlanner consult (DriveGroup branches on GroupOrder.Phase) -- not a wire command, so unlike
+    // CombatDirective it needs no LastEmitted WIRE marker. The no-WAIT group grind uses LastGroupOrder to
+    // re-issue the leg only when the order CHANGES (structural value-equality on the record struct),
+    // keeping the bridge quiet while the member works the same stamped order. Default None = solo /
+    // ungrouped; GoalSelector routes a grouped member to Goal.Questing whenever Phase != None (IsActive).
+    public GroupOrder GroupOrder { get; set; } = GroupOrder.None;
+    public GroupOrder LastGroupOrder { get; set; } = GroupOrder.None;
 
     // ----------------------------- helpers ---------------------------------
     public double TimeInGoalSec => (DateTime.UtcNow - GoalSinceUtc).TotalSeconds;

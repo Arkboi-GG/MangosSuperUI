@@ -107,17 +107,18 @@ public sealed class GoalSelector
             return Goal.Maintenance;
         }
 
-        // Group execution directive (grouping §3.2) — the god bot stamped a shared objective for this
-        // bot's group this tick. Work it as a TEAM (Questing → the QuestPlanner group consult drives
-        // the shared mob; the combat directive focus-fires it). Sits AFTER the survival hard-needs
-        // (dead / heal / teleport / vendor) so a dying or broke-gear member still peels, and BEFORE
-        // solo training / grind-lock / questing so a GROUPED bot never wanders off to train or grind
-        // ALONE while the team has work — group training/vendoring are coordinator errands (next
-        // increment). This is also why a grouped bot no longer solo-trains at spawn: the shared
-        // objective preempts the training trigger below.
-        if (ctx.ExecDirective.IsActive)
+        // Group execution directive (grouping §3) — the god bot stamped this bot's group a phase this
+        // tick (travel / accept / shared objective / turn-in / hold). Work it as a TEAM (Questing →
+        // QuestPlanner.DriveGroup executes the stamped phase for this bot; the combat directive focus-
+        // fires the shared mob). Sits AFTER the survival hard-needs (dead / heal / teleport / vendor) so
+        // a dying or broke-gear member still peels, and BEFORE solo training / grind-lock / questing so
+        // a GROUPED bot never wanders off to train or grind ALONE while the team has work — group
+        // training/vendoring are coordinator errands (next increment), so until then a grouped member
+        // that needs them peels via those same solo triggers in the gaps. This is also why a grouped
+        // bot no longer solo-trains at spawn: an active group phase preempts the training trigger below.
+        if (ctx.GroupOrder.IsActive)
         {
-            ctx.GoalReason = "group-obj";
+            ctx.GoalReason = $"group:{ctx.GroupOrder.Phase}";
             return Goal.Questing;
         }
 

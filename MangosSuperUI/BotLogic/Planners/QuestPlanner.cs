@@ -115,7 +115,7 @@ public sealed class QuestPlanner : IBotPlanner
         // member runs ahead. None => fall through to the normal solo batch (accept / turn in / pick).
         // We deliberately leave ctx.Quest untouched: when the stamp clears, the solo path resumes the
         // SAME batch from the live log (turning in anything the team just completed).
-        if (ctx.ExecDirective.IsActive)
+        if (ctx.GroupOrder.IsActive)
             return DriveGroup(ctx);
 
         // A negated/expired WAIT surfaced a failure -> recover (batch-aware).
@@ -999,37 +999,187 @@ public sealed class QuestPlanner : IBotPlanner
     // (objective satisfied for the team) -> we fall back to the solo batch, which turns in whatever
     // just completed. Deliberately no counted WAIT: a holder whose credit arrived from a teammate's
     // kill would never fire its OWN TASK_COMPLETE and would lock.
+    // ── The §3 phase executor: branch on the god bot's stamped GroupOrder.Phase. ───────────────
+    // Thin: every leg reuses the solo planner's primitives (MoveTo / AtNpc / the enriched grind /
+    // QUEST_INTERACT). The COORDINATOR owns all gating + advancement; this only EXECUTES the current
+    // phase for THIS bot, reading the bot's OWN log for its eligible/owed subset. v1 drives the
+    // questing phases + HoldAtAnchor + the transient Forming. GroupVendor / GroupTrain are not stamped
+    // by the v1 coordinator (group-maintenance is a follow-on); if ever seen they hit the default
+    // (idle refresh), never deadlocking on an unhandled phase.
     private StepResult DriveGroup(BotContext ctx)
     {
-        var d = ctx.ExecDirective;
+        var o = ctx.GroupOrder;
 
-        // A leg failed under the directive -> drop it; the god bot re-stamps / re-picks next tick (it
+        // A leg failed under the order -> drop it; the coordinator re-stamps / re-picks next tick (it
         // owns recovery). A dying member already peeled to Maintenance via the GoalSelector hard-need
-        // before reaching here, so this is the benign "couldn't path to the mob right now" case.
+        // before reaching here, so this is the benign "couldn't path / interact right now" case.
         if (ctx.Failure != null)
         {
             ctx.Failure = null;
-            ctx.LastGroupExec = ExecDirective.None;   // force a fresh leg next tick
+            ctx.LastGroupOrder = GroupOrder.None;   // force a fresh leg next tick
             return StepResult.Wait();
         }
 
-        // Keep the log fresh on a cadence so the coordinator's gate sees server-credited kills (shared
-        // group credit advances counts with no local ack). The no-WAIT grind below lets this re-run.
+        // Keep the quest-log cache FRESH before ANY group phase reads it. The accept / turn-in gates
+        // (NextAcceptableAtGiver here; NextGiver / NextEnder in the coordinator) key on ctx.QuestLog --
+        // an in-memory cache refreshed only by QUEST_STATUS_ALL. Without a sync, a just-landed accept
+        // never updates the cache, so the gates keep re-selecting an already-held quest -> the C++
+        // CanTakeQuest-failed re-accept loop (and the same class would wedge TurnIn). GroupObjective
+        // self-synced and the default (Forming) case synced; hoisting the SAME cadence here covers
+        // every phase, so no group decision is ever made off a pre-accept snapshot.
         if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
             return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
 
-        // (Re)issue the shared objective ONLY when it changes (value-equality) -- a member already
-        // grinding the same mob stays quiet on the bridge; the god bot moving the objective (or picking
-        // a new one) re-fires. The grind is indefinite (sentinel count, no WAIT): C++ travels to the
-        // coords then grinds the creature in place until we redirect or the stamp clears.
-        if (ctx.ExecDirective != ctx.LastGroupExec)
+        switch (o.Phase)
+        {
+            case GroupPhase.TravelToGiver:
+            case GroupPhase.TravelToTurnIn:
+                return GroupTravel(ctx, o);
+            case GroupPhase.Accept:
+                return GroupAccept(ctx, o);
+            case GroupPhase.Objective:
+                return GroupObjective(ctx, o);
+            case GroupPhase.TurnIn:
+                return GroupTurnIn(ctx, o);
+            case GroupPhase.HoldAtAnchor:
+                return GroupHold(ctx, o);
+            default:
+                // Forming (transient) or a phase this v1 executor doesn't drive: keep the log fresh on a
+                // cadence so the coordinator's gates see server truth, then idle until it stamps a
+                // concrete phase. Never a hard wait that could strand the bot.
+                if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
+                    return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+                return StepResult.Wait();
+        }
+    }
+
+    // Travel together to the stamped giver / ender. The coordinator flips the phase to Accept / TurnIn
+    // once the whole group is within reach, so arrival needs no local detection beyond "am I there yet".
+    private StepResult GroupTravel(BotContext ctx, GroupOrder o)
+    {
+        var npc = NpcOf(o);
+        if (AtNpc(ctx, npc))
+            return StepResult.Wait();          // arrived; the coordinator advances the phase next tick
+        ctx.SetStep("grp_travel");
+        return MoveTo(npc);
+    }
+
+    // In range, accept every quest this giver offers that we're eligible for and don't already hold
+    // (§1 breadth -- fire for all we CAN hold; C++ bounces any it won't). One per tick (Send the ack);
+    // the coordinator keeps the whole group in Accept until no eligible member still owes one here (§2).
+    private StepResult GroupAccept(BotContext ctx, GroupOrder o)
+    {
+        var npc = NpcOf(o);
+        if (!AtNpc(ctx, npc))
+        {
+            ctx.SetStep("grp_travel");
+            return MoveTo(npc);                // close the last yards individually
+        }
+        if (NextAcceptableAtGiver(ctx, o.TargetNpcEntry) is int qid)
+        {
+            ctx.SetStep("grp_accept");
+            return GroupInteract(qid, o.TargetNpcEntry, accept: true);
+        }
+        return StepResult.Wait();              // nothing left to accept here; wait for the team
+    }
+
+    // Grind the ONE shared objective the coordinator stamped (its embedded kill directive). Indefinite
+    // enriched grind (sentinel count, no WAIT), (re)issued when the objective changes OR when we just
+    // arrived from another phase (Step guard) -- a member already grinding the same mob stays quiet,
+    // otherwise we (re)engage. The log is refreshed on a cadence so the coordinator's "all holders done"
+    // gate sees server-credited kills (shared group credit advances counts with no local ack).
+    private StepResult GroupObjective(BotContext ctx, GroupOrder o)
+    {
+        if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
+            return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+        if (o != ctx.LastGroupOrder || ctx.Step != "grp_obj")
         {
             ctx.SetStep("grp_obj");
-            ctx.LastGroupExec = d;
-            return GroupObjectiveLeg(d);
+            ctx.LastGroupOrder = o;
+            return GroupObjectiveLeg(o.Objective);
         }
         return StepResult.Wait();
     }
+
+    // In range, turn in every COMPLETE pool quest we hold at the stamped ender. One per tick; the
+    // coordinator keeps the group in TurnIn until none holds a complete quest here.
+    private StepResult GroupTurnIn(BotContext ctx, GroupOrder o)
+    {
+        var npc = NpcOf(o);
+        if (!AtNpc(ctx, npc))
+        {
+            ctx.SetStep("grp_travel");
+            return MoveTo(npc);
+        }
+        if (NextCompleteAtEnder(ctx, o.TargetNpcEntry) is int qid)
+        {
+            ctx.SetStep("grp_turnin");
+            return GroupInteract(qid, o.TargetNpcEntry, accept: false);
+        }
+        return StepResult.Wait();
+    }
+
+    // A teammate is recovering: keep grinding the latched objective if there is one, else hold at the
+    // anchor coords. (The recovering member itself peeled to Maintenance via the GoalSelector hard-need.)
+    private StepResult GroupHold(BotContext ctx, GroupOrder o)
+    {
+        if (o.Objective.IsActive)
+            return GroupObjective(ctx, o);     // grind the latched mob (change-guarded)
+        var anchor = NpcOf(o);                 // TargetPos carries the anchor coords (NpcEntry 0)
+        if (AtNpc(ctx, anchor))
+            return StepResult.Wait();
+        ctx.SetStep("grp_hold");
+        return MoveTo(anchor);
+    }
+
+    // QUEST_INTERACT for the group path (no BatchQuest): accept / complete by quest id at the NPC.
+    private static StepResult GroupInteract(int questId, int npcEntry, bool accept)
+    {
+        string action = accept ? "accept" : "complete";
+        string expect = accept ? "QUEST_ACCEPT_ACK" : "QUEST_COMPLETE_ACK";
+        return StepResult.Send(
+            new BridgeCommand("QUEST_INTERACT", new { action, quest_id = questId, npc_entry = npcEntry }),
+            expect, InteractDeadline);
+    }
+
+    // The next quest THIS bot can accept at the stamped giver (eligible + unheld + uncompleted). The
+    // graph scan already excludes in-log / completed, so a returned id is genuinely acceptable here.
+    private int? NextAcceptableAtGiver(BotContext ctx, int giverEntry)
+    {
+        var id = ctx.Identity;
+        if (id == null) return null;
+        int raceBit = QuestGraphLoader.RaceToBitmask(id.Race);
+        int classBit = QuestGraphLoader.ClassToBitmask(id.ClassId);
+        var active = new HashSet<int>(ctx.QuestLog.Keys);
+        foreach (var q in _quests.GetAvailableQuests(raceBit, classBit, id.Level, id.CompletedQuestIds, active))
+            if (q.Giver?.NpcEntry == giverEntry)
+                return q.QuestId;
+        return null;
+    }
+
+    // The next quest THIS bot holds at server-COMPLETE whose turn-in is the stamped ender.
+    private int? NextCompleteAtEnder(BotContext ctx, int enderEntry)
+    {
+        foreach (var kv in ctx.QuestLog)
+        {
+            if (kv.Value.Status != QuestStatusComplete) continue;
+            var q = _quests.GetQuest(kv.Key);
+            var ender = q?.TurnIn ?? q?.Giver;
+            if (ender != null && ender.NpcEntry == enderEntry)
+                return kv.Key;
+        }
+        return null;
+    }
+
+    // Build a travel/interact target from the stamped order (TargetNpcEntry + TargetPos coords).
+    private static QuestNpcLocation NpcOf(GroupOrder o) => new QuestNpcLocation
+    {
+        NpcEntry = o.TargetNpcEntry,
+        X = o.TargetPos.X,
+        Y = o.TargetPos.Y,
+        Z = o.TargetPos.Z,
+        Map = o.TargetPos.Map
+    };
 
     // The shared-objective grind: enriched MOVE_TO (travel to the coords, then grind the creature in
     // place) with a sentinel kill_count never reached -> indefinite. Fire = no WAIT, so DriveGroup

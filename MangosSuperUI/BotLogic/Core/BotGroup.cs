@@ -61,6 +61,15 @@ public class BotGroup
     /// <summary>(Future) If PlayerLed, the human player's GUID. Null for BotCoordinated.</summary>
     public int? PlayerLeaderGuid { get; set; }
 
+    // ── Grouping central-driver state (AIBOT_GROUPING_DESIGN §7) ──
+    // The god-bot coordinator's per-group held plan: the union pool / phase / cursor /
+    // latched objective / train baseline. TRANSIENT — created with the group, mutated by
+    // GroupCoordinator.Update each tick, GC'd on disband. NEVER persisted:
+    // SaveGroupsToDbAsync writes its 5 fixed columns and ignores this, and LoadGroupsFromDb
+    // rebuilds groups with a fresh Plan. So a restart / reload simply re-Forms from live
+    // state next tick — nothing to round-trip, nothing to miscount across a reload.
+    public GroupPlan Plan { get; } = new();
+
     // ── Helpers ──
 
     public bool IsLeader(int guid) => LeaderGuid == guid;

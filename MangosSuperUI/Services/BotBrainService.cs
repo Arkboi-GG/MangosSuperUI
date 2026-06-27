@@ -47,6 +47,7 @@ public class BotBrainService : BackgroundService
     private readonly BotBrain _driver;           // the spine (BotBrain → BotExecutor/BotSupervisor)
     private readonly GroupManager _groupManager;
     private readonly QuestGraphLoader _quests;    // the shared quest graph -> handed to the god-bot pre-pass for union objective selection
+    private readonly ZoneSafetyMap _safety;       // §5.1 weakest-member travel gate (path creature-level)
 
     // Roster mirrors. _bots feeds the dashboard + grouping; _contexts is the
     // live-state the spine drives. One entry per connected bot in both.
@@ -71,7 +72,8 @@ public class BotBrainService : BackgroundService
         ILogger<BotBrainService> logger,
         ILoggerFactory loggerFactory,
         BotBrain driver,
-        QuestGraphLoader quests)
+        QuestGraphLoader quests,
+        ZoneSafetyMap safety)
     {
         _bridge = bridge;
         _db = db;
@@ -81,6 +83,7 @@ public class BotBrainService : BackgroundService
         _logger = logger;
         _driver = driver;
         _quests = quests;
+        _safety = safety;
         _groupManager = new GroupManager(_db, loggerFactory.CreateLogger<GroupManager>());
     }
 
@@ -687,7 +690,7 @@ public class BotBrainService : BackgroundService
         // decision+stamp -- it issues NO commands; the spine emits COMBAT_DIRECTIVE on change (BotBrain
         // step 1a) and the QuestPlanner consults the exec stamp. Only when driving; sensing-only skips it.
         if (_brainEnabled)
-            GroupCoordinator.Update(_contexts, _groupManager, _quests);
+            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety);
 
         foreach (var kvp in _contexts)
         {
