@@ -34,13 +34,18 @@ public sealed class BotExecutor
     // Ridge workers = 180s, but pass-2 'kill anything' keeps the gap far under this).
     private static readonly TimeSpan ObjectiveKillGrace = TimeSpan.FromSeconds(120);
 
-    // Premature-arrival guard (npc_not_found fix). A PLAIN travel MOVE_TO's TASK_COMPLETE is accepted
-    // as an arrival only when the bot is within this of the dest. Acks match by event TYPE (no corr),
-    // so a duplicate / previous-leg TASK_COMPLETE in the pipe would otherwise ack a just-issued travel
-    // leg early — the bot "arrives" hundreds of yards out and QuestPlanner fires QUEST_INTERACT from the
-    // wrong spot. Comfortably above the C++ 5yd arrival threshold, well under any real miss. Objective
-    // grinds are EXEMPT (IsObjectiveGrind): their "GRIND finished" legitimately completes away from dest.
+    // Premature-arrival guard (npc_not_found fix). Acks match by event TYPE (no corr), so a duplicate /
+    // previous-leg TASK_COMPLETE in the pipe can ack a just-issued travel leg early — the bot "arrives"
+    // hundreds of yards out and QuestPlanner fires QUEST_INTERACT from the wrong spot. We reject a
+    // TASK_COMPLETE only when it is BOTH implausibly young (a leg too new to have walked this far) AND
+    // far from dest — that pair is the stale-duplicate signature. We do NOT reject on distance alone:
+    // ctx.Pos is refreshed only on the 5s STATE heartbeat, so a legitimately-walked long leg can read up
+    // to ~one STATE-cycle stale (≈ 35yd at 7yd/s) at the instant C++'s real arrival lands. C++ only ever
+    // emits "arrived" within its own 3yd 2D gate (AiBotAIMain), so once a leg is older than
+    // PrematureArrivalSec its TASK_COMPLETE is real and is trusted regardless of the stale-position read.
+    // Objective grinds are EXEMPT (IsObjectiveGrind): their "GRIND finished" completes away from dest.
     private const float ArrivalGateYards = 20f;
+    private const double PrematureArrivalSec = 3.0;
 
     public BotExecutor(BotBridgeService bridge, ZoneSafetyMap safety, ILogger<BotExecutor> logger)
     {
@@ -185,6 +190,36 @@ public sealed class BotExecutor
                     }
                 }
                 break;
+            case "GRIND_BLOCKED":
+                // C++ dwell-escaped an over-cap grind field (the whole reachable area is denser than
+                // the solo overpull cap, so the bot livelocked patrolling it). There is NO pending
+                // MOVE_TO WAIT at grind time — the enriched MOVE_TO already handed off to grind-in-
+                // place and its WAIT resolved — so this CANNOT route through TryNegate. Set ctx.Failure
+                // DIRECTLY and let QuestPlanner.Recover relocate the objective to fresh ground. Carries
+                // the dead center (x|y|z) so the planner moves OFF that exact spot. Not a WAIT ack and
+                // not progress; bump the fail streak so the brain's wedge breaker is still a backstop.
+                {
+                    var gb = ParsePipe(evt.Data);
+                    Vec4? dead = null;
+                    if (gb.TryGetValue("x", out var gxs) && gb.TryGetValue("y", out var gys))
+                    {
+                        float gz = gb.TryGetValue("z", out var gzs) ? ParseF(gzs) : ctx.Pos.Z;
+                        dead = new Vec4(ParseF(gxs), ParseF(gys), gz, ctx.MapId);
+                    }
+                    ctx.Failure = new WaitFailure
+                    {
+                        CommandType = "GRIND",
+                        Reason = "overpull_dwell",
+                        Dest = dead,
+                        DangerLevel = 0,
+                        QuestId = null,
+                        Utc = DateTime.UtcNow
+                    };
+                    ctx.Pending = null;            // drop any stale grind WAIT so the planner re-derives cleanly
+                    ctx.ConsecutiveFailures++;     // feeds the brain's fast fail-loop breaker as a backstop
+                    _logger.LogDebug("[EXEC] {Name} GRIND_BLOCKED @ {Dead} — relocating objective", ctx.Name, dead);
+                    return true;                   // handled; no WAIT-matching needed
+                }
         }
 
         var pending = ctx.Pending;
@@ -211,11 +246,12 @@ public sealed class BotExecutor
         // TASK_COMPLETE legitimately fires away from the dest (C++ grinds at the mouth/scan hit).
         if (pending.CommandType == "MOVE_TO" && !pending.IsObjectiveGrind
             && string.Equals(evt.EventType, "TASK_COMPLETE", StringComparison.OrdinalIgnoreCase)
+            && pending.AgeSec < PrematureArrivalSec
             && ctx.DistToTarget >= 0 && ctx.DistToTarget > ArrivalGateYards)
         {
-            _logger.LogDebug("[EXEC] {Name} ignoring stale TASK_COMPLETE — {D:F0}yd from dest, not arrived",
-                ctx.Name, ctx.DistToTarget);
-            return false;   // keep waiting for the real arrival
+            _logger.LogDebug("[EXEC] {Name} ignoring premature TASK_COMPLETE — {D:F0}yd out, leg only {A:F1}s old (stale duplicate)",
+                ctx.Name, ctx.DistToTarget, pending.AgeSec);
+            return false;   // a too-young far arrival is a previous-leg duplicate; wait for the real one
         }
 
         _logger.LogDebug("[EXEC] {Name} ack {Type} via {Evt}",

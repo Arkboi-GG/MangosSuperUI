@@ -49,6 +49,13 @@ public sealed class GrindPlanner : IBotPlanner
         // so there is no WAIT that could false-stall a killing bot).
         if (ctx.Grind == null)
         {
+            // Fallback grind is the re-evaluated FILLER, not a strategic commitment — so it carries no
+            // held objective (the GoalSelector re-picks the moment a quest/group order appears, exactly
+            // as today). Clear any stale held objective (e.g. a coordinator order left on a just-ungrouped
+            // bot) so the reconcile (Held-Objective build §3) has nothing to defend here. (Held-Objective
+            // anchor is inert until the Session-3 echo lands; this keeps it clean regardless.)
+            ctx.ClearObjective();
+
             ctx.Grind = new GrindScratch
             {
                 CreatureEntry = 0,

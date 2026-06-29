@@ -54,6 +54,12 @@ public class BotStateSnapshot
     public float? LeaderZ { get; set; }
     public bool IsGrouped => GroupId.HasValue;
 
+    // --- C++ held-task echo (Held-Objective build §4) — what C++ reports running right now ---
+    // Unknown until the C++ STATE echo lands (Session 3). The bridge's STATE parse fills this from the
+    // task_* fields in the producer movement; until then it stays Unknown and the reconcile is a no-op
+    // (FromBridgeState does not set it, so the default applies).
+    public HeldTaskEcho HeldTask { get; set; } = HeldTaskEcho.Unknown;
+
     /// <summary>
     /// Build a snapshot from the existing BotState (BotBridgeService model).
     /// </summary>
@@ -79,7 +85,43 @@ public class BotStateSnapshot
             Copper = bs.Copper,
             Durability = bs.Durability,
             ServerQuestId = bs.QuestId,
-            ServerQuestStatus = bs.QuestStatus
+            ServerQuestStatus = bs.QuestStatus,
+            HeldTask = ParseHeldTask(bs)
         };
     }
+
+    // Build the C++ held-task echo from STATE (Held-Objective build §4). GATED on TaskActivity being
+    // non-empty: a pre-Session-3 binary sends no activity → HeldTaskEcho.Unknown → the reconcile is a
+    // no-op (today's behavior). Once C++ emits taskActivity, the kind comes from the existing taskState
+    // string, the headway from taskActivity, plus the target creature / MOVE_TO dest / kill count.
+    private static HeldTaskEcho ParseHeldTask(Services.BotState bs)
+    {
+        if (string.IsNullOrWhiteSpace(bs.TaskActivity))
+            return HeldTaskEcho.Unknown;   // no readback yet
+
+        var kind = ParseTaskKind(bs.TaskKind);   // committed task kind — NOT bs.TaskState (a display status)
+        var activity = ParseTaskActivity(bs.TaskActivity);
+        var dest = new Vec4(bs.TaskDestX, bs.TaskDestY, bs.TaskDestZ, bs.MapId);
+        return new HeldTaskEcho(kind, activity, (int)bs.TaskCreature, dest, bs.TaskKills);
+    }
+
+    private static HeldTaskKind ParseTaskKind(string s) => (s ?? "").Trim().ToUpperInvariant() switch
+    {
+        "GRIND" => HeldTaskKind.Grind,
+        "MOVE_TO" or "MOVE" or "MOVETO" => HeldTaskKind.MoveTo,
+        "INTERACT" => HeldTaskKind.Interact,
+        "IDLE" or "" => HeldTaskKind.Idle,
+        _ => HeldTaskKind.Idle
+    };
+
+    private static TaskActivity ParseTaskActivity(string s) => (s ?? "").Trim().ToLowerInvariant() switch
+    {
+        "traveling" or "travelling" => Core.TaskActivity.Traveling,
+        "searching" => Core.TaskActivity.Searching,
+        "engaged" => Core.TaskActivity.Engaged,
+        "recovering" => Core.TaskActivity.Recovering,
+        "blocked" => Core.TaskActivity.Blocked,
+        "idle" => Core.TaskActivity.Idle,
+        _ => Core.TaskActivity.Unknown
+    };
 }

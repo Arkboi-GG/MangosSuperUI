@@ -40,7 +40,9 @@ namespace MangosSuperUI.BotLogic.Planners;
 public sealed class QuestPlanner : IBotPlanner
 {
     private readonly QuestGraphLoader _quests;
+    private readonly ZoneSafetyMap _zones;
     private readonly ILogger<QuestPlanner> _logger;
+    private readonly Random _rng = new();
 
     private static readonly TimeSpan TravelDeadline = TimeSpan.FromMinutes(8);    // continuation travel can be long (section 4.11); also the enriched-objective WAIT bound (travel + first kill) — the KILL-push then tightens it to 120s no-kill
     private static readonly TimeSpan InteractDeadline = TimeSpan.FromSeconds(20); // accept/turn-in acks are near-instant
@@ -94,9 +96,10 @@ public sealed class QuestPlanner : IBotPlanner
     // that is actively leveling and will reach the quest band within a kill or two.
     private const int RedMargin = 4;            // newly-acquire only quests whose level <= botLevel + this
 
-    public QuestPlanner(QuestGraphLoader quests, ILogger<QuestPlanner> logger)
+    public QuestPlanner(QuestGraphLoader quests, ZoneSafetyMap zones, ILogger<QuestPlanner> logger)
     {
         _quests = quests;
+        _zones = zones;
         _logger = logger;
     }
 
@@ -180,11 +183,13 @@ public sealed class QuestPlanner : IBotPlanner
                 // MOVE_TO never emits "arrived (seam crossed)" (the C++ seam-divert grinds at the
                 // mouth), and its one WAIT is the backpressure — the brain can't re-issue under it,
                 // so the June-16 seam-cross flood cannot recur.
+                ctx.ClearObjective();   // grind leg done — drop Held so the obj_sync tick can't spuriously reconcile
                 ctx.SetStep("obj_sync");
                 return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
             case "grind_obj":
                 // TASK_COMPLETE = kill_count reached. Re-sync so opportunistic credit on the
                 // OTHER batched quests is seen, then derive the next objective / turn-in.
+                ctx.ClearObjective();   // grind leg done — drop Held so the obj_sync tick can't spuriously reconcile
                 ctx.SetStep("obj_sync");
                 return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
             case "to_turnin":
@@ -267,6 +272,12 @@ public sealed class QuestPlanner : IBotPlanner
     private StepResult Derive(BotContext ctx, QuestScratch q)
     {
         const int MaxDerivePasses = 16;   // legit reprocess is <= BatchCap overflow give-ups + 1 gather; 16 = headroom
+        // Solo held-objective hygiene (Held-Objective build §2, solo extension): every fresh derive starts
+        // with NO held objective; only an objective leg issued below (re)stamps it. So Held mirrors exactly
+        // "the reconcilable solo leg currently in flight" — it survives the in-flight WAIT + a goal bounce
+        // (the strand fix), but a turn-in / accept / grind-lock derive leaves it clear, so a stale Grind can
+        // not drive a spurious re-issue. Group Held is coordinator-owned and stamped elsewhere (untouched).
+        ctx.ClearObjective();
         for (int pass = 0; pass < MaxDerivePasses; pass++)
         {
             // -- 0. grey drop (the ONLY drop) -- one ABANDON per tick for accepted greys --
@@ -317,6 +328,13 @@ public sealed class QuestPlanner : IBotPlanner
                     // §4 enriched MOVE_TO: carry creature_entry/grind_radius/kill_count so C++ engages the
                     // mob on approach and grinds in place (ScanApproachTarget → ConvertMoveToGrindInPlace),
                     // never marching to / teleporting into the deep loader coord. One TASK_COMPLETE = the leg.
+                    // Hold this objective (SelfSolo): survives the goal bounce + the in-flight WAIT so the
+                    // reconcile re-issues it within one STATE cycle if C++ silently drops the grind task,
+                    // instead of the bot waiting out the 8-min travel deadline. Anchor-only — does not route.
+                    ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
+                        pick.Value.Leg.CreatureEntry, pick.Value.Leg.X, pick.Value.Leg.Y, pick.Value.Leg.Z,
+                        pick.Value.Leg.Map, pick.Value.Leg.Count > 0 ? pick.Value.Leg.Count : 1,
+                        pick.Value.Quest.QuestId, 0));
                     return MoveToObjectiveLeg(pick.Value.Leg);
                 }
             }
@@ -359,6 +377,9 @@ public sealed class QuestPlanner : IBotPlanner
                     ctx.SetStep("to_objective");
                     _logger.LogInformation("[QUEST] {Name} overflow grind [{Id}] slot {Slot} (server still INCOMPLETE past our count, try {N}/{Max})",
                         ctx.Name, bq.QuestId, o.Slot, tries + 1, MaxOverflowGrinds);
+                    ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
+                        o.CreatureEntry, o.GrindX, o.GrindY, o.GrindZ, o.GrindMap,
+                        OverflowChunk, bq.QuestId, o.Slot));   // SelfSolo overflow grind — same self-heal anchor
                     return MoveToObjective(o, OverflowChunk);
                 }
             }
@@ -427,9 +448,6 @@ public sealed class QuestPlanner : IBotPlanner
         return StepResult.Block("no_quests");
     }
 
-    // ========================================================================
-    // Failure recovery (batch-aware): shelve the ONE quest, keep the batch.
-    // ========================================================================
     private StepResult Recover(BotContext ctx)
     {
         var f = ctx.Failure!;
@@ -477,6 +495,41 @@ public sealed class QuestPlanner : IBotPlanner
             }
             q.Active = null;
             ctx.SetStep("plan");      // clear the stale leg so next tick derives, never re-fires a sync QUERY
+            return StepResult.Wait();
+        }
+
+        // OVERPULL_DWELL: C++ dwell-escaped an over-cap grind field (the whole reachable area at
+        // this objective center is denser than the solo cap — starter packs 4-6 deep vs cap 3 —
+        // so the bot livelocked patrolling it). The quest is NOT at fault and the field is NOT
+        // unsafe: do NOT shelve, do NOT blacklist, do NOT defer. Relocate the SAME objective's
+        // grind center to fresh ground and re-issue the enriched MOVE_TO. f.Dest is the dead
+        // center we move OFF. If the quest finished via shared/overflow credit while we were
+        // stuck (no unmet leg left), re-derive clean instead.
+        if (f.Reason == "overpull_dwell")
+        {
+            var live = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && HasUnmet(ctx, b)).ToList();
+            var pick = NearestLeg(ctx, live);
+            if (pick.HasValue)
+            {
+                var fresh = RelocateGrindCenter(ctx, pick.Value.Leg, f.Dest);
+
+                q.Active = pick.Value.Quest;
+                q.ActiveSlot = 0;
+                ctx.SetStep("to_objective");
+                ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
+                    fresh.CreatureEntry, fresh.X, fresh.Y, fresh.Z, fresh.Map,
+                    fresh.Count > 0 ? fresh.Count : 1));
+
+                _logger.LogInformation(
+                    "[QUEST] {Name} overpull-relocate [{Id}] entry={E}: dead ({DX:F0},{DY:F0}) -> fresh ({RX:F0},{RY:F0})",
+                    ctx.Name, q.Active.QuestId, fresh.CreatureEntry,
+                    f.Dest?.X ?? 0f, f.Dest?.Y ?? 0f, fresh.X, fresh.Y);
+
+                return MoveToObjectiveLeg(fresh);
+            }
+
+            q.Active = null;
+            ctx.SetStep("plan");
             return StepResult.Wait();
         }
 
@@ -827,6 +880,52 @@ public sealed class QuestPlanner : IBotPlanner
                 if (d < bestD) { bestD = d; best = (b, leg); }
             }
         return best;
+    }
+
+    // Relocate a grind leg's center OFF a dead (over-cap) spot to fresh ground for the same mob.
+    // Samples a ring OffsetYards out from the dead center in a random direction, rejects any cell
+    // the safety grid says is over-level for the bot (same GetMaxCreatureLevel ruleset as the
+    // path-safety gate) or empty of spawns, and takes the first cell that passes. Falls back to the
+    // leg's original center if nothing qualifies (never worse than re-sending today's coord). Z is
+    // carried from the leg — C++ ReGroundZ snaps it onto terrain on arrival, as with every coord.
+    private GrindLeg RelocateGrindCenter(BotContext ctx, GrindLeg leg, Vec4? dead)
+    {
+        const float OffsetYards = 110f;   // ~one safety cell (CELL_SIZE=100) past the dead spot
+        const int Samples = 8;      // ring samples before falling back to the original center
+
+        var id = ctx.Identity;
+        int botLevel = id?.Level ?? 1;
+        int threshold = botLevel + SafetyMargin;
+
+        float ax = dead?.X ?? leg.X;
+        float ay = dead?.Y ?? leg.Y;
+
+        double baseAngle = _rng.NextDouble() * Math.PI * 2.0;
+
+        float bestX = leg.X, bestY = leg.Y;
+        bool found = false;
+
+        for (int i = 0; i < Samples; i++)
+        {
+            double ang = baseAngle + (Math.PI * 2.0 * i / Samples);
+            float cx = ax + (float)Math.Cos(ang) * OffsetYards;
+            float cy = ay + (float)Math.Sin(ang) * OffsetYards;
+
+            int cellMax = _zones.GetMaxCreatureLevel(leg.Map, cx, cy);
+            int spawns = _zones.GetSpawnCount(leg.Map, cx, cy);
+
+            if (cellMax > 0 && cellMax > threshold) continue;   // over-level cell — skip
+            if (spawns <= 0) continue;                          // dead/empty cell — skip
+
+            bestX = cx; bestY = cy;
+            found = true;
+            break;
+        }
+
+        if (!found)
+            _logger.LogDebug("[QUEST] {Name} overpull-relocate: no validated sample, using original center", ctx.Name);
+
+        return new GrindLeg(leg.CreatureEntry, bestX, bestY, leg.Z, leg.Map, leg.Count);
     }
 
     // Overflow target: the nearest same-map creature slot among quests the server still calls

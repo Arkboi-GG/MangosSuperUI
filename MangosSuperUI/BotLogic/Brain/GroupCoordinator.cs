@@ -103,7 +103,19 @@ public static class GroupCoordinator
         // Mode Off disbands all groups, so GetAllGroups() is empty and the None pass is the whole
         // story. The explicit guard makes the off-switch obvious + cheap.
         if (groups.Mode == GroupingMode.Off)
+        {
+            // Grouping off → drop any coordinator-assigned held objective so each bot reverts fully to
+            // solo (its own producers own Held). Self-solo objectives are left untouched. (§6.)
+            foreach (var ctx in contexts.Values)
+                if (ctx.Held is { Source: ObjectiveSource.Coordinator })
+                    ctx.ClearObjective();
             return;
+        }
+
+        // Track who got an active group order this tick, so the post-pass can clear stale coordinator-
+        // assigned objectives on bots that dropped out of an active group (ungrouped / sub-quorum /
+        // graph-not-loaded) without disturbing the grace clock of bots still on the same order.
+        var groupedGuids = new HashSet<int>();
 
         foreach (var group in groups.GetAllGroups())
         {
@@ -134,7 +146,59 @@ public static class GroupCoordinator
 
             var order = DriveGroup(group.Plan, members, anchorGuid, quests, safety);
             foreach (var ctx in members)
+            {
                 ctx.GroupOrder = order;
+                StampHeld(ctx, order);            // mirror the order as the reconcile/observability anchor (§3/§6)
+                groupedGuids.Add(ctx.Guid);
+            }
+        }
+
+        // Clear stale coordinator-assigned objectives on bots no longer in an active group this tick
+        // (leaves self-solo objectives — the solo producers own those). A post-pass, NOT the default
+        // None pass, so a bot still on the SAME order keeps its grace clock intact (SetObjective only
+        // re-stamps the clock on a CHANGE). §6.
+        foreach (var ctx in contexts.Values)
+            if (!groupedGuids.Contains(ctx.Guid) && ctx.Held is { Source: ObjectiveSource.Coordinator })
+                ctx.ClearObjective();
+    }
+
+    // Mirror the assigned GroupOrder as the bot's held strategic objective (§3/§6) — the reconcile /
+    // observability anchor. Only the MOVING (Travel) and GRINDING (Grind) phases are reconcilable; the
+    // at-NPC interact phases (Accept/TurnIn) and the anchor hold are PASSIVE (Hold), never re-issued by
+    // the reconcile. SetObjective preserves the grace clock when the order is unchanged.
+    private static void StampHeld(BotContext ctx, GroupOrder o)
+    {
+        switch (o.Phase)
+        {
+            case GroupPhase.Objective:
+                var d = o.Objective;
+                ctx.SetObjective(Objective.Grind(ObjectiveSource.Coordinator, d.CreatureEntry,
+                    d.X, d.Y, d.Z, d.Map, 0, d.QuestId, d.Slot));   // killCount 0 = indefinite (coordinator gate owns completion)
+                break;
+            case GroupPhase.HoldAtAnchor:
+                if (o.Objective.IsActive)
+                {
+                    var h = o.Objective;
+                    ctx.SetObjective(Objective.Grind(ObjectiveSource.Coordinator, h.CreatureEntry,
+                        h.X, h.Y, h.Z, h.Map, 0, h.QuestId, h.Slot));
+                }
+                else
+                {
+                    ctx.SetObjective(Objective.Hold(o.TargetPos));
+                }
+                break;
+            case GroupPhase.TravelToGiver:
+            case GroupPhase.TravelToTurnIn:
+                ctx.SetObjective(Objective.Travel(ObjectiveSource.Coordinator,
+                    o.TargetPos.X, o.TargetPos.Y, o.TargetPos.Z, o.TargetPos.Map, o.TargetNpcEntry));
+                break;
+            case GroupPhase.Accept:
+            case GroupPhase.TurnIn:
+                ctx.SetObjective(Objective.Hold(o.TargetPos));   // at the NPC interacting — passive, not reconciled
+                break;
+            default:
+                ctx.ClearObjective();   // Forming (transient) / None / unhandled → no committed objective this tick
+                break;
         }
     }
 

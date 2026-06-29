@@ -411,6 +411,12 @@ public sealed class BotContext
     public bool InCombat { get; set; }
     public bool Dead { get; set; }
 
+    // ---- C++ held-task echo (Held-Objective build §4; refreshed each tick from STATE) ----
+    // What C++ reports it is ACTUALLY running right now (mirror of m_currentTask). Unknown until the
+    // C++ STATE echo lands (Session 3) — the reconcile (BotBrain) treats Unknown as "no readback →
+    // today's behavior", so this is a no-op until the wire half ships. Copied from the snapshot in Sense.
+    public HeldTaskEcho HeldTask { get; set; } = HeldTaskEcho.Unknown;
+
     // ---- goal scratch (typed; only the active goal's is populated) ----
     public QuestScratch? Quest { get; set; }
     public GrindScratch? Grind { get; set; }
@@ -464,6 +470,33 @@ public sealed class BotContext
     public GroupOrder GroupOrder { get; set; } = GroupOrder.None;
     public GroupOrder LastGroupOrder { get; set; } = GroupOrder.None;
 
+    // ---- held strategic objective (Held-Objective build §2) ----
+    // The bot's COMMITTED strategic task, ABOVE Goal and OUTLIVING the leg-level WAIT (ctx.Pending),
+    // ResetScratch, and the EnterGoalAsync SET_TASK IDLE bounce. Set by the strategic decider (a
+    // planner committing a leg, or the GroupCoordinator assigning the shared objective); CLEARED only
+    // on done / reassign / hard cap — NEVER by a goal change. That survival is the whole point: it lets
+    // the reconcile detect "C++ dropped my objective" (echo=IDLE while Held=Grind) and re-commit.
+    // GoalSelector consults it to stay the course instead of re-deriving the pick filter every tick.
+    // Null = no objective held → free to select. (Nothing stamps it until the producer movement; until
+    // then every consult/reconcile branch is inert and behavior is byte-for-byte today's.)
+    public Objective? Held { get; private set; }
+    public DateTime ObjectiveSinceUtc { get; private set; } = DateTime.UtcNow;
+
+    /// <summary>Commit (or re-commit) the held strategic objective. Stamps the grace clock only on a
+    /// CHANGE (structural equality on the record), so re-stamping the SAME objective each tick doesn't
+    /// keep resetting the reconcile adoption grace.</summary>
+    public void SetObjective(Objective o)
+    {
+        if (Held is not { } cur || !cur.Equals(o)) ObjectiveSinceUtc = DateTime.UtcNow;
+        Held = o;
+    }
+
+    /// <summary>Drop the held objective (done / reassigned / capped) → free to select next.</summary>
+    public void ClearObjective() => Held = null;
+
+    /// <summary>Seconds since the held objective was last (re)committed — the reconcile adoption grace.</summary>
+    public double TimeSinceObjectiveSec => (DateTime.UtcNow - ObjectiveSinceUtc).TotalSeconds;
+
     // ----------------------------- helpers ---------------------------------
     public double TimeInGoalSec => (DateTime.UtcNow - GoalSinceUtc).TotalSeconds;
     public double TimeInStepSec => (DateTime.UtcNow - StepSinceUtc).TotalSeconds;
@@ -502,5 +535,6 @@ public sealed class BotContext
         Durability = (int)snap.Durability;
         InCombat = snap.InCombat;
         Dead = snap.IsDead;
+        HeldTask = snap.HeldTask;   // C++ task readback (Unknown until the Session-3 STATE echo lands)
     }
 }

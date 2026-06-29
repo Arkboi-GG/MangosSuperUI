@@ -107,6 +107,35 @@ public class BotStatePayload
     [JsonPropertyName("taskState")]
     public string TaskState { get; set; } = "IDLE";
 
+    // --- Held-task echo (Held-Objective build §4) — what C++ reports it is ACTUALLY running. ---
+    // taskState (above) is a DISPLAY status that conflates DEAD/COMBAT with the task, so it is NOT
+    // a clean kind. taskKind is the committed task kind from m_currentTask.type (stays GRIND/MOVE_TO
+    // through combat) — this is what the reconcile matches against. These add the within-objective
+    // ACTIVITY (the headway signal triage reads instead of a clock) + the target + pushed kill
+    // progress. ABSENT on a pre-Session-3 binary → defaults below → the snapshot maps to
+    // HeldTaskEcho.Unknown (gated on taskActivity being non-empty), so the reconcile stays a no-op
+    // until the C++ writer ships. snake/camel keys match the existing style.
+    [JsonPropertyName("taskKind")]
+    public string TaskKind { get; set; } = "";              // IDLE/MOVE_TO/GRIND — the committed task kind (NOT the display taskState)
+
+    [JsonPropertyName("taskActivity")]
+    public string TaskActivity { get; set; } = "";          // idle/traveling/searching/engaged/recovering/blocked — "" = no echo (Unknown)
+
+    [JsonPropertyName("taskCreature")]
+    public uint TaskCreature { get; set; } = 0;             // the grind mob C++ is on (0 = nearest valid)
+
+    [JsonPropertyName("taskDestX")]
+    public float TaskDestX { get; set; } = 0;
+
+    [JsonPropertyName("taskDestY")]
+    public float TaskDestY { get; set; } = 0;
+
+    [JsonPropertyName("taskDestZ")]
+    public float TaskDestZ { get; set; } = 0;
+
+    [JsonPropertyName("taskKills")]
+    public int TaskKills { get; set; } = 0;                 // kills credited on the current task so far
+
     [JsonPropertyName("freeSlots")]
     public uint FreeSlots { get; set; } = 16;
 
@@ -284,6 +313,14 @@ public class BotState
     public bool IsDead { get; set; }
     public int TargetGuid { get; set; }
     public string TaskState { get; set; } = "IDLE";
+    // Held-task echo (Held-Objective build §4) — kind (committed task) + activity + target + kill progress.
+    public string TaskKind { get; set; } = "";
+    public string TaskActivity { get; set; } = "";
+    public uint TaskCreature { get; set; } = 0;
+    public float TaskDestX { get; set; } = 0;
+    public float TaskDestY { get; set; } = 0;
+    public float TaskDestZ { get; set; } = 0;
+    public int TaskKills { get; set; } = 0;
     public uint FreeSlots { get; set; } = 16;
     public uint TotalSlots { get; set; } = 16;
     public uint Copper { get; set; } = 0;
@@ -547,6 +584,13 @@ public class BotBridgeService : BackgroundService
         bs.IsDead = state.IsDead;
         bs.TargetGuid = state.TargetGuid;
         bs.TaskState = state.TaskState;
+        bs.TaskKind = state.TaskKind;           // Held-task echo (§4) — committed kind, NOT the display taskState
+        bs.TaskActivity = state.TaskActivity;   // Held-task echo (§4) — Unknown until C++ emits it
+        bs.TaskCreature = state.TaskCreature;
+        bs.TaskDestX = state.TaskDestX;
+        bs.TaskDestY = state.TaskDestY;
+        bs.TaskDestZ = state.TaskDestZ;
+        bs.TaskKills = state.TaskKills;
         bs.FreeSlots = state.FreeSlots;
         bs.TotalSlots = state.TotalSlots;
         bs.Copper = state.Copper;
@@ -567,6 +611,29 @@ public class BotBridgeService : BackgroundService
         if (evt == null) return;
 
         var eventType = evt.Event?.ToUpperInvariant() ?? "";
+
+        // Fresh-position refresh ("give C# fresh data whenever C++ has it"). Any event whose data
+        // carries x|y|z — a TASK_COMPLETE arrival, a TELEPORT_ACK — updates the bot's canonical
+        // position NOW, the same field the 5s STATE heartbeat writes (conn.State.X/Y/Z, which the
+        // brain snapshots into ctx.Pos). Without it, ctx.Pos is up to one 5s cycle stale: a bot that
+        // just walked to a giver still reads tens of yards out, so the planner re-issues MOVE_TO
+        // (or the arrival gate false-rejects) instead of interacting — the 150s between-task park.
+        // C++ already knows the exact arrival coord; this stops discarding it until the next STATE.
+        if (!string.IsNullOrEmpty(evt.Data) && evt.Data.Contains("x="))
+        {
+            var posKv = ParsePipeDelimited(evt.Data);
+            if (posKv.TryGetValue("x", out var sx) &&
+                posKv.TryGetValue("y", out var sy) &&
+                posKv.TryGetValue("z", out var sz) &&
+                float.TryParse(sx, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fx) &&
+                float.TryParse(sy, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fy) &&
+                float.TryParse(sz, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fz))
+            {
+                conn.State.X = fx;
+                conn.State.Y = fy;
+                conn.State.Z = fz;
+            }
+        }
 
         switch (eventType)
         {

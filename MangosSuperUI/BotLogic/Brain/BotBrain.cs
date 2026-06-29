@@ -47,6 +47,12 @@ public sealed class BotBrain
     private const double WedgeBackoffSec = 5;    // park this long, then resume + relocate to a fresh cell
     private const double TrainWedgeCooldownSec = 300;   // a trainer-route wedge defers Training this long (mirrors TrainingPlanner give-up) so the bot quests instead of re-bee-lining
 
+    // ── Held-objective reconcile (Held-Objective build §3) ──
+    // Grace after a held objective is (re)committed before the reconcile may re-issue it: C++ needs a
+    // STATE tick (~5s) to adopt the task and echo it back, so a just-assigned objective whose echo still
+    // reads the OLD task is NOT a real mismatch. The time analog of BotExecutor.ArrivalGateYards.
+    private const double ReconcileGraceSec = 7;
+
     public BotBrain(
         BotExecutor executor,
         BotSupervisor supervisor,
@@ -86,6 +92,16 @@ public sealed class BotBrain
 
         // 1b. No-progress circuit breaker. Fires before goal/plan so a wedged bot is parked, not driven.
         if (await TryBreakWedgeAsync(ctx)) return;
+
+        // 1c. Reconcile the held objective against C++'s reported task (Held-Objective build §3).
+        //     ctx.Held is the committed strategic objective; ctx.HeldTask is what C++ says it is
+        //     ACTUALLY running. If C++ has dropped / never adopted it (echo known, past the adoption
+        //     grace, and not matching), knock out the in-flight WAIT + the group change-guard so the
+        //     active planner RE-ISSUES the realizing leg this tick — the self-heal for the SET_TASK IDLE
+        //     strand. Degrades safe: Held null or echo Unknown (no readback yet) → no-op, today's
+        //     behavior byte-for-byte. Runs before goal selection so the re-issue happens in this tick's
+        //     Act block; orthogonal to the wedge/goal machinery (it only clears guards, never drives).
+        ReconcileHeldObjective(ctx);
 
         // 2. Select the goal. On a change: stop a leaving grind patrol, reset the
         //    goal scratch, clear any WAIT, stamp the new goal.
@@ -228,6 +244,56 @@ public sealed class BotBrain
     }
 
     // ----------------------------------------------------------------------
+
+    /// <summary>
+    /// Reconcile the held strategic objective (ctx.Held) against C++'s reported task (ctx.HeldTask,
+    /// §3). The held objective OUTLIVES the leg WAIT and the goal bounce; the echo says what C++ is
+    /// ACTUALLY running. When they disagree past the adoption grace — C++ idle or on a stale/different
+    /// task while we still hold a Grind/Travel objective — the realizing leg was lost (the classic case:
+    /// EnterGoalAsync fired SET_TASK IDLE on a Questing exit and a change-guard then suppressed the
+    /// re-issue). Clear the in-flight commitment guards so the active planner re-commits the leg THIS
+    /// tick (PlanNext runs below with Pending == null). This never builds wire itself; it only invalidates
+    /// the guards and lets the owning planner re-issue, reusing the established paths.
+    ///
+    /// No-ops (today's behavior, byte-for-byte) when: no objective held, the echo is Unknown (no C++
+    /// readback yet — pre-Session-3), the objective was (re)committed within the adoption grace, the
+    /// kind is passive (Hold/Idle), or C++ is already on it.
+    /// </summary>
+    private void ReconcileHeldObjective(BotContext ctx)
+    {
+        if (ctx.Held is not { } held || !held.NeedsActuation) return;   // nothing reconcilable held
+
+        // Only reconcile while the bot is actually PURSUING the objective. Both a solo quest objective and a
+        // group shared objective are worked under Goal.Questing (GoalSelector routes an active GroupOrder there,
+        // and the solo enriched-objective leg is a Questing leg); a fallback grind clears Held on arm. So if the
+        // bot has peeled to Maintenance / Training / Idle (death, heal, vendor, wedge-park), the held objective is
+        // stale-by-context — re-issuing into another planner would clobber its in-flight WAIT (e.g. knock out a
+        // RESURRECT mid-rez). Gate it. The strand case is untouched: the parked bot this exists to rescue is
+        // still Goal.Questing (the 31,043 Questing/enter park).
+        if (ctx.Goal != Goal.Questing) return;
+
+        var echo = ctx.HeldTask;
+        if (!echo.IsKnown) return;                                       // no readback → degrade to ctx.Pending inference
+        if (ctx.TimeSinceObjectiveSec < ReconcileGraceSec) return;       // just (re)committed — let C++ adopt it first
+        if (held.MatchedBy(echo)) return;                                // C++ is on it → §5 progress checks own the rest
+
+        // Mismatch: C++ is idle / on a stale or different task while we hold this objective. Clear the in-flight
+        // WAIT + any stale failure, then force the OWNING planner to re-issue the realizing leg this tick. The
+        // mechanism differs by provenance: a Coordinator objective re-issues via DriveGroup's change-guard (clear
+        // LastGroupOrder); a SelfSolo objective re-issues via a fresh QuestPlanner derive (step → "plan", the
+        // established re-derive sentinel). NOT a raw advance: the step-apply switch would read a cleared
+        // to_objective WAIT as COMPLETION and move on, and Recover would DEFER the quest — both wrong for
+        // "C++ dropped it, put it back".
+        _executor.ClearPending(ctx);
+        ctx.Failure = null;
+        if (held.Source == ObjectiveSource.Coordinator)
+            ctx.LastGroupOrder = GroupOrder.None;   // force QuestPlanner.DriveGroup to re-issue the group leg
+        else
+            ctx.SetStep("plan");                    // force QuestPlanner to RE-DERIVE the solo leg (not advance/defer)
+        _logger.LogInformation(
+            "[BRAIN] {Name} RECONCILE — C++ task {Echo} != held {Held} (cre={Cre}, src={Src}) — re-issuing",
+            ctx.Name, echo.Kind, held.Kind, held.CreatureEntry, held.Source);
+    }
 
     /// <summary>
     /// Transition into a new goal: stop a leaving C++ grind patrol (SET_TASK IDLE),
