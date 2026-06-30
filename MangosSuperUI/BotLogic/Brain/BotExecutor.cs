@@ -168,10 +168,44 @@ public sealed class BotExecutor
                 }
                 break;
             case "QUEST_UPDATE":
-            case "QUEST_ACCEPT_ACK":
             case "QUEST_COMPLETE_ACK":
                 ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
+                break;
+            case "QUEST_ACCEPT_ACK":
+                ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
+                ctx.MarkProgress();
+                // Seed the just-accepted quest into the log cache IMMEDIATELY. ctx.QuestLog is otherwise
+                // refreshed ONLY by QUEST_STATUS_ALL, so between an accept and the next QUERY the cache
+                // does not reflect the new quest -- and a batch rebuilt in that window (a quick Questing
+                // bounce inside QuestPlanner.LogSyncCapSec, where the q==null fast path builds off the
+                // recent-but-pre-accept snapshot) misses it in BuildBatch step-1 resume, re-seeds it as a
+                // fresh Accepted=false pick, and marches the bot ALL THE WAY back to its giver to re-accept
+                // a quest the C++ idempotent-ack just rubber-stamps (the re-accept walk). Seeding here makes
+                // step-1 resume catch it. Guards: parse the quest id (the ack data is the bare quest_id, with
+                // a keyed fallback), and seed ONLY when absent so an IDEMPOTENT re-accept ack can never clobber
+                // real server counts already cached. Ref-swap (copy+assign) keeps a concurrent planner read
+                // lock-free (same pattern as QUEST_STATUS_ALL). INCOMPLETE(3)+zero counts is the correct
+                // fresh-accept state; the next QUERY ref-swaps the authoritative snapshot over it. The stamp
+                // is deliberately NOT advanced -- it tracks the last AUTHORITATIVE refresh, so a due QUERY
+                // still fires (this only ADDS a known-held id, it does not assert the snapshot is current).
+                {
+                    var raw = evt.Data?.Trim();
+                    if (!int.TryParse(raw, out var acceptedQid))
+                    {
+                        var kv = ParsePipe(evt.Data);
+                        if (!kv.TryGetValue("quest_id", out var qs) || !int.TryParse(qs, out acceptedQid))
+                            acceptedQid = 0;
+                    }
+                    if (acceptedQid > 0 && !ctx.QuestLog.ContainsKey(acceptedQid))
+                    {
+                        var seeded = new Dictionary<int, QuestLogEntry>(ctx.QuestLog)
+                        {
+                            [acceptedQid] = new QuestLogEntry { Status = 3, MobCounts = new int[4], ItemCounts = new int[4] }
+                        };
+                        ctx.QuestLog = seeded;
+                    }
+                }
                 break;
             case "LEVEL_UP":
                 ctx.LastLevelUtc = DateTime.UtcNow;

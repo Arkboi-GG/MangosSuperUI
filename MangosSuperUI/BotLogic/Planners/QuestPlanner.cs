@@ -167,6 +167,20 @@ public sealed class QuestPlanner : IBotPlanner
                 // firing the accept from far away returns npc_not_found. Not actually at the giver →
                 // re-issue the travel instead of a doomed interact. The executor's ArrivalGate normally
                 // absorbs this; this is the planner-side backstop.
+                //
+                // In-log abort (re-accept march fix): a QUERY may have landed mid-trip and the log now
+                // shows we already hold this quest (it was always in the C++ log; the giver leg was issued
+                // off a stale snapshot). Don't finish the walk just to fire a redundant accept -- mark it
+                // accepted, drop the leg, and re-derive straight to its objective/turn-in this same tick.
+                if (q.Active != null && ctx.QuestLog.ContainsKey(q.Active.QuestId))
+                {
+                    q.Active.Accepted = true;
+                    _logger.LogDebug("[QUEST] {Name} to_giver aborted -- [{Id}] already in log, resuming (no re-accept walk)",
+                        ctx.Name, q.Active.QuestId);
+                    q.Active = null;
+                    ctx.SetStep("plan");
+                    break;
+                }
                 if (q.Active?.Node.Giver is { } gv)
                 {
                     if (AtNpc(ctx, gv)) { ctx.SetStep("accept"); return Interact(q.Active, accept: true); }
@@ -174,7 +188,18 @@ public sealed class QuestPlanner : IBotPlanner
                 }
                 break;
             case "accept":
-                if (q.Active != null) { q.Active.Accepted = true; q.Active = null; }
+                if (q.Active != null)
+                {
+                    q.Active.Accepted = true;
+                    q.Active = null;
+                    // Drain the hub in place. We just accepted AT a giver, so any OTHER quest this giver (or
+                    // one within BatchRadius) offers should be folded in and accepted now, before we leave --
+                    // otherwise the seed/accept arrives from outside the cluster, grabs only the one quest, and
+                    // the 10s en-route Rescan discovers the rest after we have walked off, marching us back (the
+                    // accept-then-backtrack waste). Bounded (BatchCap/BatchRadius) and idempotent (adds only new);
+                    // resets LastGatherPos so Derive's gated en-route gather this tick no-ops.
+                    GatherLocals(ctx, q);
+                }
                 break;
             case "to_objective":
                 // §4 enriched objective: the MOVE_TO carried creature_entry/grind_radius/kill_count,
@@ -226,6 +251,15 @@ public sealed class QuestPlanner : IBotPlanner
                         ctx.Name, q.Active.QuestId, q.Active.Node.Title);
                     q.Batch.Remove(q.Active);
                     q.Active = null;
+                    // Drain follow-ups in place. A turn-in just added this quest to CompletedQuestIds, so any
+                    // follow-up gated on it -- frequently offered by the VERY NPC we are standing on (the ender
+                    // is often also the next giver) -- is now Pickable. Re-gather HERE so it enters the batch and
+                    // the accept phase grabs it in place this same derive, instead of deriving a far objective,
+                    // leaving, and having the 10s en-route Rescan walk us all the way back to this NPC to accept
+                    // it (the turn-in-then-backtrack waste seen live: complete 5261 at npc 196 -> leave -> rescan
+                    // -> return to 196 for follow-up 33). Bounded + idempotent; resets LastGatherPos so Derive's
+                    // gated en-route gather this tick no-ops.
+                    GatherLocals(ctx, q);
                 }
                 break;
         }
@@ -310,6 +344,12 @@ public sealed class QuestPlanner : IBotPlanner
             // En-route discovery: fold in new local givers once the bot has moved enough.
             if (ctx.Pos.Dist2D(q.LastGatherPos) > GatherRescanYards)
                 GatherLocals(ctx, q);
+
+            // In-log reconcile (re-accept march fix): flip any batch quest the C++ log already shows we
+            // hold to Accepted=true so the accept phase never walks the bot to its giver for a redundant
+            // accept (the idempotent C++ ack just rubber-stamps it -- the trip is pure wasted travel, hit
+            // on every level-up / Training bounce when BuildBatch resumed off a pre-QUERY snapshot).
+            ReconcileAcceptedFromLog(ctx, q);
 
             // -- 1. ACCEPT phase -- visit unaccepted givers nearest-first --
             var toAccept = q.Batch.Where(b => !b.Accepted && !b.Failed && b.Node.Giver != null).ToList();
@@ -730,6 +770,7 @@ public sealed class QuestPlanner : IBotPlanner
 
         foreach (var node in Pickable(_quests, id)
                      .Where(n => !have.Contains(n.QuestId))
+                     .Where(n => !ctx.QuestLog.ContainsKey(n.QuestId))   // already in the C++ log => not a fresh pick (resumed by BuildBatch step 1). Pickable uses the no-active GetAvailableQuests overload, which returns in-log quests, so without this an already-held quest gets re-seeded Accepted=false and the bot marches to its giver to re-accept (the re-accept walk).
                      .Where(n => WithinBatch(ctx, n))
                      .OrderBy(n => Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver!.X, n.Giver!.Y)))
         {
@@ -739,6 +780,28 @@ public sealed class QuestPlanner : IBotPlanner
             added = true;
         }
         return added;
+    }
+
+    // In-log accept reconcile (re-accept march fix). The C++ log (ctx.QuestLog, refreshed by
+    // QUEST_STATUS_ALL) is the durable truth for what is accepted. A batch quest can read Accepted=false
+    // yet ALREADY be in the log -- BuildBatch step-1 resume ran off a pre-QUERY snapshot (a Questing
+    // re-entry right after a level-up / Training bounce), so it missed the quest, and GatherLocals then
+    // re-seeded it as a fresh pick (Pickable uses the no-active GetAvailableQuests overload, which does
+    // NOT exclude in-log quests). The accept phase would then march the bot ALL THE WAY to the giver to
+    // fire an accept the C++ idempotent-ack just rubber-stamps -- pure wasted travel, on every level-up.
+    // Flip any such quest to Accepted=true so it skips straight to objective/turn-in. No per-quest
+    // seeding is needed: the objective/turn-in phases read ctx.QuestLog by id+slot (HasUnmet / IsComplete
+    // / RawRemaining), exactly like the BuildBatch step-1 resume shape.
+    private void ReconcileAcceptedFromLog(BotContext ctx, QuestScratch q)
+    {
+        foreach (var b in q.Batch)
+        {
+            if (b.Accepted || b.TurnedIn) continue;
+            if (!ctx.QuestLog.ContainsKey(b.QuestId)) continue;
+            b.Accepted = true;
+            _logger.LogDebug("[QUEST] {Name} already-in-log [{Id}] \"{Title}\" -- skip giver, resume from log (no re-accept walk)",
+                ctx.Name, b.QuestId, b.Node.Title);
+        }
     }
 
     // The nearest in-reach pickable -- used only to SEED an empty batch so the bot travels to
