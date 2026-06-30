@@ -47,6 +47,11 @@ public sealed class BotExecutor
     private const float ArrivalGateYards = 20f;
     private const double PrematureArrivalSec = 3.0;
 
+    // First-rescan lead-in for an interruptible objective leg. Matches BotBrain's RescanInterval (10s,
+    // which re-arms each subsequent rescan), so the en-route soft re-plan cadence is uniform. The 50yd
+    // movement throttle inside QuestPlanner.Rescan is the real gate, so the exact value is non-critical.
+    private static readonly TimeSpan RescanLeadIn = TimeSpan.FromSeconds(10);
+
     public BotExecutor(BotBridgeService bridge, ZoneSafetyMap safety, ILogger<BotExecutor> logger)
     {
         _bridge = bridge;
@@ -76,7 +81,14 @@ public sealed class BotExecutor
             ExpectedEvent = expectedEvent,
             SentUtc = now,
             DeadlineUtc = now + deadline,
-            IsObjectiveGrind = objectiveGrind
+            IsObjectiveGrind = objectiveGrind,
+            // Interruptible: an objective leg (incl. the phase-4b lone-far trek) carries a rescan clock so
+            // BotBrain step 3c re-evaluates it on a cadence while the WAIT is pending — QuestPlanner.Rescan
+            // re-gathers around the bot's CURRENT position and PREEMPTS the trek if a closer quest folds in
+            // en route (the "scan a 100yd radius along the whole path" behavior). Non-objective WAITs leave
+            // this null (not interruptible). First rescan is one interval out; the 50yd movement throttle
+            // inside Rescan no-ops it cheaply when the bot is grinding in place rather than travelling.
+            RescanAtUtc = objectiveGrind ? now + RescanLeadIn : (DateTime?)null
         };
 
         // Capture the destination so FleetReport can show distance-to-target.
@@ -191,13 +203,13 @@ public sealed class BotExecutor
                 }
                 break;
             case "GRIND_BLOCKED":
-                // C++ dwell-escaped an over-cap grind field (the whole reachable area is denser than
-                // the solo overpull cap, so the bot livelocked patrolling it). There is NO pending
-                // MOVE_TO WAIT at grind time — the enriched MOVE_TO already handed off to grind-in-
-                // place and its WAIT resolved — so this CANNOT route through TryNegate. Set ctx.Failure
-                // DIRECTLY and let QuestPlanner.Recover relocate the objective to fresh ground. Carries
-                // the dead center (x|y|z) so the planner moves OFF that exact spot. Not a WAIT ack and
-                // not progress; bump the fail streak so the brain's wedge breaker is still a backstop.
+                // C++ froze on a grind (over-cap field OR no valid target) for AIBOT_GRIND_FREEZE_DWELL
+                // ticks and handed back. There is NO pending MOVE_TO WAIT at grind time (the enriched
+                // MOVE_TO already handed off to grind-in-place and its WAIT resolved), so this CANNOT route
+                // through TryNegate — set ctx.Failure DIRECTLY and let QuestPlanner.Recover break the freeze
+                // with the unstick detour. Carries the center (x|y|z) + reason (overpull_dwell|no_target).
+                // Not a WAIT ack and not progress; bump the fail streak so the wedge breaker stays a backstop
+                // (a successful detour's TASK_COMPLETE resets it).
                 {
                     var gb = ParsePipe(evt.Data);
                     Vec4? dead = null;
@@ -206,19 +218,25 @@ public sealed class BotExecutor
                         float gz = gb.TryGetValue("z", out var gzs) ? ParseF(gzs) : ctx.Pos.Z;
                         dead = new Vec4(ParseF(gxs), ParseF(gys), gz, ctx.MapId);
                     }
+                    string grsn = gb.TryGetValue("reason", out var rr) ? rr : "grind_blocked";
                     ctx.Failure = new WaitFailure
                     {
                         CommandType = "GRIND",
-                        Reason = "overpull_dwell",
+                        Reason = grsn,
                         Dest = dead,
                         DangerLevel = 0,
                         QuestId = null,
                         Utc = DateTime.UtcNow
                     };
                     ctx.Pending = null;            // drop any stale grind WAIT so the planner re-derives cleanly
-                    ctx.ConsecutiveFailures++;     // feeds the brain's fast fail-loop breaker as a backstop
-                    _logger.LogDebug("[EXEC] {Name} GRIND_BLOCKED @ {Dead} — relocating objective", ctx.Name, dead);
-                    return true;                   // handled; no WAIT-matching needed
+                    // NB: do NOT bump ConsecutiveFailures. GRIND_BLOCKED is a self-healing handback (C# answers
+                    // with the unstick detour), not a hard failure — counting it tripped the wedge-breaker
+                    // (cap 8) within ~24s of metronoming, which parked the bot into a Goal.Grinding filler
+                    // (entry=0 goal=0) that can't unstick itself, starving the detour. The detour's OWN 60s
+                    // WAIT deadline is the real backstop if a kill never lands; the wedge stays a backstop for
+                    // genuine no-progress (TimeSinceProgressSec > 150s), which a detouring bot never hits.
+                    _logger.LogDebug("[EXEC] {Name} GRIND_BLOCKED ({Reason}) @ {Dead} — unstick detour", ctx.Name, grsn, dead);
+                    return true;                // handled; no WAIT-matching needed
                 }
         }
 

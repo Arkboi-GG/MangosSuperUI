@@ -88,7 +88,8 @@ public static class GroupCoordinator
         IReadOnlyDictionary<int, BotContext> contexts,
         GroupManager groups,
         QuestGraphLoader quests,
-        ZoneSafetyMap safety)
+        ZoneSafetyMap safety,
+        CreatureSpawnLoader spawns)   // Scatter Build 2: real-spawn anchor sampling for the shared objective
     {
         // Default EVERY bot to None on BOTH seams, then overwrite grouped members below. A bot
         // that left a group this tick (or the whole mode going Off) reverts to solo for combat
@@ -144,7 +145,7 @@ public static class GroupCoordinator
             if (!quests.IsLoaded)
                 continue;
 
-            var order = DriveGroup(group.Plan, members, anchorGuid, quests, safety);
+            var order = DriveGroup(group.Plan, members, anchorGuid, quests, safety, spawns);
             foreach (var ctx in members)
             {
                 ctx.GroupOrder = order;
@@ -207,7 +208,7 @@ public static class GroupCoordinator
     // ────────────────────────────────────────────────────────────────────────
     private static GroupOrder DriveGroup(
         GroupPlan plan, List<BotContext> members, int anchorGuid,
-        QuestGraphLoader quests, ZoneSafetyMap safety)
+        QuestGraphLoader quests, ZoneSafetyMap safety, CreatureSpawnLoader spawns)
     {
         var anchor = AnchorOf(members, anchorGuid);
         var prevPhase = plan.Phase;   // instrumentation: phase BEFORE this tick's decision
@@ -267,7 +268,7 @@ public static class GroupCoordinator
         }
 
         // (b) Objective -- grind the nearest incomplete shared mob together (latched).
-        var obj = NextObjective(plan, anchor, members, quests);
+        var obj = NextObjective(plan, anchor, members, quests, spawns);
         if (obj.IsActive)
         {
             plan.LatchedObjective = obj;
@@ -461,7 +462,8 @@ public static class GroupCoordinator
 
     // ── (b) The latched, else nearest, incomplete shared kill objective on the anchor's map ──
     private static ExecDirective NextObjective(
-        GroupPlan plan, BotContext anchor, List<BotContext> members, QuestGraphLoader quests)
+        GroupPlan plan, BotContext anchor, List<BotContext> members, QuestGraphLoader quests,
+        CreatureSpawnLoader spawns)
     {
         // Hold the latch while any present, live holder still owes kills on it (no per-tick re-pick).
         if (plan.LatchedObjective.IsActive && StillOwed(plan.LatchedObjective, members, quests))
@@ -499,6 +501,19 @@ public static class GroupCoordinator
                 if (d < bestD) { bestD = d; best = cand; }
             }
         }
+
+        // Build 2 scatter (god-bot, group path). The chosen shared anchor becomes a RANDOM REAL
+        // SPAWN COORD of the creature, rolled ONCE here at selection. NextObjective returns the
+        // LATCHED objective unchanged on every later tick (the early return above), so this coord is
+        // held stable — all members StampHeld AND fire the enriched MOVE_TO from this SAME
+        // ExecDirective, so they converge on one scattered anchor (focus-fire intact) and their
+        // Held↔echo match is automatic (both read d.X/d.Y/d.Z from here, so MatchedBy's 25yd tol is
+        // trivially met). Selection above stayed on canonical distance — only the stored anchor moves.
+        // Two trios on the same quest (or successive picks) no longer camp one pixel. Null sample
+        // (<2 spawns on map) → canonical coord unchanged, no regression.
+        if (best.IsActive && spawns.SampleScatterPoint(best.CreatureEntry, best.Map) is { } gsp)
+            best = ExecDirective.Objective(best.QuestId, best.Slot, best.CreatureEntry,
+                gsp.X, gsp.Y, gsp.Z, best.Map, anchor.Guid);
         return best;
     }
 

@@ -40,12 +40,14 @@ namespace MangosSuperUI.BotLogic.Planners;
 public sealed class QuestPlanner : IBotPlanner
 {
     private readonly QuestGraphLoader _quests;
-    private readonly ZoneSafetyMap _zones;
+    private readonly CreatureSpawnLoader _spawns;   // Scatter Build 2: per-entry spawn footprint sampler
     private readonly ILogger<QuestPlanner> _logger;
-    private readonly Random _rng = new();
+    // (removed) ZoneSafetyMap _zones + Random _rng — were used ONLY by RelocateGrindCenter, which is
+    // deleted (its sole caller, the overpull relocate, was replaced by the unstick detour 2026-06-29).
 
     private static readonly TimeSpan TravelDeadline = TimeSpan.FromMinutes(8);    // continuation travel can be long (section 4.11); also the enriched-objective WAIT bound (travel + first kill) — the KILL-push then tightens it to 120s no-kill
     private static readonly TimeSpan InteractDeadline = TimeSpan.FromSeconds(20); // accept/turn-in acks are near-instant
+    private static readonly TimeSpan DetourDeadline = TimeSpan.FromSeconds(60);   // unstick "kill 1 of whatever" — guard-bypassed pull lands fast; if it can't (truly empty area) the deadline escalates to a normal accepted-quest defer
 
     private const float GrindRadius = 60f;
     private const float ForceRadius = 150f;     // bot within this of a failed giver/turn-in => WMO last leg -> force_*
@@ -96,10 +98,10 @@ public sealed class QuestPlanner : IBotPlanner
     // that is actively leveling and will reach the quest band within a kill or two.
     private const int RedMargin = 4;            // newly-acquire only quests whose level <= botLevel + this
 
-    public QuestPlanner(QuestGraphLoader quests, ZoneSafetyMap zones, ILogger<QuestPlanner> logger)
+    public QuestPlanner(QuestGraphLoader quests, CreatureSpawnLoader spawns, ILogger<QuestPlanner> logger)
     {
         _quests = quests;
-        _zones = zones;
+        _spawns = spawns;
         _logger = logger;
     }
 
@@ -190,6 +192,17 @@ public sealed class QuestPlanner : IBotPlanner
                 // TASK_COMPLETE = kill_count reached. Re-sync so opportunistic credit on the
                 // OTHER batched quests is seen, then derive the next objective / turn-in.
                 ctx.ClearObjective();   // grind leg done — drop Held so the obj_sync tick can't spuriously reconcile
+                ctx.SetStep("obj_sync");
+                return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+            case "detour":
+                // The unstick detour's single kill just completed (TASK_COMPLETE "GRIND finished"). The freeze
+                // is broken (+1 kill, +XP, and the nearest mob was usually the quest mob itself → often quest
+                // credit too). Snap back to the objective: re-sync the log (so any credit the detour kill
+                // earned is seen) and re-derive — the still-unmet blocked leg is the nearest, so the bot
+                // returns to it; if the kill COMPLETED it, derive advances to turn-in. Same tail as
+                // to_objective. Held was cleared at detour-issue (the detour was the commitment); derive
+                // re-stamps it. The premature-arrival guard exempts this (it's a grind TASK_COMPLETE, not travel).
+                ctx.ClearObjective();
                 ctx.SetStep("obj_sync");
                 return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
             case "to_turnin":
@@ -312,31 +325,52 @@ public sealed class QuestPlanner : IBotPlanner
                 }
             }
 
-            // -- 2. OBJECTIVE sweep -- nearest unmet GRIND LEG (kill or creature-drop item), outliers shelved --
+            // -- 1b. LOCAL TURN-IN -- hand in any complete quest whose ender is within the immediate
+            //      cluster (BatchRadius, the same radius as the gather/accept hub) BEFORE leaving for an
+            //      objective. The hub is now drained fully on both sides: accept everything nearby (phase 1),
+            //      turn in everything nearby (here). This closes the starvation where a ready hand-in at an
+            //      adjacent giver (e.g. an immediate follow-up hub) — and the chain it unlocks — sat behind a
+            //      freshly-accepted FAR objective: turn-in was phase 3 (after the objective sweep), so the bot
+            //      grabbed a new quest, ground its objective, and never reached the nearby hand-in. DISTANT
+            //      enders are deliberately NOT caught here — they fall through to the phase-3 turn-in AFTER the
+            //      objective sweep, preserving the "kill in the field, then hand in" no-yo-yo optimization. The
+            //      bot is between legs when Derive runs (an in-flight objective leg holds its WAIT), so this is
+            //      drain-between-legs, never a mid-travel divert.
+            var localComplete = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed
+                                                   && (IsComplete(ctx, b) || !b.Node.HasObjectives)
+                                                   && WithinTurnInCluster(ctx, b)).ToList();
+            if (localComplete.Count > 0)
+            {
+                var bq = Nearest(ctx, localComplete, b => { var l = TurnInNpc(b); return (l.X, l.Y, l.Map); });
+                if (bq != null)
+                {
+                    q.Active = bq;
+                    var npc = TurnInNpc(bq);
+                    if (AtNpc(ctx, npc)) { ctx.SetStep("turnin"); return Interact(bq, accept: false); }
+                    ctx.SetStep("to_turnin");
+                    return MoveTo(npc);
+                }
+            }
+
+            // -- 2. NEAR OBJECTIVE -- nearest unmet GRIND LEG, taken ONLY if within the immediate cluster
+            //      (BatchRadius). A farther-but-reachable leg is NOT parked here: distance no longer changes
+            //      batch membership, only PHASE ORDER. The far leg stays a live candidate and is taken as the
+            //      phase-4b lone-far trek, AFTER local turn-ins (phase 1b/3) and a reprocess have had their
+            //      shot — so the bot chains the near cluster, turns in for XP, grabs follow-ups, and only
+            //      treks to the far one when nothing nearer remains. (This is "deprioritize, don't defer" —
+            //      the old reach>cap shelve pulled far quests from the batch and could strand the bot into
+            //      grind-lock; that shelve is removed in TagOutliers.)
             var withObj = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && HasUnmet(ctx, b)).ToList();
             var candidates = withObj.Where(b => !b.Deferred).ToList();
             if (candidates.Count > 0)
             {
-                TagOutliers(ctx, candidates);                       // shelve only quests whose objectives fall outside the allowed range
+                TagOutliers(ctx, candidates);                       // red-deprioritize only now (no distance park)
                 var live = candidates.Where(b => !b.Deferred).ToList();
                 var pick = NearestLeg(ctx, live);
-                if (pick != null)
-                {
-                    q.Active = pick.Value.Quest;
-                    q.ActiveSlot = 0;                               // legs aren't slot-routed (item legs live in ItemObjectives)
-                    ctx.SetStep("to_objective");
-                    // §4 enriched MOVE_TO: carry creature_entry/grind_radius/kill_count so C++ engages the
-                    // mob on approach and grinds in place (ScanApproachTarget → ConvertMoveToGrindInPlace),
-                    // never marching to / teleporting into the deep loader coord. One TASK_COMPLETE = the leg.
-                    // Hold this objective (SelfSolo): survives the goal bounce + the in-flight WAIT so the
-                    // reconcile re-issues it within one STATE cycle if C++ silently drops the grind task,
-                    // instead of the bot waiting out the 8-min travel deadline. Anchor-only — does not route.
-                    ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
-                        pick.Value.Leg.CreatureEntry, pick.Value.Leg.X, pick.Value.Leg.Y, pick.Value.Leg.Z,
-                        pick.Value.Leg.Map, pick.Value.Leg.Count > 0 ? pick.Value.Leg.Count : 1,
-                        pick.Value.Quest.QuestId, 0));
-                    return MoveToObjectiveLeg(pick.Value.Leg);
-                }
+                if (pick != null
+                    && Dist2(ctx.Pos.X, ctx.Pos.Y, pick.Value.Leg.X, pick.Value.Leg.Y) <= BatchRadius)
+                    return DispatchObjectiveLeg(ctx, q, pick.Value);   // near → work it now
+                // pick is null or FAR → fall through (turn-ins, reprocess, then the phase-4b far trek)
             }
 
             // -- 2b. OVERFLOW grind -- the SERVER still reports this kill quest INCOMPLETE even
@@ -377,10 +411,15 @@ public sealed class QuestPlanner : IBotPlanner
                     ctx.SetStep("to_objective");
                     _logger.LogInformation("[QUEST] {Name} overflow grind [{Id}] slot {Slot} (server still INCOMPLETE past our count, try {N}/{Max})",
                         ctx.Name, bq.QuestId, o.Slot, tries + 1, MaxOverflowGrinds);
+                    // Build 2 scatter (overflow path): same real-spawn dispersal + Held/MOVE_TO
+                    // coord-consistency as the normal sweep. Routed through MoveToObjectiveLeg (a
+                    // GrindLeg with Count=OverflowChunk → kill_count=OverflowChunk, identical to the
+                    // retired MoveToObjective).
+                    var oleg = Scatter(new GrindLeg(o.CreatureEntry, o.GrindX, o.GrindY, o.GrindZ, o.GrindMap, OverflowChunk));
                     ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
-                        o.CreatureEntry, o.GrindX, o.GrindY, o.GrindZ, o.GrindMap,
+                        oleg.CreatureEntry, oleg.X, oleg.Y, oleg.Z, oleg.Map,
                         OverflowChunk, bq.QuestId, o.Slot));   // SelfSolo overflow grind — same self-heal anchor
-                    return MoveToObjective(o, OverflowChunk);
+                    return MoveToObjectiveLeg(oleg);
                 }
             }
 
@@ -420,6 +459,18 @@ public sealed class QuestPlanner : IBotPlanner
                 foreach (var b in q.Batch) b.Deferred = false;
                 continue;
             }
+
+            // -- 4b. FAR OBJECTIVE (the lone-far trek) -- nothing near to grind, no local turn-in pending,
+            //      nothing new to gather. NOW take the nearest unmet leg with NO distance cap: a deliberate
+            //      trek to a reachable-but-far objective the near sweep (phase 2) skipped. Taken only as a
+            //      last resort, so the bot never idles or grind-locks while real in-zone work remains.
+            //      Cross-map legs are excluded by NearestLeg, so a cross-continent objective is never walked
+            //      to here — it rides in the log until the bot out-levels it and it greys out (the only drop).
+            //      Path-safety (C++ IsPathSafe + the path_unsafe blacklist) still guards the trek itself.
+            var farObj = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && !b.Deferred && HasUnmet(ctx, b)).ToList();
+            var farPick = NearestLeg(ctx, farObj);
+            if (farPick != null)
+                return DispatchObjectiveLeg(ctx, q, farPick.Value);
 
             // -- 5. nothing to accept / work / turn in / discover -> batch exhausted --
             // The carried set (incl. any Failed-this-sweep quests still in the C++ log) is resumed on
@@ -498,39 +549,38 @@ public sealed class QuestPlanner : IBotPlanner
             return StepResult.Wait();
         }
 
-        // OVERPULL_DWELL: C++ dwell-escaped an over-cap grind field (the whole reachable area at
-        // this objective center is denser than the solo cap — starter packs 4-6 deep vs cap 3 —
-        // so the bot livelocked patrolling it). The quest is NOT at fault and the field is NOT
-        // unsafe: do NOT shelve, do NOT blacklist, do NOT defer. Relocate the SAME objective's
-        // grind center to fresh ground and re-issue the enriched MOVE_TO. f.Dest is the dead
-        // center we move OFF. If the quest finished via shared/overflow credit while we were
-        // stuck (no unmet leg left), re-derive clean instead.
-        if (f.Reason == "overpull_dwell")
+        // GRIND FREEZE (overpull_dwell | no_target): C++ froze on this objective's field — every reachable
+        // candidate is over the solo cap, OR the quest mobs are all dead/tapped right now. The quest is NOT
+        // at fault and the field is NOT unsafe: do NOT shelve, blacklist, or defer. Break the freeze with a
+        // guaranteed single kill — an in-place SET_TASK GRIND entry=0 kill_count=1 at the bot's spot. C++
+        // treats (entry==0 && killGoal==1) as an UNSTICK pull and bypasses the overpull veto once (the
+        // in-combat retreat stays armed), so it ALWAYS lands a kill — and the nearest valid mob is usually
+        // the very mob we were frozen beside, so this often credits the blocked quest directly. On its
+        // TASK_COMPLETE (step "detour") we re-sync + re-derive, snapping back to the objective.
+        //
+        // Held is CLEARED here on purpose: during the detour the bot's committed task is the detour, not the
+        // objective — leaving Held set would make the reconcile (BotBrain 1c) fight the detour (Held=Grind
+        // entry=K vs C++ echo entry=0 → spurious re-issue). Derive re-stamps Held when the objective resumes.
+        if (f.Reason == "overpull_dwell" || f.Reason == "no_target")
         {
-            var live = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && HasUnmet(ctx, b)).ToList();
-            var pick = NearestLeg(ctx, live);
-            if (pick.HasValue)
-            {
-                var fresh = RelocateGrindCenter(ctx, pick.Value.Leg, f.Dest);
+            ctx.ClearObjective();
+            ctx.SetStep("detour");
 
-                q.Active = pick.Value.Quest;
-                q.ActiveSlot = 0;
-                ctx.SetStep("to_objective");
-                ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
-                    fresh.CreatureEntry, fresh.X, fresh.Y, fresh.Z, fresh.Map,
-                    fresh.Count > 0 ? fresh.Count : 1));
+            _logger.LogInformation("[QUEST] {Name} grind freeze ({Reason}) [{Id}] — unstick: kill 1 in place, then resume",
+                ctx.Name, f.Reason, active.QuestId);
 
-                _logger.LogInformation(
-                    "[QUEST] {Name} overpull-relocate [{Id}] entry={E}: dead ({DX:F0},{DY:F0}) -> fresh ({RX:F0},{RY:F0})",
-                    ctx.Name, q.Active.QuestId, fresh.CreatureEntry,
-                    f.Dest?.X ?? 0f, f.Dest?.Y ?? 0f, fresh.X, fresh.Y);
-
-                return MoveToObjectiveLeg(fresh);
-            }
-
-            q.Active = null;
-            ctx.SetStep("plan");
-            return StepResult.Wait();
+            return StepResult.Send(
+                new BridgeCommand("SET_TASK", new
+                {
+                    task = "GRIND",
+                    x = ctx.Pos.X,
+                    y = ctx.Pos.Y,
+                    z = ctx.Pos.Z,
+                    radius = GrindRadius,
+                    creature_entry = 0,
+                    kill_count = 1
+                }),
+                "TASK_COMPLETE", DetourDeadline);
         }
 
         // A NO-OBJECTIVE quest whose TURN-IN the server refused: it needs an action this
@@ -775,22 +825,19 @@ public sealed class QuestPlanner : IBotPlanner
         return Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver.X, n.Giver.Y) <= BatchRadius;
     }
 
-    // ========================================================================
-    // Objective selection + the far-outlier rule
-    // ========================================================================
-    // A quest's "reach" = distance from the bot to its FARTHEST unmet kill objective
-    // (it can't turn in until all are done, so the worst leg defines the commitment).
-    private float QuestReach(BotContext ctx, BatchQuest b)
+    // The TURN-IN ender is within the immediate hub cluster (BatchRadius — the same radius the gather
+    // and accept use), i.e. a hand-in to drain locally before leaving for an objective rather than a far
+    // trek. Same-map only; a cross-map ender is never "local". Mirrors WithinBatch but keys on the ender.
+    private static bool WithinTurnInCluster(BotContext ctx, BatchQuest b)
     {
-        float worst = 0f;
-        foreach (var leg in UnmetLegs(ctx, b))
-        {
-            if (leg.Map != ctx.MapId) return float.MaxValue;   // cross-map leg = maximally far
-            float d = Dist2(ctx.Pos.X, ctx.Pos.Y, leg.X, leg.Y);
-            if (d > worst) worst = d;
-        }
-        return worst;
+        var npc = TurnInNpc(b);
+        if (npc.Map != ctx.MapId) return false;
+        return Dist2(ctx.Pos.X, ctx.Pos.Y, npc.X, npc.Y) <= BatchRadius;
     }
+
+    // ========================================================================
+    // Objective selection
+    // ========================================================================
 
     // Shelve (Deferred = true for this sweep) ONLY a quest that would take the bot OUTSIDE its
     // current allowed travel range — i.e. its FARTHEST unmet objective is beyond GetMaxTravelDistance
@@ -803,17 +850,14 @@ public sealed class QuestPlanner : IBotPlanner
     {
         var id = ctx.Identity;
         if (id == null) return;
-        float cap = ZoneSafetyMap.GetMaxTravelDistance(id.Level, ctx.ZoneId, 0);   // the current allowed range
-        foreach (var b in candidates)
-        {
-            float reach = QuestReach(ctx, b);   // distance to the FARTHEST unmet objective (cross-map = MaxValue)
-            if (reach > cap)
-            {
-                b.Deferred = true;
-                _logger.LogDebug("[QUEST] {Name} shelving out-of-range quest [{Id}] reach={R:F0} (cap {Cap:F0})",
-                    ctx.Name, b.QuestId, reach, cap);
-            }
-        }
+
+        // (2026-06-29) The out-of-range DISTANCE PARK was REMOVED here. Distance no longer DEFERS an
+        // objective — it only changes PHASE ORDER (near sweep = phase 2 ≤ BatchRadius; farther-but-reachable
+        // = the phase-4b lone-far trek, after local turn-ins + reprocess). A far quest is therefore never
+        // pulled from the batch — the pull is what used to strand a bot into grind-lock — it just sorts last
+        // and, if the bot out-levels it first, greys out and drops. Cross-map legs are auto-excluded by
+        // NearestLeg. Only the red deprioritize below still sweep-defers: an over-level quest is a QUALITY
+        // problem (don't pull the bot into red content while in-level work remains), not a distance one.
 
         // Red-deprioritize: an already-ACCEPTED over-level (red) quest -- e.g. an L9 bot that grabbed an
         // L12 Westfall quest before the IsRed acquisition gate, then got death-ported INTO Westfall so its
@@ -821,7 +865,7 @@ public sealed class QuestPlanner : IBotPlanner
         // content ahead of its in-range Elwynn work. We never ABANDON it (carry policy: only grey drops),
         // so it stays in the log and resumes once the bot levels into its band. We only SWEEP-DEFER it here,
         // and ONLY while at least one non-red in-range quest remains to work this sweep -- so a bot that has
-        // nothing BUT a red still works the red rather than idling. Mirrors the out-of-range shelve above.
+        // nothing BUT a red still works the red rather than idling.
         var nonRedLive = candidates.Any(b => !b.Deferred && !IsRed(b.Node, id.Level));
         if (nonRedLive)
         {
@@ -882,50 +926,19 @@ public sealed class QuestPlanner : IBotPlanner
         return best;
     }
 
-    // Relocate a grind leg's center OFF a dead (over-cap) spot to fresh ground for the same mob.
-    // Samples a ring OffsetYards out from the dead center in a random direction, rejects any cell
-    // the safety grid says is over-level for the bot (same GetMaxCreatureLevel ruleset as the
-    // path-safety gate) or empty of spawns, and takes the first cell that passes. Falls back to the
-    // leg's original center if nothing qualifies (never worse than re-sending today's coord). Z is
-    // carried from the leg — C++ ReGroundZ snaps it onto terrain on arrival, as with every coord.
-    private GrindLeg RelocateGrindCenter(BotContext ctx, GrindLeg leg, Vec4? dead)
+    // Build 2 scatter (replaced RelocateGrindCenter, 2026-06-29). Disperse an objective grind onto
+    // a RANDOM REAL SPAWN COORD of its target creature instead of the single representative
+    // GrindX/GrindY, so co-holders (grouped or independently-solo on the same quest) fan out across
+    // the mob's actual footprint rather than dogpiling one pixel. Real spawn coords are valid ground
+    // by construction (no nav check needed — and the enriched-objective MOVE_TO skips arrival jitter).
+    // Falls back to the leg's original coord when the entry has <2 known spawns on this map (the
+    // sampler returns null) — never worse than today. The returned leg drives BOTH the MOVE_TO and the
+    // Held stamp at the call sites, keeping them coord-consistent for the 1c reconcile.
+    private GrindLeg Scatter(GrindLeg leg)
     {
-        const float OffsetYards = 110f;   // ~one safety cell (CELL_SIZE=100) past the dead spot
-        const int Samples = 8;      // ring samples before falling back to the original center
-
-        var id = ctx.Identity;
-        int botLevel = id?.Level ?? 1;
-        int threshold = botLevel + SafetyMargin;
-
-        float ax = dead?.X ?? leg.X;
-        float ay = dead?.Y ?? leg.Y;
-
-        double baseAngle = _rng.NextDouble() * Math.PI * 2.0;
-
-        float bestX = leg.X, bestY = leg.Y;
-        bool found = false;
-
-        for (int i = 0; i < Samples; i++)
-        {
-            double ang = baseAngle + (Math.PI * 2.0 * i / Samples);
-            float cx = ax + (float)Math.Cos(ang) * OffsetYards;
-            float cy = ay + (float)Math.Sin(ang) * OffsetYards;
-
-            int cellMax = _zones.GetMaxCreatureLevel(leg.Map, cx, cy);
-            int spawns = _zones.GetSpawnCount(leg.Map, cx, cy);
-
-            if (cellMax > 0 && cellMax > threshold) continue;   // over-level cell — skip
-            if (spawns <= 0) continue;                          // dead/empty cell — skip
-
-            bestX = cx; bestY = cy;
-            found = true;
-            break;
-        }
-
-        if (!found)
-            _logger.LogDebug("[QUEST] {Name} overpull-relocate: no validated sample, using original center", ctx.Name);
-
-        return new GrindLeg(leg.CreatureEntry, bestX, bestY, leg.Z, leg.Map, leg.Count);
+        var sp = _spawns.SampleScatterPoint(leg.CreatureEntry, leg.Map);
+        if (sp == null) return leg;                                  // no footprint → canonical
+        return leg with { X = sp.X, Y = sp.Y, Z = sp.Z };           // Z is a real spawn Z; C++ ReGroundZ snaps on arrival
     }
 
     // Overflow target: the nearest same-map creature slot among quests the server still calls
@@ -1046,33 +1059,33 @@ public sealed class QuestPlanner : IBotPlanner
             new BridgeCommand("MOVE_TO", new { mapId = loc.Map, x = loc.X, y = loc.Y, z = loc.Z }),
             "TASK_COMPLETE", TravelDeadline);
 
-    // §4 enriched objective: ONE MOVE_TO carries the kill target (creature_entry/grind_radius/
-    // kill_count). C++ scans for the mob during the approach and hands off to GRIND in place,
-    // re-centering on the bot — at the cave mouth on a seam, mid-approach on a scan hit, or at
-    // the dest on auto-arrive — never the bare "arrived (seam crossed)" teleport (that path is
-    // creature_entry==0 only). Its single TASK_COMPLETE ("GRIND finished" at kill_count) = this
-    // objective done. The one WAIT is the backpressure (no re-issue under it); the executor flags
-    // it IsObjectiveGrind, so the KILL-push rolls the deadline to now+120s on each kill — it fails
-    // only on a 120s no-kill gap once grinding, or the travel ceiling before the first kill. A
-    // genuinely all-deep-past-the-50yd-mouth objective therefore shelves at the deadline (bounded),
-    // it never loops. kill_count is the remaining count (>=1; 0 = an indefinite C++ grind that never acks).
-    private static StepResult MoveToObjective(QuestObjective obj, int killCount)
-        => StepResult.Send(
-            new BridgeCommand("MOVE_TO", new
-            {
-                mapId = obj.GrindMap,
-                x = obj.GrindX,
-                y = obj.GrindY,
-                z = obj.GrindZ,
-                creature_entry = obj.CreatureEntry,
-                grind_radius = GrindRadius,
-                kill_count = killCount
-            }),
-            "TASK_COMPLETE", TravelDeadline);   // IsObjectiveGrind => KILL-push tightens to 120s no-kill
+    // Dispatch one objective grind leg — shared by the NEAR sweep (phase 2) and the FAR lone-trek
+    // (phase 4b) so both go through identical scatter + Held-stamp logic. Scatter samples a real spawn
+    // coord for this creature so co-holders disperse across its footprint instead of dogpiling the one
+    // representative GrindX/GrindY (Build 2); the SAME scattered coord stamps Held AND drives the MOVE_TO,
+    // keeping them coord-consistent so the 1c reconcile's MatchedBy sees the echo's dest within tol of Held
+    // (no false re-issue — the 06-28 crawl trap). No footprint → Scatter returns the leg unchanged. The
+    // §4 enriched MOVE_TO carries creature_entry/grind_radius/kill_count so C++ engages the mob on approach
+    // and grinds in place; its single TASK_COMPLETE = this leg. Held (SelfSolo) survives the goal bounce +
+    // the in-flight WAIT so the reconcile re-issues within one STATE cycle if C++ drops the task.
+    private StepResult DispatchObjectiveLeg(BotContext ctx, QuestScratch q, (BatchQuest Quest, GrindLeg Leg) pick)
+    {
+        q.Active = pick.Quest;
+        q.ActiveSlot = 0;                               // legs aren't slot-routed (item legs live in ItemObjectives)
+        ctx.SetStep("to_objective");
+        var leg = Scatter(pick.Leg);
+        ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
+            leg.CreatureEntry, leg.X, leg.Y, leg.Z,
+            leg.Map, leg.Count > 0 ? leg.Count : 1,
+            pick.Quest.QuestId, 0));
+        return MoveToObjectiveLeg(leg);
+    }
 
     // §4 enriched MOVE_TO for a grind leg (kill or creature-drop item). kill_count = remaining
     // (never 0 — 0 = an indefinite C++ grind that never acks). For an item leg the count is the
     // items still owed; an unlucky drop streak just re-derives another leg after the TASK_COMPLETE.
+    // Both objective dispatch paths (normal sweep + overflow) now route through here, after Scatter
+    // (Build 2) has set the leg's coords to a real spawn point of the target creature.
     private static StepResult MoveToObjectiveLeg(GrindLeg leg)
         => StepResult.Send(
             new BridgeCommand("MOVE_TO", new

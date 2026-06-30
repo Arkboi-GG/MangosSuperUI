@@ -77,6 +77,7 @@ builder.Services.AddSingleton<BotStateTracker>();
 builder.Services.AddSingleton<QuirkLoader>();
 builder.Services.AddSingleton<SpellProgressionLoader>();
 builder.Services.AddSingleton<ZoneDataLoader>();
+builder.Services.AddSingleton<CreatureSpawnLoader>();   // Scatter Build 2: per-entry spawn footprint sampler (QuestPlanner)
 builder.Services.AddSingleton<QuestGraphLoader>();
 builder.Services.AddSingleton<BotBrainDbInit>();
 
@@ -130,6 +131,13 @@ await app.Services.GetRequiredService<ZoneSafetyMap>().LoadAsync();
 // and every vendor lookup returned null ("no vendors loaded on this map"). Load it here, same
 // as the other startup loaders.
 await app.Services.GetRequiredService<ZoneDataLoader>().LoadAsync();
+
+// Creature spawn footprints — backs QuestPlanner's Scatter (Build 2). Like the loaders above,
+// registered as a singleton but its LoadAsync must be invoked here or _spawnsByEntry stays empty
+// and every objective dispatch falls back to the canonical GrindX/GrindY (no scatter, no crash —
+// just today's dogpile). Confirm the "CreatureSpawnLoader: cached N spawn points across M entries"
+// line at boot.
+await app.Services.GetRequiredService<CreatureSpawnLoader>().LoadAsync();
 
 // Class-trainer location cache — backs TrainingPlanner.GetNearestTrainer. Like ZoneDataLoader
 // above, registered as a singleton but its LoadAsync must be invoked here or _trainersByClass
