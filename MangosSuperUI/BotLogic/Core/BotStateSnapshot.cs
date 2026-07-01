@@ -1,5 +1,7 @@
 ﻿namespace MangosSuperUI.BotLogic.Core;
 
+using MangosSuperUI.BotLogic.Data;   // QuestLogEntry (the quest-log snapshot now rides on STATE)
+
 /// <summary>
 /// Lightweight snapshot populated from the most recent bridge STATE message.
 /// Passed into every domain method so they don't need to query the bridge themselves.
@@ -60,6 +62,14 @@ public class BotStateSnapshot
     // (FromBridgeState does not set it, so the default applies).
     public HeldTaskEcho HeldTask { get; set; } = HeldTaskEcho.Unknown;
 
+    // --- Full quest-log snapshot, pushed on STATE (retired the QUERY_QUEST_STATUS pull) ---
+    // The authoritative mirror of the C++ player quest log (me->GetQuestStatusMap()), parsed from the
+    // STATE "quests" blob. ctx.QuestLog is set from this in Sense every tick, so the planner always reads
+    // ground truth and never a stale/partial/empty request-reply cache. StateUtc is when this STATE landed
+    // (bs.LastUpdate) — the freshness clock the objective re-derive (obj_sync) gates on.
+    public Dictionary<int, QuestLogEntry> QuestLog { get; set; } = new();
+    public DateTime StateUtc { get; set; }
+
     /// <summary>
     /// Build a snapshot from the existing BotState (BotBridgeService model).
     /// </summary>
@@ -86,8 +96,48 @@ public class BotStateSnapshot
             Durability = bs.Durability,
             ServerQuestId = bs.QuestId,
             ServerQuestStatus = bs.QuestStatus,
-            HeldTask = ParseHeldTask(bs)
+            HeldTask = ParseHeldTask(bs),
+            QuestLog = ParseQuestLog(bs.Quests),   // full quest-log snapshot off STATE (retired pull)
+            StateUtc = bs.LastUpdate                // when this STATE landed → the obj-resync freshness clock
         };
+    }
+
+    // Parse the pipe-delimited quest-log snapshot carried on STATE (was the QUEST_STATUS_ALL payload):
+    //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
+    // status: COMPLETE=1, INCOMPLETE=3 (VMaNGOS enum). Empty/blank => the bot holds no quests (a real,
+    // authoritative "zero", because C++ pushes the full map every heartbeat — there is no stale-cache
+    // ambiguity to guard against anymore). Builds a fresh dictionary the caller assigns onto ctx.QuestLog.
+    private static Dictionary<int, QuestLogEntry> ParseQuestLog(string? data)
+    {
+        var log = new Dictionary<int, QuestLogEntry>();
+        if (string.IsNullOrWhiteSpace(data)) return log;
+
+        foreach (var part in data.Split('|', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var f = part.Split(':');
+            if (f.Length < 2) continue;
+            if (!int.TryParse(f[0].Trim(), out int qid)) continue;
+            if (!int.TryParse(f[1].Trim(), out int status)) continue;
+
+            var mob = new int[4];
+            if (f.Length >= 3)
+            {
+                var mc = f[2].Split(',');
+                for (int i = 0; i < 4 && i < mc.Length; i++)
+                    int.TryParse(mc[i].Trim(), out mob[i]);
+            }
+
+            var item = new int[4];
+            if (f.Length >= 4)
+            {
+                var ic = f[3].Split(',');
+                for (int i = 0; i < 4 && i < ic.Length; i++)
+                    int.TryParse(ic[i].Trim(), out item[i]);
+            }
+
+            log[qid] = new QuestLogEntry { Status = status, MobCounts = mob, ItemCounts = item };
+        }
+        return log;
     }
 
     // Build the C++ held-task echo from STATE (Held-Objective build §4). GATED on TaskActivity being

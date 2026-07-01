@@ -94,8 +94,32 @@ public class QuestGraphLoader
                 var positivePrereqs = quest.PrevQuests.Where(pq => pq > 0).ToList();
                 if (positivePrereqs.Count > 0)
                 {
-                    bool anyRewarded = positivePrereqs.Any(pq => completedQuestIds.Contains(pq));
-                    if (!anyRewarded)
+                    // VMaNGOS SatisfyQuestPreviousQuest: a positive prereq satisfies the gate when it is
+                    // REWARDED -- but if that prereq belongs to a NEGATIVE ExclusiveGroup ("do all"), every
+                    // OTHER quest sharing that group must ALSO be rewarded. Group -18 = {18, 33}: completing
+                    // only #18 does NOT unlock its follow-ups (#6 needs #18; #3903 needs #18 AND #33) -- the
+                    // server rejects them requirements_not_met until #33 is also turned in. The old code OR'd
+                    // the prereqs and ignored the group, so it offered the follow-ups a turn-in early ->
+                    // re-accept-fail -> DeferPick -> grind-lock. (Negative prereq entries "must be active"
+                    // are still left to C++ CanTakeQuest below, as before.)
+                    bool satisfied = false;
+                    foreach (var pq in positivePrereqs)
+                    {
+                        if (!completedQuestIds.Contains(pq))
+                            continue;                                  // this prereq not rewarded yet
+                        if (_quests.TryGetValue(pq, out var prevNode) && prevNode.ExclusiveGroup < 0)
+                        {
+                            int grp = prevNode.ExclusiveGroup;
+                            bool allSiblingsRewarded = _quests.Values
+                                .Where(o => o.ExclusiveGroup == grp)
+                                .All(o => completedQuestIds.Contains(o.QuestId));
+                            if (!allSiblingsRewarded)
+                                continue;                              // a "do-all" group sibling still owed
+                        }
+                        satisfied = true;
+                        break;
+                    }
+                    if (!satisfied)
                         continue;
                 }
                 // Negative entries (must be active) — we don't have the active quest
@@ -846,6 +870,34 @@ public class QuestGraphLoader
 
                     if (bestClusterMap == refMap) usedNearby++;
                     else usedGlobalFallback++;
+
+                    // 2026-06-30 (wolf-meat fix): bestSource above has NO distance tiebreak — when
+                    // two+ creatures tie on |DropChance|, the foreach picks whichever sorts first and
+                    // every tied sibling becomes invisible downstream (the C++ approach scan, grind
+                    // target picker, and kill-credit all key off ONE entry). Confirmed live: Young
+                    // Wolf and Timber Wolf both drop Tough Wolf Meat at chance=-80, both spawn within
+                    // ~30-55yd of the Wolves Across the Border giver, and the bot walked past
+                    // whichever one lost the tie. Collect every OTHER same-item creature that ties
+                    // bestSource's chance AND has a real spawn on the giver's map (NOT bestSource's
+                    // resolved map if that was a cross-map fallback — a tie only matters if it's near
+                    // the same field bestSource resolved to). Capped to 3, mirroring
+                    // AiBotTaskData::MAX_ALT_ENTRIES on the C++ side. Empty whenever one creature
+                    // clearly wins the chance ranking — the common case is unaffected.
+                    if (bestClusterMap == refMap)
+                    {
+                        const float DropChanceTieEpsilon = 0.01f;
+                        var alts = new List<int>();
+                        foreach (var ds in sources)
+                        {
+                            if (ds.CreatureEntry == bestSource.CreatureEntry) continue;
+                            if (Math.Abs(Math.Abs(ds.DropChance) - Math.Abs(bestSource.DropChance)) > DropChanceTieEpsilon) continue;
+                            if (!dropCreatureSpawns.TryGetValue(ds.CreatureEntry, out var altSpawns)) continue;
+                            if (!altSpawns.Any(s => s.Map == refMap)) continue;
+                            alts.Add(ds.CreatureEntry);
+                            if (alts.Count >= 3) break;
+                        }
+                        itemObj.AltDropEntries = alts;
+                    }
                 }
             }
         }

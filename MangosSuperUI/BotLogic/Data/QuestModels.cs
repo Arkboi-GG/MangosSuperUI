@@ -147,6 +147,21 @@ public class QuestItemReq
         .ThenByDescending(d => d.SpawnCount)
         .FirstOrDefault();
 
+    /// <summary>
+    /// Other creature entries TIED with BestDropSource on drop chance for this item (2026-06-30:
+    /// the wolf-meat fix). BestDropSource's selection (highest drop chance among same-map
+    /// creatures) has no distance tiebreak — when two+ creatures tie on chance, picking ONE
+    /// makes its siblings invisible everywhere downstream (the C++ approach scan, the grind
+    /// target picker, kill-credit), even when they're standing in the SAME field as the chosen
+    /// one. Computed once by QuestGraphLoader alongside BestDropSource (LoadItemDropSourcesAsync)
+    /// from creatures that tied on chance AND have a spawn on the giver's map. Capped to 3
+    /// (mirrors AiBotTaskData::MAX_ALT_ENTRIES on the C++ side). Empty for every item where one
+    /// creature clearly wins, and ALWAYS empty for kill objectives (QuestObjective) — a kill
+    /// quest names one specific creature and the server only credits that exact entry, so this
+    /// is deliberately item-drop-only.
+    /// </summary>
+    public List<int> AltDropEntries { get; set; } = new();
+
     /// <summary>Best game object to interact with for this item (most spawns).</summary>
     public GameObjectDropSource? BestGoSource => GoSources
         .Where(g => g.SpawnCount > 0)

@@ -153,6 +153,15 @@ public class BotStatePayload
 
     [JsonPropertyName("durability")]
     public uint Durability { get; set; } = 100;   // min equipped-slot durability % (100 = full / no damageable gear)
+
+    // Full quest-log snapshot, pushed on every STATE (replaces the retired QUERY_QUEST_STATUS pull).
+    // Pipe-delimited, identical format to the old QUEST_STATUS_ALL payload:
+    //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
+    // status: COMPLETE=1, INCOMPLETE=3 (VMaNGOS enum). Empty string = the bot genuinely holds no quests.
+    // This is C++ ground truth (me->GetQuestStatusMap()) on the 5s heartbeat, so ctx.QuestLog is now a
+    // continuously-maintained mirror of the core log — never a request/reply cache that can go stale/partial.
+    [JsonPropertyName("quests")]
+    public string Quests { get; set; } = "";
 }
 
 public class BotEventPayload
@@ -329,6 +338,8 @@ public class BotState
     public uint QuestId { get; set; } = 0;
     public uint QuestStatus { get; set; } = 0;
     public uint Durability { get; set; } = 100;   // min equipped-slot durability % from STATE (100 = full)
+    // Full quest-log snapshot pushed on STATE (retired pull). Pipe-delimited, QUEST_STATUS_ALL format.
+    public string Quests { get; set; } = "";
     // BotState class — add:
     public bool HasReceivedState { get; set; } = false;
 }
@@ -598,6 +609,7 @@ public class BotBridgeService : BackgroundService
         bs.QuestId = state.QuestId;
         bs.QuestStatus = state.QuestStatus;
         bs.Durability = state.Durability;
+        bs.Quests = state.Quests;   // full quest-log snapshot (retired pull → STATE is the single source of truth)
         bs.HasReceivedState = true;
 
         BotStates[conn.Guid] = bs;

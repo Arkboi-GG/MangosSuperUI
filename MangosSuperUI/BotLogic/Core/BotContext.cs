@@ -65,6 +65,18 @@ public sealed class Outstanding
     // Settable so the brain can push it forward when the planner chooses to keep waiting.
     public DateTime? RescanAtUtc { get; set; }
 
+    // Quest id this WAIT is acting on — set only for a QUEST_INTERACT (accept OR complete),
+    // pulled from the issued command's quest_id payload field (same trick as the MOVE_TO target
+    // cache below). 2026-06-30: turn-in is the one planner step whose bookkeeping
+    // (BotIdentity.CompletedQuestIds.Add) writes DURABLE, NON-RE-DERIVABLE state — a rewarded
+    // quest vanishes from C++'s log entirely, so ctx.QuestLog can never resurrect "this was
+    // completed" if the bookkeeping is missed on a goal bounce (e.g. GoalSelector's Training
+    // trigger firing off the SAME LEVEL_UP event the reward granted, before QuestPlanner's
+    // "turnin" case ever runs). Stamped ack-driven in BotExecutor.OnEvent so it can never be
+    // skipped regardless of what the goal does next tick; QuestPlanner's own Add stays as a
+    // harmless idempotent duplicate on the happy path.
+    public int? QuestId { get; init; }
+
     public double AgeSec => (DateTime.UtcNow - SentUtc).TotalSeconds;
     public bool Expired => DateTime.UtcNow > DeadlineUtc;
 }
@@ -536,5 +548,13 @@ public sealed class BotContext
         InCombat = snap.InCombat;
         Dead = snap.IsDead;
         HeldTask = snap.HeldTask;   // C++ task readback (Unknown until the Session-3 STATE echo lands)
+
+        // Quest log now rides on STATE (the QUERY_QUEST_STATUS pull is retired). Set it here — on the TICK
+        // thread, the SINGLE writer — so there is no cross-thread mutation race and no request/reply cache to
+        // go stale, partial, or empty. snap.QuestLog is the full C++ player log; StateUtc is when this STATE
+        // landed, so QuestLogStampUtc is a true "data produced at" clock (advances only on a new STATE, not
+        // every 250ms tick) — exactly what the objective re-derive freshness gate needs.
+        QuestLog = snap.QuestLog;
+        QuestLogStampUtc = snap.StateUtc;
     }
 }

@@ -75,6 +75,11 @@ public sealed class BotExecutor
         // its deadline forward once the grind starts (the travel deadline only covers travel).
         bool objectiveGrind = cmd.Type == "MOVE_TO" && cmd.Payload.ContainsKey("creature_entry");
 
+        // 2026-06-30: cache the quest id off a QUEST_INTERACT's payload (accept OR complete) so
+        // the ack handler can stamp durable bookkeeping synchronously, goal-bounce-proof. Mirrors
+        // moveTgt below for MOVE_TO.
+        int? questId = ExtractQuestId(cmd);
+
         ctx.Pending = new Outstanding
         {
             CommandType = cmd.Type,
@@ -88,7 +93,8 @@ public sealed class BotExecutor
             // en route (the "scan a 100yd radius along the whole path" behavior). Non-objective WAITs leave
             // this null (not interruptible). First rescan is one interval out; the 50yd movement throttle
             // inside Rescan no-ops it cheaply when the bot is grinding in place rather than travelling.
-            RescanAtUtc = objectiveGrind ? now + RescanLeadIn : (DateTime?)null
+            RescanAtUtc = objectiveGrind ? now + RescanLeadIn : (DateTime?)null,
+            QuestId = questId
         };
 
         // Capture the destination so FleetReport can show distance-to-target.
@@ -175,50 +181,23 @@ public sealed class BotExecutor
             case "QUEST_ACCEPT_ACK":
                 ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
-                // Seed the just-accepted quest into the log cache IMMEDIATELY. ctx.QuestLog is otherwise
-                // refreshed ONLY by QUEST_STATUS_ALL, so between an accept and the next QUERY the cache
-                // does not reflect the new quest -- and a batch rebuilt in that window (a quick Questing
-                // bounce inside QuestPlanner.LogSyncCapSec, where the q==null fast path builds off the
-                // recent-but-pre-accept snapshot) misses it in BuildBatch step-1 resume, re-seeds it as a
-                // fresh Accepted=false pick, and marches the bot ALL THE WAY back to its giver to re-accept
-                // a quest the C++ idempotent-ack just rubber-stamps (the re-accept walk). Seeding here makes
-                // step-1 resume catch it. Guards: parse the quest id (the ack data is the bare quest_id, with
-                // a keyed fallback), and seed ONLY when absent so an IDEMPOTENT re-accept ack can never clobber
-                // real server counts already cached. Ref-swap (copy+assign) keeps a concurrent planner read
-                // lock-free (same pattern as QUEST_STATUS_ALL). INCOMPLETE(3)+zero counts is the correct
-                // fresh-accept state; the next QUERY ref-swaps the authoritative snapshot over it. The stamp
-                // is deliberately NOT advanced -- it tracks the last AUTHORITATIVE refresh, so a due QUERY
-                // still fires (this only ADDS a known-held id, it does not assert the snapshot is current).
-                {
-                    var raw = evt.Data?.Trim();
-                    if (!int.TryParse(raw, out var acceptedQid))
-                    {
-                        var kv = ParsePipe(evt.Data);
-                        if (!kv.TryGetValue("quest_id", out var qs) || !int.TryParse(qs, out acceptedQid))
-                            acceptedQid = 0;
-                    }
-                    if (acceptedQid > 0 && !ctx.QuestLog.ContainsKey(acceptedQid))
-                    {
-                        var seeded = new Dictionary<int, QuestLogEntry>(ctx.QuestLog)
-                        {
-                            [acceptedQid] = new QuestLogEntry { Status = 3, MobCounts = new int[4], ItemCounts = new int[4] }
-                        };
-                        ctx.QuestLog = seeded;
-                    }
-                }
+                // No cache seed anymore. ctx.QuestLog is fed exclusively by STATE (the retired pull), so the
+                // just-accepted quest appears on the next 5s heartbeat as C++ ground truth. The batch entry is
+                // already flipped Accepted=true by QuestPlanner's "accept" step this same tick, so the in-flight
+                // accept never depended on the cache. (Trade-off: a quest accepted <5s before a goal bounce can
+                // be re-gathered+re-accepted on return until STATE catches up — bounded, and the C++ accept is
+                // idempotent, so it's one wasted interact at worst. Strictly better than the old stale-cache class.)
                 break;
             case "LEVEL_UP":
                 ctx.LastLevelUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
                 ctx.OnGrindProgress();
                 break;
-            case "QUEST_STATUS_ALL":
-                // Authoritative quest-log snapshot (reply to QUERY_QUEST_STATUS). Not a
-                // WAIT ack and not progress — just refresh the cache the QuestPlanner reads
-                // to resume an in-log quest. Ref-swapped so a concurrent planner read is safe.
-                ctx.QuestLog = ParseQuestLog(evt.Data);
-                ctx.QuestLogStampUtc = DateTime.UtcNow;
-                break;
+            // QUEST_STATUS_ALL is RETIRED. The full quest log now rides on every STATE message and is set onto
+            // ctx.QuestLog in BotContext.Sense (the single, tick-thread writer). There is no longer a
+            // request/reply cache to overwrite, under-report, empty-wipe, or race — so the old handler (and its
+            // empty-payload guard and dropped-held instrumentation) is gone with it. C++ no longer emits this
+            // event because nothing sends QUERY_QUEST_STATUS.
             case "TELEPORT_ACK":
                 // Teleport-assist: the bot was relocated (NearTeleportTo). Update Pos from the ack
                 // payload (x|y|z|map) IMMEDIATELY so the planner sees DistToTarget≈0 and fires the
@@ -309,6 +288,29 @@ public sealed class BotExecutor
         _logger.LogDebug("[EXEC] {Name} ack {Type} via {Evt}",
             ctx.Name, pending.CommandType, evt.EventType);
 
+        // 2026-06-30: ack-driven, goal-bounce-proof durable completion. A QUEST_COMPLETE_ACK for a
+        // QUEST_INTERACT WAIT means the server just rewarded this quest — stamp CompletedQuestIds
+        // (+ clear its fail/defer/overflow counters) HERE, synchronous with the ack, BEFORE this tick's
+        // TickAsync (and GoalSelector) ever runs. This is the one piece of bookkeeping that cannot be
+        // deferred to QuestPlanner's "turnin" step: if a goal bounce (e.g. Training, off the SAME
+        // LEVEL_UP this reward granted) wipes ctx.Quest before that step runs, the quest's only durable
+        // record of completion is lost and it gets re-offered as brand new — and any future quest gated
+        // on it as a prereq stays locked forever. QuestPlanner's own CompletedQuestIds.Add (case
+        // "turnin") is now a harmless idempotent duplicate on the happy path — left in place, still
+        // needed for the batch-removal/follow-up-drain/log-line it also does.
+        if (pending.CommandType == "QUEST_INTERACT"
+            && string.Equals(evt.EventType, "QUEST_COMPLETE_ACK", StringComparison.OrdinalIgnoreCase)
+            && pending.QuestId is int rewardedId
+            && ctx.Identity is { } rid)
+        {
+            rid.CompletedQuestIds.Add(rewardedId);
+            rid.QuestDeferralCounts.Remove(rewardedId);
+            rid.QuestOverflowGrinds.Remove(rewardedId);
+            rid.QuestFailStreak.Remove(rewardedId);
+            _logger.LogInformation("[EXEC] {Name} quest {Id} rewarded — CompletedQuestIds stamped (ack-driven)",
+                ctx.Name, rewardedId);
+        }
+
         ctx.Pending = null;
         ctx.MarkProgress();
         ctx.ConsecutiveFailures = 0;   // a real ack breaks any fail streak
@@ -388,43 +390,6 @@ public sealed class BotExecutor
     // Pipe-delimited key=value parse (the bridge event-data format). Segments with
     // no '=' (e.g. QUEST_INTERACT_FAIL's leading bare reason) are dropped here and
     // recovered via FirstBareSegment.
-    // QUEST_STATUS_ALL payload (C++ BridgeHandleQueryQuestStatus):
-    //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
-    // status: COMPLETE=1, INCOMPLETE=3 (VMaNGOS enum — counterintuitive). Empty payload = no active quests. Builds a
-    // fresh dictionary and returns it (caller ref-swaps ctx.QuestLog atomically).
-    private static Dictionary<int, QuestLogEntry> ParseQuestLog(string? data)
-    {
-        var log = new Dictionary<int, QuestLogEntry>();
-        if (string.IsNullOrWhiteSpace(data)) return log;
-
-        foreach (var part in data.Split('|', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var f = part.Split(':');
-            if (f.Length < 2) continue;
-            if (!int.TryParse(f[0].Trim(), out int qid)) continue;
-            if (!int.TryParse(f[1].Trim(), out int status)) continue;
-
-            var mob = new int[4];
-            if (f.Length >= 3)
-            {
-                var mc = f[2].Split(',');
-                for (int i = 0; i < 4 && i < mc.Length; i++)
-                    int.TryParse(mc[i].Trim(), out mob[i]);
-            }
-
-            var item = new int[4];
-            if (f.Length >= 4)
-            {
-                var ic = f[3].Split(',');
-                for (int i = 0; i < 4 && i < ic.Length; i++)
-                    int.TryParse(ic[i].Trim(), out item[i]);
-            }
-
-            log[qid] = new QuestLogEntry { Status = status, MobCounts = mob, ItemCounts = item };
-        }
-        return log;
-    }
-
     private static Dictionary<string, string> ParsePipe(string? data)
         => string.IsNullOrEmpty(data)
             ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -452,6 +417,15 @@ public sealed class BotExecutor
             return null;
         int map = cmd.Payload.TryGetValue("mapId", out var mo) ? ToInt(mo) : 0;
         return new Vec4(ToFloat(xo), ToFloat(yo), ToFloat(zo), map);
+    }
+
+    // Pull quest_id off a QUEST_INTERACT payload (both Interact and GroupInteract send it as an
+    // anonymous-object int). Null for every other command type, or if the key is somehow absent.
+    private static int? ExtractQuestId(BridgeCommand cmd)
+    {
+        if (cmd.Type != "QUEST_INTERACT") return null;
+        if (!cmd.Payload.TryGetValue("quest_id", out var qo)) return null;
+        return qo is IConvertible ? Convert.ToInt32(qo) : (int?)null;
     }
 
     private static float ToFloat(object o) => o is IConvertible ? Convert.ToSingle(o) : 0f;
