@@ -1513,6 +1513,8 @@ public sealed class QuestPlanner : IBotPlanner
                 return GroupTurnIn(ctx, o);
             case GroupPhase.HoldAtAnchor:
                 return GroupHold(ctx, o);
+            case GroupPhase.GroupTrain:
+                return GroupTrainHold(ctx, o);
             default:
                 // Forming (transient) or a phase this v1 executor doesn't drive: keep the log fresh on a
                 // cadence so the coordinator's gates see server truth, then idle until it stamps a
@@ -1600,6 +1602,20 @@ public sealed class QuestPlanner : IBotPlanner
             return StepResult.Wait();
         ctx.SetStep("grp_hold");
         return MoveTo(anchor);
+    }
+
+    // The group-gated training window (§4): THIS bot either has nothing new to learn, or already
+    // peeled to Goal.Training via GoalSelector's groupTrainWindow carve-out (in which case DriveGroup
+    // isn't even running for it -- QuestPlanner only runs under Goal.Questing). So a bot reaching this
+    // case is a non-trainee waiting out the round. Unlike GroupHold there's no embedded anchor coord
+    // (GroupOrder.Train carries no TargetPos -- trainees scatter to their OWN class trainers, there's
+    // nothing to converge ON), so keep grinding the latched objective if one exists; otherwise just
+    // sit -- moving to (0,0,0) off an unset TargetPos would be wrong.
+    private StepResult GroupTrainHold(BotContext ctx, GroupOrder o)
+    {
+        if (o.Objective.IsActive)
+            return GroupObjective(ctx, o);     // grind the latched mob (change-guarded) while trainees are away
+        return StepResult.Wait();              // nothing latched yet and nowhere to converge — sit tight
     }
 
     // QUEST_INTERACT for the group path (no BatchQuest): accept / complete by quest id at the NPC.

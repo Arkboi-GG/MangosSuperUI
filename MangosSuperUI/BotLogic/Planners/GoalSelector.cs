@@ -108,15 +108,24 @@ public sealed class GoalSelector
         }
 
         // Group execution directive (grouping §3) — the god bot stamped this bot's group a phase this
-        // tick (travel / accept / shared objective / turn-in / hold). Work it as a TEAM (Questing →
-        // QuestPlanner.DriveGroup executes the stamped phase for this bot; the combat directive focus-
-        // fires the shared mob). Sits AFTER the survival hard-needs (dead / heal / teleport / vendor) so
-        // a dying or broke-gear member still peels, and BEFORE solo training / grind-lock / questing so
-        // a GROUPED bot never wanders off to train or grind ALONE while the team has work — group
-        // training/vendoring are coordinator errands (next increment), so until then a grouped member
-        // that needs them peels via those same solo triggers in the gaps. This is also why a grouped
-        // bot no longer solo-trains at spawn: an active group phase preempts the training trigger below.
-        if (ctx.GroupOrder.IsActive)
+        // tick (travel / accept / shared objective / turn-in / hold / group-train). Work it as a TEAM
+        // (Questing → QuestPlanner.DriveGroup executes the stamped phase for this bot; the combat
+        // directive focus-fires the shared mob). Sits AFTER the survival hard-needs (dead / heal /
+        // teleport / vendor) so a dying or broke-gear member still peels, and BEFORE solo training /
+        // grind-lock / questing so a GROUPED bot never wanders off to train or grind ALONE while the
+        // team has work.
+        //
+        // ONE exception: GroupPhase.GroupTrain (§4). That phase means the coordinator has ALREADY
+        // authorized a group-gated training round (every present member cleared TrainBaselineLevel+2)
+        // — so a member that itself still owes a trainer visit (HasUnlearnedSpells) is let PAST this
+        // gate to reach the training trigger below, instead of being held on Questing. A member with
+        // nothing new to learn is NOT exempted — it falls into the group branch same as any other
+        // phase and stays with the team (grinding the latched objective if one's embedded) until every
+        // trainee returns. This is also why a grouped bot no longer solo-trains at spawn or mid-fight:
+        // outside GroupTrain, the group phase preempts the training trigger unconditionally.
+        bool groupTrainWindow = ctx.GroupOrder.Phase == GroupPhase.GroupTrain
+                                 && ctx.Identity is { HasUnlearnedSpells: true };
+        if (ctx.GroupOrder.IsActive && !groupTrainWindow)
         {
             ctx.GoalReason = $"group:{ctx.GroupOrder.Phase}";
             return Goal.Questing;
@@ -127,7 +136,8 @@ public sealed class GoalSelector
         // trains once it can afford it / after the next LEVEL_UP re-flags new spells. Cooldown-gated
         // so an unreachable-trainer / TRAIN_FAIL trip doesn't immediately re-fire. Sits AFTER survival
         // (dead/heal/vendor) and BEFORE grind-lock + questing, so spells are learned before the bot
-        // commits to more fighting (the whole point — spell-starved bots can't kill).
+        // commits to more fighting (the whole point — spell-starved bots can't kill). For a GROUPED
+        // bot this only fires when groupTrainWindow just let it through — a solo bot is unrestricted.
         if (ctx.Identity is { HasUnlearnedSpells: true } tid
             && !(tid.TrainCooldownUntil is DateTime tcd && DateTime.UtcNow < tcd)
             && ctx.Copper >= TrainGoldFloor)

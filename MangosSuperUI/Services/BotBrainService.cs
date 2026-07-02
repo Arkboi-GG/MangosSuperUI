@@ -693,7 +693,7 @@ public class BotBrainService : BackgroundService
         // decision+stamp -- it issues NO commands; the spine emits COMBAT_DIRECTIVE on change (BotBrain
         // step 1a) and the QuestPlanner consults the exec stamp. Only when driving; sensing-only skips it.
         if (_brainEnabled)
-            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety, _spawns);
+            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety, _spawns, _driver.QuestPlanner);
 
         foreach (var kvp in _contexts)
         {

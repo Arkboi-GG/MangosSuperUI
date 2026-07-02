@@ -72,9 +72,13 @@ public enum GroupPhase
     // member still holds an unturned, complete pool quest.
     TurnIn = 6,
 
-    // The whole group tours the trainer(s) together; each trains what it needs. Trigger =
-    // ALL present members ≥2 levels past the last group-train baseline (§4). This also
-    // structurally ends the L1 bum-rush — training is a group-gated event, not a per-bot
+    // The group-gated training window (§4): every present member must reach
+    // TrainBaselineLevel + 2 AND at least one still owes a trainer visit (HasUnlearnedSpells).
+    // A member with something to learn peels via its OWN TrainingPlanner trip to its OWN class
+    // trainer (GoalSelector authorizes the individual trigger only during this phase); a member
+    // with nothing new grinds the embedded latched objective in place, if any, until every
+    // trainee returns. No single shared NPC target -- classes need different trainers. This
+    // also structurally ends the L1 bum-rush -- training is a group-gated event, not a per-bot
     // spawn reflex.
     GroupTrain = 7,
 
@@ -173,6 +177,13 @@ public readonly record struct GroupOrder
     /// the executor keeps the held members on the mob at the formation point.</summary>
     public static GroupOrder Hold(int anchorGuid, ExecDirective objective, Vec4 anchorPos)
         => new(GroupPhase.HoldAtAnchor, anchorGuid, 0, anchorPos, objective);
+
+    /// <summary>GroupTrain: the group-gated training window is open (§4). No NPC target -- each
+    /// trainee routes to its OWN class trainer via its own TrainingPlanner, never a single shared
+    /// NPC (classes differ). Carries the latched objective (if any) so a member with nothing new
+    /// to learn keeps grinding it in place instead of standing idle while trainees are away.</summary>
+    public static GroupOrder Train(int anchorGuid, ExecDirective objective)
+        => new(GroupPhase.GroupTrain, anchorGuid, 0, default, objective);
 }
 
 // ----------------------------- GroupPlan (§7) ------------------------------
@@ -183,6 +194,25 @@ public readonly record struct GroupOrder
 // decider, and there is still exactly one decision layer (§7 / §8).
 public sealed class GroupPlan
 {
+    /// <summary>The persistent "virtual member" (§Option A, 2026-07-01). A synthetic BotContext the
+    /// coordinator drives through the REAL QuestPlanner.PlanNext -- Derive, BuildBatch, GatherLocals,
+    /// PriorityLeg, TagOutliers, Recover, all of it -- instead of a hand-rolled parallel
+    /// reimplementation (Forming/NextGiver/NextObjective/NextEnder are RETIRED; this replaces them).
+    /// Never has a real bridge connection: its sensory state is refreshed each tick from the union of
+    /// present real members (GroupCoordinator.RefreshVirtualSensory), and GroupOrder is NEVER set on
+    /// it, which is what keeps QuestPlanner.PlanNext routing it through the solo decision path rather
+    /// than recursing into the group executor. Lazily created; survives ResetForForming (the virtual
+    /// bot's own accrued state -- deferrals, overflow-grind attempt counts, the in-flight leg -- is
+    /// exactly as durable as a real bot's own BotIdentity/QuestScratch and must not be wiped just
+    /// because the pool needs a fresh union pass).</summary>
+    public BotContext? Virtual { get; set; }
+
+    /// <summary>The raw command the virtual bot's last StepResult.Issue carried (§Option A). Outstanding
+    /// (ctx.Pending) doesn't retain the payload, so this is where BuildGroupOrderFromVirtual reads the
+    /// enriched-objective leg's x/y/z/creature_entry back out -- set by ArmVirtualPending, read once per
+    /// translation, never needs to survive longer than that.</summary>
+    public BridgeCommand? LastVirtualCommand { get; set; }
+
     /// <summary>The union pool: every pool quest id the group is working this cluster (the
     /// union across present members' eligible pickups, sized by §6 min-headroom — the
     /// tightest member's free quest-log slots, NOT BatchCap). Rebuilt in Forming; the
@@ -205,9 +235,17 @@ public sealed class GroupPlan
     public ExecDirective LatchedObjective { get; set; } = ExecDirective.None;
 
     /// <summary>The GroupTrain cadence baseline (§4): the level all present members must
-    /// reach +2 before the next group-train fires. Set to the MIN present member level at
-    /// each completed GroupTrain; the trigger is "every present member Level >= this + 2",
-    /// so training is a whole-group, every-2-levels event — never a per-bot spawn reflex.</summary>
+    /// reach +2 before the next group-train fires. Default 0 means "never seeded" (real levels
+    /// start at 1) -- GroupCoordinator.DriveGroup lazy-seeds it to the current min present member
+    /// level the FIRST time it's ever evaluated, so a fresh or freshly-squadded party's clock
+    /// starts from wherever they actually are, not from zero (else everyone clearing "0 + 2" on
+    /// their very first level-up would fire an immediate training round -- the same per-bot
+    /// bum-rush this phase exists to prevent). After that, set to the MIN present member level
+    /// the moment each round OPENS -- whether it actually sends anyone to a trainer (someone owed
+    /// a visit) or just resets the clock (nobody did) -- so a mid-round level-up can't
+    /// retroactively raise the bar for members already en route. The trigger is "every present
+    /// member Level >= this + 2", so training is a whole-group, every-2-levels event — never a
+    /// per-bot spawn reflex.</summary>
     public int TrainBaselineLevel { get; set; }
 
     /// <summary>When the current Phase was entered (UTC). Drives the §2 / §3 phase TIMEOUT

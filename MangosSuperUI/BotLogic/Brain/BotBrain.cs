@@ -70,6 +70,14 @@ public sealed class BotBrain
     /// <summary>The executor, exposed so the host can route bridge events through ack matching.</summary>
     public BotExecutor Executor => _executor;
 
+    /// <summary>The DI-resolved QuestPlanner singleton (§Option A, 2026-07-01) -- exposed so
+    /// GroupCoordinator can drive the group's shared decisions through the EXACT SAME
+    /// PlanNext/Derive/BuildBatch/GatherLocals/PriorityLeg/Recover machinery a solo bot runs,
+    /// instead of a hand-rolled parallel reimplementation. Reuses the singleton already resolved
+    /// for Goal.Questing -- no new DI registration, no risk of a second differently-configured
+    /// instance drifting from the one solo bots actually use.</summary>
+    public QuestPlanner QuestPlanner => (QuestPlanner)_planners[Goal.Questing];
+
     /// <summary>
     /// One tick for one bot. The host has already read the snapshot from the bridge.
     /// </summary>

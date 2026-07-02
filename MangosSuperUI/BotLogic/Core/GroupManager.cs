@@ -266,22 +266,38 @@ public class GroupManager
     private const int MAX_LEVEL_GAP = 2;        // bots must be within 2 levels
     private const float MAX_PAIR_DISTANCE = 200f; // must be within 200yd to pair
 
+    // ── Role buckets (2026-07-01, replaces the hardcoded class-pair passes) ──
+    // A fixed classification, not level-aware: a level-1 Druid counts as a Healer here even though it
+    // has no heal spell yet, exactly as the OLD code already counted Paladin as "off-healer" regardless
+    // of level. If that granularity ever matters, this is the one place to make it level-aware later.
+    private enum Role { Tank, Healer, Dps }
+
+    private static Role RoleFor(int classId) => (WowClass)classId switch
+    {
+        WowClass.Warrior => Role.Tank,
+        WowClass.Paladin or WowClass.Priest or WowClass.Shaman or WowClass.Druid => Role.Healer,
+        _ => Role.Dps   // Hunter, Rogue, Mage, Warlock (and anything unrecognized)
+    };
+
     /// <summary>
-    /// Class-aware auto-formation for ungrouped bots. Builds trios where possible,
-    /// falls back to duos. Filters by level proximity and zone/distance.
+    /// Role-aware auto-formation for ungrouped bots. Builds trios where possible, falls back to
+    /// duos. Filters by level proximity and zone/distance. Composed from ROLE buckets (Tank = Warrior;
+    /// Healer = Paladin/Priest/Shaman/Druid; Dps = Hunter/Rogue/Mage/Warlock) instead of hardcoded
+    /// class pairs, so e.g. a Priest and a Shaman are interchangeable "Healer" candidates rather than
+    /// needing their own explicit combo -- adding a class only means teaching RoleFor about it, not a
+    /// new pass.
     ///
     /// Composition priority (best → worst):
-    ///   Trio:  warrior + priest + mage       (tank + healer + DPS — best possible)
-    ///   Trio:  warrior + priest + paladin    (tank + healer + off-tank)
-    ///   Trio:  warrior + paladin + mage      (tank + off-healer + DPS)
-    ///   Duo:   warrior + priest              (tank + healer)
-    ///   Duo:   warrior + paladin             (tank + off-healer)
-    ///   Duo:   warrior + mage               (tank + DPS)
-    ///   Duo:   paladin + priest              (off-tank + healer, no warrior)
-    ///   Duo:   paladin + mage               (off-tank + DPS, no warrior)
+    ///   Trio:  Tank + Healer + Dps      (full trinity — best possible)
+    ///   Trio:  Tank + Healer + Healer   (still solid — a spare healer never hurts)
+    ///   Trio:  Healer + Dps + Dps       (no tank available)
+    ///   Trio:  Tank + Dps + Dps         (no healer available)
+    ///   Duo:   Tank + Healer
+    ///   Duo:   Tank + Dps
+    ///   Duo:   Healer + Dps
     ///
-    /// Leader selection: warrior > paladin > priest > mage (tankiest leads).
-    /// Within same class, lowest level leads (so quests are available to all).
+    /// Leader selection: Tank > Healer > Dps (tankiest leads). Within the same role, lowest level
+    /// leads (so quests are available to all).
     /// </summary>
     public List<BotGroup> AutoFormGroups(
         IReadOnlyDictionary<int, BotIdentity> allBots,
@@ -323,18 +339,17 @@ public class GroupManager
         bool IsCompatibleWithBoth(BotIdentity candidate, BotIdentity a, BotIdentity b)
             => AreCompatible(candidate, a) && AreCompatible(candidate, b);
 
-        // Helper: pick leader — warrior > paladin > priest > mage, then lowest level
+        // Helper: pick leader — Tank > Healer > Dps, then lowest level
         int PickLeader(params BotIdentity[] members)
         {
-            int ClassPriority(int classId) => classId switch
+            int RolePriority(int classId) => RoleFor(classId) switch
             {
-                1 => 0, // Warrior — always leads
-                2 => 1, // Paladin
-                5 => 2, // Priest
-                _ => 3  // Mage, others
+                Role.Tank => 0,
+                Role.Healer => 1,
+                _ => 2   // Dps
             };
             return members
-                .OrderBy(m => ClassPriority(m.ClassId))
+                .OrderBy(m => RolePriority(m.ClassId))
                 .ThenBy(m => m.Level)
                 .ThenBy(m => m.Guid)
                 .First().Guid;
@@ -353,96 +368,82 @@ public class GroupManager
             return true;
         }
 
-        // Buckets (only unclaimed, re-filtered each pass)
-        List<BotIdentity> GetAvailable(int classId) =>
-            ungrouped.Where(b => b.ClassId == classId && !claimed.Contains(b.Guid))
+        // Buckets (only unclaimed, re-filtered each pass) — by ROLE now, not raw class id.
+        List<BotIdentity> GetAvailable(Role role) =>
+            ungrouped.Where(b => RoleFor(b.ClassId) == role && !claimed.Contains(b.Guid))
                      .OrderBy(b => b.Level).ThenBy(b => b.Guid).ToList();
 
-        // ── Pass 1: Trios (warrior + priest + DPS/off-tank) ──
+        // ── Pass 1: Trios, best composition first ──
 
-        // warrior + priest + mage (best trio)
-        foreach (var w in GetAvailable((int)WowClass.Warrior))
+        // Tank + Healer + Dps (full trinity)
+        foreach (var t in GetAvailable(Role.Tank))
         {
-            var priest = GetAvailable((int)WowClass.Priest)
-                .FirstOrDefault(p => AreCompatible(w, p));
-            if (priest == null) continue;
+            var healer = GetAvailable(Role.Healer).FirstOrDefault(h => AreCompatible(t, h));
+            if (healer == null) continue;
 
-            var mage = GetAvailable((int)WowClass.Mage)
-                .FirstOrDefault(m => IsCompatibleWithBoth(m, w, priest));
-            if (mage != null)
-                TryForm(w, priest, mage);
+            var dps = GetAvailable(Role.Dps).FirstOrDefault(d => IsCompatibleWithBoth(d, t, healer));
+            if (dps != null)
+                TryForm(t, healer, dps);
         }
 
-        // warrior + priest + paladin
-        foreach (var w in GetAvailable((int)WowClass.Warrior))
+        // Tank + Healer + Healer (a spare healer beats a missing one)
+        foreach (var t in GetAvailable(Role.Tank))
         {
-            var priest = GetAvailable((int)WowClass.Priest)
-                .FirstOrDefault(p => AreCompatible(w, p));
-            if (priest == null) continue;
-
-            var paladin = GetAvailable((int)WowClass.Paladin)
-                .FirstOrDefault(p => IsCompatibleWithBoth(p, w, priest));
-            if (paladin != null)
-                TryForm(w, priest, paladin);
+            var healers = GetAvailable(Role.Healer).Where(h => AreCompatible(t, h)).ToList();
+            if (healers.Count < 2) continue;
+            var h1 = healers[0];
+            var h2 = healers.Skip(1).FirstOrDefault(h => IsCompatibleWithBoth(h, t, h1));
+            if (h2 != null)
+                TryForm(t, h1, h2);
         }
 
-        // warrior + paladin + mage
-        foreach (var w in GetAvailable((int)WowClass.Warrior))
+        // Healer + Dps + Dps (no tank left)
+        foreach (var h in GetAvailable(Role.Healer))
         {
-            var paladin = GetAvailable((int)WowClass.Paladin)
-                .FirstOrDefault(p => AreCompatible(w, p));
-            if (paladin == null) continue;
+            var dpsList = GetAvailable(Role.Dps).Where(d => AreCompatible(h, d)).ToList();
+            if (dpsList.Count < 2) continue;
+            var d1 = dpsList[0];
+            var d2 = dpsList.Skip(1).FirstOrDefault(d => IsCompatibleWithBoth(d, h, d1));
+            if (d2 != null)
+                TryForm(h, d1, d2);
+        }
 
-            var mage = GetAvailable((int)WowClass.Mage)
-                .FirstOrDefault(m => IsCompatibleWithBoth(m, w, paladin));
-            if (mage != null)
-                TryForm(w, paladin, mage);
+        // Tank + Dps + Dps (no healer left)
+        foreach (var t in GetAvailable(Role.Tank))
+        {
+            var dpsList = GetAvailable(Role.Dps).Where(d => AreCompatible(t, d)).ToList();
+            if (dpsList.Count < 2) continue;
+            var d1 = dpsList[0];
+            var d2 = dpsList.Skip(1).FirstOrDefault(d => IsCompatibleWithBoth(d, t, d1));
+            if (d2 != null)
+                TryForm(t, d1, d2);
         }
 
         // ── Pass 2: Duos (remaining ungrouped) ──
 
-        // warrior + priest
-        foreach (var w in GetAvailable((int)WowClass.Warrior))
+        // Tank + Healer
+        foreach (var t in GetAvailable(Role.Tank))
         {
-            var priest = GetAvailable((int)WowClass.Priest)
-                .FirstOrDefault(p => AreCompatible(w, p));
-            if (priest != null) TryForm(w, priest);
+            var healer = GetAvailable(Role.Healer).FirstOrDefault(h => AreCompatible(t, h));
+            if (healer != null) TryForm(t, healer);
         }
 
-        // warrior + paladin
-        foreach (var w in GetAvailable((int)WowClass.Warrior))
+        // Tank + Dps
+        foreach (var t in GetAvailable(Role.Tank))
         {
-            var paladin = GetAvailable((int)WowClass.Paladin)
-                .FirstOrDefault(p => AreCompatible(w, p));
-            if (paladin != null) TryForm(w, paladin);
+            var dps = GetAvailable(Role.Dps).FirstOrDefault(d => AreCompatible(t, d));
+            if (dps != null) TryForm(t, dps);
         }
 
-        // warrior + mage
-        foreach (var w in GetAvailable((int)WowClass.Warrior))
+        // Healer + Dps (no tanks left)
+        foreach (var h in GetAvailable(Role.Healer))
         {
-            var mage = GetAvailable((int)WowClass.Mage)
-                .FirstOrDefault(m => AreCompatible(w, m));
-            if (mage != null) TryForm(w, mage);
+            var dps = GetAvailable(Role.Dps).FirstOrDefault(d => AreCompatible(h, d));
+            if (dps != null) TryForm(h, dps);
         }
 
-        // paladin + priest (no warriors left)
-        foreach (var pal in GetAvailable((int)WowClass.Paladin))
-        {
-            var priest = GetAvailable((int)WowClass.Priest)
-                .FirstOrDefault(p => AreCompatible(pal, p));
-            if (priest != null) TryForm(pal, priest);
-        }
-
-        // paladin + mage
-        foreach (var pal in GetAvailable((int)WowClass.Paladin))
-        {
-            var mage = GetAvailable((int)WowClass.Mage)
-                .FirstOrDefault(m => AreCompatible(pal, m));
-            if (mage != null) TryForm(pal, mage);
-        }
-
-        // ── Pass 3 (Session 33): Any-class duos — better grouped than solo ──
-        // After all class-synergy combos are exhausted, pair up whoever's left.
+        // ── Pass 3 (Session 33): Any-remaining duos — better grouped than solo ──
+        // After all role-priority combos are exhausted, pair up whoever's left, role-blind.
         // Rogue + Rogue? Fine. Priest + Priest? Still shared kill credit.
         {
             var stillUngrouped = ungrouped.Where(b => !claimed.Contains(b.Guid)).ToList();
