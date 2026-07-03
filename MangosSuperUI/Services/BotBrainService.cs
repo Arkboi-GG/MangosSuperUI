@@ -49,6 +49,7 @@ public class BotBrainService : BackgroundService
     private readonly QuestGraphLoader _quests;    // the shared quest graph -> handed to the god-bot pre-pass for union objective selection
     private readonly ZoneSafetyMap _safety;       // §5.1 weakest-member travel gate (path creature-level)
     private readonly CreatureSpawnLoader _spawns; // Scatter Build 2: real-spawn anchor sampler -> god-bot shared-objective dispersal
+    private readonly ZoneDataLoader _zoneData;    // GAP G (2026-07-02): nearest vendor/repair NPC for the whole-group vendor errand (GroupCoordinator.Update)
 
     // Roster mirrors. _bots feeds the dashboard + grouping; _contexts is the
     // live-state the spine drives. One entry per connected bot in both.
@@ -75,7 +76,8 @@ public class BotBrainService : BackgroundService
         BotBrain driver,
         QuestGraphLoader quests,
         ZoneSafetyMap safety,
-        CreatureSpawnLoader spawns)
+        CreatureSpawnLoader spawns,
+        ZoneDataLoader zoneData)
     {
         _bridge = bridge;
         _db = db;
@@ -87,6 +89,7 @@ public class BotBrainService : BackgroundService
         _quests = quests;
         _safety = safety;
         _spawns = spawns;
+        _zoneData = zoneData;
         _groupManager = new GroupManager(_db, loggerFactory.CreateLogger<GroupManager>());
     }
 
@@ -693,7 +696,7 @@ public class BotBrainService : BackgroundService
         // decision+stamp -- it issues NO commands; the spine emits COMBAT_DIRECTIVE on change (BotBrain
         // step 1a) and the QuestPlanner consults the exec stamp. Only when driving; sensing-only skips it.
         if (_brainEnabled)
-            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety, _spawns, _driver.QuestPlanner);
+            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety, _spawns, _driver.QuestPlanner, _zoneData);
 
         foreach (var kvp in _contexts)
         {

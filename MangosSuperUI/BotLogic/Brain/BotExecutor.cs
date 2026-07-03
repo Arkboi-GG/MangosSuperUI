@@ -220,7 +220,10 @@ public sealed class BotExecutor
                 // ticks and handed back. There is NO pending MOVE_TO WAIT at grind time (the enriched
                 // MOVE_TO already handed off to grind-in-place and its WAIT resolved), so this CANNOT route
                 // through TryNegate — set ctx.Failure DIRECTLY and let QuestPlanner.Recover break the freeze
-                // with the unstick detour. Carries the center (x|y|z) + reason (overpull_dwell|no_target).
+                // with the unstick detour. Carries the center (x|y|z) + reason. C++ currently emits only
+                // reason=no_target (the objective-grind overpull_dwell handback was retired 2026-06-30 when
+                // C++ began self-unsticking dense fields in place); the parse below stays reason-generic so a
+                // future reason flows through untouched — it's the planner that decides what to act on.
                 // Not a WAIT ack and not progress; bump the fail streak so the wedge breaker stays a backstop
                 // (a successful detour's TASK_COMPLETE resets it).
                 {

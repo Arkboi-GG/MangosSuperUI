@@ -313,19 +313,30 @@ public readonly record struct ExecDirective
     public float Z { get; }
     public int Map { get; }
     public int AnchorGuid { get; }       // the reference member (stable "nearest" origin; whose credit the count nominally feeds)
+    // Tied item-drop alt-entries (GAP C fix, 2026-07-02) -- three plain ints, not a list: this
+    // struct's equality is load-bearing (see the LastGroupOrder change-check comment below on
+    // BotContext), and a list gets REFERENCE equality by default, which would make every tick's
+    // freshly-extracted list compare "different" even with identical values and defeat that guard.
+    // 0 = unused slot, same convention as the wire's own alt_entry1/2/3. Threaded through from the
+    // virtual bot's own LastVirtualCommand payload (see GroupCoordinator.TryExtractCoords) -- the
+    // virtual bot ran the real solo MoveToObjectiveLeg dispatch, so the alternates are already
+    // sitting in that payload; this just carries them the rest of the way to GroupObjectiveLeg.
+    public int Alt1 { get; }
+    public int Alt2 { get; }
+    public int Alt3 { get; }
 
     public ExecDirective(ExecMode mode, int questId, int slot, int creatureEntry,
-        float x, float y, float z, int map, int anchorGuid)
+        float x, float y, float z, int map, int anchorGuid, int alt1 = 0, int alt2 = 0, int alt3 = 0)
     {
         Mode = mode; QuestId = questId; Slot = slot; CreatureEntry = creatureEntry;
-        X = x; Y = y; Z = z; Map = map; AnchorGuid = anchorGuid;
+        X = x; Y = y; Z = z; Map = map; AnchorGuid = anchorGuid; Alt1 = alt1; Alt2 = alt2; Alt3 = alt3;
     }
 
     public bool IsActive => Mode != ExecMode.None;
     public static readonly ExecDirective None = new(ExecMode.None, 0, 0, 0, 0f, 0f, 0f, 0, 0);
     public static ExecDirective Objective(int questId, int slot, int creatureEntry,
-        float x, float y, float z, int map, int anchorGuid)
-        => new(ExecMode.Objective, questId, slot, creatureEntry, x, y, z, map, anchorGuid);
+        float x, float y, float z, int map, int anchorGuid, int alt1 = 0, int alt2 = 0, int alt3 = 0)
+        => new(ExecMode.Objective, questId, slot, creatureEntry, x, y, z, map, anchorGuid, alt1, alt2, alt3);
 }
 
 // =============================== BotContext =================================

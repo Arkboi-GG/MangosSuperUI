@@ -100,7 +100,18 @@ public sealed class GoalSelector
         // thrash; a repair restores durability to full and selling frees slots, so it self-
         // clears. Sits ahead of "stay the course" so a low-durability emergency preempts a
         // quest (its leg is resumed from the log afterward).
-        if (!(ctx.Identity?.VendorCooldownUntil is DateTime vc && DateTime.UtcNow < vc)
+        //
+        // GROUP SUPPRESSION (GAP G, 2026-07-02): "maintenance is NEVER a solo peel" (only training splits
+        // the group). When the coordinator stamped a GroupVendor errand this tick (its Update runs BEFORE
+        // this selector, so ctx.GroupOrder.Phase already reflects the decision), the member must FOLLOW
+        // the group to the shared vendor via the group branch below -- NOT peel solo here. So skip the
+        // solo peel while GroupVendor is stamped. Deliberately NOT suppressed when the member is grouped
+        // but GroupVendor was NOT stamped this tick (e.g. no vendor reachable from the anchor, so the
+        // coordinator fell through to questing): there the solo peel is the intended backstop the
+        // coordinator's own fall-through promises, so a genuinely broke-gear member is never stranded.
+        bool groupHandlingVendor = ctx.GroupOrder.Phase == GroupPhase.GroupVendor;
+        if (!groupHandlingVendor
+            && !(ctx.Identity?.VendorCooldownUntil is DateTime vc && DateTime.UtcNow < vc)
             && (ctx.Durability < DurabilityVendorThreshold || ctx.FreeSlots <= 0))
         {
             ctx.GoalReason = ctx.Durability < DurabilityVendorThreshold ? "repair" : "bags-full";

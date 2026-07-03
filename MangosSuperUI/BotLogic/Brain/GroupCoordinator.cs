@@ -53,6 +53,12 @@ public static class GroupCoordinator
     private const double GateLivenessSec = 90;        // §6 liveness escape: a stuck/away member stops gating after this
     private const int GroupTrainLevelGap = 2;         // §4: every present member must clear TrainBaselineLevel + this before a training round opens
 
+    // ── Group-vendor thresholds (GAP G, 2026-07-02) ── mirror GoalSelector / MaintenancePlanner EXACTLY
+    // so the whole-group errand triggers on the same condition the solo peel would have, and the peel
+    // suppression in GoalSelector keys on the same numbers (no window where one fires and the other doesn't).
+    private const int GroupDurabilityVendorThreshold = 30;   // == GoalSelector.DurabilityVendorThreshold / MaintenancePlanner.DurabilityVendorThreshold
+    private const int GroupRepairRequiredBelowDurability = 70;  // == MaintenancePlanner.RepairRequiredBelowDurability — below this, the shared vendor lookup HARD-filters to repair-capable NPCs
+
     // ── Instrumentation (logic-neutral): make the decider SAY which door it took. ──
     // One [GROUP] line per group on a phase CHANGE, plus a ~15s heartbeat while parked in a
     // "stuck" phase (Hold/None/Forming) so a persistent park keeps reporting LIVE gate values.
@@ -91,8 +97,12 @@ public static class GroupCoordinator
         QuestGraphLoader quests,
         ZoneSafetyMap safety,
         CreatureSpawnLoader spawns,   // Scatter Build 2: real-spawn anchor sampling for the shared objective
-        QuestPlanner questPlanner)    // §Option A (2026-07-01): drives the group's shared decisions through
+        QuestPlanner questPlanner,    // §Option A (2026-07-01): drives the group's shared decisions through
                                       // the REAL solo decision machinery instead of a hand-rolled parallel one
+        ZoneDataLoader zoneData)      // GAP G (2026-07-02): GetNearestVendor for the whole-group vendor errand.
+                                      // CALLER NOTE: the only caller is BotBrainService.RunBrainTicksAsync
+                                      // (BotBrainService.cs, the GroupCoordinator.Update(...) line) -- it holds
+                                      // the ZoneDataLoader singleton as a ctor-injected field and passes it here.
     {
         // Default EVERY bot to None on BOTH seams, then overwrite grouped members below. A bot
         // that left a group this tick (or the whole mode going Off) reverts to solo for combat
@@ -148,7 +158,7 @@ public static class GroupCoordinator
             if (!quests.IsLoaded)
                 continue;
 
-            var order = DriveGroup(group.Plan, members, anchorGuid, quests, safety, spawns, questPlanner);
+            var order = DriveGroup(group.Plan, members, anchorGuid, quests, safety, spawns, questPlanner, zoneData);
             foreach (var ctx in members)
             {
                 ctx.GroupOrder = order;
@@ -227,7 +237,8 @@ public static class GroupCoordinator
     // ────────────────────────────────────────────────────────────────────────
     private static GroupOrder DriveGroup(
         GroupPlan plan, List<BotContext> members, int anchorGuid,
-        QuestGraphLoader quests, ZoneSafetyMap safety, CreatureSpawnLoader spawns, QuestPlanner questPlanner)
+        QuestGraphLoader quests, ZoneSafetyMap safety, CreatureSpawnLoader spawns, QuestPlanner questPlanner,
+        ZoneDataLoader zoneData)
     {
         var anchor = AnchorOf(members, anchorGuid);
         var prevPhase = plan.Phase;   // instrumentation: phase BEFORE this tick's decision
@@ -287,12 +298,48 @@ public static class GroupCoordinator
             plan.TrainBaselineLevel = members.Min(m => m.Level);
         }
 
-        // v1 SCOPE: this coordinator drives grouped QUESTING (via the virtual member, §Option A below)
-        // plus the §4 group-gated TRAINING window above. Group-coordinated MAINTENANCE -- the
-        // whole-group vendor/repair errand of §4 -- is still a documented FOLLOW-ON: routing GroupVendor
-        // through MaintenancePlanner, above GoalSelector's solo durability gate, is OUTSIDE this scope.
-        // Until then a grouped member that needs a vendor peels via its own GoalSelector trigger, and
-        // the rest of the team HOLDS for it via AnyRecovering above (same as a death or a training trip).
+        // ── Group-gated vendor / repair errand (§4, GAP G 2026-07-02) ──
+        // "Maintenance is NEVER a solo peel" (Nico's rule: only training splits the group). A member
+        // whose durability craters or bags fill would, solo, peel to MaintenancePlanner and vendor ALONE
+        // while the rest HoldAtAnchor -- a split the rule forbids. Instead, when ANY present member needs
+        // a vendor, route the WHOLE group to one shared vendor together (unlike training, where classes
+        // scatter to different trainers). Structured exactly like the group-train gate above: reached only
+        // when AnyRecovering is false (nobody already mid-trip), so it meaningfully fires on the tick the
+        // round OPENS; once a member flips into the errand the peel-hold / liveness machinery carries the
+        // rest. The solo durability peel in GoalSelector is SUPPRESSED for a grouped member whenever this
+        // phase is STAMPED this tick (GoalSelector GAP G change keys on ctx.GroupOrder.Phase), so a member
+        // can't bolt solo before the group errand forms -- but stays free to peel as a backstop on a tick
+        // where no vendor was reachable and the phase was NOT stamped (see the null-vendor fall-through).
+        //
+        // requireRepair: if ANY member is below the repair-durability floor, hard-filter the shared lookup
+        // to a repair-capable NPC (an armorer) -- a sell-only vendor wouldn't fix the gear that triggered
+        // this. A null vendor (none in range, or none repair-capable when required) is a clean FALL-THROUGH
+        // to questing, NOT a freeze: the member's own solo MaintenancePlanner backstop still owns actually
+        // resolving an unreachable-vendor wedge; the group just doesn't gate on it. Same GateLivenessSec
+        // escape as every other gate keeps one stuck member from freezing the errand forever.
+        bool anyNeedsVendor = members.Any(m => m.Durability < GroupDurabilityVendorThreshold || m.FreeSlots <= 0);
+        if (anyNeedsVendor)
+        {
+            bool anyNeedsRepair = members.Any(m => m.Durability < GroupRepairRequiredBelowDurability);
+            var vendor = zoneData.GetNearestVendor(anchor.ZoneId, anchor.MapId, anchor.Pos.X, anchor.Pos.Y,
+                                                   members.Min(m => m.Level), anyNeedsRepair);
+            if (vendor != null)
+            {
+                plan.SetPhase(GroupPhase.GroupVendor);
+                var vpos = new Vec4(vendor.X, vendor.Y, vendor.Z, vendor.MapId);
+                Emit(anchorGuid, prevPhase, GroupPhase.GroupVendor,
+                    $"vendor-window open npc={vendor.NpcEntry} \"{vendor.NpcName}\" repair={(vendor.CanRepair ? "Y" : "N")} needRepair={anyNeedsRepair}", members);
+                return GroupOrder.ToNpc(GroupPhase.GroupVendor, anchorGuid, vendor.NpcEntry, vpos);
+            }
+            // No suitable vendor reachable from the anchor -> don't stamp the phase (would strand the group
+            // walking nowhere). Fall through to questing; a genuinely broke-gear member still has its own
+            // solo MaintenancePlanner backstop. That backstop stays available precisely BECAUSE the phase
+            // isn't stamped: GoalSelector suppresses the solo peel only when it sees GroupPhase.GroupVendor
+            // on ctx.GroupOrder this tick, so an unstamped (unreachable-vendor) tick leaves the solo peel
+            // free to fire -- no need for GoalSelector to re-run the vendor lookup itself.
+            Emit(anchorGuid, prevPhase, prevPhase,
+                $"vendor needed but none in range (needRepair={anyNeedsRepair}) -> questing; solo backstop owns it", members);
+        }
 
         return DriveGroupViaVirtual(plan, members, anchorGuid, anchor, quests, safety, questPlanner, prevPhase);
     }
@@ -347,6 +394,33 @@ public static class GroupCoordinator
         var vsnap = BuildVirtualSnapshot(anchor, members);
         vctx.Sense(vsnap);                                   // Pos/MapId/ZoneId/Level/QuestLog -- exactly what Derive reads
         RefreshVirtualEligibility(vctx, members, quests);    // union exclusions + inject newly-eligible-for-someone content
+
+        // GAP F fix (2026-07-02): consume the virtual grind-lock. When the virtual bot's own Derive hit
+        // a deferral-driven batch exhaust on a PRIOR tick, it stamped GrindLockUntil on the virtual
+        // identity and returned Block -- but nothing read that clock (only real members read their OWN
+        // GrindLockUntil in GoalSelector), so it was set-then-ignored: the group fell to solo grind AND
+        // re-ran the entire virtual Derive (batch build / gather / exhaust) every tick just to land on
+        // Block again -- the quest-grind oscillation this lock exists to prevent, now at the group level.
+        // While the lock is active, short-circuit BEFORE PlanNext: return GroupOrder.None so each member
+        // solo-grinds for the window (exactly today's Blocked behavior), but skip the expensive re-derive.
+        // This deliberately mirrors solo GoalSelector, which commits to the FULL window by wall-clock and
+        // has no early-clear on newly-workable content ("the bot earns its hour of XP") -- a grouped bot
+        // behaving identically is the correctness goal, not a compromise. The union-workability guard
+        // that PREVENTS a wrongful lock still runs where it matters: it's inside the virtual Derive that
+        // SETS the lock (WorkableInLog reads the union QuestLog), so the lock never gets stamped while any
+        // member has workable in-log content in the first place -- this consumer only honors a lock that
+        // guard already permitted. NOT the richer "grind together at the anchor" form (fix-spec option a):
+        // that needs a creature_entry=0 indefinite group objective, an untested wire shape on this fork
+        // (the sentinel note warns kill_count=0 insta-completes; a 0-entry group leg is entirely
+        // unexercised), so it's deferred rather than shipped on spec -- see the gap doc.
+        if (vctx.Identity?.GrindLockUntil is DateTime vgl && DateTime.UtcNow < vgl)
+        {
+            plan.LatchedObjective = ExecDirective.None;
+            plan.SetPhase(GroupPhase.None);
+            Emit(anchorGuid, prevPhase, GroupPhase.None,
+                $"virtual: grind-lock {(int)Math.Ceiling((vgl - DateTime.UtcNow).TotalMinutes)}m -> solo-grind (clock consumed, no re-derive)", members);
+            return GroupOrder.None;
+        }
 
         // Resolve any in-flight virtual WAIT against REAL group state first. Still outstanding ->
         // re-stamp the SAME order (idempotent; real members' own LastGroupOrder change-guard no-ops on
@@ -487,6 +561,37 @@ public static class GroupCoordinator
         vid.PruneExpiredDeferrals();
         vid.PrunePathBlacklist();
 
+        // GAP E fix (2026-07-02): the inverse down-union for grey-drops. The virtual bot runs the real
+        // solo Derive, whose "0. grey drop" phase calls AbandonGrey on the VIRTUAL identity and returns
+        // an ABANDON_QUEST Fire -- but that Fire never reaches the wire for a bodyless virtual bot (it
+        // falls through BuildGroupOrderFromVirtual to HoldAtAnchor). So the group's PLANNING correctly
+        // stops working the grey quest, but nothing tells real members holding it to drop it -- a member
+        // under a GroupOrder isn't running its own solo grey-drop, so it lingers in that member's log.
+        // Pushing the virtual grey set back DOWN onto each present member's own AbandonedGreyQuestIds is
+        // the exact inverse of the up-union above, and it's all real members need: every solo consult
+        // that could re-work the quest (BuildBatch resume, Pickable, WorkableInLog) already excludes its
+        // own AbandonedGreyQuestIds, so the quest leaves every member's planning and can't re-enter. This
+        // does NOT force an immediate in-game ABANDON_QUEST (that would be option 1, a new GroupOrder
+        // phase); it guarantees no member re-works the grey, and each member's next solo-path visit
+        // clears it from the C++ log.
+        //
+        // TIGHTENED (2026-07-02): gate the push on "grey at the GROUP's level" (vctx.Level = the weakest
+        // present member, which the virtual bot already plans at). vid.AbandonedGreyQuestIds is a UNION,
+        // so it also contains greys a HIGHER member solo-abandoned pre-group that may still be GREEN for a
+        // lower member -- pushing those down unconditionally would stamp a quest onto a member for whom
+        // it's still workable (over-exclusion). GrayLevel is monotonic in level, so a quest grey at the
+        // weakest level is grey for EVERY present member: one check per id at vctx.Level is exact -- it
+        // pushes only genuine group-greys (safe for all) and skips the higher-member solo-history entries
+        // (which those members already carry in their own set anyway). The grey test is QuestPlanner's own
+        // IsQuestGreyForLevel -- the SAME IsGrey/GrayLevel the solo path uses, not a parallel copy here.
+        foreach (var qid in vid.AbandonedGreyQuestIds)
+        {
+            if (!QuestPlanner.IsQuestGreyForLevel(quests, qid, vctx.Level))
+                continue;   // a higher member's pre-group solo grey, still green for the weakest -> don't propagate
+            foreach (var m in members)
+                m.Identity?.AbandonedGreyQuestIds.Add(qid);
+        }
+
         if (!quests.IsLoaded) return;
         var q = vctx.Quest;
         if (q == null) return;   // BuildBatch hasn't run yet this cycle (first-ever tick) -- nothing to inject into
@@ -530,7 +635,7 @@ public static class GroupCoordinator
         if (p.CommandType == "MOVE_TO" && p.IsObjectiveGrind)
         {
             if (active == null || plan.LastVirtualCommand == null) { vctx.Pending = null; return true; }
-            if (!TryExtractCoords(plan.LastVirtualCommand, out _, out _, out _, out _, out int creatureEntry))
+            if (!TryExtractCoords(plan.LastVirtualCommand, out _, out _, out _, out _, out int creatureEntry, out _, out _, out _))
             { vctx.Pending = null; return true; }
 
             // Which objective/item slot(s) does this creature_entry actually satisfy? (ActiveSlot is
@@ -694,7 +799,7 @@ public static class GroupCoordinator
                 }
 
             case "to_objective" when active != null && plan.LastVirtualCommand != null
-                                      && TryExtractCoords(plan.LastVirtualCommand, out float x, out float y, out float z, out int map, out int creatureEntry):
+                                      && TryExtractCoords(plan.LastVirtualCommand, out float x, out float y, out float z, out int map, out int creatureEntry, out int alt1, out int alt2, out int alt3):
                 {
                     var dest = new QuestNpcLocation { NpcEntry = 0, X = x, Y = y, Z = z, Map = map };
                     if (!PathSafeForWeakest(members, anchor, dest, safety))
@@ -703,7 +808,7 @@ public static class GroupCoordinator
                         Emit(anchorGuid, prevPhase, GroupPhase.HoldAtAnchor, $"virtual: objective cre={creatureEntry} unsafe -> path_unsafe defer", members);
                         return HoldAtAnchor(plan, anchor);
                     }
-                    var directive = ExecDirective.Objective(active.QuestId, 0, creatureEntry, x, y, z, map, anchorGuid);
+                    var directive = ExecDirective.Objective(active.QuestId, 0, creatureEntry, x, y, z, map, anchorGuid, alt1, alt2, alt3);
                     plan.LatchedObjective = directive;
                     plan.SetPhase(GroupPhase.Objective);
                     Emit(anchorGuid, prevPhase, GroupPhase.Objective, $"virtual: quest={active.QuestId} cre={creatureEntry}", members);
@@ -735,11 +840,14 @@ public static class GroupCoordinator
             default:
                 // Genuine between-leg transients (obj_sync / detour / grind_obj / plan -- PlanNext
                 // returned Continue and will re-derive once external state catches up, e.g. obj_sync
-                // waiting for the next STATE heartbeat) or an ABANDON_QUEST grey-drop (open item -- no
-                // group translation yet; real members holding the same grey quest drop it via their own
-                // independent solo-side grey-drop). Hold at the anchor rather than going fully idle, so
-                // a latched objective (if any) keeps the rest productive -- but SAY so, so a stall here
-                // is visible in the log instead of silent (the gap that hid the accept/turnin bug above).
+                // waiting for the next STATE heartbeat), OR an ABANDON_QUEST grey-drop tick. The grey-drop
+                // is now HANDLED at the identity level (GAP E fix, 2026-07-02): RefreshVirtualEligibility
+                // unions the virtual bot's grey set down onto every present member, so by the time we're
+                // here the quest has already left every member's planning -- the Fire itself has no group
+                // wire translation and correctly needs none. Hold at the anchor rather than going fully
+                // idle, so a latched objective (if any) keeps the rest productive -- but SAY so, so a real
+                // stall here is still visible in the log instead of silent (the gap that hid the
+                // accept/turnin bug above).
                 Emit(anchorGuid, prevPhase, GroupPhase.HoldAtAnchor, $"virtual: step={vctx.Step} unhandled -> hold", members);
                 return HoldAtAnchor(plan, anchor);
         }
@@ -766,14 +874,26 @@ public static class GroupCoordinator
     // Same extraction pattern BotExecutor.ExtractTarget uses -- BridgeCommand.Payload is a flat
     // key/value bag built from an anonymous object, so this is the only way back to the raw
     // coordinates once a StepResult.Issue has been produced.
-    private static bool TryExtractCoords(BridgeCommand cmd, out float x, out float y, out float z, out int map, out int creatureEntry)
+    //
+    // alt1/2/3 (GAP C fix, 2026-07-02): the virtual bot's LastVirtualCommand IS the real solo
+    // MoveToObjectiveLeg dispatch (the virtual bot ran DispatchObjectiveLeg for real), so
+    // alt_entry1/2/3 -- the tied item-drop siblings -- are already sitting in this same payload
+    // whenever the leg has any. Pulled here so BuildGroupOrderFromVirtual's to_objective case can
+    // thread them into ExecDirective.Objective(...) with no new resolution logic of its own. Plain
+    // scalar out-params, not a list -- ExecDirective's own equality is load-bearing (see its
+    // comment on BotContext), so nothing on this path should ever construct a reference type that
+    // would defeat it.
+    private static bool TryExtractCoords(BridgeCommand cmd, out float x, out float y, out float z, out int map, out int creatureEntry, out int alt1, out int alt2, out int alt3)
     {
-        x = y = z = 0; map = 0; creatureEntry = 0;
+        x = y = z = 0; map = 0; creatureEntry = 0; alt1 = 0; alt2 = 0; alt3 = 0;
         if (!cmd.Payload.TryGetValue("x", out var xo) || !cmd.Payload.TryGetValue("y", out var yo) || !cmd.Payload.TryGetValue("z", out var zo))
             return false;
         x = ToFloat(xo); y = ToFloat(yo); z = ToFloat(zo);
         if (cmd.Payload.TryGetValue("mapId", out var mo)) map = ToInt(mo);
         if (cmd.Payload.TryGetValue("creature_entry", out var ceo)) creatureEntry = ToInt(ceo);
+        if (cmd.Payload.TryGetValue("alt_entry1", out var a1o)) alt1 = ToInt(a1o);
+        if (cmd.Payload.TryGetValue("alt_entry2", out var a2o)) alt2 = ToInt(a2o);
+        if (cmd.Payload.TryGetValue("alt_entry3", out var a3o)) alt3 = ToInt(a3o);
         return true;
     }
 

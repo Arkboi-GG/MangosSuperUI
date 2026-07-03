@@ -64,6 +64,14 @@ public sealed class QuestPlanner : IBotPlanner
     private const double GroupSyncSec = 5;      // group consult: re-QUERY the log at most this often so the god bot's all-eligible-done gate sees server truth (shared kill-credit advances counts with no local ack)
     private const int GroupGrindSentinel = 9999;// group consult: kill_count for the shared-objective grind -- a ceiling never reached (no-WAIT), so C++ grinds the mob indefinitely until the god bot moves the objective. NOT 0 (0 can insta-complete the enriched leg)
 
+    // -- Group-vendor errand (GAP G, 2026-07-02) -- mirror MaintenancePlanner's solo vendor values so a
+    // grouped member's sell/repair behaves byte-for-byte like a solo trip; only the ROUTING (one shared
+    // NPC the coordinator picked, vs the member picking its own) differs.
+    private const int GroupVendorSellKeepQuality = 2;      // == MaintenancePlanner.SellKeepQuality — sell grey+white, keep green+
+    private const float GroupVendorArriveYards = 15f;      // == MaintenancePlanner.VendorArriveYards — C++ finds the NPC within 15yd
+    private const int GroupVendorRepairBelowDurability = 70;   // == MaintenancePlanner.RepairRequiredBelowDurability — below this a member still owes a repair even after selling
+    private static readonly TimeSpan GroupVendorAckDeadline = TimeSpan.FromSeconds(30);   // == MaintenancePlanner.VendorAckDeadlineSec — SELL_ACK / REPAIR_ACK wait
+
     // -- Overflow grind (server-authoritative completion) --
     // When the SERVER still reports a kill quest INCOMPLETE (status != 3) but our local
     // QuestNode counts are all met, our requirement is stale/under (a quest_template patch
@@ -658,19 +666,25 @@ public sealed class QuestPlanner : IBotPlanner
             return StepResult.Wait();
         }
 
-        // GRIND FREEZE (overpull_dwell | no_target): C++ froze on this objective's field — every reachable
-        // candidate is over the solo cap, OR the quest mobs are all dead/tapped right now. The quest is NOT
-        // at fault and the field is NOT unsafe: do NOT shelve, blacklist, or defer. Break the freeze with a
-        // guaranteed single kill — an in-place SET_TASK GRIND entry=0 kill_count=1 at the bot's spot. C++
+        // GRIND FREEZE (no_target): C++ froze on this objective's field — the quest mobs are all
+        // dead/tapped/absent right now (a genuinely empty field). The quest is NOT at fault and the
+        // field is NOT unsafe: do NOT shelve, blacklist, or defer. Break the freeze with a guaranteed
+        // single kill — an in-place SET_TASK GRIND entry=0 kill_count=1 at the bot's spot. C++
         // treats (entry==0 && killGoal==1) as an UNSTICK pull and bypasses the overpull veto once (the
         // in-combat retreat stays armed), so it ALWAYS lands a kill — and the nearest valid mob is usually
         // the very mob we were frozen beside, so this often credits the blocked quest directly. On its
         // TASK_COMPLETE (step "detour") we re-sync + re-derive, snapping back to the objective.
         //
+        // HISTORY: C++ also handed back reason "overpull_dwell" when a DENSE field vetoed every pull;
+        // that handback was retired 2026-06-30 when C++ began self-unsticking a dense field IN PLACE
+        // (AttackStart bypassing the cap — see AiBotAIMain.cpp UpdateAI), so "no_target" (empty field)
+        // is the only GRIND_BLOCKED reason that reaches C# now. If a future C++ change reintroduces an
+        // overpull-style handback, add its reason to the check below (and to DriveGroup's group mirror).
+        //
         // Held is CLEARED here on purpose: during the detour the bot's committed task is the detour, not the
         // objective — leaving Held set would make the reconcile (BotBrain 1c) fight the detour (Held=Grind
         // entry=K vs C++ echo entry=0 → spurious re-issue). Derive re-stamps Held when the objective resumes.
-        if (f.Reason == "overpull_dwell" || f.Reason == "no_target")
+        if (f.Reason == "no_target")
         {
             ctx.ClearObjective();
             ctx.SetStep("detour");
@@ -1338,6 +1352,19 @@ public sealed class QuestPlanner : IBotPlanner
         return ql <= GrayLevel(botLevel);
     }
 
+    /// <summary>Group-side grey check by quest id. Resolves the node via the graph and applies the
+    /// EXACT SAME IsGrey/GrayLevel the solo path uses -- one grey formula, one owner, so the
+    /// coordinator never carries a parallel copy that can drift (the Option A discipline). An
+    /// unknown/unloaded quest returns false (never auto-drop something we can't classify).
+    /// Used by GroupCoordinator's grey-drop down-union to gate at the group's (weakest-member)
+    /// level; because GrayLevel is monotonic in level, grey-at-weakest implies grey for every
+    /// present member, so a single check per quest id is both correct and sufficient.</summary>
+    internal static bool IsQuestGreyForLevel(QuestGraphLoader quests, int questId, int level)
+    {
+        var node = quests.GetQuest(questId);
+        return node != null && IsGrey(node, level);
+    }
+
     // Player::GetGrayLevel (vanilla). Target/quest is gray when its level <= this.
     private static int GrayLevel(int pl)
     {
@@ -1483,8 +1510,42 @@ public sealed class QuestPlanner : IBotPlanner
         // A leg failed under the order -> drop it; the coordinator re-stamps / re-picks next tick (it
         // owns recovery). A dying member already peeled to Maintenance via the GoalSelector hard-need
         // before reaching here, so this is the benign "couldn't path / interact right now" case.
+        //
+        // GRIND_BLOCKED (GAP D fix, 2026-07-02) is the one exception: a frozen grind field is
+        // self-healing, not a real failure, and the blanket path below just silently clears it and
+        // lets the coordinator re-stamp the SAME dead camp next tick -> immediate re-freeze, forever.
+        // Run the identical unstick detour solo Recover does (SET_TASK GRIND entry=0 kill_count=1, in
+        // place) instead -- it ALWAYS lands a kill (C++ bypasses the overpull veto once for
+        // entry==0/killGoal==1), and the detour's own TASK_COMPLETE naturally falls back to DriveGroup
+        // next tick: ctx.GroupOrder is untouched throughout, so PlanNext's routing check re-enters
+        // here, not Recover. Every OTHER failure reason keeps the existing blanket handling. (Reason is
+        // "no_target" only -- the overpull_dwell handback was retired C++-side 2026-06-30; see solo
+        // Recover for the full history. If it ever returns, add its reason here too.)
         if (ctx.Failure != null)
         {
+            if (ctx.Failure.CommandType == "GRIND" && ctx.Failure.Reason == "no_target")
+            {
+                string grsn = ctx.Failure.Reason;
+                ctx.Failure = null;
+                ctx.ClearObjective();   // mirrors solo Recover:675 -- the committed task is the detour, not the objective
+
+                _logger.LogInformation("[QUEST] {Name} grind freeze ({Reason}) [group] — unstick: kill 1 in place, then resume group order",
+                    ctx.Name, grsn);
+
+                return StepResult.Send(
+                    new BridgeCommand("SET_TASK", new
+                    {
+                        task = "GRIND",
+                        x = ctx.Pos.X,
+                        y = ctx.Pos.Y,
+                        z = ctx.Pos.Z,
+                        radius = GrindRadius,
+                        creature_entry = 0,
+                        kill_count = 1
+                    }),
+                    "TASK_COMPLETE", DetourDeadline);
+            }
+
             ctx.Failure = null;
             ctx.LastGroupOrder = GroupOrder.None;   // force a fresh leg next tick
             return StepResult.Wait();
@@ -1515,6 +1576,8 @@ public sealed class QuestPlanner : IBotPlanner
                 return GroupHold(ctx, o);
             case GroupPhase.GroupTrain:
                 return GroupTrainHold(ctx, o);
+            case GroupPhase.GroupVendor:
+                return GroupVendorErrand(ctx, o);
             default:
                 // Forming (transient) or a phase this v1 executor doesn't drive: keep the log fresh on a
                 // cadence so the coordinator's gates see server truth, then idle until it stamps a
@@ -1618,6 +1681,69 @@ public sealed class QuestPlanner : IBotPlanner
         return StepResult.Wait();              // nothing latched yet and nowhere to converge — sit tight
     }
 
+    // The group-gated vendor errand (§4, GAP G 2026-07-02): the whole group converges on ONE shared
+    // vendor the coordinator picked (unlike GroupTrain, where classes scatter to their own trainers).
+    // Travel there together; on arrival a member that needs maintenance sells then (if the NPC can
+    // repair and its gear is still low) repairs, exactly mirroring MaintenancePlanner's solo sell→repair
+    // wire -- SELL_ITEMS {npc_entry, keep_quality} → SELL_ACK, then REPAIR_AT_NPC {npc_entry} → REPAIR_ACK.
+    // A member that needs NOTHING just holds at the NPC (keeps the team together while others transact).
+    // Sub-steps ride ctx.Step (grp_vendor_travel / grp_vendor_sell / grp_vendor_repair), the same
+    // move→interact pattern GroupPlan.ToNpc's doc calls out. The COORDINATOR owns advancement: it keeps
+    // the group in GroupVendor until no present member is still over threshold, then flips the phase.
+    private StepResult GroupVendorErrand(BotContext ctx, GroupOrder o)
+    {
+        var npc = NpcOf(o);
+
+        // Not in range yet -> close the last yards individually (the coordinator already gated the
+        // whole group's arrival loosely; this is the per-member final approach, like GroupAccept).
+        if (!AtNpc2D(ctx, npc, GroupVendorArriveYards))
+        {
+            ctx.SetStep("grp_vendor_travel");
+            return MoveTo(npc);
+        }
+
+        // In range. If this member came out of a sell this tick (Step marks it), advance to repair when
+        // it still owes one. The coordinator's requireRepair hard-filter guarantees the stamped vendor is
+        // repair-capable whenever ANY member is below the repair floor (else the gate fell through to
+        // questing and this phase was never stamped) -- so a member below that floor can REPAIR here
+        // without the order needing to carry a CanRepair flag. If somehow the durability recovered
+        // between stamp and now (it can't via selling, but be defensive), the sell was enough -> hold.
+        if (ctx.Step == "grp_vendor_sell")
+        {
+            if (ctx.Durability < GroupVendorRepairBelowDurability)
+            {
+                ctx.SetStep("grp_vendor_repair");
+                return StepResult.Send(
+                    new BridgeCommand("REPAIR_AT_NPC", new { npc_entry = o.TargetNpcEntry }),
+                    "REPAIR_ACK", GroupVendorAckDeadline);
+            }
+            return StepResult.Wait();   // sold, nothing more to do here -> hold with the team
+        }
+        if (ctx.Step == "grp_vendor_repair")
+            return StepResult.Wait();   // repair ack (or its deadline) landed -> done, hold
+
+        // Fresh arrival. Does THIS member actually need the vendor? (Same thresholds the coordinator
+        // gated the whole group on -- a member that's fine just holds so the team stays together.)
+        bool needsSell = ctx.FreeSlots <= 0;
+        bool needsRepair = ctx.Durability < GroupVendorRepairBelowDurability;
+        if (needsSell || needsRepair)
+        {
+            // Always sell first (frees slots AND is the natural lead-in; SellStep in the solo path
+            // repairs afterward off the same arrival). keep_quality matches the solo trip.
+            ctx.SetStep("grp_vendor_sell");
+            return StepResult.Send(
+                new BridgeCommand("SELL_ITEMS", new { npc_entry = o.TargetNpcEntry, keep_quality = GroupVendorSellKeepQuality }),
+                "SELL_ACK", GroupVendorAckDeadline);
+        }
+
+        return StepResult.Wait();   // this member needs nothing -> hold at the vendor with the team
+    }
+
+    // 2D proximity to an NPC within an explicit radius (the vendor arrive gate uses 15yd, wider than
+    // NpcReachYards' 10). Same-map required, same shape as AtNpc but with a caller-supplied radius.
+    private static bool AtNpc2D(BotContext ctx, QuestNpcLocation npc, float yards)
+        => npc.Map == ctx.MapId && Dist2(ctx.Pos.X, ctx.Pos.Y, npc.X, npc.Y) <= yards;
+
     // QUEST_INTERACT for the group path (no BatchQuest): accept / complete by quest id at the NPC.
     private static StepResult GroupInteract(int questId, int npcEntry, bool accept)
     {
@@ -1671,6 +1797,11 @@ public sealed class QuestPlanner : IBotPlanner
     // place) with a sentinel kill_count never reached -> indefinite. Fire = no WAIT, so DriveGroup
     // keeps re-evaluating each tick (refresh cadence + change guard) and the unmatched "GRIND finished"
     // never lands. Completion is the COORDINATOR's server-count gate, not a local count.
+    //
+    // alt_entry1/2/3 (GAP C fix, 2026-07-02): d.Alt1/2/3 -- threaded in by the coordinator from the
+    // virtual bot's own solo MoveToObjectiveLeg dispatch (see GroupCoordinator.TryExtractCoords) --
+    // 0 for every kill-objective directive. Without this a grouped member's valid-kill set never
+    // widened to a tied item-drop sibling the way a solo bot's already does.
     private static StepResult GroupObjectiveLeg(ExecDirective d)
         => StepResult.Fire(
             new BridgeCommand("MOVE_TO", new
@@ -1681,7 +1812,10 @@ public sealed class QuestPlanner : IBotPlanner
                 z = d.Z,
                 creature_entry = d.CreatureEntry,
                 grind_radius = GrindRadius,
-                kill_count = GroupGrindSentinel
+                kill_count = GroupGrindSentinel,
+                alt_entry1 = d.Alt1,
+                alt_entry2 = d.Alt2,
+                alt_entry3 = d.Alt3
             }));
 
     private static StepResult Interact(BatchQuest b, bool accept)
