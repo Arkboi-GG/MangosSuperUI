@@ -110,6 +110,17 @@ public sealed class MaintenancePlanner : IBotPlanner
     private const float RezDelayBaseSec = 15f;
     private const int RezDelayJitterSec = 8;     // → 15-22s
 
+    // ── Group rez guard gate (2026-07-04 round 5) ──
+    // A GROUPED bot holds its in-place 50% rez until the coordinator reports a living groupmate
+    // within guard range of the corpse (BotContext.GroupGuardNearUtc, stamped by TrackDeaths while
+    // the GroupDefend protocol converges the team on this body). 33-45% of the round-5 re-deaths
+    // landed inside 90s of a rez — a bot standing up at half HP alone inside the camp that just
+    // killed it. Capped: a marooned / mid-converge party can never deadlock the rez, and the
+    // MaxDeadSec backstop above it remains the absolute ceiling. Graveyard rezzes (safe ground)
+    // and solo bots are untouched.
+    private const double GuardFreshSec = 5;        // a stamp this recent = a guard is standing here NOW
+    private const double GuardWaitCapSec = 45;     // max extra wait past the corpse-run delay before rezzing anyway
+
     private const double RespawnDeadlineSec = 20;  // RESURRECT → RESPAWN ack window (old ResurrectTimeoutSeconds)
     private const double MaxDeadSec = 300;  // absolute backstop (old MAX_DEAD_SECONDS)
 
@@ -365,6 +376,21 @@ public sealed class MaintenancePlanner : IBotPlanner
         // pop up at 50% HP in place. (Heal-to-full then tops us off before re-engaging.)
         if (DateTime.UtcNow < m.RezAtUtc)
             return StepResult.Wait();
+
+        // ── GROUP GUARD GATE (round 5) ── a grouped bot waits for the defend converge before
+        // standing up at 50% in the camp that killed it. Fresh guard stamp OR the cap elapsed ->
+        // fall through to the rez.
+        if (ctx.GroupOrder.IsActive
+            && (DateTime.UtcNow - ctx.GroupGuardNearUtc).TotalSeconds > GuardFreshSec
+            && (DateTime.UtcNow - m.RezAtUtc).TotalSeconds < GuardWaitCapSec)
+        {
+            if (ctx.Step != "rez_guard_wait")
+            {
+                ctx.SetStep("rez_guard_wait");
+                _log.LogInformation("[REZ] {Name} holding rez — waiting for a guard (group converging on corpse)", ctx.Name);
+            }
+            return StepResult.Wait();
+        }
 
         // Delay elapsed, not a loop/cluster → rez IN PLACE, where we died.
         //

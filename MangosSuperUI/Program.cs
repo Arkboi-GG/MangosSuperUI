@@ -64,6 +64,7 @@ builder.Services.AddSingleton<PaletteSwapService>();
 builder.Services.AddScoped<VariationRecipeService>();
 builder.Services.AddScoped<TextureSegmentationService>();
 builder.Services.AddSingleton<VramManager>();
+builder.Services.AddSingleton<WikiDocStore>();
 
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();

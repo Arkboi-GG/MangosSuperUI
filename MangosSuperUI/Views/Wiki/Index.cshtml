@@ -1,0 +1,127 @@
+@{
+    ViewData["Title"] = "Wiki";
+}
+
+@section Styles {
+    <link rel="stylesheet" href="~/css/wiki.css" asp-append-version="true" />
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header wiki-header">
+            <div class="wiki-header-left">
+                <button id="wikiBrowseBtn" class="wiki-browse-btn" type="button"
+                        title="Browse all pages" aria-expanded="false" aria-controls="wikiDrawer">
+                    <i class="fa-solid fa-bars"></i>
+                    <span>Browse</span>
+                </button>
+                <div class="wiki-title-block">
+                    <h1><i class="fa-solid fa-book" style="color: var(--accent);"></i> Wiki</h1>
+                    <p>VMaNGOS engine documentation — <span id="wikiPageCount">—</span> pages, cross-linked from the source graph</p>
+                </div>
+            </div>
+
+            <div class="wiki-header-tools">
+                <button id="wikiOptsBtn" class="wiki-opts-btn" type="button"
+                        title="Display options" aria-expanded="false" aria-controls="wikiOptsPanel">
+                    <i class="fa-solid fa-sliders"></i>
+                </button>
+
+                <!-- Display options. Each .wiki-opt carries data-opt; segmented buttons carry
+                     data-val. wiki.js wires these generically and persists them — add an option
+                     by adding a group here + a CSS rule, no JS change. -->
+                <div class="wiki-opts-panel" id="wikiOptsPanel" role="dialog" aria-label="Display options" hidden>
+                    <div class="wiki-opts-head">
+                        <span>Display</span>
+                        <button type="button" class="wiki-opts-reset" data-wiki-reset>Reset</button>
+                    </div>
+
+                    <div class="wiki-opt" data-opt="width">
+                        <label>Width</label>
+                        <div class="wiki-seg">
+                            <button type="button" data-val="narrow">Narrow</button>
+                            <button type="button" data-val="comfortable">Comfort</button>
+                            <button type="button" data-val="wide">Wide</button>
+                            <button type="button" data-val="full">Full</button>
+                        </div>
+                    </div>
+
+                    <div class="wiki-opt" data-opt="size">
+                        <label>Text size</label>
+                        <div class="wiki-seg">
+                            <button type="button" data-val="small">S</button>
+                            <button type="button" data-val="normal">M</button>
+                            <button type="button" data-val="large">L</button>
+                        </div>
+                    </div>
+
+                    <div class="wiki-opt" data-opt="spacing">
+                        <label>Line spacing</label>
+                        <div class="wiki-seg">
+                            <button type="button" data-val="tight">Tight</button>
+                            <button type="button" data-val="normal">Normal</button>
+                            <button type="button" data-val="relaxed">Relaxed</button>
+                        </div>
+                    </div>
+
+                    <div class="wiki-opt wiki-opt-row" data-opt="surface">
+                        <label>Reading surface</label>
+                        <button type="button" class="wiki-switch" role="switch" aria-checked="false">
+                            <span class="wiki-switch-knob"></span>
+                        </button>
+                    </div>
+
+                    <div class="wiki-opt wiki-opt-row" data-opt="infobox">
+                        <label>Show infobox</label>
+                        <button type="button" class="wiki-switch" role="switch" aria-checked="true">
+                            <span class="wiki-switch-knob"></span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="content-body wiki-body">
+            <!-- Left rail: this document's Contents (its ToC) -->
+            <aside class="wiki-contents" id="wikiContents" aria-label="Contents">
+                <div class="wiki-contents-head">
+                    <span>Contents</span>
+                    <button type="button" class="wiki-contents-hide" id="wikiContentsHide">hide</button>
+                </div>
+                <nav class="wiki-contents-body" id="wikiContentsBody"></nav>
+            </aside>
+
+            <!-- Center: the rendered article (landing / loading / error / page) -->
+            <article class="wiki-article" id="wikiArticle"></article>
+
+            <!-- Shown only when Contents is hidden — click to bring it back -->
+            <button type="button" class="wiki-contents-show" id="wikiContentsShow" title="Show contents">
+                <i class="fa-solid fa-list-ul"></i> Contents
+            </button>
+
+            <!-- Browse drawer: the full page tree, closed by default -->
+            <div class="wiki-drawer-backdrop" id="wikiDrawerBackdrop" hidden></div>
+            <aside class="wiki-drawer" id="wikiDrawer" aria-label="Browse pages" aria-hidden="true">
+                <div class="wiki-drawer-head">
+                    <span>Browse</span>
+                    <button type="button" class="wiki-drawer-close" id="wikiDrawerClose" title="Close" aria-label="Close browse">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+                <div class="wiki-nav-search">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="text" id="wikiFilter" placeholder="Filter pages…" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="wiki-tree" id="wikiTree">
+                    <div class="wiki-tree-loading">Loading pages…</div>
+                </div>
+            </aside>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/js/wiki.js" asp-append-version="true"></script>
+}

@@ -48,6 +48,7 @@ public static class GroupCoordinator
     // ── Tunables ──
     private const int QuestLogCap = 20;               // 1.12 quest-log size (min-headroom sizing, §6)
     private const int QuestStatusComplete = 1;        // VMaNGOS QUEST_STATUS: COMPLETE=1 (INCOMPLETE=3)
+    private const int QuestStatusIncomplete = 3;      // union status-merge (BuildVirtualSnapshot): merged reads COMPLETE only if EVERY holder is COMPLETE
     private const int TravelSafetyMargin = 3;         // §5.1: weakest may face up to weakest+3 on a travel leg
     private const float ArrivalReachYards = 15f;      // "the group has arrived at the NPC together" gate
     private const double GateLivenessSec = 90;        // §6 liveness escape: a stuck/away member stops gating after this
@@ -58,6 +59,19 @@ public static class GroupCoordinator
     // suppression in GoalSelector keys on the same numbers (no window where one fires and the other doesn't).
     private const int GroupDurabilityVendorThreshold = 30;   // == GoalSelector.DurabilityVendorThreshold / MaintenancePlanner.DurabilityVendorThreshold
     private const int GroupRepairRequiredBelowDurability = 70;  // == MaintenancePlanner.RepairRequiredBelowDurability — below this, the shared vendor lookup HARD-filters to repair-capable NPCs
+
+    // ── Group-vendor window hardening (2026-07-03, the GroupVendor livelock fix) ──
+    // A single member unable to REACH the shared vendor (a genuine navmesh graph disconnection — see
+    // the 2026-07-03 session notes) used to hold the WHOLE group in GroupVendor forever: the gate
+    // re-derived every tick for as long as anyNeedsVendor stayed true, which it does by construction
+    // for a member that can never arrive. GroupVendorWindowCapSec bounds how long the group waits
+    // before force-releasing to questing regardless (the member's own BotBrain.TryEscalateUnreachableAsync
+    // — a hard TELEPORT_TO on a durable no_path streak — and/or its solo MaintenancePlanner backstop
+    // still own actually resolving ITS OWN wedge; this cap only stops that from ALSO freezing the
+    // team). GroupVendorCooldownSec then holds the window closed so a member whose need hasn't
+    // actually cleared doesn't immediately re-open a fresh window the very next tick.
+    private const double GroupVendorWindowCapSec = 180;
+    private const double GroupVendorCooldownSec = 300;
 
     // ── Instrumentation (logic-neutral): make the decider SAY which door it took. ──
     // One [GROUP] line per group on a phase CHANGE, plus a ~15s heartbeat while parked in a
@@ -71,13 +85,30 @@ public static class GroupCoordinator
     private static void Emit(int anchorGuid, GroupPhase prev, GroupPhase now, string detail, List<BotContext> members)
     {
         bool changed = prev != now;
-        bool stuck = now == GroupPhase.HoldAtAnchor || now == GroupPhase.None || now == GroupPhase.Forming;
+        bool stuck = now == GroupPhase.HoldAtAnchor || now == GroupPhase.None || now == GroupPhase.Forming
+                     || now == GroupPhase.GroupGrind    // grinding windows keep the ~15s heartbeat (the countdown lines)
+                     || now == GroupPhase.GroupDefend;  // ...and so do defensive stands (corpse/heal guards)
         if (!changed)
         {
             if (!stuck) return;
             if (_lastEmit.TryGetValue(anchorGuid, out var last)
                 && (DateTime.UtcNow - last).TotalSeconds < EmitHeartbeatSec) return;
         }
+        _lastEmit[anchorGuid] = DateTime.UtcNow;
+        var who = string.Join(" ", members.Select(m =>
+            $"[{m.Guid}:L{m.Level} hp{(int)(m.HpPct * 100)} dead={m.Dead} prog{(int)m.TimeSinceProgressSec}s]"));
+        var line = $"[GROUP] anchor={anchorGuid} {prev}->{now} {detail} | {who}";
+        if (Log != null) Log.LogInformation(line);
+        else Console.WriteLine(line);
+    }
+
+    // Rare, decision-changing events (the Fix-4 exhaust ladder; the Fix-1 virtual deadline) must
+    // NEVER be swallowed by the heartbeat throttle or the unchanged-phase gate — a silent ladder is
+    // the silent-gap class the 2026-07-04 shakedown flagged (a frozen Objective phase emitted
+    // nothing for 10 hours). Bypasses both gates; still stamps _lastEmit so the following heartbeat
+    // cadence stays honest.
+    private static void EmitForce(int anchorGuid, GroupPhase prev, GroupPhase now, string detail, List<BotContext> members)
+    {
         _lastEmit[anchorGuid] = DateTime.UtcNow;
         var who = string.Join(" ", members.Select(m =>
             $"[{m.Guid}:L{m.Level} hp{(int)(m.HpPct * 100)} dead={m.Dead} prog{(int)m.TimeSinceProgressSec}s]"));
@@ -189,6 +220,20 @@ public static class GroupCoordinator
                 ctx.SetObjective(Objective.Grind(ObjectiveSource.Coordinator, d.CreatureEntry,
                     d.X, d.Y, d.Z, d.Map, 0, d.QuestId, d.Slot));   // killCount 0 = indefinite (coordinator gate owns completion)
                 break;
+            case GroupPhase.GroupDefend:
+                // Axiom 2 hardened: passive guard at the point. Objective.Hold is never reconciled
+                // (a C++ Idle echo is the CORRECT state here), so the reconcile can't re-issue
+                // anything into a defensive stand.
+                ctx.SetObjective(Objective.Hold(o.TargetPos));
+                break;
+            case GroupPhase.GroupGrind:
+                // Axiom 1: an indefinite entry-0 grind at the clump point. Reconcilable: echo Grind
+                // (any entry) or MoveTo toward the point both match; Idle mismatches and re-issues —
+                // the self-heal for a dropped C++ grind, with the Fix-3 streak backoff preventing a
+                // metronome against an unreachable point.
+                ctx.SetObjective(Objective.Grind(ObjectiveSource.Coordinator, 0,
+                    o.TargetPos.X, o.TargetPos.Y, o.TargetPos.Z, o.TargetPos.Map, 0));
+                break;
             case GroupPhase.HoldAtAnchor:
                 if (o.Objective.IsActive)
                 {
@@ -243,6 +288,10 @@ public static class GroupCoordinator
         var anchor = AnchorOf(members, anchorGuid);
         var prevPhase = plan.Phase;   // instrumentation: phase BEFORE this tick's decision
 
+        // Round 5 (2026-07-04): death-episode bookkeeping + the meat-grinder trigger. Runs every
+        // tick, before any branch, so deaths are counted no matter which phase they land in.
+        TrackDeaths(plan, members, anchor, anchorGuid, prevPhase);
+
         // ── Peel preemption (§4) ──
         // A peeled (recovering) member: the REST hold on the same target at the anchor. The
         // recovering member's own GoalSelector routes it to Maintenance/Training regardless of
@@ -254,8 +303,100 @@ public static class GroupCoordinator
             var peeled = string.Join(",", members
                 .Where(m => m.Dead || m.Goal == Goal.Maintenance || m.Goal == Goal.Training)
                 .Select(m => $"{m.Guid}({(m.Dead ? $"dead,hp{(int)(m.HpPct * 100)}" : m.Goal.ToString().ToLowerInvariant())})"));
-            Emit(anchorGuid, prevPhase, GroupPhase.HoldAtAnchor, $"DOOR1 peel recovering={peeled}", members);
-            return HoldAtAnchor(plan, anchor);
+
+            // Axiom 2 (Nico, 2026-07-04), HARDENED after round 5: a death NEVER splits the group —
+            // AND the converge is DEFENSIVE. The clump point becomes the DEAD MEMBER'S live position
+            // (the corpse while it lies there; the graveyard the moment a ghost/GY rez moves it) and
+            // everyone converges there and stands GUARD: SET_TASK IDLE, fight only what aggros, pull
+            // NOTHING. The first cut of this protocol ordered a GRIND at the corpse — converging the
+            // team into the camp that just produced a corpse and actively pulling it was a wipe
+            // engine (291 deaths at a flat ~80/hr, 33-45% of re-deaths inside 90s of the rez; every
+            // top corpse coordinate a dense L8-10 camp). Position rounded to 5yd so a static corpse
+            // produces a stable (change-guard-friendly) order; a GY jump changes it once,
+            // deliberately, and the whole team re-paths to the member.
+            var deadMember = members.FirstOrDefault(m => m.Dead);
+            if (deadMember != null)
+            {
+                var cp = new Vec4(
+                    MathF.Round(deadMember.Pos.X / 5f) * 5f,
+                    MathF.Round(deadMember.Pos.Y / 5f) * 5f,
+                    deadMember.Pos.Z, deadMember.MapId);
+                plan.GrindPoint = cp;
+                plan.HasGrindPoint = true;
+                plan.SetPhase(GroupPhase.GroupDefend);
+                Emit(anchorGuid, prevPhase, GroupPhase.GroupDefend,
+                    $"DOOR1 defend corpse member={deadMember.Guid} @({cp.X:F0},{cp.Y:F0}) recovering={peeled}", members);
+                return GroupOrder.DefendAt(anchorGuid, cp);
+            }
+
+            // A member is ALIVE but healing off a rez (50% HP, eating): keep standing GUARD at the
+            // memoized point (it persists across the dead->healing flip, so this is the same spot
+            // the corpse lay). Grinding here would pull the camp onto the eater — the exact loop
+            // the defend phase exists to break.
+            var healingMember = members.FirstOrDefault(m =>
+                !m.Dead && m.Maintenance is { RezSent: true, HealDone: false });
+            if (healingMember != null)
+            {
+                Vec4 hp;
+                if (plan.HasGrindPoint
+                    && (plan.Phase == GroupPhase.GroupDefend || plan.Phase == GroupPhase.GroupGrind))
+                {
+                    hp = plan.GrindPoint;
+                }
+                else
+                {
+                    hp = new Vec4(
+                        MathF.Round(healingMember.Pos.X / 5f) * 5f,
+                        MathF.Round(healingMember.Pos.Y / 5f) * 5f,
+                        healingMember.Pos.Z, healingMember.MapId);
+                }
+                plan.GrindPoint = hp;
+                plan.HasGrindPoint = true;
+                plan.SetPhase(GroupPhase.GroupDefend);
+                Emit(anchorGuid, prevPhase, GroupPhase.GroupDefend,
+                    $"DOOR1 guard heal member={healingMember.Guid} @({hp.X:F0},{hp.Y:F0}) recovering={peeled}", members);
+                return GroupOrder.DefendAt(anchorGuid, hp);
+            }
+
+            // Alive ERRAND peel (vendor/training trip): the waiters grind at the anchor (Axiom 1) —
+            // errand ground is the group's own held position, not a hostile camp.
+            var gp = EnsureGrindPoint(plan, anchor);
+            Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"DOOR1 peel recovering={peeled} -> grind@({gp.X:F0},{gp.Y:F0})", members);
+            plan.SetPhase(GroupPhase.GroupGrind);
+            return GroupOrder.GrindAt(anchorGuid, gp);
+        }
+
+        // ── Meat-grinder retreat (round 5) ──
+        // Armed by TrackDeaths when the death window fills; STARTED only here — the first tick the
+        // party is whole again (a corpse is never abandoned; the defend protocol above owns the
+        // group until everyone is up and healed). The retreat is an Axiom-1 grind at the last
+        // proven-safe ground for a fixed hold, and the active quest that kept sending the group
+        // into the camp was already queued for a shelve (PendingGrinderDefer -> the virtual layer's
+        // Recover) — so when normal planning resumes after the hold, it derives DIFFERENT work
+        // instead of walking back in. No safe point captured yet (a group that has never had a
+        // calm window) -> the retreat leg is skipped and only the shelve applies.
+        if (plan.RetreatPending)
+        {
+            plan.RetreatPending = false;
+            if (plan.HasLastSafePoint)
+            {
+                plan.RetreatUntil = DateTime.UtcNow.AddSeconds(RetreatHoldSec);
+                EmitForce(anchorGuid, prevPhase, GroupPhase.GroupGrind,
+                    $"MEAT-GRINDER retreat begins -> ({plan.LastSafePoint.X:F0},{plan.LastSafePoint.Y:F0}) for {RetreatHoldSec}s", members);
+            }
+        }
+        if (plan.RetreatUntil is DateTime ru)
+        {
+            if (DateTime.UtcNow < ru && plan.HasLastSafePoint)
+            {
+                plan.GrindPoint = plan.LastSafePoint;
+                plan.HasGrindPoint = true;
+                plan.SetPhase(GroupPhase.GroupGrind);
+                Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind,
+                    $"retreat {(int)(ru - DateTime.UtcNow).TotalSeconds}s -> regroup @({plan.LastSafePoint.X:F0},{plan.LastSafePoint.Y:F0})", members);
+                return GroupOrder.GrindAt(anchorGuid, plan.LastSafePoint);
+            }
+            plan.RetreatUntil = null;   // hold elapsed — resume normal planning below
         }
 
         // ── Group-gated training window (§4) ──
@@ -317,16 +458,53 @@ public static class GroupCoordinator
         // to questing, NOT a freeze: the member's own solo MaintenancePlanner backstop still owns actually
         // resolving an unreachable-vendor wedge; the group just doesn't gate on it. Same GateLivenessSec
         // escape as every other gate keeps one stuck member from freezing the errand forever.
+        //
+        // 2026-07-03 hardening (the GroupVendor livelock): two problems, fixed together.
+        // (a) The lookup used to re-run EVERY TICK for as long as anyNeedsVendor stayed true — ~4/sec
+        //     in the live capture that diagnosed this — and re-logged every time. The vendor is now
+        //     MEMOIZED on plan.VendorNpcEntry/VendorPos the first tick the window opens, and re-stamped
+        //     from the memo on every subsequent tick: one lookup per errand, not one per tick.
+        // (b) Nothing stopped the group re-deriving the SAME GroupVendor phase forever if the chosen
+        //     vendor happened to be unreachable for one member. plan.TimeInPhaseSec (already tracked
+        //     for every phase) is now checked against GroupVendorWindowCapSec; past the cap the window
+        //     force-closes and the group falls through to questing regardless of anyNeedsVendor, then
+        //     cools down (GroupVendorCooldownSec) so a member whose need hasn't actually cleared can't
+        //     re-open a fresh window on the very next tick — the same amnesiac-retry shape the cap
+        //     exists to break.
         bool anyNeedsVendor = members.Any(m => m.Durability < GroupDurabilityVendorThreshold || m.FreeSlots <= 0);
-        if (anyNeedsVendor)
+        bool vendorOnCooldown = plan.VendorWindowCooldownUntil is DateTime cd && DateTime.UtcNow < cd;
+
+        if (prevPhase == GroupPhase.GroupVendor && plan.VendorNpcEntry != 0)
+        {
+            if (anyNeedsVendor && plan.TimeInPhaseSec < GroupVendorWindowCapSec)
+            {
+                // Re-stamp from the memo -- no re-lookup, no re-log.
+                return GroupOrder.ToNpc(GroupPhase.GroupVendor, anchorGuid, plan.VendorNpcEntry, plan.VendorPos);
+            }
+
+            if (anyNeedsVendor)
+            {
+                // Wall-clock cap tripped -- the group must never be hostage to one member's errand.
+                plan.VendorWindowCooldownUntil = DateTime.UtcNow.AddSeconds(GroupVendorCooldownSec);
+                Emit(anchorGuid, prevPhase, prevPhase,
+                    $"vendor-window CAPPED at {plan.TimeInPhaseSec:F0}s (npc={plan.VendorNpcEntry}) -> releasing to questing for {GroupVendorCooldownSec:F0}s; member's own escalation/backstop owns the rest",
+                    members);
+            }
+            // Either the need genuinely cleared (errand done) or the cap tripped -- either way this
+            // window is over. Clear the memo so a future window re-derives fresh.
+            plan.ClearVendorTarget();
+        }
+
+        if (anyNeedsVendor && !vendorOnCooldown)
         {
             bool anyNeedsRepair = members.Any(m => m.Durability < GroupRepairRequiredBelowDurability);
             var vendor = zoneData.GetNearestVendor(anchor.ZoneId, anchor.MapId, anchor.Pos.X, anchor.Pos.Y,
                                                    members.Min(m => m.Level), anyNeedsRepair);
             if (vendor != null)
             {
-                plan.SetPhase(GroupPhase.GroupVendor);
                 var vpos = new Vec4(vendor.X, vendor.Y, vendor.Z, vendor.MapId);
+                plan.SetVendorTarget(vendor.NpcEntry, vpos);   // memoize -- one lookup for the whole window
+                plan.SetPhase(GroupPhase.GroupVendor);
                 Emit(anchorGuid, prevPhase, GroupPhase.GroupVendor,
                     $"vendor-window open npc={vendor.NpcEntry} \"{vendor.NpcName}\" repair={(vendor.CanRepair ? "Y" : "N")} needRepair={anyNeedsRepair}", members);
                 return GroupOrder.ToNpc(GroupPhase.GroupVendor, anchorGuid, vendor.NpcEntry, vpos);
@@ -385,6 +563,25 @@ public static class GroupCoordinator
 
     private const int GroupInjectCap = 8;          // mirrors QuestPlanner.BatchCap -- ceiling on how many freshly-eligible quests RefreshVirtualEligibility injects per tick
     private const float GroupInjectRadiusYards = 300f;   // loose locality gate for injection only; PriorityLeg (inside Derive) does the real near/far ordering once a candidate is in the batch
+    private const float GroupInjectRadiusWideYards = 1500f;   // Fix 4 rung 4: after 4+ identical exhaust cycles, reach for the next hub (the solo ReachTier analog)
+
+    // ── Cluster-aware path gate (2026-07-04 rounds 4/5) ──
+    // The old gate vetoed a corridor on its single highest creature level — maximally sensitive
+    // to exactly the noise Nico called out (patrolling mobs; a lone rare a bot simply paths
+    // around). Round 4 measured it: Thuros Lightfingers L11, ONE spawn, vetoing the entire
+    // kobold-cave corridor for any group with weakest under 8, while solo bots (which never run
+    // this gate) cleared the same content freely. The gate now vetoes on CLUSTERS: 1-2 over-band
+    // stragglers pass; a camp in one cell, a blanketed corridor, or paired deep-reds veto.
+    private const int PathClusterCellVeto = 3;    // over-band spawns in ONE 100yd cell = a camp on the line
+    private const int PathClusterTotalVeto = 5;   // over-band spawns across the corridor = blanketed even if spread
+    private const int PathDeepPairVeto = 2;       // >= this many spawns 3+ OVER the band in one cell = lethal pocket
+    private const float GroupGuardYards = 30f;    // a living groupmate this close to a corpse = the rez is guarded
+
+    // ── Meat-grinder breaker (2026-07-04 round 5) ──
+    private const int MeatGrinderDeaths = 3;         // this many alive->dead transitions...
+    private const int MeatGrinderWindowSec = 300;    // ...inside this window = the camp is winning
+    private const int SafePointCalmSec = 300;        // party whole + death-free this long -> current spot is proven-safe ground
+    private const int RetreatHoldSec = 120;          // how long the retreat grind holds at the safe point before normal planning resumes
 
     private static GroupOrder DriveGroupViaVirtual(
         GroupPlan plan, List<BotContext> members, int anchorGuid, BotContext anchor,
@@ -393,7 +590,22 @@ public static class GroupCoordinator
         var vctx = GetOrCreateVirtual(plan);
         var vsnap = BuildVirtualSnapshot(anchor, members);
         vctx.Sense(vsnap);                                   // Pos/MapId/ZoneId/Level/QuestLog -- exactly what Derive reads
-        RefreshVirtualEligibility(vctx, members, quests);    // union exclusions + inject newly-eligible-for-someone content
+        RefreshVirtualEligibility(vctx, members, quests, plan);    // union exclusions + inject newly-eligible-for-someone content
+
+        // Meat-grinder shelve (round 5): the breaker also removes the quest that kept sending the
+        // group into the camp. Synthesized as a normal WaitFailure so the real Recover machinery
+        // shelves it — durable, escalating, logged ("shelving [id] (meat_grinder ...)"), expiring —
+        // instead of a bespoke side-channel defer. No active quest (deaths during a pure grind
+        // window) -> nothing to shelve; the retreat leg alone applies.
+        if (plan.PendingGrinderDefer)
+        {
+            plan.PendingGrinderDefer = false;
+            if (vctx.Quest?.Active != null)
+            {
+                vctx.Pending = null;
+                vctx.Failure = new WaitFailure { CommandType = "MOVE_TO", Reason = "meat_grinder", Utc = DateTime.UtcNow };
+            }
+        }
 
         // GAP F fix (2026-07-02): consume the virtual grind-lock. When the virtual bot's own Derive hit
         // a deferral-driven batch exhaust on a PRIOR tick, it stamped GrindLockUntil on the virtual
@@ -401,39 +613,124 @@ public static class GroupCoordinator
         // GrindLockUntil in GoalSelector), so it was set-then-ignored: the group fell to solo grind AND
         // re-ran the entire virtual Derive (batch build / gather / exhaust) every tick just to land on
         // Block again -- the quest-grind oscillation this lock exists to prevent, now at the group level.
-        // While the lock is active, short-circuit BEFORE PlanNext: return GroupOrder.None so each member
-        // solo-grinds for the window (exactly today's Blocked behavior), but skip the expensive re-derive.
-        // This deliberately mirrors solo GoalSelector, which commits to the FULL window by wall-clock and
-        // has no early-clear on newly-workable content ("the bot earns its hour of XP") -- a grouped bot
-        // behaving identically is the correctness goal, not a compromise. The union-workability guard
-        // that PREVENTS a wrongful lock still runs where it matters: it's inside the virtual Derive that
-        // SETS the lock (WorkableInLog reads the union QuestLog), so the lock never gets stamped while any
-        // member has workable in-log content in the first place -- this consumer only honors a lock that
-        // guard already permitted. NOT the richer "grind together at the anchor" form (fix-spec option a):
-        // that needs a creature_entry=0 indefinite group objective, an untested wire shape on this fork
-        // (the sentinel note warns kill_count=0 insta-completes; a 0-entry group leg is entirely
-        // unexercised), so it's deferred rather than shipped on spec -- see the gap doc.
-        if (vctx.Identity?.GrindLockUntil is DateTime vgl && DateTime.UtcNow < vgl)
+        // While the lock is active, short-circuit BEFORE PlanNext: skip the expensive re-derive for the
+        // window. The union-workability guard that PREVENTS a wrongful lock still runs where it matters:
+        // it's inside the virtual Derive that SETS the lock (WorkableInLog reads the union QuestLog), so
+        // the lock never gets stamped while any member has workable in-log content in the first place --
+        // this consumer only honors a lock that guard already permitted.
+        //
+        // 2026-07-04 (Axiom 1): the lock window IS now the "grind together" form this comment once
+        // deferred -- the old wire fear conflated the WAITed SET_TASK shape (where kill_count=0
+        // insta-completes the WAIT) with the no-WAIT Dispatch shape solo GrindPlanner has shipped daily
+        // (394 entry=0 grinds in the 2026-07-04 Server.log tail alone). The prior alternative -- holding
+        // the LATCHED single mob at its verbatim spawn coordinate -- camped group B on Garrick's empty
+        // one-spawn hill all night: zero XP, so the weakest-ding release below could never fire and the
+        // level-keyed defers could never expire (the four-lock deadlock in the shakedown, D3/D4).
+        // ── Fix 4 (2026-07-04): the exhaust escape ladder. Evaluated ONCE per lock, on the tick a
+        // fresh lock is first observed (GrindLockWeakestLevel still unstamped). Fingerprint the
+        // deferred set; an identical set to the previous lock means the 20-minute window changed
+        // nothing — the amnesiac clockwork that ran 30+ identical cycles on 2026-07-04. Escalate:
+        // cycle 2 force-expires TIME defers; cycle 3 also LEVEL defers (their stamping condition is
+        // a straight-line danger read from a position the group has since left — stale by
+        // definition, and their release key (the weakest leveling) is exactly what a bad lock
+        // prevents); cycle 4+ additionally widens the injection radius so acquisition can reach the
+        // next hub. Any expiry also DROPS the lock so the re-derive happens NOW, not in 20 minutes.
+        if (vctx.Identity?.GrindLockUntil is DateTime vglLadder && DateTime.UtcNow < vglLadder
+            && plan.GrindLockWeakestLevel == 0)
         {
-            plan.LatchedObjective = ExecDirective.None;
-            plan.SetPhase(GroupPhase.None);
-            Emit(anchorGuid, prevPhase, GroupPhase.None,
-                $"virtual: grind-lock {(int)Math.Ceiling((vgl - DateTime.UtcNow).TotalMinutes)}m -> solo-grind (clock consumed, no re-derive)", members);
-            return GroupOrder.None;
+            string fp = string.Join(",", vctx.Identity.DeferredQuestIds.Keys.OrderBy(k => k));
+            if (fp.Length > 0 && fp == plan.LastExhaustSet) plan.ExhaustCycles++;
+            else { plan.ExhaustCycles = 1; plan.LastExhaustSet = fp; }
+
+            if (plan.ExhaustCycles >= 2)
+            {
+                bool expireLevel = plan.ExhaustCycles >= 3;
+                int cleared = ForceExpireDeferrals(vctx, members, expireLevel);
+                string widened = plan.ExhaustCycles >= 4 ? " + widened pick radius" : "";
+                if (cleared > 0)
+                {
+                    vctx.Identity.GrindLockUntil = null;   // re-derive NOW with the defers cleared
+                    EmitForce(anchorGuid, prevPhase, prevPhase,
+                        $"exhaust cycle={plan.ExhaustCycles} unchanged set=[{fp}] -> force-expired {cleared} defer(s){(expireLevel ? " incl level-gated" : "")}{widened} -- re-deriving now", members);
+                }
+                else
+                {
+                    EmitForce(anchorGuid, prevPhase, prevPhase,
+                        $"exhaust cycle={plan.ExhaustCycles} unchanged set=[{fp}] -> nothing expirable{widened}", members);
+                }
+            }
         }
 
-        // Resolve any in-flight virtual WAIT against REAL group state first. Still outstanding ->
-        // re-stamp the SAME order (idempotent; real members' own LastGroupOrder change-guard no-ops on
-        // an unchanged stamp) and stop here without asking Derive for a fresh decision this tick.
-        if (vctx.Pending != null)
+        if (vctx.Identity?.GrindLockUntil is DateTime vgl && DateTime.UtcNow < vgl)
         {
-            if (!TryResolveVirtualWait(plan, vctx, members, quests))
-                return BuildGroupOrderFromVirtual(plan, vctx, anchor, anchorGuid, members, safety, prevPhase);
+            // BREAK THE LOCK ON A WEAKEST LEVEL-UP (2026-07-03): a path_unsafe grind-lock waits ONLY on the
+            // weakest member's level -- the shelved quests are LEVEL-deferred (requiredLevel = danger -
+            // margin), and RefreshVirtualEligibility above has already pruned any the current weakest clears.
+            // So a weakest-member ding is exactly the signal the block has (or may have) lifted. If the
+            // weakest has risen since this lock began, DROP the lock and fall through to the real Derive to
+            // re-decide -- it re-checks path safety at the new level and either resumes the now-safe quest or
+            // simply re-locks. Without this the group burned the whole fixed window (~13 min live) after the
+            // block had already cleared. (Solo grind-lock deliberately does NOT clear on level-up -- "earn the
+            // hour of XP" -- but that's the genuinely-nothing-to-do case; a GROUP path_unsafe lock is gated on
+            // a level a ding resolves, a different animal.)
+            if (plan.GrindLockWeakestLevel != 0 && vctx.Level > plan.GrindLockWeakestLevel)
+            {
+                vctx.Identity.GrindLockUntil = null;
+                plan.GrindLockWeakestLevel = 0;
+                // fall through -- the Pending resolve + PlanNext below re-derive at the new weakest level.
+            }
+            else
+            {
+                if (plan.GrindLockWeakestLevel == 0)
+                    plan.GrindLockWeakestLevel = vctx.Level;   // stamp the weakest level this lock began at
 
-            if (vctx.Pending != null && vctx.Pending.Expired)   // universal deadline backstop, mirrors BotBrain step 3b
+                // NEVER solo-grind in a group (Nico, 2026-07-03) — and NEVER latch a single mob for
+                // the window (Nico, 2026-07-04 / Axiom 1: the old latched hold camped Garrick's empty
+                // one-spawn hill all night — zero XP, so the weakest-ding release could never fire).
+                // The lock window is now a real GroupGrind: everyone clumps at the memoized point and
+                // grinds nearby level-appropriate mobs (entry=0, C++ scan), focus-fire on. XP flows,
+                // the weakest actually levels, and both release keys (the ding above, the wall clock)
+                // become reachable.
+                var lockPoint = EnsureGrindPoint(plan, anchor);
+                Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind,
+                    $"virtual: grind-lock {(int)Math.Ceiling((vgl - DateTime.UtcNow).TotalMinutes)}m -> grind together @({lockPoint.X:F0},{lockPoint.Y:F0})", members);
+                plan.SetPhase(GroupPhase.GroupGrind);
+                return GroupOrder.GrindAt(anchorGuid, lockPoint);
+            }
+        }
+        else
+        {
+            plan.GrindLockWeakestLevel = 0;   // no lock active -> reset so the next lock captures fresh
+        }
+
+        // Resolve any in-flight virtual WAIT against REAL group state first. Still outstanding AND
+        // within its deadline -> re-stamp the SAME order (idempotent; real members' own
+        // LastGroupOrder change-guard no-ops on an unchanged stamp) and stop here without asking
+        // Derive for a fresh decision this tick.
+        //
+        // Fix 1 (2026-07-04): the deadline check MUST run on the UNRESOLVED path. The old shape
+        // returned early on "still owed" and only checked Expired after a successful resolve — but
+        // every successful resolve already nulls Pending inside the resolver, so the "universal
+        // deadline backstop" was unreachable under every input. Consequence: a WAIT whose union
+        // gate is UNSATISFIABLE (5624's kill-a-friendly objective; a single-drop item with a
+        // detached holder) was IMMORTAL, and while it stood, PlanNext never ran again — no
+        // re-derive, no defer expiry, no exhaust, no turn-ins of OTHER quests. Group A froze
+        // behind exactly this for 10+ hours on 2026-07-04. Now: resolve wins if it can; an
+        // unresolved-but-expired WAIT becomes a deadline Failure the real Recover shelves
+        // (DeferAcceptedQuest — durable, carried); only an unresolved, unexpired WAIT re-stamps.
+        if (vctx.Pending != null && !TryResolveVirtualWait(plan, vctx, members, quests))
+        {
+            if (vctx.Pending is { Expired: true })
             {
                 vctx.Failure ??= new WaitFailure { CommandType = vctx.Pending.CommandType, Reason = "deadline", Utc = DateTime.UtcNow };
                 vctx.Pending = null;
+                EmitForce(anchorGuid, prevPhase, prevPhase,
+                    $"virtual: WAIT {vctx.Failure.CommandType} deadline (union gate never satisfied) -> Recover shelves it", members);
+                // fall through to PlanNext — Recover consumes the Failure this same tick.
+            }
+            else
+            {
+                return BuildGroupOrderFromVirtual(plan, vctx, anchor, anchorGuid, members, safety, prevPhase);
             }
         }
 
@@ -446,10 +743,15 @@ public static class GroupCoordinator
                 break;
             case StepResult.Blocked:
             case StepResult.Done:
-                plan.LatchedObjective = ExecDirective.None;
-                plan.SetPhase(GroupPhase.None);
-                Emit(anchorGuid, prevPhase, GroupPhase.None, "virtual: no_quests -> solo-grind", members);
-                return GroupOrder.None;
+                // No workable SHARED quest this tick -> the group stays TOGETHER (Nico, 2026-07-03: a
+                // group NEVER splits to solo-grind) and, per Axiom 1 (2026-07-04), it GRINDS — nearby
+                // level-appropriate mobs at the clump point, never a latched single mob and never an
+                // idle clump. When a union quest becomes workable again (a defer expires, the weakest
+                // levels, the Fix-4 ladder force-expires), the next tick re-derives it.
+                var idlePoint = EnsureGrindPoint(plan, anchor);
+                Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"virtual: no shared quest -> grind together @({idlePoint.X:F0},{idlePoint.Y:F0})", members);
+                plan.SetPhase(GroupPhase.GroupGrind);
+                return GroupOrder.GrindAt(anchorGuid, idlePoint);
                 // Dispatch (fire-and-forget, e.g. ABANDON_QUEST grey-drop) and Continue: nothing to arm;
                 // fall through and let BuildGroupOrderFromVirtual read whatever vctx.Step/Quest.Active
                 // Derive left behind (a grey-drop mutates the batch/Identity directly, no group translation
@@ -479,8 +781,9 @@ public static class GroupCoordinator
     // other reach/safety gate in this file already uses), Level = WEAKEST present member (so
     // grey/red/reach checks protect the low member, matching PathSafeForWeakest's existing bias),
     // QuestLog = union of every present member's own log (a quest is "in the log" if ANY holder has
-    // it; per-slot MobCounts/ItemCounts = MAX across holders -- shared kill-credit should keep these
-    // roughly equal in practice, MAX is the safe read if it doesn't). Health/mana always full and
+    // it; per-slot MobCounts/ItemCounts = MIN across holders, Status = COMPLETE only if EVERY holder is
+    // COMPLETE -- the UNION OF NEEDS: the group is only as done as its least-progressed owing member, so
+    // Derive never advances turn-in ahead of anyone). Health/mana always full and
     // never dead -- the virtual bot itself is never the reason a leg stalls; real member health is
     // MaintenancePlanner's job via the normal AnyRecovering peel above.
     private static BotStateSnapshot BuildVirtualSnapshot(BotContext anchor, List<BotContext> members)
@@ -501,21 +804,35 @@ public static class GroupCoordinator
                 }
                 else
                 {
-                    if (kv.Value.Status > e.Status) e.Status = kv.Value.Status;   // COMPLETE(1) beats INCOMPLETE(3)? see note below
+                    // UNION OF NEEDS (2026-07-03): per-slot progress is the MINIMUM across holders --
+                    // the group's objective is only as done as its LEAST-progressed owing member. MAX
+                    // (the old read) let the FASTEST looter's count stand in for the whole group, so Derive
+                    // advanced to turn-in the moment ONE member finished and stranded the rest (the
+                    // premature-advance / "group moved on before everyone collected" bug). Status is
+                    // recomputed as an all-holders-complete union in the post-pass below.
                     for (int i = 0; i < 4 && i < e.MobCounts.Length && i < kv.Value.MobCounts.Length; i++)
-                        e.MobCounts[i] = Math.Max(e.MobCounts[i], kv.Value.MobCounts[i]);
+                        e.MobCounts[i] = Math.Min(e.MobCounts[i], kv.Value.MobCounts[i]);
                     for (int i = 0; i < 4 && i < e.ItemCounts.Length && i < kv.Value.ItemCounts.Length; i++)
-                        e.ItemCounts[i] = Math.Max(e.ItemCounts[i], kv.Value.ItemCounts[i]);
+                        e.ItemCounts[i] = Math.Min(e.ItemCounts[i], kv.Value.ItemCounts[i]);
                 }
             }
         }
-        // Status merge note: VMaNGOS's enum is NOT ordered by "more done" (COMPLETE=1, INCOMPLETE=3,
-        // UNAVAILABLE=2) -- ">" is meaningless across them. What we actually want is "COMPLETE wins if
-        // ANY holder reads COMPLETE", so fix the merge explicitly rather than trust numeric ordering.
-        foreach (var m in members)
-            foreach (var kv in m.QuestLog)
-                if (kv.Value.Status == 1 && merged.TryGetValue(kv.Key, out var e))
-                    e.Status = 1;
+        // Status merge = UNION OF NEEDS (2026-07-03): the group's quest reads COMPLETE only when EVERY
+        // holder reads COMPLETE. A single holder still INCOMPLETE keeps the merged status INCOMPLETE, so
+        // the virtual bot's Derive keeps the quest in-work and never advances to turn-in ahead of the
+        // slowest owing member. Status-level companion to the per-slot MIN counts above. (The old rule --
+        // COMPLETE if ANY holder complete -- was the OR that stranded slow members.)
+        foreach (var kv in merged)
+        {
+            bool allComplete = true;
+            foreach (var m in members)
+                if (m.QuestLog.TryGetValue(kv.Key, out var he) && he.Status != QuestStatusComplete)
+                {
+                    allComplete = false;
+                    break;
+                }
+            kv.Value.Status = allComplete ? QuestStatusComplete : QuestStatusIncomplete;
+        }
 
         int weakestLevel = members.Min(m => m.Level);
         return new BotStateSnapshot
@@ -541,7 +858,7 @@ public static class GroupCoordinator
 
     // Union the durable exclusion state ("defer for all") and inject newly-eligible-for-someone
     // content. This is the one place group-specific eligibility logic belongs (§ above).
-    private static void RefreshVirtualEligibility(BotContext vctx, List<BotContext> members, QuestGraphLoader quests)
+    private static void RefreshVirtualEligibility(BotContext vctx, List<BotContext> members, QuestGraphLoader quests, GroupPlan plan)
     {
         var vid = vctx.Identity!;
         vid.Level = vctx.Level;
@@ -614,7 +931,11 @@ public static class GroupCoordinator
                 if (vid.DeferredQuestIds.ContainsKey(node.QuestId)) continue;    // group-level defer (any member) still applies
                 if (vid.AbandonedGreyQuestIds.Contains(node.QuestId)) continue;
                 if (node.Giver == null || node.Giver.Map != vctx.MapId) continue;
-                if (Dist2(vctx.Pos.X, vctx.Pos.Y, node.Giver.X, node.Giver.Y) > GroupInjectRadiusYards) continue;
+                // Fix 4 rung 4: a group stuck in identical exhaust cycles widens its reach so
+                // acquisition can seed the NEXT hub (Goldshire -> Westbrook / the Westfall border
+                // givers) instead of re-locking on a drained one forever.
+                float injectRadius = plan.ExhaustCycles >= 4 ? GroupInjectRadiusWideYards : GroupInjectRadiusYards;
+                if (Dist2(vctx.Pos.X, vctx.Pos.Y, node.Giver.X, node.Giver.Y) > injectRadius) continue;
 
                 q.Batch.Add(new BatchQuest { QuestId = node.QuestId, Node = node, Accepted = false });
                 have.Add(node.QuestId);
@@ -652,7 +973,13 @@ public static class GroupCoordinator
 
             bool anyoneStillOwes = members.Any(m =>
             {
-                if (m.Dead || m.TimeSinceProgressSec > GateLivenessSec) return false;   // liveness escape, mirrors §6
+                // COMPLETION IS A HARD UNION (2026-07-03): a slow-but-alive member still OWES and MUST gate --
+                // NO TimeSinceProgressSec liveness bypass here (that bypass was the second leak that let the
+                // group advance while a member was still killing/collecting, stranding it). Only a dead member
+                // is skipped, and it already peeled to death-recovery via AnyRecovering upstream; a genuinely-
+                // stuck (not merely slow) objective is moved off for the WHOLE group by Derive's path_unsafe-
+                // defer / overflow-bound / grey-drop, never by leaving one member behind.
+                if (m.Dead) return false;
                 if (!m.QuestLog.TryGetValue(active.QuestId, out var e)) return false;   // not a holder
                 if (e.Status == QuestStatusComplete) return false;
                 foreach (var slot in killSlots)
@@ -672,6 +999,7 @@ public static class GroupCoordinator
             if (anyoneStillOwes) return false;
             vctx.Pending = null;
             vctx.MarkProgress();
+            plan.ExhaustCycles = 0; plan.LastExhaustSet = "";   // Fix 4: real progress resets the ladder
             return true;
         }
 
@@ -683,6 +1011,7 @@ public static class GroupCoordinator
             if (!AllWithinReach(members, npc, ArrivalReachYards)) return false;
             vctx.Pending = null;
             vctx.MarkProgress();
+            plan.ExhaustCycles = 0; plan.LastExhaustSet = "";   // Fix 4: real progress resets the ladder
             return true;
         }
 
@@ -713,6 +1042,7 @@ public static class GroupCoordinator
             if (anyoneStillOwes) return false;
             vctx.Pending = null;
             vctx.MarkProgress();
+            plan.ExhaustCycles = 0; plan.LastExhaustSet = "";   // Fix 4: real progress resets the ladder
             return true;
         }
 
@@ -764,8 +1094,8 @@ public static class GroupCoordinator
                     if (!PathSafeForWeakest(members, anchor, npc, safety))
                     {
                         RouteVirtualUnsafe(vctx, npc, anchor, safety);
-                        Emit(anchorGuid, prevPhase, GroupPhase.HoldAtAnchor, $"virtual: giver={npc.NpcEntry} unsafe -> path_unsafe defer", members);
-                        return HoldAtAnchor(plan, anchor);
+                        Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"virtual: giver={npc.NpcEntry} unsafe -> path_unsafe defer; grind together", members);
+                        return GroupGrindAt(plan, anchor, anchorGuid);
                     }
                     // Two-phase, matching the old design: TravelToGiver (StampHeld mirrors this as a
                     // RECONCILABLE Objective.Travel -- the self-heal catches a C++ task silently dropping
@@ -786,8 +1116,8 @@ public static class GroupCoordinator
                     if (!PathSafeForWeakest(members, anchor, npc, safety))
                     {
                         RouteVirtualUnsafe(vctx, npc, anchor, safety);
-                        Emit(anchorGuid, prevPhase, GroupPhase.HoldAtAnchor, $"virtual: ender={npc.NpcEntry} unsafe -> path_unsafe defer", members);
-                        return HoldAtAnchor(plan, anchor);
+                        Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"virtual: ender={npc.NpcEntry} unsafe -> path_unsafe defer; grind together", members);
+                        return GroupGrindAt(plan, anchor, anchorGuid);
                     }
                     if (AllWithinReach(members, npc, ArrivalReachYards))
                     {
@@ -805,8 +1135,8 @@ public static class GroupCoordinator
                     if (!PathSafeForWeakest(members, anchor, dest, safety))
                     {
                         RouteVirtualUnsafe(vctx, dest, anchor, safety);
-                        Emit(anchorGuid, prevPhase, GroupPhase.HoldAtAnchor, $"virtual: objective cre={creatureEntry} unsafe -> path_unsafe defer", members);
-                        return HoldAtAnchor(plan, anchor);
+                        Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"virtual: objective cre={creatureEntry} unsafe -> path_unsafe defer; grind together", members);
+                        return GroupGrindAt(plan, anchor, anchorGuid);
                     }
                     var directive = ExecDirective.Objective(active.QuestId, 0, creatureEntry, x, y, z, map, anchorGuid, alt1, alt2, alt3);
                     plan.LatchedObjective = directive;
@@ -902,12 +1232,136 @@ public static class GroupCoordinator
 
     // ── Whole-group errands (§4) ──
 
-    // The rest hold the latched objective at the anchor while a peeled member recovers.
+    // TRANSIENT hold only (2026-07-04): between-leg ticks (obj_sync / detour / grey-drop) where the
+    // right move is "keep whatever task is running, stamp nothing new". Every real idle state goes
+    // through GroupGrindAt instead (Axiom 1). Still embeds the latch so an Objective<->hold flap
+    // doesn't drop a live shared grind mid-objective.
     private static GroupOrder HoldAtAnchor(GroupPlan plan, BotContext anchor)
     {
         plan.SetPhase(GroupPhase.HoldAtAnchor);
         var anchorPos = new Vec4(anchor.Pos.X, anchor.Pos.Y, anchor.Pos.Z, anchor.MapId);
         return GroupOrder.Hold(anchor.Guid, plan.LatchedObjective, anchorPos);
+    }
+
+    // Axiom 1 (2026-07-04): the group's idle behavior — grind nearby level-appropriate mobs together
+    // at a memoized clump point. Point = wherever the group stood when the window opened (or the
+    // corpse/rez position on the DOOR1 corpse-defense path, which sets plan.GrindPoint directly).
+    private static GroupOrder GroupGrindAt(GroupPlan plan, BotContext anchor, int anchorGuid)
+    {
+        var gp = EnsureGrindPoint(plan, anchor);
+        plan.SetPhase(GroupPhase.GroupGrind);
+        return GroupOrder.GrindAt(anchorGuid, gp);
+    }
+
+    // Memoize the clump point for the CURRENT GroupGrind window (a live anchor position would change
+    // the stamped order — structural equality — every tick and re-path the team at tick speed, the
+    // vendor-memo lesson). Rounded to 5yd; SetPhase clears it when the window closes.
+    private static Vec4 EnsureGrindPoint(GroupPlan plan, BotContext anchor)
+    {
+        if (plan.Phase == GroupPhase.GroupGrind && plan.HasGrindPoint)
+            return plan.GrindPoint;
+        var p = new Vec4(
+            MathF.Round(anchor.Pos.X / 5f) * 5f,
+            MathF.Round(anchor.Pos.Y / 5f) * 5f,
+            anchor.Pos.Z, anchor.MapId);
+        plan.GrindPoint = p;
+        plan.HasGrindPoint = true;
+        return p;
+    }
+
+    // Round 5 (2026-07-04): death-episode bookkeeping. Counts alive->dead TRANSITIONS (not
+    // dead-ticks) into a rolling window; captures proven-safe ground whenever the party has been
+    // whole and death-free for a full calm window; and arms the meat-grinder breaker when the
+    // window fills — the retreat itself is applied by DriveGroup once the party is whole, and the
+    // active-quest shelve by DriveGroupViaVirtual where the virtual context is in scope.
+    private static void TrackDeaths(GroupPlan plan, List<BotContext> members, BotContext anchor,
+        int anchorGuid, GroupPhase prevPhase)
+    {
+        var now = DateTime.UtcNow;
+
+        var deadNow = new HashSet<int>(members.Where(m => m.Dead).Select(m => m.Guid));
+        foreach (var g in deadNow)
+        {
+            if (!plan.LastDeadGuids.Contains(g))
+            {
+                plan.RecentDeaths.Enqueue(now);
+                plan.LastDeathUtc = now;
+            }
+        }
+        plan.LastDeadGuids.Clear();
+        foreach (var g in deadNow) plan.LastDeadGuids.Add(g);
+
+        // Rez guard stamp (round 5): every tick a LIVING groupmate stands within guard range of a
+        // dead member's corpse, refresh that member's GroupGuardNearUtc. MaintenancePlanner's
+        // in-place rez gate reads this — a grouped bot does not stand up at 50% HP alone in the
+        // camp that killed it; it waits (capped) for the defend protocol's converge to arrive.
+        foreach (var dm in members)
+        {
+            if (!dm.Dead) continue;
+            bool guarded = members.Any(o => o.Guid != dm.Guid && !o.Dead
+                && o.MapId == dm.MapId
+                && Dist2(o.Pos.X, o.Pos.Y, dm.Pos.X, dm.Pos.Y) <= GroupGuardYards);
+            if (guarded) dm.GroupGuardNearUtc = now;
+        }
+
+        while (plan.RecentDeaths.Count > 0
+               && (now - plan.RecentDeaths.Peek()).TotalSeconds > MeatGrinderWindowSec)
+            plan.RecentDeaths.Dequeue();
+
+        // Proven-safe ground: the party is whole and has not lost anyone for the full calm window.
+        // (LastDeathUtc default = MinValue, so a fresh group's spawn point qualifies immediately.)
+        if (deadNow.Count == 0 && (now - plan.LastDeathUtc).TotalSeconds > SafePointCalmSec)
+        {
+            plan.LastSafePoint = new Vec4(
+                MathF.Round(anchor.Pos.X / 5f) * 5f,
+                MathF.Round(anchor.Pos.Y / 5f) * 5f,
+                anchor.Pos.Z, anchor.MapId);
+            plan.HasLastSafePoint = true;
+        }
+
+        bool retreatActive = plan.RetreatUntil is DateTime r && now < r;
+        if (plan.RecentDeaths.Count >= MeatGrinderDeaths && !plan.RetreatPending && !retreatActive)
+        {
+            plan.RetreatPending = true;
+            plan.PendingGrinderDefer = true;
+            EmitForce(anchorGuid, prevPhase, prevPhase,
+                $"MEAT-GRINDER: {plan.RecentDeaths.Count} deaths/{MeatGrinderWindowSec}s"
+                + (plan.HasLastSafePoint
+                    ? $" -> retreat to ({plan.LastSafePoint.X:F0},{plan.LastSafePoint.Y:F0}) when whole + shelve active quest"
+                    : " -> no safe point yet; shelve active quest only"), members);
+        }
+    }
+
+    // Fix 4 (2026-07-04): force-expire the group's deferrals — from the VIRTUAL identity AND from
+    // every present member's own identity (the virtual re-unions the raw member dicts every tick,
+    // so clearing only the virtual copy would be undone one tick later). Time-based always;
+    // level-based only when the ladder has escalated to rung 3. Also clears the per-quest fail
+    // bookkeeping so the retry isn't instantly re-shelved by a stale streak.
+    private static int ForceExpireDeferrals(BotContext vctx, List<BotContext> members, bool includeLevel)
+    {
+        var vid = vctx.Identity;
+        if (vid == null) return 0;
+
+        var toClear = vid.DeferredQuestIds
+            .Where(kv => kv.Value.ExpiresAt.HasValue || (includeLevel && kv.Value.RequiredLevel.HasValue))
+            .Select(kv => kv.Key)
+            .ToList();
+
+        foreach (var qid in toClear)
+        {
+            vid.DeferredQuestIds.Remove(qid);
+            vid.QuestFailStreak.Remove(qid);
+            vid.QuestDeferralCounts.Remove(qid);
+            foreach (var m in members)
+            {
+                var id = m.Identity;
+                if (id == null) continue;
+                id.DeferredQuestIds.Remove(qid);
+                id.QuestFailStreak.Remove(qid);
+                id.QuestDeferralCounts.Remove(qid);
+            }
+        }
+        return toClear.Count;
     }
 
     // ── Predicates / helpers ──
@@ -956,13 +1410,25 @@ public static class GroupCoordinator
     // §5.1 weakest-member travel gate: don't march the group to a target whose path (from the anchor)
     // runs through creatures above the WEAKEST present member's safe band. Acceptance stays per-member;
     // only the group's TRAVEL TARGET is gated. Degrades open if the grid isn't loaded.
+    // Cluster-aware (2026-07-04): the corridor is judged by the SHAPE of what's over the band,
+    // not its single maximum. Over-band count 0 = the old clean pass. A camp (3+ over-band in one
+    // cell), a blanketed corridor (5+ over-band total), or paired deep-reds (2+ spawns 3+ over the
+    // band in one cell) veto. Anything else — a lone rare, a straggler pair, a patrol read — is
+    // pathable-around and PASSES: the area rule ("avoid what is simply beyond our level") stays,
+    // the lone-mob veto goes. The defer-level math downstream still keys the corridor MAX
+    // (RouteVirtualUnsafe reads GetMaxCreatureLevelOnPath), unchanged.
     private static bool PathSafeForWeakest(List<BotContext> members, BotContext anchor, QuestNpcLocation target, ZoneSafetyMap safety)
     {
         if (target.Map != anchor.MapId) return false;   // cross-map travel is per-bot, later
         if (!safety.IsLoaded) return true;
         int weakest = members.Min(m => m.Level);
-        int danger = safety.GetMaxCreatureLevelOnPath(anchor.MapId, anchor.Pos.X, anchor.Pos.Y, target.X, target.Y);
-        return danger <= weakest + TravelSafetyMargin;
+        int threshold = weakest + TravelSafetyMargin;
+        var threat = safety.GetPathThreat(anchor.MapId, anchor.Pos.X, anchor.Pos.Y, target.X, target.Y, threshold);
+        if (threat.OverCount == 0) return true;
+        if (threat.MaxCellOver >= PathClusterCellVeto) return false;
+        if (threat.OverCount >= PathClusterTotalVeto) return false;
+        if (threat.MaxCellDeep >= PathDeepPairVeto) return false;
+        return true;
     }
 
     // Stamp a travel-or-interact phase keyed to an NPC, recording the phase on the plan.

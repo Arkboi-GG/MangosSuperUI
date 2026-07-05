@@ -256,6 +256,22 @@ public sealed class BotExecutor
                 }
         }
 
+        // Fix 3 (2026-07-04): the durable no_path streak must count EVERY MOVE_FAILED reason=no_path,
+        // WAIT or no WAIT. Group objective legs and every reconcile re-issue are fire-and-forget
+        // (Dispatch) — no Pending, so TryNegate below never sees their failures, no Failure is
+        // stamped, the streak never grows, and TryEscalateUnreachableAsync (the 5-fail hard-teleport
+        // rescue) is structurally blind to the exact loop that needs it most (Oyic, 2026-07-04:
+        // 10,033 uncounted no_paths against one coordinate at ~1/s for 10 hours while the waited
+        // path's identical rescue saved Xoz in 5 fails). Recorded HERE, unconditionally; the old
+        // duplicate recorder inside TryNegate is removed so a waited fail doesn't double-count.
+        if (evt.EventType == "MOVE_FAILED" && ctx.Identity is { } idNoPath)
+        {
+            var mfk = ParsePipe(evt.Data);
+            if (mfk.TryGetValue("reason", out var mfr) && mfr == "no_path"
+                && mfk.TryGetValue("dest_x", out var mfx) && mfk.TryGetValue("dest_y", out var mfy))
+                idNoPath.RecordNoPath(ParseF(mfx), ParseF(mfy));
+        }
+
         var pending = ctx.Pending;
         if (pending == null) return false;
 
@@ -384,6 +400,10 @@ public sealed class BotExecutor
 
         _logger.LogDebug("[EXEC] {Name} WAIT negated: {Cmd} ← {Evt} reason={Reason}",
             ctx.Name, pending.CommandType, evt.EventType, reason);
+
+        // Durable no_path streak: recorded UPSTREAM in OnEvent for EVERY MOVE_FAILED reason=no_path
+        // (Fix 3, 2026-07-04 — WAIT or fire-and-forget alike), so nothing to record here; recording
+        // in both places would double-count a waited fail.
 
         ctx.Pending = null;   // NB: no MarkProgress — a failure is not progress.
         ctx.ConsecutiveFailures++;   // feeds the brain's fast fail-loop breaker

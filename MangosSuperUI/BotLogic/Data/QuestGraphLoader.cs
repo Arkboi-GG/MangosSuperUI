@@ -126,6 +126,17 @@ public class QuestGraphLoader
                 // set here, so let C++ CanTakeQuest handle those cases.
             }
 
+            // PrevChain check — mirrors VMaNGOS Player::SatisfyQuestPrevChain (Player.cpp
+            // 13741-13760). SEPARATE from the PrevQuests gate above and STRICT AND: every quest in
+            // PrevChainQuests (built from NextQuestInChain reverse edges) must be REWARDED before this
+            // quest unlocks. Unlike PrevQuests' one-from-all, a single rewarded predecessor is NOT
+            // enough — the whole prev-chain must be done, exactly as the server enforces. This is the
+            // gate that keeps 5624 "Garments of the Light" hidden until 5623 "In Favor of the Light"
+            // is turned in, instead of the god bot stamping an accept the server refuses forever.
+            if (quest.PrevChainQuests.Count > 0
+                && !quest.PrevChainQuests.All(completedQuestIds.Contains))
+                continue;
+
             // ExclusiveGroup check — sign determines behavior:
             //   Positive: "pick one" — only one quest from this group can be active/completed.
             //             Block if any sibling is already active or completed.
@@ -195,6 +206,14 @@ public class QuestGraphLoader
             // Step 5: Resolve kill target grind centers per-quest, scoped to giver proximity
             ResolveKillTargetsPerQuest(quests, allCreatureSpawns);
 
+            // Step 5b (Fix 5, 2026-07-04): flag kill objectives whose target creature is FRIENDLY
+            //          to the quest's eligible side. A "kill" on a friendly NPC can never be landed
+            //          by a bot (real credit is a scripted spellcast/event), so downstream planning
+            //          must classify the quest unworkable instead of driving it forever (the 5624
+            //          "Garments of the Light" landmine: group A ground friendly John Turner's camp
+            //          for 10h on 2026-07-04 behind an unsatisfiable union gate).
+            await FlagFriendlyKillTargetsAsync(conn, quests);
+
             // Step 6: Load item drop sources
             await LoadItemDropSourcesAsync(conn, quests);
 
@@ -217,20 +236,105 @@ public class QuestGraphLoader
             int withGiver = quests.Values.Count(q => q.Giver != null);
             int withTurnIn = quests.Values.Count(q => q.TurnIn != null);
             int withKillObj = quests.Values.Count(q => q.HasKillObjectives);
+            int unworkable = quests.Values.Count(q => q.Objectives.Any(o => o.TargetFriendly));
             int withItemObj = quests.Values.Count(q => q.HasItemObjectives);
             int withGoObj = quests.Values.Count(q => q.ItemObjectives.Any(i => i.BestGoSource != null));
             int withPrereq = quests.Values.Count(q => q.PrevQuests.Count > 0);
 
             _logger.LogInformation(
                 "QuestGraphLoader: loaded {Total} quests in {Ms}ms — " +
-                "givers={Givers}, turnins={TurnIns}, kill_obj={Kill}, item_obj={Item}, go_obj={GO}, prereqs={Prereq}",
+                "givers={Givers}, turnins={TurnIns}, kill_obj={Kill}, item_obj={Item}, go_obj={GO}, prereqs={Prereq}, friendly_target_unworkable={Unw}",
                 quests.Count, sw.ElapsedMilliseconds,
-                withGiver, withTurnIn, withKillObj, withItemObj, withGoObj, withPrereq);
+                withGiver, withTurnIn, withKillObj, withItemObj, withGoObj, withPrereq, unworkable);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "QuestGraphLoader: failed to load quest graph");
             _loaded = false;
+        }
+    }
+
+    // ── Step 5b: friendly-target kill objectives (Fix 5, 2026-07-04) ─────────
+    //
+    // A ReqCreatureOrGOId slot passes IsCreature for ANY positive entry — including creatures the
+    // quest's own takers can never attack (friendly civilians whose quest credit is a scripted
+    // spellcast, e.g. 12423 John Turner for 5624). Resolve each kill-target creature's faction
+    // masks and flag QuestObjective.TargetFriendly when the target is friendly (and not hostile)
+    // to the quest's eligible faction side. Side derivation: quest RaceMask -> Alliance-only /
+    // Horde-only / both; faction group bits are the standard 1=Players, 2=Alliance, 4=Horde.
+    // The player bit is always included so "friendly to all players" civilians flag regardless of
+    // side. Conservative on purpose: a quest is only flagged when its takers' side is in the
+    // friend mask AND NOT in the hostile mask — attackable-neutral mobs (friend=0) and genuinely
+    // cross-faction kill targets (hostile to the taking side) are never flagged. Wrapped in its
+    // own try/catch: a schema mismatch degrades to "no flags" (today's behavior), never a failed
+    // graph load. Every flagged quest is logged individually so a misfire is visible, not silent.
+    private async Task FlagFriendlyKillTargetsAsync(System.Data.IDbConnection conn, Dictionary<int, QuestNode> quests)
+    {
+        const int PlayerBit = 1, AllianceBit = 2, HordeBit = 4;
+        const int AllianceRaces = 1 | 4 | 8 | 64;      // human | dwarf | night elf | gnome
+        const int HordeRaces = 2 | 16 | 32 | 128;      // orc | undead | tauren | troll
+
+        try
+        {
+            var creatureEntries = quests.Values
+                .SelectMany(q => q.Objectives)
+                .Where(o => o.IsCreature)
+                .Select(o => o.CreatureEntry)
+                .Distinct()
+                .ToList();
+            if (creatureEntries.Count == 0) return;
+
+            // ORDER BY ft.build so the dictionary's last-write-wins keeps the HIGHEST build's masks
+            // (faction_template rows are patch-versioned, mirroring the ct.patch convention).
+            // Column names verified against the live vmangos schema 2026-07-04 (SHOW COLUMNS FROM
+            // faction_template): it is friendly_mask / hostile_mask, NOT friend_mask — the first
+            // deploy queried friend_mask, threw Unknown column, and the try/catch below degraded to
+            // zero flags exactly as designed (friendly_target_unworkable=0 in the summary line, 5624
+            // dispatched again, caught only by the path gate). The per-faction friend_faction1-4 /
+            // enemy_faction4 lists are deliberately NOT consulted — group masks cover the
+            // guard/civilian class this exists for, and the per-quest Information log below makes any
+            // list-only miss visible rather than silent.
+            var rows = await conn.QueryAsync<dynamic>(@"
+                SELECT ct.entry AS creature_entry, ft.hostile_mask, ft.friendly_mask
+                FROM creature_template ct
+                JOIN faction_template ft ON ft.id = ct.faction
+                WHERE ct.patch = 0 AND ct.entry IN @Entries
+                ORDER BY ft.build",
+                new { Entries = creatureEntries });
+
+            var masks = new Dictionary<int, (int Hostile, int Friend)>();
+            foreach (var r in rows)
+                masks[(int)r.creature_entry] = ((int)(long)Convert.ToInt64(r.hostile_mask),
+                                                (int)(long)Convert.ToInt64(r.friendly_mask));
+
+            int flagged = 0;
+            foreach (var q in quests.Values)
+            {
+                if (q.Objectives.Length == 0) continue;
+                bool alli = q.RaceMask == 0 || (q.RaceMask & AllianceRaces) != 0;
+                bool horde = q.RaceMask == 0 || (q.RaceMask & HordeRaces) != 0;
+                int side = PlayerBit | (alli ? AllianceBit : 0) | (horde ? HordeBit : 0);
+
+                foreach (var o in q.Objectives)
+                {
+                    if (!o.IsCreature) continue;
+                    if (!masks.TryGetValue(o.CreatureEntry, out var m)) continue;
+                    if ((m.Friend & side) != 0 && (m.Hostile & side) == 0)
+                    {
+                        o.TargetFriendly = true;
+                        flagged++;
+                        _logger.LogInformation(
+                            "QuestGraphLoader: quest [{Id}] \"{Title}\" kill-target {Entry} is FRIENDLY to its takers (friend={F} hostile={H} side={S}) — flagged unworkable",
+                            q.QuestId, q.Title, o.CreatureEntry, m.Friend, m.Hostile, side);
+                    }
+                }
+            }
+            if (flagged > 0)
+                _logger.LogInformation("QuestGraphLoader: flagged {N} friendly-target kill objective(s) as unworkable", flagged);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "QuestGraphLoader: friendly-target flagging failed (schema mismatch?) — continuing without flags");
         }
     }
 
@@ -1071,11 +1175,11 @@ public class QuestGraphLoader
     /// </summary>
     private void BuildPrevQuestsLists(Dictionary<int, QuestNode> quests)
     {
-        int directCount = 0, reverseCount = 0;
+        int directCount = 0, reverseCount = 0, chainCount = 0;
 
         foreach (var quest in quests.Values)
         {
-            // Source 1: PrevQuestId → own prevQuests (VMaNGOS line 5935)
+            // Source 1: PrevQuestId → own prevQuests (VMaNGOS ObjectMgr.cpp line ~5935)
             // Skip if the target quest doesn't exist (same guard as VMaNGOS)
             if (quest.PrevQuestId != 0 && quests.ContainsKey(Math.Abs(quest.PrevQuestId)))
             {
@@ -1083,7 +1187,7 @@ public class QuestGraphLoader
                 directCount++;
             }
 
-            // Source 2: NextQuestId → target quest's prevQuests (VMaNGOS line 5946)
+            // Source 2: NextQuestId → target quest's prevQuests (VMaNGOS ObjectMgr.cpp line ~5946)
             // If this quest has NextQuestId, add this quest's ID to the target's PrevQuests.
             // Sign: if NextQuestId > 0, push positive (must be rewarded).
             //        if NextQuestId < 0, push negative (must be active).
@@ -1099,11 +1203,29 @@ public class QuestGraphLoader
                     reverseCount++;
                 }
             }
+
+            // Source 3: NextQuestInChain → target quest's PREV-CHAIN list (VMaNGOS ObjectMgr.cpp
+            // lines 5913-5923: `qNextItr->second->prevChainQuests.push_back(qinfo->GetQuestId())`).
+            // This is a SEPARATE list from PrevQuests, gated SEPARATELY in GetAvailableQuests to
+            // mirror Player::SatisfyQuestPrevChain (Player.cpp 13741-13760), which requires EVERY
+            // prev-chain entry REWARDED (strict AND) — not the one-from-all OR of PrevQuests. The
+            // 5623→5624 priest chain links ONLY here (PrevQuestId=0, NextQuestId=0), so without this
+            // 5624 had an empty prereq set and was offered before 5623 was rewarded → the server
+            // refused requirements_not_met → the union accept gate livelocked the group (2026-07-03).
+            // NextQuestInChain is a forward chain pointer (always a positive quest id on this data);
+            // the predecessor (this quest) must be REWARDED before the successor unlocks. Dup-guarded.
+            if (quest.NextQuestInChain != 0
+                && quests.TryGetValue(quest.NextQuestInChain, out var chainQuest)
+                && !chainQuest.PrevChainQuests.Contains(quest.QuestId))
+            {
+                chainQuest.PrevChainQuests.Add(quest.QuestId);
+                chainCount++;
+            }
         }
 
         _logger.LogInformation(
-            "QuestGraphLoader: built PrevQuests — {Direct} direct, {Reverse} reverse edges",
-            directCount, reverseCount);
+            "QuestGraphLoader: built PrevQuests — {Direct} direct, {Reverse} reverse edges, {Chain} prev-chain edges",
+            directCount, reverseCount, chainCount);
     }
 
     // ── Race/Class Bitmask Helpers ─────────────────────────────────────────

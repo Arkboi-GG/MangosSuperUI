@@ -493,6 +493,12 @@ public sealed class BotContext
     public GroupOrder GroupOrder { get; set; } = GroupOrder.None;
     public GroupOrder LastGroupOrder { get; set; } = GroupOrder.None;
 
+    /// <summary>Round 5 (2026-07-04): last time the GroupCoordinator saw a LIVING groupmate within
+    /// guard range of this bot's corpse (stamped by TrackDeaths every tick while dead+guarded).
+    /// MaintenancePlanner's in-place rez gate waits for a fresh stamp — capped — so a grouped bot
+    /// never stands up at 50% HP alone in the camp that killed it. Solo bots never read it.</summary>
+    public DateTime GroupGuardNearUtc { get; set; }
+
     // ---- held strategic objective (Held-Objective build §2) ----
     // The bot's COMMITTED strategic task, ABOVE Goal and OUTLIVING the leg-level WAIT (ctx.Pending),
     // ResetScratch, and the EnterGoalAsync SET_TASK IDLE bounce. Set by the strategic decider (a
@@ -519,6 +525,16 @@ public sealed class BotContext
 
     /// <summary>Seconds since the held objective was last (re)committed — the reconcile adoption grace.</summary>
     public double TimeSinceObjectiveSec => (DateTime.UtcNow - ObjectiveSinceUtc).TotalSeconds;
+
+    /// <summary>Last time BotBrain.ReconcileHeldObjective actually ACTED on a mismatch (cleared
+    /// Pending/LastGroupOrder and re-issued) for the CURRENTLY held objective — 2026-07-03, the
+    /// reconcile-storm fix. Distinct from ObjectiveSinceUtc (when the objective was committed): this
+    /// is a re-fire COOLDOWN, not an adoption grace, so the reconcile can't hammer the bridge with a
+    /// fresh re-issue every tick while C++ is still working the previous one. Compared against
+    /// ObjectiveSinceUtc (not used as a bare timestamp) so a cooldown stamp left over from a PRIOR
+    /// objective can never suppress a legitimate reconcile on a freshly-committed one. Default
+    /// DateTime.MinValue = never fired yet.</summary>
+    public DateTime LastReconcileUtc { get; set; } = DateTime.MinValue;
 
     // ----------------------------- helpers ---------------------------------
     public double TimeInGoalSec => (DateTime.UtcNow - GoalSinceUtc).TotalSeconds;

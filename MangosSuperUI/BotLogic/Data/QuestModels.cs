@@ -90,6 +90,23 @@ public class QuestNode
     /// If ANY positive entry is rewarded, the check passes (one-from-all).
     /// </summary>
     public List<int> PrevQuests { get; set; } = new();
+
+    /// <summary>
+    /// Runtime-built PREV-CHAIN list mirroring VMaNGOS Quest::prevChainQuests
+    /// (ObjectMgr.cpp: for each quest with NextQuestInChain=X, push its own id into X's
+    /// prevChainQuests). This is a SEPARATE list from PrevQuests and a SEPARATE gate: it
+    /// mirrors Player::SatisfyQuestPrevChain, which requires EVERY entry to be REWARDED
+    /// (a strict AND across all predecessors), NOT the one-from-all OR that PrevQuests uses.
+    /// Kept apart precisely so a branching chain resolves like the server instead of passing
+    /// on any single rewarded predecessor. Empty for the vast majority of quests.
+    ///
+    /// Why it exists (2026-07-03): the 5623 "In Favor of the Light" -> 5624 "Garments of the
+    /// Light" priest chain links ONLY via NextQuestInChain (PrevQuestId=0, NextQuestId=0), so
+    /// with only PrevQuests built, 5624 had NO prereq and read as available before 5623 was
+    /// turned in. The god bot stamped the accept, the server refused requirements_not_met, and
+    /// the union accept gate livelocked the whole group (guid 6, ~1/s for 5h).
+    /// </summary>
+    public List<int> PrevChainQuests { get; set; } = new();
 }
 
 /// <summary>
@@ -117,6 +134,18 @@ public class QuestObjective
     /// Session 31: Spawn Fan-Out.
     /// </summary>
     public List<(float X, float Y, float Z)> SpawnPositions { get; set; } = new();
+
+    /// <summary>
+    /// Fix 5 (2026-07-04): the target creature is FRIENDLY to the quest's eligible side, so a
+    /// bot can never land the kill the objective encodes — real credit is a scripted spellcast /
+    /// event (e.g. 5624 "Garments of the Light": ReqCreatureOrGOId=12423 John Turner, an
+    /// Alliance-friendly civilian). Flagged by QuestGraphLoader.FlagFriendlyKillTargetsAsync from
+    /// creature_template.faction -> faction_template friend/hostile masks vs the quest's RaceMask
+    /// side. The planner treats a quest with any such objective as UNWORKABLE: BuildBatch skips it
+    /// (unworkable-obj), IsPickable refuses it, WorkableInLog ignores the slot — so it can never
+    /// become the eternal active pick (the 2026-07-04 group-A immortal-WAIT trigger).
+    /// </summary>
+    public bool TargetFriendly { get; set; }
 
     public bool IsCreature => CreatureOrGOId > 0;
     public bool IsGameObject => CreatureOrGOId < 0;

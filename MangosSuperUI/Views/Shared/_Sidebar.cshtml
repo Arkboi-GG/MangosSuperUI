@@ -20,6 +20,7 @@
         "database" or "functiongraph" or "sourcemap" => "data",
         "downloads" => "downloads",
         "bots" => "bots",
+        "wiki" => "wiki",
         _ => ""
     };
 }
@@ -258,6 +259,23 @@
                     <a asp-controller="SourceMap" asp-action="Index" class="@NavClass("SourceMap")">
                         <i class="fa-solid fa-sitemap"></i>
                         Source Map
+                    </a>
+                </li>
+            </ul>
+        </div>
+
+
+        <!-- Wiki -->
+        <div class="sidebar-section" data-group="wiki">
+            <div class="sidebar-section-title" data-toggle-group="wiki">
+                <span>Wiki</span>
+                <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
+            </div>
+            <ul class="sidebar-nav sidebar-nav-collapsible">
+                <li class="sidebar-nav-item" data-nav-key="wiki-code">
+                    <a asp-controller="Wiki" asp-action="Index" class="@NavClass("Wiki")">
+                        <i class="fa-solid fa-book"></i>
+                        Code Docs
                     </a>
                 </li>
             </ul>

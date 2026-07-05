@@ -69,6 +69,13 @@ public sealed class QuestPlanner : IBotPlanner
     // NPC the coordinator picked, vs the member picking its own) differs.
     private const int GroupVendorSellKeepQuality = 2;      // == MaintenancePlanner.SellKeepQuality — sell grey+white, keep green+
     private const float GroupVendorArriveYards = 15f;      // == MaintenancePlanner.VendorArriveYards — C++ finds the NPC within 15yd
+
+    // ── GroupGrind (Axiom 1, 2026-07-04) ──
+    private const float GroupGrindRadius = 50f;            // the shared grind leash (C++ DoGrindPatrol hops within it)
+    private const float GroupGrindConvergeYards = 70f;     // farther than this ON A NEW ORDER -> converge first (radius + slack, so a
+                                                           // patrolling member at the leash edge is never yanked into a re-converge)
+    private const float GroupGrindArriveYards = 15f;       // converge is done -> arm the grind
+    private const float GroupDefendArriveYards = 12f;      // stand tight on the corpse / rez / healer
     private const int GroupVendorRepairBelowDurability = 70;   // == MaintenancePlanner.RepairRequiredBelowDurability — below this a member still owes a repair even after selling
     private static readonly TimeSpan GroupVendorAckDeadline = TimeSpan.FromSeconds(30);   // == MaintenancePlanner.VendorAckDeadlineSec — SELL_ACK / REPAIR_ACK wait
 
@@ -846,6 +853,7 @@ public sealed class QuestPlanner : IBotPlanner
             bool actionableOnTurnIn = kv.Value.Status == QuestStatusComplete || !node.HasObjectives;
             if (!actionableOnTurnIn)
             {
+                if (node.Objectives.Any(o => o.TargetFriendly)) { skipped.Add($"{kv.Key}:unworkable-obj"); continue; }        // Fix 5: kill objective on a FRIENDLY NPC (scripted/spellcast credit) — undrivable
                 if (!node.Objectives.All(o => o.IsCreature)) { skipped.Add($"{kv.Key}:noncreature-obj"); continue; }          // GO-interact objectives: phase 2
                 if (!node.ItemObjectives.All(it => it.BestDropSource != null)) { skipped.Add($"{kv.Key}:item-unresolved"); continue; }  // GO-sourced/unresolved items: phase 2
             }
@@ -957,6 +965,7 @@ public sealed class QuestPlanner : IBotPlanner
     public static bool IsPickable(QuestNode q, BotIdentity id)
          => q.Giver != null
             && q.Objectives.All(o => o.IsCreature)                       // GO-interact objectives: phase 2
+            && q.Objectives.All(o => !o.TargetFriendly)                  // Fix 5: never PICK a kill-a-friendly quest (5624-class) — undrivable until spellcast objectives exist
             && q.ItemObjectives.All(it => it.BestDropSource != null)     // creature-sourced items only; GO-sourced/unresolved: phase 2
             && !id.CompletedQuestIds.Contains(q.QuestId)                 // 2026-06-30 fix: GatherLocals/GoalSelector's only chokepoint that did NOT
                                                                          // re-check completion — GetAvailableQuests was trusted blindly here while
@@ -1307,6 +1316,7 @@ public sealed class QuestPlanner : IBotPlanner
             foreach (var o in node.Objectives)
             {
                 if (!o.IsCreature || o.Count <= 0) continue;
+                if (o.TargetFriendly) continue;   // Fix 5: an unkillable friendly target is NOT workable (must not suppress a legitimate exhaust/lock)
                 if (o.GrindMap != ctx.MapId) continue;
                 int got = (o.Slot >= 1 && o.Slot <= e.MobCounts.Length) ? e.MobCounts[o.Slot - 1] : 0;
                 if (got < o.Count) return qid;
@@ -1507,6 +1517,14 @@ public sealed class QuestPlanner : IBotPlanner
     {
         var o = ctx.GroupOrder;
 
+        // Fix 6 (2026-07-04): a grouped member never reaches GoalSelector's prune line (the group
+        // branch returns Questing first), so member-side deferrals / blacklists were WRITE-ONLY for
+        // the whole grouped lifetime — and the coordinator re-unions the RAW member dicts into the
+        // virtual identity every tick, so stale member entries could re-pollute a pruned virtual.
+        // Prune here, per tick, exactly as the solo path does in GoalSelector / BuildBatch.
+        ctx.Identity?.PruneExpiredDeferrals();
+        ctx.Identity?.PrunePathBlacklist();
+
         // A leg failed under the order -> drop it; the coordinator re-stamps / re-picks next tick (it
         // owns recovery). A dying member already peeled to Maintenance via the GoalSelector hard-need
         // before reaching here, so this is the benign "couldn't path / interact right now" case.
@@ -1574,6 +1592,10 @@ public sealed class QuestPlanner : IBotPlanner
                 return GroupTurnIn(ctx, o);
             case GroupPhase.HoldAtAnchor:
                 return GroupHold(ctx, o);
+            case GroupPhase.GroupGrind:
+                return GroupGrindTogether(ctx, o);
+            case GroupPhase.GroupDefend:
+                return GroupDefendPoint(ctx, o);
             case GroupPhase.GroupTrain:
                 return GroupTrainHold(ctx, o);
             case GroupPhase.GroupVendor:
@@ -1667,6 +1689,89 @@ public sealed class QuestPlanner : IBotPlanner
         return MoveTo(anchor);
     }
 
+    // Axiom 1 (2026-07-04): the whole group grinds nearby level-appropriate mobs together at the
+    // stamped clump point (grind-lock windows, no-shared-quest holds, alive-errand peel waits, and
+    // the Axiom-2 corpse defense — TargetPos is the corpse/rez position there). Far from the point
+    // ON A NEW ORDER -> converge first (a MOVE_TO with its normal WAIT, so MOVE_FAILED feeds the
+    // Fix-3 streak and a marooned member escalates to the hard teleport instead of thrashing);
+    // near -> the solo-proven indefinite SET_TASK GRIND {entry=0, kill_count=0} — C++
+    // SelectGrindTarget scans nearest valid XP mobs (skips grey/critters), DoGrindPatrol keeps it
+    // moving, the combat directive focus-fires the anchor's pull. Hysteresis: distance is only
+    // re-checked when the ORDER changes (the point moved — e.g. a graveyard rez), so a member
+    // patrolling at the leash edge is never yanked into a re-converge loop.
+    private StepResult GroupGrindTogether(BotContext ctx, GroupOrder o)
+    {
+        var point = NpcOf(o);   // TargetPos carries the clump point (NpcEntry 0)
+
+        if (o != ctx.LastGroupOrder)
+        {
+            ctx.LastGroupOrder = o;
+            if (!AtNpc2D(ctx, point, GroupGrindConvergeYards))
+            {
+                ctx.SetStep("grp_gconverge");
+                return MoveTo(point);
+            }
+            ctx.SetStep("grp_grind");
+            return FireGroupGrind(ctx, point);
+        }
+
+        // Order unchanged: a converging member that has now arrived arms the grind once.
+        if (ctx.Step == "grp_gconverge" && AtNpc2D(ctx, point, GroupGrindArriveYards))
+        {
+            ctx.SetStep("grp_grind");
+            return FireGroupGrind(ctx, point);
+        }
+
+        return StepResult.Wait();
+    }
+
+    private static StepResult FireGroupGrind(BotContext ctx, QuestNpcLocation point)
+        => StepResult.Fire(new BridgeCommand("SET_TASK", new
+        {
+            task = "GRIND",
+            x = point.X,
+            y = point.Y,
+            z = point.Z,
+            radius = GroupGrindRadius,
+            creature_entry = 0,
+            kill_count = 0
+        }));
+
+    // Axiom 2 hardened (2026-07-04 round 5): the DEFENSIVE converge. Walk to the point (corpse /
+    // rez position / healing member), then SET_TASK IDLE — stand guard, fight ONLY what aggros
+    // (the combat layer has always defended idle bots; the pre-GroupGrind HoldAtAnchor peels ran
+    // exactly this way for weeks), pull NOTHING. This replaces the grind-at-corpse order that
+    // turned every death into a camp dive: converge + active pulls at a corpse inside a dense
+    // L8-10 camp was the round-5 wipe engine (291 deaths, flat ~80/hr, 33-45% re-deaths <90s).
+    // The converge leg is a normal WAITed MoveTo, so a blocked approach feeds the Fix-3 streak
+    // and escalates to the hard teleport instead of thrashing. Same order-change hysteresis as
+    // GroupGrindTogether: distance is only re-checked when the point moves (e.g. a GY-rez jump).
+    private StepResult GroupDefendPoint(BotContext ctx, GroupOrder o)
+    {
+        var point = NpcOf(o);   // TargetPos carries the guard point (NpcEntry 0)
+
+        if (o != ctx.LastGroupOrder)
+        {
+            ctx.LastGroupOrder = o;
+            if (!AtNpc2D(ctx, point, GroupDefendArriveYards))
+            {
+                ctx.SetStep("grp_dconverge");
+                return MoveTo(point);
+            }
+            ctx.SetStep("grp_defend");
+            return StepResult.Fire(new BridgeCommand("SET_TASK", new { task = "IDLE" }));
+        }
+
+        // Order unchanged: a converging member that has now arrived goes to guard once.
+        if (ctx.Step == "grp_dconverge" && AtNpc2D(ctx, point, GroupDefendArriveYards))
+        {
+            ctx.SetStep("grp_defend");
+            return StepResult.Fire(new BridgeCommand("SET_TASK", new { task = "IDLE" }));
+        }
+
+        return StepResult.Wait();
+    }
+
     // The group-gated training window (§4): THIS bot either has nothing new to learn, or already
     // peeled to Goal.Training via GoalSelector's groupTrainWindow carve-out (in which case DriveGroup
     // isn't even running for it -- QuestPlanner only runs under Goal.Questing). So a bot reaching this
@@ -1676,9 +1781,29 @@ public sealed class QuestPlanner : IBotPlanner
     // sit -- moving to (0,0,0) off an unset TargetPos would be wrong.
     private StepResult GroupTrainHold(BotContext ctx, GroupOrder o)
     {
+        // Axiom 1 (2026-07-04): a non-trainee NEVER idles out a training round — it grinds nearby
+        // level-appropriate mobs where it stands (the latch no longer survives into GroupTrain, so
+        // the old latched-mob branch is gone with it). Solo-proven wire: indefinite entry-0
+        // SET_TASK GRIND at the member's own position; the KILL stream is the liveness signal.
+        // Step-guarded so it fires once per round, not per tick.
         if (o.Objective.IsActive)
-            return GroupObjective(ctx, o);     // grind the latched mob (change-guarded) while trainees are away
-        return StepResult.Wait();              // nothing latched yet and nowhere to converge — sit tight
+            return GroupObjective(ctx, o);     // legacy path (latch shouldn't reach here anymore; harmless if it does)
+        if (ctx.Step != "grp_train_grind")
+        {
+            ctx.SetStep("grp_train_grind");
+            ctx.ClearObjective();              // the filler grind is not a committed objective (mirrors GrindPlanner)
+            return StepResult.Fire(new BridgeCommand("SET_TASK", new
+            {
+                task = "GRIND",
+                x = ctx.Pos.X,
+                y = ctx.Pos.Y,
+                z = ctx.Pos.Z,
+                radius = GroupGrindRadius,
+                creature_entry = 0,
+                kill_count = 0
+            }));
+        }
+        return StepResult.Wait();
     }
 
     // The group-gated vendor errand (§4, GAP G 2026-07-02): the whole group converges on ONE shared

@@ -74,7 +74,7 @@
 
     // Default group order + item order within each group
     var DEFAULT_ORDER = {
-        groups: ['operations', 'server', 'spells', 'world', 'content', 'bots', 'data', 'downloads'],
+        groups: ['operations', 'server', 'spells', 'world', 'content', 'bots', 'data', 'wiki', 'downloads'],
         items: {
             operations: ['home', 'console', 'players', 'accounts', 'realm'],
             server: ['activity', 'serverlogs', 'livelogs', 'config', 'backup'],
@@ -83,6 +83,7 @@
             content: ['items', 'gameobjects', 'loottuner', 'instances', 'lootifier'],
             bots: ['bots-fleet', 'bots-map', 'bots-dashboard'],
             data: ['database', 'sourcemap'],
+            wiki: ['wiki-code'],
             downloads: ['downloads-page']
         }
     };
@@ -346,6 +347,7 @@
             content: 'Content',
             bots: 'Bots',
             data: 'Data',
+            wiki: 'Wiki',
             downloads: 'Downloads & Uploads'
         };
 
@@ -541,6 +543,7 @@
             content: 'Content',
             bots: 'Bots',
             data: 'Data',
+            wiki: 'Wiki',
             downloads: 'Downloads & Uploads'
         };
 
@@ -551,6 +554,7 @@
             content: 'fa-box-open',
             bots: 'fa-robot',
             data: 'fa-database',
+            wiki: 'fa-book',
             downloads: 'fa-arrow-down-to-line'
         };
 

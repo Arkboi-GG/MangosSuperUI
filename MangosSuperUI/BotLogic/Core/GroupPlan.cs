@@ -90,7 +90,28 @@ public enum GroupPhase
     // A member peeled to its own recovery (Maintenance — the survival hard-needs always
     // win, §4). The REST hold ON THE SAME TARGET at the anchor, still gaining XP / loot,
     // until the peeled member returns OR the liveness escape fires (then press on).
-    HoldAtAnchor = 9
+    // 2026-07-04: DEMOTED to the between-leg TRANSIENT hold only (obj_sync / detour /
+    // grey-drop ticks). Every real idle state — grind-lock windows, no-shared-quest,
+    // peel waits, corpse defense — now resolves to GroupGrind (Axiom 1 / Axiom 2).
+    HoldAtAnchor = 9,
+
+    // Axiom 1 (Nico, 2026-07-04): the whole group grinds nearby LEVEL-APPROPRIATE mobs
+    // together at a shared clump point — the solo-proven SET_TASK GRIND {entry=0,
+    // kill_count=0} wire per member, focus-fire on via the combat directive, C++
+    // SelectGrindTarget/DoGrindPatrol owning the scan. No latched single mob, no marching
+    // to a spawn coordinate. Used for: grind-lock windows, batch-exhaust holds, and
+    // alive-errand peel waits — TargetPos carries the clump point.
+    GroupGrind = 10,
+
+    // Axiom 2 hardened (2026-07-04 round 5): the DEFENSIVE converge. Members walk to the
+    // point (a corpse, a rez position, a healing member) and go SET_TASK IDLE — they fight
+    // ONLY what aggros, and pull NOTHING. This exists because the first corpse protocol
+    // ordered a GRIND at the corpse: converging three bots into the camp that just produced
+    // a corpse and telling them to actively pull it was a wipe engine — 291 deaths at a flat
+    // ~80/hr, 33-45% of re-deaths inside 90s of the rez, every top corpse coordinate a dense
+    // L8-10 camp (round-5 forensics). Defend = stand on the body, guard the rez and the
+    // heal, pull nothing, leave together.
+    GroupDefend = 11
 }
 
 // ---------------------------- GroupOrder (§7.1) ----------------------------
@@ -178,6 +199,24 @@ public readonly record struct GroupOrder
     public static GroupOrder Hold(int anchorGuid, ExecDirective objective, Vec4 anchorPos)
         => new(GroupPhase.HoldAtAnchor, anchorGuid, 0, anchorPos, objective);
 
+    /// <summary>GroupGrind (Axiom 1 / Axiom 2, 2026-07-04): the whole group grinds nearby
+    /// level-appropriate mobs together at the clump point in TargetPos. No NPC, no latched
+    /// objective — each member fires the solo-shaped indefinite SET_TASK GRIND at the point
+    /// (converging first if far); the combat directive keeps the focus-fire. The point is
+    /// memoized on GroupPlan.GrindPoint (an anchor spot, or a dead member's corpse/rez
+    /// position for the DOOR1 corpse-defense case) so a drifting anchor can't re-path the
+    /// team every tick.</summary>
+    public static GroupOrder GrindAt(int anchorGuid, Vec4 point)
+        => new(GroupPhase.GroupGrind, anchorGuid, 0, point, ExecDirective.None);
+
+    /// <summary>GroupDefend (Axiom 2 hardened, 2026-07-04): converge on TargetPos (a corpse /
+    /// rez position / healing member) and stand DEFENSIVE — SET_TASK IDLE on arrival, fight only
+    /// what aggros, pull nothing. Used while any member is dead or healing off a rez. The point
+    /// rides the same GroupPlan.GrindPoint memo as GroupGrind (it persists across the
+    /// dead->healing flip so the group keeps guarding the same spot).</summary>
+    public static GroupOrder DefendAt(int anchorGuid, Vec4 point)
+        => new(GroupPhase.GroupDefend, anchorGuid, 0, point, ExecDirective.None);
+
     /// <summary>GroupTrain: the group-gated training window is open (§4). No NPC target -- each
     /// trainee routes to its OWN class trainer via its own TrainingPlanner, never a single shared
     /// NPC (classes differ). Carries the latched objective (if any) so a member with nothing new
@@ -234,6 +273,85 @@ public sealed class GroupPlan
     /// each member as GroupOrder.Objective.</summary>
     public ExecDirective LatchedObjective { get; set; } = ExecDirective.None;
 
+    /// <summary>Memoized shared-vendor target for the current GroupVendor window (2026-07-03 hardening
+    /// — the GroupVendor livelock fix). Set once when the window opens (GroupCoordinator.DriveGroup);
+    /// re-read on every subsequent tick the window stays open so ZoneDataLoader.GetNearestVendor runs
+    /// ONCE per errand instead of once per tick (the observed ~4Hz [VENDOR] lookup spam during the
+    /// 2026-07-03 freeze). 0 = no window open / memo cleared.</summary>
+    public int VendorNpcEntry { get; private set; }
+    public Vec4 VendorPos { get; private set; }
+
+    /// <summary>Cooldown after a capped (force-released) vendor window, so a member whose durability/
+    /// bags haven't actually improved doesn't immediately re-open a fresh window on the very next tick
+    /// — the same amnesiac-retry shape GroupCoordinator.GroupVendorWindowCapSec exists to break.
+    /// Mirrors BotIdentity.TrainCooldownUntil's pattern for the analogous solo case. Null = no
+    /// cooldown active.</summary>
+    public DateTime? VendorWindowCooldownUntil { get; set; }
+
+    /// <summary>Open (or re-affirm) the memoized vendor target for this window.</summary>
+    public void SetVendorTarget(int npcEntry, Vec4 pos)
+    {
+        VendorNpcEntry = npcEntry;
+        VendorPos = pos;
+    }
+
+    /// <summary>Close the window — the errand is over (need cleared) or was force-released (cap
+    /// tripped). Next open re-derives the vendor fresh.</summary>
+    public void ClearVendorTarget()
+    {
+        VendorNpcEntry = 0;
+        VendorPos = default;
+    }
+
+    /// <summary>Axiom 1 (2026-07-04): the memoized GroupGrind clump point. Set when the phase is
+    /// entered (from the anchor's position, or overwritten each tick from a dead member's live
+    /// position in the DOOR1 corpse-defense case so a graveyard rez pulls the whole group to the
+    /// member); cleared by SetPhase on any transition off GroupGrind. Memoized for the same reason
+    /// as the vendor target — re-deriving it from the anchor's LIVE position every tick would
+    /// change the stamped order every tick (structural equality) and re-path the whole team at
+    /// tick speed.</summary>
+    public Vec4 GrindPoint { get; set; }
+    public bool HasGrindPoint { get; set; }
+
+    /// <summary>Meat-grinder breaker state (2026-07-04 round 5). RecentDeaths holds the UTC of
+    /// every alive->dead transition inside the rolling window; LastDeadGuids detects the
+    /// transitions; LastSafePoint is the anchor's position last time the party went a full calm
+    /// window whole and death-free — the proven-safe ground a retreat falls back to. When the
+    /// window fills (3 deaths / 5 min), RetreatPending arms and PendingGrinderDefer asks the
+    /// virtual layer to shelve the active quest (through the normal Recover machinery, so it is
+    /// durable, logged, and expiring); the retreat itself starts only once the party is whole
+    /// (never abandon a corpse) and holds for RetreatHoldSec of Axiom-1 grinding at the safe
+    /// point. This is what breaks the flat ~80-deaths/hr loop: previously NOTHING ever decided
+    /// "this camp is beating us — leave".</summary>
+    public Queue<DateTime> RecentDeaths { get; } = new();
+    public HashSet<int> LastDeadGuids { get; } = new();
+    public DateTime LastDeathUtc { get; set; }
+    public Vec4 LastSafePoint { get; set; }
+    public bool HasLastSafePoint { get; set; }
+    public bool RetreatPending { get; set; }
+    public DateTime? RetreatUntil { get; set; }
+    public bool PendingGrinderDefer { get; set; }
+
+    /// <summary>Fix 4 (2026-07-04): the exhaust escape ladder. LastExhaustSet fingerprints the
+    /// deferred-quest set at the moment each grind-lock is stamped; an identical set on the next
+    /// lock increments ExhaustCycles (a changed set resets to 1). The coordinator's ladder then
+    /// escalates: cycle 2 force-expires TIME defers, cycle 3 also force-expires LEVEL defers
+    /// (their stamping condition — a straight-line danger read from a position the group has since
+    /// left — is stale by definition), cycle 4+ widens the virtual pick's injection radius so
+    /// acquisition can seed the next hub (the group's door out of a drained zone). Reset to 0 by
+    /// any resolved virtual WAIT (real group progress) and by ResetForForming.</summary>
+    public string LastExhaustSet { get; set; } = "";
+    public int ExhaustCycles { get; set; }
+
+    /// <summary>The group's weakest present-member level captured when the current path_unsafe
+    /// grind-lock BEGAN (2026-07-03). A path_unsafe lock waits ONLY on the weakest member's level
+    /// (level-based defers, requiredLevel = danger - margin), so a weakest-member level-up is exactly
+    /// what clears it. DriveGroupViaVirtual drops the lock and re-derives the moment the weakest rises
+    /// above this, instead of burning the full fixed window after the block has already lifted (the
+    /// ~13-min waste on 2026-07-03: lock set at L5-weakest, weakest dinged L6 minutes later, but the lock
+    /// ran its whole 20-min course before resuming quest 6). 0 = no lock currently captured.</summary>
+    public int GrindLockWeakestLevel { get; set; }
+
     /// <summary>The GroupTrain cadence baseline (§4): the level all present members must
     /// reach +2 before the next group-train fires. Default 0 means "never seeded" (real levels
     /// start at 1) -- GroupCoordinator.DriveGroup lazy-seeds it to the current min present member
@@ -262,17 +380,53 @@ public sealed class GroupPlan
     public void SetPhase(GroupPhase phase)
     {
         if (Phase != phase) PhaseSinceUtc = DateTime.UtcNow;
+
+        // Fix 2 (2026-07-04): the latch LIVES only while the group is actually on an objective
+        // (Objective, and the HoldAtAnchor transient that can interleave with it — obj_sync /
+        // detour ticks). Any other phase clears it, so a turned-in quest's mob can never again
+        // become the eternal idle target (the Garrick-all-night bug: set once at Objective entry,
+        // previously cleared only by ResetForForming). Re-entry to Objective re-latches naturally
+        // from the leg's own translation.
+        if (phase != GroupPhase.Objective && phase != GroupPhase.HoldAtAnchor)
+            LatchedObjective = ExecDirective.None;
+
+        // Axiom 1 / Axiom 2: the memoized clump point lives across the grind<->defend family
+        // (a corpse point set while a member was dead must persist through the dead->healing
+        // flip so the group keeps guarding the same spot) and dies on any transition out of it.
+        if (phase != GroupPhase.GroupGrind && phase != GroupPhase.GroupDefend)
+        {
+            GrindPoint = default;
+            HasGrindPoint = false;
+        }
+
         Phase = phase;
     }
 
     /// <summary>Rebuild-from-scratch on (re)Forming: drop the pool, cursor, and latched
     /// objective so the union is recomputed clean (a disband→reform or a hub change starts
-    /// fresh). Keeps TrainBaselineLevel — the train cadence survives a re-form.</summary>
+    /// fresh). Keeps TrainBaselineLevel — the train cadence survives a re-form. Also clears the
+    /// vendor memo (a stale NPC target shouldn't survive a reform), but NOT
+    /// VendorWindowCooldownUntil — like the train cadence, the cooldown survives a re-form so a
+    /// just-capped vendor errand can't immediately re-open under a fresh Forming pass.</summary>
     public void ResetForForming()
     {
         Pool.Clear();
         Cursor = 0;
         LatchedObjective = ExecDirective.None;
+        GrindLockWeakestLevel = 0;
+        GrindPoint = default;
+        HasGrindPoint = false;
+        ExhaustCycles = 0;
+        LastExhaustSet = "";
+        RecentDeaths.Clear();
+        LastDeadGuids.Clear();
+        LastDeathUtc = default;
+        LastSafePoint = default;
+        HasLastSafePoint = false;
+        RetreatPending = false;
+        RetreatUntil = null;
+        PendingGrinderDefer = false;
+        ClearVendorTarget();
         SetPhase(GroupPhase.Forming);
     }
 }

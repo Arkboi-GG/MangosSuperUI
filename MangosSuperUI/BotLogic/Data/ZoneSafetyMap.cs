@@ -101,9 +101,10 @@ public class ZoneSafetyMap
     /// dogpile, average level in [L-lowOffset, L+highOffset] (XP, not grey, not a wall), max level
     /// <= L+dangerCeil (no red mob lurking), and not caller-vetoed. Returns null if none qualify.
     ///
-    /// Cells already exclude critters / guards / service NPCs (load filter 995478 | 1026), so a
-    /// populated cell is a genuine aggressive pack -- this is why steering here fixes the
-    /// "kill-anything finds a chicken in a farmyard" spin (chickens are NO_AGGRO -> never in a cell).
+    /// Cells already exclude non-hostile NPCs (2026-07-03: a faction-reactance filter — a spawn is in the
+    /// grid only if its faction is hostile to a player, so guards / town NPCs / spirit healers / critters are
+    /// all gone), so a populated cell is a genuine aggressive pack -- this is why steering here fixes the
+    /// "kill-anything finds a chicken in a farmyard" spin (chickens are non-hostile -> never in a cell).
     /// </summary>
     /// <summary>
     /// Is killing this creature REAL progress for a bot of the given level? False for critters
@@ -204,6 +205,63 @@ public class ZoneSafetyMap
         }
 
         return maxLevel;
+    }
+
+    /// <summary>
+    /// Cluster-aware corridor threat (2026-07-04, rounds 4/5). Walks the same half-cell-sampled
+    /// straight line as GetMaxCreatureLevelOnPath, but instead of returning only the corridor's
+    /// single highest level, it counts — per DEDUPED cell — how many hostile spawns actually
+    /// exceed the caller's threshold. This is what makes the group path gate DYNAMIC in the
+    /// sense Nico asked for: mobs patrol and a bot can path AROUND one high-level mob, so a lone
+    /// over-band rare (Thuros Lightfingers L11 vetoing the whole kobold-cave corridor for a
+    /// weakest-under-8 group, round 4) must read differently from an over-band CAMP. The caller
+    /// applies the rule; this just reports the shape of the threat:
+    ///   MaxLevel     — corridor max (legacy semantics; feeds the defer-level math unchanged)
+    ///   OverCount    — total spawns with level &gt; threshold across the corridor
+    ///   MaxCellOver  — the worst single cell's over-threshold count (the camp detector)
+    ///   MaxCellDeep  — the worst single cell's count of spawns &gt; threshold+2 (deep reds)
+    /// Cells are deduped via a visited set (half-cell sampling re-hits each cell ~2×; counting
+    /// a camp twice would double its apparent size).
+    /// </summary>
+    public PathThreat GetPathThreat(int mapId, float x1, float y1, float x2, float y2, int thresholdLevel)
+    {
+        if (!_grids.TryGetValue(mapId, out var grid)) return default;
+
+        float dx = x2 - x1;
+        float dy = y2 - y1;
+        float dist = MathF.Sqrt(dx * dx + dy * dy);
+        float step = CELL_SIZE * 0.5f;
+        int samples = Math.Max(2, (int)(dist / step) + 1);
+
+        int maxLevel = 0, overCount = 0, maxCellOver = 0, maxCellDeep = 0;
+        var visited = new HashSet<(int, int)>();
+
+        for (int i = 0; i <= samples; i++)
+        {
+            float t = (float)i / samples;
+            var (ix, iy) = WorldToGrid(x1 + dx * t, y1 + dy * t);
+            if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) continue;
+            if (!visited.Add((ix, iy))) continue;
+
+            var cell = grid[ix, iy];
+            if (cell.SpawnCount == 0 || cell.LevelCounts == null) continue;
+            if (cell.MaxLevel > maxLevel) maxLevel = cell.MaxLevel;
+
+            int cellOver = 0, cellDeep = 0;
+            for (int lvl = Math.Clamp(thresholdLevel + 1, 1, 63); lvl <= 63; lvl++)
+            {
+                int n = cell.LevelCounts[lvl];
+                if (n == 0) continue;
+                cellOver += n;
+                if (lvl > thresholdLevel + 2) cellDeep += n;
+            }
+
+            overCount += cellOver;
+            if (cellOver > maxCellOver) maxCellOver = cellOver;
+            if (cellDeep > maxCellDeep) maxCellDeep = cellDeep;
+        }
+
+        return new PathThreat(maxLevel, overCount, maxCellOver, maxCellDeep);
     }
 
     /// <summary>
@@ -372,14 +430,28 @@ public class ZoneSafetyMap
                     ct.level_max AS MaxLevel
                 FROM creature c
                 JOIN creature_template ct ON ct.entry = c.id AND ct.patch = 0
+                JOIN faction_template ft ON ft.id = ct.faction AND ft.build = 4222
                 WHERE c.map IN (0, 1)
                   AND ct.level_min > 0
                   AND ct.level_max > 0
                   AND ct.level_max <= 63
-                  AND (ct.npc_flags & 995478) = 0
-                  AND (ct.flags_extra & 1026) = 0");
-            //995478 = questgiver | trainer | vendor | repair | flightmaster | innkeeper | banker | auctioneer | stablemaster
-            // 1026 = NO_AGGRO(2) | NO_AGGRO_ON_SIGHT(1024) — excludes guards +spirit healers
+                  AND (ft.hostile_mask & 3) <> 0");
+            // FACTION REACTANCE FILTER (2026-07-03) — a spawn contributes to the DANGER grid only if its
+            // faction is actually HOSTILE to a player. REPLACES the old npc_flags/flags_extra exclusion, which
+            // LEAKED: friendly Goldshire guards (faction 11) carry NO_AGGRO_ON_SIGHT(1024) but NOT NO_AGGRO(2),
+            // so (flags_extra & 1026) matched 1024 yet a level-55 guard still landed in the grid — and one
+            // friendly guard's cell set MaxLevel=55, vetoing EVERY corridor through town as path_unsafe. That
+            // was the 2026-07-03 whole-pool cascade: an L6 group told it couldn't walk to a LEVEL-5 named
+            // (Garrick, entry 103) because a friendly guard stood between them and it → 20-min grind-lock.
+            //
+            // Reactance, confirmed against THIS DB at build 4222 (which covers all 204 creature factions on the
+            // fork — full resolve, no fallback): player faction-templates use our_mask bit 1 = "all players",
+            // bit 2 = Alliance, bit 4 = Horde. A creature is hostile to an ALLIANCE player iff hostile_mask & 3
+            // (bits 1|2) is set. Verified: Garrick (ft 17, hm 1) → 1&3=1 KEPT; Goldshire guard (11, hm 12) →
+            // 12&3=0 DROPPED; town NPC (12, hm 4) → DROPPED; spirit healer (35, hm 0) → DROPPED. This fleet is
+            // ALLIANCE; a Horde fleet uses mask 5 (bits 1|4). The faction test SUPERSEDES the old flag filters
+            // (a friendly service NPC has hostile_mask&3=0 and drops out anyway; a hostile mob that also happens
+            // to be a questgiver is now correctly KEPT as danger instead of being wrongly excluded by npc_flags).
 
             // Accumulate per-cell
             var accum = new Dictionary<int, Dictionary<(int ix, int iy), CellAccum>>();
@@ -413,6 +485,7 @@ public class ZoneSafetyMap
                 cell.TotalLevel += avgLvl;
                 cell.Count++;
                 if (maxLvl > cell.MaxLevel) cell.MaxLevel = maxLvl;
+                cell.Levels[Math.Clamp(maxLvl, 1, 63)]++;   // threat histogram keys the spawn's MAX level (danger is worst-case)
 
                 spawnCount++;
             }
@@ -428,7 +501,8 @@ public class ZoneSafetyMap
                     {
                         AvgLevel = cell.TotalLevel / cell.Count,
                         MaxLevel = cell.MaxLevel,
-                        SpawnCount = cell.Count
+                        SpawnCount = cell.Count,
+                        LevelCounts = cell.Levels
                     };
                 }
 
@@ -479,6 +553,15 @@ public class ZoneSafetyMap
         public float AvgLevel;
         public int MaxLevel;
         public int SpawnCount;
+
+        // Per-level spawn histogram (index = level 1..63), populated cells only (null when empty).
+        // Added 2026-07-04 (round 4/5): the (avg, max, count) aggregate cannot distinguish "twenty
+        // L6 kobolds + ONE L11 named" from "a camp of L11s" — and a single lone rare (Thuros
+        // Lightfingers) was vetoing every corridor past it for any group whose weakest was under 8.
+        // The histogram lets GetPathThreat count how many spawns actually exceed a caller's
+        // threshold, which is what separates "path around one mob" from "that's a camp".
+        // Memory: ~64 ints per POPULATED cell, a few thousand cells per map — ~2MB total.
+        public int[]? LevelCounts;
     }
 
     private class CellAccum
@@ -486,7 +569,19 @@ public class ZoneSafetyMap
         public float TotalLevel;
         public int Count;
         public int MaxLevel;
+        public int[] Levels = new int[64];   // per-level spawn counts (see CellData.LevelCounts)
     }
+}
+
+/// <summary>Corridor threat shape from ZoneSafetyMap.GetPathThreat — see its doc for field semantics.</summary>
+public readonly struct PathThreat
+{
+    public readonly int MaxLevel;
+    public readonly int OverCount;
+    public readonly int MaxCellOver;
+    public readonly int MaxCellDeep;
+    public PathThreat(int maxLevel, int overCount, int maxCellOver, int maxCellDeep)
+    { MaxLevel = maxLevel; OverCount = overCount; MaxCellOver = maxCellOver; MaxCellDeep = maxCellDeep; }
 }
 
 /// <summary>A grind-worthy cell: world center + the cell's level/density + distance from the bot.</summary>

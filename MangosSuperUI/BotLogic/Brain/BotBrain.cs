@@ -47,11 +47,26 @@ public sealed class BotBrain
     private const double WedgeBackoffSec = 5;    // park this long, then resume + relocate to a fresh cell
     private const double TrainWedgeCooldownSec = 300;   // a trainer-route wedge defers Training this long (mirrors TrainingPlanner give-up) so the bot quests instead of re-bee-lining
 
+    // ── No-path escalation (2026-07-03, the GroupVendor livelock fix) ──
+    private const int EscalateNoPathStreakCount = 5;   // consecutive no_path fails against the SAME dest before a hard teleport
+    private static readonly TimeSpan TeleportAckDeadline = TimeSpan.FromSeconds(10);
+
     // ── Held-objective reconcile (Held-Objective build §3) ──
     // Grace after a held objective is (re)committed before the reconcile may re-issue it: C++ needs a
     // STATE tick (~5s) to adopt the task and echo it back, so a just-assigned objective whose echo still
     // reads the OLD task is NOT a real mismatch. The time analog of BotExecutor.ArrivalGateYards.
     private const double ReconcileGraceSec = 7;
+
+    // 2026-07-03, the reconcile-storm fix. ReconcileGraceSec above is a ONE-TIME adoption grace after
+    // a fresh commit; nothing previously stopped ReconcileHeldObjective re-firing on EVERY subsequent
+    // tick for as long as the mismatch persisted (confirmed live: a sustained multi-minute burst of
+    // re-issues at faster than 1Hz for a single bot). That's pure waste against BRIDGE_STATE_INTERVAL
+    // (5000ms, AiBotAIMain.h) — the echo this check reads only refreshes every 5s, so any re-fire
+    // faster than that is judging the exact same stale echo it already judged a mismatch on the
+    // previous tick, and re-sending an identical wire command before C++ could possibly have acted on
+    // the last one. Set to (at least) the STATE cadence so each fire gets to observe one fresh echo
+    // before deciding to fire again.
+    private const double ReconcileRefireCooldownSec = 7;
 
     public BotBrain(
         BotExecutor executor,
@@ -98,10 +113,17 @@ public sealed class BotBrain
             ctx.LastEmittedCombat = ctx.CombatDirective;
         }
 
-        // 1b. No-progress circuit breaker. Fires before goal/plan so a wedged bot is parked, not driven.
+        // 1b. No-path escalation — a faster, more targeted check than the generic wedge ceiling below.
+        //     Runs first: a durable per-destination no_path streak should escalate to a hard teleport
+        //     well before the generic park-and-relocate breaker's amnesiac failure counter ever catches
+        //     it (TryBreakWedgeAsync resets ctx.ConsecutiveFailures on every trip — see that method's
+        //     docstring). See TryEscalateUnreachableAsync below.
+        if (await TryEscalateUnreachableAsync(ctx)) return;
+
+        // 1c. No-progress circuit breaker. Fires before goal/plan so a wedged bot is parked, not driven.
         if (await TryBreakWedgeAsync(ctx)) return;
 
-        // 1c. Reconcile the held objective against C++'s reported task (Held-Objective build §3).
+        // 1d. Reconcile the held objective against C++'s reported task (Held-Objective build §3).
         //     ctx.Held is the committed strategic objective; ctx.HeldTask is what C++ says it is
         //     ACTUALLY running. If C++ has dropped / never adopted it (echo known, past the adoption
         //     grace, and not matching), knock out the in-flight WAIT + the group change-guard so the
@@ -245,6 +267,70 @@ public sealed class BotBrain
         return true;
     }
 
+    /// <summary>
+    /// No-path escalation (2026-07-03, the GroupVendor livelock fix). A DIFFERENT, faster, more
+    /// targeted signal than TryBreakWedgeAsync's generic ceiling: MOVE_FAILED reason=no_path against
+    /// an UNCHANGED destination is deterministic (the same Detour query will fail again), and
+    /// TryBreakWedgeAsync's own park-and-relocate resets ctx.ConsecutiveFailures to 0 on every trip —
+    /// so a leg that is genuinely unreachable (a real navmesh graph disconnection, confirmed live
+    /// 2026-07-03: a bot standing on valid, on-mesh navmesh with no path to a real, populated
+    /// destination) re-derives the SAME MOVE_TO, fails ~WedgeFailCap times, wedges, resets, repeats —
+    /// invisibly, forever, because the failure history never survives the reset.
+    ///
+    /// This durable, per-destination streak (BotIdentity.NoPathStreak, keyed like PathBlacklist) is
+    /// NOT cleared by the wedge park, so it keeps counting across cycles. At
+    /// EscalateNoPathStreakCount consecutive no_path fails against the SAME coordinate, this fires a
+    /// hard TELEPORT_TO straight to that destination — max_dist=0 (uncapped; the "hearth" teleport
+    /// variant, distinct from the small-radius interior-NPC assist hop) — which uses NearTeleportTo on
+    /// the C++ side and therefore does NOT require a path to exist. Confirmed live: the mechanism that
+    /// ONCE rescued a bot in this exact spot was combat/target-gated and cannot fire on a targetless
+    /// travel leg — this is the target-independent equivalent for MOVE_TO.
+    ///
+    /// No-ops (today's behavior) whenever: no failure is pending, it isn't a MOVE_TO/no_path failure,
+    /// the destination is unknown, or the streak hasn't cleared the threshold yet.
+    /// </summary>
+    private async Task<bool> TryEscalateUnreachableAsync(BotContext ctx)
+    {
+        var id = ctx.Identity;
+        if (id == null) return false;
+        if (ctx.Dead) return false;   // TELEPORT_TO on a corpse is TELEPORT_FAIL reason=dead — rez owns the dead path
+
+        // Fix 3 (2026-07-04): TWO triggers, not one. (a) The original: a WAIT-negated MOVE_TO
+        // no_path Failure. (b) NEW: the durable streak against the bot's HELD objective destination
+        // — the fire-and-forget legs (group objective / reconcile re-issues) never produce a
+        // Failure, so the streak recorded at the bridge-event level (BotExecutor.OnEvent) is their
+        // only visible trace. Without (b), the rescue that saved Xoz after 5 waited fails was
+        // structurally unable to fire for Oyic's 10,033 no-WAIT fails against one coordinate.
+        Vec4? target = null;
+        if (ctx.Failure is { CommandType: "MOVE_TO", Reason: "no_path", Dest: { } fdest })
+            target = fdest;
+        else if (ctx.Held is { NeedsActuation: true } h
+                 && id.GetNoPathStreak(h.Target.X, h.Target.Y) >= EscalateNoPathStreakCount)
+            target = h.Target;
+        if (target is not { } dest) return false;
+
+        int streak = id.GetNoPathStreak(dest.X, dest.Y);
+        if (streak < EscalateNoPathStreakCount)
+            return false;
+
+        _logger.LogWarning(
+            "[BRAIN] {Name} UNREACHABLE — {N} consecutive no_path to {Dest} — hard TELEPORT_TO (max_dist=0)",
+            ctx.Name, streak, dest);
+
+        _executor.ClearPending(ctx);
+        ctx.Failure = null;
+        ctx.ConsecutiveFailures = 0;
+        id.ClearNoPathStreak(dest.X, dest.Y);   // the coordinate is about to stop being "the current leg"
+        id.ClearGrindRelocate();
+        if (ctx.Goal == Goal.Grinding)
+            ctx.RecordDeadGrindCell(ctx.Pos.X, ctx.Pos.Y);
+
+        var teleport = new BridgeCommand("TELEPORT_TO",
+            new { x = dest.X, y = dest.Y, z = dest.Z, mapId = dest.Map, max_dist = 0 });
+        await _executor.IssueAsync(ctx, teleport, "TELEPORT_ACK", TeleportAckDeadline);
+        return true;
+    }
+
     /// <summary>Route an inbound bridge event for this bot through the executor's ack matching.</summary>
     public void OnEvent(BotContext ctx, BotEvent evt)
     {
@@ -284,6 +370,27 @@ public sealed class BotBrain
         if (!echo.IsKnown) return;                                       // no readback → degrade to ctx.Pending inference
         if (ctx.TimeSinceObjectiveSec < ReconcileGraceSec) return;       // just (re)committed — let C++ adopt it first
         if (held.MatchedBy(echo)) return;                                // C++ is on it → §5 progress checks own the rest
+
+        // Re-fire cooldown (2026-07-03, the reconcile-storm fix — see ReconcileRefireCooldownSec's
+        // docstring). LastReconcileUtc compared against ObjectiveSinceUtc, not used as a bare
+        // timestamp, so a cooldown left over from a PRIOR objective can never suppress a legitimate
+        // reconcile on a freshly-committed one (a genuinely new objective's own ReconcileGraceSec gate
+        // above already governs its first fire).
+        bool coolingDown = ctx.LastReconcileUtc >= ctx.ObjectiveSinceUtc
+                            && (DateTime.UtcNow - ctx.LastReconcileUtc).TotalSeconds < ReconcileRefireCooldownSec;
+        if (coolingDown) return;
+
+        // Fix 3 (2026-07-04): an objective whose destination is on a durable no_path streak must NOT
+        // be metronome re-issued — the 7s cooldown turned Oyic's unreachable held Grind into a
+        // ~4,700-reconcile metronome (each re-issue: fire MOVE_TO -> MOVE_FAILED -> Idle -> repeat),
+        // which is throttling a failure, not fixing one. At the escalation threshold this yields
+        // entirely: TryEscalateUnreachableAsync (step 1b, runs BEFORE this) owns the destination via
+        // the hard teleport; re-issuing underneath it would just reset the race.
+        if (ctx.Identity is { } rid
+            && rid.GetNoPathStreak(held.Target.X, held.Target.Y) >= EscalateNoPathStreakCount)
+            return;
+
+        ctx.LastReconcileUtc = DateTime.UtcNow;
 
         // Mismatch: C++ is idle / on a stale or different task while we hold this objective. Clear the in-flight
         // WAIT + any stale failure, then force the OWNING planner to re-issue the realizing leg this tick. The
