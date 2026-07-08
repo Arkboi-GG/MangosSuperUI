@@ -93,14 +93,17 @@
                         <button class="btn-sm btn-outline-subtle" disabled>
                             <i class="fa-solid fa-compress"></i> Run compaction now <span class="phase-tag">C8</span>
                         </button>
-                        <button class="btn-sm btn-outline-subtle" disabled>
-                            <i class="fa-solid fa-masks-theater"></i> Build voice library <span class="phase-tag">C6</span>
+                        <button class="btn-sm btn-outline-subtle" id="btnBuildVoices">
+                            <i class="fa-solid fa-masks-theater"></i> Build voice library
+                        </button>
+                        <button class="btn-sm btn-outline-subtle" id="btnRerollSeeds" title="Reassign pre-library personas onto library voices (replaces their cards)">
+                            <i class="fa-solid fa-dice"></i> Reroll seed personas
                         </button>
                         <button class="btn-sm btn-outline-subtle" disabled>
                             <i class="fa-solid fa-scroll"></i> Recompile era pack <span class="phase-tag">C10</span>
                         </button>
                     </div>
-                    <div class="ks-note">Last-run status appears here once the batch lane exists.</div>
+                    <div class="ks-note" id="voiceStatus">Voice library: loading…</div>
                 </div>
             </div>
 

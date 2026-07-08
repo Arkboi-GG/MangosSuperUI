@@ -23,6 +23,7 @@ $(function () {
                 renderSwitch($('#ksChat'), data.chatEnabled);
                 renderSwitch($('#ksAmbient'), data.ambientEnabled);
                 renderProfiles(data.profiles || []);
+                renderVoiceStatus(data);
             },
             error: function () { showToast('Failed to load capacity data', 'error'); }
         });
@@ -32,9 +33,9 @@ $(function () {
 
     function renderSwitch(btn, on) {
         btn.data('on', !!on)
-           .toggleClass('on', !!on)
-           .toggleClass('off', !on)
-           .find('.ks-state').text(on ? 'ENABLED' : 'DISABLED');
+            .toggleClass('on', !!on)
+            .toggleClass('off', !on)
+            .find('.ks-state').text(on ? 'ENABLED' : 'DISABLED');
     }
 
     $('.kill-switch').on('click', function () {
@@ -160,6 +161,67 @@ $(function () {
             error: function () { showToast('Activate failed', 'error'); load(); }
         });
     }
+
+    // ===================== Voice library (C6) =====================
+
+    var voicePoll = null;
+
+    function renderVoiceStatus(data) {
+        var b = data.voiceBuild || {};
+        var line;
+        if (b.running) {
+            line = 'Voice library: BUILDING — ' + b.accepted + '/' + b.target +
+                ' (dedup rejects ' + b.rejectedDedup + ', parse rejects ' + b.rejectedParse + ')';
+            startVoicePoll();
+        } else {
+            line = 'Voice library: ' + data.voiceCount + '/' + data.voiceTarget + ' voices';
+            if (data.seedPersonaCount > 0) line += ' — ' + data.seedPersonaCount + ' seed-era personas (reroll to upgrade)';
+            if (b.error) line += ' — last build error: ' + b.error;
+            stopVoicePoll();
+        }
+        $('#voiceStatus').text(line);
+    }
+
+    function startVoicePoll() {
+        if (voicePoll) return;
+        voicePoll = setInterval(function () {
+            $.ajax({
+                url: '/BotChat/Capacity/VoiceBuildStatus', method: 'GET',
+                success: function (b) {
+                    if (b.running) {
+                        $('#voiceStatus').text('Voice library: BUILDING — ' + b.accepted + '/' + b.target +
+                            ' (dedup rejects ' + b.rejectedDedup + ', parse rejects ' + b.rejectedParse + ')');
+                    } else { stopVoicePoll(); load(); }
+                }
+            });
+        }, 5000);
+    }
+
+    function stopVoicePoll() { if (voicePoll) { clearInterval(voicePoll); voicePoll = null; } }
+
+    $('#btnBuildVoices').on('click', function () {
+        if (!confirm('Build the voice library? This runs one LLM call per card on the active profile and can take a while.')) return;
+        $.ajax({
+            url: '/BotChat/Capacity/BuildVoiceLibrary', method: 'POST', contentType: 'application/json',
+            success: function (r) {
+                if (r.success) { showToast('Voice library build started'); startVoicePoll(); }
+                else showToast(r.error || 'Start failed', 'error');
+            },
+            error: function () { showToast('Start failed', 'error'); }
+        });
+    });
+
+    $('#btnRerollSeeds').on('click', function () {
+        if (!confirm('Reassign all pre-library (seed-era) personas onto library voices? Their current cards are REPLACED.')) return;
+        $.ajax({
+            url: '/BotChat/Capacity/RerollSeedPersonas', method: 'POST', contentType: 'application/json',
+            success: function (r) {
+                if (r.success) { showToast('Rerolled ' + r.rerolled + ' personas'); load(); }
+                else showToast(r.error || 'Reroll failed', 'error');
+            },
+            error: function () { showToast('Reroll failed', 'error'); }
+        });
+    });
 
     $('#btnAddProfile').on('click', function () {
         $('#profileTable tbody').append(profileRow({

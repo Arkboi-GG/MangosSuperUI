@@ -4,6 +4,7 @@ using MangosSuperUI.Models;
 using MangosSuperUI.Services;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Chat.Voice;
 using Dapper;
 using System.Text.Json;
 
@@ -23,15 +24,20 @@ public class ChatSettingsController : Controller
 {
     private readonly ConnectionFactory _db;
     private readonly ChatSettingsService _settings;
+    private readonly VoiceLibraryBuilder _voiceBuilder;
+    private readonly PersonaService _personas;
     private readonly AuditService _audit;
     private readonly IHubContext<BotBridgeHub> _hub;
     private readonly ILogger<ChatSettingsController> _logger;
 
     public ChatSettingsController(ConnectionFactory db, ChatSettingsService settings,
+        VoiceLibraryBuilder voiceBuilder, PersonaService personas,
         AuditService audit, IHubContext<BotBridgeHub> hub, ILogger<ChatSettingsController> logger)
     {
         _db = db;
         _settings = settings;
+        _voiceBuilder = voiceBuilder;
+        _personas = personas;
         _audit = audit;
         _hub = hub;
         _logger = logger;
@@ -167,12 +173,57 @@ public class ChatSettingsController : Controller
                    ambient_rate_mult AS ambientRateMult, active
             FROM chat_inference_profile ORDER BY id");
 
+        var voiceCount = await conn.QuerySingleAsync<int>(
+            "SELECT COUNT(*) FROM chat_voice WHERE retired=0");
+        var seedPersonaCount = await conn.QuerySingleAsync<int>(
+            "SELECT COUNT(*) FROM bot_persona WHERE voice_id IS NULL");
+
         return Json(new
         {
             profiles,
             chatEnabled = _settings.GetBool(0, "global.chat_enabled", true),
-            ambientEnabled = _settings.GetBool(0, "global.ambient_enabled", true)
+            ambientEnabled = _settings.GetBool(0, "global.ambient_enabled", true),
+            voiceCount,
+            voiceTarget = _settings.GetInt(0, "voice.library_target", 300),
+            seedPersonaCount,
+            voiceBuild = _voiceBuilder.Status
         });
+    }
+
+    // ==================== Voice library (C6) ====================
+
+    [HttpPost("Capacity/BuildVoiceLibrary")]
+    public async Task<IActionResult> BuildVoiceLibrary()
+    {
+        if (!_voiceBuilder.TryStart())
+            return Json(new { success = false, error = "a build is already running" });
+
+        _logger.LogInformation("[CHAT-CAP] {Who} started a voice library build", Who);
+        await _audit.LogAsync(new AuditEntry
+        {
+            Operator = "admin",
+            OperatorIp = HttpContext.Connection.RemoteIpAddress?.ToString(),
+            Category = "bots",
+            Action = "voice_library_build",
+            TargetType = "chat_voice",
+            TargetName = "library",
+            IsReversible = false,
+            Success = true,
+            Notes = "Voice library build started (Batch class)"
+        });
+        return Json(new { success = true });
+    }
+
+    [HttpGet("Capacity/VoiceBuildStatus")]
+    public IActionResult VoiceBuildStatus() => Json(_voiceBuilder.Status);
+
+    /// <summary>One-shot: reassign pre-library (seed-era) personas onto library voices.</summary>
+    [HttpPost("Capacity/RerollSeedPersonas")]
+    public async Task<IActionResult> RerollSeedPersonas()
+    {
+        var count = await _personas.RerollSeedPersonasAsync();
+        _logger.LogInformation("[CHAT-CAP] {Who} rerolled {Count} seed-era personas onto the library", Who, count);
+        return Json(new { success = true, rerolled = count });
     }
 
     public class ProfileDto

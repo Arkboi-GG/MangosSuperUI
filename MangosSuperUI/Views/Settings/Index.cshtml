@@ -432,6 +432,43 @@
                 </div>
             </div>
 
+            <!-- Documentation Wiki -->
+            <div class="card mb-4">
+                <div class="card-header d-flex align-items-center gap-2">
+                    <i class="fa-solid fa-book" style="color: var(--accent);"></i>
+                    Documentation Wiki
+                </div>
+                <div class="card-body">
+                    <p style="font-size: 12.5px; color: var(--text-secondary); margin: 0 0 16px;">
+                        Root folder of the generated documentation corpus rendered by the <a href="/Wiki" style="color: var(--accent);">Wiki</a> page.
+                        Point this at the folder containing the <code>.md</code> docs &mdash; the search index builds itself from the corpus
+                        automatically (stored in the Admin database) and rebuilds whenever the docs change.
+                    </p>
+                    <div class="row g-3">
+                        <div class="col-md-8">
+                            <label class="cmd-label">
+                                Docs Root Directory
+                                <i class="fa-solid fa-circle-question cfg-hint" title="Directory containing the generated documentation (.md files, folder-mirrored, plus _topics/ guides). The Wiki page and its search read from here. Changing it requires an app restart."></i>
+                            </label>
+                            <input type="text" class="form-input cfg-input" id="cfgWikiRoot" placeholder="/home/wowvmangos/docs_full" />
+                        </div>
+                        <div class="col-md-4 d-flex align-items-end">
+                            <button class="btn-outline-subtle" id="btnWikiReindex" title="Force a full rebuild of the wiki search index. Needed after changing MariaDB's innodb_ft_min_token_size; otherwise the index maintains itself.">
+                                <i class="fa-solid fa-arrows-rotate"></i> Rebuild Search Index
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Wiki Status -->
+                    <div class="dbc-status-panel mt-3" id="wikiStatusPanel">
+                        <div class="d-flex align-items-center gap-2" id="wikiStatusRow">
+                            <i class="fa-solid fa-spinner fa-spin" style="font-size: 13px; color: var(--text-muted);"></i>
+                            <span style="font-size: 12.5px; color: var(--text-secondary);">Checking wiki status...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Kestrel -->
             <div class="card mb-4">
                 <div class="card-header d-flex align-items-center gap-2">

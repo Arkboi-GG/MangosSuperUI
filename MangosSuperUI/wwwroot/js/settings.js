@@ -56,6 +56,11 @@ $(function () {
             // Kestrel
             $('#cfgKestrelUrl').val(s.kestrel.url);
 
+            // Wiki
+            if (s.wiki) {
+                $('#cfgWikiRoot').val(s.wiki.root || '');
+            }
+
             // AI Services
             if (s.spellCreator) {
                 // ComfyUI nodes
@@ -86,10 +91,11 @@ $(function () {
             }
         });
 
-        // Also load DBC status + ComfyUI pool status + Backup status
+        // Also load DBC status + ComfyUI pool status + Backup status + Wiki status
         loadDbcStatus();
         loadComfyStatus();
         loadBackupStatus();
+        loadWikiStatus();
     }
 
     // ===================== COMFYUI NODE MANAGEMENT =====================
@@ -335,6 +341,92 @@ $(function () {
         });
     });
 
+    // ===================== WIKI STATUS =====================
+
+    function loadWikiStatus() {
+        $.getJSON('/Wiki/Stats', function (stats) {
+            var $panel = $('#wikiStatusPanel');
+            var $row = $('#wikiStatusRow');
+
+            if (!stats || !stats.ready) {
+                $row.html(
+                    '<i class="fa-solid fa-triangle-exclamation" style="font-size: 13px; color: var(--status-warning);"></i>' +
+                    '<span style="font-size: 12.5px; color: var(--text-secondary);">No docs found at the configured root &mdash; the Wiki page will be empty until the corpus is in place.</span>'
+                );
+                $panel.css('border-left', '3px solid var(--status-warning)');
+                return;
+            }
+
+            // Corpus is present — layer the search-index state on top.
+            $.getJSON('/Wiki/IndexStatus', function (idx) {
+                var chips =
+                    '<span class="dbc-count-chip">pages: <span class="count-val">' + (stats.pageCount || 0) + '</span></span> ' +
+                    '<span class="dbc-count-chip">folders: <span class="count-val">' + (stats.folderCount || 0) + '</span></span> ';
+
+                var idxLabel, idxColor;
+                if (idx && idx.building) {
+                    idxLabel = 'building ' + (idx.done || 0) + ' / ' + (idx.total || 0);
+                    idxColor = 'var(--status-warning)';
+                    setTimeout(loadWikiStatus, 2000);   // live progress while it builds
+                } else if (idx && idx.lastError) {
+                    idxLabel = 'error: ' + idx.lastError;
+                    idxColor = 'var(--status-error)';
+                } else if (idx && idx.lastCompletedUtc) {
+                    idxLabel = 'ready';
+                    idxColor = 'var(--status-online)';
+                } else {
+                    idxLabel = 'idle (builds on first search)';
+                    idxColor = 'var(--text-muted)';
+                }
+                chips += '<span class="dbc-count-chip"><span class="node-status-dot" style="background: ' + idxColor + ';"></span> search index: <span class="count-val">' + escapeHtml(idxLabel) + '</span></span>';
+
+                $('#wikiStatusRow').html(
+                    '<i class="fa-solid fa-circle-check" style="font-size: 13px; color: var(--status-online);"></i>' +
+                    '<span style="font-size: 12.5px; color: var(--text-secondary);">Corpus loaded from <code>' + escapeHtml(stats.root || '') + '</code></span>' +
+                    '<div class="d-flex flex-wrap gap-2 mt-2">' + chips + '</div>'
+                );
+                $('#wikiStatusPanel').css('border-left', '3px solid var(--status-online)');
+            }).fail(function () {
+                // Stats worked, index endpoint didn't — show the corpus part alone.
+                $('#wikiStatusRow').html(
+                    '<i class="fa-solid fa-circle-check" style="font-size: 13px; color: var(--status-online);"></i>' +
+                    '<span style="font-size: 12.5px; color: var(--text-secondary);">Corpus loaded (' + (stats.pageCount || 0) + ' pages) &mdash; index status unavailable</span>'
+                );
+                $('#wikiStatusPanel').css('border-left', '3px solid var(--status-online)');
+            });
+        }).fail(function () {
+            $('#wikiStatusRow').html(
+                '<i class="fa-solid fa-circle-xmark" style="font-size: 13px; color: var(--status-error);"></i>' +
+                '<span style="font-size: 12.5px; color: var(--text-secondary);">Could not reach the wiki status endpoint</span>'
+            );
+            $('#wikiStatusPanel').css('border-left', '3px solid var(--status-error)');
+        });
+    }
+
+    $('#btnWikiReindex').on('click', function () {
+        var $btn = $(this);
+        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Rebuilding...');
+
+        $.ajax({
+            url: '/Wiki/Reindex',
+            type: 'POST',
+            success: function (data) {
+                if (data && data.started) {
+                    showMessage('success', 'Search index rebuild started \u2014 progress shows in the Wiki status below.');
+                } else {
+                    showMessage('error', 'Rebuild not started \u2014 a build is already running, or the docs root / Admin database is unavailable.');
+                }
+            },
+            error: function (xhr) {
+                showMessage('error', 'Reindex request failed: ' + xhr.statusText);
+            },
+            complete: function () {
+                $btn.prop('disabled', false).html('<i class="fa-solid fa-arrows-rotate"></i> Rebuild Search Index');
+                loadWikiStatus();
+            }
+        });
+    });
+
     // ===================== SAVE =====================
     $('#btnSaveConfig').on('click', function () {
         var $btn = $(this);
@@ -388,6 +480,9 @@ $(function () {
                 clientM2Path: $('#cfgClientM2Path').val() || '',
                 clientDataPath: $('#cfgClientDataPath').val() || '',
                 patchOutputPath: $('#cfgPatchOutputPath').val() || ''
+            },
+            wiki: {
+                root: $('#cfgWikiRoot').val() || ''
             },
             kestrel: {
                 url: $('#cfgKestrelUrl').val()

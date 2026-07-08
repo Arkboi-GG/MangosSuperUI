@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Services;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 namespace MangosSuperUI.Controllers;
@@ -78,6 +79,10 @@ public class SettingsController : Controller
                 ClientDataPath = _config["Vmangos:ClientDataPath"] ?? ""
             },
             SpellCreator = BuildSpellCreatorConfig(),
+            Wiki = new WikiConfig
+            {
+                Root = _config["Wiki:Root"] ?? ""
+            },
             Kestrel = new KestrelConfig
             {
                 Url = _config["Kestrel:Endpoints:Http:Url"] ?? "http://0.0.0.0:5000"
@@ -159,7 +164,48 @@ public class SettingsController : Controller
     {
         try
         {
-            var json = JsonSerializer.Serialize(settings, JsonOpts);
+            // MERGE into the existing override rather than rewriting it wholesale:
+            // server-config.json carries sections this page doesn't manage
+            // (BotChat.InferenceProfiles, future additions) — the old full rewrite
+            // silently dropped them on every save. JSONC comments in the existing file
+            // are lost on the first save (JsonNode can't round-trip comments); the
+            // section VALUES are what must survive.
+            JsonObject root = new();
+            if (System.IO.File.Exists(ConfigFilePath))
+            {
+                try
+                {
+                    var docOpts = new JsonDocumentOptions
+                    {
+                        CommentHandling = JsonCommentHandling.Skip,
+                        AllowTrailingCommas = true
+                    };
+                    root = JsonNode.Parse(System.IO.File.ReadAllText(ConfigFilePath), null, docOpts) as JsonObject ?? new JsonObject();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Existing server-config.json unreadable — writing a fresh file.");
+                    root = new JsonObject();
+                }
+            }
+
+            void Set(string name, object? section)
+            {
+                if (section is null) return;
+                // drop a differently-cased existing key so we never end up with both
+                var existing = root.FirstOrDefault(kv => string.Equals(kv.Key, name, StringComparison.OrdinalIgnoreCase)).Key;
+                if (existing is not null) root.Remove(existing);
+                root[name] = JsonSerializer.SerializeToNode(section, JsonOpts);
+            }
+
+            Set("connectionStrings", settings.ConnectionStrings);
+            Set("remoteAccess", settings.RemoteAccess);
+            Set("vmangos", settings.Vmangos);
+            Set("spellCreator", settings.SpellCreator);
+            Set("wiki", settings.Wiki);
+            Set("kestrel", settings.Kestrel);
+
+            var json = root.ToJsonString(JsonOpts);
             System.IO.File.WriteAllText(ConfigFilePath, json);
             _logger.LogInformation("Saved server-config.json to {Path}", ConfigFilePath);
             await _audit.LogConfigChangeAsync(json, null);
@@ -212,7 +258,12 @@ public class SettingsController : Controller
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // read-side: the live override is JSONC with mixed-case section names —
+        // without these, Override() fails to parse the very file Save() writes to
+        PropertyNameCaseInsensitive = true,
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true
     };
 }
 
@@ -224,6 +275,7 @@ public class ServerConfig
     public RemoteAccessConfig? RemoteAccess { get; set; }
     public VmangosConfig? Vmangos { get; set; }
     public SpellCreatorConfig? SpellCreator { get; set; }
+    public WikiConfig? Wiki { get; set; }
     public KestrelConfig? Kestrel { get; set; }
 }
 
@@ -293,6 +345,14 @@ public class OllamaConfig
     public string BaseUrl { get; set; } = "";
     public string Model { get; set; } = "";
     public string VisionModel { get; set; } = "";
+}
+
+public class WikiConfig
+{
+    // Root of the generated documentation corpus the /Wiki page renders and indexes.
+    // (Wiki:IndexConnection remains a config-file-only advanced override; it defaults
+    // to the Admin connection string, which is already editable above.)
+    public string Root { get; set; } = "";
 }
 
 public class KestrelConfig

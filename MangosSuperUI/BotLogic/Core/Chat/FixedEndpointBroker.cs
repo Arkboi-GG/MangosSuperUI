@@ -73,6 +73,7 @@ public class FixedEndpointBroker : IInferenceBroker
     private string _endpoint = "";
     private string _modelReactive = "";
     private string _modelAmbient = "";
+    private string _modelBatch = "";
     private string _apiFlavor = "ollama";
     private int _concurrency = 2;
     private int _ctxBudget = 3000;
@@ -97,7 +98,14 @@ public class FixedEndpointBroker : IInferenceBroker
             slots = _slots;
             endpoint = _endpoint;
             flavor = _apiFlavor;
-            model = cls == TrafficClass.Ambient ? _modelAmbient : _modelReactive;
+            model = cls switch
+            {
+                TrafficClass.Ambient => _modelAmbient,
+                // Batch prefers model_batch; manual runs (voice build button) fall back
+                // to the reactive tag when batch is unset — the operator clicked, honor it.
+                TrafficClass.Batch => string.IsNullOrEmpty(_modelBatch) ? _modelReactive : _modelBatch,
+                _ => _modelReactive
+            };
         }
         if (string.IsNullOrEmpty(endpoint)) return null;
         if (string.IsNullOrEmpty(model))
@@ -242,6 +250,7 @@ public class FixedEndpointBroker : IInferenceBroker
             var p = conn.QuerySingleOrDefault<ProfileRow>(@"
                 SELECT name AS Name, endpoint_url AS Endpoint, api_flavor AS ApiFlavor,
                        model_reactive AS ModelReactive, model_ambient AS ModelAmbient,
+                       model_batch AS ModelBatch,
                        concurrency AS Concurrency, ctx_budget_tokens AS CtxBudget
                 FROM chat_inference_profile WHERE active=1 LIMIT 1");
             if (p == null)
@@ -251,13 +260,14 @@ public class FixedEndpointBroker : IInferenceBroker
             }
             // OpenAI-flavored profile with empty tags → ask the server what it serves
             // (vLLM exposes exactly one model on /v1/models).
-            if (string.Equals(p.ApiFlavor?.Trim(), "openai", StringComparison.OrdinalIgnoreCase) && (string.IsNullOrEmpty(p.ModelReactive) || string.IsNullOrEmpty(p.ModelAmbient)))
+            if (string.Equals(p.ApiFlavor?.Trim(), "openai", StringComparison.OrdinalIgnoreCase) && (string.IsNullOrEmpty(p.ModelReactive) || string.IsNullOrEmpty(p.ModelAmbient) || string.IsNullOrEmpty(p.ModelBatch)))
             {
                 var served = ResolveServedModel(p.Endpoint);
                 if (served != null)
                 {
                     if (string.IsNullOrEmpty(p.ModelReactive)) p.ModelReactive = served;
                     if (string.IsNullOrEmpty(p.ModelAmbient)) p.ModelAmbient = served;
+                    if (string.IsNullOrEmpty(p.ModelBatch)) p.ModelBatch = served;
                     _logger.LogInformation("[CHAT-CAP] profile '{Name}' auto-resolved served model → '{Model}'", p.Name, served);
                 }
                 else
@@ -279,6 +289,7 @@ public class FixedEndpointBroker : IInferenceBroker
                 _endpoint = v.Endpoint;
                 _apiFlavor = string.IsNullOrWhiteSpace(v.ApiFlavor) ? "ollama" : v.ApiFlavor.Trim().ToLowerInvariant();
                 _modelReactive = v.ModelReactive;
+                _modelBatch = v.ModelBatch;
                 _modelAmbient = v.ModelAmbient;
                 _concurrency = v.Concurrency;
                 _ctxBudget = v.CtxBudget;
@@ -297,6 +308,7 @@ public class FixedEndpointBroker : IInferenceBroker
         public string ApiFlavor { get; set; } = "ollama";
         public string ModelReactive { get; set; } = "";
         public string ModelAmbient { get; set; } = "";
+        public string ModelBatch { get; set; } = "";
         public int Concurrency { get; set; }
         public int CtxBudget { get; set; }
     }

@@ -13,6 +13,7 @@ using MangosSuperUI.BotLogic.Chat.Core;
 using MangosSuperUI.BotLogic.Chat.Engine;
 using MangosSuperUI.BotLogic.Chat.Capacity;
 using MangosSuperUI.BotLogic.Chat.Memory;
+using MangosSuperUI.BotLogic.Chat.Voice;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -129,6 +130,8 @@ builder.Services.AddSingleton<ChatMemoryStore>();
 builder.Services.AddSingleton<UrgeScorer>();
 builder.Services.AddSingleton<ChainGuard>();
 builder.Services.AddSingleton<BudgetBuckets>();
+// C6: voice library builder (Batch-class admin action from the Capacity tab)
+builder.Services.AddSingleton<VoiceLibraryBuilder>();
 builder.Services.AddSingleton<ChatCoordinator>();
 builder.Services.AddSingleton<IChatCoordinator>(sp => sp.GetRequiredService<ChatCoordinator>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChatCoordinator>());
