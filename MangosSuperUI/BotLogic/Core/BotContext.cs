@@ -433,6 +433,7 @@ public sealed class BotContext
     public int Durability { get; set; } = 100;            // min equipped-slot durability % (100 = full); drives the repair errand
     public bool InCombat { get; set; }
     public bool Dead { get; set; }
+    public bool InPlayerParty { get; set; }                // [PLAYERPARTY] a REAL player leads this bot's group (C++ pparty; GoalSelector holds Idle on it)
 
     // ---- C++ held-task echo (Held-Objective build §4; refreshed each tick from STATE) ----
     // What C++ reports it is ACTUALLY running right now (mirror of m_currentTask). Unknown until the
@@ -574,6 +575,7 @@ public sealed class BotContext
         Durability = (int)snap.Durability;
         InCombat = snap.InCombat;
         Dead = snap.IsDead;
+        InPlayerParty = snap.InPlayerParty;
         HeldTask = snap.HeldTask;   // C++ task readback (Unknown until the Session-3 STATE echo lands)
 
         // Quest log now rides on STATE (the QUERY_QUEST_STATUS pull is retired). Set it here — on the TICK

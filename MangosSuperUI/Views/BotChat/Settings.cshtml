@@ -1,0 +1,114 @@
+@{
+    ViewData["Title"] = "Chat Feel";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header">
+            <div>
+                <h1><i class="fa-solid fa-comments" style="color: var(--accent);"></i> Chat Feel</h1>
+                <p>How the bot fleet talks — density, responsiveness, voice, memory</p>
+            </div>
+            <div class="d-flex gap-2 align-items-center">
+                <span class="active-preset-badge">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                    Preset: <strong id="activePresetName">…</strong>
+                </span>
+                <a class="btn-sm btn-outline-subtle" href="/BotChat/Capacity">
+                    <i class="fa-solid fa-server"></i> Chat Capacity
+                </a>
+            </div>
+        </div>
+
+        <div class="content-body">
+
+            <!-- Preset bar (§14.3: selector + save-as-custom on top) -->
+            <div class="card mb-4">
+                <div class="card-header">
+                    <i class="fa-solid fa-bolt" style="color: var(--accent);"></i> Presets
+                </div>
+                <div class="card-body">
+                    <div class="preset-bar">
+                        <select id="presetSelect" class="form-select"></select>
+                        <button class="btn-sm btn-outline-subtle" id="btnApplyPreset">
+                            <i class="fa-solid fa-play"></i> Apply
+                        </button>
+                        <span class="preset-divider"></span>
+                        <input type="text" id="customPresetName" class="form-control"
+                               maxlength="48" placeholder="Save current as…" />
+                        <button class="btn-sm btn-outline-subtle" id="btnSavePreset">
+                            <i class="fa-solid fa-floppy-disk"></i> Save
+                        </button>
+                    </div>
+                    <div class="zone-affordance">
+                        <i class="fa-solid fa-map-location-dot"></i>
+                        Per-zone overrides — <span class="v2-tag">v2</span>
+                        (the schema supports <code>zone:&lt;id&gt;</code> scopes today; this page ships global-only)
+                    </div>
+                </div>
+            </div>
+
+            <!-- Collapsible setting groups — rendered from /BotChat/Settings/Data by chatfeel.js -->
+            <div id="settingGroups">
+                <div class="text-center p-4"><i class="fa-solid fa-spinner fa-spin"></i> Loading settings…</div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+@section Styles {
+    <style>
+        .active-preset-badge { font-size: 12px; color: var(--text-muted); background: var(--bg-elevated, rgba(255,255,255,0.04)); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; }
+        .active-preset-badge strong { color: var(--accent); }
+
+        .preset-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .preset-bar .form-select { max-width: 240px; }
+        .preset-bar .form-control { max-width: 220px; }
+        .preset-divider { width: 1px; height: 24px; background: var(--border); margin: 0 4px; }
+
+        .zone-affordance { margin-top: 10px; font-size: 12px; color: var(--text-muted); opacity: 0.75; }
+        .zone-affordance .v2-tag { border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; }
+
+        /* ── Collapsible groups ── */
+        .setting-group { margin-bottom: 14px; }
+        .setting-group .card-header { cursor: pointer; user-select: none; display: flex; align-items: center; justify-content: space-between; }
+        .setting-group .card-header .chev { transition: transform 0.15s; color: var(--text-muted); }
+        .setting-group.collapsed .card-body { display: none; }
+        .setting-group.collapsed .card-header .chev { transform: rotate(-90deg); }
+        .group-count { font-size: 11px; color: var(--text-muted); }
+
+        /* ── One setting row ── */
+        .setting-row { display: grid; grid-template-columns: 280px 1fr 90px; gap: 14px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--border); }
+        .setting-row:last-child { border-bottom: none; }
+        .setting-label .key { font-family: monospace; font-size: 12px; }
+        .setting-label .meaning { font-size: 11px; color: var(--text-muted); }
+        .setting-control input[type="range"] { width: 100%; }
+        .setting-value input[type="number"], .setting-value .bool-toggle { width: 100%; }
+        .setting-control input[type="text"] { width: 100%; font-family: monospace; font-size: 12px; }
+        .setting-row.dirty .setting-label .key { color: var(--accent); }
+
+        /* ── Diurnal curve (6 numeric inputs, v1) ── */
+        .curve-inputs { display: flex; gap: 8px; flex-wrap: wrap; }
+        .curve-point { text-align: center; }
+        .curve-point label { display: block; font-size: 10px; color: var(--text-muted); margin-bottom: 2px; }
+        .curve-point input { width: 64px; }
+
+        /* ── Bool toggle ── */
+        .bool-toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+        .bool-toggle .state { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted); }
+        .bool-toggle input:checked ~ .state { color: var(--status-online); }
+
+        /* ── Toast (loot-tuner idiom) ── */
+        .chat-toast { position: fixed; bottom: 24px; right: 24px; padding: 10px 16px; border-radius: 8px; font-size: 13px; z-index: 3000; animation: toastIn 0.15s ease-out; }
+        .chat-toast.success { background: var(--status-online); color: white; }
+        .chat-toast.error { background: var(--status-error); color: white; }
+        @@keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+}
+
+@section Scripts {
+    <script src="~/js/chatfeel.js" asp-append-version="true"></script>
+}

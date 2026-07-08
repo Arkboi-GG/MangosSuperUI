@@ -18,7 +18,7 @@ namespace MangosSuperUI.Services;
 /// are what this store produces.
 ///
 /// Read-only. The corpus is regenerated out-of-band by SourceMapper on the box; the store
-/// caches the label index and rebuilds it when the corpus changes on disk.
+/// caches the label index and the nav tree, rebuilding both when the corpus changes.
 /// </summary>
 public sealed class WikiDocStore
 {
@@ -31,6 +31,11 @@ public sealed class WikiDocStore
     private readonly object _lock = new();
     private Dictionary<string, string>? _labels;
     private string _labelsSig = "";
+
+    // nav tree cache — building it reads every doc's *Source:* line, so it's built once
+    // per corpus change (same signature guard as the label index)
+    private WikiTree? _tree;
+    private string _treeSig = "";
 
     public WikiDocStore(IConfiguration config)
     {
@@ -46,34 +51,202 @@ public sealed class WikiDocStore
 
     // ----------------------------------------------------------------- tree
 
-    /// <summary>Folder-mirrored nav tree: directories and pages, sorted dirs-then-pages.</summary>
+    /// <summary>
+    /// Nav tree, D25/D26/D29 model: folder → <b>file</b> → doc, with class-group nodes
+    /// interleaved at the file level for multi-partial classes.
+    ///
+    /// The unit-of-documentation (a type) and the unit-of-source (a file) are many-to-many,
+    /// so the flat folder→page tree hid the derivation. This tree makes it explicit:
+    ///   • a file that yields ≥2 docs becomes a <c>file</c> node with those docs beneath it
+    ///     ("these n docs come from that file" — the Trade.h / Spell.h case);
+    ///   • ≥2 <c>Class.Suffix</c> partials in a folder become a <c>class</c> group node, each
+    ///     partial annotated with its primary file, the shared header shown once on the group
+    ///     and never as a tree parent (G10) — the AiBotAI / Spell case;
+    ///   • a file that yields exactly one doc stays a single page row, annotated with its
+    ///     source file(s) ("SpellMgr — SpellMgr.cpp/.h") instead of adding a depth level —
+    ///     the Compress() spirit applied to the dominant 1:1 case.
+    ///
+    /// Per D26 a doc's tree parent is its PRIMARY file (first .cpp in its *Source:* pairing,
+    /// else first entry); per D29 the file data is parsed from each doc's machine-true
+    /// *Source:* line — no graph.json dependency. Cross-folder partials (Unit.SpellAuras in
+    /// Spells/ while Unit.Main lives elsewhere) stay in their own folder under their own
+    /// file, keeping the tree single-parent and folder-mirrored.
+    /// </summary>
     public WikiTree Tree()
+    {
+        var sig = CorpusSignature();
+        lock (_lock)
+        {
+            if (_tree is not null && _treeSig == sig) return _tree;
+            _tree = BuildTree();
+            _treeSig = sig;
+            return _tree;
+        }
+    }
+
+    private WikiTree BuildTree()
     {
         var root = new WikiNode { Name = RootLabel(), Path = "", Type = "dir" };
         if (!RootExists) return new WikiTree(RootLabel(), root.Children, 0);
 
         int pages = 0;
         var index = new Dictionary<string, WikiNode>(OIC) { [""] = root };
+        var docsByDir = new Dictionary<string, List<DocInfo>>(OIC);
 
         foreach (var rel in EnumerateDocs())
         {
             pages++;
-            var parts = rel.Split('/');
-            var dir = EnsureDir(index, parts[..^1]);
-            var stem = Path.GetFileNameWithoutExtension(parts[^1]);
-            dir.Children.Add(new WikiNode
-            {
-                Name = stem,
-                Label = stem,
-                Path = rel[..^3],           // strip ".md" -> page path
-                Type = "page"
-            });
+            var slash = rel.LastIndexOf('/');
+            var dirPath = slash < 0 ? "" : rel[..slash];
+            var stem = Path.GetFileNameWithoutExtension(rel);
+            var files = ParseSourceFiles(rel);
+
+            if (!docsByDir.TryGetValue(dirPath, out var list))
+                docsByDir[dirPath] = list = new List<DocInfo>();
+            list.Add(new DocInfo(stem, rel[..^3], files, PrimaryFile(files)));
+        }
+
+        foreach (var (dirPath, docs) in docsByDir)
+        {
+            var dir = EnsureDir(index, dirPath.Length == 0 ? Array.Empty<string>() : dirPath.Split('/'));
+            BuildDirChildren(dir, docs);
         }
 
         Sort(root);
         Compress(root);   // collapse single-child folder chains (game > AI -> "game/AI")
         return new WikiTree(RootLabel(), root.Children, pages);
     }
+
+    /// <summary>One folder's children: class groups first claim their partials, the rest
+    /// group by primary file; single-doc files flatten to an annotated page row.</summary>
+    private static void BuildDirChildren(WikiNode dir, List<DocInfo> docs)
+    {
+        var claimed = new HashSet<DocInfo>();
+
+        // -- class groups: "Class.Suffix" stems sharing a prefix, ≥2 in this folder (D25/D28)
+        var groups = docs
+            .Where(d => d.Stem.Contains('.'))
+            .GroupBy(d => d.Stem.Split('.')[0], StringComparer.Ordinal)
+            .Where(g => g.Count() >= 2);
+
+        foreach (var g in groups)
+        {
+            var parts = g.OrderBy(p => p.Stem, OIC).ToList();
+            var node = new WikiNode { Name = g.Key, Path = "", Type = "class" };
+
+            // the class's shared file(s): non-primary files appearing under ≥2 partials —
+            // shown once on the group, never a tree parent (G10)
+            var shared = parts
+                .SelectMany(p => p.Files.Where(f => !OIC.Equals(f, p.Primary)))
+                .GroupBy(f => f, OIC)
+                .Where(sg => sg.Count() >= 2)
+                .Select(sg => sg.Key)
+                .OrderBy(f => f, OIC)
+                .ToList();
+            if (shared.Count > 0) node.Note = "shared: " + string.Join(", ", shared);
+
+            // a same-named overview doc (W2.5 class overviews) leads the group
+            var overview = docs.FirstOrDefault(d =>
+                !claimed.Contains(d) && string.Equals(d.Stem, g.Key, StringComparison.Ordinal));
+            if (overview is not null)
+            {
+                node.Children.Add(PageNode(overview, "overview"));
+                claimed.Add(overview);
+            }
+
+            foreach (var p in parts)
+            {
+                node.Children.Add(PageNode(p, p.Primary));   // partial — annotated by its file (D25)
+                claimed.Add(p);
+            }
+            dir.Children.Add(node);
+        }
+
+        // -- everything else groups by primary file (D26: single-parent, primary file wins)
+        var rest = docs.Where(d => !claimed.Contains(d)).ToList();
+
+        foreach (var fg in rest.Where(d => d.Primary is not null).GroupBy(d => d.Primary!, OIC))
+        {
+            var members = fg.OrderBy(m => m.Stem, OIC).ToList();
+
+            if (members.Count >= 2)
+            {
+                // n docs from one file -> a file node ("Trade.h — 5 docs" case)
+                var fnode = new WikiNode { Name = fg.Key, Path = "", Type = "file" };
+                // paired secondary file(s) common to every member (usually the .h of a tu)
+                var secondaries = members[0].Files
+                    .Where(f => !OIC.Equals(f, fg.Key))
+                    .Where(f => members.All(m => m.Files.Contains(f, OIC)))
+                    .ToList();
+                if (secondaries.Count > 0) fnode.Note = "+ " + string.Join(", ", secondaries);
+
+                foreach (var m in members) fnode.Children.Add(PageNode(m, null));
+                dir.Children.Add(fnode);
+            }
+            else
+            {
+                // the dominant 1:1 case — one page row, source file(s) as the annotation
+                var d = members[0];
+                dir.Children.Add(PageNode(d, CompressFiles(d.Files)));
+            }
+        }
+
+        // docs with no parsable *Source:* line (future topic docs, exotic stubs)
+        foreach (var d in rest.Where(d => d.Primary is null))
+            dir.Children.Add(PageNode(d, null));
+    }
+
+    private static WikiNode PageNode(DocInfo d, string? note) => new()
+    {
+        Name = d.Stem,
+        Label = d.Stem,
+        Path = d.PagePath,
+        Type = "page",
+        Note = note
+    };
+
+    /// <summary>The doc's machine-true source files, parsed from the MAP's *Source:* line (D29).</summary>
+    private List<string> ParseSourceFiles(string rel)
+    {
+        try
+        {
+            var full = Path.Combine(_root, rel.Replace('/', Path.DirectorySeparatorChar));
+            var text = File.ReadAllText(full);
+            var idx = text.IndexOf("## Map", StringComparison.OrdinalIgnoreCase);
+            var scope = idx >= 0 ? text[idx..] : text;
+            var m = Regex.Match(scope, @"\*Source:\*\s*(.+)", RegexOptions.IgnoreCase);
+            if (!m.Success) return new List<string>();
+            return m.Groups[1].Value.Replace("`", "")
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(f => f.Length > 0)
+                .Distinct(OIC)
+                .ToList();
+        }
+        catch { return new List<string>(); }
+    }
+
+    /// <summary>D26: primary = first .cpp in the pairing, else first .cs, else first file.</summary>
+    private static string? PrimaryFile(List<string> files) =>
+        files.FirstOrDefault(f => f.EndsWith(".cpp", StringComparison.OrdinalIgnoreCase))
+        ?? files.FirstOrDefault(f => f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+        ?? files.FirstOrDefault();
+
+    /// <summary>"X.cpp, X.h" -> "X.cpp/.h"; otherwise a short join.</summary>
+    private static string? CompressFiles(List<string> files)
+    {
+        if (files.Count == 0) return null;
+        if (files.Count == 1) return files[0];
+        var stems = files.Select(f => Path.GetFileNameWithoutExtension(f)).Distinct(OIC).ToList();
+        if (stems.Count == 1)
+        {
+            var exts = files.Select(Path.GetExtension).ToList();
+            return stems[0] + exts[0] + string.Concat(exts.Skip(1).Select(e => "/" + e));
+        }
+        var joined = string.Join(", ", files);
+        return joined.Length <= 44 ? joined : files[0] + " +" + (files.Count - 1);
+    }
+
+    private sealed record DocInfo(string Stem, string PagePath, List<string> Files, string? Primary);
 
     // ----------------------------------------------------------------- page
 
@@ -538,8 +711,9 @@ public sealed class WikiNode
 {
     public string Name { get; set; } = "";
     public string Path { get; set; } = "";     // page path (no ".md") or folder path
-    public string Type { get; set; } = "";     // dir | page
+    public string Type { get; set; } = "";     // dir | file | class | page
     public string? Label { get; set; }         // unit label for pages
+    public string? Note { get; set; }          // annotation: source file(s), shared header, "overview"
     public List<WikiNode> Children { get; set; } = new();
 }
 

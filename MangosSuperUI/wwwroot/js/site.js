@@ -81,7 +81,7 @@
             spells: ['spells', 'patch', 'visuallab'],
             world: ['worldmap', 'worldeditor'],
             content: ['items', 'gameobjects', 'loottuner', 'instances', 'lootifier'],
-            bots: ['bots-fleet', 'bots-map', 'bots-dashboard'],
+            bots: ['bots-fleet', 'bots-map', 'bots-dashboard', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
             wiki: ['wiki-code'],
             downloads: ['downloads-page']

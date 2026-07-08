@@ -32,6 +32,13 @@ public class BotStateSnapshot
     // alongside the at_graveyard rez; drives the durability-repair errand.
     public uint Durability { get; set; } = 100;
 
+    // [PLAYERPARTY] This bot's group contains a REAL player (C++ pparty on STATE, 2026-07-07).
+    // A human invited the bot in-game; C++ owns the whole escort behaviour (PlayerParty
+    // doctrine: follow + assist), and C# stands down — GoalSelector holds Goal.Idle on this
+    // flag ("player-party"). Server truth, NOT the C# GroupManager (which only knows about
+    // groups the god-bot formed).
+    public bool InPlayerParty { get; set; } = false;
+
     // Computed
     public float HealthPercent => MaxHealth > 0 ? Health / (float)MaxHealth : 1f;
     public float ManaPercent => MaxMana > 0 ? Mana / (float)MaxMana : 1f;
@@ -94,6 +101,7 @@ public class BotStateSnapshot
             TotalSlots = bs.TotalSlots,
             Copper = bs.Copper,
             Durability = bs.Durability,
+            InPlayerParty = bs.InPlayerParty,   // [PLAYERPARTY] pparty on STATE — needs the BotState parse in BotBridgeService
             ServerQuestId = bs.QuestId,
             ServerQuestStatus = bs.QuestStatus,
             HeldTask = ParseHeldTask(bs),

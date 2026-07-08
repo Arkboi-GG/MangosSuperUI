@@ -74,6 +74,24 @@ public sealed class GoalSelector
             return ctx.Goal;
         }
 
+        // [PLAYERPARTY] Escort hold (2026-07-07) — a REAL player invited this bot to their
+        // party (C++ pparty on STATE). The human is the coordinator and C++ owns the whole
+        // behaviour (PlayerParty doctrine: follow the boss, assist his targets, defend him,
+        // healers heal); C# goes hands-off. Goal.Idle has no planner, and the goal CHANGE
+        // fires SET_TASK IDLE via EnterGoalAsync — the one command that parks C++'s task
+        // machinery cleanly. The held objective is cleared so the reconcile can never try
+        // to re-issue a pre-invite quest/grind leg into the escort. Sits AFTER dead/healing
+        // (a dead companion still gets the plain in-place rez — right when the party is
+        // standing there) and the teleport hold (let a committed hop land), and BEFORE the
+        // vendor/training/group/quest machinery — none of that runs while a human leads.
+        // Leaving the party clears the flag on the next STATE and normal selection resumes.
+        if (ctx.InPlayerParty)
+        {
+            ctx.ClearObjective();
+            ctx.GoalReason = "player-party";
+            return Goal.Idle;
+        }
+
         // Vendor/repair errand hold — keep the bot in Maintenance while a vendor trip is
         // in flight (ctx.Service), exactly as the heal-hold pins it post-rez. Without this
         // the goal would flip on the next Select mid-trip and ResetScratch would wipe the

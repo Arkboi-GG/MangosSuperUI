@@ -17,8 +17,12 @@ namespace MangosSuperUI.BotLogic.Planners;
 //     section-4 ENRICHED MOVE_TO (creature_entry+grind_radius+kill_count -> C++
 //     grinds at the mouth). After each, re-QUERY_QUEST_STATUS and recompute -- the
 //     server credits a kill to EVERY accepted quest that needs it, so overlapping
-//     objectives fall for free. A quest whose farthest unmet objective is >=2x the
-//     mean of the others' is shelved for this sweep (the far-outlier rule).
+//     objectives fall for free. Distance orders PHASES only (near sweep <= BatchRadius,
+//     then turn-ins, then the phase-4b lone-far trek) -- it never drops a quest. The one
+//     distance HARD gate is the drift rail (2026-07-06): an objective farther than
+//     ObjectiveGiverRailYards from its OWN GIVER is anomalous graph data (usedGlobal-tier
+//     kill cluster / far BestDropSource) and is never scored or dispatched -- it rides
+//     the log like a cross-map leg until it greys (see WithinObjectiveRail).
 //   * turn-in-all: only after the close objectives drain, turn in every COMPLETE
 //     quest nearest-first (objectives BEFORE turn-ins; turn-ins BEFORE any far trek).
 //   * reprocess: re-gather (follow-ups now eligible + locals passed en route) and
@@ -123,6 +127,24 @@ public sealed class QuestPlanner : IBotPlanner
     // new reds. Vanilla "red" begins at +5 (GetRedLevel); +4 keeps a one-level safety cushion for a bot
     // that is actively leveling and will reach the quest band within a kill or two.
     private const int RedMargin = 4;            // newly-acquire only quests whose level <= botLevel + this
+
+    // -- Drift rail (2026-07-06, the continental-drift governor's C# half) --
+    // An objective leg farther than this from ITS OWN GIVER is anomalous graph data, not a
+    // quest the fleet should walk: the loader's kill resolution is giver-scoped but keeps a
+    // usedGlobal tier (nearest cluster >2000yd), and the item BestDropSource pick had NO
+    // distance term at all (fixed loader-side the same day) -- both produced legs 3,500-9,000yd
+    // out that phase 4b treks to with no cap (PriorityLeg's only exclusion was cross-MAP, and
+    // every drift zone in the 2026-07-06 run is map 0). Vanilla 1-15 giver->objective spans
+    // measure <=~2,000yd (Hogger ~1,350 from the Goldshire poster is the worst common case), so
+    // 2,500 splits legit from pathological cleanly; it also matches the d>2500 trail-B filter.
+    // Enforced at SCORING (PriorityLeg) + WORKABILITY (WorkableInLog, so the phase-5 exhaust
+    // suppression can't livelock on a railed-only log) + ACQUISITION (IsPickable, shared with
+    // GoalSelector) -- deliberately NOT at UnmetLegs emission: suppressing the leg there flips
+    // HasUnmet false and reroutes the quest through the phase-2b overflow path, which dispatches
+    // NearestCreatureSlot coords with no rail. A railed leg rides the log (carry policy, same as
+    // cross-map) until the bot out-levels it and it greys. Turn-ins are deliberately NOT railed:
+    // a COMPLETE quest must hand in wherever its ender is (one bounded trip, reward kept).
+    private const float ObjectiveGiverRailYards = 2500f;   // BotTuning candidate
 
     public QuestPlanner(QuestGraphLoader quests, CreatureSpawnLoader spawns, ILogger<QuestPlanner> logger)
     {
@@ -982,7 +1004,10 @@ public sealed class QuestPlanner : IBotPlanner
             && !IsGrey(q, id.Level)                                       // grey-filter hole: GoalSelector's pick must agree with BuildBatch's grey-reject, else pick>0 / batch=0 → the quest⇄grind tick-spin
             && !IsRed(q, id.Level)                                        // acquisition ceiling: don't NEWLY grab an over-level (red) quest -- e.g. an L9 bot seeding an L12 Westfall quest. Already-accepted reds resume via BuildBatch step 1 (this filters NEW picks only, and GoalSelector shares it so goal==pick).
             && !id.IsPathBlacklisted(q.Giver.X, q.Giver.Y)
-            && q.Objectives.All(o => !id.IsPathBlacklisted(o.GrindX, o.GrindY));   // back off a death pocket as an AREA: a kill objective in a blacklisted cell is unpickable, not just its giver
+            && q.Objectives.All(o => !id.IsPathBlacklisted(o.GrindX, o.GrindY))    // back off a death pocket as an AREA: a kill objective in a blacklisted cell is unpickable, not just its giver
+            && q.Objectives.All(o => WithinObjectiveRail(q.Giver, o.GrindMap, o.GrindX, o.GrindY))   // drift rail at ACQUISITION: don't grab a quest whose kill leg resolves anomalously far from its own giver (usedGlobal-tier cluster / cross-map objective) -- it could never be dispatched (PriorityLeg rails it) and would ride as dead weight until grey. GoalSelector shares this filter, so goal == pick stays true.
+            && q.ItemObjectives.All(it => it.BestDropSource is not { } s
+                                          || WithinObjectiveRail(q.Giver, s.GrindMap, s.GrindX, s.GrindY));   // same rail on the item leg's resolved drop source (null already fails the BestDropSource!=null clause above)
 
 
     /// <summary>
@@ -1040,13 +1065,13 @@ public sealed class QuestPlanner : IBotPlanner
     // Objective selection
     // ========================================================================
 
-    // Shelve (Deferred = true for this sweep) ONLY a quest that would take the bot OUTSIDE its
-    // current allowed travel range — i.e. its FARTHEST unmet objective is beyond GetMaxTravelDistance
-    // for this level/zone (tier-0 baseline, ~2200yd pre-10). A quest whose objectives are ALL within
-    // range is never shelved here, no matter how many it has or how much nearer another quest happens
-    // to be: PriorityLeg orders by band -> progress -> level -> distance, so an in-range quest simply becomes "#2" and gets
-    // worked. (Replaces the old relative 2x-mean-of-others rule, which shelved trivially-reachable
-    // quests — e.g. a 375yd objective next to a 5yd one — and dropped bots into needless grinding.)
+    // STALE-DOC FIX (2026-07-06): this method does NOT distance-shelve anymore and has not since
+    // 2026-06-29 -- the old docstring here still described the removed GetMaxTravelDistance park
+    // and hid the fact that a same-map objective at ANY distance was a legal phase-4b trek (the
+    // continental-drift transport). What this method actually does today is the RED deprioritize
+    // below, and nothing else. Distance is handled elsewhere: phase ORDER (near sweep <=
+    // BatchRadius, then turn-ins, then the far trek) plus the ObjectiveGiverRailYards drift rail
+    // in PriorityLeg / WorkableInLog / IsPickable (the anomalous-data hard gate).
     private void TagOutliers(BotContext ctx, List<BatchQuest> candidates)
     {
         var id = ctx.Identity;
@@ -1194,6 +1219,22 @@ public sealed class QuestPlanner : IBotPlanner
             foreach (var leg in UnmetLegs(ctx, b))
             {
                 if (leg.Map != ctx.MapId) continue;                     // cross-map legs ride the log (carry policy)
+                if (!WithinObjectiveRail(b.Node.Giver, leg.Map, leg.X, leg.Y))
+                {
+                    // Drift rail: the leg resolves anomalously far from its own giver -- never score or
+                    // dispatch it (near pass AND far pass: a railed leg must not become the phase-4b trek
+                    // and must not become nearMiss for the phase-3 yield check). It rides the log like a
+                    // cross-map leg. Information only on the far pass -- that is the pass that would
+                    // actually have walked it; the near pass could never dispatch it anyway (>BatchRadius).
+                    if (startedGlobal)
+                        _logger.LogInformation("[QUEST-RAIL] {Name} rail blocks far trek [{Id}] entry {Entry} at ({X:F0},{Y:F0}) -- {D:F0}yd from its giver (cap {Cap:F0}); leg rides the log",
+                            ctx.Name, b.QuestId, leg.CreatureEntry, leg.X, leg.Y,
+                            b.Node.Giver == null ? -1f : Dist2(b.Node.Giver.X, b.Node.Giver.Y, leg.X, leg.Y),
+                            ObjectiveGiverRailYards);
+                    else
+                        _logger.LogDebug("[QUEST-RAIL] {Name} rail skips [{Id}] in near scoring", ctx.Name, b.QuestId);
+                    continue;
+                }
                 float d = Dist2(ctx.Pos.X, ctx.Pos.Y, leg.X, leg.Y);
                 int band = (int)(d / OrderSlackYards);
                 scored.Add(((started, level, band, d), b, leg,
@@ -1318,6 +1359,7 @@ public sealed class QuestPlanner : IBotPlanner
                 if (!o.IsCreature || o.Count <= 0) continue;
                 if (o.TargetFriendly) continue;   // Fix 5: an unkillable friendly target is NOT workable (must not suppress a legitimate exhaust/lock)
                 if (o.GrindMap != ctx.MapId) continue;
+                if (!WithinObjectiveRail(node.Giver, o.GrindMap, o.GrindX, o.GrindY)) continue;   // drift rail: a railed leg is NOT workable -- MUST mirror PriorityLeg, or the phase-5 exhaust suppression livelocks (rail blocks the leg, this says workable, Block->reselect->rebuild->repeat)
                 int got = (o.Slot >= 1 && o.Slot <= e.MobCounts.Length) ? e.MobCounts[o.Slot - 1] : 0;
                 if (got < o.Count) return qid;
             }
@@ -1326,6 +1368,7 @@ public sealed class QuestPlanner : IBotPlanner
                 if (it.Count <= 0) continue;
                 var src = it.BestDropSource;                          // creature-sourced only (GO-sourced = phase 2)
                 if (src == null || src.GrindMap != ctx.MapId) continue;
+                if (!WithinObjectiveRail(node.Giver, src.GrindMap, src.GrindX, src.GrindY)) continue;   // drift rail mirror (see kill branch)
                 int got = (it.Slot >= 1 && it.Slot <= e.ItemCounts.Length) ? e.ItemCounts[it.Slot - 1] : 0;
                 if (got < it.Count) return qid;
             }
@@ -1392,6 +1435,24 @@ public sealed class QuestPlanner : IBotPlanner
         int ql = QuestLevelOf(n);
         if (ql <= 0) return false;                    // scaling / unknown level -> never block
         return ql > botLevel + RedMargin;
+    }
+
+    // Drift rail predicate (2026-07-06). TRUE = the leg is sane relative to its own giver and may
+    // be scored / dispatched / counted workable / newly acquired. FALSE = anomalous graph data:
+    // the leg resolves on a different map than its giver, or farther than ObjectiveGiverRailYards
+    // from it. Measured giver->leg (NOT bot->leg) on purpose -- that makes the rail a property of
+    // the QUEST, not of where the bot happens to stand, so a bot already stranded in Searing Gorge
+    // still measures its Elwynn quests as sane (near THEIR givers) and gets pulled home by them;
+    // a bot->leg cap would do the opposite (shelve the home work, pin the bot in the gorge).
+    // (0,0) coords = unresolved objective -> unmeasurable -> pass (preserves pre-rail behavior;
+    // such a leg was never dispatch-worthy anyway). Null giver -> pass (defensive: every batch /
+    // pickable quest has one -- BuildBatch and IsPickable both require it).
+    private static bool WithinObjectiveRail(QuestNpcLocation? giver, int legMap, float legX, float legY)
+    {
+        if (giver == null) return true;
+        if (legX == 0f && legY == 0f) return true;
+        if (legMap != giver.Map) return false;
+        return Dist2(giver.X, giver.Y, legX, legY) <= ObjectiveGiverRailYards;
     }
 
     // ========================================================================

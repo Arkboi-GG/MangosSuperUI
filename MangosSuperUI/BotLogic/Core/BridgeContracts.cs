@@ -84,4 +84,5 @@ public class BotEvent
     public uint Have { get; set; }
     public uint Need { get; set; }
     public uint Cost { get; set; }
+    public uint SenderGuid { get; set; }
 }

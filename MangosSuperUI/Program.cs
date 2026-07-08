@@ -8,6 +8,11 @@ using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.BotLogic.Brain;
 using MangosSuperUI.BotLogic.Planners;
+using MangosSuperUI.BotLogic.Chat.Coordinator;
+using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Chat.Engine;
+using MangosSuperUI.BotLogic.Chat.Capacity;
+using MangosSuperUI.BotLogic.Chat.Memory;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -25,6 +30,7 @@ builder.Configuration.AddJsonFile("server-config.json", optional: true, reloadOn
 // ---------- Configuration ----------
 builder.Services.Configure<VmangosSettings>(builder.Configuration.GetSection("Vmangos"));
 builder.Services.Configure<RemoteAccessSettings>(builder.Configuration.GetSection("RemoteAccess"));
+builder.Services.Configure<BotChatSettings>(builder.Configuration.GetSection("BotChat"));
 
 // ---------- Data ----------
 builder.Services.AddSingleton<ConnectionFactory>();
@@ -65,6 +71,8 @@ builder.Services.AddScoped<VariationRecipeService>();
 builder.Services.AddScoped<TextureSegmentationService>();
 builder.Services.AddSingleton<VramManager>();
 builder.Services.AddSingleton<WikiDocStore>();
+builder.Services.AddSingleton<WikiIndexer>();
+builder.Services.AddSingleton<WikiSearchStore>();
 
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();
@@ -101,6 +109,29 @@ builder.Services.AddSingleton<BotDiagnosticsService>();
 // Brain orchestrator (BackgroundService)
 builder.Services.AddSingleton<BotBrainService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BotBrainService>());
+
+// ---------- BotLogic: Chat social layer (CHAT_ARCHITECTURE) ----------
+// C0: coordinator stub — drains CHAT_RECV stimuli off the bridge and logs [CHAT-COORD].
+// Fully separate from the brain spine (D9): its own BackgroundService, never on a brain tick.
+// C1: settings snapshot service (§14.1 — 5s TTL, zone→global resolution, hot-apply)
+builder.Services.AddSingleton<ChatSettingsService>();
+// C2: reactive whisper MVP — persona, engine, broker (temp, C5 replaces), typing timeline, Tier 0
+builder.Services.AddSingleton<PersonaService>();
+builder.Services.AddSingleton<PromptAssembler>();
+builder.Services.AddSingleton<StylePostPass>();
+builder.Services.AddSingleton<ConversationTracker>();
+builder.Services.AddSingleton<TypingScheduler>();
+builder.Services.AddSingleton<IInferenceBroker, FixedEndpointBroker>();
+builder.Services.AddSingleton<IChatEngine, ChatEngine>();
+// C3: Tier-1 verbatim memory + relationship bumps (buffered, flushed by the coordinator)
+builder.Services.AddSingleton<ChatMemoryStore>();
+// C4: arbitration — urge scoring + the anti-storm guards (chain depth, token buckets)
+builder.Services.AddSingleton<UrgeScorer>();
+builder.Services.AddSingleton<ChainGuard>();
+builder.Services.AddSingleton<BudgetBuckets>();
+builder.Services.AddSingleton<ChatCoordinator>();
+builder.Services.AddSingleton<IChatCoordinator>(sp => sp.GetRequiredService<ChatCoordinator>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ChatCoordinator>());
 
 
 // ---------- MVC + SignalR ----------

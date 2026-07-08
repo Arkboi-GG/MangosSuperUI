@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using MangosSuperUI.Hubs;
+using MangosSuperUI.BotLogic.Chat.Coordinator;
 using Microsoft.AspNetCore.SignalR;
 
 namespace MangosSuperUI.Services;
@@ -154,6 +155,11 @@ public class BotStatePayload
     [JsonPropertyName("durability")]
     public uint Durability { get; set; } = 100;   // min equipped-slot durability % (100 = full / no damageable gear)
 
+    // [PLAYERPARTY] 1 = this bot's group contains a REAL player (C++ FindPartyBoss on the
+    // 5s STATE, 2026-07-07). Sent as 0/1 (C++ %u), converted to bool on the BotState copy.
+    [JsonPropertyName("pparty")]
+    public uint Pparty { get; set; } = 0;
+
     // Full quest-log snapshot, pushed on every STATE (replaces the retired QUERY_QUEST_STATUS pull).
     // Pipe-delimited, identical format to the old QUEST_STATUS_ALL payload:
     //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
@@ -204,6 +210,11 @@ public class BotEventPayload
     [JsonPropertyName("channel_name")]
     public string? ChannelName { get; set; }
 
+    // C0 (§5.1): GUID low of the chat sender when resolvable, else 0. Roster/is-bot lookup key;
+    // the NAME remains the memory key (D3).
+    [JsonPropertyName("sender_guid")]
+    public uint? SenderGuid { get; set; }
+
 
     [JsonPropertyName("reason")]
     public string? Reason { get; set; }
@@ -216,21 +227,6 @@ public class BotEventPayload
 
     [JsonPropertyName("cost")]
     public uint? Cost { get; set; }
-}
-
-public class BotChatPayload
-{
-    [JsonPropertyName("guid")]
-    public int Guid { get; set; }
-
-    [JsonPropertyName("senderName")]
-    public string SenderName { get; set; } = "";
-
-    [JsonPropertyName("message")]
-    public string Message { get; set; } = "";
-
-    [JsonPropertyName("chatType")]
-    public int ChatType { get; set; } // 7 = WHISPER in vanilla
 }
 
 // --- Outbound (C# → C++) ---
@@ -262,7 +258,7 @@ public class SayTextPayload
     public string Text { get; set; } = "";
 
     [JsonPropertyName("chatType")]
-    public int ChatType { get; set; } // 0=SAY, 6=YELL, 7=WHISPER
+    public int ChatType { get; set; } // 0=SAY, 1=PARTY (==CHAT_MSG_PARTY 0x01, VERIFIED SharedDefines.h), 6=YELL, 7=WHISPER, 14=CHANNEL
 
     [JsonPropertyName("target")]
     public string? Target { get; set; } // Player name for whisper replies
@@ -338,6 +334,10 @@ public class BotState
     public uint QuestId { get; set; } = 0;
     public uint QuestStatus { get; set; } = 0;
     public uint Durability { get; set; } = 100;   // min equipped-slot durability % from STATE (100 = full)
+    // [PLAYERPARTY] a REAL player leads this bot's group (server truth off STATE, 2026-07-07).
+    // Flows snapshot -> ctx.Sense -> the GoalSelector "player-party" Idle hold; C++ owns the
+    // whole escort behaviour (PlayerParty doctrine).
+    public bool InPlayerParty { get; set; } = false;
     // Full quest-log snapshot pushed on STATE (retired pull). Pipe-delimited, QUEST_STATUS_ALL format.
     public string Quests { get; set; } = "";
     // BotState class — add:
@@ -365,8 +365,7 @@ public class BotConnection
 /// Inbound message types:
 ///   HELLO       — bot announces itself on connect (guid, name, race, class, level, position)
 ///   STATE       — periodic state update (health, mana, position, combat, task)
-///   EVENT       — discrete events (COMBAT_START, DEATH, RESPAWN, QUEST_COMPLETE, etc.)
-///   CHAT_RECV   — a player whispered the bot
+///   EVENT       — discrete events (COMBAT_START, DEATH, RESPAWN, QUEST_COMPLETE, CHAT_RECV, etc.)
 ///
 /// Outbound message types:
 ///   MOVE_TO     — walk to coordinates
@@ -382,6 +381,11 @@ public class BotBridgeService : BackgroundService
 
     // BotBrain integration — set after startup to avoid circular DI
     private BotBrainService? _brain;
+
+    // ChatCoordinator integration (C0, §5.5) — late-wired like the brain: the coordinator
+    // constructor-injects this bridge (for SendSayTextAsync in C2+), so the bridge cannot
+    // constructor-inject it back. ChatCoordinator.StartAsync calls SetChatCoordinator(this).
+    private IChatCoordinator? _chat;
 
     // All connected bots, keyed by character GUID
     public ConcurrentDictionary<int, BotConnection> Connections { get; } = new();
@@ -410,6 +414,16 @@ public class BotBridgeService : BackgroundService
     {
         _brain = brain;
         _logger.LogInformation("BotBridge: BotBrainService wired for event routing");
+    }
+
+    /// <summary>
+    /// Called by ChatCoordinator.StartAsync to wire itself in (C0, §5.5).
+    /// Same late-wire pattern as SetBrainService — see _chat field comment.
+    /// </summary>
+    public void SetChatCoordinator(IChatCoordinator chat)
+    {
+        _chat = chat;
+        _logger.LogInformation("BotBridge: ChatCoordinator wired for chat stimulus routing");
     }
 
     // ==================== Lifecycle ====================
@@ -531,10 +545,6 @@ public class BotBridgeService : BackgroundService
                 await HandleEventAsync(msg.Payload, conn);
                 break;
 
-            case "CHAT_RECV":
-                await HandleChatAsync(msg.Payload, conn);
-                break;
-
             default:
                 _logger.LogWarning("BotBridge: unknown message type '{Type}' from bot {Guid}", msg.Type, conn.Guid);
                 break;
@@ -609,6 +619,7 @@ public class BotBridgeService : BackgroundService
         bs.QuestId = state.QuestId;
         bs.QuestStatus = state.QuestStatus;
         bs.Durability = state.Durability;
+        bs.InPlayerParty = state.Pparty != 0;   // [PLAYERPARTY] pparty on STATE (2026-07-07)
         bs.Quests = state.Quests;   // full quest-log snapshot (retired pull → STATE is the single source of truth)
         bs.HasReceivedState = true;
 
@@ -705,8 +716,18 @@ public class BotBridgeService : BackgroundService
                     channelName = evt.ChannelName ?? "",
                     timestamp = DateTime.UtcNow
                 });
-                // TODO Phase 4: Route to Ollama personality engine
-                break;
+                // C0 (§5.5): chat is the ChatCoordinator's business, not the goal spine's.
+                // Hand off and RETURN — CHAT_RECV must not reach _brain.HandleBridgeEventAsync
+                // (it used to fall through to _driver.OnEvent and evaporate).
+                _chat?.EnqueueStimulus(new ChatStimulusRaw(
+                    conn.Guid,
+                    evt.Sender ?? "Unknown",
+                    evt.SenderGuid ?? 0,
+                    evt.Message ?? "",
+                    evt.ChatType ?? "say",
+                    evt.ChannelName ?? "",
+                    DateTime.UtcNow));
+                return;
 
             case "TASK_COMPLETE":
                 _logger.LogInformation("BotBridge: TASK_COMPLETE {Name} — {Data}",
@@ -863,6 +884,7 @@ public class BotBridgeService : BackgroundService
                 QuestStatus = evt.Status ?? "",
                 NewLevel = evt.NewLevel ?? 0,
                 Sender = evt.Sender ?? "",
+                SenderGuid = evt.SenderGuid ?? 0,
                 Message = evt.Message ?? "",
                 ChatType = evt.ChatType ?? "",
                 ChannelName = evt.ChannelName ?? "",
@@ -871,39 +893,6 @@ public class BotBridgeService : BackgroundService
                 Have = evt.Have ?? 0,
                 Need = evt.Need ?? 0,
                 Cost = evt.Cost ?? 0
-            };
-            _ = Task.Run(() => _brain.HandleBridgeEventAsync(conn.Guid, botEvent));
-        }
-    }
-
-    private async Task HandleChatAsync(JsonElement payload, BotConnection conn)
-    {
-        var chat = payload.Deserialize<BotChatPayload>(JsonOpts);
-        if (chat == null) return;
-
-        _logger.LogInformation("BotBridge: CHAT_RECV bot={Name} from={Sender}: {Message}",
-            conn.State.Name, chat.SenderName, chat.Message);
-
-        // Push to UI for visibility
-        await _hub.Clients.All.SendAsync("BotChatReceived", new
-        {
-            guid = conn.Guid,
-            botName = conn.State.Name,
-            senderName = chat.SenderName,
-            message = chat.Message,
-            chatType = chat.ChatType,
-            timestamp = DateTime.UtcNow
-        });
-
-        // Route to behavioral engine (if wired)
-        if (_brain != null)
-        {
-            var botEvent = new MangosSuperUI.BotLogic.Core.BotEvent
-            {
-                EventType = "CHAT_RECV",
-                Sender = chat.SenderName,
-                Message = chat.Message,
-                ChatType = chat.ChatType.ToString()
             };
             _ = Task.Run(() => _brain.HandleBridgeEventAsync(conn.Guid, botEvent));
         }

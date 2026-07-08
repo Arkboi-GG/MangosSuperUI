@@ -1,6 +1,6 @@
 /* ============================================================
    MangosSuperUI — wiki.js
-   The code-docs wiki client. Renders the SourceMapper corpus:
+   The code-docs wiki client. Renders the generated documentation corpus:
    a browsable page tree, a rendered article with an on-this-page
    ToC, and cross-references (Unit/Member) that navigate in-place.
    ============================================================ */
@@ -11,7 +11,8 @@
     var API = {
         tree: '/Wiki/Tree',
         page: '/Wiki/Page',
-        stats: '/Wiki/Stats'
+        stats: '/Wiki/Stats',
+        search: '/Wiki/Search'
     };
 
     var els = {};
@@ -50,18 +51,33 @@
         els.tree.appendChild(frag);
     }
 
+    // Tree nodes (D25/D26): 'dir' folders, 'file' groups ("these n docs come from that
+    // file"), 'class' groups (multi-partial classes, shared header on the group), 'page'
+    // leaves. file/class reuse the dir machinery (same wrapper class + a modifier), so
+    // open/close, filtering, and markActive ancestor-expansion all work unchanged. A
+    // node.note renders as a dim right-aligned annotation (source files, shared header).
+    function noteMarkup(note) {
+        return note ? '<span class="wiki-tree-note" title="' + esc(note) + '">' + esc(note) + '</span>' : '';
+    }
+
     function buildNode(node, depth) {
-        if (node.type === 'dir') {
+        if (node.type === 'dir' || node.type === 'file' || node.type === 'class') {
             var wrap = document.createElement('div');
-            wrap.className = 'wiki-tree-dir';
+            wrap.className = 'wiki-tree-dir' + (node.type !== 'dir' ? ' wiki-tree-' + node.type : '');
             wrap.dataset.name = node.name.toLowerCase();
+
+            var ico = node.type === 'file' ? '<span class="wiki-tree-ico">' + icon('fa-file-code') + '</span>'
+                : node.type === 'class' ? '<span class="wiki-tree-ico">' + icon('fa-cubes') + '</span>'
+                    : '';
 
             var head = document.createElement('button');
             head.className = 'wiki-tree-row wiki-tree-dirrow';
             head.style.paddingLeft = (8 + depth * 14) + 'px';
+            head.title = node.note ? node.name + ' — ' + node.note : node.name;
             head.innerHTML =
-                '<span class="wiki-tree-chev">' + icon('fa-chevron-right') + '</span>' +
-                '<span class="wiki-tree-name">' + esc(node.name) + '</span>';
+                '<span class="wiki-tree-chev">' + icon('fa-chevron-right') + '</span>' + ico +
+                '<span class="wiki-tree-name">' + esc(node.name) + '</span>' +
+                noteMarkup(node.note);
             head.addEventListener('click', function () { wrap.classList.toggle('open'); });
             wrap.appendChild(head);
 
@@ -78,9 +94,11 @@
         a.href = '/Wiki?path=' + encodeURIComponent(node.path);
         a.dataset.wikiPath = node.path;
         a.dataset.name = (node.label || node.name).toLowerCase();
+        a.title = node.note ? node.name + ' — ' + node.note : node.name;
         a.innerHTML =
             '<span class="wiki-tree-dot"></span>' +
-            '<span class="wiki-tree-name">' + esc(node.name) + '</span>';
+            '<span class="wiki-tree-name">' + esc(node.name) + '</span>' +
+            noteMarkup(node.note);
         a.addEventListener('click', function (e) {
             if (e.metaKey || e.ctrlKey || e.button === 1) return;  // let new-tab through
             e.preventDefault();
@@ -124,6 +142,13 @@
         pages.forEach(function (p) {
             var hit = p.dataset.name.indexOf(q) !== -1;
             p.classList.toggle('hidden', !hit);
+        });
+        // a folder / file / class whose OWN name matches reveals its whole subtree —
+        // "spellauras.cpp" finds the file's docs, "spell" finds the class group's partials
+        dirs.forEach(function (d) {
+            if (d.dataset.name && d.dataset.name.indexOf(q) !== -1) {
+                d.querySelectorAll('.wiki-tree-page').forEach(function (p) { p.classList.remove('hidden'); });
+            }
         });
         // a folder shows (and force-opens) iff it has a visible descendant page
         dirs.forEach(function (d) {
@@ -215,11 +240,285 @@
             '<div class="wiki-md" id="wikiMd">' + infobox + page.html + '</div>' +
             '</div>';
 
+        enhanceArticle();
+
         buildToc(page.toc);
 
         // scroll to anchor (member deep-link) or top
         if (anchor) scrollToAnchor(anchor);
         else els.article.scrollTop = 0;
+    }
+
+    // ------------------------------------------- article enhancement passes
+    //
+    // Two post-render passes over the rendered markdown (#wikiMd). The corpus is
+    // model-written and its shapes vary doc-to-doc, so BOTH passes are defensive:
+    // any surprise must degrade to "leave the HTML exactly as rendered", never to
+    // a broken page. Server-assigned anchors (WikiSlug — invariant G4) are moved,
+    // never recomputed: JS creates no new anchor ids.
+    //
+    //   1. normalizeMemberSections — inside "Member Reference" / "Member-by-Member"
+    //      style sections, the model emits members as either (a) one giant <p> of
+    //      soft-line-broken "**Name**: text" entries (no blank lines in the .md),
+    //      (b) one <p> per member, or (c) a <ul> of "<li><strong>Name</strong>…".
+    //      All three are restructured into uniform .wiki-member entries; sibling
+    //      continuation blocks (a <ul> of sub-points under a member) fold into the
+    //      preceding member's description; comma-grouped names ("**A**, **B**")
+    //      stay one entry.
+    //
+    //   2. makeSectionsCollapsible — every h2 section becomes a click-to-collapse
+    //      <section class="wiki-sect">. "Map — …" and "Member/Path Reference"
+    //      start collapsed (viewer prefs: collapsemap / collapseref) with a count
+    //      pill so a collapsed section still says how much it holds. Deep links
+    //      and ToC clicks auto-expand (see scrollToAnchor).
+
+    var MEMBER_SECTION_RX = /^(member[\s\u2010-\u2015-]*by[\s\u2010-\u2015-]*member|member reference|path reference)/i;
+    var COLLAPSE_MAP_RX = /^map\s*[\u2010-\u2015—–-]/i;
+    var COLLAPSE_REF_RX = /^(member|path) reference/i;
+
+    function enhanceArticle() {
+        var root = el('wikiMd');
+        if (!root) return;
+        try { normalizeMemberSections(root); } catch (e) { /* leave as rendered */ }
+        try { makeSectionsCollapsible(root); } catch (e) { /* leave as rendered */ }
+    }
+
+    function headingLevel(eln) {
+        return /^H[1-6]$/.test(eln.tagName) ? parseInt(eln.tagName.slice(1), 10) : 0;
+    }
+    function cleanHeadingText(h) { return (h.textContent || '').trim(); }
+
+    // --- pass 1: member-entry normalization -------------------------------
+
+    function normalizeMemberSections(root) {
+        var heads = Array.prototype.slice.call(root.querySelectorAll('h2, h3'));
+        heads.forEach(function (h) {
+            if (MEMBER_SECTION_RX.test(cleanHeadingText(h))) normalizeScope(h);
+        });
+    }
+
+    // Everything after the section heading, up to the next heading of the same
+    // or higher level, is the scope. Inside it we stream elements into member
+    // entries; deeper sub-headings (the "### Transport & Protocol" groups) stay
+    // in place and simply reset the run.
+    function normalizeScope(h) {
+        var lvl = headingLevel(h);
+        var scope = [];
+        var n = h.nextElementSibling;
+        while (n) {
+            var hl = headingLevel(n);
+            if (hl && hl <= lvl) break;
+            scope.push(n);
+            n = n.nextElementSibling;
+        }
+
+        var container = null;   // current .wiki-members run
+        var lastEntry = null;   // last .wiki-member (continuation target)
+
+        function startRun(before) {
+            container = document.createElement('div');
+            container.className = 'wiki-members';
+            before.parentNode.insertBefore(container, before);
+        }
+
+        scope.forEach(function (eln) {
+            if (headingLevel(eln)) { container = null; lastEntry = null; return; }
+            if (eln.tagName === 'HR') { container = null; lastEntry = null; return; }
+
+            // one-or-many members packed into a single <p>
+            if (eln.tagName === 'P' && startsWithStrong(eln)) {
+                var entries = splitMemberParagraph(eln);
+                if (entries.length) {
+                    if (!container) startRun(eln);
+                    entries.forEach(function (en) { container.appendChild(en); });
+                    lastEntry = entries[entries.length - 1];
+                    eln.remove();
+                    return;
+                }
+            }
+
+            // continuation block (a <ul>/<p>/<pre> that elaborates the previous
+            // member, e.g. BridgeSendState's bullet list) — fold it in. This is
+            // checked BEFORE the member-list test on purpose: a strong-led <ul>
+            // directly under a member entry is that member's sub-points, not a
+            // fresh set of members.
+            if (lastEntry) {
+                lastEntry.querySelector('.wiki-member-desc').appendChild(eln);
+                return;
+            }
+
+            // a whole <ul> of members (the "sometimes it came out bulleted" docs)
+            if (eln.tagName === 'UL' && listIsMemberList(eln)) {
+                if (!container) startRun(eln);
+                Array.prototype.slice.call(eln.children).forEach(function (li) {
+                    container.appendChild(entryFromNodes(
+                        Array.prototype.slice.call(li.childNodes), li.id));
+                });
+                lastEntry = container.lastElementChild;
+                eln.remove();
+                return;
+            }
+
+            // plain intro prose breaks the run
+            container = null;
+        });
+    }
+
+    function startsWithStrong(p) {
+        var n = p.firstChild;
+        while (n && n.nodeType === 3 && /^\s*$/.test(n.nodeValue)) n = n.nextSibling;
+        return !!(n && n.nodeType === 1 && n.tagName === 'STRONG');
+    }
+
+    function listIsMemberList(ul) {
+        var lis = Array.prototype.slice.call(ul.children).filter(function (c) { return c.tagName === 'LI'; });
+        if (lis.length === 0) return false;
+        return lis.every(startsWithStrong);
+    }
+
+    // Markdig renders the corpus's blank-line-free member blocks as ONE <p> whose
+    // entries are separated only by soft line breaks ("\n" inside text nodes).
+    // Boundary rule: a <strong> directly preceded by a text node ending in a
+    // newline (or a <br>, defensively) starts a new member. Comma-separated
+    // strongs ("**A**, **B**, …") never match — they stay grouped as one entry.
+    function splitMemberParagraph(p) {
+        var nodes = Array.prototype.slice.call(p.childNodes);
+        var runs = [];
+        var cur = [];
+        nodes.forEach(function (nd, i) {
+            if (i > 0 && cur.length && nd.nodeType === 1 && nd.tagName === 'STRONG') {
+                var prev = nodes[i - 1];
+                var brBoundary = prev.nodeType === 1 && prev.tagName === 'BR';
+                var nlBoundary = prev.nodeType === 3 && /\n\s*$/.test(prev.nodeValue);
+                if (brBoundary || nlBoundary) { runs.push(cur); cur = []; }
+            }
+            cur.push(nd);
+        });
+        if (cur.length) runs.push(cur);
+        return runs.map(function (run, idx) {
+            // only the first entry can inherit the <p>'s server-assigned member id
+            return entryFromNodes(run, idx === 0 ? p.id : '');
+        });
+    }
+
+    // Build one .wiki-member from a run of nodes. The name row swallows the
+    // leading <strong> plus any ", "-separated sibling strongs (grouped members
+    // share one description); everything after is the description. Nodes are
+    // MOVED, not re-serialized, so Linkify's <a class="wiki-xref"> and inline
+    // <code> survive intact.
+    function entryFromNodes(nodes, id) {
+        var entry = document.createElement('div');
+        entry.className = 'wiki-member';
+        if (id) entry.id = id;   // preserve the server-assigned anchor (G4)
+
+        var name = document.createElement('div');
+        name.className = 'wiki-member-name';
+        var desc = document.createElement('div');
+        desc.className = 'wiki-member-desc';
+
+        var i = 0;
+        while (i < nodes.length) {
+            var nd = nodes[i];
+            if (nd.nodeType === 1 && nd.tagName === 'STRONG') { name.appendChild(nd); i++; continue; }
+            if (nd.nodeType === 1 && nd.tagName === 'BR') { i++; continue; }   // drop stray breaks
+            if (nd.nodeType === 3 && /^[\s,]*$/.test(nd.nodeValue) &&
+                nodes[i + 1] && nodes[i + 1].nodeType === 1 && nodes[i + 1].tagName === 'STRONG') {
+                name.appendChild(nd); i++; continue;   // ", " between grouped names
+            }
+            break;
+        }
+        for (var j = i; j < nodes.length; j++) desc.appendChild(nodes[j]);
+
+        // "**Name**: text" — the separator colon belongs to neither side
+        var ft = desc.firstChild;
+        if (ft && ft.nodeType === 3) ft.nodeValue = ft.nodeValue.replace(/^\s*:\s*/, '').replace(/^\n\s*/, '');
+        // "**Name:**" — colon inside the bold; trim it off the display
+        var strongs = name.getElementsByTagName('strong');
+        if (strongs.length) {
+            var lt = strongs[strongs.length - 1].lastChild;
+            if (lt && lt.nodeType === 3) lt.nodeValue = lt.nodeValue.replace(/\s*:\s*$/, '');
+        }
+
+        entry.appendChild(name);
+        entry.appendChild(desc);   // kept even when empty — continuation blocks fold into it
+        return entry;
+    }
+
+    // --- pass 2: collapsible h2 sections ----------------------------------
+
+    function makeSectionsCollapsible(root) {
+        var hs = Array.prototype.slice.call(root.querySelectorAll('h2'));
+        hs.forEach(function (h) {
+            if (h.closest('.wiki-sect')) return;   // never double-wrap
+            var txt = cleanHeadingText(h);
+
+            var body = document.createElement('div');
+            body.className = 'wiki-sect-body';
+            var n = h.nextSibling;
+            while (n && !(n.nodeType === 1 && (n.tagName === 'H2' || n.tagName === 'SECTION'))) {
+                var next = n.nextSibling;
+                body.appendChild(n);
+                n = next;
+            }
+
+            var sect = document.createElement('section');
+            sect.className = 'wiki-sect';
+            h.parentNode.insertBefore(sect, h);
+            sect.appendChild(h);
+            sect.appendChild(body);
+
+            // count pill: MAP sections count table rows, member sections count
+            // normalized entries — a collapsed section still says what it holds
+            var count = 0;
+            if (COLLAPSE_MAP_RX.test(txt)) {
+                var tbl = body.querySelector('table');
+                if (tbl) count = tbl.querySelectorAll('tbody tr').length;
+            } else {
+                count = body.querySelectorAll('.wiki-member').length;
+            }
+            if (count) {
+                var pill = document.createElement('span');
+                pill.className = 'wiki-sect-count';
+                pill.textContent = count;
+                h.appendChild(pill);
+            }
+
+            var chev = document.createElement('span');
+            chev.className = 'wiki-sect-chev';
+            chev.innerHTML = icon('fa-chevron-down');
+            h.insertBefore(chev, h.firstChild);
+
+            var pref = COLLAPSE_MAP_RX.test(txt) ? 'collapsemap'
+                : COLLAPSE_REF_RX.test(txt) ? 'collapseref' : '';
+            if (pref) sect.dataset.collapsePref = pref;
+
+            var collapsed = !!(pref && prefs[pref]);
+            sect.classList.toggle('collapsed', collapsed);
+
+            h.classList.add('wiki-sect-head');
+            h.setAttribute('role', 'button');
+            h.setAttribute('tabindex', '0');
+            h.setAttribute('aria-expanded', String(!collapsed));
+
+            function toggle() {
+                var c = sect.classList.toggle('collapsed');
+                h.setAttribute('aria-expanded', String(!c));
+            }
+            h.addEventListener('click', toggle);
+            h.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+            });
+        });
+    }
+
+    // live re-apply when a collapse pref is flipped in the ⚙ panel
+    function applyCollapsePref(opt) {
+        if (opt !== 'collapsemap' && opt !== 'collapseref') return;
+        document.querySelectorAll('.wiki-sect[data-collapse-pref="' + opt + '"]').forEach(function (sect) {
+            sect.classList.toggle('collapsed', !!prefs[opt]);
+            var hh = sect.querySelector('.wiki-sect-head');
+            if (hh) hh.setAttribute('aria-expanded', String(!prefs[opt]));
+        });
     }
 
     function buildToc(toc) {
@@ -249,6 +548,15 @@
     function scrollToAnchor(id, updateHash) {
         var target = document.getElementById(id);
         if (!target) return;
+        // deep links / ToC clicks into a collapsed section must expand it first,
+        // or the browser scrolls to a hidden element
+        var sect = target.closest ? target.closest('.wiki-sect.collapsed') : null;
+        while (sect) {
+            sect.classList.remove('collapsed');
+            var hh = sect.querySelector('.wiki-sect-head');
+            if (hh) hh.setAttribute('aria-expanded', 'true');
+            sect = sect.parentElement ? sect.parentElement.closest('.wiki-sect.collapsed') : null;
+        }
         target.scrollIntoView({ behavior: 'smooth', block: 'start' });
         target.classList.add('wiki-flash');
         setTimeout(function () { target.classList.remove('wiki-flash'); }, 1200);
@@ -345,14 +653,194 @@
     }
 
 
+    // ------------------------------------------------------------- W2 search
+    //
+    // Header search over the superui_docs index (GET /Wiki/Search). Debounced as-you-
+    // type; results render in a dropdown under the box: kind badge, title, folder,
+    // snippet (client-side term highlighting over escaped text). Keyboard: '/' focuses
+    // from anywhere, ↑/↓ move, Enter opens, Esc closes. When the index isn't built or
+    // reachable ({ ready:false }) the panel says so and points at Browse — search
+    // never errors at the user.
+
+    var searchState = { seq: 0, items: [], sel: -1 };
+
+    function wireSearch() {
+        els.searchBox = el('wikiSearch');
+        els.searchInput = el('wikiSearchInput');
+        els.searchPanel = el('wikiSearchPanel');
+        if (!els.searchInput || !els.searchPanel) return;   // markup is optional
+
+        var deb = null;
+        els.searchInput.addEventListener('input', function () {
+            clearTimeout(deb);
+            var q = els.searchInput.value.trim();
+            if (q.length < 2) { closeSearch(); return; }
+            deb = setTimeout(function () { runSearch(q); }, 180);
+        });
+
+        els.searchInput.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') { closeSearch(); els.searchInput.blur(); return; }
+            if (e.key === 'ArrowDown') { e.preventDefault(); moveSearchSel(1); return; }
+            if (e.key === 'ArrowUp') { e.preventDefault(); moveSearchSel(-1); return; }
+            if (e.key === 'Enter') { e.preventDefault(); pickSearchSel(); }
+        });
+
+        // '/' focuses search from anywhere (unless already typing somewhere)
+        document.addEventListener('keydown', function (e) {
+            if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+            var t = e.target;
+            var typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+            if (typing) return;
+            e.preventDefault();
+            els.searchInput.focus();
+            els.searchInput.select();
+        });
+
+        document.addEventListener('click', function (e) {
+            if (els.searchBox && !els.searchBox.contains(e.target)) closeSearch();
+        });
+    }
+
+    function runSearch(q) {
+        var seq = ++searchState.seq;
+        getJSON(API.search + '?q=' + encodeURIComponent(q))
+            .then(function (res) { if (seq === searchState.seq) renderSearch(q, res); })
+            .catch(function () {
+                if (seq !== searchState.seq) return;
+                renderSearchHint('Search is unavailable right now.');
+            });
+    }
+
+    var searchRetryTimer = null;
+
+    // While the index is building (or hasn't produced rows yet), quietly re-run the
+    // pending query so results appear the moment the build lands — no user action.
+    function scheduleSearchRetry(q) {
+        clearTimeout(searchRetryTimer);
+        searchRetryTimer = setTimeout(function () {
+            if (!els.searchInput) return;
+            if (els.searchInput.value.trim() !== q) return;      // they typed on
+            if (els.searchPanel.hidden) return;                  // they closed it
+            runSearch(q);
+        }, 1800);
+    }
+
+    function searchNoticeHtml(res) {
+        return res && res.notice
+            ? '<div class="wiki-search-notice">' + icon('fa-triangle-exclamation') + ' ' + esc(res.notice) + '</div>'
+            : '';
+    }
+
+    function renderSearchHint(html, res) {
+        searchState.items = []; searchState.sel = -1;
+        els.searchPanel.innerHTML = searchNoticeHtml(res) + '<div class="wiki-search-hint">' + html + '</div>';
+        els.searchPanel.hidden = false;
+    }
+
+    function renderSearch(q, res) {
+        if (!res.ready) {
+            if (res.building) {
+                renderSearchHint(icon('fa-rotate') +
+                    ' Building the search index\u2026 ' + esc(res.progress || '') +
+                    ' \u2014 results will appear automatically.', res);
+                scheduleSearchRetry(q);
+            } else {
+                renderSearchHint(icon('fa-circle-info') +
+                    ' The search index is empty \u2014 it builds itself from the docs folder the first time it\u2019s needed. ' +
+                    'If this persists, check <code>Wiki:Root</code> and the admin DB connection. ' +
+                    'Browse (\u2630) still filters pages by name.', res);
+                scheduleSearchRetry(q);
+            }
+            return;
+        }
+        var items = res.hits || [];
+        if (items.length === 0) { renderSearchHint('No matches for \u201C' + esc(q) + '\u201D.', res); return; }
+
+        searchState.items = items;
+        searchState.sel = -1;
+        els.searchPanel.innerHTML = searchNoticeHtml(res) + items.map(function (h, i) {
+            var href = '/Wiki?path=' + encodeURIComponent(h.path) + (h.anchor ? '#' + h.anchor : '');
+            return '<a class="wiki-sr" data-i="' + i + '" href="' + href + '">' +
+                '<span class="wiki-sr-top">' +
+                '<span class="wiki-sr-kind k-' + esc(h.kind) + '">' + esc(h.kind) + '</span>' +
+                '<span class="wiki-sr-title">' + highlightTerms(h.title, q) + '</span>' +
+                (h.folder ? '<span class="wiki-sr-folder">' + esc(h.folder) + '</span>' : '') +
+                '</span>' +
+                (h.snippet ? '<span class="wiki-sr-snip">' + highlightTerms(h.snippet, q) + '</span>' : '') +
+                '</a>';
+        }).join('');
+        els.searchPanel.hidden = false;
+
+        els.searchPanel.querySelectorAll('.wiki-sr').forEach(function (a) {
+            a.addEventListener('click', function (e) {
+                if (e.metaKey || e.ctrlKey || e.button === 1) return;   // new tab
+                e.preventDefault();
+                openSearchHit(+a.dataset.i);
+            });
+        });
+    }
+
+    function openSearchHit(i) {
+        var h = searchState.items[i];
+        if (!h) return;
+        navigate(h.path, h.anchor || null, true);
+        closeSearch();
+        els.searchInput.blur();
+    }
+
+    function moveSearchSel(d) {
+        if (!searchState.items.length) return;
+        var n = searchState.items.length;
+        searchState.sel = (searchState.sel + d + n) % n;
+        var rows = els.searchPanel.querySelectorAll('.wiki-sr');
+        rows.forEach(function (r, i) { r.classList.toggle('active', i === searchState.sel); });
+        var row = rows[searchState.sel];
+        if (row) row.scrollIntoView({ block: 'nearest' });
+    }
+
+    function pickSearchSel() {
+        openSearchHit(searchState.sel >= 0 ? searchState.sel : 0);
+    }
+
+    function closeSearch() {
+        if (!els.searchPanel) return;
+        els.searchPanel.hidden = true;
+        els.searchPanel.innerHTML = '';
+        searchState.items = []; searchState.sel = -1;
+    }
+
+    // Wrap query terms in <mark> over ALREADY-ESCAPED text. Token-boundary rule mirrors
+    // the server's snippet anchoring: a term only highlights where the preceding char is
+    // not a letter/digit — "xp" marks "XP gain" and "XPValue", never inside "exposing".
+    // Entity fragments are excluded so "amp"/"lt" style terms can't corrupt an &amp;.
+    function highlightTerms(text, q) {
+        var safe = esc(text || '');
+        var terms = q.split(/\s+/)
+            .filter(function (t) { return t.length >= 2 && !/^(amp|lt|gt|quot|nbsp|#\d+)$/i.test(t); })
+            .map(function (t) { return t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); });
+        if (!terms.length) return safe;
+        try {
+            return safe.replace(new RegExp('(?<![A-Za-z0-9])(' + terms.join('|') + ')', 'gi'), '<mark>$1</mark>');
+        } catch (e) {
+            // engine without lookbehind — plain substring marking beats none
+            try { return safe.replace(new RegExp('(' + terms.join('|') + ')', 'gi'), '<mark>$1</mark>'); }
+            catch (e2) { return safe; }
+        }
+    }
+
+
     // A tiny, generic display-prefs layer. Prefs are applied as data-attributes on the
     // wiki root (.wiki-body); wiki.css does all the visual work by reacting to them. The
     // options panel is declarative: each control carries data-opt (+ data-val for the
     // segmented ones), so ADDING an option is just markup + a CSS rule + a default here —
     // no new JS. That's the seam future ideas (themes, link-preview toggle, etc.) plug into.
+    //
+    // Exception to "CSS does all the visual work": the two collapse prefs (collapsemap /
+    // collapseref) govern render-time state on .wiki-sect, so setPref re-applies them to
+    // the current article via applyCollapsePref.
 
     var PREFS_KEY = 'superui.wiki.prefs';
-    var PREF_DEFAULTS = { width: 'comfortable', size: 'normal', spacing: 'normal', surface: false, infobox: true };
+    var PREF_DEFAULTS = { width: 'comfortable', size: 'normal', spacing: 'normal', surface: false, infobox: true, collapsemap: true, collapseref: true };
 
     var prefs = Object.assign({}, PREF_DEFAULTS);
 
@@ -390,10 +878,13 @@
     function setPref(opt, val) {
         prefs[opt] = val;
         applyPrefs(); savePrefs(); syncPanel();
+        applyCollapsePref(opt);
     }
     function resetPrefs() {
         prefs = Object.assign({}, PREF_DEFAULTS);
         applyPrefs(); savePrefs(); syncPanel();
+        applyCollapsePref('collapsemap');
+        applyCollapsePref('collapseref');
     }
 
     function openOpts(open) {
@@ -443,6 +934,7 @@
         applyPrefs();
         wireOptions();
         wireLayout();
+        wireSearch();
 
         els.article.addEventListener('click', onArticleClick);
         els.filter.addEventListener('input', function () { applyFilter(els.filter.value); });

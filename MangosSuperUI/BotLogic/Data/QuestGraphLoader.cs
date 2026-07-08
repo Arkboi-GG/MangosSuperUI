@@ -885,7 +885,7 @@ public class QuestGraphLoader
         // Apply drop sources to quest item objectives AND resolve grind centers per-quest
         int resolved = 0;
         int itemObjResolved = 0;
-        int usedNearby = 0, usedGlobalFallback = 0;
+        int usedNearby = 0, usedFarSameMap = 0, usedGlobalFallback = 0;
 
         foreach (var quest in quests.Values)
         {
@@ -916,31 +916,71 @@ public class QuestGraphLoader
                 else continue;
 
                 // Find the best drop source creature that has spawns near the quest giver.
-                // Priority: highest |DropChance| among creatures with same-map spawns near giver.
+                //
+                // BESTDROPSOURCE DISTANCE FIX (2026-07-06, the June-19 bug): the OLD loop's comment
+                // claimed "same-map spawns NEAR GIVER" but the code never checked nearestDist -- it
+                // broke on the FIRST chance-ordered source with ANY same-map spawn, so an 80%-chance
+                // creature whose only same-map spawns sit 8,000yd away beat a 60% dropper standing
+                // next to the giver. The resulting far grind center was a fully legal enriched
+                // MOVE_TO that continuation travel happily walked -- one of the two confirmed
+                // continental-drift transports (Uyisaribog-class single ~9,000yd jumps).
+                //
+                // NEW priority:
+                //   1. NEAR same-map (nearest spawn <= NearDropSourceYards of the giver), highest
+                //      |DropChance| first -- the chance-ordered loop's FIRST near hit wins (break),
+                //      so the common case is byte-identical to before.
+                //   2. Else the same-map source whose nearest cluster is CLOSEST to the giver --
+                //      once everything is far, reachability beats drop chance (a 40% dropper at
+                //      3,000yd over an 80% one at 9,000yd). Still likely beyond the planner's
+                //      ObjectiveGiverRailYards (2,500), so the leg rides rather than walks -- this
+                //      tier mostly just keeps the recorded coords honest.
+                //   3. Else the cross-map fallback, unchanged (planner rails cross-map anyway).
+                // NearDropSourceYards = 2000 matches the kill-resolution proximity tiers' outer
+                // "near" band and sits UNDER the planner rail, so a tier-1 pick is never railed.
+                const float NearDropSourceYards = 2000f;
                 ItemDropSource? bestSource = null;
                 List<CreatureSpawn>? bestCluster = null;
                 int bestClusterMap = refMap;
+                float bestSameMapDist = float.MaxValue;   // nearest-spawn->giver distance of the best SAME-MAP candidate so far
 
                 foreach (var ds in sources.OrderByDescending(s => Math.Abs(s.DropChance)))
                 {
                     if (!dropCreatureSpawns.TryGetValue(ds.CreatureEntry, out var spawns) || spawns.Count == 0)
                         continue;
 
-                    // Prefer same-map spawns near the quest giver
                     var sameMapSpawns = spawns.Where(s => s.Map == refMap).ToList();
                     if (sameMapSpawns.Count > 0)
                     {
                         var sorted = sameMapSpawns
                             .OrderBy(s => Distance2D(s.X, s.Y, refX, refY))
                             .ToList();
-                        var cluster = TakeNearestCluster(sorted, refX, refY);
-                        bestSource = ds;
-                        bestCluster = cluster;
-                        bestClusterMap = refMap;
-                        break; // Same-map + highest drop chance = best option
+                        float nearestDist = Distance2D(sorted[0].X, sorted[0].Y, refX, refY);
+
+                        if (nearestDist <= NearDropSourceYards)
+                        {
+                            // Tier 1: near same-map + highest remaining chance = the pick.
+                            bestSource = ds;
+                            bestCluster = TakeNearestCluster(sorted, refX, refY);
+                            bestClusterMap = refMap;
+                            bestSameMapDist = nearestDist;
+                            break;
+                        }
+
+                        // Tier 2: far same-map -- keep the NEAREST-to-giver one. A same-map
+                        // candidate always displaces a cross-map fallback.
+                        bool haveSameMap = bestSource != null && bestClusterMap == refMap;
+                        if (!haveSameMap || nearestDist < bestSameMapDist)
+                        {
+                            bestSource = ds;
+                            bestCluster = TakeNearestCluster(sorted, refX, refY);
+                            bestClusterMap = refMap;
+                            bestSameMapDist = nearestDist;
+                        }
+                        continue;
                     }
 
-                    // Track best cross-map fallback (only if no same-map source found yet)
+                    // Tier 3: cross-map fallback (only while NO candidate of any kind exists yet;
+                    // any same-map candidate found later displaces it above).
                     if (bestSource == null)
                     {
                         var bestMap = spawns.GroupBy(s => s.Map)
@@ -972,7 +1012,11 @@ public class QuestGraphLoader
                         .ToList();
                     itemObjResolved++;
 
-                    if (bestClusterMap == refMap) usedNearby++;
+                    if (bestClusterMap == refMap)
+                    {
+                        if (bestSameMapDist <= NearDropSourceYards) usedNearby++;
+                        else usedFarSameMap++;   // resolved same-map but beyond the near band -- the planner rail will hold these legs
+                    }
                     else usedGlobalFallback++;
 
                     // 2026-06-30 (wolf-meat fix): bestSource above has NO distance tiebreak — when
@@ -1009,10 +1053,10 @@ public class QuestGraphLoader
         _logger.LogInformation(
             "QuestGraphLoader: resolved drop sources for {Resolved}/{Total} item objectives " +
             "({Items} unique items, {Creatures} drop creatures) — " +
-            "grind centers: {ObjResolved} resolved (nearby={Nearby}, cross-map={Global})",
+            "grind centers: {ObjResolved} resolved (nearby={Nearby}, far-same-map={FarSame}, cross-map={Global})",
             resolved, quests.Values.SelectMany(q => q.ItemObjectives).Count(),
             itemIds.Count, dropCreatureEntries.Count,
-            itemObjResolved, usedNearby, usedGlobalFallback);
+            itemObjResolved, usedNearby, usedFarSameMap, usedGlobalFallback);
     }
 
     // ── Query 6b: Game Object Drop Sources ──────────────────────────────

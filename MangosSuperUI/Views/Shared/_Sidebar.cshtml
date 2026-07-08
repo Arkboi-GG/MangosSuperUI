@@ -19,7 +19,7 @@
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
         "downloads" => "downloads",
-        "bots" => "bots",
+        "bots" or "chatsettings" => "bots",
         "wiki" => "wiki",
         _ => ""
     };
@@ -237,6 +237,18 @@
                     <a asp-controller="Bots" asp-action="Index" class="@(currentController.Equals("Bots", StringComparison.OrdinalIgnoreCase) && !currentAction.Equals("Fleet", StringComparison.OrdinalIgnoreCase) && !currentAction.Equals("Map", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
                         <i class="fa-solid fa-robot"></i>
                         IBot Monitor
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="bots-chatfeel">
+                    <a asp-controller="ChatSettings" asp-action="Settings" class="@(currentController.Equals("ChatSettings", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("Settings", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
+                        <i class="fa-solid fa-comments"></i>
+                        Chat Feel
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="bots-chatcapacity">
+                    <a asp-controller="ChatSettings" asp-action="Capacity" class="@(currentController.Equals("ChatSettings", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("Capacity", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
+                        <i class="fa-solid fa-server"></i>
+                        Chat Capacity
                     </a>
                 </li>
             </ul>

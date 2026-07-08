@@ -353,6 +353,14 @@ public class ZoneSafetyMap
             <= 3 => 900f,    // starter sub-zone + road to first town (Northshire -> Goldshire), no further
             <= 6 => 1600f,   // first town + immediate surroundings
             <= 10 => 3000f,   // full starter leveling zone + capital
+            <= 15 => 3600f,   // 2026-07-06 drift tighten: base(3000) + one 900yd hub hop. The old
+                              // shared 6000 ceiling admitted CROSS-CLUSTER givers -- EK is vertically
+                              // compact, so straight-line caps can't tell Redridge (right) from
+                              // Kharanos (wrong) except by magnitude: from Goldshire, Sentinel Hill
+                              // ~1,530 / Darkshire ~1,600 / Lakeshire ~2,230 / Kharanos ~3,900yd.
+                              // 3,600 keeps every legit intra-cluster hop (dwarf side too:
+                              // Kharanos->Thelsamar ~2,500) and excludes the trans-Steppes hops that
+                              // put L11-13s on dwarf content 4,000-6,000yd from home.
             <= 20 => 6000f,
             _ => 15000f
         };
@@ -396,7 +404,16 @@ public class ZoneSafetyMap
         return botLevel switch
         {
             <= 10 => 2200f,   // full leveling zone end-to-end (Elwynn ~2k); no capital spillover
-            <= 15 => 4000f,   // zone + adjacent zones (Westfall, Redridge)
+            <= 15 => 3000f,   // zone + ADJACENT-CLUSTER zones only (2026-07-06 drift tighten, was
+                              // 4000). 4000 at tier 0 already admitted Kharanos (~3,900 straight-line
+                              // from Goldshire -- EK's clusters are closer as the crow flies than they
+                              // are on foot) with ZERO escalation, which is how L11-13 Alliance bots
+                              // ended up questing dwarf content: level-legal (red/grey both pass, Dun
+                              // Morogh is an L1-10 zone), in reach, no proactive route check. Every
+                              // legit human-cluster hop measures <=~2,300 (Sentinel Hill 1,530 /
+                              // Darkshire 1,600 / Lakeshire 2,230); 3,000 covers them with margin and
+                              // excludes the cross-cluster admits. Escalation (ReachTier) still widens
+                              // to the 3,600 ceiling when the local hubs drain.
             <= 20 => 5000f,
             <= 30 => 6000f,
             _ => 15000f

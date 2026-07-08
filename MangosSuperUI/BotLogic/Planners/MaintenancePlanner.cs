@@ -48,7 +48,9 @@ namespace MangosSuperUI.BotLogic.Planners;
 //   ── ESCAPE (only when trapped) ──
 //   graveyard_port  STILL DEAD. If DeathLoopStreak >= GraveyardAfterStreak (died more than
 //             twice in the same pocket inside the 5-min window) OR a death-cluster fired
-//             (≥N deaths / window, any spot/goal), the bot is trapped in a lethal area —
+//             (≥N deaths / window, any spot/goal) OR this death is a RAPID RE-DEATH
+//             (within RapidRedeathPortSec of the previous death, ANY spot — the measured
+//             70-83% re-death-<90s bucket, 2026-07-06 run), the bot is trapped in a lethal area —
 //             send RESURRECT{at_graveyard:1}; C++ NearTeleportTo's the invulnerable ghost
 //             to the nearest faction graveyard, emits GRAVEYARD_PORT, stays dead; we then
 //             plain-RESURRECT at the graveyard. A teleport, not a corpse-walk — it's the
@@ -152,6 +154,21 @@ public sealed class MaintenancePlanner : IBotPlanner
     private const int GraveyardAfterStreak = 2;
     private const double GraveyardPortDeadlineSec = 10;  // wait for GRAVEYARD_PORT ack, else fall back to rez-in-place
 
+    // ── Rapid re-death port (2026-07-06 — targets the measured re-death mass) ──
+    // The 2026-07-06 17.5h solo run: 70-83% of deaths on the worst bots landed within 90s of a
+    // RESPAWN — rez in place at the corpse, the killer/a wanderer still inside GetAttackDistance,
+    // DrinkAndEat gated by combat, dead again. The same-spot streak (30yd) missed drifting
+    // re-deaths and charged 2-3 deaths of tuition per pocket before porting; the cluster cap (3)
+    // charged the same. This trigger matches the bucket exactly: a death within this many seconds
+    // of the PREVIOUS death (death-to-death; corpse delay 15-22s + re-death <90s ≈ 105-112s),
+    // ANY spot — the bot is trapped, port NOW. Tuition per pocket: exactly one re-death.
+    // NB: the old MOVE_TO ghost-walk is NOT an option here — it never translated a ghost on this
+    // build (see the contract block at the top); the graveyard NearTeleportTo is the only working
+    // reposition-while-dead. Known no-op case: dying NEXT to the nearest graveyard (the Westfall
+    // Sentinel Hill economic seal) — the port lands where the bot already stands; that class is
+    // the broke+broken recovery's job, not this trigger's.
+    private const double RapidRedeathPortSec = 120;
+
     // ── Per-quest death attribution (the macro-loop exit) ──
     // A death WHILE QUESTING is blamed on the quest the bot was working (the brain stamps
     // ctx.DeathBlameQuestId at the death transition). At QuestFailCap attributed failures the quest
@@ -253,6 +270,13 @@ public sealed class MaintenancePlanner : IBotPlanner
                              && (DateTime.UtcNow - id.LastDeathTime).TotalSeconds < DeathLoopWindowSec
                              && SameSpotAsLastDeath(id.LastDeathLocation, ctx);
 
+            // Rapid re-death (2026-07-06): this death landed within RapidRedeathPortSec of the
+            // PREVIOUS death — ANY spot (no 30yd gate; a rez→stagger-40yd→die chain is the same
+            // trap). Computed BEFORE RecordDeath overwrites LastDeathTime, like the loop check.
+            bool rapidRedeath = id != null
+                                && id.LastDeathTime != default
+                                && (DateTime.UtcNow - id.LastDeathTime).TotalSeconds < RapidRedeathPortSec;
+
             // Escalation counter: a loop death pushes the relocate further next rez; a death
             // somewhere new means the last relocate worked → reset. Bump BEFORE RecordDeath
             // (which overwrites LastDeathLocation) using the loop verdict computed above.
@@ -277,9 +301,9 @@ public sealed class MaintenancePlanner : IBotPlanner
             // The brain stamped ctx.DeathBlameQuestId at the death transition (it had ctx.Quest
             // before the scratch reset; we don't). Bump the unified per-quest fail streak; at the
             // cap, durably DEFER that quest so the bot won't be routed back to the kill — and clear
-            // the streak. With cap=1 this shelves on the first death: the death→graveyard→walk-back
-            // →die loop can't form because the quest is gone from the pickable/resumable set before
-            // the bot can return. No blame id (died grinding, or between legs) → nothing to do.
+            // the streak. Cap is 3 (at 1, one unlucky death over-shelved into grind-lock); the
+            // 60-min defer brings the quest back when the bot is a level or two stronger.
+            // No blame id (died grinding, or between legs) → nothing to do.
             if (id != null && ctx.DeathBlameQuestId is int blamed)
             {
                 int fails = id.QuestFailStreak.GetValueOrDefault(blamed, 0) + 1;
@@ -316,13 +340,15 @@ public sealed class MaintenancePlanner : IBotPlanner
                 RezAtUtc = DateTime.UtcNow.AddSeconds(RezDelayBaseSec + (ctx.Guid % RezDelayJitterSec)),
                 DeathPos = deathPos,
                 DeathLoop = deathLoop,
-                DeathCluster = deathCluster
+                // Rapid re-death rides the cluster flag — identical escape (graveyard port), zero
+                // new scratch fields. The ARM log line below distinguishes them (RAPID vs CLUSTER).
+                DeathCluster = deathCluster || rapidRedeath
             };
             ctx.Service = null;   // drop any in-flight vendor trip — recovery owns the bot; re-evaluate after heal
             ctx.SetStep("rez_wait");
-            _log.LogInformation("[REZ] {Name} DEATH @ ({X:F0},{Y:F0})@{Map} loop={Loop} streak={Streak} recent={Recent}{Cluster} (deaths={Deaths})",
+            _log.LogInformation("[REZ] {Name} DEATH @ ({X:F0},{Y:F0})@{Map} loop={Loop} streak={Streak} recent={Recent}{Cluster}{Rapid} (deaths={Deaths})",
                 ctx.Name, deathPos.X, deathPos.Y, deathPos.Map, deathLoop, id?.DeathLoopStreak ?? 0,
-                recentDeaths, deathCluster ? " CLUSTER" : "", id?.DeathsSinceQuestStart ?? 0);
+                recentDeaths, deathCluster ? " CLUSTER" : "", rapidRedeath ? " RAPID" : "", id?.DeathsSinceQuestStart ?? 0);
             return StepResult.Wait();
         }
 
@@ -342,15 +368,30 @@ public sealed class MaintenancePlanner : IBotPlanner
             return SendResurrect(ctx, m);
 
         // ── GRAVEYARD ESCALATION ──
-        // Two triggers, same escape: (1) DeathLoopStreak — died >2× in the SAME pocket inside the
-        // 5-min window (a no_path pocket / lethal spot we keep dying in); or (2) DeathCluster —
+        // Three triggers, same escape: (1) DeathLoopStreak — died >2× in the SAME pocket inside the
+        // 5-min window (a no_path pocket / lethal spot we keep dying in); (2) DeathCluster —
         // ≥N deaths in the rolling window regardless of spot/goal (the murloc-lake / vendor-errand
-        // chain that streak + Questing-attribution both miss). Either way C++ ports the INVULNERABLE
+        // chain that streak + Questing-attribution both miss); or (3) a RAPID re-death — this death
+        // within RapidRedeathPortSec of the previous one, any spot (folded into the DeathCluster
+        // stamp at ARM — the measured 70-83% re-death bucket, 2026-07-06). Either way C++ ports the INVULNERABLE
         // ghost to the nearest faction graveyard (RESURRECT{at_graveyard:1} → NearTeleportTo, the
         // proven seam-cross primitive — NOT the old RepopAtGraveyard race), emits GRAVEYARD_PORT, and
         // stays dead. We then send a plain RESURRECT to rez there. RelocateSent/RelocateDone are reused
         // as the port phase flags. Runs BEFORE the corpse-run delay below: we're leaving the area now.
         bool useGraveyard = (id?.DeathLoopStreak ?? 0) >= GraveyardAfterStreak || m.DeathCluster;
+        // [PLAYERPARTY] Never graveyard-port a companion (2026-07-07): the party is standing at
+        // the corpse — an in-place rez rejoins the fight, while a port would teleport the escort
+        // across the map away from the human mid-quest (the rapid-redeath trigger would fire on
+        // exactly the "died twice defending you" case). All three triggers suppressed; the plain
+        // in-place RESURRECT below still runs on the normal delay. The ARM bookkeeping above
+        // (death-spot blacklist, quest blame, streaks) still recorded — it informs post-party
+        // behaviour without moving anyone now.
+        if (useGraveyard && ctx.InPlayerParty)
+        {
+            useGraveyard = false;
+            _log.LogInformation("[GRAVE] {Name} port suppressed — in a REAL player's party (in-place rez beside the group)",
+                ctx.Name);
+        }
         if (useGraveyard)
         {
             if (!m.RelocateSent)
@@ -788,7 +829,7 @@ public sealed class MaintenancePlanner : IBotPlanner
 
         _log.LogInformation("[GRAVE] {Name} graveyard port ({Why}) from ({X:F0},{Y:F0})@{Map} streak={Streak}",
             ctx.Name,
-            m.DeathCluster ? $"death-cluster ≥{RecentDeathClusterCap}/{RecentDeathWindowSec / 60:F0}min"
+            m.DeathCluster ? $"death-cluster ≥{RecentDeathClusterCap}/{RecentDeathWindowSec / 60:F0}min OR rapid re-death <{RapidRedeathPortSec:F0}s"
                            : $"streak={ctx.Identity?.DeathLoopStreak ?? 0} >= {GraveyardAfterStreak}",
             ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.Identity?.DeathLoopStreak ?? 0);
 
