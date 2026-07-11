@@ -1,0 +1,589 @@
+@{
+    ViewData["Title"] = "Quest Lootifier";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header">
+            <div class="d-flex align-items-center justify-content-between">
+                <div>
+                    <h1><i class="fa-solid fa-scroll" style="color: var(--accent);"></i> Quest Lootifier</h1>
+                    <p>Generate stat-rerolled variants for quest reward items — awarded in place of the base at turn-in</p>
+                </div>
+                <div class="d-flex gap-2">
+                    <button class="btn-outline-subtle" id="btnQlStatus" title="How many quest variants exist">
+                        <i class="fa-solid fa-list-check"></i> Status
+                    </button>
+                    <button class="btn-outline-subtle" id="btnQlRollbackAll" title="Remove ALL quest reward variants" style="color: var(--status-danger, #c0392b);">
+                        <i class="fa-solid fa-rotate-left"></i> Rollback All
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="content-body">
+
+            <!-- Mode toggle -->
+            <div class="card mb-3">
+                <div class="card-body d-flex gap-2 flex-wrap align-items-center">
+                    <div class="ql-mode-toggle">
+                        <button class="ql-mode active" data-mode="single"><i class="fa-solid fa-magnifying-glass"></i> Single Quest</button>
+                        <button class="ql-mode" data-mode="all"><i class="fa-solid fa-layer-group"></i> All Quests</button>
+                        <button class="ql-mode" data-mode="browse"><i class="fa-solid fa-list"></i> Browse Lootified</button>
+                    </div>
+                    <div class="text-muted" style="font-size:12px;" id="qlModeHint">
+                        Search a quest and lootify its reward items.
+                    </div>
+                    <div class="ql-coverage" id="qlCoverage" title="Share of all eligible quest reward items that are lootified">
+                        <div class="ql-coverage-bar"><div class="ql-coverage-fill" id="qlCoverageFill"></div></div>
+                        <span class="ql-coverage-label" id="qlCoverageLabel">—</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="row g-3">
+                <!-- LEFT: selection -->
+                <div class="col-lg-6">
+                    <div class="card h-100" id="qlSinglePanel">
+                        <div class="card-header d-flex align-items-center gap-2">
+                            <i class="fa-solid fa-scroll" style="color: var(--accent);"></i> Find Quest
+                        </div>
+                        <div class="card-body">
+                            <div class="d-flex gap-2 mb-3">
+                                <input type="text" class="form-input" id="qlSearch" placeholder="Quest title or ID (e.g. 'The Defias' or 155)" style="flex:1;" />
+                                <button class="btn-accent" id="qlSearchBtn"><i class="fa-solid fa-magnifying-glass"></i></button>
+                            </div>
+
+                            <div id="qlSearchResults"></div>
+
+                            <div id="qlSelectedQuest" style="display:none;">
+                                <div class="ql-quest-head" id="qlQuestHead"></div>
+                                <div class="text-muted mb-2" style="font-size:11px; text-transform:uppercase; letter-spacing:0.5px;">
+                                    Reward Items <span id="qlRewardCount"></span>
+                                </div>
+                                <div id="qlRewardList"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- All-quests panel -->
+                    <div class="card h-100" id="qlAllPanel" style="display:none;">
+                        <div class="card-header d-flex align-items-center gap-2">
+                            <i class="fa-solid fa-layer-group" style="color: var(--accent);"></i> All Quests
+                        </div>
+                        <div class="card-body">
+                            <p class="text-muted" style="font-size:12.5px;">
+                                This generates variants for <strong>every</strong> reward item on <strong>every</strong> quest
+                                in the game that has stats or a spell effect (both guaranteed and choice rewards).
+                                Items already lootified are skipped unless you check regenerate.
+                            </p>
+                            <label class="d-flex align-items-center gap-2" style="font-size:13px;">
+                                <input type="checkbox" id="qlRegenerate" /> Regenerate items that already have variants (replaces them)
+                            </label>
+                            <div class="ql-warn mt-3">
+                                <i class="fa-solid fa-triangle-exclamation"></i>
+                                This can create tens of thousands of item_template rows. It's reversible via Rollback All.
+                            </div>
+
+                            <!-- Chunked run progress -->
+                            <div id="qlRunProgress" style="display:none;" class="mt-3">
+                                <div class="ql-progress"><div class="ql-progress-fill" id="qlProgressFill"></div></div>
+                                <div class="d-flex justify-content-between align-items-center mt-2">
+                                    <span class="text-muted" style="font-size:12px;" id="qlProgressText">Preparing…</span>
+                                    <button class="btn-outline-subtle" id="qlCancelRun" style="font-size:12px; padding:4px 10px;">
+                                        <i class="fa-solid fa-stop"></i> Stop
+                                    </button>
+                                </div>
+                            </div>
+                            <button class="btn-accent mt-3" id="qlRunAllBtn">
+                                <i class="fa-solid fa-bolt"></i> Generate All Quest Variants
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- RIGHT: ruleset + preview -->
+                <div class="col-lg-6">
+                    <div class="card mb-3">
+                        <div class="card-header d-flex align-items-center gap-2">
+                            <i class="fa-solid fa-sliders" style="color: var(--accent);"></i> Ruleset
+                        </div>
+                        <div class="card-body">
+                            <div class="row g-3">
+                                <div class="col-6">
+                                    <label class="cmd-label">Budget Ceiling</label>
+                                    <div class="d-flex align-items-center gap-1">
+                                        <span>+</span>
+                                        <input type="number" class="form-input" id="qlBudgetCeiling" value="35" min="0" max="200" style="width:80px;" />
+                                        <span>%</span>
+                                    </div>
+                                </div>
+                                <div class="col-6">
+                                    <label class="cmd-label">Variants per Item</label>
+                                    <input type="number" class="form-input" id="qlVariants" value="10" min="1" max="50" style="width:80px;" />
+                                </div>
+                                <div class="col-6">
+                                    <label class="d-flex align-items-center gap-2" style="font-size:13px; margin-top:6px;">
+                                        <input type="checkbox" id="qlAllowNew" checked /> Allow new affixes (same family)
+                                    </label>
+                                </div>
+                                <div class="col-6">
+                                    <label class="cmd-label">Max Extra Stat Slots</label>
+                                    <input type="number" class="form-input" id="qlMaxAffix" value="1" min="0" max="3" style="width:80px;" />
+                                </div>
+                                <div class="col-12">
+                                    <label class="d-flex align-items-center gap-2" style="font-size:13px; margin-top:2px;">
+                                        <input type="checkbox" id="qlLegendary" checked />
+                                        Generate one quest-flavored <span class="quality-5" style="font-weight:600;">legendary</span> per reward item
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header d-flex align-items-center justify-content-between">
+                            <span><i class="fa-solid fa-flask" style="color: var(--accent);"></i> Preview</span>
+                            <button class="btn-outline-subtle" id="qlPreviewBtn" style="display:none;"><i class="fa-solid fa-flask"></i> Roll Samples</button>
+                        </div>
+                        <div class="card-body">
+                            <div id="qlPreview" class="ql-empty">
+                                Select reward items and roll samples to preview.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Browse lootified panel -->
+            <div class="card" id="qlBrowsePanel" style="display:none;">
+                <div class="card-header d-flex align-items-center justify-content-between">
+                    <span><i class="fa-solid fa-list" style="color: var(--accent);"></i> Lootified Reward Items</span>
+                    <div class="d-flex gap-2 align-items-center">
+                        <input type="text" class="form-input" id="qlBrowseSearch" placeholder="Filter by name or item ID" style="width:220px;" />
+                        <span class="text-muted" style="font-size:12px;" id="qlBrowseCount"></span>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div id="qlBrowseList" class="ql-empty">Loading...</div>
+                    <div class="d-flex justify-content-center gap-2 mt-3" id="qlBrowsePager" style="display:none;">
+                        <button class="btn-outline-subtle" id="qlBrowsePrev"><i class="fa-solid fa-chevron-left"></i></button>
+                        <span class="text-muted" style="font-size:12px; align-self:center;" id="qlBrowsePageInfo"></span>
+                        <button class="btn-outline-subtle" id="qlBrowseNext"><i class="fa-solid fa-chevron-right"></i></button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Commit bar -->
+            <div class="card mt-3" id="qlCommitBar" style="display:none;">
+                <div class="card-body d-flex align-items-center justify-content-between flex-wrap gap-2">
+                    <div class="text-muted" style="font-size:12.5px;" id="qlCommitSummary"></div>
+                    <button class="btn-accent" id="qlCommitBtn"><i class="fa-solid fa-bolt"></i> Generate Variants</button>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+@section Styles {
+    <style>
+        /* WoW item-quality colors — defined per-page (same palette as the OG
+                   Lootifier; these classes are not global). */
+        .quality-0 {
+            color: #9d9d9d;
+        }
+
+        .quality-1 {
+            color: var(--text-primary);
+        }
+
+        .quality-2 {
+            color: #1eff00;
+        }
+
+        .quality-3 {
+            color: #0070dd;
+        }
+
+        .quality-4 {
+            color: #a335ee;
+        }
+
+        .quality-5 {
+            color: #ff8000;
+        }
+
+        .ql-mode-toggle {
+            display: inline-flex;
+            background: var(--bg-input);
+            border-radius: var(--radius-md);
+            padding: 3px;
+            gap: 2px;
+        }
+
+        .ql-coverage {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: auto;
+        }
+
+        .ql-coverage-bar {
+            width: 120px;
+            height: 8px;
+            background: var(--bg-input);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .ql-coverage-fill {
+            height: 100%;
+            width: 0%;
+            background: var(--accent);
+            transition: width 0.4s ease;
+        }
+
+        .ql-coverage-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
+        .ql-progress {
+            width: 100%;
+            height: 14px;
+            background: var(--bg-input);
+            border-radius: 7px;
+            overflow: hidden;
+        }
+
+        .ql-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: var(--accent);
+            transition: width 0.25s ease;
+            border-radius: 7px;
+        }
+
+        .ql-mode {
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 13px;
+            font-weight: 600;
+            padding: 6px 14px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+        }
+
+            .ql-mode.active {
+                background: var(--accent);
+                color: var(--text-on-accent);
+            }
+
+        .ql-quest-head {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--text-primary);
+            padding: 8px 10px;
+            background: var(--bg-card-alt);
+            border-radius: var(--radius-sm);
+            margin-bottom: 10px;
+        }
+
+        .ql-result {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border-light);
+            cursor: pointer;
+        }
+
+            .ql-result:hover {
+                background: var(--bg-card-alt);
+            }
+
+            .ql-result .ql-lvl {
+                font-family: monospace;
+                font-size: 11px;
+                color: var(--text-muted);
+            }
+
+        .ql-reward {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 7px 10px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+            .ql-reward img {
+                width: 20px;
+                height: 20px;
+                image-rendering: pixelated;
+                border-radius: 2px;
+            }
+
+            .ql-reward .ql-name {
+                flex: 1;
+                font-size: 12.5px;
+            }
+
+        .ql-kind {
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 1px 6px;
+            border-radius: 3px;
+        }
+
+            .ql-kind.guaranteed {
+                background: rgba(46,160,67,0.15);
+                color: #2ea043;
+            }
+
+            .ql-kind.choice {
+                background: rgba(59,130,196,0.15);
+                color: var(--accent);
+            }
+
+        .ql-reward.ineligible {
+            opacity: 0.45;
+        }
+
+        .ql-badge-done {
+            font-size: 10px;
+            font-weight: 700;
+            color: #2ea043;
+            background: rgba(46,160,67,0.12);
+            padding: 1px 7px;
+            border-radius: 10px;
+            white-space: nowrap;
+        }
+
+        .ql-view-variants {
+            font-size: 10px;
+            font-weight: 700;
+            color: #2ea043;
+            background: rgba(46,160,67,0.12);
+            border: none;
+            padding: 2px 9px;
+            border-radius: 10px;
+            white-space: nowrap;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+            .ql-view-variants:hover {
+                background: rgba(46,160,67,0.22);
+            }
+
+            .ql-view-variants .ql-chev {
+                font-size: 8px;
+            }
+
+        .ql-reward-variants {
+            background: var(--bg-card-alt);
+            border-radius: var(--radius-sm);
+            margin: 2px 0 6px 34px;
+            overflow: hidden;
+        }
+
+        .ql-ivhead {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 4px 12px;
+            font-size: 9.5px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-medium);
+        }
+
+            .ql-ivhead span:nth-child(2) {
+                flex: 1;
+                text-align: center;
+            }
+
+            .ql-ivhead span:last-child {
+                width: 70px;
+                text-align: right;
+            }
+
+        .ql-ivrow {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 5px 12px;
+            font-size: 11.5px;
+            border-top: 1px solid var(--border-light);
+        }
+
+            .ql-ivrow:first-of-type {
+                border-top: none;
+            }
+
+        .ql-ivname {
+            flex: 1;
+            font-weight: 500;
+        }
+
+        .ql-ivstats {
+            color: var(--text-secondary);
+            font-family: monospace;
+            margin: 0 12px;
+            flex: 1;
+            text-align: center;
+        }
+
+        .ql-ivbudget {
+            color: var(--text-secondary);
+            font-family: monospace;
+            width: 70px;
+            text-align: right;
+        }
+
+        .ql-vleg {
+            font-size: 9px;
+            font-weight: 700;
+            color: #ff8000;
+            letter-spacing: 0.5px;
+        }
+
+        .ql-browse-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+            .ql-browse-row img {
+                width: 22px;
+                height: 22px;
+                image-rendering: pixelated;
+                border-radius: 2px;
+            }
+
+            .ql-browse-row .ql-bname {
+                flex: 1;
+                font-size: 12.5px;
+            }
+
+            .ql-browse-row .ql-bcount {
+                font-size: 11px;
+                color: var(--text-secondary);
+                font-family: monospace;
+                background: none;
+                border: none;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+            }
+
+                .ql-browse-row .ql-bcount:hover {
+                    color: var(--accent);
+                }
+
+            .ql-browse-row .ql-bleg {
+                font-size: 9px;
+                font-weight: 700;
+                color: #ff8000;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+
+            .ql-browse-row .ql-brollback {
+                background: none;
+                border: none;
+                color: var(--status-danger,#c0392b);
+                cursor: pointer;
+                font-size: 12px;
+                padding: 2px 6px;
+                opacity: 0.7;
+            }
+
+                .ql-browse-row .ql-brollback:hover {
+                    opacity: 1;
+                }
+
+        .ql-empty {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 13px;
+            padding: 24px 0;
+        }
+
+        .ql-warn {
+            font-size: 12px;
+            color: var(--status-warning, #b8860b);
+            background: rgba(184,134,11,0.08);
+            padding: 8px 12px;
+            border-radius: var(--radius-sm);
+        }
+
+        .ql-variant-block {
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-sm);
+            margin-bottom: 10px;
+            overflow: hidden;
+        }
+
+        .ql-variant-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            background: var(--bg-card-alt);
+            font-size: 12.5px;
+            font-weight: 600;
+        }
+
+            .ql-variant-head img {
+                width: 20px;
+                height: 20px;
+                image-rendering: pixelated;
+                border-radius: 2px;
+            }
+
+        .ql-variant-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 5px 10px;
+            font-size: 11.5px;
+            border-top: 1px solid var(--border-light);
+        }
+
+            .ql-variant-row .ql-vname {
+                font-weight: 500;
+            }
+
+            .ql-variant-row .ql-vstats {
+                color: var(--text-secondary);
+                font-family: monospace;
+            }
+
+            .ql-variant-row .ql-vbudget {
+                color: var(--text-muted);
+                font-family: monospace;
+                width: 44px;
+                text-align: right;
+            }
+    </style>
+}
+
+@section Scripts {
+    <script src="~/js/questlootifier.js" asp-append-version="true"></script>
+}

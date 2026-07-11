@@ -1,0 +1,602 @@
+@{
+    ViewData["Title"] = "Crafting Lootifier";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header d-flex align-items-start justify-content-between">
+            <div>
+                <h1><i class="fa-solid fa-hammer" style="color: var(--accent);"></i> Crafting Lootifier</h1>
+                <p>Additive stat variants for crafted gear, rolled at craft time</p>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="btn-sm btn-outline-subtle" id="btnViewStatus">
+                    <i class="fa-solid fa-chart-simple"></i> Status
+                </button>
+                <button class="btn-sm btn-outline-subtle" id="btnRollbackAll" style="border-color: var(--status-warning); color: var(--status-warning);">
+                    <i class="fa-solid fa-trash-can"></i> Rollback All
+                </button>
+            </div>
+        </div>
+
+        <div class="content-body">
+            <div class="lf-tabs mb-3">
+                <button class="lf-tab active" data-tab="generate">Generate</button>
+                <button class="lf-tab" data-tab="professions">Professions</button>
+                <button class="lf-tab" data-tab="browse">Browse Lootified</button>
+            </div>
+
+            <!-- ============================ GENERATE ============================ -->
+            <div id="tab-generate">
+                <div class="row">
+                    <div class="col-lg-5">
+                        <div class="card mb-3" style="position: sticky; top: 16px;">
+                            <div class="card-header"><strong>1 · Pick craftable gear</strong></div>
+                            <div class="card-body">
+                                <div class="d-flex gap-1">
+                                    <input type="text" class="form-input" id="itemSearch" placeholder="Search gear by name or entry id..." />
+                                    <button class="btn-accent btn-search-go" id="btnSearchItem"><i class="fa-solid fa-magnifying-glass"></i></button>
+                                </div>
+                                <div id="searchResults" class="lf-search-results" style="display:none;"></div>
+
+                                <div id="selectedItems" class="lf-selected" style="margin-top:12px;"></div>
+
+                                <div id="rulesetPanel" style="display:none; margin-top:16px;">
+                                    <div class="d-flex align-items-center justify-content-between" style="margin-bottom:8px;">
+                                        <strong style="font-size:13px;">Customize</strong>
+                                        <button class="btn-micro" id="btnResetRuleset">Reset Defaults</button>
+                                    </div>
+                                    <div class="lf-field">
+                                        <label>Tier offset <span class="text-muted">(slides all boost ranges up/down together)</span></label>
+                                        <div class="d-flex align-items-center gap-1">
+                                            <input type="range" id="rsOffset" min="-15" max="40" step="1" value="0" style="flex:1;" />
+                                            <span id="rsOffsetVal" class="text-muted" style="width:34px;text-align:right;">+0</span>
+                                        </div>
+                                    </div>
+                                    <div class="lf-field">
+                                        <label>
+                                            Existing-bump bias
+                                            <span class="text-muted" title="0 = all bonus into NEW affix lines, 1 = all into bumping existing lines">(?)</span>
+                                        </label>
+                                        <div class="d-flex align-items-center gap-1">
+                                            <input type="range" id="rsBumpBias" min="0" max="1" step="0.05" value="0.5" style="flex:1;" />
+                                            <span id="rsBumpBiasVal" class="text-muted" style="width:34px;text-align:right;">0.50</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="d-flex gap-1" style="margin-top:8px;">
+                                        <label class="lf-check"><input type="checkbox" id="rsAllowNewAffixes" checked /> Allow new affixes</label>
+                                        <div class="lf-field" style="margin:0;">
+                                            <label>Max new lines</label>
+                                            <input type="number" class="form-input" id="rsMaxAffixChange" value="1" min="0" max="3" style="width:50px;" />
+                                        </div>
+                                    </div>
+
+                                    <label class="lf-check" style="margin-top:8px;">
+                                        <input type="checkbox" id="rsLegendaryBand" checked /> Include "of the Gods" legendary band
+                                    </label>
+
+                                    <div style="margin-top:14px;">
+                                        <div class="d-flex align-items-center justify-content-between" style="margin-bottom:6px;">
+                                            <strong style="font-size:12px;">Bands</strong>
+                                            <button class="btn-micro" id="btnAddBand"><i class="fa-solid fa-plus"></i> Add band</button>
+                                        </div>
+                                        <div class="lf-band-head"><span>Name</span><span>Pos</span><span>Boost %</span><span>Slots</span><span></span></div>
+                                        <div id="bandEditor"></div>
+                                        <div id="bandWarn" class="lf-band-warn" style="display:none;"></div>
+                                    </div>
+                                    <div class="d-flex gap-1" style="margin-top:14px;">
+                                        <button class="btn-outline-subtle w-100" id="btnPreview"><i class="fa-solid fa-eye"></i> Preview</button>
+                                        <button class="btn-accent w-100" id="btnGenerate" disabled><i class="fa-solid fa-bolt"></i> Generate</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="col-lg-7">
+                        <div class="card">
+                            <div class="card-header d-flex align-items-center justify-content-between">
+                                <strong>Preview</strong>
+                                <span class="text-muted" id="previewInfo" style="font-size:12px;">Pick gear and hit Preview</span>
+                            </div>
+                            <div class="card-body p-0" id="previewContainer"></div>
+                        </div>
+                        <div id="coverageBar" class="lf-coverage mt-3"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============================ PROFESSIONS ============================ -->
+            <div id="tab-professions" style="display:none;">
+                <div class="card mb-3">
+                    <div class="card-header"><strong>Pick a profession</strong></div>
+                    <div class="card-body" id="profList">
+                        <div class="text-muted">Loading professions...</div>
+                    </div>
+                </div>
+
+                <div id="profBatchPanel" style="display:none;">
+                    <div class="row">
+                        <div class="col-lg-5">
+                            <div class="card" style="position: sticky; top: 16px;">
+                                <div class="card-header d-flex align-items-center justify-content-between">
+                                    <strong>Batch</strong>
+                                    <span class="text-muted" id="profBatchInfo" style="font-size:12px;"></span>
+                                </div>
+                                <div class="card-body">
+                                    <div class="d-flex align-items-center justify-content-between" style="margin-bottom:8px;">
+                                        <strong style="font-size:13px;">Customize (this profession)</strong>
+                                        <button class="btn-micro" id="pBtnResetRuleset">Reset Defaults</button>
+                                    </div>
+                                    <div class="lf-field">
+                                        <label>Tier offset <span class="text-muted">(slides all boost ranges up/down together)</span></label>
+                                        <div class="d-flex align-items-center gap-1">
+                                            <input type="range" id="pRsOffset" min="-15" max="40" step="1" value="0" style="flex:1;" />
+                                            <span id="pRsOffsetVal" class="text-muted" style="width:34px;text-align:right;">+0</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="lf-field">
+                                        <label>Existing-bump bias</label>
+                                        <div class="d-flex align-items-center gap-1">
+                                            <input type="range" id="pRsBumpBias" min="0" max="1" step="0.05" value="0.5" style="flex:1;" />
+                                            <span id="pRsBumpBiasVal" class="text-muted" style="width:34px;text-align:right;">0.50</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="d-flex gap-1" style="margin-top:8px;">
+                                        <label class="lf-check"><input type="checkbox" id="pRsAllowNewAffixes" checked /> Allow new affixes</label>
+                                        <div class="lf-field" style="margin:0;">
+                                            <label>Max new lines</label>
+                                            <input type="number" class="form-input" id="pRsMaxAffixChange" value="1" min="0" max="3" style="width:50px;" />
+                                        </div>
+                                    </div>
+
+                                    <label class="lf-check" style="margin-top:8px;">
+                                        <input type="checkbox" id="pRsLegendaryBand" checked /> Include "of the Gods" legendary band
+                                    </label>
+
+                                    <div style="margin-top:14px;">
+                                        <div class="d-flex align-items-center justify-content-between" style="margin-bottom:6px;">
+                                            <strong style="font-size:12px;">Bands</strong>
+                                            <button class="btn-micro" id="pBtnAddBand"><i class="fa-solid fa-plus"></i> Add band</button>
+                                        </div>
+                                        <div class="lf-band-head"><span>Name</span><span>Pos</span><span>Boost %</span><span>Slots</span><span></span></div>
+                                        <div id="pBandEditor"></div>
+                                        <div id="pBandWarn" class="lf-band-warn" style="display:none;"></div>
+                                    </div>
+
+                                    <button class="btn-accent w-100" id="btnProfBatch" style="margin-top:14px;">
+                                        <i class="fa-solid fa-bolt"></i> Lootify all equippable
+                                    </button>
+                                    <div class="text-muted" style="margin-top:8px; font-size:11px;">
+                                        Only equippable gear is lootified — sharpening stones, oils and reagents are skipped.
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-lg-7">
+                            <div class="card">
+                                <div class="card-header"><strong>Recipes (rank order)</strong></div>
+                                <div class="card-body p-0" id="recipeList"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============================= BROWSE ============================= -->
+            <div id="tab-browse" style="display:none;">
+                <div class="card">
+                    <div class="card-header d-flex align-items-center justify-content-between">
+                        <strong>Lootified crafting items</strong>
+                        <input type="text" class="form-input" id="browseSearch" placeholder="Filter by name or entry..." style="width:260px;" />
+                    </div>
+                    <div class="card-body p-0" id="browseContainer"></div>
+                    <div class="card-body" id="browsePager" style="display:none;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Rollback modal -->
+<div class="modal fade" id="rollbackModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header"><h5 class="modal-title">Confirm rollback</h5></div>
+            <div class="modal-body"><p id="rollbackDesc"></p></div>
+            <div class="modal-footer">
+                <button class="btn-sm btn-outline-subtle" data-bs-dismiss="modal" id="btnCancelRollback">Cancel</button>
+                <button class="btn-sm" id="btnConfirmRollback" style="background: var(--status-warning); border: none; color: #000; font-weight: 600; border-radius: var(--radius-sm); padding: 6px 16px; cursor: pointer;">Rollback</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Status modal -->
+<div class="modal fade" id="statusModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header"><h5 class="modal-title">Crafting Lootifier status</h5></div>
+            <div class="modal-body" id="statusBody" style="padding:16px;"></div>
+        </div>
+    </div>
+</div>
+
+@section Styles {
+    <style>
+        .quality-0 {
+            color: #9d9d9d;
+        }
+
+        .quality-1 {
+            color: var(--text-primary);
+        }
+
+        .quality-2 {
+            color: #1eff00;
+        }
+
+        .quality-3 {
+            color: #0070dd;
+        }
+
+        .quality-4 {
+            color: #a335ee;
+        }
+
+        .quality-5 {
+            color: #ff8000;
+        }
+
+        .col-lg-5 {
+            flex: 0 0 42%;
+            max-width: 42%;
+        }
+
+        .col-lg-7 {
+            flex: 0 0 calc(58% - 20px);
+            max-width: calc(58% - 20px);
+        }
+
+        .d-flex {
+            display: flex;
+        }
+
+        .align-items-center {
+            align-items: center;
+        }
+
+        .align-items-start {
+            align-items: flex-start;
+        }
+
+        .justify-content-between {
+            justify-content: space-between;
+        }
+
+        .gap-1 {
+            gap: 8px;
+        }
+
+        .gap-2 {
+            gap: 12px;
+        }
+
+        .mb-3 {
+            margin-bottom: 16px;
+        }
+
+        .mt-3 {
+            margin-top: 16px;
+        }
+
+        .p-0 {
+            padding: 0;
+        }
+
+        .lf-tabs {
+            display: flex;
+            gap: 4px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .lf-tab {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            padding: 8px 16px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            font-size: 13px;
+        }
+
+            .lf-tab.active {
+                color: var(--text-primary);
+                border-bottom-color: var(--accent);
+            }
+
+        .lf-search-results {
+            max-height: 260px;
+            overflow-y: auto;
+            margin-top: 8px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+        }
+
+        .lf-search-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            cursor: pointer;
+            border-bottom: 1px solid var(--border);
+        }
+
+            .lf-search-item:hover {
+                background: rgba(255,255,255,0.04);
+            }
+
+            .lf-search-item img {
+                width: 24px;
+                height: 24px;
+                border-radius: 3px;
+            }
+
+            .lf-search-item.done {
+                opacity: 0.5;
+            }
+
+        .lf-selected-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            margin-bottom: 6px;
+        }
+
+            .lf-selected-item .rm {
+                margin-left: auto;
+                cursor: pointer;
+                color: var(--status-warning);
+            }
+
+        .lf-field {
+            margin-top: 10px;
+        }
+
+            .lf-field > label {
+                display: block;
+                font-size: 12px;
+                color: var(--text-muted);
+                margin-bottom: 4px;
+            }
+
+        .lf-check {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+        }
+
+        .lf-band-head, .lf-band-row {
+            display: grid;
+            grid-template-columns: 1fr 64px 96px 48px 24px;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .lf-band-head {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .lf-band-row {
+            margin-bottom: 5px;
+        }
+
+            .lf-band-row input, .lf-band-row select {
+                font-size: 11px;
+                padding: 3px 5px;
+            }
+
+            .lf-band-row .boost {
+                display: flex;
+                align-items: center;
+                gap: 3px;
+            }
+
+                .lf-band-row .boost input {
+                    width: 40px;
+                }
+
+            .lf-band-row .rmBand {
+                cursor: pointer;
+                color: var(--status-warning);
+                text-align: center;
+            }
+
+        .lf-band-warn {
+            color: var(--status-warning);
+            font-size: 11px;
+            margin-top: 6px;
+        }
+
+        .lf-item-block {
+            border-bottom: 1px solid var(--border);
+            padding: 10px 14px;
+        }
+
+        .lf-item-title {
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+
+        .lf-variant-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+            font-size: 12px;
+        }
+
+            .lf-variant-row img {
+                width: 20px;
+                height: 20px;
+                border-radius: 3px;
+            }
+
+        .lf-variant-name {
+            min-width: 210px;
+        }
+
+        .lf-award {
+            color: var(--accent);
+            font-variant-numeric: tabular-nums;
+            width: 54px;
+            text-align: right;
+        }
+
+        .lf-boost {
+            color: var(--text-muted);
+            width: 52px;
+            text-align: right;
+        }
+
+        .lf-stat-pill {
+            display: inline-block;
+            font-size: 10px;
+            padding: 1px 6px;
+            border-radius: 8px;
+            background: rgba(255,255,255,0.06);
+            margin: 1px;
+        }
+
+            .lf-stat-pill.new {
+                background: rgba(30,255,0,0.12);
+                color: #6cff45;
+            }
+
+        .lf-coverage {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .btn-micro {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+        }
+
+        /* professions tab */
+        .lf-prof-health {
+            margin-bottom: 10px;
+            font-size: 12px;
+        }
+
+        .lf-prof-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+            gap: 10px;
+        }
+
+        .lf-prof-card {
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 12px;
+            cursor: pointer;
+        }
+
+            .lf-prof-card:hover {
+                background: rgba(255,255,255,0.04);
+            }
+
+            .lf-prof-card.active {
+                border-color: var(--accent);
+                box-shadow: 0 0 0 1px var(--accent) inset;
+            }
+
+        .lf-prof-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .lf-recipe-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 5px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+        }
+
+            .lf-recipe-row img {
+                width: 20px;
+                height: 20px;
+                border-radius: 3px;
+            }
+
+            .lf-recipe-row.skip {
+                opacity: 0.4;
+            }
+
+            .lf-recipe-row .text-muted {
+                margin-left: auto;
+            }
+
+        .lf-skip-tag {
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        .lf-done-tag {
+            font-size: 10px;
+            color: #6cff45;
+        }
+
+        .lf-toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: var(--surface, #1b1b1f);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+            padding: 10px 16px;
+            border-radius: var(--radius-sm);
+            z-index: 9999;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+            font-size: 13px;
+            max-width: 420px;
+        }
+
+            .lf-toast.success {
+                border-left-color: #1eff00;
+            }
+
+            .lf-toast.error {
+                border-left-color: var(--status-warning);
+            }
+
+        #previewContainer, #browseContainer, #recipeList {
+            max-height: 620px;
+            overflow-y: auto;
+        }
+    </style>
+}
+
+@section Scripts {
+    <script src="~/js/craftinglootifier.js" asp-append-version="true"></script>
+}

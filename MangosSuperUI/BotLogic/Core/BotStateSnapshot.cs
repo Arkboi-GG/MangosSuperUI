@@ -32,6 +32,20 @@ public class BotStateSnapshot
     // alongside the at_graveyard rez; drives the durability-repair errand.
     public uint Durability { get; set; } = 100;
 
+    // [HUB-ERRAND] The "do your rounds" run token (2026-07-08 §3). Stamped on BotState by the
+    // BotBridgeService CHAT_RECV recognizer (boss party-chat), NOT by the STATE parse — it
+    // persists across STATEs on the connection object and simply rides FromBridgeState into
+    // every snapshot. Null = no errand armed / "lets move" cleared it. The GoalSelector runs
+    // the errand goal only while this is live AND != ctx.HubErrandDone (the consumed-token
+    // check), so each command runs exactly once and expiry auto-reverts to the follow hold.
+    public DateTime? HubErrandUntil { get; set; }
+
+    // [HUB-ERRAND] Distance to the party boss (C++ ppdist on STATE, 2026-07-08): -1 = no boss
+    // resolved, 99999 = boss on ANOTHER map (instance/boat), else 3D yards. Feeds the errand
+    // abort guard (boss >150yd / off-map -> drop the rounds, resume follow). Up to one 5s
+    // STATE cycle stale, which is fine for a 150yd gate.
+    public int PartyBossDist { get; set; } = -1;
+
     // [PLAYERPARTY] This bot's group contains a REAL player (C++ pparty on STATE, 2026-07-07).
     // A human invited the bot in-game; C++ owns the whole escort behaviour (PlayerParty
     // doctrine: follow + assist), and C# stands down — GoalSelector holds Goal.Idle on this
@@ -102,6 +116,8 @@ public class BotStateSnapshot
             Copper = bs.Copper,
             Durability = bs.Durability,
             InPlayerParty = bs.InPlayerParty,   // [PLAYERPARTY] pparty on STATE — needs the BotState parse in BotBridgeService
+            HubErrandUntil = bs.HubErrandUntil, // [HUB-ERRAND] run token — stamped by the CHAT_RECV recognizer, persists on conn.State
+            PartyBossDist = bs.PartyBossDist,   // [HUB-ERRAND] ppdist on STATE — the boss-range abort guard
             ServerQuestId = bs.QuestId,
             ServerQuestStatus = bs.QuestStatus,
             HeldTask = ParseHeldTask(bs),

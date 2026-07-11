@@ -160,6 +160,12 @@ public class BotStatePayload
     [JsonPropertyName("pparty")]
     public uint Pparty { get; set; } = 0;
 
+    // [HUB-ERRAND] Distance to the party boss (2026-07-08): -1 = no boss resolved,
+    // 99999 = boss on ANOTHER map (instance/boat), else 3D yards. Sent beside pparty
+    // by the same FindPartyBoss walk; feeds the C# errand abort guard.
+    [JsonPropertyName("ppdist")]
+    public int Ppdist { get; set; } = -1;
+
     // Full quest-log snapshot, pushed on every STATE (replaces the retired QUERY_QUEST_STATUS pull).
     // Pipe-delimited, identical format to the old QUEST_STATUS_ALL payload:
     //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
@@ -338,6 +344,15 @@ public class BotState
     // Flows snapshot -> ctx.Sense -> the GoalSelector "player-party" Idle hold; C++ owns the
     // whole escort behaviour (PlayerParty doctrine).
     public bool InPlayerParty { get; set; } = false;
+    // [HUB-ERRAND] Boss distance off STATE (ppdist, 2026-07-08): -1 no boss, 99999 boss on
+    // another map, else 3D yards. Rides snapshot -> the errand planner's abort guard.
+    public int PartyBossDist { get; set; } = -1;
+    // [HUB-ERRAND] The "do your rounds" run token (2026-07-08 §3). Stamped HERE by the
+    // CHAT_RECV recognizer in HandleEventAsync — deliberately NOT in the STATE field-by-field
+    // copy, so it persists across STATEs exactly like the conn.State control-plane pattern
+    // promises. Null = nothing armed / "lets move" cleared it. Expiry is enforced by the
+    // GoalSelector's liveness check, not here.
+    public DateTime? HubErrandUntil { get; set; }
     // Full quest-log snapshot pushed on STATE (retired pull). Pipe-delimited, QUEST_STATUS_ALL format.
     public string Quests { get; set; } = "";
     // BotState class — add:
@@ -392,6 +407,11 @@ public class BotBridgeService : BackgroundService
 
     // Snapshot of all bot states (survives brief disconnects for UI display)
     public ConcurrentDictionary<int, BotState> BotStates { get; } = new();
+
+    // [HUB-ERRAND] How long a "do your rounds" run token stays live. The GoalSelector
+    // auto-reverts to the follow hold at expiry regardless of errand progress, so this is
+    // the errand's hard timebox as well as its arming window.
+    private static readonly TimeSpan HubErrandWindow = TimeSpan.FromMinutes(4);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -620,6 +640,7 @@ public class BotBridgeService : BackgroundService
         bs.QuestStatus = state.QuestStatus;
         bs.Durability = state.Durability;
         bs.InPlayerParty = state.Pparty != 0;   // [PLAYERPARTY] pparty on STATE (2026-07-07)
+        bs.PartyBossDist = state.Ppdist;        // [HUB-ERRAND] ppdist on STATE (2026-07-08); HubErrandUntil deliberately NOT copied — it persists
         bs.Quests = state.Quests;   // full quest-log snapshot (retired pull → STATE is the single source of truth)
         bs.HasReceivedState = true;
 
@@ -716,6 +737,36 @@ public class BotBridgeService : BackgroundService
                     channelName = evt.ChannelName ?? "",
                     timestamp = DateTime.UtcNow
                 });
+                // [HUB-ERRAND] Deterministic party-chat command recognizer (2026-07-08 §3).
+                // Placed BEFORE the ChatCoordinator hand-off (a command must never depend on an
+                // LLM turn) but still FORWARDING after it (personas may ad-lib on top of the ack).
+                // Boss-only: the sender must be a resolvable REAL player — guid known (non-zero)
+                // and NOT in the bot roster. Every party bot hears the party line and stamps
+                // ITSELF — no party-membership mapping needed. "do your rounds" arms a bounded
+                // run token on conn.State (persists across STATEs — the field-by-field STATE copy
+                // never touches it); "lets move"/"let's move" clears it, the GoalSelector reverts
+                // to the follow hold next tick, and the goal change SET_TASK IDLEs C++ back into
+                // formation. The interrupt is free.
+                if (string.Equals(evt.ChatType, "party", StringComparison.OrdinalIgnoreCase)
+                    && evt.SenderGuid is uint hubSender && hubSender != 0
+                    && !BotStates.ContainsKey((int)hubSender)
+                    && !string.IsNullOrWhiteSpace(evt.Message))
+                {
+                    string hubMsg = evt.Message.Replace("'", "").ToLowerInvariant();
+                    if (hubMsg.Contains("do your rounds"))
+                    {
+                        conn.State.HubErrandUntil = DateTime.UtcNow.Add(HubErrandWindow);
+                        _logger.LogInformation("[HUB-ERRAND] {Name} armed by {Sender}: 'do your rounds' (until {Until:HH:mm:ss}Z)",
+                            conn.State.Name, evt.Sender ?? "?", conn.State.HubErrandUntil);
+                    }
+                    else if (hubMsg.Contains("lets move"))
+                    {
+                        conn.State.HubErrandUntil = null;
+                        _logger.LogInformation("[HUB-ERRAND] {Name} cleared by {Sender}: 'lets move'",
+                            conn.State.Name, evt.Sender ?? "?");
+                    }
+                }
+
                 // C0 (§5.5): chat is the ChatCoordinator's business, not the goal spine's.
                 // Hand off and RETURN — CHAT_RECV must not reach _brain.HandleBridgeEventAsync
                 // (it used to fall through to _driver.OnEvent and evaporate).

@@ -46,6 +46,12 @@ public sealed class GoalSelector
         // automatically when STATE next reports isDead=false.
         if (ctx.Dead)
         {
+            // [HUB-ERRAND] Death clears the errand run (§3 guard): consume the run token so the
+            // post-rez tick resumes FOLLOW beside the party, not a half-finished round. The stamp
+            // itself lives on the bridge connection and lapses on its own clock — consuming here
+            // only retires THIS run; a fresh "do your rounds" re-arms with a new timestamp.
+            if (ctx.InPlayerParty && snap.HubErrandUntil is DateTime deadHu)
+                ctx.HubErrandDone = deadHu;
             ctx.GoalReason = "dead";
             return Goal.Maintenance;
         }
@@ -88,6 +94,25 @@ public sealed class GoalSelector
         if (ctx.InPlayerParty)
         {
             ctx.ClearObjective();
+
+            // [HUB-ERRAND] "do your rounds" (2026-07-08 §3): the boss armed a run token in party
+            // chat (BotBridgeService CHAT_RECV recognizer -> conn.State.HubErrandUntil -> this
+            // snapshot). Run the hub errand under Goal.Vendoring — verified unclaimed by any
+            // planner — while the stamp is LIVE and UNCONSUMED. The timestamp IS the run token:
+            // HubErrandPlanner stamps ctx.HubErrandDone = the stamp on completion/abort (and the
+            // dead branch above does the same on a death), so each command runs exactly once;
+            // expiry ("lets move" nulls the stamp, or the 4-min window lapses) auto-reverts to
+            // the Idle follow hold below, whose goal change SET_TASK IDLEs C++ back into
+            // formation. Sits INSIDE the player-party branch by construction: no human party,
+            // no errand. The teleport hold above still pins a committed assist round-trip.
+            if (snap.HubErrandUntil is DateTime hubUntil
+                && DateTime.UtcNow < hubUntil
+                && ctx.HubErrandDone != hubUntil)
+            {
+                ctx.GoalReason = "hub-errand";
+                return Goal.Vendoring;
+            }
+
             ctx.GoalReason = "player-party";
             return Goal.Idle;
         }

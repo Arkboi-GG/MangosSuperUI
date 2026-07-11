@@ -456,6 +456,16 @@ public sealed class BotContext
     // it's set so nothing interrupts the short round-trip.
     public TeleportTrip? Teleport { get; set; }
 
+    // ---- hub-errand consumed run token ([HUB-ERRAND] 2026-07-08 §3; cross-goal, NOT scratch) ----
+    // Set to the HubErrandUntil stamp when a "do your rounds" round finishes/aborts
+    // (HubErrandPlanner), wedges (its IsProgressing ceiling), or the bot dies mid-round
+    // (GoalSelector's dead branch). The GoalSelector runs the errand goal only while the live
+    // stamp != this — the timestamp IS the once-only latch: a re-issued command carries a NEW
+    // timestamp and runs fresh, while the same stamp can never run twice. Like DeathBlameQuestId
+    // above, this is a plain property the brain's scratch reset doesn't know BY DESIGN —
+    // surviving the goal change is the whole mechanism.
+    public DateTime? HubErrandDone { get; set; }
+
     // ---- quest-log cache (refreshed by QUEST_STATUS_ALL; read by QuestPlanner to resume) ----
     // Reference-swapped by the executor (not mutated in place) so the planner can read a
     // stable snapshot without locking. Stamp = when it was last refreshed.

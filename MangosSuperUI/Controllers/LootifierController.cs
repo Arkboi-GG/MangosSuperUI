@@ -7,6 +7,44 @@ using MySqlConnector;
 
 namespace MangosSuperUI.Controllers;
 
+// ══════════════════════════════════════════════════════════════════════════
+//  LOOTIFIER v5 — weighted pools
+//
+//  Building on v4 (dedup + scoped refs), variants now form a single WEIGHTED
+//  POOL with the base item rather than a scatter of independent direct rows.
+//
+//  Why: VMaNGOS LootGroup::Roll (LootMgr.cpp) treats a grouped row's
+//  ChanceOrQuestChance as an ABSOLUTE percentage of one 0-100 roll, walking
+//  members and subtracting until the roll goes negative — the group yields
+//  exactly ONE item per Process(). Independent direct rows (the v4 approach)
+//  therefore drop as N separate coin-flips, not "pick one of N". To get
+//  Diablo-style "one item drops, weighted among base+variants", all members
+//  must live in one group whose explicit chances sum to 100.
+//
+//  Two cases, both converging on a 100%/1 weighted reference pool (identical
+//  in shape to a vanilla shared pool, so it renders/edits in Instance Loot):
+//
+//  1. REF-SOURCED (base already in a reference_loot_template group):
+//     variants are added to that SAME ref group as explicit members, then the
+//     whole group (base + prior members + variants) is renormalized to sum
+//     100 so nothing is diluted into a dead-roll gap. Action: 'pool_joined'.
+//
+//  2. DIRECT-DROP boss (Hogger, Edwin's legendary — no pool):
+//     a fresh reference_loot_template entry is minted; the base row is moved
+//     out of creature_loot_template into it; variants are added; all members
+//     normalized to 100; and the base's direct row is replaced by a single
+//     pointer (ChanceOrQuestChance=100, mincountOrRef=-refEntry, maxcount=1).
+//     Action: 'pool_created'.
+//
+//  Carried over from v4:
+//   - BATCH DEDUP: one variant set per distinct base item; each (loot, base)
+//     pair pooled once, seeded from tracking for idempotent re-runs.
+//   - ROLLBACK: 'pool_created' deletes the minted ref + restores the base's
+//     direct row; 'pool_joined' deletes only the added variant members and
+//     restores the pre-join member chances. Shared item_template rows are
+//     kept if another creature still references them.
+// ══════════════════════════════════════════════════════════════════════════
+
 public class LootifierController : Controller
 {
     private readonly ConnectionFactory _db;
@@ -14,7 +52,33 @@ public class LootifierController : Controller
     private readonly AuditService _audit;
     private readonly IWebHostEnvironment _env;
 
+    // Per-request collector for pool capacity warnings (families that can't
+    // seat every member at MEMBER_FLOOR_PCT). Surfaced in the commit response.
+    private List<string>? _poolWarnings;
+
     private const int LOOTIFIER_ID_START = 950000;
+
+    // Loot group used for freshly-minted direct-drop variant pools.
+    private const int POOL_GROUP_ID = 98;
+
+    // Reference-table entries the Lootifier mints for direct-drop pools start
+    // here, well above vanilla reference_loot_template ids (~35000 in 1.12).
+    private const int LOOTIFIER_REF_START = 9500000;
+
+    // Pool share model (v6): the BASE item becomes a rare fallback and the
+    // lootified variants take almost all of the base's original pool share.
+    //   - BASE_FLOOR_PCT: base item's fixed share inside its family (special,
+    //     exempt from the member floor below).
+    //   - MEMBER_FLOOR_PCT: no variant/legendary may sit below this — anything
+    //     the tier-split pushes under it snaps up, cost taken proportionally
+    //     from the family's above-floor members.
+    // If a family has so many members that 0.5 + 0.3*count exceeds its share,
+    // it can't be floored legally → we skip flooring for that family and warn.
+    private const float BASE_FLOOR_PCT = 0.5f;
+    private const float MEMBER_FLOOR_PCT = 0.3f;
+
+    // VMaNGOS skips grouped rows with 0 < chance < 0.000001 (LootMgr.cpp:308).
+    private const float MIN_POOL_CHANCE = 0.0005f;
 
     // ── VERIFIED stat type mapping (confirmed from VMaNGOS item_template) ──
     // Judgement Legplates: 5=27(Int), 6=5(Spi), 7=26(Sta), 4=10(Str) ✓
@@ -320,6 +384,70 @@ public class LootifierController : Controller
         return entries;
     }
 
+    // ===================== ZONE FILTERING (via DbcService.WorldMapZones) =====================
+    //
+    // VMaNGOS `creature` spawns have map + position but no zone column, so
+    // zone filtering is spatial: each zone's bounding box comes from the
+    // client's WorldMapArea.dbc, parsed once at startup by DbcService from
+    // the configured Vmangos:DbcPath (same source as icons/spells). Boxes
+    // are the world-map rectangles, so mobs right on a zone border can match
+    // the neighbouring zone too — visible and uncheckable in the preview.
+
+    /// <summary>Outdoor zones only: maps 0/1, skipping continent overview rows.</summary>
+    private IEnumerable<WorldMapZoneDbc> OutdoorZones() =>
+        _dbc.WorldMapZones.Where(z => z.AreaId != 0 && (z.MapId == 0 || z.MapId == 1));
+
+    [HttpGet]
+    public IActionResult Zones()
+    {
+        var zones = OutdoorZones()
+            .OrderBy(z => z.MapId)
+            .ThenBy(z => z.DisplayName)
+            .ToList();
+
+        return Json(new
+        {
+            success = true,
+            available = zones.Count > 0,
+            dbcPath = _dbc.DbcPath,
+            zones = zones.Select(z => new { areaId = z.AreaId, mapId = z.MapId, name = z.DisplayName })
+        });
+    }
+
+    /// <summary>
+    /// Build the spawn-location WHERE clause for batch scans: dungeon map IDs
+    /// (parameterized) OR'd with zone bounding boxes (inline literals — values
+    /// are floats parsed from the binary DBC, not user strings). Returns null
+    /// when no location filter is active. Requires `creature c` to be joined.
+    /// </summary>
+    private string? BuildLocationWhere(BatchRequest request, string mapParamName)
+    {
+        var parts = new List<string>();
+
+        if (request.mapIds != null && request.mapIds.Length > 0)
+            parts.Add($"c.map IN @{mapParamName}");
+
+        if (request.zoneIds != null && request.zoneIds.Length > 0)
+        {
+            var zones = OutdoorZones().ToList();
+            foreach (var zid in request.zoneIds)
+            {
+                var z = zones.FirstOrDefault(zb => zb.AreaId == (uint)zid);
+                if (z == null) continue;
+
+                float xLo = Math.Min(z.LocBottom, z.LocTop);
+                float xHi = Math.Max(z.LocBottom, z.LocTop);
+                float yLo = Math.Min(z.LocRight, z.LocLeft);
+                float yHi = Math.Max(z.LocRight, z.LocLeft);
+
+                parts.Add(FormattableString.Invariant(
+                    $"(c.map = {z.MapId} AND c.position_x BETWEEN {xLo:F1} AND {xHi:F1} AND c.position_y BETWEEN {yLo:F1} AND {yHi:F1})"));
+            }
+        }
+
+        return parts.Count > 0 ? "(" + string.Join(" OR ", parts) + ")" : null;
+    }
+
     // ===================== BATCH PREVIEW =====================
 
     [HttpPost]
@@ -378,11 +506,13 @@ public class LootifierController : Controller
                 p1.Add("dRanks", request.creatureRanks);
             }
         }
-        if (request.mapIds != null && request.mapIds.Length > 0)
+        var locWhere1 = BuildLocationWhere(request, "dMapIds");
+        if (locWhere1 != null)
         {
             j1.Add("JOIN creature c ON c.id = ct.entry");
-            w1.Add("c.map IN @dMapIds");
-            p1.Add("dMapIds", request.mapIds);
+            w1.Add(locWhere1);
+            if (request.mapIds != null && request.mapIds.Length > 0)
+                p1.Add("dMapIds", request.mapIds);
         }
 
         var directSql = $@"SELECT DISTINCT
@@ -425,11 +555,13 @@ public class LootifierController : Controller
         }
 
         string mapJoin2 = "";
-        if (request.mapIds != null && request.mapIds.Length > 0)
+        var locWhere2 = BuildLocationWhere(request, "rMapIds");
+        if (locWhere2 != null)
         {
             mapJoin2 = "JOIN creature c ON c.id = ct.entry";
-            w2.Add("c.map IN @rMapIds");
-            p2.Add("rMapIds", request.mapIds);
+            w2.Add(locWhere2);
+            if (request.mapIds != null && request.mapIds.Length > 0)
+                p2.Add("rMapIds", request.mapIds);
         }
 
         var refSql = $@"SELECT DISTINCT
@@ -479,10 +611,14 @@ public class LootifierController : Controller
                 iconMap[did] = _dbc.GetItemIconPath(did);
         }
 
+        // NOTE: distinctBaseItems is the true item_template creation multiplier
+        // now that BatchCommit dedups variant generation per base item.
+        int distinctBaseItems = rows.Select(r => (int)r.itemEntry).Distinct().Count();
+
         return Json(new
         {
             success = true,
-            totalItems = rows.Select(r => (int)r.itemEntry).Distinct().Count(),
+            totalItems = distinctBaseItems,
             totalCreatures = byCreature.Count,
             creatures = byCreature,
             icons = iconMap,
@@ -550,7 +686,7 @@ public class LootifierController : Controller
         return Json(new { success = true, items = sampleResults, legendary = legendaryPreview });
     }
 
-    // ===================== BATCH COMMIT (optimized with transactions + cached schema) =====================
+    // ===================== BATCH COMMIT (dedup + scoped refs) =====================
 
     // Cached column list — fetched once per app lifetime
     private static List<string>? _cachedItemColumns;
@@ -578,6 +714,7 @@ public class LootifierController : Controller
         using var adminConn = _db.Admin();
 
         await EnsureTrackingTables(adminConn);
+        _poolWarnings = new List<string>();
 
         // Pre-cache column list
         var columns = await GetItemColumns(mangosConn);
@@ -586,106 +723,141 @@ public class LootifierController : Controller
         int totalItemsCreated = 0;
         int totalLootRowsCreated = 0;
         int creaturesProcessed = 0;
+        int pairsSkipped = 0;
+
+        // ── DEDUP STATE ──
+        // One variant set per distinct base item for the whole batch.
+        // Value is null when the item was inspected and found ineligible.
+        var variantCache = new Dictionary<int, (List<int> entries, CommitRoll[] rolls)?>();
+
+        // Each (lootId, baseItem) pair is expanded at most once — covers
+        // creatures sharing a loot_id within this run, and previous runs
+        // via the tracking table (idempotent re-commit).
+        var expandedPairs = await LoadExpandedPairs(adminConn);
 
         // Batch tracking rows for bulk insert
         var trackingItemRows = new List<(int genEntry, int baseEntry, int creatureEntry, float budgetPct, string tierName)>();
         var trackingLootRows = new List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>();
 
-        try
+        foreach (var creatureGroup in request.creatures)
         {
-            foreach (var creatureGroup in request.creatures)
+            int lootId = await mangosConn.ExecuteScalarAsync<int>(@"
+                SELECT loot_id FROM creature_template
+                WHERE entry = @E ORDER BY patch DESC LIMIT 1",
+                new { E = creatureGroup.creatureEntry });
+
+            if (lootId == 0) continue;
+
+            foreach (var itemEntry in creatureGroup.itemEntries)
             {
-                int lootId = await mangosConn.ExecuteScalarAsync<int>(@"
-                    SELECT loot_id FROM creature_template
-                    WHERE entry = @E ORDER BY patch DESC LIMIT 1",
-                    new { E = creatureGroup.creatureEntry });
+                // Skip pairs already expanded (this run or a previous one).
+                if (!expandedPairs.Add((lootId, itemEntry)))
+                {
+                    pairsSkipped++;
+                    continue;
+                }
 
-                if (lootId == 0) continue;
-
-                int nextId = await GetNextLootifierId(adminConn);
-
-                foreach (var itemEntry in creatureGroup.itemEntries)
+                // ── Variant set: generate once per base item, reuse everywhere ──
+                if (!variantCache.TryGetValue(itemEntry, out var cached))
                 {
                     var item = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
                         SELECT * FROM item_template
                         WHERE entry = @E AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = @E)",
                         new { E = itemEntry });
 
-                    if (item == null) continue;
+                    if (item == null)
+                    {
+                        variantCache[itemEntry] = null;
+                        continue;
+                    }
 
                     var analysis = AnalyzeItemStats(item);
                     bool hasStats = (int)analysis.totalStats > 0;
                     bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
-                    if (!hasStats && !hasSpellEffects) continue;
+                    if (!hasStats && !hasSpellEffects)
+                    {
+                        variantCache[itemEntry] = null;
+                        continue;
+                    }
 
                     var variants = GenerateVariants(item, analysis, ruleset);
-                    var createdEntries = new List<int>();
 
-                    foreach (var variant in variants)
+                    int nextId = await GetNextLootifierId(adminConn);
+                    var createdEntries = new List<int>();
+                    var commitRolls = new CommitRoll[variants.Count];
+
+                    for (int vi = 0; vi < variants.Count; vi++)
                     {
                         int newEntry = nextId++;
-                        var roll = VariantToCommitRoll(variant);
+                        var roll = VariantToCommitRoll(variants[vi]);
+                        commitRolls[vi] = roll;
 
                         await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll);
 
+                        // Attribution: the first creature that needed this item.
                         trackingItemRows.Add((newEntry, itemEntry, creatureGroup.creatureEntry, roll.budgetPct, roll.tierLabel ?? ""));
                         createdEntries.Add(newEntry);
                         totalItemsCreated++;
                     }
 
-                    var commitRolls = new CommitRoll[variants.Count];
-                    for (int ri = 0; ri < variants.Count; ri++)
-                        commitRolls[ri] = VariantToCommitRoll(variants[ri]);
-
-                    int lootRows = await ExpandLootTableFast(mangosConn, trackingLootRows, lootId,
-                        itemEntry, createdEntries, commitRolls, creatureGroup.creatureEntry);
-                    totalLootRowsCreated += lootRows;
-                }
-
-                creaturesProcessed++;
-
-                // Generate legendary if enabled (one per creature, random item)
-                if (ruleset.generateLegendary)
-                {
-                    try
+                    // ONE legendary per BASE ITEM (not per creature). Built here at
+                    // cache time so a shared item (e.g. Searing Blade dropped by many
+                    // mobs) gets a single legendary, named after the FIRST creature
+                    // that drops it, and reused everywhere. Folded into the cached
+                    // entries/rolls so every creature's pool includes the same one.
+                    var entriesList = createdEntries;
+                    var rollsList = commitRolls.ToList();
+                    if (ruleset.generateLegendary)
                     {
-                        var columns2 = await GetItemColumns(mangosConn);
-                        int legendaryCreated = await GenerateAndInsertLegendary(
-                            mangosConn, adminConn, columns2,
-                            creatureGroup.creatureEntry, lootId,
-                            creatureGroup.itemEntries.ToList(), ruleset,
-                            trackingItemRows, trackingLootRows);
-                        totalItemsCreated += legendaryCreated;
-                        totalLootRowsCreated += legendaryCreated;
+                        try
+                        {
+                            var leg = await BuildLegendaryItem(mangosConn, adminConn, columns,
+                                creatureGroup.creatureEntry, itemEntry, ruleset, trackingItemRows);
+                            if (leg.HasValue)
+                            {
+                                entriesList = new List<int>(createdEntries) { leg.Value.entry };
+                                rollsList = commitRolls.Append(leg.Value.roll).ToList();
+                                totalItemsCreated++;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"Legendary build failed for item {itemEntry}: {ex.Message}");
+                        }
                     }
-                    catch (Exception ex)
-                    {
-                        // Log but don't fail the whole batch for a legendary issue
-                        System.Diagnostics.Debug.WriteLine($"Legendary generation failed for creature {creatureGroup.creatureEntry}: {ex.Message}");
-                    }
+
+                    cached = (entriesList, rollsList.ToArray());
+                    variantCache[itemEntry] = cached;
                 }
 
-                // Flush tracking rows in batches of 500 to avoid huge SQL strings
-                if (trackingItemRows.Count >= 500)
-                {
-                    await FlushTrackingItems(adminConn, trackingItemRows);
-                    trackingItemRows.Clear();
-                }
-                if (trackingLootRows.Count >= 500)
-                {
-                    await FlushTrackingLoot(adminConn, trackingLootRows);
-                    trackingLootRows.Clear();
-                }
+                if (cached == null) continue; // ineligible base item
+
+                // The cached entries/rolls already include this base item's ONE
+                // legendary (built once at cache time), so every creature that
+                // shares the item reuses the same legendary — no per-creature dup.
+                int lootRows = await ExpandLootTable(mangosConn, adminConn, trackingLootRows,
+                    lootId, itemEntry, cached.Value.entries, cached.Value.rolls, creatureGroup.creatureEntry);
+                totalLootRowsCreated += lootRows;
             }
 
-            // Flush remaining
-            if (trackingItemRows.Count > 0) await FlushTrackingItems(adminConn, trackingItemRows);
-            if (trackingLootRows.Count > 0) await FlushTrackingLoot(adminConn, trackingLootRows);
+            creaturesProcessed++;
+
+            // Flush tracking rows in batches of 500 to avoid huge SQL strings
+            if (trackingItemRows.Count >= 500)
+            {
+                await FlushTrackingItems(adminConn, trackingItemRows);
+                trackingItemRows.Clear();
+            }
+            if (trackingLootRows.Count >= 500)
+            {
+                await FlushTrackingLoot(adminConn, trackingLootRows);
+                trackingLootRows.Clear();
+            }
         }
-        catch
-        {
-            throw;
-        }
+
+        // Flush remaining
+        if (trackingItemRows.Count > 0) await FlushTrackingItems(adminConn, trackingItemRows);
+        if (trackingLootRows.Count > 0) await FlushTrackingLoot(adminConn, trackingLootRows);
 
         await _audit.LogAsync(new AuditEntry
         {
@@ -696,13 +868,37 @@ public class LootifierController : Controller
             TargetType = "lootifier",
             TargetName = $"batch:{creaturesProcessed} creatures",
             StateBefore = "{}",
-            StateAfter = JsonSerializer.Serialize(new { totalItemsCreated, totalLootRowsCreated, creaturesProcessed }),
+            StateAfter = JsonSerializer.Serialize(new { totalItemsCreated, totalLootRowsCreated, creaturesProcessed, pairsSkipped }),
             IsReversible = true,
             Success = true,
-            Notes = $"Lootifier batch: {totalItemsCreated} variants + {totalLootRowsCreated} loot rows across {creaturesProcessed} creatures"
+            Notes = $"Lootifier batch: {totalItemsCreated} variants + {totalLootRowsCreated} loot rows across {creaturesProcessed} creatures ({pairsSkipped} already-expanded pairs skipped)"
         });
 
-        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, creaturesProcessed });
+        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, creaturesProcessed, pairsSkipped, warnings = _poolWarnings });
+    }
+
+    /// <summary>
+    /// Load (lootId, baseItem) pairs already pooled in previous commits so
+    /// re-running a batch never double-pools. The dedup key in BatchCommit is
+    /// (lootId, baseItemEntry); both pool-creation markers record exactly that:
+    /// 'pool_created' (direct → minted ref, loot_entry=lootId, item_entry=base)
+    /// and 'pool_joined' would use the ref entry, so we also seed from the
+    /// creature-side pointer marker. We therefore match on the creature-side
+    /// rows: 'pool_created' carries (lootId, base) directly.
+    /// </summary>
+    private async Task<HashSet<(int lootEntry, int itemEntry)>> LoadExpandedPairs(MySqlConnector.MySqlConnection adminConn)
+    {
+        var set = new HashSet<(int, int)>();
+        if (!await TableExists(adminConn, "lootifier_loot_entries")) return set;
+
+        // Direct-drop pools record (lootId, base) on the creature-side marker.
+        var direct = await adminConn.QueryAsync<dynamic>(@"
+            SELECT DISTINCT loot_entry, item_entry FROM lootifier_loot_entries
+            WHERE action_type = 'pool_created' AND loot_table = 'creature_loot_template'");
+        foreach (var r in direct)
+            set.Add(((int)r.loot_entry, (int)r.item_entry));
+
+        return set;
     }
 
     /// <summary>Bulk insert tracking items using multi-value INSERT.</summary>
@@ -737,6 +933,35 @@ public class LootifierController : Controller
         await adminConn.ExecuteAsync(sb.ToString());
     }
 
+    /// <summary>
+    /// Write one loot tracking row — buffered (batch path) or immediate (single path).
+    /// </summary>
+    private async Task TrackLoot(MySqlConnector.MySqlConnection adminConn,
+        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>? buffer,
+        int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)
+    {
+        if (buffer != null)
+        {
+            buffer.Add((creatureEntry, table, lootEntry, itemEntry, action, origChance, newChance));
+            return;
+        }
+
+        await adminConn.ExecuteAsync(@"
+            INSERT INTO lootifier_loot_entries
+                (creature_entry, loot_table, loot_entry, item_entry, action_type, original_chance, new_chance, created_at)
+            VALUES (@CE, @Table, @Entry, @Item, @Action, @OrigChance, @NewChance, NOW())",
+            new
+            {
+                CE = creatureEntry,
+                Table = table,
+                Entry = lootEntry,
+                Item = itemEntry,
+                Action = action,
+                OrigChance = origChance,
+                NewChance = newChance
+            });
+    }
+
     // ===================== COMMIT (single source) =====================
 
     [HttpPost]
@@ -749,6 +974,7 @@ public class LootifierController : Controller
         using var adminConn = _db.Admin();
 
         await EnsureTrackingTables(adminConn);
+        _poolWarnings = new List<string>();
 
         int lootId = await mangosConn.ExecuteScalarAsync<int>(@"
             SELECT loot_id FROM creature_template
@@ -799,36 +1025,43 @@ public class LootifierController : Controller
                 totalItemsCreated++;
             }
 
-            int lootRowsAdded = await ExpandLootTable(mangosConn, adminConn, lootId,
-                itemGroup.baseItemEntry, createdEntries, itemGroup.rolls, request.creatureEntry);
+            // Per-item legendary (single mode): one boss-named legendary for
+            // THIS base item, folded into its pool family via one call.
+            var poolEntries = createdEntries;
+            var poolRolls = itemGroup.rolls;
+            if (ruleset.generateLegendary)
+            {
+                try
+                {
+                    var leg = await BuildLegendaryItem(mangosConn, adminConn, null,
+                        request.creatureEntry, itemGroup.baseItemEntry, ruleset);
+                    if (leg.HasValue)
+                    {
+                        poolEntries = new List<int>(createdEntries) { leg.Value.entry };
+                        poolRolls = itemGroup.rolls.Append(leg.Value.roll).ToArray();
+                        totalItemsCreated++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Legendary build failed for creature {request.creatureEntry} item {itemGroup.baseItemEntry}: {ex.Message}");
+                }
+            }
+
+            // NOTE: re-commit of the same creature+item is idempotent: the pool
+            // is reused (prior 'pool_created' → same ref entry), members upserted
+            // and renormalized to 100. No compounding, no duplicate pointers.
+            int lootRowsAdded = await ExpandLootTable(mangosConn, adminConn, null,
+                lootId, itemGroup.baseItemEntry, poolEntries, poolRolls, request.creatureEntry);
             totalLootRowsCreated += lootRowsAdded;
 
             commitLog.Add(new
             {
                 baseItem = itemGroup.baseItemEntry,
                 baseName = (string)baseItem.name,
-                variantsCreated = createdEntries.Count,
+                variantsCreated = poolEntries.Count,
                 lootRowsAdded
             });
-        }
-
-        // Generate legendary if enabled (single mode: user picks which item via legendaryItemEntry)
-        if (ruleset.generateLegendary)
-        {
-            try
-            {
-                var allItemEntries = request.variants.Select(v => v.baseItemEntry).ToList();
-                int legendaryCreated = await GenerateAndInsertLegendary(
-                    mangosConn, adminConn, null,
-                    request.creatureEntry, lootId,
-                    allItemEntries, ruleset);
-                totalItemsCreated += legendaryCreated;
-                totalLootRowsCreated += legendaryCreated;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"Legendary generation failed for creature {request.creatureEntry}: {ex.Message}");
-            }
         }
 
         await _audit.LogAsync(new AuditEntry
@@ -846,7 +1079,7 @@ public class LootifierController : Controller
             Notes = $"Lootifier: {totalItemsCreated} variants + {totalLootRowsCreated} loot rows for creature {request.creatureEntry}"
         });
 
-        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, details = commitLog });
+        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, details = commitLog, warnings = _poolWarnings });
     }
 
     // ===================== ROLLBACK =====================
@@ -870,31 +1103,127 @@ public class LootifierController : Controller
             $"SELECT id, loot_table, loot_entry, item_entry, action_type, original_chance FROM lootifier_loot_entries {where}",
             new { CE = request.creatureEntry })).ToList();
 
-        int itemsRemoved = 0, lootRowsFixed = 0;
+        int itemsRemoved = 0, lootRowsFixed = 0, itemsKept = 0;
 
+        // Variant membership in a loot table is recorded as pool_member (direct
+        // mint) or pool_joined (ref join). Both mean "this item is referenced".
         foreach (var gi in generatedItems)
         {
+            int genEntry = (int)gi.generated_entry;
+
+            // Per-creature rollback: keep the item_template row if another
+            // creature's pool still points at it (shared variant sets).
+            if (request.creatureEntry > 0)
+            {
+                int otherRefs = await adminConn.ExecuteScalarAsync<int>(@"
+                    SELECT COUNT(*) FROM lootifier_loot_entries
+                    WHERE item_entry = @E AND action_type IN ('pool_member','pool_joined')
+                      AND creature_entry <> @CE",
+                    new { E = genEntry, CE = request.creatureEntry });
+
+                if (otherRefs > 0)
+                {
+                    itemsKept++;
+                    continue;
+                }
+            }
+
             await mangosConn.ExecuteAsync("DELETE FROM item_template WHERE entry = @E",
-                new { E = (int)gi.generated_entry });
+                new { E = genEntry });
             itemsRemoved++;
         }
 
+        // Restore loot in dependency order:
+        //   1. delete variant member rows (pool_member / pool_joined)
+        //   2. for pool_created: drop the minted pointer, delete the whole
+        //      minted ref group, and restore the base's original direct row.
+        // The creature-side 'pool_created' breadcrumb for a ref-JOIN pool has
+        // original_chance = -1 (sentinel): no direct row to restore, and the
+        // ref group is shared vanilla data, so we leave it — only the variant
+        // members (deleted in step 1) came from us.
         foreach (var le in lootEntries)
         {
             string table = (string)le.loot_table;
             string action = (string)le.action_type;
+            int lootEntry = (int)le.loot_entry;
+            int itemEntry = (int)le.item_entry;
 
-            if (action == "inserted")
+            if (action == "pool_member" || action == "pool_joined")
             {
                 await mangosConn.ExecuteAsync(
                     $"DELETE FROM `{table}` WHERE entry = @Entry AND item = @Item",
-                    new { Entry = (int)le.loot_entry, Item = (int)le.item_entry });
+                    new { Entry = lootEntry, Item = itemEntry });
+                lootRowsFixed++;
             }
-            else if (action == "modified")
+        }
+
+        // Restore base items whose share we split when joining an existing pool.
+        // original_chance holds the true pre-lootify share (from og_ baseline).
+        // Deduplicate: a base may have a pool_base row per creature that touched
+        // it — restore once to the recorded original, not cumulatively.
+        var restoredBases = new HashSet<(int, int)>();
+        foreach (var le in lootEntries)
+        {
+            if ((string)le.action_type != "pool_base") continue;
+            int refEntry = (int)le.loot_entry;
+            int baseItem = (int)le.item_entry;
+            if (!restoredBases.Add((refEntry, baseItem))) continue;
+
+            float origShare = (float)le.original_chance;
+            await mangosConn.ExecuteAsync(
+                "UPDATE reference_loot_template SET ChanceOrQuestChance = @Chance WHERE entry = @Entry AND item = @Item",
+                new { Chance = origShare, Entry = refEntry, Item = baseItem });
+            lootRowsFixed++;
+        }
+
+        foreach (var le in lootEntries)
+        {
+            if ((string)le.action_type != "pool_created") continue;
+            if ((string)le.loot_table != "creature_loot_template") continue;
+
+            int lootId = (int)le.loot_entry;         // creature loot_id
+            int baseItem = (int)le.item_entry;        // base item entry
+            float origChance = (float)le.original_chance;
+            // Fetch the pointer to learn the ref entry it points at.
+            var ptr = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
+                SELECT mincountOrRef, maxcount, patch_min, patch_max FROM creature_loot_template
+                WHERE entry = @LootId AND item = @Item AND mincountOrRef < 0",
+                new { LootId = lootId, Item = baseItem });
+
+            if (origChance < 0f)
             {
+                // Ref-JOIN breadcrumb: nothing minted, shared ref stays. Done.
+                lootRowsFixed++;
+                continue;
+            }
+
+            // Direct-mint pool: remove pointer, drop minted ref group, restore base.
+            if (ptr != null)
+            {
+                int refEntry = Math.Abs((int)ptr.mincountOrRef);
+
                 await mangosConn.ExecuteAsync(
-                    $"UPDATE `{table}` SET ChanceOrQuestChance = @Chance WHERE entry = @Entry AND item = @Item",
-                    new { Chance = (float)le.original_chance, Entry = (int)le.loot_entry, Item = (int)le.item_entry });
+                    "DELETE FROM creature_loot_template WHERE entry = @LootId AND item = @Item AND mincountOrRef < 0",
+                    new { LootId = lootId, Item = baseItem });
+
+                // Only delete the minted ref if it's in our reserved range.
+                if (refEntry >= LOOTIFIER_REF_START)
+                    await mangosConn.ExecuteAsync(
+                        "DELETE FROM reference_loot_template WHERE entry = @Ref",
+                        new { Ref = refEntry });
+
+                await mangosConn.ExecuteAsync(@"
+                    INSERT IGNORE INTO creature_loot_template (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
+                    VALUES (@LootId, @Item, @Chance, 0, 1, @MaxCount, @PMin, @PMax)",
+                    new
+                    {
+                        LootId = lootId,
+                        Item = baseItem,
+                        Chance = origChance,
+                        MaxCount = ptr.maxcount != null ? (int)ptr.maxcount : 1,
+                        PMin = ptr.patch_min != null ? (int)ptr.patch_min : 0,
+                        PMax = ptr.patch_max != null ? (int)ptr.patch_max : 10
+                    });
             }
             lootRowsFixed++;
         }
@@ -910,14 +1239,14 @@ public class LootifierController : Controller
             Action = "lootifier_rollback",
             TargetType = "lootifier",
             TargetName = request.creatureEntry > 0 ? $"creature:{request.creatureEntry}" : "all",
-            StateBefore = JsonSerializer.Serialize(new { itemsRemoved, lootRowsFixed }),
+            StateBefore = JsonSerializer.Serialize(new { itemsRemoved, itemsKept, lootRowsFixed }),
             StateAfter = "{}",
             IsReversible = false,
             Success = true,
-            Notes = $"Lootifier rollback: {itemsRemoved} items removed, {lootRowsFixed} loot entries restored"
+            Notes = $"Lootifier rollback: {itemsRemoved} items removed ({itemsKept} kept — shared), {lootRowsFixed} loot entries restored"
         });
 
-        return Json(new { success = true, itemsRemoved, lootRowsFixed });
+        return Json(new { success = true, itemsRemoved, itemsKept, lootRowsFixed });
     }
 
     // ===================== STATUS =====================
@@ -963,6 +1292,11 @@ public class LootifierController : Controller
         }
 
         float maxBudget = baseBudget * (1 + ruleset.budgetCeilingPct / 100f);
+        // Anchor the variant budget floor a hair above base (1.02×) so even the
+        // lowest roll is a mild upgrade rather than a below-base sidegrade. Tiers
+        // subdivide the headroom [floor, maxBudget] rather than [0, maxBudget].
+        float floorBudget = Math.Min(baseBudget * 1.02f, maxBudget);
+        float budgetSpan = Math.Max(0f, maxBudget - floorBudget);
 
         // ── Phase 1: Allocate variant slots per tier (proportional to tier width) ──
         var tierAllocations = AllocateTierSlots(tiers, numVariants);
@@ -995,9 +1329,9 @@ public class LootifierController : Controller
 
             for (int s = 0; s < slotsForTier; s++)
             {
-                // Roll budget within this tier's range
-                float tierMinBudget = maxBudget * (tier.minPct / 100f);
-                float tierMaxBudget = maxBudget * (Math.Min(tier.maxPct, 100f) / 100f);
+                // Roll budget within this tier's range (anchored at floorBudget)
+                float tierMinBudget = floorBudget + budgetSpan * (tier.minPct / 100f);
+                float tierMaxBudget = floorBudget + budgetSpan * (Math.Min(tier.maxPct, 100f) / 100f);
                 float budgetRoll = tierMinBudget + (float)rng.NextDouble() * (tierMaxBudget - tierMinBudget);
                 float budgetPct = maxBudget > 0 ? (budgetRoll / maxBudget) * 100f : 0;
 
@@ -1388,110 +1722,6 @@ public class LootifierController : Controller
                 new { Entry = newEntry });
         }
     }
-    private async Task<int> ExpandLootTableFast(MySqlConnector.MySqlConnection mangosConn,
-        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)> trackingRows,
-        int lootId, int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls, int creatureEntry)
-    {
-        int rowsAdded = 0;
-
-        var directRow = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
-            SELECT entry, item, ChanceOrQuestChance AS chance, groupid, mincountOrRef, maxcount, patch_min, patch_max
-            FROM creature_loot_template
-            WHERE entry = @LootId AND item = @Item AND mincountOrRef > 0",
-            new { LootId = lootId, Item = baseItemEntry });
-
-        if (directRow != null)
-            return await ExpandIntoGroupFast(mangosConn, trackingRows, "creature_loot_template",
-                directRow, variantEntries, rolls, creatureEntry);
-
-        var refPtrs = await mangosConn.QueryAsync<dynamic>(@"
-            SELECT entry, item, mincountOrRef FROM creature_loot_template
-            WHERE entry = @LootId AND mincountOrRef < 0",
-            new { LootId = lootId });
-
-        foreach (var ptr in refPtrs)
-        {
-            int refEntry = Math.Abs((int)ptr.mincountOrRef);
-            var refRow = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
-                SELECT entry, item, ChanceOrQuestChance AS chance, groupid, mincountOrRef, maxcount, patch_min, patch_max
-                FROM reference_loot_template
-                WHERE entry = @RefEntry AND item = @Item",
-                new { RefEntry = refEntry, Item = baseItemEntry });
-
-            if (refRow != null)
-            {
-                rowsAdded = await ExpandIntoGroupFast(mangosConn, trackingRows, "reference_loot_template",
-                    refRow, variantEntries, rolls, creatureEntry);
-                break;
-            }
-        }
-
-        return rowsAdded;
-    }
-
-    private async Task<int> ExpandIntoGroupFast(MySqlConnector.MySqlConnection mangosConn,
-        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)> trackingRows,
-        string tableName, dynamic baseRow, List<int> variantEntries, CommitRoll[] rolls, int creatureEntry)
-    {
-        int rowsAdded = 0;
-        int groupId = (int)baseRow.groupid;
-        int lootEntry = (int)baseRow.entry;
-        float originalChance = (float)baseRow.chance;
-
-        var groupItems = (await mangosConn.QueryAsync<dynamic>(
-            $"SELECT item, ChanceOrQuestChance AS chance FROM `{tableName}` WHERE entry = @Entry AND groupid = @GroupId",
-            new { Entry = lootEntry, GroupId = groupId })).ToList();
-
-        float baseShare;
-        if (originalChance == 0)
-        {
-            float explicitTotal = groupItems.Where(i => (float)i.chance > 0).Sum(i => (float)i.chance);
-            int equalItems = groupItems.Count(i => (float)i.chance == 0);
-            baseShare = equalItems > 0 ? (100f - explicitTotal) / equalItems : 0;
-        }
-        else
-        {
-            baseShare = Math.Abs(originalChance);
-        }
-
-        float originalNewShare = baseShare * 0.40f;
-        float variantBudget = baseShare - originalNewShare;
-
-        float[] variantWeights = new float[rolls.Length];
-        for (int i = 0; i < rolls.Length; i++)
-            variantWeights[i] = Math.Max(0.1f, 100f - rolls[i].budgetPct);
-        float weightSum = variantWeights.Sum();
-
-        // Track the modification (collected, not inserted yet)
-        trackingRows.Add((creatureEntry, tableName, lootEntry, (int)baseRow.item, "modified", originalChance, originalNewShare));
-
-        await mangosConn.ExecuteAsync(
-            $"UPDATE `{tableName}` SET ChanceOrQuestChance = @Chance WHERE entry = @Entry AND item = @Item AND groupid = @GroupId",
-            new { Chance = originalNewShare, Entry = lootEntry, Item = (int)baseRow.item, GroupId = groupId });
-
-        for (int i = 0; i < variantEntries.Count && i < rolls.Length; i++)
-        {
-            float variantChance = (float)Math.Round(variantBudget * (variantWeights[i] / weightSum), 4);
-
-            await mangosConn.ExecuteAsync(
-                $@"INSERT IGNORE INTO `{tableName}` (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
-                   VALUES (@Entry, @Item, @Chance, @GroupId, 1, 1, @PMin, @PMax)",
-                new
-                {
-                    Entry = lootEntry,
-                    Item = variantEntries[i],
-                    Chance = variantChance,
-                    GroupId = groupId,
-                    PMin = (int)baseRow.patch_min,
-                    PMax = (int)baseRow.patch_max
-                });
-
-            trackingRows.Add((creatureEntry, tableName, lootEntry, variantEntries[i], "inserted", 0, variantChance));
-            rowsAdded++;
-        }
-
-        return rowsAdded;
-    }
 
     // The original InsertVariantItem (used by single-source commit, unchanged)
 
@@ -1695,49 +1925,51 @@ public class LootifierController : Controller
     }
 
     /// <summary>
-    /// Generate and insert a single legendary variant for a creature.
-    /// Picks one item (user-chosen or random), creates a 150% budget legendary with boss name.
-    /// Inserts directly into creature_loot_template at the configured effective drop %.
+    /// Build ONE boss-named legendary item for a specific base item and return
+    /// its (entry, roll) so the caller can fold it into that base item's pool
+    /// family alongside the normal variants — in a SINGLE JoinExistingPool /
+    /// CreatePoolFromDirect call. This is what keeps the legendary from
+    /// double-claiming the family budget (the old per-creature pass ran a
+    /// separate pooling call and grabbed the whole variant remainder).
+    ///
+    /// New philosophy: one legendary PER lootified item (not one per creature).
+    /// The legendary is a 150%-budget variant; PoolWeight(150) floors to 1, so
+    /// it lands as the rarest member of its family.
+    ///
+    /// No loot-table writes here — returns null if the item can't be built.
     /// </summary>
-    private async Task<int> GenerateAndInsertLegendary(
+    private async Task<(int entry, CommitRoll roll)?> BuildLegendaryItem(
         MySqlConnector.MySqlConnection mangosConn,
         MySqlConnector.MySqlConnection adminConn,
-        List<string> columns,
-        int creatureEntry, int lootId,
-        List<int> eligibleItemEntries, RulesetDto ruleset,
+        List<string>? columns,
+        int creatureEntry, int baseItemEntry, RulesetDto ruleset,
         List<(int genEntry, int baseEntry, int creatureEntry, float budgetPct, string tierName)>? trackingItemRows = null,
-        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>? trackingLootRows = null)
+        bool? isShared = null)
     {
-        if (eligibleItemEntries.Count == 0) return 0;
-
         var rng = new Random();
 
-        // Pick the item: user-chosen (legendaryItemEntry > 0) or random
-        int chosenEntry = ruleset.legendaryItemEntry > 0 && eligibleItemEntries.Contains(ruleset.legendaryItemEntry)
-            ? ruleset.legendaryItemEntry
-            : eligibleItemEntries[rng.Next(eligibleItemEntries.Count)];
-
-        // Load base item
         var item = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
             SELECT * FROM item_template
             WHERE entry = @E AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = @E)",
-            new { E = chosenEntry });
-        if (item == null) return 0;
+            new { E = baseItemEntry });
+        if (item == null) return null;
 
-        // Load creature name for boss naming
         var creature = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
             SELECT name FROM creature_template
             WHERE entry = @E AND patch = (SELECT MAX(patch) FROM creature_template ct2 WHERE ct2.entry = @E)",
             new { E = creatureEntry });
         string bossName = creature != null ? (string)creature.name : $"Boss #{creatureEntry}";
 
-        // Analyze the item
+        // Shared = dropped by more than one creature. If the caller didn't decide,
+        // count distinct creatures whose loot (direct or via reference) yields this
+        // item. Shared items get the generic suffix (no single creature to name).
+        bool shared = isShared ?? await IsSharedDropItem(mangosConn, baseItemEntry);
+
         var analysis = AnalyzeItemStats(item);
         bool hasStats = (int)analysis.totalStats > 0;
         bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
-        if (!hasStats && !hasSpellEffects) return 0;
+        if (!hasStats && !hasSpellEffects) return null;
 
-        // Roll stats at 150% of base budget
         float baseBudget = (float)analysis.weightedBudget;
         if (!hasStats && hasSpellEffects)
             baseBudget = EstimateBudgetFromItemLevel(GetPropInt(item, "item_level"));
@@ -1751,28 +1983,23 @@ public class LootifierController : Controller
         foreach (var s in familyStats) eligible.Add(s);
         var eligibleList = eligible.ToList();
 
-        List<StatRoll> stats;
-        if (hasStats)
-            stats = RollStats(rng, legendaryBudget, presentTypes, eligibleList, analysis, ruleset);
-        else
-            stats = RollStatsForSpellItem(rng, legendaryBudget, eligibleList, family);
+        List<StatRoll> stats = hasStats
+            ? RollStats(rng, legendaryBudget, presentTypes, eligibleList, analysis, ruleset)
+            : RollStatsForSpellItem(rng, legendaryBudget, eligibleList, family);
 
-        // Build legendary name
         string itemName = (string)item.name;
-        string legendaryName = BuildLegendaryName(bossName, itemName, family, ruleset);
+        string legendaryName = BuildLegendaryName(bossName, itemName, family, ruleset, forceSuffix: shared);
 
-        // Create the commit roll
         var roll = new CommitRoll
         {
-            budgetPct = 150f, // over 100% — this is legendary territory
+            budgetPct = 150f,
             tierLabel = legendaryName.Contains(itemName)
                 ? legendaryName.Replace(itemName, "").Trim()
                 : legendaryName,
-            tierPosition = "full", // special: name is fully replaced
+            tierPosition = "full",
             stats = stats.Select(s => new CommitStat { statType = s.statType, statValue = s.statValue }).ToArray()
         };
 
-        // Get next ID and insert
         int newEntry = await GetNextLootifierId(adminConn);
 
         if (columns != null)
@@ -1780,20 +2007,17 @@ public class LootifierController : Controller
         else
             await InsertVariantItem(mangosConn, item, newEntry, roll);
 
-        // Override the name completely (InsertVariantItem builds prefix/suffix, but legendary needs full name)
         await mangosConn.ExecuteAsync(
-            "UPDATE item_template SET name = @Name, quality = 5 WHERE entry = @Entry",
+            "UPDATE item_template SET name = @Name, quality = 5, DisenchantID = 0 WHERE entry = @Entry",
             new { Name = legendaryName, Entry = newEntry });
 
-        // Gold multiplier for legendary: 3x
         await mangosConn.ExecuteAsync(
             "UPDATE item_template SET buy_price = ROUND(buy_price * 3), sell_price = ROUND(sell_price * 3) WHERE entry = @Entry",
             new { Entry = newEntry });
 
-        // Track the generated item
         if (trackingItemRows != null)
         {
-            trackingItemRows.Add((newEntry, chosenEntry, creatureEntry, 150f, "Legendary"));
+            trackingItemRows.Add((newEntry, baseItemEntry, creatureEntry, 150f, "Legendary"));
         }
         else
         {
@@ -1801,39 +2025,23 @@ public class LootifierController : Controller
                 INSERT INTO lootifier_generated_items
                     (generated_entry, base_entry, creature_entry, budget_pct, tier_name, created_at)
                 VALUES (@GenEntry, @BaseEntry, @CreatureEntry, 150, 'Legendary', NOW())",
-                new { GenEntry = newEntry, BaseEntry = chosenEntry, CreatureEntry = creatureEntry });
+                new { GenEntry = newEntry, BaseEntry = baseItemEntry, CreatureEntry = creatureEntry });
         }
 
-        // Insert into loot table as a direct drop at the configured effective %
-        // Use a high group ID to avoid conflicts with existing groups
-        int legendaryGroupId = 99;
-        float dropChance = ruleset.legendaryDropPct;
-
-        await mangosConn.ExecuteAsync(@"
-            INSERT IGNORE INTO creature_loot_template (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
-            VALUES (@Entry, @Item, @Chance, @GroupId, 1, 1, 0, 10)",
-            new { Entry = lootId, Item = newEntry, Chance = dropChance, GroupId = legendaryGroupId });
-
-        // Track the loot insertion
-        if (trackingLootRows != null)
-        {
-            trackingLootRows.Add((creatureEntry, "creature_loot_template", lootId, newEntry, "inserted", 0, dropChance));
-        }
-        else
-        {
-            await adminConn.ExecuteAsync(@"
-                INSERT INTO lootifier_loot_entries
-                    (creature_entry, loot_table, loot_entry, item_entry, action_type, original_chance, new_chance, created_at)
-                VALUES (@CE, 'creature_loot_template', @Entry, @Item, 'inserted', 0, @Chance, NOW())",
-                new { CE = creatureEntry, Entry = lootId, Item = newEntry, Chance = dropChance });
-        }
-
-        return 1;
+        return (newEntry, roll);
     }
 
     /// <summary>Build the legendary item name from boss name + item name.</summary>
-    private string BuildLegendaryName(string bossName, string itemName, string family, RulesetDto ruleset)
+    private string BuildLegendaryName(string bossName, string itemName, string family, RulesetDto ruleset, bool forceSuffix = false)
     {
+        // Shared / non-unique items (dropped by many creatures) get NO creature
+        // name — there's no single creature to name them after. Use the generic
+        // family suffix ("of Destruction" etc.) so the name is stable regardless
+        // of how many mobs drop it. Only truly unique-drop items keep the
+        // possessive creature name.
+        if (forceSuffix)
+            return itemName + " " + GenericLegendarySuffix(family, ruleset);
+
         // Check if boss name overlaps with item name (any word ≥ 4 chars in common)
         var bossWords = bossName.Split(' ', StringSplitOptions.RemoveEmptyEntries)
             .Select(w => w.Trim('\'', '\u2018', '\u2019', ',', '.').ToLowerInvariant())
@@ -1851,15 +2059,7 @@ public class LootifierController : Controller
         {
             // Item already references the boss (e.g., "Smite's Mighty Reaper")
             // Use family-appropriate suffix
-            string suffix = family switch
-            {
-                "physical" => ruleset.legendarySuffixMelee,
-                "caster" => ruleset.legendarySuffixCaster,
-                _ => ruleset.legendarySuffixMelee // hybrid defaults to melee
-            };
-            // Check item class for ranged weapons
-            // (We don't have item class here easily, so hybrid check is enough)
-            return itemName + " " + suffix;
+            return itemName + " " + GenericLegendarySuffix(family, ruleset);
         }
         else
         {
@@ -1872,6 +2072,49 @@ public class LootifierController : Controller
         }
     }
 
+    /// <summary>Generic family-appropriate legendary suffix from the ruleset.</summary>
+    private string GenericLegendarySuffix(string family, RulesetDto ruleset) => family switch
+    {
+        "physical" => ruleset.legendarySuffixMelee,
+        "caster" => ruleset.legendarySuffixCaster,
+        _ => ruleset.legendarySuffixMelee // hybrid defaults to melee
+    };
+
+    /// <summary>
+    /// True if a base item is dropped by more than one creature — directly in
+    /// creature_loot_template, or via a reference_loot_template pool that any
+    /// creature points at. Used to decide legendary naming: shared items get a
+    /// generic suffix (no single creature to name), unique drops get the name.
+    /// </summary>
+    private async Task<bool> IsSharedDropItem(MySqlConnector.MySqlConnection mangosConn, int itemEntry)
+    {
+        // Loot ids that yield this item directly.
+        var directLootIds = (await mangosConn.QueryAsync<int>(
+            "SELECT DISTINCT entry FROM creature_loot_template WHERE item = @I AND mincountOrRef > 0",
+            new { I = itemEntry })).ToList();
+
+        // Reference entries that contain this item, and the loot ids that point to them.
+        var refEntries = (await mangosConn.QueryAsync<int>(
+            "SELECT DISTINCT entry FROM reference_loot_template WHERE item = @I",
+            new { I = itemEntry })).ToList();
+
+        var refLootIds = new List<int>();
+        if (refEntries.Count > 0)
+            refLootIds = (await mangosConn.QueryAsync<int>(
+                "SELECT DISTINCT entry FROM creature_loot_template WHERE mincountOrRef < 0 AND ABS(mincountOrRef) IN @Refs",
+                new { Refs = refEntries })).ToList();
+
+        var allLootIds = directLootIds.Concat(refLootIds).Distinct().ToList();
+        if (allLootIds.Count == 0) return false;
+
+        // Distinct creatures using any of those loot ids.
+        int creatureCount = await mangosConn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(DISTINCT entry) FROM creature_template WHERE loot_id IN @Ids",
+            new { Ids = allLootIds });
+
+        return creatureCount > 1;
+    }
+
     private float GetGoldMultiplier(float budgetPct)
     {
         if (budgetPct >= 98) return 2.0f;
@@ -1881,12 +2124,27 @@ public class LootifierController : Controller
         return 1.01f + t * 0.58f;
     }
 
-    private async Task<int> ExpandLootTable(MySqlConnector.MySqlConnection mangosConn,
-        MySqlConnector.MySqlConnection adminConn, int lootId, int baseItemEntry,
-        List<int> variantEntries, CommitRoll[] rolls, int creatureEntry)
-    {
-        int rowsAdded = 0;
+    // ══════════════════════════════════════════════════════════════
+    //  WEIGHTED POOL EXPANSION (v5)
+    // ══════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Pool a creature's loot for one base item: base + variants become a
+    /// single weighted group that always resolves to exactly one pick.
+    /// - Ref-sourced (base already in a reference group) → add variants to that
+    ///   same ref group, renormalize the whole group to sum 100 ('pool_joined').
+    /// - Direct-drop → mint a reference group, move base in, add variants,
+    ///   normalize to 100, replace base's direct row with a 100%/1 pointer
+    ///   ('pool_created').
+    /// trackingRows == null → tracking rows written immediately (single path);
+    /// otherwise buffered for bulk flush (batch path).
+    /// Returns the number of variant members added.
+    /// </summary>
+    private async Task<int> ExpandLootTable(MySqlConnector.MySqlConnection mangosConn,
+        MySqlConnector.MySqlConnection adminConn,
+        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>? trackingRows,
+        int lootId, int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls, int creatureEntry)
+    {
         var directRow = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
             SELECT entry, item, ChanceOrQuestChance AS chance, groupid, mincountOrRef, maxcount, patch_min, patch_max
             FROM creature_loot_template
@@ -1894,11 +2152,12 @@ public class LootifierController : Controller
             new { LootId = lootId, Item = baseItemEntry });
 
         if (directRow != null)
-            return await ExpandIntoGroup(mangosConn, adminConn, "creature_loot_template",
-                directRow, variantEntries, rolls, creatureEntry);
+            return await CreatePoolFromDirect(mangosConn, adminConn, trackingRows,
+                lootId, directRow, baseItemEntry, variantEntries, rolls, creatureEntry);
 
+        // Ref-sourced: find the reference group the base lives in, join it.
         var refPtrs = await mangosConn.QueryAsync<dynamic>(@"
-            SELECT entry, item, mincountOrRef FROM creature_loot_template
+            SELECT mincountOrRef FROM creature_loot_template
             WHERE entry = @LootId AND mincountOrRef < 0",
             new { LootId = lootId });
 
@@ -1913,93 +2172,333 @@ public class LootifierController : Controller
 
             if (refRow != null)
             {
-                rowsAdded = await ExpandIntoGroup(mangosConn, adminConn, "reference_loot_template",
-                    refRow, variantEntries, rolls, creatureEntry);
-                break;
+                int added = await JoinExistingPool(mangosConn, adminConn, trackingRows,
+                    refRow, baseItemEntry, variantEntries, rolls, creatureEntry);
+
+                // Creature-side breadcrumb so LoadExpandedPairs dedups this
+                // (lootId, base) on future runs — mirrors the direct-drop marker.
+                await TrackLoot(adminConn, trackingRows, creatureEntry, "creature_loot_template",
+                    lootId, baseItemEntry, "pool_created", -1, (int)refRow.entry);
+
+                return added;
             }
         }
 
-        return rowsAdded;
+        return 0;
     }
 
-    private async Task<int> ExpandIntoGroup(MySqlConnector.MySqlConnection mangosConn,
-        MySqlConnector.MySqlConnection adminConn, string tableName,
-        dynamic baseRow, List<int> variantEntries, CommitRoll[] rolls, int creatureEntry)
+    /// <summary>
+    /// Relative pool weight for a member from its budget %. Low-tier variants
+    /// common, "of the Gods"/legendary rare. Returned as a raw weight; callers
+    /// distribute a fixed budget across these, then apply the member floor.
+    /// </summary>
+    private static float PoolWeight(float budgetPct) => Math.Max(1f, 105f - budgetPct);
+
+    /// <summary>
+    /// Distribute a family's variant budget across N members by raw weight,
+    /// enforcing MEMBER_FLOOR_PCT: any member the weighted split pushes below
+    /// the floor snaps up to it, and the excess is taken proportionally from
+    /// the members still above the floor. Iterates until stable.
+    ///
+    /// Returns null (does NOT floor) if the budget cannot legally seat every
+    /// member at the floor (count * floor > budget) — caller warns and falls
+    /// back to an unfloored proportional split so the pool stays valid.
+    /// The returned array sums to exactly `budget`.
+    /// </summary>
+    private static float[]? DistributeWithFloor(float[] rawWeights, float budget, float floor)
     {
-        int rowsAdded = 0;
-        int groupId = (int)baseRow.groupid;
-        int lootEntry = (int)baseRow.entry;
-        float originalChance = (float)baseRow.chance;
+        int n = rawWeights.Length;
+        if (n == 0) return Array.Empty<float>();
 
-        var groupItems = (await mangosConn.QueryAsync<dynamic>(
-            $"SELECT item, ChanceOrQuestChance AS chance FROM `{tableName}` WHERE entry = @Entry AND groupid = @GroupId",
-            new { Entry = lootEntry, GroupId = groupId })).ToList();
+        // Capacity check: can't give everyone the floor out of this budget.
+        if (floor * n > budget + 1e-4f) return null;
 
-        float baseShare;
-        if (originalChance == 0)
+        var share = new float[n];
+        var locked = new bool[n]; // locked = pinned at floor
+        float rawSum = rawWeights.Sum();
+        if (rawSum <= 0f) rawSum = n; // equal split fallback
+
+        // Iteratively pin sub-floor members and redistribute the remainder.
+        for (int pass = 0; pass < n + 1; pass++)
         {
-            float explicitTotal = groupItems.Where(i => (float)i.chance > 0).Sum(i => (float)i.chance);
-            int equalItems = groupItems.Count(i => (float)i.chance == 0);
-            baseShare = equalItems > 0 ? (100f - explicitTotal) / equalItems : 0;
+            float lockedTotal = 0f, freeWeight = 0f;
+            for (int i = 0; i < n; i++)
+            {
+                if (locked[i]) lockedTotal += floor;
+                else freeWeight += (rawSum > 0 ? rawWeights[i] : 1f);
+            }
+            float freeBudget = budget - lockedTotal;
+
+            bool changed = false;
+            for (int i = 0; i < n; i++)
+            {
+                if (locked[i]) { share[i] = floor; continue; }
+                float w = rawSum > 0 ? rawWeights[i] : 1f;
+                float s = freeWeight > 0 ? freeBudget * (w / freeWeight) : freeBudget / n;
+                if (s < floor)
+                {
+                    locked[i] = true;
+                    changed = true;
+                }
+                else share[i] = s;
+            }
+            if (!changed) break;
+        }
+
+        // Round to 4dp and fix residual on the largest free (unlocked) member,
+        // or the largest overall if all are locked.
+        int largest = 0;
+        for (int i = 0; i < n; i++)
+        {
+            share[i] = (float)Math.Round(Math.Max(floor, share[i]), 4);
+            if (share[i] > share[largest]) largest = i;
+        }
+        float total = share.Sum();
+        share[largest] = (float)Math.Round(share[largest] + (budget - total), 4);
+        if (share[largest] < floor) share[largest] = floor;
+        return share;
+    }
+
+    /// <summary>
+    /// Ref-sourced base: fold this base item's variants into its EXISTING
+    /// reference pool, preserving every base item's ORIGINAL share.
+    ///
+    /// The pool's true vanilla shares come from vmangos_admin.og_reference_
+    /// loot_template (the LootTuner baseline), NOT the live table — the live
+    /// table may already be mid-lootify and reading it would compound the
+    /// dilution across successive base items in the same pool.
+    ///
+    /// Model ("preserve each base's original share"):
+    ///   - Each ORIGINAL pool member owns its og_ share (e.g. Cape 30, Cruel 20).
+    ///   - Lootifying base B floors B to BASE_FLOOR_PCT (rare fallback); B's
+    ///     variants + legendary split the rest of B's share, no member below
+    ///     MEMBER_FLOOR_PCT (floor + redistribute within the family).
+    ///   - Every OTHER original member keeps its og_ share untouched.
+    ///   - Result still sums to 100 (og_ pool summed to 100; we only
+    ///     redistribute within one member's slice).
+    ///
+    /// Idempotent + rollback-safe: og_ is the source of truth, so re-running
+    /// recomputes identically, and rollback restores base shares from og_.
+    /// </summary>
+    private async Task<int> JoinExistingPool(MySqlConnector.MySqlConnection mangosConn,
+        MySqlConnector.MySqlConnection adminConn,
+        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>? trackingRows,
+        dynamic refRow, int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls, int creatureEntry)
+    {
+        int refEntry = (int)refRow.entry;
+        int groupId = (int)refRow.groupid;
+        int pMin = (int)refRow.patch_min;
+        int pMax = (int)refRow.patch_max;
+
+        // Original vanilla share of THIS base item, from the frozen baseline.
+        float baseOrigShare = await GetOgRefShare(mangosConn, refEntry, groupId, baseItemEntry);
+        if (baseOrigShare <= 0f)
+        {
+            // Base not in the og_ pool (or no baseline) — fall back to the live
+            // share so we still do something sane rather than nothing.
+            var liveChance = await mangosConn.ExecuteScalarAsync<float?>(
+                "SELECT ChanceOrQuestChance FROM reference_loot_template WHERE entry=@E AND item=@I AND groupid=@G",
+                new { E = refEntry, I = baseItemEntry, G = groupId });
+            baseOrigShare = Math.Max(MIN_POOL_CHANCE, Math.Abs(liveChance ?? 100f));
+        }
+
+        // v6 split: base becomes a RARE fallback at BASE_FLOOR_PCT; the
+        // variants + legendary take the rest of this base's original share.
+        // The base floor is special — exempt from the member floor.
+        float baseKeep = Math.Min(BASE_FLOOR_PCT, baseOrigShare); // never exceed the slice
+        float variantPool = Math.Max(0f, baseOrigShare - baseKeep);
+
+        int memberCount = Math.Min(variantEntries.Count, rolls.Length);
+        var rawWeights = new float[memberCount];
+        for (int i = 0; i < memberCount; i++)
+            rawWeights[i] = PoolWeight(rolls[i].budgetPct);
+
+        // Floor + redistribute so nothing sits below MEMBER_FLOOR_PCT.
+        var shares = DistributeWithFloor(rawWeights, variantPool, MEMBER_FLOOR_PCT);
+        if (shares == null)
+        {
+            // Family can't seat every member at the floor within its share.
+            // Warn and fall back to an unfloored proportional split (still valid,
+            // just some members below the ideal floor) rather than corrupting.
+            _poolWarnings?.Add(
+                $"Item {baseItemEntry}: {memberCount} variants can't all reach {MEMBER_FLOOR_PCT}% within its {baseOrigShare:0.##}% pool share — using unfloored split. Lower Variants per Item for this pool.");
+            shares = new float[memberCount];
+            float rawSum = rawWeights.Sum();
+            for (int i = 0; i < memberCount; i++)
+                shares[i] = rawSum > 0 ? variantPool * (rawWeights[i] / rawSum) : variantPool / memberCount;
+        }
+
+        // Write the base item at its floor share (repairs any prior crush).
+        await UpsertRefMember(mangosConn, refEntry, baseItemEntry, RoundChance(baseKeep), groupId, 1, pMin, pMax);
+        await TrackLoot(adminConn, trackingRows, creatureEntry, "reference_loot_template",
+            refEntry, baseItemEntry, "pool_base", baseOrigShare, baseKeep);
+
+        int added = 0;
+        for (int i = 0; i < memberCount; i++)
+        {
+            float share = Math.Max(MIN_POOL_CHANCE, RoundChance(shares[i]));
+            await UpsertRefMember(mangosConn, refEntry, variantEntries[i], share, groupId, 1, pMin, pMax);
+            await TrackLoot(adminConn, trackingRows, creatureEntry, "reference_loot_template",
+                refEntry, variantEntries[i], "pool_joined", 0, share);
+            added++;
+        }
+
+        return added;
+    }
+
+    /// <summary>Original share of an item in an og_reference_loot_template pool,
+    /// or 0 if no baseline row exists. Read cross-schema from vmangos_admin.</summary>
+    private async Task<float> GetOgRefShare(MySqlConnector.MySqlConnection mangosConn,
+        int refEntry, int groupId, int item)
+    {
+        try
+        {
+            var c = await mangosConn.ExecuteScalarAsync<float?>(@"
+                SELECT ChanceOrQuestChance FROM `vmangos_admin`.`og_reference_loot_template`
+                WHERE entry = @E AND item = @I AND groupid = @G",
+                new { E = refEntry, I = item, G = groupId });
+            return c.HasValue ? Math.Abs(c.Value) : 0f;
+        }
+        catch
+        {
+            return 0f; // og_ table missing → caller falls back to live share
+        }
+    }
+
+    private static float RoundChance(float v) => (float)Math.Round(v, 4);
+
+    /// <summary>
+    /// Insert-or-update one reference_loot_template member. Matches the
+    /// codebase's check-then-write style (no reliance on a specific unique
+    /// key), so re-committing renormalizes members in place instead of
+    /// duplicating rows.
+    /// </summary>
+    private async Task UpsertRefMember(MySqlConnector.MySqlConnection mangosConn,
+        int refEntry, int item, float chance, int groupId, int maxCount, int pMin, int pMax)
+    {
+        int exists = await mangosConn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM reference_loot_template WHERE entry = @Entry AND item = @Item",
+            new { Entry = refEntry, Item = item });
+
+        if (exists > 0)
+        {
+            await mangosConn.ExecuteAsync(@"
+                UPDATE reference_loot_template
+                SET ChanceOrQuestChance = @Chance, groupid = @GroupId, maxcount = @MaxCount
+                WHERE entry = @Entry AND item = @Item",
+                new { Entry = refEntry, Item = item, Chance = chance, GroupId = groupId, MaxCount = maxCount });
         }
         else
         {
-            baseShare = Math.Abs(originalChance);
+            await mangosConn.ExecuteAsync(@"
+                INSERT INTO reference_loot_template (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
+                VALUES (@Entry, @Item, @Chance, @GroupId, 1, @MaxCount, @PMin, @PMax)",
+                new { Entry = refEntry, Item = item, Chance = chance, GroupId = groupId, MaxCount = maxCount, PMin = pMin, PMax = pMax });
         }
+    }
 
-        float originalNewShare = baseShare * 0.40f;
-        float variantBudget = baseShare - originalNewShare;
+    /// <summary>
+    /// Direct-drop base with no existing pool: mint a reference_loot_template
+    /// group holding base + variants normalized to 100, then replace the base's
+    /// direct creature_loot_template row with a single 100%/1 pointer to it.
+    /// Structurally identical to a vanilla shared pool → renders in Instance Loot.
+    /// Idempotent: a prior 'pool_created' row means the pointer/ref already
+    /// exist; we reuse that ref entry and upsert members instead of minting again.
+    /// </summary>
+    private async Task<int> CreatePoolFromDirect(MySqlConnector.MySqlConnection mangosConn,
+        MySqlConnector.MySqlConnection adminConn,
+        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>? trackingRows,
+        int lootId, dynamic directRow, int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls, int creatureEntry)
+    {
+        int pMin = (int)directRow.patch_min;
+        int pMax = (int)directRow.patch_max;
+        float baseOrigChance = (float)directRow.chance;
+        int baseMaxCount = (int)directRow.maxcount;
 
-        float[] variantWeights = new float[rolls.Length];
-        for (int i = 0; i < rolls.Length; i++)
-            variantWeights[i] = Math.Max(0.1f, 100f - rolls[i].budgetPct);
-        float weightSum = variantWeights.Sum();
+        // Reuse a previously-minted ref entry for this (lootId, base) if present.
+        var priorCreate = await adminConn.QueryFirstOrDefaultAsync<dynamic>(@"
+            SELECT loot_entry FROM lootifier_loot_entries
+            WHERE creature_entry = @CE AND item_entry = @Base AND action_type = 'pool_created'
+              AND loot_table = 'creature_loot_template'
+            ORDER BY id ASC LIMIT 1",
+            new { CE = creatureEntry, Base = baseItemEntry });
 
-        await adminConn.ExecuteAsync(@"
-            INSERT INTO lootifier_loot_entries
-                (creature_entry, loot_table, loot_entry, item_entry, action_type, original_chance, new_chance, created_at)
-            VALUES (@CE, @Table, @Entry, @Item, 'modified', @OrigChance, @NewChance, NOW())",
-            new
-            {
-                CE = creatureEntry,
-                Table = tableName,
-                Entry = lootEntry,
-                Item = (int)baseRow.item,
-                OrigChance = originalChance,
-                NewChance = originalNewShare
-            });
+        int refEntry;
+        bool freshMint = priorCreate == null;
 
-        await mangosConn.ExecuteAsync(
-            $"UPDATE `{tableName}` SET ChanceOrQuestChance = @Chance WHERE entry = @Entry AND item = @Item AND groupid = @GroupId",
-            new { Chance = originalNewShare, Entry = lootEntry, Item = (int)baseRow.item, GroupId = groupId });
-
-        for (int i = 0; i < variantEntries.Count && i < rolls.Length; i++)
+        if (freshMint)
         {
-            float variantChance = (float)Math.Round(variantBudget * (variantWeights[i] / weightSum), 4);
+            refEntry = await GetNextLootifierRefEntry(mangosConn);
 
-            await mangosConn.ExecuteAsync(
-                $@"INSERT IGNORE INTO `{tableName}` (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
-                   VALUES (@Entry, @Item, @Chance, @GroupId, 1, 1, @PMin, @PMax)",
-                new
-                {
-                    Entry = lootEntry,
-                    Item = variantEntries[i],
-                    Chance = variantChance,
-                    GroupId = groupId,
-                    PMin = (int)baseRow.patch_min,
-                    PMax = (int)baseRow.patch_max
-                });
+            // Move the base row out of the creature's direct drops and record
+            // its original chance so rollback can restore it exactly.
+            await TrackLoot(adminConn, trackingRows, creatureEntry, "creature_loot_template",
+                lootId, baseItemEntry, "pool_created", baseOrigChance, refEntry);
 
-            await adminConn.ExecuteAsync(@"
-                INSERT INTO lootifier_loot_entries
-                    (creature_entry, loot_table, loot_entry, item_entry, action_type, original_chance, new_chance, created_at)
-                VALUES (@CE, @Table, @Entry, @Item, 'inserted', 0, @NewChance, NOW())",
-                new { CE = creatureEntry, Table = tableName, Entry = lootEntry, Item = variantEntries[i], NewChance = variantChance });
+            await mangosConn.ExecuteAsync(@"
+                DELETE FROM creature_loot_template
+                WHERE entry = @LootId AND item = @Item AND mincountOrRef > 0",
+                new { LootId = lootId, Item = baseItemEntry });
 
-            rowsAdded++;
+            // Pointer: 100% / 1 pick → group always resolves to one weighted item.
+            await mangosConn.ExecuteAsync(@"
+                INSERT IGNORE INTO creature_loot_template (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
+                VALUES (@LootId, @Item, 100, 0, @Ref, 1, @PMin, @PMax)",
+                new { LootId = lootId, Item = baseItemEntry, Ref = -refEntry, PMin = pMin, PMax = pMax });
+        }
+        else
+        {
+            refEntry = (int)priorCreate.loot_entry < 0
+                ? Math.Abs((int)priorCreate.loot_entry)
+                : (int)priorCreate.loot_entry;
         }
 
-        return rowsAdded;
+        // v6 split for a minted pool: the pool's full budget is 100 (pointer is
+        // 100%/1). Base becomes the rare fallback at BASE_FLOOR_PCT; variants +
+        // legendary split the remaining 100 - base with the member floor.
+        float baseKeep = Math.Min(BASE_FLOOR_PCT, 100f);
+        float variantPool = 100f - baseKeep;
+
+        int memberCount = Math.Min(variantEntries.Count, rolls.Length);
+        var rawWeights = new float[memberCount];
+        for (int i = 0; i < memberCount; i++)
+            rawWeights[i] = PoolWeight(rolls[i].budgetPct);
+
+        var shares = DistributeWithFloor(rawWeights, variantPool, MEMBER_FLOOR_PCT);
+        if (shares == null)
+        {
+            _poolWarnings?.Add(
+                $"Item {baseItemEntry}: {memberCount} variants can't all reach {MEMBER_FLOOR_PCT}% within a minted 100% pool — using unfloored split. Lower Variants per Item.");
+            shares = new float[memberCount];
+            float rawSum = rawWeights.Sum();
+            for (int i = 0; i < memberCount; i++)
+                shares[i] = rawSum > 0 ? variantPool * (rawWeights[i] / rawSum) : variantPool / memberCount;
+        }
+
+        // Base member at its floor (keeps its maxcount for stack size).
+        await UpsertRefMember(mangosConn, refEntry, baseItemEntry, RoundChance(baseKeep),
+            POOL_GROUP_ID, Math.Max(1, baseMaxCount), pMin, pMax);
+
+        int added = 0;
+        for (int i = 0; i < memberCount; i++)
+        {
+            float chance = Math.Max(MIN_POOL_CHANCE, RoundChance(shares[i]));
+            await UpsertRefMember(mangosConn, refEntry, variantEntries[i], chance, POOL_GROUP_ID, 1, pMin, pMax);
+            await TrackLoot(adminConn, trackingRows, creatureEntry, "reference_loot_template",
+                refEntry, variantEntries[i], "pool_member", 0, chance);
+            added++;
+        }
+
+        return added;
+    }
+
+    /// <summary>Next free reference_loot_template entry for a minted pool.</summary>
+    private async Task<int> GetNextLootifierRefEntry(MySqlConnector.MySqlConnection mangosConn)
+    {
+        var maxRef = await mangosConn.ExecuteScalarAsync<int?>(
+            "SELECT MAX(entry) FROM reference_loot_template WHERE entry >= @Start",
+            new { Start = LOOTIFIER_REF_START });
+        return maxRef.HasValue ? maxRef.Value + 1 : LOOTIFIER_REF_START;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -2147,7 +2646,9 @@ public class LootifierController : Controller
                 original_chance FLOAT DEFAULT 0,
                 new_chance FLOAT DEFAULT 0,
                 created_at DATETIME NOT NULL,
-                INDEX idx_creature (creature_entry)
+                INDEX idx_creature (creature_entry),
+                INDEX idx_pair (loot_entry, item_entry),
+                INDEX idx_item (item_entry)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
     }
 
@@ -2278,6 +2779,7 @@ public class BatchRequest
     public int levelMax { get; set; }
     public int[]? creatureRanks { get; set; }
     public int[]? mapIds { get; set; }
+    public int[]? zoneIds { get; set; }   // WorldMapArea areaID — outdoor zone spawn filter
     public RulesetDto? ruleset { get; set; }
 }
 

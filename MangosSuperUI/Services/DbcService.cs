@@ -10,7 +10,7 @@ namespace MangosSuperUI.Services;
 ///              followed by fixed-size records, then a string block.
 ///              String fields store a uint32 offset into the string block.
 /// </summary>
-public class DbcService
+public partial class DbcService
 {
     private readonly ILogger<DbcService> _logger;
     private readonly IConfiguration _configuration;
@@ -64,6 +64,13 @@ public class DbcService
     /// </summary>
     private IReadOnlyDictionary<uint, HelmetGeosetVisEntry> HelmetGeosetVisData { get; set; }
         = new Dictionary<uint, HelmetGeosetVisEntry>();
+
+    /// <summary>All rows of WorldMapArea.dbc — the client's zone bounding
+    /// boxes. Used by LootifierController for zone-scoped batch scans:
+    /// creature spawns are filtered by position against these boxes, since
+    /// the VMaNGOS creature table has no zone column.</summary>
+    public IReadOnlyList<WorldMapZoneDbc> WorldMapZones { get; private set; }
+        = Array.Empty<WorldMapZoneDbc>();
 
     // ── Status / diagnostics ──────────────────────────────────────────────
 
@@ -388,6 +395,7 @@ public class DbcService
             SpellEntries = LoadSpellEntries(Path.Combine(DbcPath, "Spell.dbc"));
             CharacterSections = LoadCharSections(Path.Combine(DbcPath, "CharSections.dbc"));
             HelmetGeosetVisData = LoadHelmetGeosetVisData(Path.Combine(DbcPath, "HelmetGeosetVisData.dbc"));
+            WorldMapZones = LoadWorldMapArea(Path.Combine(DbcPath, "WorldMapArea.dbc"));
 
             IsLoaded = true;
             _logger.LogInformation("DbcService: Loaded successfully — {Counts}",
@@ -943,6 +951,74 @@ public class DbcService
         return list;
     }
 
+    /// <summary>
+    /// WorldMapArea.dbc — vanilla 1.12: 8 fields, 32 bytes per record, ~50 rows.
+    /// Field layout:
+    ///   [0] m_ID
+    ///   [1] m_mapID      — 0=Eastern Kingdoms, 1=Kalimdor (vanilla outdoor world)
+    ///   [2] m_areaID     — AreaTable id; 0 for continent overview rows
+    ///   [3] m_areaName   (stringref) — internal name, e.g. "DunMorogh",
+    ///                      "Ogrimmar" (the typo is in the DBC itself)
+    ///   [4] m_locLeft    (float) — west  border, Y max
+    ///   [5] m_locRight   (float) — east  border, Y min
+    ///   [6] m_locTop     (float) — north border, X max
+    ///   [7] m_locBottom  (float) — south border, X min
+    /// Note the rotated WoW axes: left/right are Y borders, top/bottom are X.
+    /// Missing file is non-fatal — zone filtering just reports unavailable.
+    /// </summary>
+    private IReadOnlyList<WorldMapZoneDbc> LoadWorldMapArea(string filePath)
+    {
+        var list = new List<WorldMapZoneDbc>();
+
+        if (!File.Exists(filePath))
+        {
+            _logger.LogWarning("DbcService: WorldMapArea.dbc not found at {Path} — zone filtering disabled", filePath);
+            LoadedCounts["WorldMapArea"] = 0;
+            return list;
+        }
+
+        var (records, stringBlock, recordSize) = ReadDbcFile(filePath);
+        int recordCount = records.Length / recordSize;
+
+        for (int i = 0; i < recordCount; i++)
+        {
+            int o = i * recordSize;
+            uint id = BitConverter.ToUInt32(records, o);
+            uint mapId = BitConverter.ToUInt32(records, o + 4);
+            uint areaId = BitConverter.ToUInt32(records, o + 8);
+            uint nameOfs = BitConverter.ToUInt32(records, o + 12);
+            float locLeft = BitConverter.ToSingle(records, o + 16);
+            float locRight = BitConverter.ToSingle(records, o + 20);
+            float locTop = BitConverter.ToSingle(records, o + 24);
+            float locBottom = BitConverter.ToSingle(records, o + 28);
+
+            string internalName = ReadString(stringBlock, nameOfs);
+            if (internalName.Length == 0) continue;
+
+            list.Add(new WorldMapZoneDbc(
+                id, mapId, areaId, internalName, PrettyZoneName(internalName),
+                locLeft, locRight, locTop, locBottom));
+        }
+
+        LoadedCounts["WorldMapArea"] = list.Count;
+        _logger.LogInformation("DbcService: Parsed {Count} WorldMapArea entries", list.Count);
+        return list;
+    }
+
+    private static readonly Dictionary<string, string> ZoneNameOverrides = new()
+    {
+        ["Ogrimmar"] = "Orgrimmar",       // misspelled in the DBC itself
+        ["UnGoro"] = "Un'Goro Crater",
+    };
+
+    /// <summary>"DunMorogh" → "Dun Morogh"; known-awkward names overridden.</summary>
+    private static string PrettyZoneName(string internalName)
+    {
+        if (ZoneNameOverrides.TryGetValue(internalName, out var ov))
+            return ov;
+        return System.Text.RegularExpressions.Regex.Replace(internalName, "(?<=[a-z])(?=[A-Z])", " ");
+    }
+
     // ── WDBC file reader (original, unchanged) ──────────────────────────────────────────────────
 
     /// <summary>
@@ -1085,3 +1161,20 @@ public record HelmetGeosetVisEntry(
     uint FacialHairFlags1,
     uint FacialHairFlags2,
     uint EarsFlags);
+
+/// <summary>
+/// One row of vanilla WorldMapArea.dbc (8 fields, 32 bytes per record).
+/// LocLeft/LocRight are the Y borders (west/east), LocTop/LocBottom the
+/// X borders (north/south) — WoW's map axes are rotated relative to
+/// world coordinates. AreaId 0 marks continent overview rows.
+/// </summary>
+public record WorldMapZoneDbc(
+    uint Id,
+    uint MapId,
+    uint AreaId,
+    string InternalName,
+    string DisplayName,
+    float LocLeft,
+    float LocRight,
+    float LocTop,
+    float LocBottom);

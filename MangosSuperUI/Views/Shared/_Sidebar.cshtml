@@ -15,7 +15,7 @@
         "home" or "console" or "players" or "accounts" or "realm" => "operations",
         "activity" or "serverlogs" or "livelogs" or "config" or "backup" => "server",
         "spells" or "patch" => "spells",
-        "items" or "gameobjects" or "loottuner" or "instances" or "lootifier" => "content",
+        "items" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" => "content",
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
         "downloads" => "downloads",
@@ -209,6 +209,18 @@
                     <a asp-controller="Lootifier" asp-action="Index" class="@NavClass("Lootifier")">
                         <i class="fa-solid fa-dragon"></i>
                         ARPG Lootifier
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="questlootifier">
+                    <a asp-controller="QuestLootifier" asp-action="Index" class="@NavClass("QuestLootifier")">
+                        <i class="fa-solid fa-scroll"></i>
+                        Quest Lootifier
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="craftinglootifier">
+                    <a asp-controller="CraftingLootifier" asp-action="Index" class="@NavClass("CraftingLootifier")">
+                        <i class="fa-solid fa-hammer"></i>
+                        Crafting Lootifier
                     </a>
                 </li>
             </ul>

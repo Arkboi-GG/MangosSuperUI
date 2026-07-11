@@ -103,6 +103,7 @@ builder.Services.AddSingleton<IBotPlanner, GrindPlanner>();
 builder.Services.AddSingleton<IBotPlanner, QuestPlanner>();   // P3: Goal.Questing
 builder.Services.AddSingleton<IBotPlanner, MaintenancePlanner>();
 builder.Services.AddSingleton<IBotPlanner, TrainingPlanner>();   // Goal.Training — class-trainer trip
+builder.Services.AddSingleton<IBotPlanner, HubErrandPlanner>();  // Goal.Vendoring — "do your rounds" hub errand (player-party, 2026-07-08 §3)
 
 builder.Services.AddSingleton<BotBrain>();
 builder.Services.AddSingleton<BotDiagnosticsService>();

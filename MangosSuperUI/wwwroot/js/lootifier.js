@@ -311,6 +311,38 @@ $(function () {
                 esc(r.name) + ' <span class="inst-level">' + r.level + '</span></button>';
         });
         $('#batchInstancePicker').html(h);
+        loadZoneChips();
+    }
+
+    function loadZoneChips() {
+        $.get('/Lootifier/Zones', function (data) {
+            if (!data || !data.success) return;
+
+            if (!data.available) {
+                $('#batchInstancePicker').append(
+                    '<div class="instance-category">Zones</div>' +
+                    '<div style="font-size:11px;color:var(--text-muted);padding:4px 2px;">' +
+                    'WorldMapArea.dbc not found in the DBC path (' + esc(data.dbcPath || 'Vmangos:DbcPath') + ') \u2014 zone filtering disabled.' +
+                    '</div>');
+                return;
+            }
+
+            function chips(list) {
+                var s = '';
+                list.forEach(function (z) {
+                    s += '<button class="instance-chip zone-chip" data-zone="' + z.areaId + '">' + esc(z.name) + '</button>';
+                });
+                return s;
+            }
+
+            var ek = data.zones.filter(function (z) { return z.mapId === 0; });
+            var kal = data.zones.filter(function (z) { return z.mapId === 1; });
+
+            var zh = '';
+            if (ek.length > 0) zh += '<div class="instance-category">Zones \u2014 Eastern Kingdoms</div>' + chips(ek);
+            if (kal.length > 0) zh += '<div class="instance-category">Zones \u2014 Kalimdor</div>' + chips(kal);
+            $('#batchInstancePicker').append(zh);
+        });
     }
 
     function collectBatchFilters() {
@@ -325,8 +357,12 @@ $(function () {
         if (ranks.length > 0) filter.creatureRanks = ranks;
 
         var maps = [];
-        $('#batchPanel .instance-chip.active').each(function () { maps.push(parseInt($(this).data('map'))); });
+        $('#batchPanel .instance-chip.active[data-map]').each(function () { maps.push(parseInt($(this).data('map'))); });
         if (maps.length > 0) filter.mapIds = maps;
+
+        var zones = [];
+        $('#batchPanel .instance-chip.active[data-zone]').each(function () { zones.push(parseInt($(this).data('zone'))); });
+        if (zones.length > 0) filter.zoneIds = zones;
 
         var lvlMin = parseInt($('#batchLevelMin').val());
         var lvlMax = parseInt($('#batchLevelMax').val());
@@ -425,17 +461,55 @@ $(function () {
         });
 
         $('#previewContainer').html(h);
-        $('#previewInfo').text(totalItems + ' items across ' + data.creatures.length + ' creatures');
-
-        var variantsPerItem = parseInt($('#rsVariantsPerItem').val()) || 10;
-        $('#commitItemCount').text(totalItems * variantsPerItem);
-        $('#commitLootRows').text('~' + totalItems * variantsPerItem);
-        $('#commitBaseItems').text(totalItems);
+        updateBatchStats();
 
         // Show sample preview option AND commit — both available immediately
         $('#batchSamplePanel').show();
         $('#batchSampleContainer').html('');
         $('#commitPanel').show();
+    }
+
+    // Dedup-aware estimates matching server BatchCommit behavior:
+    // one variant set per DISTINCT base item; loot rows per (creature, item) pair.
+    function computeBatchSelection() {
+        var distinctItems = {};
+        var pairs = 0;
+        var creaturesWithSelection = 0;
+        if (batchData && batchData.creatures) {
+            batchData.creatures.forEach(function (c) {
+                var sel = batchSelectedItems[c.creatureEntry];
+                if (!sel) return;
+                var any = false;
+                c.items.forEach(function (it) {
+                    if (sel[it.itemEntry]) {
+                        distinctItems[it.itemEntry] = true;
+                        pairs++;
+                        any = true;
+                    }
+                });
+                if (any) creaturesWithSelection++;
+            });
+        }
+        return {
+            distinct: Object.keys(distinctItems).length,
+            pairs: pairs,
+            creatures: creaturesWithSelection
+        };
+    }
+
+    function updateBatchStats() {
+        var s = computeBatchSelection();
+        // Read the variants-per-item from the field that actually drives the
+        // commit in the current mode (batch has its own shared input; the
+        // single-mode #rsVariantsPerItem defaults to 10 and would mis-report).
+        var variantsPerItem = currentMode === 'batch'
+            ? (parseInt($('.lf-rs-shared[data-target="rsVariantsPerItem"]').val()) || 10)
+            : (parseInt($('#rsVariantsPerItem').val()) || 10);
+
+        $('#previewInfo').text(s.distinct + ' unique items \u00b7 ' + s.pairs + ' placements across ' + s.creatures + ' creatures');
+        $('#commitItemCount').text(s.distinct * variantsPerItem);
+        $('#commitLootRows').text('~' + (s.pairs * variantsPerItem));
+        $('#commitBaseItems').text(s.distinct);
     }
 
     // ===================== BATCH SAMPLE PREVIEW =====================
@@ -825,9 +899,9 @@ $(function () {
             return;
         }
 
-        var totalItems = creatures.reduce(function (sum, c) { return sum + c.itemEntries.length; }, 0);
+        var s = computeBatchSelection();
 
-        $('#btnCommit').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Committing ' + totalItems + ' items...');
+        $('#btnCommit').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Committing ' + s.distinct + ' unique items (' + s.pairs + ' placements)...');
 
         $.ajax({
             url: '/Lootifier/BatchCommit',
@@ -837,7 +911,12 @@ $(function () {
             success: function (result) {
                 $('#btnCommit').prop('disabled', false).html('<i class="fa-solid fa-bolt"></i> <span>Commit to Database</span>');
                 if (result.success) {
-                    showToast(result.totalItemsCreated + ' items + ' + result.totalLootRowsCreated + ' loot rows across ' + result.creaturesProcessed + ' creatures', 'success');
+                    var msg = result.totalItemsCreated + ' items + ' + result.totalLootRowsCreated + ' loot rows across ' + result.creaturesProcessed + ' creatures';
+                    if (result.pairsSkipped > 0) msg += ' (' + result.pairsSkipped + ' already-lootified pairs skipped)';
+                    showToast(msg, 'success');
+                    if (result.warnings && result.warnings.length > 0) {
+                        showToast(result.warnings.length + ' pool(s) exceeded floor capacity — ' + result.warnings[0], 'warning');
+                    }
                     $('#commitPanel').hide();
                 } else {
                     showToast('Batch commit failed: ' + (result.error || ''), 'error');
@@ -1024,6 +1103,13 @@ $(function () {
         } else {
             batchSelectedItems[ce] = {};
         }
+        updateBatchStats();
+    });
+
+    // Live-refresh the projected counts when the variants-per-item field changes
+    // (batch shared input or the single-mode input), so NEW ITEMS stays accurate.
+    $(document).on('input change', '.lf-rs-shared[data-target="rsVariantsPerItem"], #rsVariantsPerItem', function () {
+        updateBatchStats();
     });
 
     // Batch: item-level checkbox
@@ -1032,6 +1118,7 @@ $(function () {
         var ie = parseInt($(this).data('item'));
         if (!batchSelectedItems[ce]) batchSelectedItems[ce] = {};
         batchSelectedItems[ce][ie] = $(this).is(':checked');
+        updateBatchStats();
     });
 
     // Generate (single)
