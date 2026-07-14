@@ -154,14 +154,17 @@ $(function () {
         var qualClass = 'quality-' + item.quality;
         var hasStats = item.totalStats > 0;
         var hasSpells = item.hasSpellEffects;
-        var isLootifiable = hasStats || hasSpells;
+        var equippable = item.equippable !== false; // treat missing as equippable (older data)
+        var isLootifiable = equippable && (hasStats || hasSpells);
         var noStatsClass = isLootifiable ? '' : ' no-stats';
         var isSelected = selectedItems[item.itemEntry] ? ' selected' : '';
 
         var chanceStr = item.chance === 0 ? 'equal' : formatChance(Math.abs(item.chance)) + '%';
 
         var familyBadge;
-        if (hasStats) {
+        if (!equippable) {
+            familyBadge = '<span class="lf-item-family" style="color:var(--status-error);">not gear</span>';
+        } else if (hasStats) {
             familyBadge = '<span class="lf-item-family">' + esc(item.detectedFamily) + '</span>';
         } else if (hasSpells) {
             familyBadge = '<span class="lf-item-family" style="color:var(--accent);"><i class="fa-solid fa-bolt" style="font-size:8px;"></i> spell</span>';
@@ -237,12 +240,20 @@ $(function () {
             maxAffix = parseInt($('#rsMaxAffixChange').val()) || 1;
         }
 
+        // Drop-chance strategy: "preserve" (split existing loot) vs "additive"
+        // (independent tunable-chance pool that adds drops without dilution).
+        var dropStrategy = $('#lfDropStrategy').is(':checked') ? 'additive' : 'preserve';
+        var poolDropPct = parseFloat($('#lfPoolDropPct').val());
+        if (isNaN(poolDropPct)) poolDropPct = 100;
+        poolDropPct = Math.min(100, Math.max(0, poolDropPct));
+
         return {
             budgetCeilingPct: budgetCeiling,
             variantsPerItem: variantsPerItem,
             allowNewAffixes: allowNew,
             maxAffixCountChange: maxAffix,
-            dropChanceStrategy: 'preserve',
+            dropChanceStrategy: dropStrategy,
+            poolDropChancePct: poolDropPct,
             namingTiers: tiers,
             // Legendary
             generateLegendary: currentMode === 'batch'
@@ -1159,5 +1170,45 @@ $(function () {
         $('#rsMaxAffixChange').val(1);
         renderNamingTiers();
     });
+
+    // ── Drop-chance strategy control (self-bootstrapping) ──
+    // Preserve = split existing loot (dungeon-safe, current behavior).
+    // Additive = independent tunable-chance pool that ADDS drops without dilution.
+    $(document).on('change', '#lfDropStrategy', function () {
+        $('#lfPoolDropWrap').css('display', $(this).is(':checked') ? 'inline-flex' : 'none');
+    });
+
+    function initDropStrategyUI() {
+        if ($('#lfDropStrategyPanel').length) return;
+        if (!$('#lfDropStrategyStyles').length) {
+            $('head').append('<style id="lfDropStrategyStyles">' +
+                '.lf-drop-panel{margin:10px 0;padding:10px 12px;border:1px solid rgba(128,128,128,.28);border-radius:8px;background:rgba(128,128,128,.06);font-size:12px;}' +
+                '.lf-drop-panel .lf-drop-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}' +
+                '.lf-drop-panel label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;}' +
+                '.lf-drop-panel input[type=number]{width:64px;padding:3px 6px;border-radius:5px;border:1px solid rgba(128,128,128,.35);background:rgba(0,0,0,.18);color:inherit;}' +
+                '.lf-drop-hint{opacity:.7;font-size:11px;margin-top:6px;line-height:1.4;}' +
+                '#lfPoolDropWrap{display:none;align-items:center;gap:6px;}' +
+                '</style>');
+        }
+        var html =
+            '<div id="lfDropStrategyPanel" class="lf-drop-panel">' +
+            '<div class="lf-drop-row">' +
+            '<label title="Preserve = split the existing loot share (dungeon-safe). Additive = add an independent tunable-chance pool without diluting existing drops.">' +
+            '<input type="checkbox" id="lfDropStrategy" /> Additive drop pool' +
+            '</label>' +
+            '<span id="lfPoolDropWrap">' +
+            '<span>· drops</span>' +
+            '<input type="number" id="lfPoolDropPct" min="0" max="100" step="5" value="100" />' +
+            '<span>% of the time</span>' +
+            '</span>' +
+            '</div>' +
+            '<div class="lf-drop-hint">Additive mints a shared pool (creating a loot table if the mob has none), moves the base item in at 0.5%, and attaches it as an independent roll — existing loot is untouched. Built once per creature; roll back to rebuild.</div>' +
+            '</div>';
+        var $anchor = $('#rsBudgetCeiling').closest('.lf-ruleset, .lf-panel, .lf-settings, fieldset, section');
+        if ($anchor.length) $(html).insertAfter($anchor.first());
+        else if ($('#lootTree').length) $(html).insertBefore($('#lootTree'));
+        else $('body').prepend(html);
+    }
+    $(initDropStrategyUI);
 
 });

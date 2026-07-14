@@ -705,6 +705,255 @@ public class BlpWriterService
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // BLP2 PALETTIZED ENCODER — compression=1, alphaDepth=8
+    //
+    // REQUIRED for body-atlas component textures (Item\TextureComponents\*).
+    //
+    // Those are NOT ordinary model textures. The client CPU-blits them into the
+    // shared character texture atlas at equip time, and that path reads raw
+    // indexed pixels — vanilla ships every one of them palettized. Hand it a DXT
+    // block and the composite goes wrong: regions render stale, or garbage bleeds
+    // across slots (a recolored BELT painting what looks like PANTS, because its
+    // LegUpperTexture slot decodes to nonsense over the whole leg region).
+    //
+    // This service previously had only DXT1 and DXT3 encoders, both hardcoding
+    // compression=2. CommitBodyAtlasAsync called EncodeBitmapToBlp(bmp, useDxt1:
+    // false) under a comment reading "component textures are uncompressed/alpha
+    // (not DXT1) — vanilla stores them as plain BLP". The intent was right; the
+    // encoder to honour it never existed. useDxt1:false means DXT3, not
+    // uncompressed. Every component texture ever committed went out as DXT3 —
+    // which is exactly why the recolors looked perfect in the PNG-based viewer
+    // and broken in the client.
+    //
+    // Palette fidelity: the recolor (PaletteSwapService.ApplyPerPixel) is a pure
+    // per-pixel function of colour, the source is itself a vanilla palettized BLP
+    // (<=256 colours), and no resampling happens at native dimensions. Equal input
+    // colours therefore map to equal output colours, so the recolored image still
+    // holds <=256 unique colours and the palette is built EXACTLY — lossless. The
+    // median-cut fallback only fires for images that arrive from some other path.
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Encode a bitmap as an uncompressed, palettized BLP2 (compression=1,
+    /// alphaDepth=8) — the format vanilla uses for character component textures.
+    /// </summary>
+    public byte[]? EncodeBitmapToBlpUncompressed(SKBitmap bitmap)
+    {
+        try
+        {
+            if (bitmap == null || bitmap.Width == 0 || bitmap.Height == 0)
+            {
+                _logger?.LogWarning("BlpWriter: null/empty bitmap for palettized encode");
+                return null;
+            }
+            return EncodeBlpPalettized(bitmap);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "BlpWriter: palettized encode failed");
+            return null;
+        }
+    }
+
+    private byte[] EncodeBlpPalettized(SKBitmap image)
+    {
+        int width = image.Width, height = image.Height;
+
+        var mipmaps = new List<SKBitmap>();
+        try
+        {
+            mipmaps.AddRange(BuildMipmapChain(image));
+
+            // Palette is derived from the FULL-RES image. Downscaled mips can
+            // interpolate new colours, so they are mapped onto this palette by
+            // nearest match rather than being allowed to define their own.
+            var palette = BuildPalette(image, out bool exact);
+            _logger?.LogInformation(
+                "BlpWriter: palettized — {N} palette entries ({Mode}), {Mips} mips",
+                palette.Count, exact ? "exact, lossless" : "median-cut", mipmaps.Count);
+
+            // Exact-match lookup first; nearest-colour only when it misses.
+            var exactLookup = new Dictionary<uint, byte>();
+            for (int i = 0; i < palette.Count; i++)
+                exactLookup[palette[i]] = (byte)i;
+
+            var encodedMips = new List<byte[]>();
+            foreach (var mip in mipmaps)
+                encodedMips.Add(EncodePalettizedMip(mip, palette, exactLookup));
+
+            var offsets = new uint[16];
+            var lengths = new uint[16];
+            uint cursor = DATA_START;
+            for (int i = 0; i < encodedMips.Count; i++)
+            {
+                offsets[i] = cursor;
+                lengths[i] = (uint)encodedMips[i].Length;
+                cursor += lengths[i];
+            }
+
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms);
+
+            bw.Write(new byte[] { (byte)'B', (byte)'L', (byte)'P', (byte)'2' });
+            bw.Write((uint)1);    // type = 1 (direct content)
+            bw.Write((byte)1);    // compression = 1 (UNCOMPRESSED, palettized)  ← the fix
+            bw.Write((byte)8);    // alpha_depth = 8 (separate 8-bit alpha plane)
+            bw.Write((byte)0);    // alpha_type = 0 (unused when not DXT)
+            bw.Write((byte)1);    // has_mips = true
+            bw.Write((uint)width);
+            bw.Write((uint)height);
+            for (int i = 0; i < 16; i++) bw.Write(offsets[i]);
+            for (int i = 0; i < 16; i++) bw.Write(lengths[i]);
+
+            // Palette: 256 entries, BGRA byte order. Unused slots stay zero.
+            var palBytes = new byte[PALETTE_BYTES];
+            for (int i = 0; i < palette.Count && i < 256; i++)
+            {
+                uint rgb = palette[i];
+                palBytes[i * 4 + 0] = (byte)(rgb & 0xFF);           // B
+                palBytes[i * 4 + 1] = (byte)((rgb >> 8) & 0xFF);    // G
+                palBytes[i * 4 + 2] = (byte)((rgb >> 16) & 0xFF);   // R
+                palBytes[i * 4 + 3] = 0;                            // A (unused)
+            }
+            bw.Write(palBytes);
+
+            foreach (var mipBytes in encodedMips)
+                bw.Write(mipBytes);
+
+            var result = ms.ToArray();
+            _logger?.LogInformation(
+                "BlpWriter: Encoded BLP2 PALETTIZED — {W}×{H}, {Mips} mips, {Bytes} bytes",
+                width, height, encodedMips.Count, result.Length);
+            return result;
+        }
+        finally
+        {
+            foreach (var mip in mipmaps) mip.Dispose();
+        }
+    }
+
+    /// <summary>A palettized mip is w*h index bytes followed by w*h alpha bytes.</summary>
+    private static byte[] EncodePalettizedMip(
+        SKBitmap mip, List<uint> palette, Dictionary<uint, byte> exactLookup)
+    {
+        int w = mip.Width, h = mip.Height, n = w * h;
+        var buf = new byte[n * 2];
+
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                var px = mip.GetPixel(x, y);
+                uint rgb = (uint)((px.Red << 16) | (px.Green << 8) | px.Blue);
+                int i = y * w + x;
+
+                if (!exactLookup.TryGetValue(rgb, out byte idx))
+                    idx = NearestPaletteIndex(palette, px.Red, px.Green, px.Blue);
+
+                buf[i] = idx;                 // palette index plane
+                buf[n + i] = px.Alpha;        // 8-bit alpha plane — the belts depend on this
+            }
+        }
+        return buf;
+    }
+
+    private static byte NearestPaletteIndex(List<uint> palette, byte r, byte g, byte b)
+    {
+        int best = 0, bestDist = int.MaxValue;
+        for (int i = 0; i < palette.Count; i++)
+        {
+            uint c = palette[i];
+            int dr = (int)((c >> 16) & 0xFF) - r;
+            int dg = (int)((c >> 8) & 0xFF) - g;
+            int db = (int)(c & 0xFF) - b;
+            int d = dr * dr + dg * dg + db * db;
+            if (d < bestDist) { bestDist = d; best = i; }
+        }
+        return (byte)best;
+    }
+
+    /// <summary>
+    /// Exact palette when the image holds <=256 unique colours (the normal case for
+    /// a recolored vanilla component texture), median-cut otherwise.
+    /// </summary>
+    private static List<uint> BuildPalette(SKBitmap image, out bool exact)
+    {
+        var unique = new HashSet<uint>();
+        for (int y = 0; y < image.Height; y++)
+        {
+            for (int x = 0; x < image.Width; x++)
+            {
+                var px = image.GetPixel(x, y);
+                unique.Add((uint)((px.Red << 16) | (px.Green << 8) | px.Blue));
+                if (unique.Count > 256) goto quantize;
+            }
+        }
+
+        exact = true;
+        var pal = unique.ToList();
+        while (pal.Count < 1) pal.Add(0);
+        return pal;
+
+    quantize:
+        exact = false;
+        return MedianCut(image, 256);
+    }
+
+    private static List<uint> MedianCut(SKBitmap image, int maxColors)
+    {
+        var pixels = new List<uint>();
+        for (int y = 0; y < image.Height; y++)
+            for (int x = 0; x < image.Width; x++)
+            {
+                var px = image.GetPixel(x, y);
+                pixels.Add((uint)((px.Red << 16) | (px.Green << 8) | px.Blue));
+            }
+
+        var buckets = new List<List<uint>> { pixels };
+        while (buckets.Count < maxColors)
+        {
+            // Split the bucket with the widest channel spread.
+            int target = -1, targetChannel = 0, widest = -1;
+            for (int i = 0; i < buckets.Count; i++)
+            {
+                if (buckets[i].Count < 2) continue;
+                for (int ch = 0; ch < 3; ch++)
+                {
+                    int shift = 16 - ch * 8;
+                    int lo = 255, hi = 0;
+                    foreach (var c in buckets[i])
+                    {
+                        int v = (int)((c >> shift) & 0xFF);
+                        if (v < lo) lo = v;
+                        if (v > hi) hi = v;
+                    }
+                    if (hi - lo > widest) { widest = hi - lo; target = i; targetChannel = ch; }
+                }
+            }
+            if (target < 0 || widest <= 0) break;
+
+            int sh = 16 - targetChannel * 8;
+            var bucket = buckets[target];
+            bucket.Sort((a, b) => ((a >> sh) & 0xFF).CompareTo((b >> sh) & 0xFF));
+            int mid = bucket.Count / 2;
+
+            buckets[target] = bucket.GetRange(0, mid);
+            buckets.Add(bucket.GetRange(mid, bucket.Count - mid));
+        }
+
+        var result = new List<uint>();
+        foreach (var b in buckets)
+        {
+            if (b.Count == 0) continue;
+            long r = 0, g = 0, bl = 0;
+            foreach (var c in b) { r += (c >> 16) & 0xFF; g += (c >> 8) & 0xFF; bl += c & 0xFF; }
+            result.Add((uint)(((r / b.Count) << 16) | ((g / b.Count) << 8) | (bl / b.Count)));
+        }
+        if (result.Count == 0) result.Add(0);
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // BLP2 DXT1 ENCODER (Session 24 — alphaDepth=0, alphaType=0)
     // ═══════════════════════════════════════════════════════════════
 

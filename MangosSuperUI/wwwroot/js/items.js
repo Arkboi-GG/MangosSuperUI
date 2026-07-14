@@ -70,13 +70,19 @@ $(function () {
 
     // ===================== CONSTANTS =====================
 
-    // Check if patch-4.MPQ exists (retextures available for download)
+    // Show the download button whenever a retexture patch can be produced.
+    // Backed by the DB (durable) via /Items/PatchStatus, not the wwwroot file
+    // (which a redeploy wipes); the download itself regenerates the file on
+    // demand if it's missing, so the button never points at a dead link.
     function checkPatchMAvailable() {
         $.ajax({
-            url: '/Items/DownloadPatch?file=patch-4.MPQ',
-            type: 'HEAD',
-            success: function () { $('#btnDownloadPatchM').show(); },
-            error: function () { $('#btnDownloadPatchM').hide(); }
+            url: '/Items/PatchStatus',
+            type: 'GET',
+            success: function (data) {
+                if (data && data.available) { $('#btnDownloadPatchM, #btnDownloadPatchTop').show(); }
+                else { $('#btnDownloadPatchM, #btnDownloadPatchTop').hide(); }
+            },
+            error: function () { $('#btnDownloadPatchM, #btnDownloadPatchTop').hide(); }
         });
     }
     checkPatchMAvailable();
@@ -2402,6 +2408,248 @@ $(function () {
         var q = parseInt($(this).val()) || 0;
         $('#editHeaderName').css('color', QUALITY_COLORS[q] || 'inherit');
     });
+
+    // ═══════════════════════════════════════════════════════════════
+    //  LOOTIFIER RETEXTURE QUEUE
+    //
+    //  One place to recolor every Lootifier's variants. Pick the sources
+    //  (Quest / Crafting / Loot-ARPG), pick a theme per colour tier, and it
+    //  queues ONE recolor per (base item × tier) — every variant in that tier
+    //  shares the resulting display_id. Lives here on the Items page so it
+    //  reuses the existing retexture + patch pipeline: one patch, one download.
+    // ═══════════════════════════════════════════════════════════════
+
+    var lrqPolling = false;
+
+    function lrqEnsureModal() {
+        if ($('#lootRetextureModal').length) return;
+
+        var html =
+            '<div class="modal fade" id="lootRetextureModal" tabindex="-1">' +
+            '<div class="modal-dialog modal-lg">' +
+            '<div class="modal-content">' +
+            '<div class="modal-header">' +
+            '<h5 class="modal-title"><i class="fa-solid fa-palette"></i> Lootifier Variant Retexture</h5>' +
+            '<button type="button" class="btn-close" data-bs-dismiss="modal"></button>' +
+            '</div>' +
+            '<div class="modal-body">' +
+            '<p class="text-muted" style="font-size:12px;">' +
+            'Queues <strong>one recolor per colour tier per item</strong> — every variant in a tier shares the ' +
+            'resulting display. Recolors run as hard palette swaps, so no vision model is required.' +
+            '</p>' +
+            '<div id="lrqSources" class="mb-3"><div class="text-muted">Loading sources…</div></div>' +
+            '<div class="mb-2" style="font-size:12px;font-weight:600;">Theme per tier</div>' +
+            '<div class="row g-2 mb-3" id="lrqThemes">' +
+            lrqThemeField('improved', 'Improved') +
+            lrqThemeField('power', 'of Power') +
+            lrqThemeField('glory', 'of Glory') +
+            lrqThemeField('gods', 'of the Gods / Legendary') +
+            '</div>' +
+            '<div class="form-check mb-3">' +
+            '<input class="form-check-input" type="checkbox" id="lrqRequeue">' +
+            '<label class="form-check-label" for="lrqRequeue" style="font-size:12px;">' +
+            'Requeue items that already have jobs (otherwise they are skipped)</label>' +
+            '</div>' +
+            '<div id="lrqQueueBox" class="p-2 mb-2" style="border:1px solid rgba(128,128,128,.28);border-radius:8px;font-size:12px;">' +
+            '<span id="lrqQueueText" class="text-muted">Queue: —</span>' +
+            '<div class="progress mt-2" style="height:6px;display:none;" id="lrqBarWrap">' +
+            '<div class="progress-bar" id="lrqBar" style="width:0%"></div>' +
+            '</div>' +
+            '</div>' +
+            '<div id="lrqFailures" style="font-size:11px;"></div>' +
+            '</div>' +
+            '<div class="modal-footer">' +
+            '<button class="btn btn-sm btn-outline-secondary" id="lrqResetBtn">Requeue failed</button>' +
+            '<button class="btn btn-sm btn-outline-danger" id="lrqClearBtn">Clear queue</button>' +
+            '<button class="btn btn-sm btn-secondary" id="lrqBuildBtn"><i class="fa-solid fa-layer-group"></i> Build Queue</button>' +
+            '<button class="btn btn-sm btn-primary" id="lrqRunBtn"><i class="fa-solid fa-play"></i> Run Queue</button>' +
+            '</div>' +
+            '</div>' +
+            '</div>' +
+            '</div>';
+
+        $('body').append(html);
+    }
+
+    function lrqThemeField(tier, label) {
+        return '<div class="col-md-6">' +
+            '<label class="form-label" style="font-size:11px;">' + label + '</label>' +
+            '<input type="text" class="form-control form-control-sm lrq-theme" data-tier="' + tier + '" placeholder="server default" />' +
+            '</div>';
+    }
+
+    function lrqLoadSources() {
+        $.getJSON('/Items/LootifierRetextureSources', function (d) {
+            if (!d.success) { $('#lrqSources').html('<div class="text-danger">' + (d.error || 'Failed to load') + '</div>'); return; }
+
+            if (d.defaultThemes) {
+                $('.lrq-theme').each(function () {
+                    var t = $(this).data('tier');
+                    if (d.defaultThemes[t]) $(this).attr('placeholder', d.defaultThemes[t]);
+                });
+            }
+
+            var rows = (d.sources || []).map(function (s) {
+                var none = s.bases === 0;
+                return '<div class="form-check">' +
+                    '<input class="form-check-input lrq-src" type="checkbox" value="' + s.source + '" id="lrqSrc_' + s.source + '"' +
+                    (none ? ' disabled' : ' checked') + '>' +
+                    '<label class="form-check-label" for="lrqSrc_' + s.source + '" style="font-size:12px;">' +
+                    '<strong>' + s.label + '</strong> — ' + s.bases + ' base items, ' + s.variants + ' variants' +
+                    (s.queued ? ' <span class="text-muted">(' + s.done + '/' + s.queued + ' retextured)</span>' : '') +
+                    '</label></div>';
+            }).join('');
+
+            $('#lrqSources').html(rows || '<div class="text-muted">No lootifier variants found yet.</div>');
+            lrqRefreshQueue();
+        });
+    }
+
+    function lrqSelectedSources() {
+        return $('.lrq-src:checked').map(function () { return this.value; }).get();
+    }
+
+    function lrqThemes() {
+        var t = {};
+        $('.lrq-theme').each(function () {
+            var v = ($(this).val() || '').trim();
+            if (v) t[$(this).data('tier')] = v;
+        });
+        return t;
+    }
+
+    function lrqRefreshQueue(cb) {
+        $.getJSON('/Items/RetextureQueueStatus', function (d) {
+            if (!d.success) return;
+            var total = d.pending + d.done + d.failed;
+            $('#lrqQueueText').text(
+                'Queue: ' + d.pending + ' pending · ' + d.done + ' done' +
+                (d.failed ? ' · ' + d.failed + ' failed' : '') +
+                (d.llmAssistAvailable ? '' : '  (no LLM — using hard palette swaps)'));
+
+            if (total > 0) {
+                $('#lrqBarWrap').show();
+                $('#lrqBar').css('width', Math.round(((d.done + d.failed) / total) * 100) + '%');
+            } else {
+                $('#lrqBarWrap').hide();
+            }
+
+            if (d.failures && d.failures.length) {
+                $('#lrqFailures').html('<div class="text-danger mt-1">' +
+                    d.failures.slice(0, 5).map(function (f) {
+                        return esc(f.itemName) + ' [' + f.tier + ']: ' + esc(f.error || 'failed');
+                    }).join('<br>') + '</div>');
+            } else {
+                $('#lrqFailures').empty();
+            }
+
+            if (cb) cb(d);
+        });
+    }
+
+    // Process the queue a few jobs at a time — each is slow (recolor → BLP →
+    // patch), so we chain small batches and let the bar advance.
+    function lrqRunQueue() {
+        if (lrqPolling) return;
+        lrqPolling = true;
+        $('#lrqRunBtn').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Running…');
+
+        function step() {
+            $.ajax({
+                url: '/Items/ProcessRetextureQueue',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ max: 3 })
+            }).done(function (r) {
+                if (!r.success) {
+                    showToast(r.error || 'Retexture failed', 'error');
+                    return lrqStop();
+                }
+                lrqRefreshQueue();
+                if (r.remaining > 0) { step(); }
+                else {
+                    showToast('Retexture queue complete', 'success');
+                    lrqStop();
+                }
+            }).fail(function () {
+                showToast('Retexture request failed', 'error');
+                lrqStop();
+            });
+        }
+
+        function lrqStop() {
+            lrqPolling = false;
+            $('#lrqRunBtn').prop('disabled', false).html('<i class="fa-solid fa-play"></i> Run Queue');
+            lrqRefreshQueue();
+        }
+
+        step();
+    }
+
+    $(document).on('click', '#lrqBuildBtn', function () {
+        var sources = lrqSelectedSources();
+        if (sources.length === 0) { showToast('Pick at least one source', 'warning'); return; }
+
+        var $b = $(this).prop('disabled', true);
+        $.ajax({
+            url: '/Items/BuildRetextureQueue',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                sources: sources,
+                themes: lrqThemes(),
+                requeue: $('#lrqRequeue').is(':checked')
+            })
+        }).done(function (r) {
+            if (!r.success) { showToast(r.error || 'Build failed', 'error'); return; }
+            showToast('Queued ' + r.queued + ' retexture jobs across ' + r.basesCovered + ' items' +
+                (r.skipped ? ' (' + r.skipped + ' already queued)' : '') +
+                (r.noDisplay ? ' — ' + r.noDisplay + ' skipped: no display_id' : ''), 'success');
+            lrqRefreshQueue();
+        }).fail(function () {
+            showToast('Build request failed', 'error');
+        }).always(function () { $b.prop('disabled', false); });
+    });
+
+    $(document).on('click', '#lrqRunBtn', lrqRunQueue);
+
+    $(document).on('click', '#lrqResetBtn', function () {
+        $.ajax({
+            url: '/Items/ResetRetextureQueue', method: 'POST',
+            contentType: 'application/json', data: JSON.stringify({ clear: false })
+        }).done(function (r) {
+            showToast('Requeued ' + (r.affected || 0) + ' failed jobs', 'info');
+            lrqRefreshQueue();
+        });
+    });
+
+    $(document).on('click', '#lrqClearBtn', function () {
+        if (!confirm('Clear the entire retexture queue? Already-applied retextures stay applied.')) return;
+        $.ajax({
+            url: '/Items/ResetRetextureQueue', method: 'POST',
+            contentType: 'application/json', data: JSON.stringify({ clear: true })
+        }).done(function (r) {
+            showToast('Cleared ' + (r.affected || 0) + ' queue rows', 'info');
+            lrqRefreshQueue();
+        });
+    });
+
+    // Open the modal (self-mounts a toolbar button if the view has no hook).
+    $(document).on('click', '#btnLootifierRetexture', function () {
+        lrqEnsureModal();
+        lrqLoadSources();
+        new bootstrap.Modal($('#lootRetextureModal')[0]).show();
+    });
+
+    (function lrqMountButton() {
+        if ($('#btnLootifierRetexture').length) return;
+        var btn = '<button id="btnLootifierRetexture" class="btn btn-sm btn-outline-secondary ms-2" ' +
+            'title="Recolor Lootifier variants by colour tier">' +
+            '<i class="fa-solid fa-palette"></i> Lootifier Retexture</button>';
+        var $anchor = $('#btnPatchStatus, #btnDownloadPatch').first();
+        if ($anchor.length) $anchor.after(btn);
+        else $('.card-header, .page-header, h1, h2').first().append(btn);
+    })();
 
     // ===================== INIT =====================
     doSearch(1);

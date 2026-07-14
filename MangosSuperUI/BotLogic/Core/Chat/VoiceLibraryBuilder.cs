@@ -6,6 +6,7 @@ using MangosSuperUI.Models;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.BotLogic.Chat.Core;
 using MangosSuperUI.BotLogic.Chat.Capacity;
+using MangosSuperUI.BotLogic.Chat.Engine;
 
 namespace MangosSuperUI.BotLogic.Chat.Voice;
 
@@ -24,6 +25,16 @@ namespace MangosSuperUI.BotLogic.Chat.Voice;
 ///
 /// Runs as a fire-and-forget admin action from the Capacity tab; progress via SignalR
 /// ("VoiceLibraryProgress") + [CHAT-CAP] logs. One run at a time.
+///
+/// THIS IS THE FLEET'S ONLY DIVERSITY SOURCE. Every persona descends from a card here,
+/// and the card's example_lines are what a small reactive model actually imitates — far
+/// more than the bio does. Two consequences, both handled below:
+///   • The prose prompt now states the skeleton's TYPING and SWEAR register and demands
+///     example_lines written IN that register, uncensored (§6.2 v2). A card whose anchors
+///     read "lol what a shitter" produces a bot that talks that way natively; no amount of
+///     post-pass rescues a library of polite Sams.
+///   • Run this on the biggest model you can serve (profile's model_batch). It is a
+///     one-time offline batch; quality here compounds across every bot forever.
 /// </summary>
 public class VoiceLibraryBuilder
 {
@@ -121,7 +132,9 @@ public class VoiceLibraryBuilder
 
                     var (system, prompt) = BuildProsePrompt(skel, eraContext);
                     var raw = await _broker.GenerateAsync(lease, system, prompt,
-                        new GenOptions(0.95f, 0.92f, 400), CancellationToken.None);
+                        new GenOptions(0.95f, 0.92f, 400, RepeatPenalty: 1.05f, RepeatLastN: 256,
+                                       PresencePenalty: 0.3f, Seed: rng.Next()),
+                        CancellationToken.None);
                     if (raw == null) { rejectedParse++; continue; }
 
                     var parsed = ParseProse(raw);
@@ -129,7 +142,17 @@ public class VoiceLibraryBuilder
 
                     var candidate = Materialize(skel, parsed);
 
-                    // ── 3. Mechanical dedup: >2 shared word-trigrams with ANY accepted card ──
+                    // ── 3a. Content floor: a card is FOREVER — never let a floored line into
+                    //        the library, where it would be discarded at every single use. ──
+                    var floored = candidate.ExampleLines.FirstOrDefault(l => ContentFloor.IsBlocked(l, out _));
+                    if (floored != null)
+                    {
+                        _logger.LogInformation("[CHAT-CAP] voice build: candidate rejected on content floor");
+                        rejectedParse++;
+                        continue;
+                    }
+
+                    // ── 3b. Mechanical dedup: >2 shared word-trigrams with ANY accepted card ──
                     var tris = Trigrams(candidate.ExampleLines);
                     if (acceptedTrigrams.Any(a => a.Intersect(tris).Count() > 2))
                     {
@@ -176,13 +199,29 @@ public class VoiceLibraryBuilder
 
     // ==================== Prose prompt + parse ====================
 
+    /// <summary>Plain-English register brief for the prose model (§6.2 v2 swear_level).</summary>
+    private static string SwearBrief(int level) => level switch
+    {
+        0 => "never swears — says \"darn\" and means it, the one clean mouth in the zone",
+        1 => "swears mildly when something goes wrong: damn, crap, hell",
+        2 => "swears casually the way most people did in 2005: damn, shit, ass, bastard; " +
+             "calls bad players shitters or scrubs; it's ordinary, not edgy",
+        _ => "swears constantly and casually — profanity is punctuation to this person",
+    };
+
     private static (string System, string Prompt) BuildProsePrompt(VoiceTables.Skeleton s, string eraContext)
     {
         string system =
-            "You write fictional 2005-era World of Warcraft player personas. You are given a fixed " +
-            "skeleton (age, region, occupation category, interests, typing style) and write ONLY the " +
-            "prose fields to fit it. Era: 2005 — flip phones, dial-up jokes, no smartphones, no " +
-            "streaming, no post-2005 references of any kind. Output ONLY a JSON object, no markdown fences.";
+            "You write fictional 2005-era World of Warcraft player personas for an offline game server. " +
+            "You are given a fixed skeleton (age, region, occupation category, interests, typing style, " +
+            "swearing register) and write ONLY the prose fields to fit it. " +
+            "Era: 2005 — flip phones, dial-up jokes, no smartphones, no streaming, no post-2005 " +
+            "references of any kind. " +
+            "REGISTER IS THE POINT: real 2005 chat was profane and blunt. Write the example lines the " +
+            "way this specific person actually typed — if the skeleton says they swear, they swear, " +
+            "in full, never censored with asterisks and never softened to \"heck\", \"darn\" or " +
+            "\"freaking\". Ordinary profanity only: no slurs of any kind, and nothing sexual. " +
+            "Output ONLY a JSON object, no markdown fences.";
 
         string era = string.IsNullOrWhiteSpace(eraContext) ? "" :
             $"\nActive era pack source (match its slang/references):\n{eraContext}\n";
@@ -195,7 +234,13 @@ public class VoiceLibraryBuilder
             - gaming background: {{s.GamingBackground}}
             - humor: {{s.Humor}}
             - typing: caps={{s.Typing.Caps}}, punctuation={{s.Typing.Punctuation}}, abbreviation level {{s.Typing.AbbrevLevel}}/3
+            - swearing: level {{s.Typing.SwearLevel}}/3 — {{SwearBrief(s.Typing.SwearLevel)}}
             {{era}}
+            The five example_lines are the most important field: they are the only thing a small
+            model sees when it imitates this person. Make them ordinary, specific and unglamorous —
+            what this person types on a Tuesday night, not catchphrases. Vary the shape: not every
+            line is a greeting. They must match the caps, abbreviation and swearing levels above.
+
             Write JSON with EXACTLY these fields:
             {
               "given_name": "one plausible first name for this person",
@@ -203,7 +248,7 @@ public class VoiceLibraryBuilder
               "life_situation_seed": "one line about their current life situation",
               "opinions": ["two short opinions about WoW or life", "..."],
               "example_lines": ["EXACTLY five short chat lines this person would type in-game",
-                                "each under 15 words, matching the typing style above",
+                                "each under 15 words, matching the typing and swearing style above",
                                 "no emojis, era-correct, everyday chat not catchphrases", "...", "..."]
             }
             """;
@@ -240,7 +285,7 @@ public class VoiceLibraryBuilder
 
     private static PersonaCard Materialize(VoiceTables.Skeleton s, ProseResult prose) => new()
     {
-        V = 1,
+        V = 2,
         GivenName = prose.GivenName.Trim(),
         Age = s.Age,
         Region = s.Region,

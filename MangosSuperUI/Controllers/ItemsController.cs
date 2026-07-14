@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
@@ -19,6 +20,7 @@ public class ItemsController : Controller
     private readonly MpqReaderService _mpq;
     private readonly PaletteSwapService _palette;
     private readonly ILogger<ItemsController> _logger;
+    private readonly IConfiguration _config;
     private readonly VariationRecipeService _variations;
     private readonly ComfyUIUpscaler _upscaler;
 
@@ -74,7 +76,8 @@ public class ItemsController : Controller
         CharacterModelService characterModels, BodyAtlasTextureService bodyAtlas,
         MpqReaderService mpq, PaletteSwapService palette, ILogger<ItemsController> logger,
         VariationRecipeService variations,
-        ComfyUIUpscaler upscaler)
+        ComfyUIUpscaler upscaler,
+        IConfiguration config)
     {
         _db = db;
         _dbc = dbc;
@@ -89,6 +92,7 @@ public class ItemsController : Controller
         _logger = logger;
         _variations = variations;
         _upscaler = upscaler;
+        _config = config;
     }
 
     public IActionResult Index() => View();
@@ -1163,12 +1167,76 @@ public class ItemsController : Controller
         var texInfo = _itemTextures.GetTexturesForDisplay(displayId);
         if (texInfo == null) return (null, null, "No textures found");
 
+        // Explicit request from the interactive panel — honour it exactly.
         var targetTex = texInfo.Textures.FirstOrDefault(t =>
             t.MpqPath.Equals(mpqPath, StringComparison.OrdinalIgnoreCase)
-            || t.Filename.Equals(filename, StringComparison.OrdinalIgnoreCase))
-            ?? texInfo.Textures.FirstOrDefault();
+            || t.Filename.Equals(filename, StringComparison.OrdinalIgnoreCase));
+
         if (targetTex == null)
-            return (null, null, "No texture found");
+        {
+            // ── No explicit texture (the batch path) ──
+            //
+            // This used to fall back to Textures.FirstOrDefault() — the first
+            // texture in the M2's list — and that is wrong for any multi-texture
+            // model.
+            //
+            // The commit patches ItemDisplayInfo field 3 = TextureName1, and that
+            // field feeds exactly ONE of the model's texture slots. Every other
+            // texture in an M2 is type 0: its path is BAKED INTO THE MODEL and no
+            // DBC field can redirect it.
+            //
+            // Staff of Westfall has two textures — a 64x64 M2-embedded glow and the
+            // 128x32 skin supplied by TextureName1. FirstOrDefault() grabbed the
+            // GLOW, recolored it pink, and then wrote that recolor's name into
+            // TextureName1: a recolor of texture A aimed at the slot that feeds
+            // texture B. The staff rendered vanilla green, and the pink went nowhere.
+            //
+            // Match on TextureName1 so we recolor the texture the DBC actually owns.
+            var dbcInfo = _dbc.GetItemModelInfo(displayId);
+            string tex1 = dbcInfo?.TextureName1 ?? "";
+
+            // Environment/reflection maps are shared cubemap-style textures the
+            // engine applies for shine — they are NOT the item's skin, and
+            // recoloring one repaints every reflective item in the game (or, via
+            // the DBC redirect, points the skin slot at a reflection map and the
+            // weapon renders BLACK — the Haggard's Sword incident, where
+            // Textures[0] of Sword_1H_Long_A_02 turned out to be ARMORREFLECT3).
+            static bool IsEnvMap(string? name)
+            {
+                var n = (name ?? "").ToUpperInvariant();
+                return n.Contains("REFLECT") || n.Contains("ENVMAP") || n.Contains("GENERICGLOW");
+            }
+
+            if (!string.IsNullOrWhiteSpace(tex1) && !IsEnvMap(tex1))
+            {
+                // Filename may be bare or a full path depending on the M2 —
+                // normalize before taking the stem (Linux GetFileName* does not
+                // split on backslashes).
+                targetTex = texInfo.Textures.FirstOrDefault(t =>
+                    Path.GetFileNameWithoutExtension((t.Filename ?? "").Replace('\\', '/'))
+                        .Equals(tex1, StringComparison.OrdinalIgnoreCase));
+
+                if (targetTex == null)
+                    return (null, null,
+                        $"TextureName1 '{tex1}' matches none of the model's {texInfo.Textures.Count} M2 texture(s) — cannot recolor a texture the DBC does not control");
+            }
+            else if (IsEnvMap(tex1))
+            {
+                // The DBC's own TextureName1 is a reflection map (some vanilla
+                // rows genuinely do this — the skin is baked, only the env map is
+                // DBC-supplied). There is nothing recolorable that the DBC
+                // controls. Refuse rather than paint the world's shine.
+                return (null, null,
+                    $"TextureName1 '{tex1}' is an environment/reflection map, not the item's skin — recoloring it is wrong for every item sharing it");
+            }
+            else
+            {
+                // Every texture is baked into the M2. Writing a name into
+                // TextureName1 would be a silent no-op — fail loudly instead.
+                return (null, null,
+                    $"model has no DBC-supplied texture (TextureName1 is empty); all {texInfo.Textures.Count} texture(s) are baked into the M2 and cannot be swapped via ItemDisplayInfo");
+            }
+        }
 
         // Preview is required for palette/segmented/variation/img2img modes but
         // NOT for Flux txt2img. Return the tex regardless; previewPath stays
@@ -1591,6 +1659,1073 @@ public class ItemsController : Controller
             blpSize = result.BlpSizeBytes,
             mode
         });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  LOOTIFIER RETEXTURE QUEUE
+    //
+    //  The Lootifiers generate many variants per base item, but a retexture is
+    //  slow (recolor → BLP → MPQ patch), so doing it inline would stall a batch
+    //  commit. Instead the Lootifiers ENQUEUE one job per (base item × colour
+    //  tier) — improved / power / glory / gods — and this processes the queue in
+    //  small batches so the UI can drive a progress bar.
+    //
+    //  One retexture per tier is shared by every variant in that tier: the job
+    //  carries the variant entry list, and on success all of them get the new
+    //  display_id. Works for items with no 3D model, since it operates on the
+    //  BLP texture rather than the GLB.
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Default recolor THEME per canonical tier (rarity-coded). A theme — not a
+    /// prose instruction — because it goes through VariationRecipeService exactly
+    /// like the Variations gallery, which is the path proven to work with no
+    /// vision model configured.
+    /// </summary>
+    /// <summary>
+    /// NO DEFAULT THEME. Blank is the signal for the seeded recolor.
+    ///
+    /// This used to be a rarity lookup table:
+    ///     improved → "polished silver steel"   (green)
+    ///     power    → "cobalt blue"             (blue)
+    ///     glory    → "royal purple"            (epic)
+    ///     gods     → "molten gold and fire"    (legendary)
+    ///
+    /// which is not a design, it is a `switch`. It painted every item the colour
+    /// of its own rarity: every epic purple, every legendary orange, regardless of
+    /// what the item actually was. And because an absolute colour target pulls
+    /// EVERY family toward one hue, it flattened the hand-painted contrast between
+    /// leather, metal and cloth into a single mush.
+    ///
+    /// A blank theme now routes to PaletteSwapService.RecolorSeededAsync, which
+    /// derives the colourway from a (base item × tier) seed. Typing a theme into
+    /// the modal still overrides it per tier — the LLM/instruction path is intact.
+    /// </summary>
+    public static string DefaultTierTheme(string tier) => "";
+
+    /// <summary>
+    /// Canonical colour tier for a tracked variant. Mirrors the Lootifiers'
+    /// CanonicalTier so grouping here matches the colour ladder they applied.
+    /// </summary>
+    private static string CanonicalTierOf(string? tierName, float budgetPct)
+    {
+        var l = (tierName ?? "").ToLowerInvariant();
+        if (l.Contains("god") || l.Contains("legend") || l.Contains("immortal") || l.Contains("azeroth")) return "gods";
+        if (l.Contains("glory") || l.Contains("fury")) return "glory";
+        if (l.Contains("power")) return "power";
+        if (l.Contains("improv")) return "improved";
+        if (budgetPct >= 98f) return "gods";
+        if (budgetPct >= 90f) return "glory";
+        if (budgetPct >= 80f) return "power";
+        return "improved";
+    }
+
+    // The three Lootifiers share lootifier_generated_items, distinguished by the
+    // creature_entry sentinel: quest = 0, crafting = -1, loot/ARPG = a real entry.
+    private static string SourceFilterSql(string source) => source switch
+    {
+        "quest" => "gi.creature_entry = 0",
+        "crafting" => "gi.creature_entry = -1",
+        "loot" => "gi.creature_entry > 0",
+        _ => "1=0"
+    };
+
+    private static readonly string[] RETEXTURE_SOURCES = { "quest", "crafting", "loot" };
+
+    /// <summary>
+    /// GET /Items/LootifierRetextureSources — what's available to retexture, per
+    /// Lootifier source, so the modal can show counts before you commit to a run.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> LootifierRetextureSources()
+    {
+        using var adminConn = _db.Admin();
+        await EnsureRetextureQueueTable(adminConn);
+
+        if (!await TableExists(adminConn, "lootifier_generated_items"))
+            return Json(new { success = true, sources = Array.Empty<object>(), note = "No lootifier data yet" });
+
+        var outSources = new List<object>();
+        foreach (var src in RETEXTURE_SOURCES)
+        {
+            var stats = await adminConn.QueryFirstOrDefaultAsync<dynamic>($@"
+                SELECT COUNT(DISTINCT gi.base_entry) AS bases, COUNT(*) AS variants
+                FROM lootifier_generated_items gi
+                WHERE {SourceFilterSql(src)}");
+
+            int queued = await adminConn.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM lootifier_retexture_queue WHERE source = @S", new { S = src });
+            int done = await adminConn.ExecuteScalarAsync<int>(
+                "SELECT COUNT(*) FROM lootifier_retexture_queue WHERE source = @S AND status = 'done'", new { S = src });
+
+            outSources.Add(new
+            {
+                source = src,
+                label = src switch { "quest" => "Quest Rewards", "crafting" => "Crafted Items", _ => "Loot / ARPG" },
+                bases = stats != null ? (int)(long)stats.bases : 0,
+                variants = stats != null ? (int)(long)stats.variants : 0,
+                queued,
+                done
+            });
+        }
+
+        return Json(new
+        {
+            success = true,
+            sources = outSources,
+            defaultThemes = new
+            {
+                improved = DefaultTierTheme("improved"),
+                power = DefaultTierTheme("power"),
+                glory = DefaultTierTheme("glory"),
+                gods = DefaultTierTheme("gods")
+            }
+        });
+    }
+
+    /// <summary>
+    /// POST /Items/BuildRetextureQueue — scan the selected Lootifier sources and
+    /// queue ONE recolor per (base item × colour tier). Every variant in a tier
+    /// shares the resulting display_id, so a base with 10 variants queues ≤ 4 jobs.
+    /// Body: { sources: ["quest","crafting","loot"], themes: {improved,power,glory,gods}, requeue?: bool }
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> BuildRetextureQueue([FromBody] JsonElement body)
+    {
+        var sources = new List<string>();
+        if (body.TryGetProperty("sources", out var sEl) && sEl.ValueKind == JsonValueKind.Array)
+            foreach (var s in sEl.EnumerateArray())
+            {
+                var v = s.GetString();
+                if (v != null && RETEXTURE_SOURCES.Contains(v)) sources.Add(v);
+            }
+        if (sources.Count == 0)
+            return Json(new { success = false, error = "No sources selected" });
+
+        bool requeue = body.TryGetProperty("requeue", out var rq) && rq.ValueKind == JsonValueKind.True;
+
+        var themes = new Dictionary<string, string>();
+        if (body.TryGetProperty("themes", out var tEl) && tEl.ValueKind == JsonValueKind.Object)
+            foreach (var p in tEl.EnumerateObject())
+            {
+                var v = p.Value.GetString();
+                if (!string.IsNullOrWhiteSpace(v)) themes[p.Name] = v!;
+            }
+
+        using var adminConn = _db.Admin();
+        using var mangosConn = _db.Mangos();
+        await EnsureRetextureQueueTable(adminConn);
+
+        if (!await TableExists(adminConn, "lootifier_generated_items"))
+            return Json(new { success = false, error = "No lootifier data found" });
+
+        int queued = 0, skipped = 0, basesCovered = 0, noDisplay = 0, ineligible = 0;
+
+        foreach (var src in sources)
+        {
+            var tracked = (await adminConn.QueryAsync<dynamic>($@"
+                SELECT gi.base_entry, gi.generated_entry, gi.tier_name, gi.budget_pct
+                FROM lootifier_generated_items gi
+                WHERE {SourceFilterSql(src)}")).ToList();
+            if (tracked.Count == 0) continue;
+
+            // Existing queue keys for this source, so a re-run doesn't duplicate.
+            var existing = new HashSet<string>((await adminConn.QueryAsync<dynamic>(
+                "SELECT base_entry, tier FROM lootifier_retexture_queue WHERE source = @S", new { S = src }))
+                .Select(r => $"{(int)r.base_entry}|{(string)r.tier}"));
+
+            var baseEntries = tracked.Select(t => (int)t.base_entry).Distinct().ToList();
+
+            // Base display_id + name live in the world DB (cross-database, so a
+            // second query rather than a join). Explicitly typed dictionary: a
+            // dynamic-inferred one can't be deconstructed later (CS8133).
+            var baseInfo = new Dictionary<int, (string name, int displayId, int invType)>();
+            foreach (var r in await mangosConn.QueryAsync<dynamic>(@"
+                SELECT entry, name, display_id, inventory_type FROM item_template
+                WHERE entry IN @E AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)",
+                new { E = baseEntries }))
+            {
+                int e = (int)r.entry;
+                string nm = (string)r.name;
+                int did = (int)(uint)r.display_id;
+                int iv = Convert.ToInt32(r.inventory_type);
+                baseInfo[e] = (nm, did, iv);
+            }
+
+            foreach (var grp in tracked.GroupBy(t => (int)t.base_entry))
+            {
+                int baseEntry = grp.Key;
+                if (!baseInfo.TryGetValue(baseEntry, out var info)) continue;
+                var (itemName, displayId, invType) = info;
+                if (displayId == 0) { noDisplay++; continue; }   // nothing to recolor
+
+                // Eligibility: necks, rings, trinkets, bags, ammo, quivers and relics
+                // have a display_id but NO texture any system can reach — no model, no
+                // body-atlas slots, no cape BLP. Queuing them just manufactures
+                // failures: 552 of the 857 in the July batch were exactly this, each
+                // one burning a job slot to arrive at "No textures found". Skip them
+                // at the source.
+                if (KindForInventoryType(invType) == KIND_NONE) { ineligible++; continue; }
+
+                basesCovered++;
+
+                var byTier = grp.GroupBy(t =>
+                    CanonicalTierOf((string?)t.tier_name, (float)t.budget_pct));
+
+                foreach (var tg in byTier)
+                {
+                    string tier = tg.Key;
+                    string key = $"{baseEntry}|{tier}";
+
+                    if (existing.Contains(key))
+                    {
+                        if (!requeue) { skipped++; continue; }
+                        await adminConn.ExecuteAsync(
+                            "DELETE FROM lootifier_retexture_queue WHERE source = @S AND base_entry = @B AND tier = @T",
+                            new { S = src, B = baseEntry, T = tier });
+                    }
+
+                    string entries = string.Join(",", tg.Select(x => (int)x.generated_entry).Distinct());
+                    string name = itemName.Length > 255 ? itemName.Substring(0, 255) : itemName;
+
+                    await adminConn.ExecuteAsync(@"
+                        INSERT INTO lootifier_retexture_queue
+                            (source, base_entry, base_display_id, item_name, tier, variant_entries,
+                             theme, instruction, status, created_at)
+                        VALUES (@S, @B, @Did, @Name, @Tier, @Entries, @Theme, '', 'pending', NOW())",
+                        new
+                        {
+                            S = src,
+                            B = baseEntry,
+                            Did = displayId,
+                            Name = name,
+                            Tier = tier,
+                            Entries = entries,
+                            // Blank → ProcessOneRetextureJob substitutes DefaultTierTheme(tier).
+                            Theme = themes.GetValueOrDefault(tier, "")
+                        });
+                    queued++;
+                }
+            }
+        }
+
+        return Json(new { success = true, queued, skipped, basesCovered, noDisplay, ineligible });
+    }
+
+    private async Task<bool> TableExists(MySqlConnector.MySqlConnection conn, string table) =>
+        await conn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @T",
+            new { T = table }) > 0;
+
+    /// <summary>
+    /// Typed row for lootifier_retexture_queue. Strongly typed on purpose: passing
+    /// a `dynamic` into ProcessOneRetextureJob would make the call itself dynamic,
+    /// so its tuple result comes back as `dynamic` and can't be deconstructed (CS8133).
+    /// </summary>
+    private class RetextureJobRow
+    {
+        public int id { get; set; }
+        public string source { get; set; } = "";
+        public int base_entry { get; set; }
+        public int base_display_id { get; set; }
+        public string item_name { get; set; } = "";
+        public string tier { get; set; } = "";
+        public string variant_entries { get; set; } = "";
+        public string theme { get; set; } = "";
+        public string instruction { get; set; } = "";
+        public string status { get; set; } = "";
+        public int new_display_id { get; set; }
+        public string? error { get; set; }
+    }
+
+    private async Task EnsureRetextureQueueTable(MySqlConnector.MySqlConnection adminConn)
+    {
+        await adminConn.ExecuteAsync(@"
+            CREATE TABLE IF NOT EXISTS lootifier_retexture_queue (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                source VARCHAR(24) NOT NULL DEFAULT 'quest',
+                base_entry INT NOT NULL,
+                base_display_id INT NOT NULL,
+                item_name VARCHAR(255) NOT NULL DEFAULT '',
+                tier VARCHAR(32) NOT NULL,
+                variant_entries TEXT NOT NULL,
+                theme VARCHAR(128) NOT NULL DEFAULT '',
+                instruction VARCHAR(512) NOT NULL DEFAULT '',
+                status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                new_display_id INT NOT NULL DEFAULT 0,
+                error VARCHAR(512) NULL,
+                created_at DATETIME NOT NULL,
+                processed_at DATETIME NULL,
+                INDEX idx_status (status),
+                INDEX idx_base (base_entry)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    }
+
+    /// <summary>GET /Items/RetextureQueueStatus — pending/done/failed counts.</summary>
+    [HttpGet]
+    public async Task<IActionResult> RetextureQueueStatus()
+    {
+        using var adminConn = _db.Admin();
+        await EnsureRetextureQueueTable(adminConn);
+
+        var rows = (await adminConn.QueryAsync<dynamic>(
+            "SELECT status, COUNT(*) AS n FROM lootifier_retexture_queue GROUP BY status")).ToList();
+
+        int pending = 0, done = 0, failed = 0;
+        foreach (var r in rows)
+        {
+            int n = (int)(long)r.n;
+            switch ((string)r.status)
+            {
+                case "pending": pending = n; break;
+                case "done": done = n; break;
+                case "failed": failed = n; break;
+            }
+        }
+
+        var failures = (await adminConn.QueryAsync<dynamic>(@"
+            SELECT base_entry, item_name, tier, error FROM lootifier_retexture_queue
+            WHERE status = 'failed' ORDER BY id DESC LIMIT 20")).ToList();
+
+        return Json(new
+        {
+            success = true,
+            pending,
+            done,
+            failed,
+            // Informational only — the queue does NOT require it. Without the vision
+            // model the recolor still runs (hard palette swaps via the regex parser),
+            // exactly like the Variations gallery.
+            llmAssistAvailable = _palette.IsAvailable,
+            failures = failures.Select(f => new
+            {
+                baseEntry = (int)f.base_entry,
+                itemName = (string)f.item_name,
+                tier = (string)f.tier,
+                error = (string?)f.error
+            })
+        });
+    }
+
+    /// <summary>
+    /// POST /Items/ProcessRetextureQueue — process up to `max` pending jobs
+    /// (default 3; each is slow). Call repeatedly from the UI until pending = 0.
+    /// Body: { max?: int }
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> ProcessRetextureQueue([FromBody] JsonElement body)
+    {
+        int max = body.ValueKind == JsonValueKind.Object
+                  && body.TryGetProperty("max", out var m) && m.TryGetInt32(out var mv)
+            ? Math.Clamp(mv, 1, 25) : 3;
+
+        // NOTE: no _palette.IsAvailable gate. The recolor engine is the same one
+        // behind the Variations gallery, which works with NO vision model — the
+        // LLM is only an optional instruction-cleanup step, and RecolorAndSaveAsync
+        // falls back to its regex instruction parser (hard palette swaps) without it.
+
+        using var adminConn = _db.Admin();
+        using var mangosConn = _db.Mangos();
+        await EnsureRetextureQueueTable(adminConn);
+
+        var jobs = (await adminConn.QueryAsync<RetextureJobRow>(
+            "SELECT * FROM lootifier_retexture_queue WHERE status = 'pending' ORDER BY id LIMIT @Max",
+            new { Max = max })).ToList();
+
+        // inventory_type drives the texture-system routing (see KindForInventoryType).
+        // It lives in the world DB, so one lookup for the whole batch rather than a
+        // query per job. Missing → 0 → KIND_NONE → the job fails loudly instead of
+        // being silently misrouted.
+        var invTypes = new Dictionary<int, int>();
+        if (jobs.Count > 0)
+        {
+            var baseEntries = jobs.Select(j => j.base_entry).Distinct().ToList();
+            foreach (var r in await mangosConn.QueryAsync<dynamic>(
+                "SELECT entry, inventory_type FROM item_template WHERE entry IN @E",
+                new { E = baseEntries }))
+            {
+                invTypes[(int)r.entry] = Convert.ToInt32(r.inventory_type);
+            }
+        }
+
+        int processed = 0, succeeded = 0, failedCount = 0, itemsRestyled = 0;
+        var results = new List<object>();
+
+        foreach (var job in jobs)
+        {
+            int id = job.id;
+            processed++;
+
+            try
+            {
+                int invType = invTypes.GetValueOrDefault(job.base_entry, 0);
+                var (ok, err, newDid) = await ProcessOneRetextureJob(job, invType, HttpContext.RequestAborted);
+
+                if (!ok || newDid == 0)
+                {
+                    failedCount++;
+                    string emsg = err ?? "unknown error";
+                    if (emsg.Length > 500) emsg = emsg.Substring(0, 500);
+                    await adminConn.ExecuteAsync(@"
+                        UPDATE lootifier_retexture_queue
+                        SET status = 'failed', error = @E, processed_at = NOW() WHERE id = @Id",
+                        new { E = emsg, Id = id });
+                    results.Add(new { id, tier = job.tier, ok = false, error = err });
+                    continue;
+                }
+
+                // Every variant in this tier shares the retextured display.
+                var entries = ParseEntryCsv(job.variant_entries);
+                if (entries.Count > 0)
+                {
+                    await mangosConn.ExecuteAsync(
+                        "UPDATE item_template SET display_id = @Did WHERE entry IN @E",
+                        new { Did = newDid, E = entries });
+                    itemsRestyled += entries.Count;
+                }
+
+                await adminConn.ExecuteAsync(@"
+                    UPDATE lootifier_retexture_queue
+                    SET status = 'done', new_display_id = @Did, error = NULL, processed_at = NOW()
+                    WHERE id = @Id",
+                    new { Did = (int)newDid, Id = id });
+
+                succeeded++;
+                results.Add(new { id, tier = job.tier, ok = true, newDisplayId = newDid, variants = entries.Count });
+            }
+            catch (Exception ex)
+            {
+                failedCount++;
+                _logger.LogError(ex, "Retexture queue job {Id} failed", id);
+                string msg = ex.Message.Length > 500 ? ex.Message.Substring(0, 500) : ex.Message;
+                await adminConn.ExecuteAsync(@"
+                    UPDATE lootifier_retexture_queue
+                    SET status = 'failed', error = @E, processed_at = NOW() WHERE id = @Id",
+                    new { E = msg, Id = id });
+                results.Add(new { id, tier = job.tier, ok = false, error = ex.Message });
+            }
+        }
+
+        int remaining = await adminConn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM lootifier_retexture_queue WHERE status = 'pending'");
+
+        // ── Rebuild patch-4.MPQ ONCE, when the queue drains ──
+        // Individual jobs commit with rebuildPatch:false. The patch is a pure
+        // function of the retexture tables, so one rebuild at the end produces
+        // exactly what N rebuilds would have — for 1/N the work. If the run is
+        // interrupted, the DB still holds every committed row; the next
+        // ProcessRetextureQueue call that empties the queue (or an explicit
+        // POST /Items/RebuildRetexturePatch) brings the patch back in sync.
+        bool patchRebuilt = false;
+        string? patchError = null;
+        if (remaining == 0 && succeeded > 0)
+        {
+            var rb = await _retexture.RebuildPatchMAsync();
+            patchRebuilt = rb.Success;
+            patchError = rb.Error;
+            _logger.LogInformation(
+                "Retexture queue: drained — patch-4.MPQ rebuild success={Ok} entries={N}",
+                rb.Success, rb.TotalEntries);
+        }
+
+        return Json(new
+        {
+            success = true,
+            processed,
+            succeeded,
+            failed = failedCount,
+            itemsRestyled,
+            remaining,
+            patchRebuilt,
+            patchError,
+            results
+        });
+    }
+
+    /// <summary>
+    /// POST /Items/RebuildRetexturePatch — force a patch-4.MPQ rebuild from the
+    /// retexture tables. The queue does this automatically when it drains; this is
+    /// the escape hatch for an interrupted run, or after a code change to the
+    /// packing step (e.g. the component-BLP gender suffix fix) that requires
+    /// re-emitting the archive from already-committed rows.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> RebuildRetexturePatch()
+    {
+        var rb = await _retexture.RebuildPatchMAsync();
+        return Json(new
+        {
+            success = rb.Success,
+            error = rb.Error,
+            patchUrl = rb.PatchWebPath,
+            entries = rb.TotalEntries,     // DB rows / display groups
+            mpqFiles = rb.MpqFileCount     // files actually IN the archive — the number that matters
+        });
+    }
+
+    /// <summary>POST /Items/ResetRetextureQueue — requeue failures, or clear all. Body: { clear?: bool }</summary>
+    [HttpPost]
+    public async Task<IActionResult> ResetRetextureQueue([FromBody] JsonElement body)
+    {
+        bool clear = body.ValueKind == JsonValueKind.Object
+                     && body.TryGetProperty("clear", out var c) && c.ValueKind == JsonValueKind.True;
+
+        using var adminConn = _db.Admin();
+        await EnsureRetextureQueueTable(adminConn);
+
+        int affected = clear
+            ? await adminConn.ExecuteAsync("DELETE FROM lootifier_retexture_queue")
+            : await adminConn.ExecuteAsync(
+                "UPDATE lootifier_retexture_queue SET status = 'pending', error = NULL, processed_at = NULL WHERE status = 'failed'");
+
+        return Json(new { success = true, affected, cleared = clear });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  ITEM KIND — resolved from inventory_type, NOT from "whatever
+    //  resolver happens to answer first".
+    //
+    //  The old router tried the body atlas, then the model path, then the cape
+    //  path, and took the first non-empty answer. That is a guess, and it was
+    //  wrong 67 times: a helm or a shoulder whose ItemDisplayInfo row happens to
+    //  carry one stray m_texture[] slot got swallowed by the atlas path, had an
+    //  arm patch nobody can see recolored, and was marked done — while the actual
+    //  pauldron/helm skin kept its vanilla texture. The DB knows exactly what kind
+    //  of item this is. Ask it.
+    //
+    //  Vanilla 1.12 inventory_type:
+    //    1 head · 2 neck · 3 shoulders · 4 shirt · 5 chest · 6 waist · 7 legs
+    //    8 feet · 9 wrists · 10 hands · 11 finger · 12 trinket · 13 weapon
+    //    14 shield · 15 ranged · 16 cloak · 17 2h · 18 bag · 19 tabard · 20 robe
+    //    21 mainhand · 22 offhand · 23 holdable · 24 ammo · 25 thrown
+    //    26 rangedright · 27 quiver · 28 relic
+    // ══════════════════════════════════════════════════════════════
+
+    private const string KIND_ATLAS = "atlas";   // paints m_texture[0..7] into the body atlas
+    private const string KIND_MODEL = "model";   // own M2 + texture
+    private const string KIND_CAPE = "cape";    // no M2, no atlas — ObjectComponents\Cape\
+    private const string KIND_NONE = "none";    // no visual representation at all
+
+    private static string KindForInventoryType(int invType) => invType switch
+    {
+        4 or 5 or 6 or 7 or 8 or 9 or 10 or 19 or 20 => KIND_ATLAS,
+        16 => KIND_CAPE,
+        1 or 3 or 13 or 14 or 15 or 17 or 21 or 22 or 23 or 25 or 26 => KIND_MODEL,
+        // neck, finger, trinket, bag, ammo, quiver, relic: no model, no atlas
+        // slots, no cape BLP. 552 of the July failures were these — they can
+        // never be retextured, so they must never be queued.
+        _ => KIND_NONE,
+    };
+
+    /// <summary>Item\ObjectComponents\{subdir}\ for a model item, by slot.</summary>
+    private static string ObjectComponentSubdir(int invType) => invType switch
+    {
+        1 => "Head",
+        3 => "Shoulder",
+        14 => "Shield",
+        _ => "Weapon",
+    };
+
+    /// <summary>
+    /// Stable seed for a (base item, tier) pair.
+    ///
+    /// FNV-1a, NOT string.GetHashCode() — .NET randomizes string hashing per
+    /// process, so GetHashCode would recolor every item differently after every
+    /// service restart. The whole point of seeding is that a regen reproduces the
+    /// same colours; a per-process hash would silently destroy that.
+    /// </summary>
+    private static int SeedFor(int baseEntry, string tier)
+    {
+        unchecked
+        {
+            uint h = 2166136261u;
+            h = (h ^ (uint)baseEntry) * 16777619u;
+            h = (h ^ (uint)(baseEntry >> 16)) * 16777619u;
+            foreach (char c in tier ?? "") h = (h ^ c) * 16777619u;
+            return (int)h;
+        }
+    }
+
+    /// <summary>
+    /// How hard a tier pushes. NOT which colour it picks — the hue is seeded per
+    /// item, so there is no rarity colour-coding. This only controls how far the
+    /// variant deviates from the original: an Improved stays close to the source's
+    /// own vividness, a Gods-tier is deliberately more saturated and higher
+    /// contrast. The tier reads as more intense without being reduced to a colour.
+    /// </summary>
+    // RETIRED as the tier axis (kept for reference / themed-path compat):
+    // satScale is renormalized by the engine's spread/tent/clamp machinery and
+    // lightBias is a uniform brightness shift — neither reads as tier. Measured
+    // on 5770: improved→gods differed by ~0.04-0.10 uniform L and clamp-crushed
+    // S. TierShape below owns the ladder now.
+    private static (float satScale, float lightBias) TierIntensity(string tier) => tier switch
+    {
+        "improved" => (1.00f, 0.00f),
+        "power" => (1.15f, 0.03f),
+        "glory" => (1.30f, 0.06f),
+        "gods" => (1.50f, 0.10f),
+        _ => (1.00f, 0.00f),
+    };
+
+    /// <summary>
+    /// Tier as VALUE STRUCTURE — the post-tent stage's knobs (see the
+    /// POST-TENT TIER STAGE block in PaletteSwapService.ApplySmoothMap):
+    /// kd = shadow toe (deepens, cannot crush), ku = highlight drive toward
+    /// white, m = saturation headroom curve, pop = specular lift on the top-4%
+    /// brightest pixels. Callers pass these WITH satScale=1, lightBias=0 —
+    /// the stage owns the tier axis; stacking both double-darkens (verified
+    /// on 5770). improved is deliberately all-zero: the base colourway.
+    /// </summary>
+    private static (float kd, float ku, float m, float pop) TierShape(string tier) => tier switch
+    {
+        "improved" => (0.00f, 0.00f, 0.00f, 0.00f),
+        "power" => (0.05f, 0.25f, 0.20f, 0.02f),
+        "glory" => (0.09f, 0.50f, 0.45f, 0.05f),
+        "gods" => (0.13f, 0.85f, 0.80f, 0.10f),
+        _ => (0.00f, 0.00f, 0.00f, 0.00f),
+    };
+
+    /// <summary>
+    /// Progressive tier policy — how MUCH of the item each tier may replace.
+    /// swapBudget = cumulative pixel share allowed to change, smallest material
+    /// first (minimum one always swaps). hueLeash = how far a swapped material
+    /// may roll from its own hue (180 = unleashed). improved: trim only, near
+    /// its own hue — recognizably the same item. gods: full colourway swap;
+    /// the span guard preserves the base↔trim contrast structure. See the
+    /// TIER POLICY block in PaletteSwapService.RecolorSeededAsync.
+    /// </summary>
+    private static (float swapBudget, float hueLeash) TierPolicy(string tier) => tier switch
+    {
+        "improved" => (0.20f, 40f),
+        "power" => (0.40f, 120f),
+        "glory" => (0.70f, 180f),
+        "gods" => (1.01f, 180f),
+        _ => (1.01f, 180f),
+    };
+
+    /// <summary>Seeded recolor unless the operator explicitly typed a theme/instruction.</summary>
+    private static bool UseSeededRecolor(RetextureJobRow job) =>
+        string.IsNullOrWhiteSpace(job.instruction) && string.IsNullOrWhiteSpace(job.theme);
+
+    private static List<int> ParseEntryCsv(string csv) =>
+        (csv ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => int.TryParse(s, out var v) ? v : 0)
+            .Where(v => v > 0)
+            .Distinct()
+            .ToList();
+
+    /// <summary>
+    /// Run one queued tier retexture. Mirrors GenerateVariations — the path that
+    /// works with NO vision model: detect families → recipe from the tier theme →
+    /// brute-force palette recolor → commit (BLP → patch MPQ) → new displayId.
+    /// The LLM is optional at every step: if the recipe service is unavailable or
+    /// returns nothing, we hand the theme straight to RecolorAndSaveAsync, whose
+    /// regex instruction parser does the hard palette swap. Operates on the BLP
+    /// texture, so items with no 3D model work fine.
+    /// </summary>
+    private async Task<(bool ok, string? err, uint newDid)> ProcessOneRetextureJob(
+        RetextureJobRow job, int invType, CancellationToken ct)
+    {
+        if (job.base_display_id <= 0) return (false, "base item has no display_id", 0);
+        uint baseDid = (uint)job.base_display_id;
+        string tier = job.tier ?? "";
+
+        // ── Route by item kind (three distinct texture systems) ──
+        // Deterministic, from inventory_type. See KindForInventoryType.
+        string kind = KindForInventoryType(invType);
+
+        switch (kind)
+        {
+            case KIND_ATLAS:
+                {
+                    var atlas = await _bodyAtlas.EnsureAtlasTexturesAsync(baseDid);
+                    if (atlas == null || atlas.SlotUrls.Count == 0)
+                        return (false, $"painted armor (invType {invType}) but no body-atlas slots resolved for display {baseDid}", 0);
+                    return await ProcessBodyAtlasJob(job, baseDid, tier, atlas.SlotUrls, ct);
+                }
+
+            case KIND_CAPE:
+                {
+                    // Each stage reports its OWN failure. The old code fell through to
+                    // `terr` — an error string from a completely different resolver —
+                    // so all 156 cape failures said "No textures found" regardless of
+                    // whether the BLP was missing, the decode threw, or the preview
+                    // path was wrong. Three bugs wearing one error message.
+                    var cape = _itemTextures.GetCapeTexture(baseDid);
+                    if (cape == null)
+                        return (false, $"cloak: no BLP under Item\\ObjectComponents\\Cape\\ for display {baseDid} (check ItemDisplayInfo TextureName1)", 0);
+
+                    if (string.IsNullOrEmpty(cape.PreviewPngPath))
+                        return (false, $"cloak: cape BLP resolved ({cape.Filename}) but produced no preview PNG", 0);
+
+                    string capePreview = Path.Combine(_env.WebRootPath,
+                        cape.PreviewPngPath.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                    if (!System.IO.File.Exists(capePreview))
+                        return (false, $"cloak: preview PNG missing on disk at {capePreview}", 0);
+
+                    return await ProcessSingleTextureJob(job, baseDid, tier, cape, capePreview, ct);
+                }
+
+            case KIND_MODEL:
+                {
+                    // M2 path first — correct for weapons, shields, shoulders.
+                    var (tex, previewPath, terr) = ResolveTargetTexture(baseDid, "", "");
+                    if (tex != null && !string.IsNullOrEmpty(previewPath))
+                        return await ProcessSingleTextureJob(job, baseDid, tier, tex, previewPath, ct);
+
+                    // Fallback: resolve the texture straight from the DBC, no M2 needed.
+                    // HELMS ALWAYS LAND HERE — their M2 is race+gender suffixed
+                    // (Helm_X_HuM.m2) while ItemDisplayInfo stores the bare stem, so
+                    // FindAndExtractItemM2 can never find it. 150 helms failed this way.
+                    string subdir = ObjectComponentSubdir(invType);
+                    var oc = _itemTextures.GetObjectComponentTexture(baseDid, subdir);
+                    if (oc == null)
+                        return (false, $"model item (invType {invType}): no M2 texture ({terr}) and no BLP under Item\\ObjectComponents\\{subdir}\\", 0);
+
+                    string ocPreview = Path.Combine(_env.WebRootPath,
+                        (oc.PreviewPngPath ?? "").TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                    if (string.IsNullOrEmpty(oc.PreviewPngPath) || !System.IO.File.Exists(ocPreview))
+                        return (false, $"model item: {subdir} BLP resolved ({oc.Filename}) but preview PNG missing", 0);
+
+                    return await ProcessSingleTextureJob(job, baseDid, tier, oc, ocPreview, ct);
+                }
+
+            default:
+                // Should be unreachable — BuildRetextureQueue filters these out.
+                return (false, $"inventory_type {invType} has no texture to recolor (neck/finger/trinket/bag/ammo/quiver/relic)", 0);
+        }
+    }
+
+    /// <summary>
+    /// GET /Items/TheorySheet?displayId=NNNN
+    ///
+    /// THE FAST LOOP for judging recolor theories. Renders the item's primary
+    /// texture under EVERY theory × every tier into one labeled contact-sheet
+    /// PNG and returns its URL. Seconds per iteration, zero client restarts.
+    ///
+    /// This preview is trustworthy for COLOUR judgment specifically, and only
+    /// as of today: the recolor is pure pixel math, so the PNG and the BLP that
+    /// ships carry identical pixels — and the transport chain (palettized BLP,
+    /// StormLib archive, sorted DBC) is now verified end-to-end in the client.
+    /// What the sheet cannot show is in-engine lighting; that's what the
+    /// variant archives are for, on the one or two finalists.
+    /// </summary>
+    /// <param name="ladder">
+    /// When true, the SAME seed is used for every tier — so the tier axis shows
+    /// one colour identity DEEPENING (richer, higher contrast, louder accent)
+    /// instead of four unrelated re-rolls. This is the "better version of
+    /// itself" reading of tiers; ladder=false is the "each tier its own
+    /// colourway" reading. They are different design games — the sheet exists
+    /// so you can look at both before committing a full run to either.
+    /// </param>
+    [HttpGet]
+    public async Task<IActionResult> TheorySheet(uint displayId, int cell = 128, bool ladder = false)
+    {
+        // Primary source texture: largest atlas slot for painted armor, the
+        // DBC-controlled model texture otherwise.
+        string? srcPng = null;
+        var atlas = await _bodyAtlas.EnsureAtlasTexturesAsync(displayId);
+        if (atlas != null && atlas.SlotUrls.Count > 0)
+        {
+            var best = atlas.SlotUrls.OrderByDescending(kv =>
+            {
+                var pth = Path.Combine(_env.WebRootPath,
+                    kv.Value.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+                return System.IO.File.Exists(pth) ? new FileInfo(pth).Length : 0;
+            }).First();
+            srcPng = Path.Combine(_env.WebRootPath,
+                best.Value.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+        }
+        else
+        {
+            var (tex, previewPath, _) = ResolveTargetTexture(displayId, "", "");
+            if (tex != null && previewPath != null) srcPng = previewPath;
+        }
+        if (srcPng == null || !System.IO.File.Exists(srcPng))
+            return Json(new { success = false, error = "no resolvable source texture for this display" });
+
+        string[] tiers = { "improved", "power", "glory", "gods" };
+        var theories = PaletteSwapService.RecolorTheories;
+
+        var outDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "theory_lab");
+        Directory.CreateDirectory(outDir);
+
+        int cols = tiers.Length + 1;               // +1 for the original
+        int rows = theories.Length;
+        int label = 84, pad = 6, header = 44;   // room for the family-diagnostics line
+        int W = label + cols * (cell + pad) + pad;
+        int H = header + rows * (cell + pad) + pad;
+
+        using var sheet = new SkiaSharp.SKBitmap(W, H);
+        using var canvas = new SkiaSharp.SKCanvas(sheet);
+        canvas.Clear(new SkiaSharp.SKColor(24, 24, 28));
+        using var text = new SkiaSharp.SKPaint
+        { Color = SkiaSharp.SKColors.White, TextSize = 13, IsAntialias = true };
+
+        // Family diagnostics — a single chromatic family makes five of the six
+        // theories mathematically near-identical (they all reduce to "seed hue
+        // plus a small offset" when there is nothing to arrange into a palette).
+        // Say so on the sheet, or a degenerate item reads as "the theories don't
+        // work" when it actually means "this texture has nothing to differ ON".
+        var fams = _palette.DetectFamilies(srcPng);
+        var chromaticFams = fams.Where(f => f.Family != "white" && f.Family != "black").ToList();
+        string famLine = $"families: {string.Join(", ", fams.Select(f => $"{f.Family} {f.Percent:F0}%"))}";
+        if (chromaticFams.Count <= 1)
+            famLine += "   [SINGLE CHROMATIC FAMILY — theories degenerate; judge on a multi-family item]";
+        canvas.DrawText(famLine, label + pad + (cell + pad), 14, text);
+
+        // Column headers
+        canvas.DrawText("original", label + pad, header - 8, text);
+        for (int t = 0; t < tiers.Length; t++)
+            canvas.DrawText(tiers[t], label + pad + (t + 1) * (cell + pad), header - 8, text);
+
+        using (var orig = SkiaSharp.SKBitmap.Decode(srcPng))
+        {
+            for (int r = 0; r < rows; r++)
+            {
+                string theory = theories[r];
+                canvas.DrawText(theory, pad, header + r * (cell + pad) + cell / 2, text);
+
+                var oRect = SkiaSharp.SKRect.Create(label + pad, header + r * (cell + pad), cell, cell);
+                if (orig != null) canvas.DrawBitmap(orig, oRect);
+
+                for (int t = 0; t < tiers.Length; t++)
+                {
+                    var (kd, ku, m, pop) = TierShape(tiers[t]);   // stage owns the tier axis
+                    var (budget, leash) = TierPolicy(tiers[t]);   // how much of the item may change
+                    // ladder: one identity per item, tiers deepen it.
+                    // non-ladder: each tier re-rolls its own colourway.
+                    int seed = ladder ? SeedFor((int)displayId, "")
+                                      : SeedFor((int)displayId, tiers[t]);
+                    string cellPng = Path.Combine(outDir,
+                        $"lab_{displayId}_{theory}_{tiers[t]}_{(ladder ? "L" : "R")}.png");
+
+                    var ok = await _palette.RecolorSeededAsync(
+                        srcPng, cellPng, seed, 1.0f, 0.0f, false,
+                        HttpContext.RequestAborted, theory, kd, ku, m, pop, budget, leash);
+                    if (ok == null) continue;
+
+                    using var bmp = SkiaSharp.SKBitmap.Decode(cellPng);
+                    if (bmp == null) continue;
+                    var rect = SkiaSharp.SKRect.Create(
+                        label + pad + (t + 1) * (cell + pad),
+                        header + r * (cell + pad), cell, cell);
+                    canvas.DrawBitmap(bmp, rect);
+                }
+            }
+        }
+
+        string sheetPath = Path.Combine(outDir, $"sheet_{displayId}{(ladder ? "_ladder" : "")}.png");
+        using (var fs = System.IO.File.Create(sheetPath))
+            sheet.Encode(fs, SkiaSharp.SKEncodedImageFormat.Png, 95);
+
+        return Json(new
+        {
+            success = true,
+            url = $"/item_textures_cache/theory_lab/sheet_{displayId}{(ladder ? "_ladder" : "")}.png",
+            chromaticFamilies = chromaticFams.Count,
+            theories,
+            note = "rows = theories, columns = original + tiers; same seeds the queue would use"
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  RECIPE CACHE    // ══════════════════════════════════════════════════════════════
+    //  RECIPE CACHE
+    //
+    //  A recipe is a pure function of (theme, colour families). The theme is one
+    //  of four fixed strings; the families come out of the texture, and thousands
+    //  of items share the same family set (brown leather, grey mail, blue cloth).
+    //  So the LLM was being asked the SAME question thousands of times.
+    //
+    //  It cost ~8 seconds per job. At 6193 jobs that is ~13.8 hours of Ollama
+    //  round-trips for a recolor engine whose actual pixel work runs in
+    //  milliseconds. The queue was never compute-bound — it was bound on waiting
+    //  for a language model to re-derive an answer it had already given.
+    //
+    //  Worse, GenerateRecipesAsync returns FIVE recipes per call and the old code
+    //  used recipes[0] and discarded the other four. So we cache all five and
+    //  rotate through them: variety across items is preserved (arguably improved —
+    //  five distinct looks instead of one non-deterministic roll), at zero
+    //  additional cost.
+    //
+    //  Process-lifetime cache. Recipes are cosmetic and the themes are stable, so
+    //  there is no invalidation concern; a restart re-warms it in a few calls.
+    // ══════════════════════════════════════════════════════════════
+
+    private static readonly ConcurrentDictionary<string, string[]> _recipeCache = new();
+    private static readonly ConcurrentDictionary<string, int> _recipeCursor = new();
+
+    /// <summary>Resolve the recolor instruction for a job (explicit → cached recipe → theme → tier default).</summary>
+    private async Task<string> ResolveJobInstruction(RetextureJobRow job, string tier, string familySourcePng, CancellationToken ct)
+    {
+        string instruction = job.instruction ?? "";
+        if (!string.IsNullOrWhiteSpace(instruction)) return instruction;
+
+        string theme = job.theme ?? "";
+        if (string.IsNullOrWhiteSpace(theme)) theme = DefaultTierTheme(tier);
+
+        try
+        {
+            // DetectFamilies is local pixel work (fast) — always run it, since it
+            // is what makes the cache key meaningful.
+            var families = _palette.DetectFamilies(familySourcePng);
+
+            string key = theme + "||" + string.Join(",",
+                families.Select(f => f.Family ?? "").Where(f => f.Length > 0)
+                        .OrderBy(f => f, StringComparer.OrdinalIgnoreCase));
+
+            if (!_recipeCache.TryGetValue(key, out var cached))
+            {
+                // Ask for 5 — the service returns ~5 anyway, and we now keep them all.
+                var recipes = await _variations.GenerateRecipesAsync(theme, families, 5, ct);
+                cached = recipes
+                    .Select(r => r.Instruction)
+                    .Where(i => !string.IsNullOrWhiteSpace(i))
+                    .ToArray();
+
+                if (cached.Length > 0)
+                {
+                    _recipeCache[key] = cached;
+                    _logger.LogInformation(
+                        "Retexture queue: cached {N} recipe(s) for key '{Key}' ({Cached} keys warm)",
+                        cached.Length, key, _recipeCache.Count);
+                }
+            }
+
+            if (cached.Length > 0)
+            {
+                // Rotate so sibling items in the same tier don't all come out identical.
+                int idx = _recipeCursor.AddOrUpdate(key, 0, (_, v) => v + 1);
+                return cached[(idx % cached.Length + cached.Length) % cached.Length];
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogInformation(
+                "Retexture queue: recipe generation failed ({Err}) — falling back to the raw theme", ex.Message);
+        }
+
+        // No recipe service / no LLM → the theme itself is the instruction and
+        // RecolorAndSaveAsync's regex parser handles it (hard palette swap).
+        return theme;
+    }
+
+    /// <summary>PAINTED ARMOR: recolor every component slot with one recipe, commit as component BLPs.</summary>
+    private async Task<(bool ok, string? err, uint newDid)> ProcessBodyAtlasJob(
+        RetextureJobRow job, uint baseDid, string tier,
+        IReadOnlyDictionary<int, string> slotUrls, CancellationToken ct)
+    {
+        string DiskOf(string webUrl) => Path.Combine(_env.WebRootPath,
+            webUrl.TrimStart('/').Replace('/', Path.DirectorySeparatorChar));
+
+        // One recipe from a representative slot (chest = 3 when present), applied
+        // to every slot so the whole piece recolors coherently.
+        int primarySlot = slotUrls.ContainsKey(3) ? 3 : slotUrls.Keys.OrderBy(k => k).First();
+        string primaryDisk = DiskOf(slotUrls[primarySlot]);
+        if (!System.IO.File.Exists(primaryDisk))
+            return (false, "body-atlas source PNG missing on disk", 0);
+
+        // Seeded unless the operator typed a theme. ONE seed for the whole piece —
+        // every slot of a chest/legs/gloves set must land on the same colourway or
+        // the armour comes out mismatched between body regions.
+        bool seeded = UseSeededRecolor(job);
+        int seed = SeedFor(job.base_entry, tier);
+        var (kd, ku, m, pop) = TierShape(tier);   // tier axis = post-tent stage
+        var (budget, leash) = TierPolicy(tier);   // how much of the item may change
+
+        string instruction = seeded
+            ? $"seeded:{seed} shape=({kd:F2},{ku:F2},{m:F2},{pop:F2}) policy=({budget:F2},{leash:F0})"
+            : await ResolveJobInstruction(job, tier, primaryDisk, ct);
+
+        // Recolored slot PNGs must live under item_textures_cache/ to pass the
+        // same staged-path validation the interactive commit uses.
+        var outDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "lootifier_tiers");
+        Directory.CreateDirectory(outDir);
+
+        var slotPngPaths = new Dictionary<int, string>();
+        foreach (var kv in slotUrls)
+        {
+            string srcDisk = DiskOf(kv.Value);
+            if (!System.IO.File.Exists(srcDisk)) continue;
+
+            string outPng = Path.Combine(outDir, $"ba_{baseDid}_{tier}_s{kv.Key}_{Guid.NewGuid():N}.png");
+
+            var ok = seeded
+                ? await _palette.RecolorSeededAsync(srcDisk, outPng, seed, 1.0f, 0.0f, false, ct,
+                      _config["Retexture:Theory"] ?? "fan", kd, ku, m, pop, budget, leash)
+                : await _palette.RecolorAndSaveAsync(srcDisk, instruction, outPng, null, ct);
+
+            if (ok == null) continue;
+            slotPngPaths[kv.Key] = outPng;
+        }
+
+        if (slotPngPaths.Count == 0)
+            return (false, "body-atlas recolor produced no slots", 0);
+
+        // rebuildPatch: false — the queue rebuilds patch-4.MPQ ONCE when it
+        // drains. Rebuilding per job repacks every BLP committed so far, which
+        // makes a batch quadratic (the 5-hour run).
+        var res = await _retexture.CommitBodyAtlasAsync(
+            baseDid, job.item_name ?? "", instruction, slotPngPaths, ct,
+            rebuildPatch: false);
+
+        if (!res.Success) return (false, res.Error ?? "body-atlas commit failed", 0);
+        return (true, null, (uint)res.NewDisplayId);
+    }
+
+    /// <summary>
+    /// SINGLE-TEXTURE ITEMS: recolor one BLP and commit it. Serves both model
+    /// items (weapons/shields/helms/shoulders) and capes — the texture is already
+    /// resolved by the caller, so the only difference is which MPQ folder it came
+    /// from, which RetextureRequest carries through OriginalMpqPath.
+    /// </summary>
+    private async Task<(bool ok, string? err, uint newDid)> ProcessSingleTextureJob(
+        RetextureJobRow job, uint baseDid, string tier,
+        ItemTextureEntry tex, string previewPath, CancellationToken ct)
+    {
+        bool seeded = UseSeededRecolor(job);
+        int seed = SeedFor(job.base_entry, tier);
+        var (kd, ku, m, pop) = TierShape(tier);   // tier axis = post-tent stage
+        var (budget, leash) = TierPolicy(tier);   // how much of the item may change
+
+        string instruction = seeded
+            ? $"seeded:{seed} shape=({kd:F2},{ku:F2},{m:F2},{pop:F2}) policy=({budget:F2},{leash:F0})"
+            : await ResolveJobInstruction(job, tier, previewPath, ct);
+
+        var outDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "lootifier_tiers");
+        Directory.CreateDirectory(outDir);
+        string outPng = Path.Combine(outDir, $"tier_{baseDid}_{tier}_{Guid.NewGuid():N}.png");
+
+        // Same super-res source the Variations gallery uses, so the committed
+        // texture is as sharp as a previewed card.
+        string src = await GetUpscaledSourceAsync(previewPath, ct);
+
+        var recolored = seeded
+            ? await _palette.RecolorSeededAsync(src, outPng, seed, 1.0f, 0.0f, false, ct,
+                  _config["Retexture:Theory"] ?? "fan", kd, ku, m, pop, budget, leash)
+            : await _palette.RecolorAndSaveAsync(src, instruction, outPng, null, ct);
+
+        if (recolored == null) return (false, "palette recolor failed", 0);
+
+        var req = new RetextureRequest
+        {
+            DisplayId = baseDid,
+            ItemName = job.item_name ?? "",
+            OriginalBlpFilename = tex.Filename,
+            OriginalMpqPath = tex.MpqPath,
+            StyleDirection = instruction,
+        };
+
+        // preResolved: tex — the entry we already resolved above. Without it the
+        // commit re-derives the texture through the M2-only path, which returns
+        // null for capes and helms and kills the job AFTER the recolor has run.
+        // rebuildPatch: false — see ProcessBodyAtlasJob.
+        var res = await _retexture.RetextureFromBitmapAsync(
+            req, outPng, ct, rebuildPatch: false, preResolved: tex);
+        if (!res.Success) return (false, res.Error ?? "retexture commit failed", 0);
+
+        return (true, null, (uint)res.NewDisplayId);
     }
 
     /// <summary>
@@ -2245,13 +3380,38 @@ public class ItemsController : Controller
     /// </summary>
     [HttpGet]
     [HttpHead]
-    public IActionResult DownloadPatch(string file)
+    public async Task<IActionResult> DownloadPatch(string file)
     {
         if (string.IsNullOrWhiteSpace(file)) return BadRequest("File name required");
         file = Path.GetFileName(file); // sanitize
         var fullPath = Path.Combine(_env.WebRootPath, "patches", "retexture", file);
+
+        // wwwroot is ephemeral — a publish/restart wipes wwwroot/patches while the
+        // retextures survive in the DB. If the current unified patch is missing on a
+        // real download (GET), regenerate it from the DB first so the download works
+        // in every environment without depending on wwwroot persisting.
+        if (!System.IO.File.Exists(fullPath)
+            && string.Equals(Request.Method, "GET", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(file, "patch-4.MPQ", StringComparison.OrdinalIgnoreCase))
+        {
+            await _retexture.EnsurePatchBuiltAsync();
+        }
+
         if (!System.IO.File.Exists(fullPath)) return NotFound($"Patch '{file}' not found");
         return PhysicalFile(fullPath, "application/octet-stream", file);
+    }
+
+    /// <summary>
+    /// GET /Items/PatchStatus
+    /// Reports whether a retexture patch is available to download. Based on the DB
+    /// (durable), not the wwwroot file (ephemeral), so the download button shows
+    /// whenever a patch can be produced — including right after a redeploy.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> PatchStatus()
+    {
+        bool available = await _retexture.HasAnyRetexturesAsync();
+        return Json(new { available });
     }
 
     // ===================== ICON SEARCH =====================

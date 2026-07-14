@@ -848,6 +848,107 @@ public class ItemTextureService
     }
 
     /// <summary>
+    /// CLOAKS / CAPES — the third kind of item texture.
+    ///
+    /// A cape has NO M2 model of its own (it's a geoset on the character), so
+    /// GetTexturesForDisplay can't serve it: that method hard-returns null when
+    /// ModelName is empty. And it paints nothing into the body atlas, so
+    /// BodyAtlasTextureService can't either — that only walks m_texture[0..7]
+    /// under Item\TextureComponents\, which cloaks never populate.
+    ///
+    /// Instead a cape is textured straight from ItemDisplayInfo's ModelTexture
+    /// (TextureName1), resolved under:
+    ///
+    ///     Item\ObjectComponents\Cape\{TextureName1}.blp
+    ///
+    /// Note FindItemBlp deliberately does NOT probe Cape\ — it's only reachable
+    /// from the M2 path, which capes never enter. Hence this dedicated resolver.
+    ///
+    /// Returns an ItemTextureEntry (same shape the model path yields) so callers
+    /// and the retexture commit can treat it identically. Null if the display has
+    /// no cape BLP — i.e. it isn't a cloak.
+    /// </summary>
+    public ItemTextureEntry? GetCapeTexture(uint displayId)
+        => GetObjectComponentTexture(displayId, "Cape");
+
+    /// <summary>
+    /// OBJECT-COMPONENT TEXTURE — the DBC-direct resolver, generalized.
+    ///
+    /// GetCapeTexture was this same routine with "Cape" hardcoded. Two other item
+    /// kinds need it:
+    ///
+    ///   HELMS. ExtractTexturesFromMpq resolves textures by parsing the M2, and
+    ///   bails if the M2 can't be extracted. But helm M2s are RACE+GENDER suffixed
+    ///   (Helm_X_HuM.m2, Helm_X_OrF.m2 — see EnsureHelmGlb), while ItemDisplayInfo
+    ///   stores only the bare stem. So FindAndExtractItemM2 misses, and every helm
+    ///   reported "No textures found" — 150 of them in the July batch. A helm's
+    ///   TEXTURE never needed the M2: TextureName1 + Item\ObjectComponents\Head\
+    ///   resolves it directly, exactly like a cape.
+    ///
+    ///   SHOULDERS. Same fallback, for the same reason, when the M2 path misses.
+    ///
+    /// Returns an ItemTextureEntry with the same shape the M2 path yields, so the
+    /// retexture commit treats all three kinds identically. Null when the display
+    /// has no BLP under that subdir — i.e. it isn't that kind of item.
+    /// </summary>
+    public ItemTextureEntry? GetObjectComponentTexture(uint displayId, string subdir)
+    {
+        // Honor custom retextures the same way GetTexturesForDisplay does.
+        var retexInfo = GetRetextureInfo(displayId);
+        uint resolvedDisplayId = retexInfo?.OrigDisplayId ?? displayId;
+
+        var modelInfo = _dbc.GetItemModelInfo(resolvedDisplayId);
+        if (modelInfo == null) return null;
+
+        string texName = modelInfo.Value.TextureName1;
+        if (string.IsNullOrEmpty(texName)) texName = modelInfo.Value.TextureName2;
+        if (string.IsNullOrEmpty(texName)) return null;
+
+        string mpqPath = $"Item\\ObjectComponents\\{subdir}\\{texName}.blp";
+        var blpData = _mpq.ExtractFile(mpqPath)
+                      ?? _mpq.ExtractFile(mpqPath.ToLowerInvariant());
+        if (blpData == null)
+        {
+            _logger.LogDebug(
+                "ObjectComponent: displayId {Id} has no BLP at {Path}", displayId, mpqPath);
+            return null;
+        }
+
+        string sub = subdir.ToLowerInvariant();
+        var cacheDir = Path.Combine(_env.WebRootPath, "item_textures_cache", sub);
+        Directory.CreateDirectory(cacheDir);
+
+        string safeName = texName.Replace('\\', '_').Replace('/', '_');
+        string pngCachePath = Path.Combine(cacheDir, $"{sub}_{resolvedDisplayId}_{safeName}.png");
+        string webPath = $"/item_textures_cache/{sub}/{sub}_{resolvedDisplayId}_{safeName}.png";
+
+        if (!File.Exists(pngCachePath))
+        {
+            try
+            {
+                DecodeBlpToPng(blpData, pngCachePath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "ObjectComponent: BLP decode failed for displayId {Id} ({Tex}) under {Subdir}",
+                    displayId, texName, subdir);
+                return null;
+            }
+        }
+
+        return new ItemTextureEntry
+        {
+            Index = 0,
+            Filename = $"{texName}.blp",
+            MpqPath = mpqPath,
+            BlpFileSize = blpData.Length,
+            PreviewPngPath = webPath,
+            HasPreview = true
+        };
+    }
+
+    /// <summary>
     /// Get the raw BLP bytes for a texture from MPQ, for retexture pipeline.
     /// </summary>
     public byte[]? GetRawBlp(string mpqPath)

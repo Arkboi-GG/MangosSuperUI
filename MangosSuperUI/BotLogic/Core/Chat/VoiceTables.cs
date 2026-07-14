@@ -11,6 +11,12 @@ using MangosSuperUI.BotLogic.Chat.Core;
 /// era-appropriate occupations (age-gated by category), 60 interests, 10 gaming
 /// backgrounds, per-age-band typing distributions (younger → lower caps, higher abbrev,
 /// higher wpm, more typos), humor + tic pools.
+///
+/// AMENDED 2026-07-13: swear_level is now a sampled axis (§6.2 schema v2). It is keyed
+/// to age band AND disposition — a hot-tempered 16-year-old and a warm 46-year-old bank
+/// teller do not swear at the same rate or with the same words, and before this they had
+/// no axis on which to differ. Disposition is therefore sampled BEFORE typing (it used to
+/// be after, and humor was rolled twice into two different fields — both fixed here).
 /// </summary>
 public static class VoiceTables
 {
@@ -27,6 +33,17 @@ public static class VoiceTables
         var (region, tz) = Regions[rng.Next(Regions.Length)];
         var occ = SampleOccupation(rng, age);
         var interests = SampleInterests(rng, age);
+        var humor = Humors[rng.Next(Humors.Length)];
+
+        // Disposition FIRST — typing (specifically swear_level) reads it.
+        var disposition = new PersonaDisposition
+        {
+            Warmth = (float)rng.NextDouble(),
+            Irritability = (float)rng.NextDouble(),
+            Confidence = (float)rng.NextDouble(),
+            Openness = (float)rng.NextDouble(),
+            Humor = humor
+        };
 
         return new Skeleton(
             Age: age,
@@ -35,17 +52,10 @@ public static class VoiceTables
             TimezoneOffset: tz,
             OccupationCategory: occ,
             GamingBackground: GamingBackgrounds[rng.Next(GamingBackgrounds.Length)],
-            Humor: Humors[rng.Next(Humors.Length)],
+            Humor: humor,
             Interests: interests,
-            Typing: SampleTyping(rng, band),
-            Disposition: new PersonaDisposition
-            {
-                Warmth = (float)rng.NextDouble(),
-                Irritability = (float)rng.NextDouble(),
-                Confidence = (float)rng.NextDouble(),
-                Openness = (float)rng.NextDouble(),
-                Humor = Humors[rng.Next(Humors.Length)]
-            });
+            Typing: SampleTyping(rng, band, disposition),
+            Disposition: disposition);
     }
 
     // ==================== Age bands (§6.3: weighted 10/20/30/20/15/5) ====================
@@ -178,9 +188,43 @@ public static class VoiceTables
 
     public static readonly string[] Humors = { "dry", "goofy", "gentle", "sarcastic", "deadpan", "corny" };
 
+    // ==================== Swear register (§6.2 v2, new axis) ====================
+
+    /// <summary>P(level 0), P(1), P(2), P(3) per age band. Teenagers and young adults
+    /// swore the most online in 2005; the 46+ band is where "darn" actually lived.</summary>
+    private static readonly Dictionary<string, float[]> SwearWeights = new()
+    {
+        ["13-15"] = new[] { 0.10f, 0.30f, 0.40f, 0.20f },
+        ["16-18"] = new[] { 0.05f, 0.25f, 0.40f, 0.30f },
+        ["19-23"] = new[] { 0.10f, 0.30f, 0.40f, 0.20f },
+        ["24-30"] = new[] { 0.15f, 0.40f, 0.35f, 0.10f },
+        ["31-45"] = new[] { 0.20f, 0.45f, 0.30f, 0.05f },
+        ["46+"]   = new[] { 0.40f, 0.45f, 0.15f, 0.00f },
+    };
+
+    /// <summary>Band-weighted draw, then nudged by temperament: hot-tempered people swear
+    /// more, warm even-tempered people swear less. Clamped 0–3.</summary>
+    public static int SampleSwearLevel(Random rng, AgeBand band, PersonaDisposition d)
+    {
+        var w = SwearWeights.TryGetValue(band.Name, out var found) ? found : SwearWeights["19-23"];
+
+        double roll = rng.NextDouble(), acc = 0;
+        int lvl = w.Length - 1;
+        for (int i = 0; i < w.Length; i++)
+        {
+            acc += w[i];
+            if (roll < acc) { lvl = i; break; }
+        }
+
+        if (d.Irritability > 0.65f && rng.NextDouble() < d.Irritability - 0.5f) lvl++;
+        if (d.Warmth > 0.75f && d.Irritability < 0.30f && rng.NextDouble() < 0.35) lvl--;
+
+        return Math.Clamp(lvl, 0, 3);
+    }
+
     // ==================== Per-age typing distributions (§6.3: younger → sloppier + faster) ====================
 
-    private static PersonaTyping SampleTyping(Random rng, AgeBand band)
+    private static PersonaTyping SampleTyping(Random rng, AgeBand band, PersonaDisposition disposition)
     {
         // (capsWeights: lower/proper/mixed/CRUISE), abbrev range, wpm mean/spread, typo range
         var (caps, abMin, abMax, wpmMean, wpmSpread, tpMin, tpMax) = band.Name switch
@@ -206,6 +250,7 @@ public static class VoiceTables
             Caps = capsStyle,
             Punctuation = punct,
             AbbrevLevel = rng.Next(abMin, abMax + 1),
+            SwearLevel = SampleSwearLevel(rng, band, disposition),
             TypoRate = tpMin + (float)rng.NextDouble() * (tpMax - tpMin),
             Wpm = Math.Max(18, (int)(wpmMean + ((float)rng.NextDouble() * 2 - 1) * wpmSpread)),
             ThinkMinS = thinkMin,

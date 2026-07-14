@@ -7,23 +7,49 @@ namespace MangosSuperUI.BotLogic.Chat.Engine;
 /// the ENTIRE line (never edits it); the coordinator logs [CHAT-ENGINE] floor. The
 /// banter_intensity slider shapes prompt tone ABOVE this floor; the floor has no knob.
 ///
-/// The shipped list covers explicit sexual content and a starter slur set by stem.
-/// OPERATOR NOTE (Nico): extend BlockedStems below with the full slur list you want
-/// enforced — kept deliberately short in generated code; matching is case-insensitive
-/// substring-on-word-stem, so one stem catches plural/verb forms.
-/// Ordinary profanity is intentionally NOT floored — 2005 chat swears; the floor is
-/// for slurs and sexual content only (§10.4).
+/// SCOPE, STATED PLAINLY: slurs and explicit sexual content. Ordinary profanity is NOT
+/// floored and never was — as of 2026-07-13 it is actively PRODUCED (§10.4 step 6b,
+/// SwearTables.cs), because 2005 chat swore and its absence was the conspicuous thing.
+/// The floor is the line between "people cussing at each other in the Barrens" and
+/// content this server will not emit under any settings. Nothing in step 6b can reach
+/// this list, and this step runs after it regardless.
+///
+/// MATCHING (fixed 2026-07-13): the old implementation was substring-anywhere, so "spic"
+/// matched SPICY and "rape" matched GRAPE / SCRAPE / DRAPE — those lines were being
+/// silently discarded and logged as floor hits. Ambiguous stems now live in BlockedWords
+/// (whole-word + inflections); only stems with no plausible innocent host stay in
+/// BlockedStems.
+///
+/// OPERATOR NOTE (Nico): extend BlockedStems / BlockedWords with the full slur list you
+/// want enforced — kept deliberately short in generated code. Matching is
+/// case-insensitive.
 /// </summary>
 public static class ContentFloor
 {
-    // Stems, lowercase. Substring match within word characters (catches suffixed forms).
+    /// <summary>
+    /// Substring-within-word stems. ONLY put a stem here if no innocent English word can
+    /// contain it — a stem here will match anywhere inside a token.
+    /// </summary>
     private static readonly string[] BlockedStems =
     {
         // explicit sexual content
         "porn", "hentai", "blowjob", "handjob", "cumshot", "deepthroat",
-        "pedo", "loli", "rape",
-        // slur stems — EXTEND ME (see class doc)
-        "nigg", "fagg", "kike", "spic", "chink", "tranny", "retard",
+        "pedo", "lolicon",
+        // slur stems
+        "nigg", "fagg", "kike", "chink", "tranny", "retard",
+    };
+
+    /// <summary>
+    /// Whole-word (and inflection) matches. These live here BECAUSE a substring test
+    /// false-positives on ordinary words:
+    ///   "spic" → spicy, suspicion      "rape" → grape, scrape, drape
+    ///   "loli" → lollipop (misspelled)
+    /// </summary>
+    private static readonly HashSet<string> BlockedWords = new(StringComparer.Ordinal)
+    {
+        "spic", "spics",
+        "rape", "rapes", "raped", "raping", "rapist", "rapists",
+        "loli", "lolis",
     };
 
     private static readonly Regex WordScan = new(@"[a-z0-9]+", RegexOptions.Compiled);
@@ -33,9 +59,16 @@ public static class ContentFloor
     {
         matchedStem = "";
         if (string.IsNullOrEmpty(line)) return false;
+
         var lower = line.ToLowerInvariant();
         foreach (Match word in WordScan.Matches(lower))
         {
+            if (BlockedWords.Contains(word.Value))
+            {
+                matchedStem = word.Value;
+                return true;
+            }
+
             foreach (var stem in BlockedStems)
             {
                 if (word.Value.Contains(stem))

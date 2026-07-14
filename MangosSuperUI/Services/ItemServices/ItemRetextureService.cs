@@ -35,6 +35,7 @@ public class ItemRetextureService
     private readonly IWebHostEnvironment _env;
     private readonly IConfiguration _config;
     private readonly ILogger<ItemRetextureService> _logger;
+    private readonly ILoggerFactory _loggerFactory;
     private readonly HttpClient _http;
 
     private readonly string _dbcPath;
@@ -44,7 +45,7 @@ public class ItemRetextureService
 
     private static readonly TimeSpan OllamaTimeout = TimeSpan.FromSeconds(20);
 
-    private const uint CUSTOM_DISPLAY_BASE = 60000;
+    public const uint CUSTOM_DISPLAY_BASE = 60000;
 
     public ItemRetextureService(
         ComfyUIDispatcher comfy,
@@ -55,7 +56,8 @@ public class ItemRetextureService
         ConnectionFactory db,
         IWebHostEnvironment env,
         IConfiguration config,
-        ILogger<ItemRetextureService> logger)
+        ILogger<ItemRetextureService> logger,
+        ILoggerFactory loggerFactory)
     {
         _comfy = comfy;
         _mpq = mpq;
@@ -66,6 +68,7 @@ public class ItemRetextureService
         _env = env;
         _config = config;
         _logger = logger;
+        _loggerFactory = loggerFactory;
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(180) };
 
         _dbcPath = config["Vmangos:DbcPath"]
@@ -549,8 +552,41 @@ public class ItemRetextureService
     /// Flux img2img passthrough (which softens detail via the VAE roundtrip and burns
     /// VRAM/time loading Flux for no reason).
     /// </summary>
+    /// <param name="rebuildPatch">
+    /// When false, commit to the DB and skip the patch-4.MPQ rebuild.
+    ///
+    /// RebuildPatchMAsync regenerates the WHOLE archive from EVERY row in both
+    /// retexture tables — it reads ItemDisplayInfo.dbc off disk, pulls every BLP
+    /// BLOB out of the DB, repacks, writes, and redeploys to the client. That is
+    /// exactly right for an interactive one-off commit (the user gets a usable
+    /// patch immediately) and quadratic for a batch: job N pays for jobs 1..N-1
+    /// all over again. A few hundred lootifier jobs turn a minutes-long run into
+    /// an hours-long one.
+    ///
+    /// The batch caller passes false and rebuilds ONCE when the queue drains.
+    /// Nothing is lost by deferring: the DB rows are the durable artifact and the
+    /// patch is a pure function of them. RegisterCustomDisplayEntry still runs per
+    /// commit, so SuperUI previews the new displayId immediately either way.
+    /// </param>
+    /// <param name="preResolved">
+    /// The texture entry the CALLER already resolved, if it has one.
+    ///
+    /// Without this, the method re-resolved from scratch via
+    /// GetTexturesForDisplay(request.DisplayId) — which parses the M2 and returns
+    /// null whenever there isn't one. Cloaks have no M2 (they're a character
+    /// geoset), so the queue would resolve a cape correctly with GetCapeTexture,
+    /// burn a full palette recolor on it, hand it here... and then this method
+    /// would throw the entry away, re-resolve through the M2-only path, get null,
+    /// and fail with "Could not extract textures for this item". 230 cloak jobs
+    /// died that way, every one of them after doing the expensive work.
+    ///
+    /// Helms resolved through GetObjectComponentTexture hit exactly the same wall.
+    ///
+    /// When supplied, this entry is used as-is and the re-resolve is skipped.
+    /// </param>
     public async Task<RetextureResult> RetextureFromBitmapAsync(
-        RetextureRequest request, string sourcePngPath, CancellationToken ct = default)
+        RetextureRequest request, string sourcePngPath, CancellationToken ct = default,
+        bool rebuildPatch = true, ItemTextureEntry? preResolved = null)
     {
         await EnsureTableAsync();
         var result = new RetextureResult { DisplayId = request.DisplayId };
@@ -564,22 +600,35 @@ public class ItemRetextureService
             }
 
             // ── Step 1: Read original texture metadata ──
-            var texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
-            if (texInfo == null)
-            {
-                result.Error = "Could not extract textures for this item";
-                return result;
-            }
+            // Trust the caller's entry when it gave us one — it may have come from
+            // a resolver this method cannot reproduce (cape / object-component),
+            // and re-deriving it here is what killed every cloak and helm job.
+            ItemTextureEntry? targetTex = preResolved;
 
-            var targetTex = texInfo.Textures.FirstOrDefault(t =>
-                t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
-                || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase))
-                ?? texInfo.Textures.FirstOrDefault();
+            // Stays null on the pre-resolved path — a cape / object-component entry
+            // has no M2, so there is no ItemTextureInfo to accompany it. Step 5 must
+            // not assume this is non-null.
+            ItemTextureInfo? texInfo = null;
 
             if (targetTex == null)
             {
-                result.Error = "No textures found for this model";
-                return result;
+                texInfo = _itemTextures.GetTexturesForDisplay(request.DisplayId);
+                if (texInfo == null)
+                {
+                    result.Error = "Could not extract textures for this item";
+                    return result;
+                }
+
+                targetTex = texInfo.Textures.FirstOrDefault(t =>
+                    t.MpqPath.Equals(request.OriginalMpqPath, StringComparison.OrdinalIgnoreCase)
+                    || t.Filename.Equals(request.OriginalBlpFilename, StringComparison.OrdinalIgnoreCase))
+                    ?? texInfo.Textures.FirstOrDefault();
+
+                if (targetTex == null)
+                {
+                    result.Error = "No textures found for this model";
+                    return result;
+                }
             }
 
             int targetW = targetTex.Width > 0 ? targetTex.Width : 64;
@@ -633,13 +682,42 @@ public class ItemRetextureService
             uint newDisplayId = await AllocateDisplayIdAsync();
 
             // ── Step 5: Build MPQ paths ──
-            string customBlpName = $"Custom_{newDisplayId}_{Path.GetFileNameWithoutExtension(targetTex.Filename)}.blp";
+            //
+            // TWO hard-won rules here, both from the black-sword incident
+            // (Haggard's Sword of Glory, display 61844):
+            //
+            // 1. targetTex.Filename is NOT always a bare filename. Some M2 texture
+            //    entries carry a FULL PATH (ITEM\OBJECTCOMPONENTS\WEAPON\
+            //    ARMORREFLECT3.BLP), and on Linux Path.GetFileNameWithoutExtension
+            //    does not split on backslashes — so the whole path survived inside
+            //    the "filename" and the directory got prepended AGAIN:
+            //
+            //      ITEM\OBJECTCOMPONENTS\WEAPON\Custom_61844_ITEM\OBJECTCOMPONENTS\WEAPON\ARMORREFLECT3.blp
+            //
+            //    A directory inside a filename. The client derives
+            //    <dir of ModelName1>\<TextureName1>.blp, never finds that, and the
+            //    weapon renders BLACK. Normalize separators BEFORE taking the stem.
+            //
+            // 2. The DIRECTORY is never guessed when the source texture's own path
+            //    is known. The custom BLP must live where the source lived —
+            //    that is by definition the directory the model loads from.
+            //    GuessM2Directory keyword-matching is the last resort only.
+            string stem = Path.GetFileNameWithoutExtension(
+                (targetTex.Filename ?? "").Replace('\\', '/'));
+            string customBlpName = $"Custom_{newDisplayId}_{stem}.blp";
             string customBlpMpqPath = customBlpName;
 
-            var modelInfo = texInfo.ModelName;
-            if (!string.IsNullOrEmpty(modelInfo))
+            string srcMpqPath = (targetTex.MpqPath ?? "").Replace('/', '\\');
+            int cut = srcMpqPath.LastIndexOf('\\');
+            if (cut >= 0)
             {
-                string m2Dir = GuessM2Directory(modelInfo);
+                // Source texture's own directory — authoritative.
+                customBlpMpqPath = srcMpqPath.Substring(0, cut + 1) + customBlpName;
+            }
+            else if (!string.IsNullOrEmpty(texInfo?.ModelName))
+            {
+                // No source path known — fall back to guessing from the model name.
+                string m2Dir = GuessM2Directory(texInfo.ModelName);
                 customBlpMpqPath = $"{m2Dir}{customBlpName}";
             }
 
@@ -676,7 +754,11 @@ public class ItemRetextureService
             _dbc.RegisterCustomDisplayEntry(newDisplayId, request.DisplayId, null, null);
 
             // ── Step 7: Rebuild patch-4.MPQ ──
-            var rebuildResult = await RebuildPatchMAsync();
+            // Deferred in batch mode — see the rebuildPatch param doc. The DB
+            // rows above are the durable artifact; the patch is derived from them.
+            PatchMRebuildResult rebuildResult = rebuildPatch
+                ? await RebuildPatchMAsync()
+                : new PatchMRebuildResult { Success = true };
 
             result.PatchMpqPath = rebuildResult.PatchWebPath;
             result.CustomBlpMpqPath = customBlpMpqPath;
@@ -726,6 +808,71 @@ public class ItemRetextureService
     };
 
     /// <summary>
+    /// Gender suffixes packed for each component BLP. ONE entry, deliberately.
+    ///
+    /// Every file here multiplies the archive's file count by the number of atlas
+    /// rows, and War3Net caps HashTableSize at ushort — so the largest MPQ hash
+    /// table is 32768 and the whole archive can hold ~32k files, full stop. At
+    /// 3 suffixes a full quest+crafted run needs ~34,700 files and CANNOT BE BUILT.
+    ///
+    /// "_U" alone is correct AND sufficient. The client resolves component textures
+    /// as {name}_{M|F|U}.blp, and it falls back to _U when no gendered file exists —
+    /// proven by vanilla data: BodyAtlasTextureService probes _M → _F → _U and
+    /// breaks on first hit, and it reports _U hits for items like
+    /// Robe_A_01Indigo_Pant_LU (→ ..._LU_U.blp). Those robes have no _M or _F file
+    /// at all, and they render correctly on male and female characters in-game.
+    /// So the client reads _U for both.
+    ///
+    /// It is also honest: we recolor ONE source PNG per slot. The texture genuinely
+    /// is unisex — shipping it three times under three names was duplicating the
+    /// same bytes to satisfy a suffix rule we had already satisfied.
+    ///
+    /// IF a retextured piece renders as missing/stale hands in-game after this,
+    /// the _U fallback theory is wrong: add "_M", "_F" here and re-run the patch
+    /// rebuild. Watch the MpqBuilder log line for the resulting hash-table fill.
+    /// </summary>
+    private static readonly string[] COMPONENT_SUFFIXES = { "_U" };
+
+    /// <summary>
+    /// Pack a body-atlas component BLP under EVERY gender suffix the client may
+    /// ask for.
+    ///
+    /// This is the single most important quirk of painted armor. The client does
+    /// NOT open the filename we store. It takes the bare name out of
+    /// ItemDisplayInfo m_texture[slot], prepends Item\TextureComponents\{subdir}\,
+    /// and appends a gender suffix:
+    ///
+    ///     m_texture[2] = "Custom_61526_s2_Gloves"
+    ///       → Item\TextureComponents\HandTexture\Custom_61526_s2_Gloves_M.blp
+    ///       → ..._F.blp  (female)   ..._U.blp  (unisex components)
+    ///
+    /// Every vanilla component BLP is suffixed this way (confirmed by the MPQ
+    /// probe in ItemsController). Packing only "Custom_..._Gloves.blp" means the
+    /// client requests a file that isn't in the archive — and because the cloned
+    /// DBC row DID load, it doesn't fall back to vanilla: it paints nothing, and
+    /// the armor piece goes untextured in-game. That was the "patch-4 loads but
+    /// only breaks the texture" bug.
+    ///
+    /// We emit the same bytes under _M / _F / _U plus the bare name, so whichever
+    /// path the client resolves, it hits. (Recoloring the male source and serving
+    /// it as female is a known approximation — see the gender note in
+    /// CommitBodyAtlasAsync.)
+    /// </summary>
+    private static void AddComponentBlpAllGenders(
+        MpqBuilderService mpqBuilder, string blpMpqPath, byte[] blp)
+    {
+        int cut = blpMpqPath.LastIndexOf('\\');
+        string dir = cut >= 0 ? blpMpqPath.Substring(0, cut + 1) : "";
+        string file = blpMpqPath.Substring(cut + 1);
+        string bare = file.EndsWith(".blp", StringComparison.OrdinalIgnoreCase)
+            ? file.Substring(0, file.Length - 4)
+            : file;
+
+        foreach (var sfx in COMPONENT_SUFFIXES)
+            mpqBuilder.AddFile($@"{dir}{bare}{sfx}.blp", blp);
+    }
+
+    /// <summary>
     /// Commit a body-atlas (painted armor) retexture. The painted-armor analog
     /// of RetextureFromBitmapAsync: instead of one model texture → one BLP →
     /// DBC field 3, this takes the recolored COMPONENT PNGs (one per body-atlas
@@ -740,9 +887,26 @@ public class ItemRetextureService
     /// slotPngPaths: slot index (0..7) → absolute on-disk recolored PNG path
     /// (already validated by the caller as living under item_textures_cache).
     /// </summary>
+    /// <param name="rebuildPatch">
+    /// When false, commit to the DB and skip the patch-4.MPQ rebuild.
+    ///
+    /// RebuildPatchMAsync regenerates the WHOLE archive from EVERY row in both
+    /// retexture tables — it reads ItemDisplayInfo.dbc off disk, pulls every BLP
+    /// BLOB out of the DB, repacks, writes, and redeploys to the client. That is
+    /// exactly right for an interactive one-off commit (the user gets a usable
+    /// patch immediately) and quadratic for a batch: job N pays for jobs 1..N-1
+    /// all over again. A few hundred lootifier jobs turn a minutes-long run into
+    /// an hours-long one.
+    ///
+    /// The batch caller passes false and rebuilds ONCE when the queue drains.
+    /// Nothing is lost by deferring: the DB rows are the durable artifact and the
+    /// patch is a pure function of them. RegisterCustomDisplayEntry still runs per
+    /// commit, so SuperUI previews the new displayId immediately either way.
+    /// </param>
     public async Task<RetextureResult> CommitBodyAtlasAsync(
         uint sourceDisplayId, string itemName, string styleDirection,
-        Dictionary<int, string> slotPngPaths, CancellationToken ct = default)
+        Dictionary<int, string> slotPngPaths, CancellationToken ct = default,
+        bool rebuildPatch = true)
     {
         await EnsureTableAsync();
         var result = new RetextureResult { DisplayId = sourceDisplayId };
@@ -757,8 +921,9 @@ public class ItemRetextureService
 
             // Encode each slot PNG → BLP first, so a single failure aborts before
             // we allocate a displayId or write any rows. Body-atlas component
-            // textures are uncompressed/alpha (not DXT1) — vanilla stores them
-            // as plain BLP; pass useDxt1:false.
+            // textures are UNCOMPRESSED/PALETTIZED — vanilla stores them as plain
+            // BLP, so they go through EncodeBitmapToBlpUncompressed, never the DXT
+            // encoders.
             var encoded = new List<(int Slot, byte[] Blp)>();
             foreach (var kv in slotPngPaths.OrderBy(k => k.Key))
             {
@@ -784,7 +949,18 @@ public class ItemRetextureService
                     _logger.LogWarning("CommitBodyAtlas: decode failed slot {Slot}", slot);
                     continue;
                 }
-                var blp = _blpWriter.EncodeBitmapToBlp(bmp, false);
+                // PALETTIZED, not DXT. Body-atlas component textures are CPU-blitted
+                // into the shared character atlas by the client, which reads raw
+                // indexed pixels — vanilla ships every Item\TextureComponents\ BLP
+                // uncompressed. This used to call EncodeBitmapToBlp(bmp, false), and
+                // `useDxt1: false` means DXT3, NOT uncompressed: the comment above
+                // asserted "vanilla stores them as plain BLP" but no such encoder
+                // existed. Every component texture went out as DXT3, which composites
+                // to garbage — a recolored belt painting what looks like PANTS,
+                // because its LegUpperTexture slot decoded to nonsense across the
+                // whole leg region. It also explains why the recolors looked perfect
+                // in the viewer (which renders the PNG) and broken in the client.
+                var blp = _blpWriter.EncodeBitmapToBlpUncompressed(bmp);
                 if (blp == null)
                 {
                     _logger.LogWarning("CommitBodyAtlas: BLP encode failed slot {Slot}", slot);
@@ -838,7 +1014,11 @@ public class ItemRetextureService
             // model + body textures from source for in-app GLB generation).
             _dbc.RegisterCustomDisplayEntry(newDisplayId, sourceDisplayId, null, null);
 
-            var rebuildResult = await RebuildPatchMAsync();
+            // Deferred in batch mode — see the rebuildPatch param doc. The DB
+            // rows above are the durable artifact; the patch is derived from them.
+            PatchMRebuildResult rebuildResult = rebuildPatch
+                ? await RebuildPatchMAsync()
+                : new PatchMRebuildResult { Success = true };
 
             result.PatchMpqPath = rebuildResult.PatchWebPath;
             result.NewDisplayId = newDisplayId;
@@ -916,7 +1096,13 @@ public class ItemRetextureService
             }
 
             var displayDbc = DbcWriterService.ReadDbc(dbcFile);
-            var mpqBuilder = new MpqBuilderService(null);
+            // A REAL logger, not null. It was `new MpqBuilderService(null)`, which
+            // silenced every diagnostic inside the builder — including the hash-table
+            // size line and the "REFUSING to build" error. The archive could wrap its
+            // hash table to zero and emit a completely unreadable patch without a
+            // single log line saying so. That is precisely how the ushort overflow
+            // went unnoticed.
+            var mpqBuilder = new MpqBuilderService(_loggerFactory.CreateLogger<MpqBuilderService>());
 
             foreach (var row in retextures)
             {
@@ -986,11 +1172,16 @@ public class ItemRetextureService
                     string blpMpqPath = (string)row.custom_blp_mpq_path;
                     byte[]? blpBytes = row.custom_blp as byte[];
 
+                    // Component BLPs are GENDER-SUFFIXED in the client. See
+                    // AddComponentBlpAllGenders — packing only "{name}.blp" makes
+                    // the cloned DBC row blank the component instead of recoloring
+                    // it, because the client only ever asks for "{name}_M|F|U.blp".
                     if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
-                        mpqBuilder.AddFile(blpMpqPath, blpBytes);
+                        AddComponentBlpAllGenders(mpqBuilder, blpMpqPath, blpBytes);
 
                     // m_texture[slot] is DBC field (14 + slot). Bare name, no ext,
-                    // no dir — client prepends Item\TextureComponents\{subdir}\.
+                    // no dir, NO gender suffix — the client prepends
+                    // Item\TextureComponents\{subdir}\ and appends _{M|F|U}.blp.
                     if (cloned && slot >= 0 && slot <= 7 && !string.IsNullOrEmpty(blpMpqPath))
                     {
                         string normalizedBlp = blpMpqPath.Replace('\\', '/');
@@ -1004,11 +1195,30 @@ public class ItemRetextureService
                 result.TotalEntries++;
             }
 
-            mpqBuilder.AddFile(@"DBFilesClient\ItemDisplayInfo.dbc", displayDbc.Write());
+            byte[] patchedDbc = displayDbc.Write();
+            mpqBuilder.AddFile(@"DBFilesClient\ItemDisplayInfo.dbc", patchedDbc);
 
             var patchDir = Path.Combine(_env.WebRootPath, "patches", "retexture");
             Directory.CreateDirectory(patchDir);
             string patchPath = Path.Combine(patchDir, "patch-4.MPQ");
+
+            // Drop the patched DBC next to the archive as a plain file. It is the
+            // single artifact the CLIENT reads and that nothing else in the pipeline
+            // can inspect — once it is sealed inside the MPQ it is a black box. Every
+            // silent failure today (zeroed hash table, DXT3 components, bare BLP
+            // names) shared that shape: the thing we could not look at was the thing
+            // that was wrong. So write it out and make it inspectable.
+            try
+            {
+                File.WriteAllBytes(Path.Combine(patchDir, "ItemDisplayInfo.dbc"), patchedDbc);
+                _logger.LogInformation(
+                    "Retexture: wrote patched ItemDisplayInfo.dbc ({Bytes} bytes, {Rows} rows) for inspection",
+                    patchedDbc.Length, displayDbc.RecordCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Retexture: could not dump patched DBC for inspection");
+            }
 
             bool built = mpqBuilder.Build(patchPath);
             if (!built)
@@ -1029,6 +1239,7 @@ public class ItemRetextureService
             }
 
             result.PatchWebPath = "/patches/retexture/patch-4.MPQ";
+            result.MpqFileCount = mpqBuilder.FileCount;
             result.Success = true;
 
             _logger.LogInformation(
@@ -1044,6 +1255,47 @@ public class ItemRetextureService
             result.Error = ex.Message;
             return result;
         }
+    }
+
+    /// <summary>
+    /// Absolute path to the served patch inside wwwroot — the single location
+    /// DownloadPatch reads from and RebuildPatchMAsync writes to.
+    /// </summary>
+    public string PatchWwwrootPath =>
+        Path.Combine(_env.WebRootPath, "patches", "retexture", "patch-4.MPQ");
+
+    /// <summary>
+    /// True if at least one retexture exists in either table, i.e. a patch can
+    /// be produced. Drives whether the download button shows — based on the DB
+    /// (durable), not the wwwroot file (ephemeral: wiped on publish/restart).
+    /// </summary>
+    public async Task<bool> HasAnyRetexturesAsync()
+    {
+        await EnsureTableAsync();
+        using var conn = _db.Admin();
+        var count = await conn.ExecuteScalarAsync<long>(
+            @"SELECT (SELECT COUNT(*) FROM custom_item_retexture)
+                   + (SELECT COUNT(*) FROM custom_item_retexture_atlas)");
+        return count > 0;
+    }
+
+    /// <summary>
+    /// Guarantees the served patch exists in wwwroot. wwwroot is ephemeral — a
+    /// publish/restart wipes wwwroot/patches — but the retextures are durable in
+    /// the DB, so if the file is missing we regenerate it from the DB on demand.
+    /// Returns the patch path, or null if there are no retextures to build from.
+    /// </summary>
+    public async Task<string?> EnsurePatchBuiltAsync()
+    {
+        var path = PatchWwwrootPath;
+        if (File.Exists(path)) return path;
+
+        if (!await HasAnyRetexturesAsync()) return null;
+
+        _logger.LogInformation(
+            "Retexture: served patch missing from wwwroot (likely wiped on redeploy) — regenerating from DB");
+        var rebuild = await RebuildPatchMAsync();
+        return rebuild.Success && File.Exists(path) ? path : null;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1380,6 +1632,13 @@ public class PatchMRebuildResult
     public string? Error { get; set; }
     public string? PatchWebPath { get; set; }
     public int TotalEntries { get; set; }
+
+    /// <summary>
+    /// Files actually packed into the archive. NOT the same as TotalEntries, which
+    /// counts DB rows/display-groups. This is the number that decides the MPQ hash
+    /// table size — and therefore whether the archive is readable at all.
+    /// </summary>
+    public int MpqFileCount { get; set; }
 }
 
 public class RetextureEntry

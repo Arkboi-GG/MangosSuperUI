@@ -1,3 +1,5 @@
+using Dapper;
+using MangosSuperUI.Models;
 using System.Collections.Concurrent;
 using War3Net.Drawing.Blp;
 
@@ -54,6 +56,16 @@ namespace MangosSuperUI.Services;
 /// to the BLP filename (e.g. "Robe_..._TU_M.blp"). Both possibilities are
 /// tried.
 ///
+/// === Custom (retextured) displays ===
+/// DisplayIds at or above ItemRetextureService.CUSTOM_DISPLAY_BASE may have
+/// recolored component BLPs committed by the retexture pipeline. Those are
+/// checked FIRST (TryLoadCustomAtlasAsync) and served from the DB, because
+/// neither of the two lookups below can see them: the in-memory DBC row for a
+/// custom display carries the SOURCE row's component names (RegisterCustomDisplayEntry
+/// clones BodyTextures and offers no override), and MpqReaderService skips
+/// patch-4.MPQ where the custom BLPs actually ship. Without the short-circuit
+/// every tier variant of a lootified item previews in the base colour.
+///
 /// === Cache policy ===
 /// Only SUCCESSFUL resolves are cached. A null result (BLP not found in
 /// any MPQ, or decode failure) is left out of _cache so subsequent
@@ -76,6 +88,7 @@ public class BodyAtlasTextureService
 {
     private readonly MpqReaderService _mpq;
     private readonly DbcService _dbc;
+    private readonly ConnectionFactory _db;
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<BodyAtlasTextureService> _logger;
 
@@ -92,11 +105,13 @@ public class BodyAtlasTextureService
     public BodyAtlasTextureService(
         MpqReaderService mpq,
         DbcService dbc,
+        ConnectionFactory db,
         IWebHostEnvironment env,
         ILogger<BodyAtlasTextureService> logger)
     {
         _mpq = mpq;
         _dbc = dbc;
+        _db = db;
         _env = env;
         _logger = logger;
     }
@@ -152,6 +167,19 @@ public class BodyAtlasTextureService
     /// </summary>
     public async Task<BodyAtlasResult?> EnsureAtlasTexturesAsync(uint displayId)
     {
+        // ── Custom retexture short-circuit ──
+        // A body-atlas retexture lives ONLY in custom_item_retexture_atlas +
+        // patch-4.MPQ. Neither is reachable from here: RegisterCustomDisplayEntry
+        // clones BodyTextures verbatim from the source row (it has no override
+        // param), so the in-memory DBC still holds the VANILLA component names;
+        // and MpqReaderService deliberately skips patch-4, so even correct names
+        // wouldn't extract. Result: every tier variant of a lootified piece
+        // resolved to the base texture and they all rendered identically.
+        // Serve the recolored BLP bytes straight from the DB instead — same
+        // pattern as ItemTextureService.TryLoadCustomRetexture for model items.
+        var custom = await TryLoadCustomAtlasAsync(displayId);
+        if (custom != null) return custom;
+
         var infoNullable = _dbc.GetItemModelInfo(displayId);
         if (infoNullable == null)
         {
@@ -221,6 +249,99 @@ public class BodyAtlasTextureService
         {
             sem.Release();
         }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Serve a committed body-atlas retexture (painted armor) from the DB.
+    /// Returns null when <paramref name="displayId"/> isn't a custom display or
+    /// has no atlas rows — the caller then falls through to the normal
+    /// DBC → MPQ path.
+    ///
+    /// Why the BLP comes from the DB rather than the MPQ: CommitBodyAtlasAsync
+    /// stores each slot's recolored BLP as a BLOB in custom_item_retexture_atlas
+    /// and only later packs it into patch-4.MPQ — which MpqReaderService skips on
+    /// purpose (it opens vanilla archives only). The DB is the durable source of
+    /// truth for both the patch build and this preview, so both stay in sync by
+    /// construction.
+    ///
+    /// The decoded PNGs are keyed by the custom displayId, which is allocated
+    /// fresh on every commit, so the disk cache can never go stale.
+    /// </summary>
+    private async Task<BodyAtlasResult?> TryLoadCustomAtlasAsync(uint displayId)
+    {
+        // Cheap gate — vanilla displays never hit the DB.
+        if (displayId < ItemRetextureService.CUSTOM_DISPLAY_BASE) return null;
+
+        List<dynamic> rows;
+        try
+        {
+            using var conn = _db.Admin();
+            rows = (await conn.QueryAsync(
+                @"SELECT slot, custom_blp, custom_blp_mpq_path
+                  FROM custom_item_retexture_atlas
+                  WHERE new_display_id = @Id
+                  ORDER BY slot",
+                new { Id = displayId })).ToList();
+        }
+        catch (Exception ex)
+        {
+            // Table absent on a fresh install, DB down, etc. Not fatal —
+            // fall through to the vanilla path.
+            _logger.LogDebug(ex,
+                "BodyAtlas: custom atlas lookup failed for displayId {Id}", displayId);
+            return null;
+        }
+
+        if (rows.Count == 0) return null;
+
+        var result = new BodyAtlasResult { DisplayId = displayId };
+
+        foreach (var row in rows)
+        {
+            int slot = Convert.ToInt32(row.slot);
+            byte[]? blp = row.custom_blp as byte[];
+            string mpqPath = (string?)row.custom_blp_mpq_path ?? "";
+
+            if (blp == null || blp.Length == 0) continue;
+            if (!SlotToSubdir.ContainsKey(slot)) continue;
+
+            // Name the cache PNG after the BLP we actually stored. The MPQ path
+            // uses backslashes; Path.GetFileName* doesn't split on those under
+            // Linux, so normalize first (same trick as ItemRetextureService).
+            string bare = Path.GetFileNameWithoutExtension(mpqPath.Replace('\\', '/'));
+            if (string.IsNullOrEmpty(bare)) bare = $"custom_s{slot}";
+
+            var cachePngPath = Path.Combine(CacheDir, displayId.ToString(),
+                $"slot{slot}_{bare}.png");
+            var webUrl = $"/body_atlas_cache/{displayId}/slot{slot}_{bare}.png";
+
+            if (!File.Exists(cachePngPath))
+            {
+                try
+                {
+                    DecodeBlpToPng(blp, cachePngPath);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "BodyAtlas: custom BLP decode failed displayId={Id} slot={Slot}",
+                        displayId, slot);
+                    continue;
+                }
+            }
+
+            _cache[(displayId, slot)] = webUrl;
+            result.SlotUrls[slot] = webUrl;
+            result.SlotPartialNames[slot] = bare;
+        }
+
+        if (result.SlotUrls.Count == 0) return null;
+
+        _logger.LogInformation(
+            "BodyAtlas: displayId {Id} served from custom_item_retexture_atlas ({Count} slot(s))",
+            displayId, result.SlotUrls.Count);
 
         return result;
     }

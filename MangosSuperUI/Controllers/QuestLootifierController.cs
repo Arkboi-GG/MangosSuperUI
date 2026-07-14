@@ -28,9 +28,15 @@ namespace MangosSuperUI.Controllers;
 //  At award time it is ALWAYS a variant — the plain base is never handed out
 //  once a quest reward has been lootified.
 //
-//  Reuses the public DTOs from LootifierController (RulesetDto, NamingTierDto,
-//  CommitRoll, CommitStat) and mirrors its variant-generation math so the
-//  produced item rows are identical in shape.
+//  Generation is BAND-BASED and ADDITIVE-ONLY, mirroring the Crafting Lootifier.
+//  The admin configures BANDS (QuestRulesetDto/QuestBandDto) — each a named tier
+//  with a min/max boost % and a slot count — and the tool rolls `slots` variants
+//  per band. Every variant PRESERVES the base reward's stats verbatim (never
+//  reduced, never dropped) and layers a boost-sized bonus on top; a stat-less
+//  white base mints a modest green/blue set instead. Band labels drive the colour
+//  ladder and the boost % is stored as budget_pct so the C++ weighted roll keeps
+//  higher bands rarer. Shares SpellEffectInfo/VariantData/StatRoll/CommitRoll/
+//  CommitStat from LootifierController; the quest-flavoured legendary is separate.
 // ══════════════════════════════════════════════════════════════════════════
 
 public class QuestLootifierController : Controller
@@ -38,6 +44,7 @@ public class QuestLootifierController : Controller
     private readonly ConnectionFactory _db;
     private readonly DbcService _dbc;
     private readonly AuditService _audit;
+    private readonly ILogger<QuestLootifierController> _logger;
 
     private const int QUEST_SENTINEL_CREATURE = 0;   // creature_entry sentinel for quest variants
     private const int LOOTIFIER_ID_START = 950000;
@@ -78,11 +85,25 @@ public class QuestLootifierController : Controller
     private const int ITEM_CLASS_WEAPON = 2;
     private const int ITEM_CLASS_ARMOR = 4;
 
-    public QuestLootifierController(ConnectionFactory db, DbcService dbc, AuditService audit)
+    // ── Additive-generation dials (mirror CraftingLootifier) ──
+    private const float MIN_DELTA_BUDGET = 2.0f;   // additive floor: every variant is a real upgrade over the base reward
+    private const float QUEST_BUMP_BIAS = 0.5f;    // delta split: existing-line bumps vs new affixes (0 = all new, 1 = all bumps)
+
+    // ── Player-item reroll (regenerate without orphaning owned copies) ──
+    // Character data lives in a separate schema on the same MySQL server; the
+    // mangos user has rights on it, so we reach it with schema-qualified names
+    // through the existing connection rather than a second ConnectionFactory entry.
+    private const string CHARACTERS_DB = "characters";
+    // Tracked legendaries carry budget_pct = 150 (see BuildQuestLegendary).
+    private const float LEGENDARY_BUDGET_MARK = 145f;
+
+    public QuestLootifierController(ConnectionFactory db, DbcService dbc, AuditService audit,
+        ILogger<QuestLootifierController> logger)
     {
         _db = db;
         _dbc = dbc;
         _audit = audit;
+        _logger = logger;
     }
 
     public IActionResult Index() => View();
@@ -93,20 +114,7 @@ public class QuestLootifierController : Controller
         return Json(new
         {
             statNames = STAT_NAMES,
-            defaultRuleset = new
-            {
-                budgetCeilingPct = 35,
-                variantsPerItem = 10,
-                allowNewAffixes = true,
-                maxAffixCountChange = 1
-            },
-            defaultNamingTiers = new[]
-            {
-                new { minPct = 0, maxPct = 79, label = "Improved", position = "prefix" },
-                new { minPct = 80, maxPct = 89, label = "of Power", position = "suffix" },
-                new { minPct = 90, maxPct = 97, label = "of Glory", position = "suffix" },
-                new { minPct = 98, maxPct = 100, label = "of the Gods", position = "suffix" }
-            }
+            defaultRuleset = DefaultRuleset()
         });
     }
 
@@ -254,8 +262,8 @@ public class QuestLootifierController : Controller
             return Json(new { success = false, error = "No items selected" });
 
         using var conn = _db.Mangos();
-        var ruleset = request.ruleset ?? new RulesetDto();
-        bool wantLegendary = request.ruleset == null ? true : ruleset.generateLegendary;
+        var ruleset = request.ruleset ?? DefaultRuleset();
+        bool wantLegendary = ruleset.generateLegendary;
         var results = new List<object>();
 
         foreach (var itemEntry in request.itemEntries.Distinct())
@@ -271,7 +279,7 @@ public class QuestLootifierController : Controller
             bool hasSpell = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
             if (!IsLootifiable(analysis)) continue;
 
-            var variants = VariantsToJson(GenerateVariants(item, analysis, ruleset));
+            var variants = VariantsToJson(GenerateVariants(item, analysis, ruleset), (int)analysis.itemQuality);
             uint displayId = (uint)item.display_id;
 
             // Sample legendary (preview only — not persisted). Same 150% budget +
@@ -337,10 +345,9 @@ public class QuestLootifierController : Controller
 
         await EnsureTrackingTables(adminConn);
         var columns = await GetItemColumns(mangosConn);
-        var ruleset = request.ruleset ?? new RulesetDto();
-        // Quest tool includes a per-item legendary by default; the UI toggle can
-        // disable it by sending generateLegendary=false explicitly.
-        if (request.ruleset == null) ruleset.generateLegendary = true;
+        // Quest tool includes a per-item legendary by default (DefaultRuleset sets
+        // generateLegendary = true); the UI toggle disables it by sending false.
+        var ruleset = request.ruleset ?? DefaultRuleset();
 
         // Resolve the target base-item set.
         List<int> baseItems;
@@ -370,6 +377,8 @@ public class QuestLootifierController : Controller
             new { CE = QUEST_SENTINEL_CREATURE }));
 
         int itemsCreated = 0, basesProcessed = 0, basesSkipped = 0;
+        int itemsRemapped = 0;                  // player-owned copies repointed at new variants
+        var rerollRng = new Random();
         var trackingRows = new List<(int genEntry, int baseEntry, int creatureEntry, float budgetPct, string tierName)>();
 
         foreach (var baseEntry in baseItems)
@@ -389,19 +398,27 @@ public class QuestLootifierController : Controller
             var analysis = AnalyzeItemStats(item);
             if (!IsLootifiable(analysis)) continue;
 
-            // Regenerate: purge prior quest variants for this base first.
-            if (regenerate && existing.Contains(baseEntry))
-                await PurgeQuestVariantsForBase(mangosConn, adminConn, baseEntry);
+            // Regenerate: capture the prior variants but DON'T delete yet — owned
+            // copies get repointed at the new set first (see below), and deferring
+            // the delete also keeps GetNextLootifierId above the old ids.
+            bool isRegen = regenerate && existing.Contains(baseEntry);
+            var oldEntries = isRegen
+                ? await GetQuestVariantEntries(adminConn, baseEntry)
+                : new List<int>();
 
             var variants = GenerateVariants(item, analysis, ruleset);
             int nextId = await GetNextLootifierId(adminConn);
+
+            var rerollPool = new List<int>();   // new variants owned copies can roll into
 
             foreach (var v in variants)
             {
                 int newEntry = nextId++;
                 var roll = VariantToCommitRoll(v);
-                await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll);
+                await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll, ruleset.goldValueScalePct,
+                    ResolveBandGoldBump(ruleset.bands, roll.tierLabel, roll.budgetPct));
                 trackingRows.Add((newEntry, baseEntry, QUEST_SENTINEL_CREATURE, roll.budgetPct, roll.tierLabel ?? ""));
+                rerollPool.Add(newEntry);
                 itemsCreated++;
             }
 
@@ -413,12 +430,35 @@ public class QuestLootifierController : Controller
                 {
                     string questTitle = await GetQuestTitleForRewardItem(mangosConn, baseEntry);
                     var leg = await BuildQuestLegendary(mangosConn, adminConn, columns, item, baseEntry, questTitle, ruleset, trackingRows);
-                    if (leg.HasValue) itemsCreated++;
+                    if (leg.HasValue)
+                    {
+                        itemsCreated++;
+                        // The legendary is only a reroll target if explicitly opted in —
+                        // otherwise a regen would hand out legendaries for free.
+                        if (ruleset.rerollIncludeLegendary) rerollPool.Add(leg.Value.entry);
+                    }
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"Quest legendary failed for item {baseEntry}: {ex.Message}");
+                    // Was Debug.WriteLine — compiled out in Release, so a legendary
+                    // that failed to build (and, critically, failed to register its
+                    // tracking row) reported NOTHING. Log it loudly.
+                    _logger.LogError(ex,
+                        "Quest legendary FAILED for base item {BaseEntry} — the variant may exist " +
+                        "in item_template but be absent from lootifier_generated_items, which makes " +
+                        "it invisible to regen cleanup, owned-item remap, and the retexture queue.",
+                        baseEntry);
                 }
+            }
+
+            // Regenerate: repoint every player-owned copy of the OLD variants at a
+            // random NEW variant of this same base (per-item roll), then drop the
+            // old templates. Owned copies are never orphaned; if generation yielded
+            // nothing, they fall back to the plain base item.
+            if (isRegen && oldEntries.Count > 0)
+            {
+                itemsRemapped += await RemapOwnedVariants(mangosConn, oldEntries, rerollPool, baseEntry, rerollRng);
+                await DeleteQuestVariants(mangosConn, adminConn, oldEntries);
             }
 
             basesProcessed++;
@@ -441,10 +481,10 @@ public class QuestLootifierController : Controller
             TargetType = "quest_lootifier",
             TargetName = request.allQuests ? "all-quests" : $"{baseItems.Count} items",
             StateBefore = "{}",
-            StateAfter = JsonSerializer.Serialize(new { itemsCreated, basesProcessed, basesSkipped }),
+            StateAfter = JsonSerializer.Serialize(new { itemsCreated, basesProcessed, basesSkipped, itemsRemapped }),
             IsReversible = true,
             Success = true,
-            Notes = $"Quest Lootifier: {itemsCreated} variants across {basesProcessed} reward items ({basesSkipped} already done)"
+            Notes = $"Quest Lootifier: {itemsCreated} variants across {basesProcessed} reward items ({basesSkipped} already done, {itemsRemapped} player-owned items rerolled)"
         });
 
         return Json(new
@@ -453,6 +493,7 @@ public class QuestLootifierController : Controller
             itemsCreated,
             basesProcessed,
             basesSkipped,
+            itemsRemapped,
             reloadHint = "Run '.reload quest_variants' (or restart) so the core picks up the new variants."
         });
     }
@@ -513,12 +554,23 @@ public class QuestLootifierController : Controller
         }
         else
         {
-            var all = (await adminConn.QueryAsync<int>(
-                "SELECT generated_entry FROM lootifier_generated_items WHERE creature_entry = @CE",
+            // Remap owned copies back to their plain base item BEFORE deleting the
+            // templates, grouped by base so each copy lands on its own original.
+            var tracked = (await adminConn.QueryAsync<dynamic>(
+                "SELECT generated_entry, base_entry FROM lootifier_generated_items WHERE creature_entry = @CE",
                 new { CE = QUEST_SENTINEL_CREATURE })).ToList();
 
-            foreach (var genEntry in all)
-                await mangosConn.ExecuteAsync("DELETE FROM item_template WHERE entry = @E", new { E = genEntry });
+            var byBase = tracked
+                .GroupBy(t => (int)t.base_entry)
+                .ToDictionary(g => g.Key, g => g.Select(t => (int)t.generated_entry).ToList());
+
+            var rng = new Random();
+            foreach (var kv in byBase)
+                await RemapOwnedVariants(mangosConn, kv.Value, new List<int>(), kv.Key, rng);
+
+            var all = tracked.Select(t => (int)t.generated_entry).ToList();
+            if (all.Count > 0)
+                await mangosConn.ExecuteAsync("DELETE FROM item_template WHERE entry IN @E", new { E = all });
 
             await adminConn.ExecuteAsync(
                 "DELETE FROM lootifier_generated_items WHERE creature_entry = @CE",
@@ -542,6 +594,170 @@ public class QuestLootifierController : Controller
         });
 
         return Json(new { success = true, removed, reloadHint = "Run '.reload quest_variants' so the core drops the removed variants." });
+    }
+
+    // ═════════════════════════ REVALUE ═════════════════════════
+
+    /// <summary>
+    /// Lists the tiers that ACTUALLY EXIST in tracking, with variant counts and
+    /// the price multiplier each tier is MEASURED to be sitting at right now
+    /// (variant sell_price / base sell_price — read from the DB, not assumed).
+    /// This is what the Revalue dialog renders: your tier names, your numbers.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> RevalueTiers()
+    {
+        using var mangosConn = _db.Mangos();
+        using var adminConn = _db.Admin();
+
+        if (!await TableExists(adminConn, "lootifier_generated_items"))
+            return Json(new { success = true, tiers = Array.Empty<object>() });
+
+        var tracked = (await adminConn.QueryAsync<dynamic>(
+            "SELECT generated_entry, base_entry, tier_name FROM lootifier_generated_items WHERE creature_entry = @CE",
+            new { CE = QUEST_SENTINEL_CREATURE })).ToList();
+
+        if (tracked.Count == 0)
+            return Json(new { success = true, tiers = Array.Empty<object>() });
+
+        var prices = await FetchItemPrices(mangosConn,
+            tracked.Select(t => (int)t.base_entry).Concat(tracked.Select(t => (int)t.generated_entry)));
+
+        var tiers = tracked
+            .GroupBy(t => (string)(t.tier_name ?? ""))
+            .Select(g =>
+            {
+                var measured = new List<double>();
+                string sampleName = "";
+                long sampleBase = 0, sampleCur = 0;
+                foreach (var t in g)
+                {
+                    if (!prices.TryGetValue((int)t.base_entry, out var bp)) continue;
+                    if (!prices.TryGetValue((int)t.generated_entry, out var vp)) continue;
+                    if (bp.sell <= 0) continue;
+                    measured.Add((double)vp.sell / bp.sell);
+                    if (sampleName.Length == 0)
+                    {
+                        sampleName = vp.name;
+                        sampleBase = bp.sell;
+                        sampleCur = vp.sell;
+                    }
+                }
+                return new
+                {
+                    tier = g.Key,
+                    count = g.Count(),
+                    currentMult = measured.Count > 0 ? (double?)Math.Round(measured.Average(), 3) : null,
+                    sampleName,
+                    sampleBaseSell = sampleBase,
+                    sampleCurrentSell = sampleCur
+                };
+            })
+            .OrderBy(x => x.currentMult ?? 0)
+            .ToList();
+
+        return Json(new { success = true, tiers });
+    }
+
+    /// <summary>
+    /// Sets prices IN PLACE for the tiers you explicitly name, using EXACTLY the
+    /// bump you typed: new_price = base_price × (1 + goldBumpPct/100). No curve,
+    /// no master scale, no hidden legendary stack — the number you enter is the
+    /// number that lands.
+    ///
+    /// Absolute recompute from the BASE item, so it never compounds; run it as
+    /// often as you like. A tier you leave blank is NOT TOUCHED. Entries, names,
+    /// display IDs and stats are untouched, so retexture mappings survive.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> Revalue([FromBody] QuestRevalueRequest? request)
+    {
+        var wanted = (request?.tiers ?? Array.Empty<QuestTierBumpDto>())
+            .Where(t => t.goldBumpPct.HasValue)
+            .GroupBy(t => t.tier ?? "", StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Last().goldBumpPct!.Value, StringComparer.OrdinalIgnoreCase);
+
+        if (wanted.Count == 0)
+            return Json(new { success = false, error = "No tier was given a value — nothing to do." });
+
+        using var mangosConn = _db.Mangos();
+        using var adminConn = _db.Admin();
+
+        if (!await TableExists(adminConn, "lootifier_generated_items"))
+            return Json(new { success = false, error = "No lootifier data found" });
+
+        var tracked = (await adminConn.QueryAsync<dynamic>(
+            "SELECT generated_entry, base_entry, tier_name FROM lootifier_generated_items WHERE creature_entry = @CE",
+            new { CE = QUEST_SENTINEL_CREATURE })).ToList();
+
+        // Only variants whose tier you actually gave a number. Everything else: untouched.
+        var targets = tracked.Where(t => wanted.ContainsKey((string)(t.tier_name ?? ""))).ToList();
+        if (targets.Count == 0)
+            return Json(new { success = true, updated = 0, perTier = Array.Empty<object>() });
+
+        var basePrices = await FetchItemPrices(mangosConn, targets.Select(t => (int)t.base_entry));
+
+        var perTier = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        int updated = 0;
+
+        foreach (var chunk in targets.Chunk(500))
+        {
+            var buyCase = new System.Text.StringBuilder("CASE entry ");
+            var sellCase = new System.Text.StringBuilder("CASE entry ");
+            var ids = new List<int>();
+
+            foreach (var t in chunk)
+            {
+                int gen = (int)t.generated_entry;
+                if (!basePrices.TryGetValue((int)t.base_entry, out var bp)) continue;
+
+                string tier = (string)(t.tier_name ?? "");
+                double mult = 1.0 + wanted[tier] / 100.0;   // exactly what you typed
+
+                long newBuy = (long)Math.Round(bp.buy * mult);
+                long newSell = (long)Math.Round(bp.sell * mult);
+                buyCase.Append("WHEN ").Append(gen).Append(" THEN ").Append(newBuy).Append(' ');
+                sellCase.Append("WHEN ").Append(gen).Append(" THEN ").Append(newSell).Append(' ');
+                ids.Add(gen);
+                perTier[tier] = perTier.GetValueOrDefault(tier) + 1;
+            }
+
+            if (ids.Count == 0) continue;
+            buyCase.Append("ELSE buy_price END");
+            sellCase.Append("ELSE sell_price END");
+
+            await mangosConn.ExecuteAsync(
+                $"UPDATE item_template SET buy_price = {buyCase}, sell_price = {sellCase} WHERE entry IN ({string.Join(",", ids)})");
+            updated += ids.Count;
+        }
+
+        return Json(new
+        {
+            success = true,
+            updated,
+            perTier = perTier.Select(kv => new { tier = kv.Key, count = kv.Value }).ToList(),
+            reloadHint = "Prices changed in item_template — restart or clear the item cache so live clients see them."
+        });
+    }
+
+    // Entry -> (buy, sell, name) at max patch, chunked.
+    private async Task<Dictionary<int, (long buy, long sell, string name)>> FetchItemPrices(
+        MySqlConnector.MySqlConnection conn, IEnumerable<int> entries)
+    {
+        var map = new Dictionary<int, (long buy, long sell, string name)>();
+        foreach (var chunk in entries.Distinct().Chunk(500))
+        {
+            var rows = await conn.QueryAsync<dynamic>(@"
+                SELECT t.entry, t.buy_price, t.sell_price, t.name
+                FROM item_template t
+                JOIN (SELECT entry, MAX(patch) mp FROM item_template WHERE entry IN @Ids GROUP BY entry) m
+                  ON m.entry = t.entry AND m.mp = t.patch
+                WHERE t.entry IN @Ids",
+                new { Ids = chunk });
+            foreach (var r in rows)
+                map[(int)r.entry] = (Convert.ToInt64(r.buy_price), Convert.ToInt64(r.sell_price), (string)(r.name ?? ""));
+        }
+        return map;
     }
 
     // ═════════════════════════ STATUS ═════════════════════════
@@ -759,7 +975,7 @@ public class QuestLootifierController : Controller
     /// </summary>
     private async Task<(int entry, CommitRoll roll)?> BuildQuestLegendary(
         MySqlConnector.MySqlConnection mangosConn, MySqlConnector.MySqlConnection adminConn,
-        List<string> columns, dynamic item, int baseItemEntry, string questTitle, RulesetDto ruleset,
+        List<string> columns, dynamic item, int baseItemEntry, string questTitle, QuestRulesetDto ruleset,
         List<(int genEntry, int baseEntry, int creatureEntry, float budgetPct, string tierName)> trackingRows)
     {
         var rng = new Random();
@@ -798,15 +1014,42 @@ public class QuestLootifierController : Controller
         };
 
         int newEntry = await GetNextLootifierId(adminConn);
-        await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll);
+        // goldBumpPct: 0 suppresses the band/curve multiplier on insert — the
+        // legendary's price is set in ONE place below, from legendaryGoldBumpPct.
+        await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll, ruleset.goldValueScalePct, 0f);
 
-        // Full-name override + legendary quality + 3× gold (as the loot legendary).
+        // Full-name override + legendary quality + explicit gold bump above base
+        // (default 500% = the old x6 stock stack), master-scaled.
+        //
+        // The disenchant column is resolved from the LIVE schema, never hardcoded.
+        // This line used to read `DisenchantID = 0`; VMaNGOS names the column
+        // `disenchant_id`, so every legendary threw "Unknown column 'DisenchantID'"
+        // here. The caller wraps this whole method in a catch that only did a
+        // System.Diagnostics.Debug.WriteLine — a NO-OP in a Release build — so the
+        // throw was completely silent, and, worse, it unwound past the
+        // trackingRows.Add() at the bottom of this method.
+        //
+        // The legendary therefore existed in item_template (InsertVariantItemFast
+        // had already run, name and quality included) but was never recorded in
+        // lootifier_generated_items. Everything downstream keys off that table, so
+        // the legendary became invisible to:
+        //   • DeleteQuestVariants  → each regen piled up ANOTHER orphan legendary
+        //   • RemapOwnedVariants   → players holding one got orphaned on regen
+        //   • BuildRetextureQueue  → never recolored, kept the vanilla display
+        // One typo, three symptoms, zero log lines.
+        string? disCol = columns.FirstOrDefault(c =>
+            c.Equals("disenchant_id", StringComparison.OrdinalIgnoreCase) ||
+            c.Equals("DisenchantID", StringComparison.OrdinalIgnoreCase));
+        string disSet = disCol != null ? $", `{disCol}` = 0" : "";
+
         await mangosConn.ExecuteAsync(
-            "UPDATE item_template SET name = @Name, quality = 5, DisenchantID = 0 WHERE entry = @Entry",
+            $"UPDATE item_template SET name = @Name, quality = 5{disSet} WHERE entry = @Entry",
             new { Name = legendaryName, Entry = newEntry });
-        await mangosConn.ExecuteAsync(
-            "UPDATE item_template SET buy_price = ROUND(buy_price * 3), sell_price = ROUND(sell_price * 3) WHERE entry = @Entry",
-            new { Entry = newEntry });
+        float legGoldMult = ScaleGoldMult(1f + ruleset.legendaryGoldBumpPct / 100f, ruleset.goldValueScalePct);
+        if (legGoldMult > 1.001f)
+            await mangosConn.ExecuteAsync(
+                "UPDATE item_template SET buy_price = ROUND(buy_price * @Mult), sell_price = ROUND(sell_price * @Mult) WHERE entry = @Entry",
+                new { Mult = legGoldMult, Entry = newEntry });
 
         trackingRows.Add((newEntry, baseItemEntry, QUEST_SENTINEL_CREATURE, 150f, "Legendary"));
         return (newEntry, roll);
@@ -879,21 +1122,125 @@ public class QuestLootifierController : Controller
         return eligible;
     }
 
-    private async Task<int> PurgeQuestVariantsForBase(MySqlConnector.MySqlConnection mangosConn,
-        MySqlConnector.MySqlConnection adminConn, int baseEntry)
-    {
-        var gen = (await adminConn.QueryAsync<int>(
+    /// <summary>Tracked variant entries for a quest base item.</summary>
+    private async Task<List<int>> GetQuestVariantEntries(MySqlConnector.MySqlConnection adminConn, int baseEntry) =>
+        (await adminConn.QueryAsync<int>(
             "SELECT generated_entry FROM lootifier_generated_items WHERE creature_entry = @CE AND base_entry = @B",
             new { CE = QUEST_SENTINEL_CREATURE, B = baseEntry })).ToList();
 
-        foreach (var g in gen)
-            await mangosConn.ExecuteAsync("DELETE FROM item_template WHERE entry = @E", new { E = g });
-
+    /// <summary>
+    /// Delete a specific set of variant entries (templates + tracking rows).
+    /// Keyed by explicit entry list rather than base_entry so it can't collide
+    /// with freshly-generated rows that may already have been flushed.
+    /// </summary>
+    private async Task<int> DeleteQuestVariants(MySqlConnector.MySqlConnection mangosConn,
+        MySqlConnector.MySqlConnection adminConn, List<int> entries)
+    {
+        if (entries.Count == 0) return 0;
+        await mangosConn.ExecuteAsync("DELETE FROM item_template WHERE entry IN @E", new { E = entries });
         await adminConn.ExecuteAsync(
-            "DELETE FROM lootifier_generated_items WHERE creature_entry = @CE AND base_entry = @B",
-            new { CE = QUEST_SENTINEL_CREATURE, B = baseEntry });
+            "DELETE FROM lootifier_generated_items WHERE generated_entry IN @E", new { E = entries });
+        return entries.Count;
+    }
 
-        return gen.Count;
+    private async Task<int> PurgeQuestVariantsForBase(MySqlConnector.MySqlConnection mangosConn,
+        MySqlConnector.MySqlConnection adminConn, int baseEntry)
+    {
+        var gen = await GetQuestVariantEntries(adminConn, baseEntry);
+        // Owned copies fall back to the plain base item — never left pointing at
+        // a template we're about to delete.
+        await RemapOwnedVariants(mangosConn, gen, new List<int>(), baseEntry, new Random());
+        return await DeleteQuestVariants(mangosConn, adminConn, gen);
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  PLAYER-ITEM REROLL
+    //
+    //  Regenerating deletes the old variant templates. Any copy a player has
+    //  equipped, bagged, mailed or listed still points at those entries and would
+    //  be orphaned. Instead of protecting them, we REPOINT each owned copy at a
+    //  randomly-chosen NEW variant of the SAME base item (rolled per item, so two
+    //  pieces don't land on the same variant). If there is no new set (rollback),
+    //  they fall back to the plain base item.
+    //
+    //  item_instance.item_id is the authoritative entry. Redundant entry columns
+    //  on character_inventory / mail_items / auction are discovered at runtime and
+    //  kept in sync; anything absent is skipped.
+    // ══════════════════════════════════════════════════════════════
+
+    private async Task<bool> CharactersDbAvailable(MySqlConnector.MySqlConnection conn) =>
+        await conn.ExecuteScalarAsync<int>(@"
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = @Db AND TABLE_NAME = 'item_instance' AND COLUMN_NAME = 'item_id'",
+            new { Db = CHARACTERS_DB }) > 0;
+
+    /// <summary>
+    /// Auxiliary character tables that redundantly store the item entry alongside
+    /// the item GUID. Discovered at runtime so a schema without them still works.
+    /// </summary>
+    private async Task<List<(string table, string guidCol, string entryCol)>> GetCharacterItemRefTables(
+        MySqlConnector.MySqlConnection conn)
+    {
+        var candidates = new (string table, string[] guidCols, string[] entryCols)[]
+        {
+            ("character_inventory", new[] { "item", "item_guid" }, new[] { "item_template", "item_id", "itemEntry" }),
+            ("mail_items",          new[] { "item_guid", "itemguid", "item" }, new[] { "item_template", "item_id", "itemEntry" }),
+            ("auction",             new[] { "item_guid", "itemguid" }, new[] { "item_template", "item_id", "itemEntry" }),
+        };
+
+        var found = new List<(string, string, string)>();
+        foreach (var c in candidates)
+        {
+            var cols = (await conn.QueryAsync<string>(@"
+                SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = @Db AND TABLE_NAME = @T",
+                new { Db = CHARACTERS_DB, T = c.table })).ToList();
+            if (cols.Count == 0) continue;
+
+            string? g = c.guidCols.FirstOrDefault(x => cols.Contains(x, StringComparer.OrdinalIgnoreCase));
+            string? e = c.entryCols.FirstOrDefault(x => cols.Contains(x, StringComparer.OrdinalIgnoreCase));
+            if (g != null && e != null) found.Add((c.table, g, e));
+        }
+        return found;
+    }
+
+    /// <summary>
+    /// Repoint every player-owned copy of <paramref name="oldEntries"/> at a random
+    /// entry from <paramref name="newPool"/> (same base item), or at
+    /// <paramref name="fallbackEntry"/> when the pool is empty. Returns the number
+    /// of item instances remapped.
+    /// </summary>
+    private async Task<int> RemapOwnedVariants(MySqlConnector.MySqlConnection mangosConn,
+        List<int> oldEntries, List<int> newPool, int fallbackEntry, Random rng)
+    {
+        if (oldEntries == null || oldEntries.Count == 0) return 0;
+        if (!await CharactersDbAvailable(mangosConn)) return 0;
+
+        var owned = (await mangosConn.QueryAsync<int>(
+            $"SELECT guid FROM `{CHARACTERS_DB}`.item_instance WHERE item_id IN @Old",
+            new { Old = oldEntries })).ToList();
+        if (owned.Count == 0) return 0;
+
+        var aux = await GetCharacterItemRefTables(mangosConn);
+        int remapped = 0;
+
+        foreach (int itemGuid in owned)
+        {
+            int target = newPool.Count > 0 ? newPool[rng.Next(newPool.Count)] : fallbackEntry;
+            if (target <= 0) continue;
+
+            await mangosConn.ExecuteAsync(
+                $"UPDATE `{CHARACTERS_DB}`.item_instance SET item_id = @New WHERE guid = @G",
+                new { New = target, G = itemGuid });
+
+            foreach (var t in aux)
+                await mangosConn.ExecuteAsync(
+                    $"UPDATE `{CHARACTERS_DB}`.`{t.table}` SET `{t.entryCol}` = @New WHERE `{t.guidCol}` = @G",
+                    new { New = target, G = itemGuid });
+
+            remapped++;
+        }
+        return remapped;
     }
 
     // ── Tracking table (shared schema with the loot Lootifier) ──
@@ -976,7 +1323,7 @@ public class QuestLootifierController : Controller
     // ══════════════════════════════════════════════════════════════
 
     private async Task InsertVariantItemFast(MySqlConnector.MySqlConnection conn, List<string> columns,
-        dynamic baseItem, int newEntry, CommitRoll roll)
+        dynamic baseItem, int newEntry, CommitRoll roll, float goldScalePct = 100f, float? goldBumpPct = null)
     {
         int baseEntry = (int)baseItem.entry;
         int basePatch = GetPropInt(baseItem, "patch");
@@ -1059,33 +1406,47 @@ public class QuestLootifierController : Controller
             SV9 = statValues[9]
         });
 
-        float goldMult = GetGoldMultiplier(roll.budgetPct);
+        // Explicit per-band bump (Gold +% column) beats the legacy budget curve.
+        float goldMult = ScaleGoldMult(
+            goldBumpPct.HasValue ? 1f + goldBumpPct.Value / 100f : GetGoldMultiplier(roll.budgetPct),
+            goldScalePct);
         if (goldMult > 1.05f)
             await conn.ExecuteAsync(
                 "UPDATE item_template SET buy_price = ROUND(buy_price * @Mult), sell_price = ROUND(sell_price * @Mult) WHERE entry = @Entry",
                 new { Mult = goldMult, Entry = newEntry });
 
-        // Variant quality tracks the NAMING TIER so color matches name:
-        //   Improved / of Power → blue  (3)
-        //   of Glory            → purple(4)
-        //   of the Gods         → orange(5)  ← this IS the legendary tier
-        // Yields ~7 blue / ~2 purple / 1 orange on a normal item. White base
-        // shifts down a band (green/blue/purple) since white shouldn't mint orange.
-        string tl = (roll.tierLabel ?? "").ToLowerInvariant();
+        // Variant quality tracks the band's naming tier so colour matches name
+        // (shared with the preview via VariantQualityForTier):
+        //   Improved / of Power → blue   of Glory → purple   of the Gods / legendary → orange
+        // White bases shift one band down (green / blue / purple) — white never mints orange.
         int baseQuality = GetPropInt(baseItem, "quality");
-        bool whiteBase = baseQuality <= 1;
-
-        int variantQuality;
-        if (roll.budgetPct >= 145f || tl.Contains("legend") || tl.Contains("gods"))
-            variantQuality = whiteBase ? 4 : 5;                   // of the Gods / legendary → orange
-        else if (tl.Contains("glory"))
-            variantQuality = whiteBase ? 3 : 4;                   // of Glory → purple
-        else
-            variantQuality = whiteBase ? 2 : 3;                   // Improved / of Power → blue
+        int variantQuality = VariantQualityForTier(roll.tierLabel ?? "", roll.budgetPct, baseQuality);
 
         await conn.ExecuteAsync(
             "UPDATE item_template SET quality = @Q WHERE entry = @Entry",
             new { Q = variantQuality, Entry = newEntry });
+    }
+
+    // Scales only the MARKUP portion of a gold multiplier, so the tier-graded
+    // curve keeps its shape: 100% = stock curve, 0% = prices untouched,
+    // 200% = double markup. Result never drops below 1× (base price).
+    private static float ScaleGoldMult(float mult, float scalePct) =>
+        1f + (mult - 1f) * (Math.Max(0f, scalePct) / 100f);
+
+    // Finds the Gold +% for a variant: exact band-label match first (that's what
+    // generation stamps into tier_name), then boost-range containment. Null means
+    // no explicit bump configured -> legacy budget curve.
+    private static float? ResolveBandGoldBump(QuestBandDto[]? bands, string? tierLabel, float budgetPct)
+    {
+        if (bands == null || bands.Length == 0) return null;
+        if (!string.IsNullOrEmpty(tierLabel))
+            foreach (var b in bands)
+                if (string.Equals(b.label, tierLabel, StringComparison.OrdinalIgnoreCase))
+                    return b.goldBumpPct;
+        foreach (var b in bands)
+            if (budgetPct >= b.minBoostPct && budgetPct <= b.maxBoostPct)
+                return b.goldBumpPct;
+        return null;
     }
 
     private float GetGoldMultiplier(float budgetPct)
@@ -1097,7 +1458,17 @@ public class QuestLootifierController : Controller
         return 1.01f + t * 0.58f;
     }
 
-    private List<VariantData> GenerateVariants(dynamic baseItem, dynamic analysis, RulesetDto ruleset)
+    // BAND-DRIVEN generation (like the Crafting Lootifier). Instead of a single
+    // budget ceiling + variant count spread across percentage tiers, the admin
+    // configures explicit BANDS — each with a label/position, a min/max boost %,
+    // and a slot count — and the tool rolls `slots` variants per band. Each roll's
+    // boost % scales the ADDITIVE bonus (RollStats preserves the base lines and
+    // layers baseBudget × boost% on top). Band labels drive the colour ladder
+    // (Improved/of Power → blue, of Glory → purple, of the Gods → orange), and the
+    // boost % is stored as budget_pct so the C++ weighted roll (105 − budget_pct)
+    // keeps higher bands rarer. The quest-flavoured legendary is separate (added
+    // per item in Commit when generateLegendary is set) and remains the rarest.
+    private List<VariantData> GenerateVariants(dynamic baseItem, dynamic analysis, QuestRulesetDto ruleset)
     {
         var rng = new Random();
 
@@ -1105,44 +1476,14 @@ public class QuestLootifierController : Controller
         int[] presentTypes = (int[])analysis.presentStatTypes;
         string family = (string)analysis.detectedFamily;
         bool hasStats = (int)analysis.totalStats > 0;
-        bool hasSpell = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
         int quality = (int)analysis.itemQuality;
+        bool whiteBase = quality <= 1;
 
-        int numVariants = Math.Clamp(ruleset.variantsPerItem, 1, 50);
-        // Quality-aware tiers: white items cap at green/blue (no epic tier).
-        var tiers = TiersForQuality(quality, ruleset);
-
-        // Budget source: statful items use their stat budget; anything without
-        // stats (white gear, or a spell-only item) derives budget from item level
-        // so there's something to allocate.
+        // Stat-less bases (white gear, or a spell-only item) have no stat budget to
+        // layer onto, so derive one from item level — the crafting mint uses the
+        // same source. The boost % then sizes the minted set.
         if (!hasStats)
             baseBudget = EstimateBudgetFromItemLevel(GetPropInt(baseItem, "item_level"));
-
-        // White items have little/no base budget, so a base-anchored floor would
-        // compress every roll into a razor-thin band at the top of the scale
-        // (making all variants read as ~95%). Instead, white uses an ABSOLUTE
-        // floor derived from item level with a generous span, so its tiers spread
-        // out properly (green Improved → blue of Power). Non-white keeps the
-        // base-anchored floor (never below base, since it replaces the reward).
-        float maxBudget, floorBudget;
-        if (quality == 1)
-        {
-            // A modest green/blue-worthy budget from item level, spread from a
-            // low floor so Improved/of Power tiers are distinguishable.
-            float ilvlBudget = EstimateBudgetFromItemLevel(GetPropInt(baseItem, "item_level"));
-            maxBudget = Math.Max(baseBudget, ilvlBudget) * 0.6f;   // cap ~blue-tier
-            floorBudget = maxBudget * 0.15f;                        // low floor → real spread
-        }
-        else
-        {
-            maxBudget = baseBudget * (1 + ruleset.budgetCeilingPct / 100f);
-            // Quest variants REPLACE the base, so the worst variant must still be
-            // an upgrade — anchor the floor a hair above base (1.02×). Tiers then
-            // subdivide [floor, maxBudget] rather than [0, maxBudget].
-            floorBudget = Math.Min(baseBudget * 1.02f, maxBudget);
-        }
-        float budgetSpan = Math.Max(0f, maxBudget - floorBudget);
-        var tierAllocations = AllocateTierSlots(tiers, numVariants);
 
         var eligible = new HashSet<int>(presentTypes);
         if (ruleset.allowNewAffixes)
@@ -1150,47 +1491,74 @@ public class QuestLootifierController : Controller
         var eligibleList = eligible.ToList();
         if (!hasStats) eligibleList = STAT_FAMILIES["hybrid"].ToList();
 
-        var fingerprints = new HashSet<string> { hasStats ? BuildFingerprint(analysis) : "" };
+        var bands = (ruleset.bands != null && ruleset.bands.Length > 0)
+            ? ruleset.bands.ToList()
+            : DefaultBands(ruleset.includeGodsBand);
+
+        // White cap (preserves the locked white ladder): a white reward never mints
+        // purple/orange, so drop the of Glory and of the Gods bands — white keeps
+        // only Improved / of Power (green).
+        if (whiteBase)
+            bands = bands.Where(b =>
+            {
+                var t = CanonicalTier(b.label ?? "", b.maxBoostPct);
+                return t != "glory" && t != "gods";
+            }).ToList();
+
+        // Fingerprint of the BASE item's stat line — no band may mint a variant
+        // identical to the item it replaces. This one stays global.
+        string baseFp = hasStats ? BuildFingerprint(analysis) : "";
         var variants = new List<VariantData>();
 
-        for (int tierIdx = 0; tierIdx < tiers.Count; tierIdx++)
+        foreach (var band in bands)
         {
-            var tier = tiers[tierIdx];
-            int slots = tierAllocations[tierIdx];
+            // Dedup is scoped to THE BAND, not the whole item.
+            //
+            // This used to be a single item-wide HashSet keyed on the stat set
+            // alone (BuildVariantFingerprint ignores the tier). So an "of Glory"
+            // that happened to roll the same stat line as an already-minted
+            // "Improved" was discarded as a duplicate — even though it is a
+            // different item entirely: different name, different quality colour,
+            // different gold value.
+            //
+            // On a low-item-level base the distinct roll space is tiny (few
+            // eligible stats, small integer values, maxExtraStatSlots = 1), and
+            // integer rounding collapses a 20% boost and a 45% boost onto the
+            // same numbers. The cheap, high-slot bands therefore EXHAUSTED the
+            // space and the expensive bands silently produced nothing — all 10
+            // retries collided, `continue` fired, and the tier vanished.
+            //
+            // Bingles' Flying Gloves (ilvl 15) minted 5 Improved / 1 of Power /
+            // 0 of Glory / 1 of the Gods against a configured 5 / 2 / 2 / 1 —
+            // the purple tier disappeared completely, and with it the whole
+            // reason the colour ladder exists.
+            //
+            // Two variants in the SAME band with identical stats are genuinely
+            // redundant, so intra-band dedup is kept.
+            var bandFingerprints = new HashSet<string>();
+            if (!string.IsNullOrEmpty(baseFp)) bandFingerprints.Add(baseFp);
 
+            int slots = Math.Max(0, band.slots);
             for (int s = 0; s < slots; s++)
             {
-                float tierMin = floorBudget + budgetSpan * (tier.minPct / 100f);
-                float tierMax = floorBudget + budgetSpan * (Math.Min(tier.maxPct, 100f) / 100f);
-                float budgetRoll = tierMin + (float)rng.NextDouble() * (tierMax - tierMin);
-                float budgetPct = maxBudget > 0 ? (budgetRoll / maxBudget) * 100f : 0;
-
-                List<StatRoll> stats = hasStats
-                    ? RollStats(rng, budgetRoll, presentTypes, eligibleList, analysis, ruleset)
-                    : RollStatsForSpellItem(rng, budgetRoll, eligibleList);
-
-                string name = ApplyTierName((string)baseItem.name, tier.label, tier.position);
-                var cand = new VariantData { name = name, budgetPct = budgetPct, tierLabel = tier.label, tierPosition = tier.position, stats = stats };
+                var cand = RollBandVariant(rng, baseItem, analysis, hasStats, baseBudget, presentTypes, eligibleList, band, ruleset);
 
                 var fp = BuildVariantFingerprint(cand);
-                if (fingerprints.Contains(fp))
+                if (bandFingerprints.Contains(fp))
                 {
                     bool found = false;
                     for (int retry = 0; retry < 10; retry++)
                     {
-                        budgetRoll = tierMin + (float)rng.NextDouble() * (tierMax - tierMin);
-                        budgetPct = maxBudget > 0 ? (budgetRoll / maxBudget) * 100f : 0;
-                        stats = hasStats
-                            ? RollStats(rng, budgetRoll, presentTypes, eligibleList, analysis, ruleset)
-                            : RollStatsForSpellItem(rng, budgetRoll, eligibleList);
-                        cand = new VariantData { name = name, budgetPct = budgetPct, tierLabel = tier.label, tierPosition = tier.position, stats = stats };
+                        cand = RollBandVariant(rng, baseItem, analysis, hasStats, baseBudget, presentTypes, eligibleList, band, ruleset);
                         fp = BuildVariantFingerprint(cand);
-                        if (!fingerprints.Contains(fp)) { found = true; break; }
+                        if (!bandFingerprints.Contains(fp)) { found = true; break; }
                     }
+                    // This band genuinely cannot produce another distinct roll —
+                    // drop THIS slot only. Later bands are unaffected.
                     if (!found) continue;
                 }
 
-                fingerprints.Add(fp);
+                bandFingerprints.Add(fp);
                 variants.Add(cand);
             }
         }
@@ -1198,28 +1566,169 @@ public class QuestLootifierController : Controller
         return variants.OrderBy(v => v.budgetPct).ToList();
     }
 
-    private int[] AllocateTierSlots(List<TierRange> tiers, int total)
+    // Roll one variant for a band: pick a boost % inside the band, turn it into an
+    // additive total budget (base × (1 + boost%)) so RollStats layers the bonus on
+    // top of the preserved base lines, and store the boost % as budgetPct.
+    private VariantData RollBandVariant(Random rng, dynamic baseItem, dynamic analysis, bool hasStats,
+        float baseBudget, int[] presentTypes, List<int> eligibleList, QuestBandDto band, QuestRulesetDto ruleset)
     {
-        var alloc = new int[tiers.Count];
-        if (tiers.Count == 0) return alloc;
-        if (tiers.Count == 1) { alloc[0] = total; return alloc; }
+        float span = Math.Max(0f, band.maxBoostPct - band.minBoostPct);
+        float boostPct = band.minBoostPct + (float)rng.NextDouble() * span;
 
-        int upper = 0;
-        for (int i = 1; i < tiers.Count; i++)
-        {
-            alloc[i] = (i == tiers.Count - 1) ? 1 : 2;
-            upper += alloc[i];
-        }
-        alloc[0] = Math.Max(1, total - upper);
+        float budgetRoll = baseBudget * (1f + boostPct / 100f);
 
-        int sum = alloc.Sum();
-        while (sum > total)
+        List<StatRoll> stats = hasStats
+            ? RollStats(rng, budgetRoll, presentTypes, eligibleList, analysis, ruleset)
+            : RollStatsForSpellItem(rng, budgetRoll, eligibleList);
+
+        // High-rarity bases can't wear the low-tier names. Resolve the band's
+        // displayed label/position from the base quality + the band's magnitude
+        // tier (purple → of Fury/of Azeroth, legendary → Immortal).
+        int baseQuality = (int)analysis.itemQuality;
+        string canon = CanonicalTier(band.label ?? "", band.maxBoostPct);
+        var (label, position) = ResolveBandNaming(baseQuality, canon, band.label ?? "", band.position ?? "suffix");
+
+        string name = ApplyTierName((string)baseItem.name, label, position);
+        return new VariantData
         {
-            int maxIdx = 0;
-            for (int i = 1; i < alloc.Length; i++) if (alloc[i] > alloc[maxIdx]) maxIdx = i;
-            if (alloc[maxIdx] > 1) { alloc[maxIdx]--; sum--; } else break;
+            name = name,
+            budgetPct = boostPct,
+            tierLabel = label,
+            tierPosition = position,
+            stats = stats
+        };
+    }
+
+    // Per-base-quality band naming. Low/plain names only fit low-rarity bases;
+    // a purple or legendary reward can never carry an "Improved"/"of Power" name
+    // (nor drop to their colour). Green/blue/white keep the configured labels.
+    //   Purple base : Improved/of Power → "of Fury" (purple)
+    //                 of Glory          → "of Glory" (purple)
+    //                 of the Gods       → "of Azeroth" (the purple→legendary step, orange)
+    //   Legendary   : every tier        → "Immortal" (prefix, orange) — it can only stay legendary
+    private (string label, string position) ResolveBandNaming(int baseQuality, string canonicalTier,
+        string defaultLabel, string defaultPosition)
+    {
+        if (baseQuality >= 5)
+            return ("Immortal", "prefix");
+
+        if (baseQuality == 4)
+        {
+            return canonicalTier switch
+            {
+                "improved" => ("of Fury", "suffix"),
+                "power" => ("of Fury", "suffix"),
+                "glory" => ("of Glory", "suffix"),
+                "gods" => ("of Azeroth", "suffix"),
+                _ => (defaultLabel, defaultPosition)
+            };
         }
-        return alloc;
+
+        return (defaultLabel, defaultPosition);
+    }
+
+    // Canonical tier token for a band, by name first (so any boost range is legal
+    // under a recognized label) then by boost bucket for custom labels. Used for
+    // the white-band cap and mirrors the Crafting Lootifier's mapping.
+    private static string CanonicalTier(string label, float boostPct)
+    {
+        var l = (label ?? "").ToLowerInvariant();
+        if (l.Contains("god") || l.Contains("legend") || l.Contains("immortal") || l.Contains("azeroth")) return "gods";
+        if (l.Contains("glory") || l.Contains("fury")) return "glory";
+        if (l.Contains("power")) return "power";
+        if (l.Contains("improv")) return "improved";
+        if (boostPct >= 40f) return "gods";
+        if (boostPct >= 30f) return "glory";
+        if (boostPct >= 20f) return "power";
+        return "improved";
+    }
+
+    // Colour ladder shared by the preview and the DB write.
+    //
+    // The ladder is RELATIVE to the base item's quality, not absolute. The old
+    // version hardcoded every non-glory/non-gods band to blue:
+    //
+    //     else laddered = whiteBase ? 2 : 3;   // blue
+    //
+    // which swept up BOTH "improved" and "power" — so a green quest reward could
+    // not produce a green variant. Math.Max(2, 3) is blue, always. Five Improved
+    // variants off a green base all came out blue, and the floor rule (never drop
+    // below base) was quietly doubling as a promotion rule.
+    //
+    // Now each band is an OFFSET from the base:
+    //
+    //     improved → base + 0     (inherits the base's colour — it IS the base
+    //                              item, marginally better; promoting it was the bug)
+    //     power    → base + 1
+    //     glory    → base + 2
+    //     gods     → 5            (the only step that may reach orange)
+    //
+    // Non-legendary bands are capped at purple, so a blue reward can't mint an
+    // orange "of Glory". The hard floor stays: a variant is NEVER rarer-down than
+    // the item it replaces.
+    //
+    // Green base (2) now yields: improved=green, power=blue, glory=purple,
+    // gods=orange, quest legendary=orange. Purple base (4) still collapses to
+    // of Fury/of Glory (purple) + of Azeroth (orange) exactly as ResolveBandNaming
+    // already names it, and a legendary base stays legendary throughout.
+    //
+    // Tier identification is delegated to CanonicalTier (label first, boost bucket
+    // as fallback), so the 150%-budget quest legendary and any custom band label
+    // resolve the same way here as they do at naming time.
+    private int VariantQualityForTier(string tierLabel, float budgetPct, int baseQuality)
+    {
+        bool whiteBase = baseQuality <= 1;
+        string canon = CanonicalTier(tierLabel ?? "", budgetPct);
+
+        // White/grey bases have no meaningful colour to inherit, so they keep the
+        // legacy fixed ladder (white shifts one step down at every rung).
+        if (whiteBase)
+        {
+            int w = canon switch
+            {
+                "gods" => 4,        // purple
+                "glory" => 3,       // blue
+                _ => 2,             // green (improved + power)
+            };
+            return Math.Max(baseQuality, w);
+        }
+
+        int laddered = canon switch
+        {
+            "gods" => 5,                // orange — the legendary step, the only rung that reaches it
+            "glory" => 4,               // purple floor  (unchanged)
+            "power" => 3,               // blue floor    (unchanged)
+            _ => baseQuality,           // improved: INHERIT the base — this is the fix
+        };
+
+        return Math.Clamp(Math.Max(baseQuality, laddered), 0, 5);
+    }
+
+    // Default band ladder — mirrors the Crafting Lootifier's defaults so the two
+    // tools feel identical. "of the Gods" (orange) is optional via includeGodsBand;
+    // the quest-flavoured legendary is added separately in Commit.
+    private QuestRulesetDto DefaultRuleset() => new QuestRulesetDto
+    {
+        allowNewAffixes = true,
+        maxAffixCountChange = 1,
+        existingBumpBias = QUEST_BUMP_BIAS,
+        generateLegendary = true,
+        includeGodsBand = true,
+        goldValueScalePct = 100f,
+        bands = DefaultBands(true).ToArray()
+    };
+
+    private List<QuestBandDto> DefaultBands(bool includeGods)
+    {
+        var bands = new List<QuestBandDto>
+        {
+            new() { label = "Improved", position = "prefix", minBoostPct = 10f, maxBoostPct = 20f, slots = 5, goldBumpPct = 25f },
+            new() { label = "of Power", position = "suffix", minBoostPct = 20f, maxBoostPct = 30f, slots = 2, goldBumpPct = 50f },
+            new() { label = "of Glory", position = "suffix", minBoostPct = 30f, maxBoostPct = 40f, slots = 2, goldBumpPct = 100f },
+        };
+        if (includeGods)
+            bands.Add(new() { label = "of the Gods", position = "suffix", minBoostPct = 40f, maxBoostPct = 60f, slots = 1, goldBumpPct = 200f });
+        return bands;
     }
 
     private float EstimateBudgetFromItemLevel(int itemLevel) => Math.Max(5f, itemLevel * 0.7f);
@@ -1250,42 +1759,94 @@ public class QuestLootifierController : Controller
         return rolled;
     }
 
+    // Statful bases: ADDITIVE ONLY (crafting-lootifier rule). Preserve every base
+    // stat line verbatim, then layer a bonus on top — never reduced, never dropped.
+    // The bonus size is this roll's headroom above the base budget (budgetRoll is
+    // the total target for the tier; GenerateVariants floors it at base×1.02, the
+    // legendary path uses base×1.5), floored at MIN_DELTA_BUDGET so even the lowest
+    // tier is a real upgrade over the plain reward. The bonus is split between
+    // bumping the existing lines and adding new affixes, gated by allowNewAffixes /
+    // maxAffixCountChange / open slots. `presentTypes` is retained for signature
+    // parity with the other call sites; base lines now come from analysis.stats.
     private List<StatRoll> RollStats(Random rng, float budgetRoll, int[] presentTypes,
-        List<int> eligibleList, dynamic analysis, RulesetDto ruleset)
+        List<int> eligibleList, dynamic analysis, QuestRulesetDto ruleset)
     {
-        int baseSlotCount = ((List<object>)analysis.stats).Count;
-        int slotCount = baseSlotCount;
-        if (ruleset.allowNewAffixes && rng.NextDouble() < 0.2 && baseSlotCount < 5)
-            slotCount = Math.Min(baseSlotCount + ruleset.maxAffixCountChange, 10);
+        float baseWeighted = (float)analysis.weightedBudget;
 
-        var chosen = new List<int>();
-        chosen.AddRange(presentTypes.OrderBy(_ => rng.Next()).Take(slotCount));
-        while (chosen.Count < slotCount)
+        // Seed the variant with the base reward's exact stat lines (preserved).
+        var lines = new Dictionary<int, int>();
+        foreach (var s in (List<object>)analysis.stats)
         {
-            var pool = eligibleList.Where(s => !chosen.Contains(s)).ToList();
-            if (pool.Count == 0) break;
-            chosen.Add(pool[rng.Next(pool.Count)]);
+            int st = (int)((dynamic)s).statType;
+            int sv = (int)((dynamic)s).statValue;
+            if (st > 0 && sv != 0) lines[st] = sv;
         }
 
-        var weights = chosen.Select(t => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(t, 1.0f)).ToArray();
-        float totalWeight = weights.Sum();
-        var rolled = new List<StatRoll>();
-        float remaining = budgetRoll;
-        for (int s = 0; s < chosen.Count; s++)
+        // Additive bonus = the roll's budget above what the base already occupies,
+        // floored so the worst variant still upgrades the reward.
+        float delta = Math.Max(MIN_DELTA_BUDGET, budgetRoll - baseWeighted);
+
+        int slotRoom = Math.Max(0, 10 - lines.Count);
+        var newCandidates = eligibleList.Where(t => !lines.ContainsKey(t)).ToList();
+        bool canAddNew = ruleset.allowNewAffixes && slotRoom > 0 && newCandidates.Count > 0;
+
+        float split = (float)Math.Clamp(ruleset.existingBumpBias + (rng.NextDouble() * 0.4 - 0.2), 0.0, 1.0);
+        if (lines.Count == 0) split = 0f;   // no base lines to bump → all bonus goes to new affixes
+        if (!canAddNew) split = 1f;         // no room/permission for new affixes → all bonus to bumps
+
+        float existingPortion = delta * split;
+        float newPortion = delta - existingPortion;
+
+        // Bump the preserved lines (weight-distributed).
+        if (existingPortion > 0f && lines.Count > 0)
         {
-            float share;
-            if (s == chosen.Count - 1) share = remaining;
-            else
+            var keys = lines.Keys.ToList();
+            float totalW = keys.Sum(k => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f));
+            foreach (var k in keys)
             {
-                float basePortion = budgetRoll * (weights[s] / totalWeight);
-                float jitter = (float)(rng.NextDouble() * 0.3 - 0.15) * basePortion;
-                share = Math.Max(1, basePortion + jitter);
+                float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
+                float share = existingPortion * (w / totalW);
+                int add = (int)Math.Round(share / w);
+                if (add > 0) lines[k] += add;
             }
-            int statValue = Math.Max(1, (int)Math.Round(share / weights[s]));
-            remaining -= statValue * weights[s];
-            rolled.Add(new StatRoll { statType = chosen[s], statValue = statValue, name = STAT_NAMES.GetValueOrDefault(chosen[s], $"Type{chosen[s]}") });
         }
-        return rolled;
+
+        // Add new affixes with the remaining bonus, or (if none allowed) pour the
+        // whole delta back into the existing lines so the tier budget still lands.
+        if (canAddNew && newPortion > 0f)
+        {
+            int maxNew = Math.Min(Math.Max(1, ruleset.maxAffixCountChange), Math.Min(slotRoom, newCandidates.Count));
+            int newCount = 1 + rng.Next(maxNew);
+            var picks = newCandidates.OrderBy(_ => rng.Next()).Take(newCount).ToList();
+
+            float totalW = picks.Sum(k => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f));
+            foreach (var k in picks)
+            {
+                float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
+                float share = newPortion * (w / totalW);
+                int val = Math.Max(1, (int)Math.Round(share / w));
+                lines[k] = lines.GetValueOrDefault(k, 0) + val;
+            }
+        }
+        else if (existingPortion < delta && lines.Count > 0)
+        {
+            var keys = lines.Keys.ToList();
+            float totalW = keys.Sum(k => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f));
+            float leftover = delta - existingPortion;
+            foreach (var k in keys)
+            {
+                float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
+                int add = (int)Math.Round(leftover * (w / totalW) / w);
+                if (add > 0) lines[k] += add;
+            }
+        }
+
+        return lines.Select(kv => new StatRoll
+        {
+            statType = kv.Key,
+            statValue = kv.Value,
+            name = STAT_NAMES.GetValueOrDefault(kv.Key, $"Type{kv.Key}")
+        }).ToList();
     }
 
     private string BuildFingerprint(dynamic analysis)
@@ -1297,29 +1858,13 @@ public class QuestLootifierController : Controller
     private string BuildVariantFingerprint(VariantData v) =>
         string.Join("|", v.stats.Select(s => $"{s.statType}:{s.statValue}").OrderBy(x => x));
 
-    private List<TierRange> GetRequiredTiers(RulesetDto ruleset)
-    {
-        if (ruleset.namingTiers != null && ruleset.namingTiers.Length > 0)
-            return ruleset.namingTiers.Where(t => !string.IsNullOrEmpty(t.label))
-                .Select(t => new TierRange { minPct = t.minPct, maxPct = t.maxPct, label = t.label ?? "", position = t.position ?? "suffix" })
-                .ToList();
-
-        return new List<TierRange>
-        {
-            new() { minPct = 0, maxPct = 79, label = "Improved", position = "prefix" },
-            new() { minPct = 80, maxPct = 89, label = "of Power", position = "suffix" },
-            new() { minPct = 90, maxPct = 97, label = "of Glory", position = "suffix" },
-            new() { minPct = 98, maxPct = 100, label = "of the Gods", position = "suffix" }
-        };
-    }
-
     private string ApplyTierName(string baseName, string tierLabel, string tierPosition)
     {
         if (string.IsNullOrEmpty(tierLabel)) return baseName;
         return tierPosition == "prefix" ? tierLabel + " " + baseName : baseName + " " + tierLabel;
     }
 
-    private List<object> VariantsToJson(List<VariantData> variants) =>
+    private List<object> VariantsToJson(List<VariantData> variants, int baseQuality) =>
         variants.Select((v, idx) => (object)new
         {
             variantIndex = idx,
@@ -1327,6 +1872,7 @@ public class QuestLootifierController : Controller
             budgetPct = Math.Round(v.budgetPct, 1),
             tierLabel = v.tierLabel,
             tierPosition = v.tierPosition,
+            quality = VariantQualityForTier(v.tierLabel ?? "", v.budgetPct, baseQuality),
             stats = v.stats.Select(s => (object)new { s.statType, s.statValue, s.name }).ToList()
         }).ToList();
 
@@ -1417,52 +1963,64 @@ public class QuestLootifierController : Controller
     /// Green+ items need existing stats; WHITE (quality 1) items are allowed even
     /// with no stats — they get stats added, but only up to the green/blue tier.
     /// </summary>
+    // Eligibility gate. Stats are OPTIONAL at every quality: a stat-less base has
+    // no budget to layer onto, so the engine derives one from item_level instead
+    // (EstimateBudgetFromItemLevel / RollStatsMinted) — and that path branches on
+    // hasStats, never on quality. The old rule (`quality == 1 ? true : hasStats`)
+    // let stat-less WHITES through but silently dropped stat-less GREEN+ items,
+    // even though the engine handles them identically. That skipped a whole class
+    // of vanilla quest rewards: pure-DPS weapons with no stat lines
+    // (Vanquisher's Sword and friends). Now the only bars are: it must be gear,
+    // and it must not be grey.
     private bool IsLootifiable(dynamic analysis)
     {
-        bool equippable = (bool)analysis.isEquippable;
+        bool equippable = (bool)analysis.isEquippable;  // class 2/4 with inventory_type > 0
         int quality = (int)analysis.itemQuality;
         if (!equippable) return false;
         if (quality <= 0) return false;                 // grey excluded
-        bool hasStats = (int)analysis.totalStats > 0;
-        if (quality == 1) return true;                  // white: allowed even without stats
-        return hasStats;                                // green+ : must already have stats
+        return true;                                    // stats optional — minted from item_level if absent
     }
 
-    /// <summary>
-    /// Naming tiers permitted for an item of the given quality. White (1) items
-    /// only reach green/blue-equivalent budget tiers, so their variants never
-    /// exceed the mid ladder — no purple "of the Gods" on a white base.
-    /// Non-white items use the full ruleset tier list.
-    /// </summary>
-    private List<TierRange> TiersForQuality(int quality, RulesetDto ruleset)
-    {
-        var full = GetRequiredTiers(ruleset);
-        if (quality != 1) return full;
-
-        // White cap: keep only tiers whose top budget stays at/under the
-        // "of Glory" band (<= 89% here), i.e. Improved + of Power. This yields
-        // green/blue-feeling upgrades without epic-tier rolls.
-        var capped = full.Where(t => t.maxPct <= 89f).ToList();
-        return capped.Count > 0 ? capped : new List<TierRange>
-        {
-            new() { minPct = 0, maxPct = 79, label = "Improved", position = "prefix" },
-            new() { minPct = 80, maxPct = 89, label = "of Power", position = "suffix" }
-        };
-    }
 }
 
 // ══════════════════════════════════════════════════════════════
 //  DTOs specific to the quest controller.
-//  The variant-engine types (SpellEffectInfo, VariantData, StatRoll,
-//  TierRange) and the commit DTOs (RulesetDto, CommitRoll, CommitStat,
-//  NamingTierDto) are declared in LootifierController.cs and shared here,
-//  since both controllers live in the same assembly.
+//  The variant-engine types (SpellEffectInfo, VariantData, StatRoll) and the
+//  commit DTOs (CommitRoll, CommitStat) are declared in LootifierController.cs
+//  and shared here. Tier selection is BAND-BASED (QuestRulesetDto/QuestBandDto,
+//  mirroring the Crafting Lootifier) rather than the shared RulesetDto's
+//  budget-ceiling + naming-tier model.
 // ══════════════════════════════════════════════════════════════
+
+// Band-based ruleset (twin of CraftingRulesetDto). Each band names a tier and
+// carries a min/max additive boost % plus a slot count.
+public class QuestRulesetDto
+{
+    public bool allowNewAffixes { get; set; } = true;
+    public int maxAffixCountChange { get; set; } = 1;
+    public float existingBumpBias { get; set; } = 0.5f;   // delta split: existing-line bumps vs new affixes
+    public bool generateLegendary { get; set; } = true;   // quest-flavoured legendary, one per reward item
+    public bool includeGodsBand { get; set; } = true;     // whether the default set offers an "of the Gods" band
+    public bool rerollIncludeLegendary { get; set; } = false; // on regen, may an owned copy reroll INTO the legendary?
+    public float goldValueScalePct { get; set; } = 100f;  // master scale on all gold bumps: 100 = as entered, 0 = prices untouched, 200 = double
+    public float legendaryGoldBumpPct { get; set; } = 500f; // quest legendary price bump above base (%); 500 = the old x6 stock behavior
+    public QuestBandDto[]? bands { get; set; }
+}
+
+public class QuestBandDto
+{
+    public string label { get; set; } = "";
+    public string position { get; set; } = "suffix";     // "prefix" or "suffix"
+    public float minBoostPct { get; set; }
+    public float maxBoostPct { get; set; }
+    public int slots { get; set; } = 1;                   // variants to roll in this band
+    public float? goldBumpPct { get; set; }               // price bump above base (%); null = legacy budget curve
+}
 
 public class QuestGenerateRequest
 {
     public int[]? itemEntries { get; set; }
-    public RulesetDto? ruleset { get; set; }
+    public QuestRulesetDto? ruleset { get; set; }
 }
 
 public class QuestCommitRequest
@@ -1470,10 +2028,21 @@ public class QuestCommitRequest
     public bool allQuests { get; set; } = false;
     public int[]? itemEntries { get; set; }
     public bool regenerate { get; set; } = false;
-    public RulesetDto? ruleset { get; set; }
+    public QuestRulesetDto? ruleset { get; set; }
 }
 
 public class QuestRollbackRequest
 {
     public int baseEntry { get; set; } = 0; // 0 = all quest variants
+}
+
+public class QuestTierBumpDto
+{
+    public string tier { get; set; } = "";      // tier_name exactly as stored in lootifier_generated_items
+    public float? goldBumpPct { get; set; }     // null / omitted = leave this tier's prices ALONE
+}
+
+public class QuestRevalueRequest
+{
+    public QuestTierBumpDto[]? tiers { get; set; }
 }

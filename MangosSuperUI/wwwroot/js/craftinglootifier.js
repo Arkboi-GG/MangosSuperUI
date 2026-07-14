@@ -53,6 +53,7 @@
                     '<span class="text-muted">-</span>' +
                     '<input type="number" class="form-input b-max" value="' + b.maxBoostPct + '" min="0" max="200" /></span>' +
                     '<input type="number" class="form-input b-slots" value="' + b.slots + '" min="0" max="30" />' +
+                    '<input type="number" class="form-input b-gold" value="' + (b.goldBumpPct != null ? b.goldBumpPct : '') + '" min="0" max="10000" step="5" placeholder="curve" style="width:64px" title="Gold price bump above base (%) for this tier. Blank = legacy boost curve." />' +
                     '<span class="rmBand" data-band="' + i + '"><i class="fa-solid fa-xmark"></i></span>' +
                     '</div>';
             });
@@ -63,12 +64,14 @@
         function collectBands() {
             var out = [];
             $('#' + ids.bandEditor + ' .lf-band-row').each(function () {
+                var gold = parseFloat($(this).find('.b-gold').val());
                 out.push({
                     label: $(this).find('.b-label').val() || '',
                     position: $(this).find('.b-pos').val() || 'suffix',
                     minBoostPct: parseFloat($(this).find('.b-min').val()) || 0,
                     maxBoostPct: parseFloat($(this).find('.b-max').val()) || 0,
-                    slots: parseInt($(this).find('.b-slots').val()) || 0
+                    slots: parseInt($(this).find('.b-slots').val()) || 0,
+                    goldBumpPct: isNaN(gold) ? null : Math.max(0, gold)
                 });
             });
             return out;
@@ -109,6 +112,30 @@
             state.bands = cur;
         }
 
+        // Self-bootstrap the Gold value % input if the .cshtml doesn't render one
+        // (mirrors the Quest Lootifier's band-editor injection pattern). Anchors
+        // after the Legendary checkbox's label; falls back to above the band editor.
+        function ensureGoldInput() {
+            var inputCss = 'width:64px;padding:3px 5px;border-radius:5px;border:1px solid rgba(128,128,128,.35);background:rgba(0,0,0,.18);color:inherit;';
+            var labelCss = 'font-size:11px;opacity:.85;display:inline-flex;align-items:center;gap:6px;margin-left:10px;';
+            var $anchor = $('#' + ids.legendary).closest('label');
+            if (!$anchor.length) $anchor = $('#' + ids.legendary);
+            if ($('#' + ids.legGold).length === 0) {
+                var lh = '<label style="' + labelCss + '" title="Gold price bump above base (%) for legendary (quality 5) variants. 400 \u2248 old stock behavior.">' +
+                    'Legendary gold +% <input id="' + ids.legGold + '" type="number" min="0" max="10000" step="25" value="400" style="' + inputCss + '" /></label>';
+                if ($anchor.length) $(lh).insertAfter($anchor);
+                else $('#' + ids.bandEditor).before(lh);
+            }
+            if ($('#' + ids.gold).length === 0) {
+                var gh = '<label style="' + labelCss + '" title="Master scale on ALL gold bumps: 100% = as entered, 0% = prices unchanged, 200% = double every bump.">' +
+                    'Gold scale % <input id="' + ids.gold + '" type="number" min="0" max="1000" step="5" value="100" style="' + inputCss + '" /></label>';
+                var $g = $('#' + ids.legGold).closest('label');
+                if ($g.length) $(gh).insertAfter($g);
+                else if ($anchor.length) $(gh).insertAfter($anchor);
+                else $('#' + ids.bandEditor).before(gh);
+            }
+        }
+
         state.seed = function (dr) {
             state.offset = 0;
             state.bands = (dr.bands || []).map(function (b) {
@@ -122,18 +149,27 @@
             $('#' + ids.allowNew).prop('checked', dr.allowNewAffixes);
             $('#' + ids.maxAffix).val(dr.maxAffixCountChange);
             $('#' + ids.legendary).prop('checked', dr.includeLegendaryBand);
+            ensureGoldInput();
+            $('#' + ids.gold).val(dr.goldValueScalePct != null ? dr.goldValueScalePct : 100);
+            $('#' + ids.legGold).val(dr.legendaryGoldBumpPct != null ? dr.legendaryGoldBumpPct : 400);
             $('#' + ids.offset).val(0);
             $('#' + ids.offsetVal).text('+0');
             renderBands();
         };
 
         state.collect = function () {
+            var gold = parseFloat($('#' + ids.gold).val());
+            if (isNaN(gold)) gold = 100;
+            var legGold = parseFloat($('#' + ids.legGold).val());
+            if (isNaN(legGold)) legGold = 400;
             return {
                 variantsPerItem: 10,
                 allowNewAffixes: $('#' + ids.allowNew).is(':checked'),
                 maxAffixCountChange: parseInt($('#' + ids.maxAffix).val()) || 0,
                 existingBumpBias: parseFloat($('#' + ids.bump).val()),
                 includeLegendaryBand: $('#' + ids.legendary).is(':checked'),
+                goldValueScalePct: Math.max(0, gold),
+                legendaryGoldBumpPct: Math.max(0, legGold),
                 bands: collectBands()
             };
         };
@@ -170,12 +206,12 @@
 
     var genRuleset = RulesetEditor({
         bump: 'rsBumpBias', bumpVal: 'rsBumpBiasVal', allowNew: 'rsAllowNewAffixes',
-        maxAffix: 'rsMaxAffixChange', legendary: 'rsLegendaryBand', offset: 'rsOffset', offsetVal: 'rsOffsetVal',
+        maxAffix: 'rsMaxAffixChange', legendary: 'rsLegendaryBand', gold: 'rsGoldScale', legGold: 'rsLegGold', offset: 'rsOffset', offsetVal: 'rsOffsetVal',
         bandEditor: 'bandEditor', bandWarn: 'bandWarn', addBand: 'btnAddBand', reset: 'btnResetRuleset'
     });
     var profRuleset = RulesetEditor({
         bump: 'pRsBumpBias', bumpVal: 'pRsBumpBiasVal', allowNew: 'pRsAllowNewAffixes',
-        maxAffix: 'pRsMaxAffixChange', legendary: 'pRsLegendaryBand', offset: 'pRsOffset', offsetVal: 'pRsOffsetVal',
+        maxAffix: 'pRsMaxAffixChange', legendary: 'pRsLegendaryBand', gold: 'pRsGoldScale', legGold: 'pRsLegGold', offset: 'pRsOffset', offsetVal: 'pRsOffsetVal',
         bandEditor: 'pBandEditor', bandWarn: 'pBandWarn', addBand: 'pBtnAddBand', reset: 'pBtnResetRuleset'
     });
 
@@ -287,7 +323,7 @@
             var isNew = !baseSet[s.statType];
             pills += '<span class="lf-stat-pill' + (isNew ? ' new' : '') + '">+' + s.statValue + ' ' + esc(s.name) + '</span>';
         });
-        var q = tierQuality(v.tier);
+        var q = (v.quality && v.quality >= 2) ? v.quality : tierQuality(v.tier);
         return '<div class="lf-variant-row">' +
             (v.iconPath ? '<img src="' + esc(v.iconPath) + '" />' : '') +
             '<span class="lf-variant-name quality-' + q + '">' + esc(v.name) + '</span>' +
@@ -353,7 +389,7 @@
                 h += '<div class="lf-recipe-row' + (r.equippable ? '' : ' skip') + '">' +
                     '<img src="' + esc(r.iconPath || '/icons/inv_misc_questionmark.png') + '" />' +
                     '<span class="quality-' + r.quality + '">' + esc(r.name) + '</span>' +
-                    '<span class="text-muted">#' + r.entry + '</span>' +
+                    '<span class="text-muted">#' + r.entry + ' \u00b7 ilvl ' + r.itemLevel + '</span>' +
                     (r.equippable ? '' : '<span class="lf-skip-tag">not equippable</span>') +
                     (r.lootified ? '<span class="lf-done-tag">\u2713 lootified</span>' : '') +
                     '</div>';
@@ -479,6 +515,202 @@
                 if ($('#tab-professions').is(':visible')) { loadProfessions(); if (selectedProf) loadRecipes(selectedProf); }
             },
             error: function () { showToast('Rollback failed', 'error'); }
+        });
+    });
+
+    var RV_LABEL = 'Crafting Lootifier';
+    var RV_BTN_ID = 'btnRevalueAll';
+    var RV_ANCHOR_ID = 'btnRollbackAll';
+    var RV_URL_TIERS = '/CraftingLootifier/RevalueTiers';
+    var RV_URL_APPLY = '/CraftingLootifier/Revalue';
+
+    // ═══════════════════ REVALUE GOLD (per-tier, you set the numbers) ═══════════════════
+    // Opens a dialog listing the tiers that ACTUALLY EXIST in the tracking table,
+    // shows what each one is currently priced at (measured from the DB), and lets
+    // you type the bump you want. Blank = that tier is left alone. Prices are
+    // rebuilt from each base item (never compounds), and only buy/sell change —
+    // entries, names, display IDs and retextures are untouched.
+
+    var __rvTiers = [];
+
+    function rvFmtMoney(c) {
+        c = Math.max(0, Math.round(c || 0));
+        var g = Math.floor(c / 10000), s = Math.floor((c % 10000) / 100), cc = c % 100;
+        var out = [];
+        if (g) out.push(g + 'g');
+        if (s || g) out.push(s + 's');
+        out.push(cc + 'c');
+        return out.join(' ');
+    }
+
+    function rvEnsureCss() {
+        if (document.getElementById('rvCss')) return;
+        $('<style id="rvCss">' +
+            '#rvOverlay{position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;}' +
+            '#rvBox{background:#1e2128;color:#e8e8ea;border:1px solid rgba(255,255,255,.14);border-radius:10px;' +
+            'width:min(760px,94vw);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 18px 50px rgba(0,0,0,.55);font-size:13px;}' +
+            '#rvBox h3{margin:0;padding:14px 18px;font-size:15px;border-bottom:1px solid rgba(255,255,255,.1);}' +
+            '#rvBody{padding:12px 18px;overflow:auto;}' +
+            '#rvBody .rv-note{opacity:.7;font-size:12px;margin-bottom:12px;line-height:1.5;}' +
+            '#rvTable{width:100%;border-collapse:collapse;}' +
+            '#rvTable th{text-align:left;font-weight:600;opacity:.65;font-size:11px;text-transform:uppercase;' +
+            'letter-spacing:.4px;padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.1);}' +
+            '#rvTable td{padding:7px 8px;border-bottom:1px solid rgba(255,255,255,.05);vertical-align:middle;}' +
+            '#rvTable input{width:82px;padding:5px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.2);' +
+            'background:rgba(0,0,0,.3);color:#fff;font-size:13px;}' +
+            '#rvTable .rv-tier{font-weight:600;}' +
+            '#rvTable .rv-now{opacity:.75;font-variant-numeric:tabular-nums;}' +
+            '#rvTable .rv-prev{font-size:12px;opacity:.85;font-variant-numeric:tabular-nums;}' +
+            '#rvTable .rv-prev .rv-arrow{opacity:.45;margin:0 5px;}' +
+            '#rvTable .rv-prev .rv-new{color:#ffd873;font-weight:600;}' +
+            '#rvTable .rv-skip{opacity:.4;font-style:italic;font-size:12px;}' +
+            '#rvFoot{padding:12px 18px;border-top:1px solid rgba(255,255,255,.1);display:flex;' +
+            'justify-content:space-between;align-items:center;gap:10px;}' +
+            '#rvFoot .rv-sum{font-size:12px;opacity:.7;}' +
+            '#rvFoot button{padding:7px 16px;border-radius:7px;border:1px solid rgba(255,255,255,.18);' +
+            'background:rgba(255,255,255,.06);color:#e8e8ea;cursor:pointer;font-size:13px;}' +
+            '#rvFoot #rvApply{background:#c8922e;border-color:#c8922e;color:#1a1a1a;font-weight:600;}' +
+            '#rvFoot #rvApply:disabled{opacity:.4;cursor:not-allowed;}' +
+            '</style>').appendTo('head');
+    }
+
+    function rvRowHtml(t, i) {
+        var now = (t.currentMult != null)
+            ? '&times;' + t.currentMult.toFixed(2) + ' <span style="opacity:.55">(+' + Math.round((t.currentMult - 1) * 100) + '%)</span>'
+            : '<span style="opacity:.45">n/a</span>';
+        return '<tr data-i="' + i + '">' +
+            '<td class="rv-tier">' + esc(t.tier || '(no tier)') + '</td>' +
+            '<td style="opacity:.7">' + t.count + '</td>' +
+            '<td class="rv-now">' + now + '</td>' +
+            '<td><input class="rv-in" type="number" min="0" max="100000" step="5" placeholder="leave" /></td>' +
+            '<td class="rv-prev"><span class="rv-skip">unchanged</span></td>' +
+            '</tr>';
+    }
+
+    function rvUpdateRow($tr) {
+        var i = parseInt($tr.attr('data-i'));
+        var t = __rvTiers[i];
+        var raw = $tr.find('.rv-in').val();
+        var $p = $tr.find('.rv-prev');
+
+        if (raw === '' || raw == null || isNaN(parseFloat(raw))) {
+            $p.html('<span class="rv-skip">unchanged</span>');
+            return;
+        }
+        var pct = Math.max(0, parseFloat(raw));
+        if (!t.sampleBaseSell) {
+            $p.html('<span class="rv-skip">no priced sample</span>');
+            return;
+        }
+        var nu = Math.round(t.sampleBaseSell * (1 + pct / 100));
+        $p.html('<span title="' + esc(t.sampleName) + '">' + rvFmtMoney(t.sampleCurrentSell) + '</span>' +
+            '<span class="rv-arrow">&rarr;</span>' +
+            '<span class="rv-new">' + rvFmtMoney(nu) + '</span>');
+    }
+
+    function rvRefresh() {
+        var n = 0, v = 0;
+        $('#rvTable tbody tr').each(function () {
+            var raw = $(this).find('.rv-in').val();
+            if (raw !== '' && !isNaN(parseFloat(raw))) { n++; v += __rvTiers[parseInt($(this).attr('data-i'))].count; }
+        });
+        $('#rvApply').prop('disabled', n === 0);
+        $('#rvSum').text(n === 0
+            ? 'Enter a value on at least one tier.'
+            : n + ' tier' + (n === 1 ? '' : 's') + ' \u2192 ' + v + ' variant' + (v === 1 ? '' : 's') + ' will be repriced.');
+    }
+
+    function rvOpen(tiers) {
+        __rvTiers = tiers || [];
+        rvEnsureCss();
+        $('#rvOverlay').remove();
+
+        if (__rvTiers.length === 0) {
+            showToast('No lootified variants tracked yet — nothing to revalue.', 'info');
+            return;
+        }
+
+        var rows = __rvTiers.map(rvRowHtml).join('');
+        $('<div id="rvOverlay"><div id="rvBox">' +
+            '<h3><i class="fa-solid fa-coins"></i> Revalue gold &mdash; ' + RV_LABEL + '</h3>' +
+            '<div id="rvBody">' +
+            '<div class="rv-note">Tiers below are read from your tracking table. Type the price bump you want ' +
+            'above the <b>base item</b> \u2014 e.g. <b>150</b> makes a variant cost 2.5&times; its base. ' +
+            'Leave a tier blank and it is <b>not touched</b>. Prices are rebuilt from the base item every time, ' +
+            'so re-running never compounds. Items, names and retextures are untouched.</div>' +
+            '<table id="rvTable"><thead><tr>' +
+            '<th>Tier</th><th>Variants</th><th>Now</th><th>New gold +%</th><th>Preview (sample item)</th>' +
+            '</tr></thead><tbody>' + rows + '</tbody></table>' +
+            '</div>' +
+            '<div id="rvFoot"><span class="rv-sum" id="rvSum"></span><span>' +
+            '<button id="rvCancel">Cancel</button> ' +
+            '<button id="rvApply" disabled>Apply</button>' +
+            '</span></div>' +
+            '</div></div>').appendTo('body');
+
+        rvRefresh();
+        $('#rvTable .rv-in').first().trigger('focus');
+    }
+
+    $(document).on('input change', '#rvTable .rv-in', function () {
+        rvUpdateRow($(this).closest('tr'));
+        rvRefresh();
+    });
+    $(document).on('click', '#rvCancel', function () { $('#rvOverlay').remove(); });
+    $(document).on('click', '#rvOverlay', function (e) { if (e.target.id === 'rvOverlay') $('#rvOverlay').remove(); });
+    $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#rvOverlay').remove(); });
+
+    $(document).on('click', '#rvApply', function () {
+        var payload = [];
+        $('#rvTable tbody tr').each(function () {
+            var raw = $(this).find('.rv-in').val();
+            if (raw === '' || isNaN(parseFloat(raw))) return;
+            payload.push({ tier: __rvTiers[parseInt($(this).attr('data-i'))].tier, goldBumpPct: Math.max(0, parseFloat(raw)) });
+        });
+        if (payload.length === 0) return;
+
+        var $b = $(this).prop('disabled', true).text('Applying...');
+        $.ajax({
+            url: RV_URL_APPLY, method: 'POST', contentType: 'application/json',
+            data: JSON.stringify({ tiers: payload }),
+            success: function (r) {
+                if (r.success) {
+                    $('#rvOverlay').remove();
+                    showToast(r.updated + ' variants repriced.', 'success');
+                    if (r.reloadHint) showToast(r.reloadHint, 'info');
+                } else {
+                    $b.prop('disabled', false).text('Apply');
+                    showToast(r.error || 'Revalue failed', 'error');
+                }
+            },
+            error: function () {
+                $b.prop('disabled', false).text('Apply');
+                showToast('Revalue failed', 'error');
+            }
+        });
+    });
+
+    function rvInitButton() {
+        if ($('#' + RV_BTN_ID).length) return;
+        var $anchor = $('#' + RV_ANCHOR_ID);
+        if (!$anchor.length) return;
+        $('<button id="' + RV_BTN_ID + '" title="Set gold prices per tier for the variants that already exist. In place \u2014 items, names and retextures are untouched.">' +
+            '<i class="fa-solid fa-coins"></i> Revalue Gold</button>')
+            .attr('class', $anchor.attr('class') || '')
+            .css('margin-left', '6px')
+            .insertAfter($anchor);
+    }
+    $(rvInitButton);
+
+    $(document).on('click', '#' + RV_BTN_ID, function () {
+        var $btn = $(this).prop('disabled', true);
+        $.getJSON(RV_URL_TIERS, function (r) {
+            $btn.prop('disabled', false);
+            if (r && r.success) rvOpen(r.tiers);
+            else showToast((r && r.error) || 'Could not load tiers', 'error');
+        }).fail(function () {
+            $btn.prop('disabled', false);
+            showToast('Could not load tiers', 'error');
         });
     });
 

@@ -241,10 +241,18 @@ public class CraftingLootifierController : Controller
             "SELECT DISTINCT base_entry FROM lootifier_generated_items WHERE creature_entry = @CE",
             new { CE = CRAFT_SENTINEL_CREATURE }));
 
+        // Order by the output item's level (low → high) — real SQL data, unlike the
+        // SkillLineAbility rank which comes back constant.
+        var ordered = outputs
+            .Where(o => meta.ContainsKey((int)o.itemEntry))
+            .OrderBy(o => meta[(int)o.itemEntry].itemLevel)
+            .ThenBy(o => (int)o.itemEntry)
+            .ToList();
+
         var recipes = new List<object>();
-        foreach (var (itemEntry, minRank) in outputs)
+        foreach (var (itemEntry, minRank) in ordered)
         {
-            if (!meta.TryGetValue((int)itemEntry, out var m)) continue;   // output not in DB (e.g. disabled)
+            var m = meta[(int)itemEntry];
             recipes.Add(new
             {
                 entry = (int)itemEntry,
@@ -253,6 +261,7 @@ public class CraftingLootifierController : Controller
                 iconPath = _dbc.GetItemIconPath((uint)m.displayId),
                 itemClass = m.cls,
                 invType = m.inv,
+                itemLevel = m.itemLevel,
                 equippable = IsEquippableGear(m.cls, m.inv),
                 lootified = lootified.Contains((int)itemEntry),
                 minRank
@@ -424,7 +433,8 @@ public class CraftingLootifierController : Controller
             {
                 int newEntry = nextId++;
                 var roll = VariantToCommitRoll(v);
-                await InsertCraftingVariant(mangosConn, columns, item, newEntry, roll, (int)analysis.itemQuality);
+                await InsertCraftingVariant(mangosConn, columns, item, newEntry, roll, (int)analysis.itemQuality, ruleset.goldValueScalePct,
+                    ResolveBandGoldBump(ruleset.bands, roll.tierLabel, roll.budgetPct), ruleset.legendaryGoldBumpPct);
                 trackingRows.Add((newEntry, baseEntry, CRAFT_SENTINEL_CREATURE, roll.budgetPct, CanonicalTier(roll.tierLabel, roll.budgetPct)));
                 itemsCreated++;
             }
@@ -482,6 +492,172 @@ public class CraftingLootifierController : Controller
         });
 
         return Json(new { success = true, removed, orphans, reloadHint = "Run '.reload crafting_variants' so the core drops the removed variants." });
+    }
+
+    // ═════════════════════════ REVALUE ═════════════════════════
+
+    /// <summary>
+    /// Lists the tiers that ACTUALLY EXIST in tracking, with variant counts and
+    /// the price multiplier each tier is MEASURED to be sitting at right now
+    /// (variant sell_price / base sell_price — read from the DB, not assumed).
+    /// This is what the Revalue dialog renders: your tier names, your numbers.
+    /// Note crafting stores CANONICAL tier names ("improved"/"power"/"glory"/
+    /// "gods"), so those are the strings you'll see and set.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> RevalueTiers()
+    {
+        using var mangosConn = _db.Mangos();
+        using var adminConn = _db.Admin();
+
+        if (!await TableExists(adminConn, "lootifier_generated_items"))
+            return Json(new { success = true, tiers = Array.Empty<object>() });
+
+        var tracked = (await adminConn.QueryAsync<dynamic>(
+            "SELECT generated_entry, base_entry, tier_name FROM lootifier_generated_items WHERE creature_entry = @CE",
+            new { CE = CRAFT_SENTINEL_CREATURE })).ToList();
+
+        if (tracked.Count == 0)
+            return Json(new { success = true, tiers = Array.Empty<object>() });
+
+        var prices = await FetchItemPrices(mangosConn,
+            tracked.Select(t => (int)t.base_entry).Concat(tracked.Select(t => (int)t.generated_entry)));
+
+        var tiers = tracked
+            .GroupBy(t => (string)(t.tier_name ?? ""))
+            .Select(g =>
+            {
+                var measured = new List<double>();
+                string sampleName = "";
+                long sampleBase = 0, sampleCur = 0;
+                foreach (var t in g)
+                {
+                    if (!prices.TryGetValue((int)t.base_entry, out var bp)) continue;
+                    if (!prices.TryGetValue((int)t.generated_entry, out var vp)) continue;
+                    if (bp.sell <= 0) continue;
+                    measured.Add((double)vp.sell / bp.sell);
+                    if (sampleName.Length == 0)
+                    {
+                        sampleName = vp.name;
+                        sampleBase = bp.sell;
+                        sampleCur = vp.sell;
+                    }
+                }
+                return new
+                {
+                    tier = g.Key,
+                    count = g.Count(),
+                    currentMult = measured.Count > 0 ? (double?)Math.Round(measured.Average(), 3) : null,
+                    sampleName,
+                    sampleBaseSell = sampleBase,
+                    sampleCurrentSell = sampleCur
+                };
+            })
+            .OrderBy(x => x.currentMult ?? 0)
+            .ToList();
+
+        return Json(new { success = true, tiers });
+    }
+
+    /// <summary>
+    /// Sets prices IN PLACE for the tiers you explicitly name, using EXACTLY the
+    /// bump you typed: new_price = base_price × (1 + goldBumpPct/100). No curve,
+    /// no master scale, no hidden legendary stack — the number you enter is the
+    /// number that lands.
+    ///
+    /// Absolute recompute from the BASE item, so it never compounds; run it as
+    /// often as you like. A tier you leave blank is NOT TOUCHED. Entries, names,
+    /// display IDs and stats are untouched, so retexture mappings survive.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> Revalue([FromBody] CraftingRevalueRequest? request)
+    {
+        var wanted = (request?.tiers ?? Array.Empty<CraftingTierBumpDto>())
+            .Where(t => t.goldBumpPct.HasValue)
+            .GroupBy(t => t.tier ?? "", StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Last().goldBumpPct!.Value, StringComparer.OrdinalIgnoreCase);
+
+        if (wanted.Count == 0)
+            return Json(new { success = false, error = "No tier was given a value — nothing to do." });
+
+        using var mangosConn = _db.Mangos();
+        using var adminConn = _db.Admin();
+
+        if (!await TableExists(adminConn, "lootifier_generated_items"))
+            return Json(new { success = false, error = "No lootifier data found" });
+
+        var tracked = (await adminConn.QueryAsync<dynamic>(
+            "SELECT generated_entry, base_entry, tier_name FROM lootifier_generated_items WHERE creature_entry = @CE",
+            new { CE = CRAFT_SENTINEL_CREATURE })).ToList();
+
+        // Only variants whose tier you actually gave a number. Everything else: untouched.
+        var targets = tracked.Where(t => wanted.ContainsKey((string)(t.tier_name ?? ""))).ToList();
+        if (targets.Count == 0)
+            return Json(new { success = true, updated = 0, perTier = Array.Empty<object>() });
+
+        var basePrices = await FetchItemPrices(mangosConn, targets.Select(t => (int)t.base_entry));
+
+        var perTier = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        int updated = 0;
+
+        foreach (var chunk in targets.Chunk(500))
+        {
+            var buyCase = new System.Text.StringBuilder("CASE entry ");
+            var sellCase = new System.Text.StringBuilder("CASE entry ");
+            var ids = new List<int>();
+
+            foreach (var t in chunk)
+            {
+                int gen = (int)t.generated_entry;
+                if (!basePrices.TryGetValue((int)t.base_entry, out var bp)) continue;
+
+                string tier = (string)(t.tier_name ?? "");
+                double mult = 1.0 + wanted[tier] / 100.0;   // exactly what you typed
+
+                long newBuy = (long)Math.Round(bp.buy * mult);
+                long newSell = (long)Math.Round(bp.sell * mult);
+                buyCase.Append("WHEN ").Append(gen).Append(" THEN ").Append(newBuy).Append(' ');
+                sellCase.Append("WHEN ").Append(gen).Append(" THEN ").Append(newSell).Append(' ');
+                ids.Add(gen);
+                perTier[tier] = perTier.GetValueOrDefault(tier) + 1;
+            }
+
+            if (ids.Count == 0) continue;
+            buyCase.Append("ELSE buy_price END");
+            sellCase.Append("ELSE sell_price END");
+
+            await mangosConn.ExecuteAsync(
+                $"UPDATE item_template SET buy_price = {buyCase}, sell_price = {sellCase} WHERE entry IN ({string.Join(",", ids)})");
+            updated += ids.Count;
+        }
+
+        return Json(new
+        {
+            success = true,
+            updated,
+            perTier = perTier.Select(kv => new { tier = kv.Key, count = kv.Value }).ToList(),
+            reloadHint = "Prices changed in item_template — restart or clear the item cache so live clients see them."
+        });
+    }
+
+    // Entry -> (buy, sell, name) at max patch, chunked.
+    private async Task<Dictionary<int, (long buy, long sell, string name)>> FetchItemPrices(
+        MySqlConnector.MySqlConnection conn, IEnumerable<int> entries)
+    {
+        var map = new Dictionary<int, (long buy, long sell, string name)>();
+        foreach (var chunk in entries.Distinct().Chunk(500))
+        {
+            var rows = await conn.QueryAsync<dynamic>(@"
+                SELECT t.entry, t.buy_price, t.sell_price, t.name
+                FROM item_template t
+                JOIN (SELECT entry, MAX(patch) mp FROM item_template WHERE entry IN @Ids GROUP BY entry) m
+                  ON m.entry = t.entry AND m.mp = t.patch
+                WHERE t.entry IN @Ids",
+                new { Ids = chunk });
+            foreach (var r in rows)
+                map[(int)r.entry] = (Convert.ToInt64(r.buy_price), Convert.ToInt64(r.sell_price), (string)(r.name ?? ""));
+        }
+        return map;
     }
 
     // Deletes generated-range item_template rows that no lootifier tracks (leftovers
@@ -847,6 +1023,24 @@ public class CraftingLootifierController : Controller
 
     private static int TierIndex(string tier) => tier switch { "gods" => 3, "glory" => 2, "power" => 1, _ => 0 };
 
+    // Variant colour anchored at the BASE quality. Improved/Power keep the base
+    // colour; of Glory is +1 (capped at purple, so only Gods reaches orange); of the
+    // Gods is +2 (the legendary). White floors to green — white + stats can't stay
+    // white. Result per base:
+    //   white  → green / green / blue           (Gods band is dropped for white)
+    //   green  → green / green / blue / purple
+    //   blue   → blue  / blue  / purple / orange
+    //   purple → purple/ purple/ purple / orange
+    private static int VariantQuality(string tier, int baseQuality)
+    {
+        int b = baseQuality <= 1 ? 2 : baseQuality;      // white + stats floors at green
+        int q;
+        if (tier == "gods") q = Math.Min(b + 2, 5);      // legendary
+        else if (tier == "glory") q = Math.Min(b + 1, 4);// +1, capped at purple
+        else q = b;                                      // improved / power keep base colour
+        return Math.Clamp(q, 2, 5);
+    }
+
     private static int BandIndexForBudget(float budgetPct)
     {
         if (budgetPct >= 40f) return 3;
@@ -894,7 +1088,8 @@ public class CraftingLootifierController : Controller
     // ══════════════════════════════════════════════════════════════════════
 
     private async Task InsertCraftingVariant(MySqlConnector.MySqlConnection conn, List<string> columns,
-        dynamic baseItem, int newEntry, CommitRoll roll, int baseQuality)
+        dynamic baseItem, int newEntry, CommitRoll roll, int baseQuality, float goldScalePct = 100f,
+        float? goldBumpPct = null, float legendaryGoldBumpPct = 400f)
     {
         int baseEntry = (int)baseItem.entry;
         int basePatch = GetPropInt(baseItem, "patch");
@@ -967,24 +1162,18 @@ public class CraftingLootifierController : Controller
             SV9 = statValues[9]
         });
 
-        // Quality never downgrades. White bases cap one band lower (green/blue/purple,
-        // never orange), matching the Quest Lootifier.
         string tier = CanonicalTier(tierLabel, roll.budgetPct);
-        bool whiteBase = baseQuality <= 1;
-
-        int tierQuality;
-        if (tier == "gods")
-            tierQuality = whiteBase ? 4 : 5;
-        else if (tier == "glory")
-            tierQuality = whiteBase ? 3 : 4;
-        else
-            tierQuality = whiteBase ? 2 : 3;   // improved + power
-        int variantQuality = Math.Max(baseQuality, tierQuality);
+        int variantQuality = VariantQuality(tier, baseQuality);
 
         bool isLegendary = variantQuality >= 5;
 
-        float goldMult = GetGoldMultiplier(roll.budgetPct);
-        if (isLegendary) goldMult *= 3f;
+        // Legendary -> explicit legendary bump; band variants -> per-band Gold +%
+        // when configured, legacy boost curve otherwise. Master-scaled.
+        float goldMult;
+        if (isLegendary) goldMult = 1f + legendaryGoldBumpPct / 100f;
+        else if (goldBumpPct.HasValue) goldMult = 1f + goldBumpPct.Value / 100f;
+        else goldMult = GetGoldMultiplier(roll.budgetPct);
+        goldMult = ScaleGoldMult(goldMult, goldScalePct);
 
         if (goldMult > 1.05f)
             await conn.ExecuteAsync(
@@ -1007,6 +1196,35 @@ public class CraftingLootifierController : Controller
         return 1.0f + t * 0.8f;
     }
 
+    // Scales only the MARKUP portion of a gold multiplier, so the tier-graded
+    // curve keeps its shape: 100% = stock curve, 0% = prices untouched,
+    // 200% = double markup. Result never drops below 1× (base price).
+    private static float ScaleGoldMult(float mult, float scalePct) =>
+        1f + (mult - 1f) * (Math.Max(0f, scalePct) / 100f);
+
+    // Finds the Gold +% for a variant. Tracking stores CANONICAL tier names
+    // ("gods"/"glory"/"power"/"improved"), band labels are display names
+    // ("of the Gods"), so match exact label first, then canonical tier, then
+    // boost-range containment. Null = no explicit bump -> legacy curve.
+    private static float? ResolveBandGoldBump(CraftingBandDto[]? bands, string? tierLabel, float budgetPct)
+    {
+        if (bands == null || bands.Length == 0) return null;
+        if (!string.IsNullOrEmpty(tierLabel))
+        {
+            foreach (var b in bands)
+                if (string.Equals(b.label, tierLabel, StringComparison.OrdinalIgnoreCase))
+                    return b.goldBumpPct;
+            string canon = CanonicalTier(tierLabel, budgetPct);
+            foreach (var b in bands)
+                if (CanonicalTier(b.label, (b.minBoostPct + b.maxBoostPct) / 2f) == canon)
+                    return b.goldBumpPct;
+        }
+        foreach (var b in bands)
+            if (budgetPct >= b.minBoostPct && budgetPct <= b.maxBoostPct)
+                return b.goldBumpPct;
+        return null;
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     //  TRACKING + SCHEMA HELPERS
     // ══════════════════════════════════════════════════════════════════════
@@ -1024,6 +1242,15 @@ public class CraftingLootifierController : Controller
         return await adminConn.ExecuteAsync(
             "DELETE FROM lootifier_generated_items WHERE creature_entry = @CE AND base_entry = @B",
             new { CE = CRAFT_SENTINEL_CREATURE, B = baseEntry });
+    }
+
+    // Read-only guard for endpoints that shouldn't create tables (Revalue) —
+    // same helper as the Quest Lootifier's.
+    private async Task<bool> TableExists(MySqlConnector.MySqlConnection conn, string tableName)
+    {
+        return await conn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @T",
+            new { T = tableName }) > 0;
     }
 
     private async Task EnsureTrackingTables(MySqlConnector.MySqlConnection adminConn)
@@ -1086,19 +1313,19 @@ public class CraftingLootifierController : Controller
     }
 
     // entry -> (name, quality, class, inventory_type, display_id), max-patch resolved.
-    private async Task<Dictionary<int, (string name, int quality, int cls, int inv, int displayId)>> FetchItemMeta(
+    private async Task<Dictionary<int, (string name, int quality, int cls, int inv, int displayId, int itemLevel)>> FetchItemMeta(
         MySqlConnector.MySqlConnection conn, List<int> itemIds)
     {
-        var map = new Dictionary<int, (string, int, int, int, int)>();
+        var map = new Dictionary<int, (string, int, int, int, int, int)>();
         foreach (var chunk in itemIds.Distinct().Chunk(500))
         {
             var rows = await conn.QueryAsync(@"
-                SELECT entry, name, quality, class, inventory_type, display_id
+                SELECT entry, name, quality, class, inventory_type, display_id, item_level
                 FROM item_template
                 WHERE entry IN @Ids AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)",
                 new { Ids = chunk });
             foreach (var r in rows)
-                map[(int)r.entry] = ((string)r.name, (int)r.quality, (int)r.@class, (int)r.inventory_type, (int)r.display_id);
+                map[(int)r.entry] = ((string)r.name, (int)r.quality, (int)r.@class, (int)r.inventory_type, (int)r.display_id, (int)r.item_level);
         }
         return map;
     }
@@ -1175,15 +1402,22 @@ public class CraftingLootifierController : Controller
         };
     }
 
+    // Eligibility gate. Stats are OPTIONAL at every quality: a stat-less base has
+    // no budget to layer onto, so the engine derives one from item_level instead
+    // (EstimateBudgetFromItemLevel / RollStatsMinted) — and that path branches on
+    // hasStats, never on quality. The old rule (`quality == 1 ? true : hasStats`)
+    // let stat-less WHITES through but silently dropped stat-less GREEN+ items,
+    // even though the engine handles them identically. That skipped a whole class
+    // of vanilla quest rewards: pure-DPS weapons with no stat lines
+    // (Vanquisher's Sword and friends). Now the only bars are: it must be gear,
+    // and it must not be grey.
     private bool IsLootifiable(dynamic analysis)
     {
-        bool equippable = (bool)analysis.isEquippable;
+        bool equippable = (bool)analysis.isEquippable;  // class 2/4 with inventory_type > 0
         int quality = (int)analysis.itemQuality;
         if (!equippable) return false;
-        if (quality <= 0) return false;
-        bool hasStats = (int)analysis.totalStats > 0;
-        if (quality == 1) return true;
-        return hasStats;
+        if (quality <= 0) return false;                 // grey excluded
+        return true;                                    // stats optional — minted from item_level if absent
     }
 
     private int GetPropInt(dynamic obj, string name)
@@ -1254,6 +1488,7 @@ public class CraftingLootifierController : Controller
                 name = v.name,
                 boostPct = v.budgetPct,
                 tier = v.tierLabel,
+                quality = VariantQuality(CanonicalTier(v.tierLabel, v.budgetPct), baseQuality),
                 awardPct = awardByIndex[i],
                 stats = v.stats.Select(s => new { s.statType, s.statValue, s.name })
             });
@@ -1272,6 +1507,7 @@ public class CraftingLootifierController : Controller
         maxAffixCountChange = 1,
         existingBumpBias = 0.5f,
         includeLegendaryBand = true,
+        goldValueScalePct = 100f,
         bands = DefaultBands(true).ToArray()
     };
 
@@ -1279,12 +1515,12 @@ public class CraftingLootifierController : Controller
     {
         var bands = new List<CraftingBandDto>
         {
-            new() { label = "Improved", position = "prefix", minBoostPct = 10f, maxBoostPct = 20f, slots = 5 },
-            new() { label = "of Power", position = "suffix", minBoostPct = 20f, maxBoostPct = 30f, slots = 2 },
-            new() { label = "of Glory", position = "suffix", minBoostPct = 30f, maxBoostPct = 40f, slots = 2 },
+            new() { label = "Improved", position = "prefix", minBoostPct = 10f, maxBoostPct = 20f, slots = 5, goldBumpPct = 25f },
+            new() { label = "of Power", position = "suffix", minBoostPct = 20f, maxBoostPct = 30f, slots = 2, goldBumpPct = 50f },
+            new() { label = "of Glory", position = "suffix", minBoostPct = 30f, maxBoostPct = 40f, slots = 2, goldBumpPct = 100f },
         };
         if (includeLegendary)
-            bands.Add(new() { label = "of the Gods", position = "suffix", minBoostPct = 40f, maxBoostPct = 60f, slots = 1 });
+            bands.Add(new() { label = "of the Gods", position = "suffix", minBoostPct = 40f, maxBoostPct = 60f, slots = 1, goldBumpPct = 200f });
         return bands;
     }
 }
@@ -1300,6 +1536,8 @@ public class CraftingRulesetDto
     public int maxAffixCountChange { get; set; } = 1;
     public float existingBumpBias { get; set; } = 0.5f;
     public bool includeLegendaryBand { get; set; } = true;
+    public float goldValueScalePct { get; set; } = 100f;  // master scale on all gold bumps: 100 = as entered, 0 = prices untouched, 200 = double
+    public float legendaryGoldBumpPct { get; set; } = 400f; // legendary (quality 5) price bump above base (%); ~ the old curve x3 stock stack
     public CraftingBandDto[]? bands { get; set; }
 }
 
@@ -1310,6 +1548,7 @@ public class CraftingBandDto
     public float minBoostPct { get; set; }
     public float maxBoostPct { get; set; }
     public int slots { get; set; } = 1;
+    public float? goldBumpPct { get; set; }   // price bump above base (%); null = legacy boost curve
 }
 
 public class CraftingGenerateRequest
@@ -1327,4 +1566,15 @@ public class CraftingProfessionRequest
 public class CraftingRollbackRequest
 {
     public int baseEntry { get; set; }
+}
+
+public class CraftingTierBumpDto
+{
+    public string tier { get; set; } = "";      // tier_name exactly as stored in lootifier_generated_items
+    public float? goldBumpPct { get; set; }     // null / omitted = leave this tier's prices ALONE
+}
+
+public class CraftingRevalueRequest
+{
+    public CraftingTierBumpDto[]? tiers { get; set; }
 }

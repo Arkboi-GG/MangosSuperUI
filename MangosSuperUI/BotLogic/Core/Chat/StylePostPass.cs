@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.RegularExpressions;
 using MangosSuperUI.BotLogic.Chat.Core;
@@ -6,21 +7,42 @@ namespace MangosSuperUI.BotLogic.Chat.Engine;
 
 /// <summary>
 /// CHAT_ARCHITECTURE §10.4 — the deterministic per-persona fingerprint, applied to EVERY
-/// outgoing line. C2 ships steps 1–6, 8, 9; step 7 (anachronism scrub) lands in C10 and
-/// slots in between 6 and 8 without touching the others.
-/// Returns null when the line must NOT be sent (content floor / emptied) with the reason
-/// for the coordinator's [CHAT-ENGINE] log.
+/// outgoing line. Steps 1–6, 8, 9 shipped in C2; step 7 (anachronism scrub) lands in C10
+/// and slots in between 6b and 8 without touching the others.
+///
+/// AMENDED 2026-07-13:
+///   • step 6b — REGISTER PASS (SwearTables): de-censor the model's self-bowdlerization
+///     and apply the persona's swear register. Runs BEFORE the content floor, which still
+///     gets the last word on slurs and sexual content.
+///   • step 10 — SELF-REPEAT LEDGER: the last 12 lines this bot actually emitted are
+///     remembered, and a near-identical new line is DISCARDED. Tier 0 only shows the model
+///     its own lines within ONE (bot, counterpart, kind) thread — a bot answering five
+///     people in the Barrens could, and did, emit the same line five times. Silence beats
+///     parroting. Trigram overlap (>2 shared) for real sentences; exact match for short
+///     lines like "lol yeah", which legitimately recur but not back-to-back.
+///
+/// Returns null when the line must NOT be sent (floor / self-repeat / emptied) with the
+/// reason for the coordinator's [CHAT-ENGINE] discard log.
 /// </summary>
 public class StylePostPass
 {
     private readonly ChatSettingsService _settings;
+
+    // Step 10 — per-bot emission ledger. Keyed by bot NAME (identity-blind, same
+    // convention as ChatMemoryStore). This instance is captured by the coordinator for
+    // the life of the process, so instance state is fine regardless of DI lifetime.
+    private const int LedgerDepth = 12;
+    private readonly ConcurrentDictionary<string, Queue<string>> _recent =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public StylePostPass(ChatSettingsService settings)
     {
         _settings = settings;
     }
 
-    public (string? Line, string? DiscardReason) Apply(PersonaCard card, string botName, string raw)
+    /// <param name="moodValence">bot_persona.mood_valence — sours the register pass. 0 until C9.</param>
+    public (string? Line, string? DiscardReason) Apply(PersonaCard card, string botName, string raw,
+                                                       float moodValence = 0f)
     {
         // ── Step 1: CleanResponse (VERBATIM port from OllamaChatService — proven code)
         //           + trailing/leading "As {name}," / "Name:" artifact strip (§10.4.1) ──
@@ -93,6 +115,11 @@ public class StylePostPass
                 : $"{line} {tic}";
         }
 
+        // ── Step 6b: REGISTER PASS (§10.4 amendment) — de-censor + persona swear register.
+        //    Strength = typing.swear_level × voice.banter_intensity. Runs before the floor. ──
+        float banter = _settings.GetFloat(0, "voice.banter_intensity", 0.5f);
+        line = SwearTables.Apply(card, line, banter, moodValence, rng);
+
         // ── Step 7: anachronism scrub — C10 (era pack), slots in here ──
 
         // ── Step 8: content floor (non-configurable) ──
@@ -109,7 +136,75 @@ public class StylePostPass
         }
 
         line = line.Trim();
-        return string.IsNullOrWhiteSpace(line) ? (null, "empty-after-style") : (line, null);
+        if (string.IsNullOrWhiteSpace(line)) return (null, "empty-after-style");
+
+        // ── Step 10: self-repeat ledger (§10.4 amendment) ──
+        if (IsSelfRepeat(botName, line)) return (null, "self-repeat");
+        Remember(botName, line);
+
+        return (line, null);
+    }
+
+    // ==================== Step 10 internals ====================
+
+    private bool IsSelfRepeat(string botName, string line)
+    {
+        if (!_recent.TryGetValue(botName, out var q)) return false;
+
+        var norm = Normalize(line);
+        if (norm.Length == 0) return false;
+        var words = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        lock (q)
+        {
+            foreach (var prev in q)
+            {
+                if (prev == norm) return true;                       // exact — always a repeat
+
+                // Short lines ("lol yeah", "brb") legitimately recur; only exact matches
+                // above catch those. Longer lines get the trigram test.
+                if (words.Length < 5) continue;
+
+                var prevWords = prev.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (prevWords.Length < 5) continue;
+                if (SharedTrigrams(words, prevWords) > 2) return true;
+            }
+        }
+        return false;
+    }
+
+    private void Remember(string botName, string line)
+    {
+        var q = _recent.GetOrAdd(botName, _ => new Queue<string>());
+        lock (q)
+        {
+            q.Enqueue(Normalize(line));
+            while (q.Count > LedgerDepth) q.Dequeue();
+        }
+    }
+
+    /// <summary>Same trigram mechanic as VoiceLibraryBuilder's library dedup (§6.3 step 3).</summary>
+    private static int SharedTrigrams(string[] a, string[] b)
+    {
+        var set = new HashSet<string>();
+        for (int i = 0; i + 2 < b.Length; i++) set.Add($"{b[i]} {b[i + 1]} {b[i + 2]}");
+
+        int shared = 0;
+        for (int i = 0; i + 2 < a.Length; i++)
+            if (set.Contains($"{a[i]} {a[i + 1]} {a[i + 2]}")) shared++;
+        return shared;
+    }
+
+    /// <summary>Compare on content, not on typos/punctuation — step 5 must not defeat step 10.</summary>
+    private static string Normalize(string line)
+    {
+        var sb = new StringBuilder(line.Length);
+        foreach (var c in line.ToLowerInvariant())
+        {
+            if (char.IsLetterOrDigit(c)) sb.Append(c);
+            else if (c == ' ' && sb.Length > 0 && sb[^1] != ' ') sb.Append(' ');
+        }
+        return sb.ToString().Trim();
     }
 
     // ==================== Step 1 internals ====================

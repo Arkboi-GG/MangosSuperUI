@@ -19,12 +19,38 @@ public interface IChatEngine
 /// Stateless composer (§10.1): acquire broker lease for the class → assemble prompt
 /// within the profile's ctx_budget_tokens → generate → return RAW text. StylePostPass
 /// and scheduling belong to the coordinator, keeping this engine stateless.
-/// Reactive generation options are locked (§10.3): temperature 0.85, top_p 0.9,
-/// num_predict 60. Reactive maxWait 15 s — a starve is [CHAT-CAP]-alert-worthy (§12.1).
+/// Reactive maxWait 15 s — a starve is [CHAT-CAP]-alert-worthy (§12.1).
+///
+/// Generation options AMENDED 2026-07-13 (§10.3 was: temp 0.85, top_p 0.9, num_predict 60,
+/// nothing else sent):
+///   • temperature 0.90 / top_p 0.92 — a touch wider; these are 25-word chat lines, not code.
+///   • repeat_penalty 1.15, repeat_last_n 128 — stops a line eating its own tail.
+///   • presence 0.5 / frequency 0.3 — pushes off the model's pet openers WITHIN a line.
+///   • seed — explicitly randomized per call. Note this is belt-and-braces: an unset seed
+///     is already random. It buys reproducibility when debugging a bad line, not diversity.
+///   • stop ["\n"] — the model was free to keep going and write the OTHER guy's next turn.
+///     One line is one line.
+///
+/// BE CLEAR ABOUT WHAT THIS DOES NOT FIX: every one of these penalties operates inside a
+/// single generation. The backend has no memory between calls, so none of it prevents two
+/// separate replies from landing on the same sentence. That is a persona-diversity problem
+/// (voice library) and a ledger problem (StylePostPass step 10), not a sampler problem.
 /// </summary>
 public class ChatEngine : IChatEngine
 {
-    private static readonly GenOptions ReactiveOpts = new(0.85f, 0.9f, 60);
+    private static readonly string[] ReactiveStop = { "\n" };
+
+    private static readonly GenOptions ReactiveOpts = new(
+        Temperature: 0.90f,
+        TopP: 0.92f,
+        NumPredict: 60,
+        RepeatPenalty: 1.15f,
+        RepeatLastN: 128,
+        PresencePenalty: 0.5f,
+        FrequencyPenalty: 0.3f,
+        Seed: null,
+        Stop: ReactiveStop);
+
     private static readonly TimeSpan ReactiveMaxWait = TimeSpan.FromSeconds(15);
 
     private readonly IInferenceBroker _broker;
@@ -54,7 +80,8 @@ public class ChatEngine : IChatEngine
         _logger.LogDebug("[CHAT-ENGINE] prompt dump for {Bot}:\n--- SYSTEM ---\n{System}\n--- USER ---\n{User}",
             job.BotName, system, user);
 
-        return await _broker.GenerateAsync(lease, system, user, ReactiveOpts, ct);
+        var opts = ReactiveOpts with { Seed = Random.Shared.Next() };
+        return await _broker.GenerateAsync(lease, system, user, opts, ct);
     }
 
     public Task<AmbientScript?> ComposeAmbientAsync(AmbientJob job, CancellationToken ct)

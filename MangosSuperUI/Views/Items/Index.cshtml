@@ -6,11 +6,16 @@
     <partial name="_Sidebar" />
 
     <div class="main-content">
-        <div class="content-header">
+        <div class="content-header" style="display:flex; align-items:flex-start; justify-content:space-between; gap:16px;">
             <div>
                 <h1>Items</h1>
                 <p>Browse all <span id="totalItemCount">—</span> items in the world database</p>
             </div>
+            <a id="btnDownloadPatchTop" href="/Items/DownloadPatch?file=patch-4.MPQ" download="patch-4.MPQ"
+               class="btn-accent" style="display:none; white-space:nowrap; text-decoration:none; align-self:center;"
+               title="Download patch-4.MPQ — every retexture. Copy it into your WoW Data\ folder; players do the same.">
+                <i class="fa-solid fa-download"></i> Download patch-4.MPQ
+            </a>
         </div>
 
         <div class="content-body">
@@ -358,311 +363,1467 @@
 @section Styles {
     <style>
         /* ── All existing styles unchanged — just pasted as-is ── */
-        .item-row { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--border-light); cursor: pointer; transition: background var(--transition-fast); }
-        .item-row:hover { background: var(--bg-input); }
-        .item-row.active { background: var(--accent-subtle); border-left: 3px solid var(--accent); }
-        .item-row:last-child { border-bottom: none; }
-        .item-icon { width: 32px; height: 32px; border-radius: var(--radius-sm); border: 1px solid var(--border); flex-shrink: 0; image-rendering: pixelated; }
-        .item-name { font-size: 13px; font-weight: 500; line-height: 1.3; }
-        .item-meta { font-size: 11px; color: var(--text-muted); }
-        .item-entry { font-size: 10px; color: var(--text-muted); font-family: monospace; }
-        .quality-0 { color: #9d9d9d; } .quality-1 { color: var(--text-primary); } .quality-2 { color: #1eff00; } .quality-3 { color: #0070dd; } .quality-4 { color: #a335ee; } .quality-5 { color: #ff8000; } .quality-6 { color: #e6cc80; }
-        .detail-icon { width: 48px; height: 48px; border-radius: var(--radius-sm); border: 2px solid var(--border); image-rendering: pixelated; }
-        .detail-icon-lg { width: 56px; height: 56px; border-radius: var(--radius-sm); border: 2px solid var(--border); image-rendering: pixelated; cursor: pointer; transition: border-color var(--transition-fast), transform 0.15s; flex-shrink: 0; }
-        .detail-icon-lg:hover { border-color: var(--accent); transform: scale(1.06); }
-        .item-detail-header { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border-light); }
-        .detail-section { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border-light); }
-        .detail-section-title { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-        .detail-row { display: flex; justify-content: space-between; font-size: 12.5px; padding: 2px 0; }
-        .detail-row .label { color: var(--text-secondary); }
-        .detail-row .value { color: var(--text-primary); font-weight: 500; }
-        .stat-line { font-size: 12.5px; color: #1eff00; }
-        .spell-line { font-size: 12px; color: var(--accent-light); }
-        .edit-panel-col { animation: slideIn 0.25s ease-out; }
-        @@keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
-        .edit-panel { border-color: var(--accent); }
-        .edit-panel.base-game-mode { border-color: var(--status-warning); }
-        .edit-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; position: sticky; top: 0; z-index: 2; }
-        .edit-panel-body { max-height: calc(100vh - 140px); overflow-y: auto; }
-        .edit-badge { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 0.5px; padding: 1px 7px; border-radius: 3px; background: rgba(0,200,100,0.15); color: #00c864; }
-        .edit-badge.base-game { background: rgba(255,170,0,0.15); color: var(--status-warning); }
-        .edit-warning-bar { display: flex; align-items: center; gap: 8px; padding: 8px 14px; font-size: 12px; font-weight: 500; color: var(--status-warning); background: rgba(255,170,0,0.06); border-bottom: 1px solid rgba(255,170,0,0.2); }
-        .edit-warning-bar span { flex: 1; }
-        .edit-safety-toggle { position: relative; width: 32px; height: 18px; flex-shrink: 0; }
-        .edit-safety-toggle input { opacity: 0; width: 0; height: 0; }
-        .toggle-slider { position: absolute; inset: 0; border-radius: 9px; background: var(--status-warning); transition: 0.2s; cursor: default; }
-        .toggle-slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px; border-radius: 50%; background: white; transition: 0.2s; transform: translateX(14px); }
-        .edit-section { margin-bottom: 12px; border: 1px solid var(--border-light); border-radius: var(--radius-md); overflow: hidden; }
-        .edit-section-header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: var(--bg-input); cursor: pointer; font-size: 13px; font-weight: 600; color: var(--text-primary); user-select: none; transition: background var(--transition-fast); }
-        .edit-section-header:hover { background: var(--border-light); }
-        .edit-section-header .chevron { margin-left: auto; transition: transform 0.2s; font-size: 11px; color: var(--text-muted); }
-        .edit-section-header.collapsed .chevron { transform: rotate(-90deg); }
-        .edit-section-body { padding: 14px; }
-        .edit-section-body.collapsed { display: none; }
-        .edit-field { margin-bottom: 12px; }
-        .edit-field:last-child { margin-bottom: 0; }
-        .edit-field label { display: block; font-size: 11.5px; font-weight: 600; color: var(--text-secondary); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.3px; }
-        .edit-field input, .edit-field select, .edit-field textarea { width: 100%; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 6px 10px; font-size: 13px; transition: border-color var(--transition-fast); }
-        .edit-field input:focus, .edit-field select:focus, .edit-field textarea:focus { border-color: var(--accent); outline: none; }
-        .edit-field textarea { resize: vertical; min-height: 60px; }
-        .edit-field-inline { display: flex; gap: 10px; align-items: flex-end; }
-        .edit-field-inline .edit-field { flex: 1; margin-bottom: 0; }
-        .quality-option-0 { color: #9d9d9d; } .quality-option-1 { color: inherit; } .quality-option-2 { color: #1eff00; } .quality-option-3 { color: #0070dd; } .quality-option-4 { color: #a335ee; } .quality-option-5 { color: #ff8000; } .quality-option-6 { color: #e6cc80; }
-        .stat-row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
-        .stat-row select { flex: 2; } .stat-row input { flex: 1; }
-        .stat-row .btn-remove-stat { flex-shrink: 0; background: none; border: none; color: var(--status-error); cursor: pointer; font-size: 13px; padding: 4px; }
-        .btn-add-row { background: none; border: 1px dashed var(--border); border-radius: var(--radius-sm); color: var(--text-muted); cursor: pointer; padding: 6px 12px; font-size: 12px; width: 100%; text-align: center; transition: all var(--transition-fast); }
-        .btn-add-row:hover { border-color: var(--accent); color: var(--accent); }
-        .spell-slot-card { border: 1px solid var(--border-light); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 8px; background: var(--bg-body); }
-        .spell-slot-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 12px; font-weight: 600; color: var(--text-secondary); }
-        .spell-name-preview { font-size: 11px; color: var(--accent-light); font-style: italic; margin-top: 3px; }
-        .checkbox-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
-        .checkbox-grid label { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 400; color: var(--text-primary); text-transform: none; letter-spacing: 0; cursor: pointer; padding: 3px 6px; border-radius: var(--radius-sm); transition: background var(--transition-fast); }
-        .checkbox-grid label:hover { background: var(--bg-input); }
-        .checkbox-grid input[type="checkbox"] { accent-color: var(--accent); }
-        .price-inputs { display: flex; gap: 6px; align-items: center; }
-        .price-inputs .price-part { display: flex; align-items: center; gap: 3px; flex: 1; }
-        .price-inputs input { width: 60px; text-align: right; }
-        .price-inputs .coin-label { font-size: 11px; font-weight: 600; }
-        .coin-gold { color: #ffd700; } .coin-silver { color: #c0c0c0; } .coin-copper { color: #b87333; }
-        .icon-picker-trigger { display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-input); transition: border-color var(--transition-fast); }
-        .icon-picker-trigger:hover { border-color: var(--accent); }
-        .icon-picker-trigger img { width: 40px; height: 40px; image-rendering: pixelated; border-radius: var(--radius-sm); border: 1px solid var(--border); }
-        .icon-picker-trigger .change-text { font-size: 12px; color: var(--accent); }
-        .icon-picker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(52px, 1fr)); gap: 4px; }
-        .icon-picker-cell { width: 52px; height: 52px; display: flex; align-items: center; justify-content: center; cursor: pointer; border: 2px solid transparent; border-radius: var(--radius-sm); transition: all var(--transition-fast); }
-        .icon-picker-cell:hover { border-color: var(--accent); background: var(--accent-subtle); }
-        .icon-picker-cell.selected { border-color: var(--accent); background: var(--accent-subtle); }
-        .icon-picker-cell img { width: 40px; height: 40px; image-rendering: pixelated; }
-        .btn-outline-warning { background: none; border: 1px solid var(--status-warning); color: var(--status-warning); border-radius: var(--radius-sm); padding: 4px 12px; font-size: 12.5px; cursor: pointer; transition: all var(--transition-fast); }
-        .btn-outline-warning:hover { background: rgba(255,170,0,0.12); }
-        .edit-toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; padding: 12px 20px; border-radius: var(--radius-md); font-size: 13px; font-weight: 500; animation: toastIn 0.3s ease-out; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
-        .edit-toast.success { background: var(--status-online); color: white; }
-        .edit-toast.error { background: var(--status-error); color: white; }
-        @@keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .item-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 14px;
+            border-bottom: 1px solid var(--border-light);
+            cursor: pointer;
+            transition: background var(--transition-fast);
+        }
+
+            .item-row:hover {
+                background: var(--bg-input);
+            }
+
+            .item-row.active {
+                background: var(--accent-subtle);
+                border-left: 3px solid var(--accent);
+            }
+
+            .item-row:last-child {
+                border-bottom: none;
+            }
+
+        .item-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            flex-shrink: 0;
+            image-rendering: pixelated;
+        }
+
+        .item-name {
+            font-size: 13px;
+            font-weight: 500;
+            line-height: 1.3;
+        }
+
+        .item-meta {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .item-entry {
+            font-size: 10px;
+            color: var(--text-muted);
+            font-family: monospace;
+        }
+
+        .quality-0 {
+            color: #9d9d9d;
+        }
+
+        .quality-1 {
+            color: var(--text-primary);
+        }
+
+        .quality-2 {
+            color: #1eff00;
+        }
+
+        .quality-3 {
+            color: #0070dd;
+        }
+
+        .quality-4 {
+            color: #a335ee;
+        }
+
+        .quality-5 {
+            color: #ff8000;
+        }
+
+        .quality-6 {
+            color: #e6cc80;
+        }
+
+        .detail-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: var(--radius-sm);
+            border: 2px solid var(--border);
+            image-rendering: pixelated;
+        }
+
+        .detail-icon-lg {
+            width: 56px;
+            height: 56px;
+            border-radius: var(--radius-sm);
+            border: 2px solid var(--border);
+            image-rendering: pixelated;
+            cursor: pointer;
+            transition: border-color var(--transition-fast), transform 0.15s;
+            flex-shrink: 0;
+        }
+
+            .detail-icon-lg:hover {
+                border-color: var(--accent);
+                transform: scale(1.06);
+            }
+
+        .item-detail-header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 14px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+        .detail-section {
+            margin-top: 14px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border-light);
+        }
+
+        .detail-section-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+
+        .detail-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12.5px;
+            padding: 2px 0;
+        }
+
+            .detail-row .label {
+                color: var(--text-secondary);
+            }
+
+            .detail-row .value {
+                color: var(--text-primary);
+                font-weight: 500;
+            }
+
+        .stat-line {
+            font-size: 12.5px;
+            color: #1eff00;
+        }
+
+        .spell-line {
+            font-size: 12px;
+            color: var(--accent-light);
+        }
+
+        .edit-panel-col {
+            animation: slideIn 0.25s ease-out;
+        }
+
+        @@keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .edit-panel {
+            border-color: var(--accent);
+        }
+
+            .edit-panel.base-game-mode {
+                border-color: var(--status-warning);
+            }
+
+        .edit-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+
+        .edit-panel-body {
+            max-height: calc(100vh - 140px);
+            overflow-y: auto;
+        }
+
+        .edit-badge {
+            display: inline-block;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            padding: 1px 7px;
+            border-radius: 3px;
+            background: rgba(0,200,100,0.15);
+            color: #00c864;
+        }
+
+            .edit-badge.base-game {
+                background: rgba(255,170,0,0.15);
+                color: var(--status-warning);
+            }
+
+        .edit-warning-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 14px;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--status-warning);
+            background: rgba(255,170,0,0.06);
+            border-bottom: 1px solid rgba(255,170,0,0.2);
+        }
+
+            .edit-warning-bar span {
+                flex: 1;
+            }
+
+        .edit-safety-toggle {
+            position: relative;
+            width: 32px;
+            height: 18px;
+            flex-shrink: 0;
+        }
+
+            .edit-safety-toggle input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+            }
+
+        .toggle-slider {
+            position: absolute;
+            inset: 0;
+            border-radius: 9px;
+            background: var(--status-warning);
+            transition: 0.2s;
+            cursor: default;
+        }
+
+            .toggle-slider::before {
+                content: '';
+                position: absolute;
+                width: 14px;
+                height: 14px;
+                left: 2px;
+                top: 2px;
+                border-radius: 50%;
+                background: white;
+                transition: 0.2s;
+                transform: translateX(14px);
+            }
+
+        .edit-section {
+            margin-bottom: 12px;
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+
+        .edit-section-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            background: var(--bg-input);
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            user-select: none;
+            transition: background var(--transition-fast);
+        }
+
+            .edit-section-header:hover {
+                background: var(--border-light);
+            }
+
+            .edit-section-header .chevron {
+                margin-left: auto;
+                transition: transform 0.2s;
+                font-size: 11px;
+                color: var(--text-muted);
+            }
+
+            .edit-section-header.collapsed .chevron {
+                transform: rotate(-90deg);
+            }
+
+        .edit-section-body {
+            padding: 14px;
+        }
+
+            .edit-section-body.collapsed {
+                display: none;
+            }
+
+        .edit-field {
+            margin-bottom: 12px;
+        }
+
+            .edit-field:last-child {
+                margin-bottom: 0;
+            }
+
+            .edit-field label {
+                display: block;
+                font-size: 11.5px;
+                font-weight: 600;
+                color: var(--text-secondary);
+                margin-bottom: 3px;
+                text-transform: uppercase;
+                letter-spacing: 0.3px;
+            }
+
+            .edit-field input, .edit-field select, .edit-field textarea {
+                width: 100%;
+                background: var(--bg-input);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-sm);
+                color: var(--text-primary);
+                padding: 6px 10px;
+                font-size: 13px;
+                transition: border-color var(--transition-fast);
+            }
+
+                .edit-field input:focus, .edit-field select:focus, .edit-field textarea:focus {
+                    border-color: var(--accent);
+                    outline: none;
+                }
+
+            .edit-field textarea {
+                resize: vertical;
+                min-height: 60px;
+            }
+
+        .edit-field-inline {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+
+            .edit-field-inline .edit-field {
+                flex: 1;
+                margin-bottom: 0;
+            }
+
+        .quality-option-0 {
+            color: #9d9d9d;
+        }
+
+        .quality-option-1 {
+            color: inherit;
+        }
+
+        .quality-option-2 {
+            color: #1eff00;
+        }
+
+        .quality-option-3 {
+            color: #0070dd;
+        }
+
+        .quality-option-4 {
+            color: #a335ee;
+        }
+
+        .quality-option-5 {
+            color: #ff8000;
+        }
+
+        .quality-option-6 {
+            color: #e6cc80;
+        }
+
+        .stat-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 6px;
+        }
+
+            .stat-row select {
+                flex: 2;
+            }
+
+            .stat-row input {
+                flex: 1;
+            }
+
+            .stat-row .btn-remove-stat {
+                flex-shrink: 0;
+                background: none;
+                border: none;
+                color: var(--status-error);
+                cursor: pointer;
+                font-size: 13px;
+                padding: 4px;
+            }
+
+        .btn-add-row {
+            background: none;
+            border: 1px dashed var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 6px 12px;
+            font-size: 12px;
+            width: 100%;
+            text-align: center;
+            transition: all var(--transition-fast);
+        }
+
+            .btn-add-row:hover {
+                border-color: var(--accent);
+                color: var(--accent);
+            }
+
+        .spell-slot-card {
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-sm);
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            background: var(--bg-body);
+        }
+
+        .spell-slot-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .spell-name-preview {
+            font-size: 11px;
+            color: var(--accent-light);
+            font-style: italic;
+            margin-top: 3px;
+        }
+
+        .checkbox-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 4px;
+        }
+
+            .checkbox-grid label {
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                font-size: 12px;
+                font-weight: 400;
+                color: var(--text-primary);
+                text-transform: none;
+                letter-spacing: 0;
+                cursor: pointer;
+                padding: 3px 6px;
+                border-radius: var(--radius-sm);
+                transition: background var(--transition-fast);
+            }
+
+                .checkbox-grid label:hover {
+                    background: var(--bg-input);
+                }
+
+            .checkbox-grid input[type="checkbox"] {
+                accent-color: var(--accent);
+            }
+
+        .price-inputs {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+            .price-inputs .price-part {
+                display: flex;
+                align-items: center;
+                gap: 3px;
+                flex: 1;
+            }
+
+            .price-inputs input {
+                width: 60px;
+                text-align: right;
+            }
+
+            .price-inputs .coin-label {
+                font-size: 11px;
+                font-weight: 600;
+            }
+
+        .coin-gold {
+            color: #ffd700;
+        }
+
+        .coin-silver {
+            color: #c0c0c0;
+        }
+
+        .coin-copper {
+            color: #b87333;
+        }
+
+        .icon-picker-trigger {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--bg-input);
+            transition: border-color var(--transition-fast);
+        }
+
+            .icon-picker-trigger:hover {
+                border-color: var(--accent);
+            }
+
+            .icon-picker-trigger img {
+                width: 40px;
+                height: 40px;
+                image-rendering: pixelated;
+                border-radius: var(--radius-sm);
+                border: 1px solid var(--border);
+            }
+
+            .icon-picker-trigger .change-text {
+                font-size: 12px;
+                color: var(--accent);
+            }
+
+        .icon-picker-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(52px, 1fr));
+            gap: 4px;
+        }
+
+        .icon-picker-cell {
+            width: 52px;
+            height: 52px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            border: 2px solid transparent;
+            border-radius: var(--radius-sm);
+            transition: all var(--transition-fast);
+        }
+
+            .icon-picker-cell:hover {
+                border-color: var(--accent);
+                background: var(--accent-subtle);
+            }
+
+            .icon-picker-cell.selected {
+                border-color: var(--accent);
+                background: var(--accent-subtle);
+            }
+
+            .icon-picker-cell img {
+                width: 40px;
+                height: 40px;
+                image-rendering: pixelated;
+            }
+
+        .btn-outline-warning {
+            background: none;
+            border: 1px solid var(--status-warning);
+            color: var(--status-warning);
+            border-radius: var(--radius-sm);
+            padding: 4px 12px;
+            font-size: 12.5px;
+            cursor: pointer;
+            transition: all var(--transition-fast);
+        }
+
+            .btn-outline-warning:hover {
+                background: rgba(255,170,0,0.12);
+            }
+
+        .edit-toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 9999;
+            padding: 12px 20px;
+            border-radius: var(--radius-md);
+            font-size: 13px;
+            font-weight: 500;
+            animation: toastIn 0.3s ease-out;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+
+            .edit-toast.success {
+                background: var(--status-online);
+                color: white;
+            }
+
+            .edit-toast.error {
+                background: var(--status-error);
+                color: white;
+            }
+
+        @@keyframes toastIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
 
         /* ── Item Texture Panel ── */
-        .texture-panel-header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 12px; font-weight: 600; color: var(--text-secondary); cursor: pointer; user-select: none; transition: background var(--transition-fast); }
-        .texture-panel-header:hover { background: var(--bg-input); }
-        .texture-panel-header.collapsed .chevron { transform: rotate(-90deg); }
-        .texture-panel-body { padding: 8px 14px 14px; }
-        .texture-panel-body.collapsed { display: none; }
-        .item-texture-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
-        .item-texture-card { border: 1px solid var(--border-light); border-radius: var(--radius-sm); overflow: hidden; cursor: pointer; transition: all var(--transition-fast); background: var(--bg-body); }
-        .item-texture-card:hover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); transform: translateY(-1px); }
-        .item-texture-preview { width: 100%; aspect-ratio: 1; object-fit: contain; image-rendering: pixelated; background: var(--bg-input); display: block; }
-        .item-texture-info { padding: 6px 8px; border-top: 1px solid var(--border-light); }
-        .item-texture-name { font-size: 10px; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .item-texture-meta { font-size: 9px; color: var(--text-muted); margin-top: 1px; }
-        .btn-retexture { position: absolute; top: 4px; right: 4px; background: var(--accent); color: white; border: none; border-radius: var(--radius-sm); width: 22px; height: 22px; font-size: 10px; cursor: pointer; opacity: 0; transition: opacity var(--transition-fast); display: flex; align-items: center; justify-content: center; }
-        .item-texture-card { position: relative; }
-        .item-texture-card:hover .btn-retexture { opacity: 1; }
-        .btn-retexture:hover { background: var(--accent-hover); transform: scale(1.1); }
-        .btn-download-patch { margin-left: auto; margin-right: 8px; font-size: 10px; padding: 2px 8px; border-radius: var(--radius-sm); background: var(--bg-input); color: var(--accent); border: 1px solid var(--border); text-decoration: none; white-space: nowrap; transition: background var(--transition-fast), border-color var(--transition-fast); }
-        .btn-download-patch:hover { background: var(--accent-subtle); border-color: var(--accent); }
-        .retex-mode-btn.active { border-color: var(--accent); background: var(--accent-subtle); }
-        .texture-overlay { position: fixed; inset: 0; z-index: 10000; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: pointer; animation: fadeIn 0.15s ease-out; }
-        .texture-overlay-content { max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; align-items: center; }
-        @@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .texture-panel-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            cursor: pointer;
+            user-select: none;
+            transition: background var(--transition-fast);
+        }
+
+            .texture-panel-header:hover {
+                background: var(--bg-input);
+            }
+
+            .texture-panel-header.collapsed .chevron {
+                transform: rotate(-90deg);
+            }
+
+        .texture-panel-body {
+            padding: 8px 14px 14px;
+        }
+
+            .texture-panel-body.collapsed {
+                display: none;
+            }
+
+        .item-texture-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 8px;
+        }
+
+        .item-texture-card {
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            cursor: pointer;
+            transition: all var(--transition-fast);
+            background: var(--bg-body);
+        }
+
+            .item-texture-card:hover {
+                border-color: var(--accent);
+                box-shadow: 0 0 0 1px var(--accent);
+                transform: translateY(-1px);
+            }
+
+        .item-texture-preview {
+            width: 100%;
+            aspect-ratio: 1;
+            object-fit: contain;
+            image-rendering: pixelated;
+            background: var(--bg-input);
+            display: block;
+        }
+
+        .item-texture-info {
+            padding: 6px 8px;
+            border-top: 1px solid var(--border-light);
+        }
+
+        .item-texture-name {
+            font-size: 10px;
+            font-weight: 600;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .item-texture-meta {
+            font-size: 9px;
+            color: var(--text-muted);
+            margin-top: 1px;
+        }
+
+        .btn-retexture {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: var(--radius-sm);
+            width: 22px;
+            height: 22px;
+            font-size: 10px;
+            cursor: pointer;
+            opacity: 0;
+            transition: opacity var(--transition-fast);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .item-texture-card {
+            position: relative;
+        }
+
+            .item-texture-card:hover .btn-retexture {
+                opacity: 1;
+            }
+
+        .btn-retexture:hover {
+            background: var(--accent-hover);
+            transform: scale(1.1);
+        }
+
+        .btn-download-patch {
+            margin-left: auto;
+            margin-right: 8px;
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: var(--radius-sm);
+            background: var(--bg-input);
+            color: var(--accent);
+            border: 1px solid var(--border);
+            text-decoration: none;
+            white-space: nowrap;
+            transition: background var(--transition-fast), border-color var(--transition-fast);
+        }
+
+            .btn-download-patch:hover {
+                background: var(--accent-subtle);
+                border-color: var(--accent);
+            }
+
+        .retex-mode-btn.active {
+            border-color: var(--accent);
+            background: var(--accent-subtle);
+        }
+
+        .texture-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 10000;
+            background: rgba(0,0,0,0.85);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            animation: fadeIn 0.15s ease-out;
+        }
+
+        .texture-overlay-content {
+            max-width: 90vw;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        @@keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+
+            to {
+                opacity: 1;
+            }
+        }
 
         /* ── Retexture Panel — slide-swaps with the edit card ──────────────
-           Both #editPanel and #retexturePanel live in #colEdit. JS adds the
-           .retex-swap-active class to #colEdit when the retexture panel
-           should be visible; CSS transitions handle the slide.
+                   Both #editPanel and #retexturePanel live in #colEdit. JS adds the
+                   .retex-swap-active class to #colEdit when the retexture panel
+                   should be visible; CSS transitions handle the slide.
 
-           Layout: the edit card stays at its normal `position: sticky` slot
-           (which gives the column its height). The retexture panel is ALWAYS
-           absolutely positioned over that same area, hidden offscreen-right
-           by default and slid into place when .retex-swap-active fires.
-           Keeping `position: absolute` constant (no position-switching mid-
-           transition) avoids the layout-thrash that breaks transforms. */
-        #colEdit { position: relative; overflow: hidden; }
-        #colEdit > #editPanel,
-        #colEdit > #retexturePanel {
-            transition: transform 0.32s ease, opacity 0.24s ease;
-            will-change: transform, opacity;
+                   Layout: the edit card stays at its normal `position: sticky` slot
+                   (which gives the column its height). The retexture panel is ALWAYS
+                   absolutely positioned over that same area, hidden offscreen-right
+                   by default and slid into place when .retex-swap-active fires.
+                   Keeping `position: absolute` constant (no position-switching mid-
+                   transition) avoids the layout-thrash that breaks transforms. */
+        #colEdit {
+            position: relative;
+            overflow: hidden;
         }
-        /* Resting: edit visible, retexture parked offscreen-right + inert.
-           top: 16px matches the sticky offset of #editPanel so the two cards
-           occupy the exact same screen rectangle when one slides into place. */
-        #colEdit > #retexturePanel {
-            position: absolute;
-            top: 16px;
-            left: 0;
-            right: 0;
-            transform: translateX(110%);
-            opacity: 0;
-            pointer-events: none;
-        }
-        /* Active: retexture slid in, edit slid off-right + inert. */
-        #colEdit.retex-swap-active > #editPanel {
-            transform: translateX(110%);
-            opacity: 0;
-            pointer-events: none;
-        }
-        #colEdit.retex-swap-active > #retexturePanel {
-            transform: translateX(0);
-            opacity: 1;
-            pointer-events: auto;
-        }
+
+            #colEdit > #editPanel,
+            #colEdit > #retexturePanel {
+                transition: transform 0.32s ease, opacity 0.24s ease;
+                will-change: transform, opacity;
+            }
+            /* Resting: edit visible, retexture parked offscreen-right + inert.
+                   top: 16px matches the sticky offset of #editPanel so the two cards
+                   occupy the exact same screen rectangle when one slides into place. */
+            #colEdit > #retexturePanel {
+                position: absolute;
+                top: 16px;
+                left: 0;
+                right: 0;
+                transform: translateX(110%);
+                opacity: 0;
+                pointer-events: none;
+            }
+            /* Active: retexture slid in, edit slid off-right + inert. */
+            #colEdit.retex-swap-active > #editPanel {
+                transform: translateX(110%);
+                opacity: 0;
+                pointer-events: none;
+            }
+
+            #colEdit.retex-swap-active > #retexturePanel {
+                transform: translateX(0);
+                opacity: 1;
+                pointer-events: auto;
+            }
 
         /* Retexture panel inner styling — uses the same .card chrome as the
-           edit panel so the swap feels like one continuous surface. */
-        .retex-panel .retex-panel-header { padding: 12px 16px; border-bottom: 1px solid var(--border-light); display: flex; align-items: center; gap: 10px; }
-        .retex-panel .retex-panel-title { font-size: 14px; font-weight: 600; color: var(--text-primary); flex: 1; min-width: 0; }
-        .retex-panel .retex-panel-title .retex-tex-name { color: var(--text-muted); font-weight: 400; margin-left: 6px; font-size: 12px; }
-        .retex-panel .retex-panel-body { padding: 14px 16px; max-height: calc(100vh - 130px); overflow-y: auto; }
-        .retex-panel .retex-panel-foot { padding: 10px 16px; border-top: 1px solid var(--border-light); display: flex; gap: 8px; justify-content: flex-end; align-items: center; background: var(--bg-body); }
+                   edit panel so the swap feels like one continuous surface. */
+        .retex-panel .retex-panel-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-light);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .retex-panel .retex-panel-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            flex: 1;
+            min-width: 0;
+        }
+
+            .retex-panel .retex-panel-title .retex-tex-name {
+                color: var(--text-muted);
+                font-weight: 400;
+                margin-left: 6px;
+                font-size: 12px;
+            }
+
+        .retex-panel .retex-panel-body {
+            padding: 14px 16px;
+            max-height: calc(100vh - 130px);
+            overflow-y: auto;
+        }
+
+        .retex-panel .retex-panel-foot {
+            padding: 10px 16px;
+            border-top: 1px solid var(--border-light);
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            align-items: center;
+            background: var(--bg-body);
+        }
 
         /* Unsaved-staging indicator inside the panel footer. */
-        .retex-unsaved-dot { display: none; align-items: center; gap: 6px; margin-right: auto; font-size: 11px; color: var(--status-warning, #d49a00); font-weight: 600; }
-        .retex-unsaved-dot::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--status-warning, #d49a00); display: inline-block; }
+        .retex-unsaved-dot {
+            display: none;
+            align-items: center;
+            gap: 6px;
+            margin-right: auto;
+            font-size: 11px;
+            color: var(--status-warning, #d49a00);
+            font-weight: 600;
+        }
+
+            .retex-unsaved-dot::before {
+                content: '';
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: var(--status-warning, #d49a00);
+                display: inline-block;
+            }
 
         /* Variation/segmented gallery — compact clickable cards. 2-col in the
-           panel (panel is narrower than the old modal), keeping cards
-           readable while still showing all variants without excessive scroll. */
-        .retex-card-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
-        .retex-card { background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; cursor: pointer; transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease; box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
-        .retex-card:hover { transform: translateY(-2px); box-shadow: 0 6px 14px rgba(0,0,0,0.35); border-color: var(--border-light); }
-        .retex-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-subtle), 0 6px 14px rgba(0,0,0,0.35); }
-        .retex-card-img { width: 100%; aspect-ratio: 2 / 1; object-fit: cover; image-rendering: pixelated; display: block; background: #2a2a2a; }
-        .retex-card-body { padding: 6px 8px; }
-        .retex-card-title { font-size: 11px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 5px; line-height: 1.25; }
-        .retex-card-sub { font-size: 9px; color: var(--text-muted); margin-top: 2px; line-height: 1.3; max-height: 24px; overflow: hidden; }
-        .retex-card-badge { font-size: 7.5px; font-weight: 700; color: var(--accent); border: 1px solid var(--accent); border-radius: 2px; padding: 0 3px; letter-spacing: 0.3px; }
-        .retex-card-selectmark { margin-left: auto; font-size: 11px; color: var(--accent); opacity: 0; transition: opacity 0.12s; }
-        .retex-card.selected .retex-card-selectmark { opacity: 1; }
+                   panel (panel is narrower than the old modal), keeping cards
+                   readable while still showing all variants without excessive scroll. */
+        .retex-card-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+        }
+
+        .retex-card {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            cursor: pointer;
+            transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+        }
+
+            .retex-card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 6px 14px rgba(0,0,0,0.35);
+                border-color: var(--border-light);
+            }
+
+            .retex-card.selected {
+                border-color: var(--accent);
+                box-shadow: 0 0 0 2px var(--accent-subtle), 0 6px 14px rgba(0,0,0,0.35);
+            }
+
+        .retex-card-img {
+            width: 100%;
+            aspect-ratio: 2 / 1;
+            object-fit: cover;
+            image-rendering: pixelated;
+            display: block;
+            background: #2a2a2a;
+        }
+
+        .retex-card-body {
+            padding: 6px 8px;
+        }
+
+        .retex-card-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            line-height: 1.25;
+        }
+
+        .retex-card-sub {
+            font-size: 9px;
+            color: var(--text-muted);
+            margin-top: 2px;
+            line-height: 1.3;
+            max-height: 24px;
+            overflow: hidden;
+        }
+
+        .retex-card-badge {
+            font-size: 7.5px;
+            font-weight: 700;
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            border-radius: 2px;
+            padding: 0 3px;
+            letter-spacing: 0.3px;
+        }
+
+        .retex-card-selectmark {
+            margin-left: auto;
+            font-size: 11px;
+            color: var(--accent);
+            opacity: 0;
+            transition: opacity 0.12s;
+        }
+
+        .retex-card.selected .retex-card-selectmark {
+            opacity: 1;
+        }
 
         /* Per-texture-card "Retexture textures" button on the edit form. */
-        .btn-retex-panel { background: var(--accent); color: white; border: none; border-radius: var(--radius-sm); padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer; transition: background var(--transition-fast); }
-        .btn-retex-panel:hover { background: var(--accent-hover); }
+        .btn-retex-panel {
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: var(--radius-sm);
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background var(--transition-fast);
+        }
+
+            .btn-retex-panel:hover {
+                background: var(--accent-hover);
+            }
 
 
-        .retex-card.selected .retex-card-selectmark { opacity: 1; }
+        .retex-card.selected .retex-card-selectmark {
+            opacity: 1;
+        }
 
 
         /* ── 3D Model Preview ── */
-        .model-preview-container { width: 100%; height: 200px; background: var(--bg-input); border-radius: var(--radius-sm); border: 1px solid var(--border); overflow: hidden; margin-bottom: 12px; }
-        .model-preview-container model-viewer { width: 100%; height: 100%; }
+        .model-preview-container {
+            width: 100%;
+            height: 200px;
+            background: var(--bg-input);
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            overflow: hidden;
+            margin-bottom: 12px;
+        }
+
+            .model-preview-container model-viewer {
+                width: 100%;
+                height: 100%;
+            }
 
         /* ── Loot field units (used in Instance Loot, included here for shared pattern) ── */
-        .loot-fields { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
-        .loot-field-unit { font-size: 10px; color: var(--text-muted); margin-right: 4px; }
-        .loot-chance-wrap { position: relative; }
-        .loot-effective-hint { position: absolute; bottom: -13px; left: 0; right: 0; text-align: right; font-size: 9px; color: var(--text-muted); white-space: nowrap; }
-        .loot-group-badge { font-size: 8px; padding: 0 4px; border-radius: 4px; background: rgba(255,170,0,0.12); color: var(--status-warning); font-weight: 700; vertical-align: middle; margin-left: 4px; }
+        .loot-fields {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            flex-shrink: 0;
+        }
+
+        .loot-field-unit {
+            font-size: 10px;
+            color: var(--text-muted);
+            margin-right: 4px;
+        }
+
+        .loot-chance-wrap {
+            position: relative;
+        }
+
+        .loot-effective-hint {
+            position: absolute;
+            bottom: -13px;
+            left: 0;
+            right: 0;
+            text-align: right;
+            font-size: 9px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .loot-group-badge {
+            font-size: 8px;
+            padding: 0 4px;
+            border-radius: 4px;
+            background: rgba(255,170,0,0.12);
+            color: var(--status-warning);
+            font-weight: 700;
+            vertical-align: middle;
+            margin-left: 4px;
+        }
 
         /* ── Page Jump ── */
-        .page-jump-group { display: flex; align-items: center; gap: 6px; }
-        .page-jump-input { width: 52px; text-align: center; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 3px 4px; font-size: 12.5px; -moz-appearance: textfield; }
-        .page-jump-input::-webkit-outer-spin-button, .page-jump-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-        .page-jump-input:focus { border-color: var(--accent); outline: none; }
-        .page-jump-sep { font-size: 12px; color: var(--text-muted); }
-        .page-jump-total { font-size: 12.5px; color: var(--text-secondary); font-weight: 500; }
-        .page-size-sep { color: var(--border); font-size: 16px; margin: 0 2px; }
-        .page-size-select { background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 3px 6px; font-size: 12px; cursor: pointer; }
-        .page-size-select:focus { border-color: var(--accent); outline: none; }
+        .page-jump-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .page-jump-input {
+            width: 52px;
+            text-align: center;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            padding: 3px 4px;
+            font-size: 12.5px;
+            -moz-appearance: textfield;
+        }
+
+            .page-jump-input::-webkit-outer-spin-button, .page-jump-input::-webkit-inner-spin-button {
+                -webkit-appearance: none;
+                margin: 0;
+            }
+
+            .page-jump-input:focus {
+                border-color: var(--accent);
+                outline: none;
+            }
+
+        .page-jump-sep {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .page-jump-total {
+            font-size: 12.5px;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .page-size-sep {
+            color: var(--border);
+            font-size: 16px;
+            margin: 0 2px;
+        }
+
+        .page-size-select {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-primary);
+            padding: 3px 6px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+            .page-size-select:focus {
+                border-color: var(--accent);
+                outline: none;
+            }
 
         /* ── 3D Character Viewer (Items page integration) ───────────────── */
         /* Collapse toggle in results card header */
-        .btn-toggle-results { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 4px; margin-left: 6px; font-size: 11px; transition: color var(--transition-fast); }
-        .btn-toggle-results:hover { color: var(--accent); }
-        .btn-toggle-results .chevron { transition: transform 0.2s; }
-        #resultsCard.collapsed .btn-toggle-results .chevron { transform: rotate(180deg); }
+        .btn-toggle-results {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 0 4px;
+            margin-left: 6px;
+            font-size: 11px;
+            transition: color var(--transition-fast);
+        }
+
+            .btn-toggle-results:hover {
+                color: var(--accent);
+            }
+
+            .btn-toggle-results .chevron {
+                transition: transform 0.2s;
+            }
+
+        #resultsCard.collapsed .btn-toggle-results .chevron {
+            transform: rotate(180deg);
+        }
         /* When collapsed, the results card shrinks to ~3 rows tall with internal scroll */
-        #resultsCard.collapsed #itemListContainer { max-height: 168px; overflow-y: auto; }
-        #resultsCard.collapsed #paginationBar { display: none !important; }
+        #resultsCard.collapsed #itemListContainer {
+            max-height: 168px;
+            overflow-y: auto;
+        }
+
+        #resultsCard.collapsed #paginationBar {
+            display: none !important;
+        }
 
         /* Character card */
-        #characterCard .cv-canvas-wrap { position: relative; width: 100%; height: 480px; background: #222; overflow: hidden; }
-        #characterCard #char-preview-canvas { width: 100%; height: 100%; display: block; }
+        #characterCard .cv-canvas-wrap {
+            position: relative;
+            width: 100%;
+            height: 480px;
+            background: #222;
+            overflow: hidden;
+        }
+
+        #characterCard #char-preview-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
 
         /* Inline controls hint in the Try On header — explains the
-           non-obvious zoom keybinding. cursor:help lets the title attr
-           expand the hint to also cover panning, which is even less
-           discoverable. */
-        .cv-controls-hint { margin-left: 10px; font-size: 11px; font-weight: 400; color: var(--text-muted); cursor: help; }
-        .cv-controls-hint kbd { background: var(--bg-input); border: 1px solid var(--border-light); border-bottom-width: 2px; border-radius: 3px; padding: 1px 5px; font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-primary); margin: 0 2px; }
+                   non-obvious zoom keybinding. cursor:help lets the title attr
+                   expand the hint to also cover panning, which is even less
+                   discoverable. */
+        .cv-controls-hint {
+            margin-left: 10px;
+            font-size: 11px;
+            font-weight: 400;
+            color: var(--text-muted);
+            cursor: help;
+        }
+
+            .cv-controls-hint kbd {
+                background: var(--bg-input);
+                border: 1px solid var(--border-light);
+                border-bottom-width: 2px;
+                border-radius: 3px;
+                padding: 1px 5px;
+                font-size: 10px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                color: var(--text-primary);
+                margin: 0 2px;
+            }
 
         /* Expanded mode — viewer card takes full row width and gets extra
-           height. Triggered by JS adding .viewer-expanded to #mainLayout.
-           Hiding the detail column with display:none rather than removing
-           it from the DOM means the user's selected item / clone state
-           isn't lost when they toggle back. */
-        #mainLayout.viewer-expanded > #colDetail { display: none; }
-        #mainLayout.viewer-expanded > #colList { flex: 0 0 100%; max-width: 100%; }
-        #mainLayout.viewer-expanded #characterCard .cv-canvas-wrap { height: 620px; }
+                   height. Triggered by JS adding .viewer-expanded to #mainLayout.
+                   Hiding the detail column with display:none rather than removing
+                   it from the DOM means the user's selected item / clone state
+                   isn't lost when they toggle back. */
+        #mainLayout.viewer-expanded > #colDetail {
+            display: none;
+        }
+
+        #mainLayout.viewer-expanded > #colList {
+            flex: 0 0 100%;
+            max-width: 100%;
+        }
+
+        #mainLayout.viewer-expanded #characterCard .cv-canvas-wrap {
+            height: 620px;
+        }
         /* In expanded mode, also widen the tier side panel a bit so the
-           pieces breathe and the class column can show full names. */
-        #mainLayout.viewer-expanded .cv-tier-side { width: 180px; }
+                   pieces breathe and the class column can show full names. */
+        #mainLayout.viewer-expanded .cv-tier-side {
+            width: 180px;
+        }
 
         /* Race + Gender toolbar */
-        .cv-race-toolbar-wrap { padding: 8px 10px; border-bottom: 1px solid var(--border-light); background: var(--bg-body); }
-        .cv-race-toolbar { display: flex; flex-wrap: wrap; gap: 6px; }
-        .cv-race-group { display: flex; align-items: center; gap: 3px; background: var(--bg-input); border: 1px solid var(--border-light); border-radius: var(--radius-sm); padding: 2px 4px 2px 8px; }
-        .cv-race-label { font-size: 11px; color: var(--text-secondary); font-weight: 500; }
-        .cv-race-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; padding: 3px 8px; font-size: 11.5px; font-weight: 600; border-radius: 3px; transition: all var(--transition-fast); }
-        .cv-race-btn:hover { background: var(--accent-subtle); color: var(--accent); }
-        .cv-race-btn.active { background: var(--accent); color: white; }
+        .cv-race-toolbar-wrap {
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border-light);
+            background: var(--bg-body);
+        }
+
+        .cv-race-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .cv-race-group {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-sm);
+            padding: 2px 4px 2px 8px;
+        }
+
+        .cv-race-label {
+            font-size: 11px;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .cv-race-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 3px 8px;
+            font-size: 11.5px;
+            font-weight: 600;
+            border-radius: 3px;
+            transition: all var(--transition-fast);
+        }
+
+            .cv-race-btn:hover {
+                background: var(--accent-subtle);
+                color: var(--accent);
+            }
+
+            .cv-race-btn.active {
+                background: var(--accent);
+                color: white;
+            }
 
         /* Equipped chips list */
-        .cv-equipped-list { padding: 8px 10px; border-top: 1px solid var(--border-light); display: flex; flex-wrap: wrap; gap: 6px; min-height: 36px; }
-        .equipped-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--bg-input); border: 1px solid var(--border-light); border-radius: 8px; padding: 5px 5px 5px 10px; font-size: 11.5px; }
-        .equipped-slot { font-size: 10px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: 0.4px; flex-shrink: 0; }
-        .equipped-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; line-height: 1.2; }
-        .equipped-name { color: var(--text-primary); max-width: 180px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
-        .equipped-meta { color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; letter-spacing: 0.2px; }
-        .equipped-remove { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 4px; font-size: 14px; line-height: 1; border-radius: 50%; transition: all var(--transition-fast); flex-shrink: 0; }
-        .equipped-remove:hover { background: var(--status-error); color: white; }
+        .cv-equipped-list {
+            padding: 8px 10px;
+            border-top: 1px solid var(--border-light);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            min-height: 36px;
+        }
+
+        .equipped-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-light);
+            border-radius: 8px;
+            padding: 5px 5px 5px 10px;
+            font-size: 11.5px;
+        }
+
+        .equipped-slot {
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            flex-shrink: 0;
+        }
+
+        .equipped-body {
+            display: flex;
+            flex-direction: column;
+            gap: 1px;
+            min-width: 0;
+            line-height: 1.2;
+        }
+
+        .equipped-name {
+            color: var(--text-primary);
+            max-width: 180px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-weight: 500;
+        }
+
+        .equipped-meta {
+            color: var(--text-muted);
+            font-size: 10px;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: 0.2px;
+        }
+
+        .equipped-remove {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 0 4px;
+            font-size: 14px;
+            line-height: 1;
+            border-radius: 50%;
+            transition: all var(--transition-fast);
+            flex-shrink: 0;
+        }
+
+            .equipped-remove:hover {
+                background: var(--status-error);
+                color: white;
+            }
 
         /* Tier picker — side panel inside the canvas wrap */
         /* Anchored to the right edge of the canvas wrap, full height,
-           ~140px wide. Translates off-screen when .collapsed. The toggle
-           button (top-right of canvas) flips both this and its own
-           rotation indicator. */
-        .cv-tier-side { position: absolute; top: 0; right: 0; bottom: 0; width: 152px;
-                        background: rgba(20, 20, 24, 0.92); border-left: 1px solid var(--border-light);
-                        padding: 8px 6px; display: flex; flex-direction: column; gap: 4px;
-                        overflow-y: auto; transition: transform 0.18s ease-out;
-                        backdrop-filter: blur(4px); z-index: 5; }
-        .cv-tier-side.collapsed { transform: translateX(100%); }
-        .cv-tier-side-header { font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-                               color: var(--accent); font-weight: 700; padding: 2px 4px 4px;
-                               border-bottom: 1px solid var(--border-light); margin-bottom: 15px; }
-        .cv-tier-side-row { display: grid; grid-template-columns: 26px repeat(5, 1fr);
-                            gap: 3px; align-items: center; }
-        .cv-tier-side-class { font-size: 11px; font-weight: 700; color: #eee;
-                              text-align: center; padding: 4px 0;
-                              background: rgba(255,255,255,0.04); border-radius: 3px;
-                              cursor: help; }
+                   ~140px wide. Translates off-screen when .collapsed. The toggle
+                   button (top-right of canvas) flips both this and its own
+                   rotation indicator. */
+        .cv-tier-side {
+            position: absolute;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: 152px;
+            background: rgba(20, 20, 24, 0.92);
+            border-left: 1px solid var(--border-light);
+            padding: 8px 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            overflow-y: auto;
+            transition: transform 0.18s ease-out;
+            backdrop-filter: blur(4px);
+            z-index: 5;
+        }
+
+            .cv-tier-side.collapsed {
+                transform: translateX(100%);
+            }
+
+        .cv-tier-side-header {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--accent);
+            font-weight: 700;
+            padding: 2px 4px 4px;
+            border-bottom: 1px solid var(--border-light);
+            margin-bottom: 15px;
+        }
+
+        .cv-tier-side-row {
+            display: grid;
+            grid-template-columns: 26px repeat(5, 1fr);
+            gap: 3px;
+            align-items: center;
+        }
+
+        .cv-tier-side-class {
+            font-size: 11px;
+            font-weight: 700;
+            color: #eee;
+            text-align: center;
+            padding: 4px 0;
+            background: rgba(255,255,255,0.04);
+            border-radius: 3px;
+            cursor: help;
+        }
         /* Class icon — replaces the text abbreviation. Same 26px column
-           width as .cv-tier-side-class (matches the grid template above).
-           image-rendering:pixelated keeps the low-res WoW icons crisp
-           rather than blurrily upscaled. */
-        .cv-tier-side-class-icon { width: 24px; height: 24px;
-                                   display: block; margin: 0 auto;
-                                   border-radius: 3px;
-                                   border: 1px solid rgba(255,255,255,0.06);
-                                   image-rendering: pixelated;
-                                   cursor: help; }
-        .cv-tier-side-btn { background: var(--bg-input); border: 1px solid var(--border-light);
-                            color: var(--text-primary); cursor: pointer;
-                            padding: 4px 0; font-size: 10.5px; font-weight: 600;
-                            border-radius: 3px; transition: all var(--transition-fast);
-                            min-width: 0; }
-        .cv-tier-side-btn:hover:not(:disabled) { background: var(--accent-subtle);
-                                                 border-color: var(--accent); color: var(--accent); }
-        .cv-tier-side-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+                   width as .cv-tier-side-class (matches the grid template above).
+                   image-rendering:pixelated keeps the low-res WoW icons crisp
+                   rather than blurrily upscaled. */
+        .cv-tier-side-class-icon {
+            width: 24px;
+            height: 24px;
+            display: block;
+            margin: 0 auto;
+            border-radius: 3px;
+            border: 1px solid rgba(255,255,255,0.06);
+            image-rendering: pixelated;
+            cursor: help;
+        }
+
+        .cv-tier-side-btn {
+            background: var(--bg-input);
+            border: 1px solid var(--border-light);
+            color: var(--text-primary);
+            cursor: pointer;
+            padding: 4px 0;
+            font-size: 10.5px;
+            font-weight: 600;
+            border-radius: 3px;
+            transition: all var(--transition-fast);
+            min-width: 0;
+        }
+
+            .cv-tier-side-btn:hover:not(:disabled) {
+                background: var(--accent-subtle);
+                border-color: var(--accent);
+                color: var(--accent);
+            }
+
+            .cv-tier-side-btn:disabled {
+                opacity: 0.25;
+                cursor: not-allowed;
+            }
 
         /* Toggle button on canvas — small floating square top-right */
-        .cv-tier-toggle { position: absolute; top: 8px; right: 8px; z-index: 10;
-                          width: 30px; height: 30px; padding: 0;
-                          background: rgba(20, 20, 24, 0.85); color: var(--accent);
-                          border: 1px solid var(--border-light); border-radius: 4px;
-                          cursor: pointer; font-size: 13px;
-                          transition: all var(--transition-fast); backdrop-filter: blur(4px); }
-        .cv-tier-toggle:hover { background: var(--accent); color: white; }
-        .cv-tier-toggle.panel-collapsed { color: var(--text-muted); }
+        .cv-tier-toggle {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            z-index: 10;
+            width: 30px;
+            height: 30px;
+            padding: 0;
+            background: rgba(20, 20, 24, 0.85);
+            color: var(--accent);
+            border: 1px solid var(--border-light);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: all var(--transition-fast);
+            backdrop-filter: blur(4px);
+        }
+
+            .cv-tier-toggle:hover {
+                background: var(--accent);
+                color: white;
+            }
+
+            .cv-tier-toggle.panel-collapsed {
+                color: var(--text-muted);
+            }
     </style>
 }
 
@@ -680,10 +1841,10 @@
     *@
     <script type="importmap">
         {
-          "imports": {
-            "three": "/lib/three/build/three.module.js",
-            "three/addons/": "/lib/three/examples/jsm/"
-          }
+        "imports": {
+        "three": "/lib/three/build/three.module.js",
+        "three/addons/": "/lib/three/examples/jsm/"
+        }
         }
     </script>
     <script type="module" asp-append-version="true">
@@ -702,26 +1863,26 @@
         const resultsCard = document.getElementById('resultsCard');
 
         const panel = mountItemsCharacterPanel({
-            canvas: document.getElementById('char-preview-canvas'),
-            raceToolbarEl: document.getElementById('cvRaceToolbar'),
-            tierSideEl: document.getElementById('cvTierSidePanel'),
-            tierToggleBtnEl: document.getElementById('btnTierToggle'),
-            stripBtnEl: document.getElementById('btnStripGear'),
-            equippedListEl: document.getElementById('cvEquippedList'),
+        canvas: document.getElementById('char-preview-canvas'),
+        raceToolbarEl: document.getElementById('cvRaceToolbar'),
+        tierSideEl: document.getElementById('cvTierSidePanel'),
+        tierToggleBtnEl: document.getElementById('btnTierToggle'),
+        stripBtnEl: document.getElementById('btnStripGear'),
+        equippedListEl: document.getElementById('cvEquippedList'),
         });
 
         // Reveal the character card the first time an item is selected.
         // Also collapse the results card so the viewer has vertical room.
         document.addEventListener('cv:item-selected', () => {
-            characterCard.style.display = '';
-            resultsCard.classList.add('collapsed');
+        characterCard.style.display = '';
+        resultsCard.classList.add('collapsed');
         }, { once: false });
 
         // Toggle button on results card header — lets the user re-expand
         // results to browse more without losing their dress-up state.
         document.getElementById('btnToggleResults')?.addEventListener('click', (e) => {
-            e.stopPropagation();
-            resultsCard.classList.toggle('collapsed');
+        e.stopPropagation();
+        resultsCard.classList.toggle('collapsed');
         });
 
         // Expand viewer to full width (hides the right-side detail panel).
@@ -730,21 +1891,21 @@
         // this, the canvas stretches via CSS but the 3D content stays at
         // the old resolution and looks blurry/letterboxed.
         document.getElementById('btnExpandViewer')?.addEventListener('click', (e) => {
-            const layout = document.getElementById('mainLayout');
-            const expanded = layout.classList.toggle('viewer-expanded');
-            // Swap icon + tooltip to reflect the new state.
-            const icon = e.currentTarget.querySelector('i');
-            if (icon) {
-                icon.classList.toggle('fa-expand', !expanded);
-                icon.classList.toggle('fa-compress', expanded);
-            }
-            e.currentTarget.title = expanded
-                ? 'Collapse viewer (show item detail)'
-                : 'Expand viewer to full width (hides item detail)';
-            // Defer the resize event one frame so the new column widths
-            // have actually applied. setTimeout(0) is enough — we need
-            // the layout to settle, not a real animation frame.
-            setTimeout(() => window.dispatchEvent(new Event('resize')), 0);
+        const layout = document.getElementById('mainLayout');
+        const expanded = layout.classList.toggle('viewer-expanded');
+        // Swap icon + tooltip to reflect the new state.
+        const icon = e.currentTarget.querySelector('i');
+        if (icon) {
+        icon.classList.toggle('fa-expand', !expanded);
+        icon.classList.toggle('fa-compress', expanded);
+        }
+        e.currentTarget.title = expanded
+        ? 'Collapse viewer (show item detail)'
+        : 'Expand viewer to full width (hides item detail)';
+        // Defer the resize event one frame so the new column widths
+        // have actually applied. setTimeout(0) is enough — we need
+        // the layout to settle, not a real animation frame.
+        setTimeout(() => window.dispatchEvent(new Event('resize')), 0);
         });
     </script>
 }

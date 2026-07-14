@@ -7,12 +7,18 @@ namespace MangosSuperUI.BotLogic.Chat.Core;
 /// The fictional human behind a bot (CHAT_ARCHITECTURE §6.2 — authoritative schema).
 /// Stored as bot_persona.card_json (post-jitter, evolves) and chat_voice.card_json
 /// (library copy, frozen). Field contracts: caps ∈ lower|proper|mixed|CRUISE;
-/// punctuation ∈ minimal|normal|heavy; abbrev_level 0–3; example_lines exactly 5 —
-/// they are the few-shot anchors and matter more than the bio for small models.
+/// punctuation ∈ minimal|normal|heavy; abbrev_level 0–3; swear_level 0–3;
+/// example_lines exactly 5 — they are the few-shot anchors and matter more than the
+/// bio for small models.
+///
+/// SCHEMA v2 (2026-07-13): added typing.swear_level. v1 cards parse fine — the field
+/// defaults to 1 (mild). The voice library is regenerated on the v2 schema so that
+/// example_lines are AUTHORED in the persona's swear register; that is what the model
+/// actually imitates. See §10.4 step 6b and SwearTables.cs.
 /// </summary>
 public class PersonaCard
 {
-    [JsonPropertyName("v")] public int V { get; set; } = 1;
+    [JsonPropertyName("v")] public int V { get; set; } = 2;
     [JsonPropertyName("given_name")] public string GivenName { get; set; } = "";
     [JsonPropertyName("age")] public int Age { get; set; }
     [JsonPropertyName("region")] public string Region { get; set; } = "";
@@ -57,6 +63,15 @@ public class PersonaTyping
     [JsonPropertyName("caps")] public string Caps { get; set; } = "lower";
     [JsonPropertyName("punctuation")] public string Punctuation { get; set; } = "minimal";
     [JsonPropertyName("abbrev_level")] public int AbbrevLevel { get; set; } = 2;
+
+    /// <summary>
+    /// 0 = never swears (rare — the church-league adult). 1 = mild, only when annoyed
+    /// (damn / crap / hell). 2 = the 2005 baseline (shit / ass / bastard, calls people
+    /// shitters). 3 = sailor. Shapes BOTH the prompt register (§10.3) and the §10.4
+    /// step-6b register pass. Scaled globally by voice.banter_intensity.
+    /// </summary>
+    [JsonPropertyName("swear_level")] public int SwearLevel { get; set; } = 1;
+
     [JsonPropertyName("typo_rate")] public float TypoRate { get; set; } = 0.04f;
     [JsonPropertyName("wpm")] public int Wpm { get; set; } = 45;
     [JsonPropertyName("think_min_s")] public int ThinkMinS { get; set; } = 2;

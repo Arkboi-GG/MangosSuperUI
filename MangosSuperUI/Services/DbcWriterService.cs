@@ -276,9 +276,55 @@ public class DbcWriterService
 
     // ── Write ──
 
+    /// <summary>
+    /// Sort every record ascending by ID (field[0]) and rebuild the index.
+    ///
+    /// THE CLIENT REQUIRES THIS. Vanilla DBCs are sorted by ID, and the WoW client
+    /// resolves a record by BINARY SEARCH on that assumption — it does not scan.
+    /// Hand it an unsorted file and lookups do not fail cleanly; they land on the
+    /// WRONG RECORD.
+    ///
+    /// Appending rows is exactly how you break the invariant. RebuildPatchMAsync
+    /// walks custom_item_retexture first, then custom_item_retexture_atlas — and
+    /// both draw display IDs from ONE shared counter, so the two sets interleave:
+    ///
+    ///     model rows appended:  60001, 60005, 60009, ...
+    ///     atlas rows appended:  60002, 60003, 60004, ...
+    ///     resulting tail:       60001, 60005, 60009, 60002, 60003, 60004  ← NOT SORTED
+    ///
+    /// Two sorted runs concatenated. Binary search over that returns garbage. The
+    /// vanilla prefix stays sorted, so vanilla items keep working perfectly, and
+    /// only the custom displays resolve to someone else's row — a glove wearing a
+    /// weapon's icon and no texture, which is precisely the symptom.
+    ///
+    /// It also explains why this lay dormant for months: in May there were FIVE
+    /// model retextures and zero atlas rows. One run. Sorted by accident.
+    ///
+    /// Sorting is a no-op for an already-sorted file, so this is safe for every
+    /// caller (SpellCreator's DBC chain included).
+    /// </summary>
+    public void SortById()
+    {
+        _records.Sort((a, b) =>
+        {
+            uint ia = a.Length > 0 ? a[0] : 0;
+            uint ib = b.Length > 0 ? b[0] : 0;
+            return ia.CompareTo(ib);
+        });
+
+        _idIndex.Clear();
+        for (int i = 0; i < _records.Count; i++)
+            if (_records[i].Length > 0)
+                _idIndex[_records[i][0]] = i;
+    }
+
     /// <summary>Produce a complete, valid WDBC binary with all modifications applied.</summary>
     public byte[] Write()
     {
+        // MUST come before serialization — see SortById. An unsorted DBC does not
+        // fail loudly in the client; it silently resolves IDs to the wrong records.
+        SortById();
+
         int fieldsPerRecord = RecordSize / 4;
 
         // Build the new string block: original block + appended strings

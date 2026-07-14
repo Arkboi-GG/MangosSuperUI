@@ -11,7 +11,29 @@ namespace MangosSuperUI.BotLogic.Chat.Capacity;
 // NOTE (C5): IInferenceBroker/GenOptions/InferenceLease move next to the real
 // InferenceBroker.cs, and BrokerStatus gets its own file, when this temp broker is deleted.
 
-public sealed record GenOptions(float Temperature, float TopP, int NumPredict);
+/// <summary>
+/// Generation options. Extended 2026-07-13 with the repetition controls that were never
+/// being sent — the request body carried temperature/top_p/num_predict and nothing else,
+/// so both backends were silently applying their own defaults.
+///
+/// HONEST SCOPE: repeat_penalty, presence_penalty and frequency_penalty act WITHIN a
+/// single generation. They stop a line from eating its own tail; they do NOT stop two
+/// separate calls from producing the same line, because the backend has no memory across
+/// calls. Cross-call sameness is fixed upstream (persona diversity, shuffled few-shot)
+/// and downstream (StylePostPass step 10's emission ledger) — not here. `stop` is the
+/// quietly valuable one: it keeps a chat reply to ONE line instead of the model helpfully
+/// writing the other guy's next turn too.
+/// </summary>
+public sealed record GenOptions(
+    float Temperature,
+    float TopP,
+    int NumPredict,
+    float RepeatPenalty = 1.1f,
+    int RepeatLastN = 256,
+    float PresencePenalty = 0f,
+    float FrequencyPenalty = 0f,
+    int? Seed = null,
+    IReadOnlyList<string>? Stop = null);
 
 /// <summary>A granted slot. Dispose releases it. Carries the model tag for its class.</summary>
 public sealed class InferenceLease : IDisposable
@@ -114,6 +136,14 @@ public class FixedEndpointBroker : IInferenceBroker
             return null;
         }
 
+        // The voice library is the fleet's ONLY diversity source and it is written once.
+        // If Batch is silently running on the small reactive model, say so out loud.
+        if (cls == TrafficClass.Batch && string.IsNullOrEmpty(_modelBatch))
+            _logger.LogWarning("[CHAT-CAP] Batch has no model_batch tag on profile '{Name}' — falling back to the " +
+                               "REACTIVE model '{Model}'. The voice library is generated once and every persona " +
+                               "descends from it; set model_batch to the largest model you can serve.",
+                               _profileName, model);
+
         bool got;
         try { got = await slots.WaitAsync(maxWait, ct); }
         catch (OperationCanceledException) { return null; }
@@ -144,7 +174,13 @@ public class FixedEndpointBroker : IInferenceBroker
             {
                 Temperature = opts.Temperature,
                 TopP = opts.TopP,
-                NumPredict = opts.NumPredict
+                NumPredict = opts.NumPredict,
+                RepeatPenalty = opts.RepeatPenalty,
+                RepeatLastN = opts.RepeatLastN,
+                PresencePenalty = opts.PresencePenalty,
+                FrequencyPenalty = opts.FrequencyPenalty,
+                Seed = opts.Seed,
+                Stop = opts.Stop?.ToList()
             }
         };
 
@@ -196,6 +232,10 @@ public class FixedEndpointBroker : IInferenceBroker
             Temperature = opts.Temperature,
             TopP = opts.TopP,
             MaxTokens = opts.NumPredict,
+            PresencePenalty = opts.PresencePenalty,
+            FrequencyPenalty = opts.FrequencyPenalty,
+            Seed = opts.Seed,
+            Stop = opts.Stop?.ToList(),
             Stream = false
         };
 
@@ -333,6 +373,10 @@ public class FixedEndpointBroker : IInferenceBroker
         [JsonPropertyName("temperature")] public float Temperature { get; set; }
         [JsonPropertyName("top_p")] public float TopP { get; set; }
         [JsonPropertyName("max_tokens")] public int MaxTokens { get; set; }
+        [JsonPropertyName("presence_penalty")] public float PresencePenalty { get; set; }
+        [JsonPropertyName("frequency_penalty")] public float FrequencyPenalty { get; set; }
+        [JsonPropertyName("seed")] public int? Seed { get; set; }
+        [JsonPropertyName("stop")] public List<string>? Stop { get; set; }
         [JsonPropertyName("stream")] public bool Stream { get; set; }
     }
 
@@ -378,6 +422,12 @@ public class FixedEndpointBroker : IInferenceBroker
         [JsonPropertyName("temperature")] public float Temperature { get; set; }
         [JsonPropertyName("top_p")] public float TopP { get; set; }
         [JsonPropertyName("num_predict")] public int NumPredict { get; set; }
+        [JsonPropertyName("repeat_penalty")] public float RepeatPenalty { get; set; }
+        [JsonPropertyName("repeat_last_n")] public int RepeatLastN { get; set; }
+        [JsonPropertyName("presence_penalty")] public float PresencePenalty { get; set; }
+        [JsonPropertyName("frequency_penalty")] public float FrequencyPenalty { get; set; }
+        [JsonPropertyName("seed")] public int? Seed { get; set; }
+        [JsonPropertyName("stop")] public List<string>? Stop { get; set; }
     }
 
     private class OllamaResponse

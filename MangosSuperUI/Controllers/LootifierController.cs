@@ -65,6 +65,10 @@ public class LootifierController : Controller
     // here, well above vanilla reference_loot_template ids (~35000 in 1.12).
     private const int LOOTIFIER_REF_START = 9500000;
 
+    // creature_template.loot_id values minted for no-loot mobs in additive mode
+    // start here (distinct high range so they never collide with vanilla loot_ids).
+    private const int LOOTIFIER_LOOTID_START = 9000000;
+
     // Pool share model (v6): the BASE item becomes a rare fallback and the
     // lootified variants take almost all of the base's original pool share.
     //   - BASE_FLOOR_PCT: base item's fixed share inside its family (special,
@@ -79,6 +83,10 @@ public class LootifierController : Controller
 
     // VMaNGOS skips grouped rows with 0 < chance < 0.000001 (LootMgr.cpp:308).
     private const float MIN_POOL_CHANCE = 0.0005f;
+
+    // ── Additive-generation dials (mirror Quest/Crafting Lootifiers) ──
+    private const float MIN_DELTA_BUDGET = 2.0f;   // additive floor: every variant is a real upgrade
+    private const float LOOT_BUMP_BIAS = 0.5f;     // delta split: existing-line bumps vs new affixes
 
     // ── VERIFIED stat type mapping (confirmed from VMaNGOS item_template) ──
     // Judgement Legplates: 5=27(Int), 6=5(Spi), 7=26(Sta), 4=10(Str) ✓
@@ -118,6 +126,12 @@ public class LootifierController : Controller
     private const int SPELLTRIGGER_USE = 0;
     private const int SPELLTRIGGER_EQUIP = 1;
     private const int SPELLTRIGGER_CHANCE_ON_HIT = 2;
+
+    // ── Item classes — only equippable Weapon/Armor gear is lootifiable ──
+    // Recipes (9), consumables (0), trade goods (7), quest items (12), reagents,
+    // projectiles, etc. are excluded even when they carry a Use: spell effect.
+    private const int ITEM_CLASS_WEAPON = 2;
+    private const int ITEM_CLASS_ARMOR = 4;
 
     // Map IDs for batch mode
     private static readonly Dictionary<int, string> MAP_NAMES = new()
@@ -180,7 +194,8 @@ public class LootifierController : Controller
                 variantsPerItem = 10,
                 allowNewAffixes = true,
                 maxAffixCountChange = 1,
-                dropChanceStrategy = "preserve"
+                dropChanceStrategy = "preserve",
+                poolDropChancePct = 100
             },
             maps = MAP_NAMES.OrderBy(kv => kv.Value).Select(kv => new { id = kv.Key, name = kv.Value })
         });
@@ -329,8 +344,10 @@ public class LootifierController : Controller
             bool hasStats = (int)analysis.totalStats > 0;
             bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
 
-            // Skip items with neither stats nor spell effects
-            if (!hasStats && !hasSpellEffects) continue;
+            // Eligibility is EQUIPPABLE, full stop: any weapon/armor in an inventory
+            // slot rolls (stat-less whites included — GenerateVariants mints a budget
+            // from item_level). Recipes, consumables, reagents etc. never do.
+            if (!IsEquippableGear(item)) continue;
 
             var variants = GenerateVariants(item, analysis, ruleset);
             allVariants.Add(new
@@ -471,8 +488,22 @@ public class LootifierController : Controller
             if (request.levelMax > 0) { p.Add(prefix + "LevelMax", request.levelMax); parts.Add($"it.required_level <= @{prefix}LevelMax"); }
             return string.Join(" AND ", parts);
         }
-        // CHANGED: also include items with spell effects (no stat requirement)
-        string ItemFilter() => "(it.stat_type1 > 0 OR it.stat_type2 > 0 OR it.stat_type3 > 0 OR it.spellid_1 > 0)";
+        // ── Candidate gate: EQUIPPABLE GEAR ONLY ──
+        // Equippable is the whole test: any weapon/armor occupying an inventory
+        // slot rolls (any slot — trinkets, rings, necks, shirts, tabards, cloaks,
+        // shields all count). Everything else does not.
+        //
+        // The old filter was `stat_type1>0 OR ... OR spellid_1>0`, and that
+        // `spellid_1` clause is exactly why plans and recipes were being picked:
+        // a recipe's spellid_1 IS its teach-spell. Same for potions, scrolls and
+        // food. Class 2 = Weapon, 4 = Armor; recipes (9), consumables (0), trade
+        // goods (7), bags (1), ammo (6) and quivers (11) are all excluded by class,
+        // and inventory_type > 0 drops anything that can't actually be worn.
+        //
+        // Note there's deliberately NO stat/spell requirement: a plain white
+        // equippable with no stats is still a valid base — GenerateVariants mints
+        // a budget from its item level.
+        string ItemFilter() => "(it.class IN (2, 4) AND it.inventory_type > 0)";
 
         var p1 = new DynamicParameters();
         var w1 = new List<string> { "lt.mincountOrRef > 0", ItemFilter() };
@@ -654,7 +685,7 @@ public class LootifierController : Controller
             var analysis = AnalyzeItemStats(item);
             bool hasStats = (int)analysis.totalStats > 0;
             bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
-            if (!hasStats && !hasSpellEffects) continue;
+            if (!IsEquippableGear(item)) continue;
 
             var variants = GenerateVariants(item, analysis, ruleset);
 
@@ -735,6 +766,11 @@ public class LootifierController : Controller
         // via the tracking table (idempotent re-commit).
         var expandedPairs = await LoadExpandedPairs(adminConn);
 
+        // Additive mode: independent tunable-chance pool per creature (no dilution).
+        bool additive = ruleset.dropChanceStrategy == "additive";
+        float poolDropPct = Math.Clamp(ruleset.poolDropChancePct, 0f, 100f);
+        var additivized = additive ? await LoadAdditivizedCreatures(adminConn) : new HashSet<int>();
+
         // Batch tracking rows for bulk insert
         var trackingItemRows = new List<(int genEntry, int baseEntry, int creatureEntry, float budgetPct, string tierName)>();
         var trackingLootRows = new List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>();
@@ -746,12 +782,19 @@ public class LootifierController : Controller
                 WHERE entry = @E ORDER BY patch DESC LIMIT 1",
                 new { E = creatureGroup.creatureEntry });
 
-            if (lootId == 0) continue;
+            // Preserve mode needs an existing loot table; additive mode mints one.
+            if (!additive && lootId == 0) continue;
+            // Additive is built once per creature — re-run rolls it back first.
+            if (additive && additivized.Contains(creatureGroup.creatureEntry)) continue;
+
+            // Collected per-creature variant sets for the single additive pool.
+            var additiveBatch = new List<(int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls)>();
 
             foreach (var itemEntry in creatureGroup.itemEntries)
             {
-                // Skip pairs already expanded (this run or a previous one).
-                if (!expandedPairs.Add((lootId, itemEntry)))
+                // Dedup: additive pools are per-creature; preserve pools per loot_id.
+                var dedupKey = additive ? (creatureGroup.creatureEntry, itemEntry) : (lootId, itemEntry);
+                if (!expandedPairs.Add(dedupKey))
                 {
                     pairsSkipped++;
                     continue;
@@ -774,7 +817,7 @@ public class LootifierController : Controller
                     var analysis = AnalyzeItemStats(item);
                     bool hasStats = (int)analysis.totalStats > 0;
                     bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
-                    if (!hasStats && !hasSpellEffects)
+                    if (!IsEquippableGear(item))
                     {
                         variantCache[itemEntry] = null;
                         continue;
@@ -832,12 +875,39 @@ public class LootifierController : Controller
 
                 if (cached == null) continue; // ineligible base item
 
-                // The cached entries/rolls already include this base item's ONE
-                // legendary (built once at cache time), so every creature that
-                // shares the item reuses the same legendary — no per-creature dup.
-                int lootRows = await ExpandLootTable(mangosConn, adminConn, trackingLootRows,
-                    lootId, itemEntry, cached.Value.entries, cached.Value.rolls, creatureGroup.creatureEntry);
-                totalLootRowsCreated += lootRows;
+                if (additive)
+                {
+                    // Defer: collect this base's variant set for the creature's pool.
+                    additiveBatch.Add((itemEntry, cached.Value.entries, cached.Value.rolls));
+                }
+                else
+                {
+                    // The cached entries/rolls already include this base item's ONE
+                    // legendary (built once at cache time), so every creature that
+                    // shares the item reuses the same legendary — no per-creature dup.
+                    int lootRows = await ExpandLootTable(mangosConn, adminConn, trackingLootRows,
+                        lootId, itemEntry, cached.Value.entries, cached.Value.rolls, creatureGroup.creatureEntry);
+                    totalLootRowsCreated += lootRows;
+                }
+            }
+
+            // Build the single additive pool for this creature (minting a loot_id
+            // if the mob had none).
+            if (additive && additiveBatch.Count > 0)
+            {
+                int effLootId = lootId;
+                bool minted = false;
+                if (effLootId == 0)
+                {
+                    effLootId = await GetNextLootifierLootId(mangosConn);
+                    await mangosConn.ExecuteAsync(
+                        "UPDATE creature_template SET loot_id = @L WHERE entry = @E",
+                        new { L = effLootId, E = creatureGroup.creatureEntry });
+                    minted = true;
+                }
+                totalLootRowsCreated += await BuildAdditivePool(mangosConn, adminConn, trackingLootRows,
+                    creatureGroup.creatureEntry, effLootId, minted, additiveBatch, poolDropPct);
+                additivized.Add(creatureGroup.creatureEntry);
             }
 
             creaturesProcessed++;
@@ -981,14 +1051,25 @@ public class LootifierController : Controller
             WHERE entry = @E ORDER BY patch DESC LIMIT 1",
             new { E = request.creatureEntry });
 
-        if (lootId == 0)
-            return Json(new { success = false, error = "Creature has no loot table" });
-
         int nextId = await GetNextLootifierId(adminConn);
         int totalItemsCreated = 0;
         int totalLootRowsCreated = 0;
         var commitLog = new List<object>();
         var ruleset = request.ruleset ?? new RulesetDto();
+
+        // Additive mode: one independent tunable-chance pool for this creature.
+        bool additive = ruleset.dropChanceStrategy == "additive";
+        float poolDropPct = Math.Clamp(ruleset.poolDropChancePct, 0f, 100f);
+        var additiveBatch = new List<(int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls)>();
+
+        if (!additive && lootId == 0)
+            return Json(new { success = false, error = "Creature has no loot table" });
+        if (additive)
+        {
+            var already = await LoadAdditivizedCreatures(adminConn);
+            if (already.Contains(request.creatureEntry))
+                return Json(new { success = false, error = "Creature already has an additive pool — roll it back first to rebuild." });
+        }
 
         foreach (var itemGroup in request.variants)
         {
@@ -1048,12 +1129,21 @@ public class LootifierController : Controller
                 }
             }
 
-            // NOTE: re-commit of the same creature+item is idempotent: the pool
-            // is reused (prior 'pool_created' → same ref entry), members upserted
-            // and renormalized to 100. No compounding, no duplicate pointers.
-            int lootRowsAdded = await ExpandLootTable(mangosConn, adminConn, null,
-                lootId, itemGroup.baseItemEntry, poolEntries, poolRolls, request.creatureEntry);
-            totalLootRowsCreated += lootRowsAdded;
+            int lootRowsAdded = 0;
+            if (additive)
+            {
+                // Defer to a single per-creature pool after the loop.
+                additiveBatch.Add((itemGroup.baseItemEntry, poolEntries, poolRolls.ToArray()));
+            }
+            else
+            {
+                // NOTE: re-commit of the same creature+item is idempotent: the pool
+                // is reused (prior 'pool_created' → same ref entry), members upserted
+                // and renormalized to 100. No compounding, no duplicate pointers.
+                lootRowsAdded = await ExpandLootTable(mangosConn, adminConn, null,
+                    lootId, itemGroup.baseItemEntry, poolEntries, poolRolls, request.creatureEntry);
+                totalLootRowsCreated += lootRowsAdded;
+            }
 
             commitLog.Add(new
             {
@@ -1062,6 +1152,23 @@ public class LootifierController : Controller
                 variantsCreated = poolEntries.Count,
                 lootRowsAdded
             });
+        }
+
+        // Additive: build the single independent pool now (minting a loot_id if none).
+        if (additive && additiveBatch.Count > 0)
+        {
+            int effLootId = lootId;
+            bool minted = false;
+            if (effLootId == 0)
+            {
+                effLootId = await GetNextLootifierLootId(mangosConn);
+                await mangosConn.ExecuteAsync(
+                    "UPDATE creature_template SET loot_id = @L WHERE entry = @E",
+                    new { L = effLootId, E = request.creatureEntry });
+                minted = true;
+            }
+            totalLootRowsCreated += await BuildAdditivePool(mangosConn, adminConn, null,
+                request.creatureEntry, effLootId, minted, additiveBatch, poolDropPct);
         }
 
         await _audit.LogAsync(new AuditEntry
@@ -1100,7 +1207,7 @@ public class LootifierController : Controller
             new { CE = request.creatureEntry })).ToList();
 
         var lootEntries = (await adminConn.QueryAsync<dynamic>(
-            $"SELECT id, loot_table, loot_entry, item_entry, action_type, original_chance FROM lootifier_loot_entries {where}",
+            $"SELECT id, creature_entry, loot_table, loot_entry, item_entry, action_type, original_chance, new_chance FROM lootifier_loot_entries {where}",
             new { CE = request.creatureEntry })).ToList();
 
         int itemsRemoved = 0, lootRowsFixed = 0, itemsKept = 0;
@@ -1117,7 +1224,7 @@ public class LootifierController : Controller
             {
                 int otherRefs = await adminConn.ExecuteScalarAsync<int>(@"
                     SELECT COUNT(*) FROM lootifier_loot_entries
-                    WHERE item_entry = @E AND action_type IN ('pool_member','pool_joined')
+                    WHERE item_entry = @E AND action_type IN ('pool_member','pool_joined','add_member')
                       AND creature_entry <> @CE",
                     new { E = genEntry, CE = request.creatureEntry });
 
@@ -1148,7 +1255,7 @@ public class LootifierController : Controller
             int lootEntry = (int)le.loot_entry;
             int itemEntry = (int)le.item_entry;
 
-            if (action == "pool_member" || action == "pool_joined")
+            if (action == "pool_member" || action == "pool_joined" || action == "add_member")
             {
                 await mangosConn.ExecuteAsync(
                     $"DELETE FROM `{table}` WHERE entry = @Entry AND item = @Item",
@@ -1228,6 +1335,58 @@ public class LootifierController : Controller
             lootRowsFixed++;
         }
 
+        // ── Additive pool rollback ──
+        // 1. Remove the independent pointer and drop the whole minted ref pool.
+        foreach (var le in lootEntries)
+        {
+            if ((string)le.action_type != "add_ptr") continue;
+            int lootId = (int)le.loot_entry;
+            int pointerItem = (int)le.item_entry;
+            var ptr = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
+                SELECT mincountOrRef FROM creature_loot_template
+                WHERE entry = @LootId AND item = @Item AND mincountOrRef < 0",
+                new { LootId = lootId, Item = pointerItem });
+            await mangosConn.ExecuteAsync(
+                "DELETE FROM creature_loot_template WHERE entry = @LootId AND item = @Item AND mincountOrRef < 0",
+                new { LootId = lootId, Item = pointerItem });
+            if (ptr != null)
+            {
+                int refEntry = Math.Abs((int)ptr.mincountOrRef);
+                if (refEntry >= LOOTIFIER_REF_START)
+                    await mangosConn.ExecuteAsync(
+                        "DELETE FROM reference_loot_template WHERE entry = @Ref",
+                        new { Ref = refEntry });
+            }
+            lootRowsFixed++;
+        }
+
+        // 2. Restore each base's original direct drop row (if it had one before).
+        foreach (var le in lootEntries)
+        {
+            if ((string)le.action_type != "add_base") continue;
+            float origChance = (float)le.original_chance;
+            if (origChance <= 0f) continue;   // base had no direct row to restore
+            int lootId = (int)le.loot_entry;
+            int baseItem = (int)le.item_entry;
+            await mangosConn.ExecuteAsync(@"
+                INSERT IGNORE INTO creature_loot_template (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
+                VALUES (@LootId, @Item, @Chance, 0, 1, 1, 0, 10)",
+                new { LootId = lootId, Item = baseItem, Chance = origChance });
+            lootRowsFixed++;
+        }
+
+        // 3. Zero any loot_id we minted for a no-loot mob (restore it to 0).
+        foreach (var le in lootEntries)
+        {
+            if ((string)le.action_type != "add_lootid") continue;
+            int mintedLootId = (int)le.loot_entry;
+            int ce = (int)le.creature_entry;
+            await mangosConn.ExecuteAsync(
+                "UPDATE creature_template SET loot_id = 0 WHERE entry = @CE AND loot_id = @L",
+                new { CE = ce, L = mintedLootId });
+            lootRowsFixed++;
+        }
+
         await adminConn.ExecuteAsync($"DELETE FROM lootifier_generated_items {where}", new { CE = request.creatureEntry });
         await adminConn.ExecuteAsync($"DELETE FROM lootifier_loot_entries {where}", new { CE = request.creatureEntry });
 
@@ -1280,12 +1439,16 @@ public class LootifierController : Controller
         string family = (string)analysis.detectedFamily;
         bool hasStats = (int)analysis.totalStats > 0;
         bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
+        int baseQuality = GetPropInt(baseItem, "quality");
 
         int numVariants = Math.Clamp(ruleset.variantsPerItem, 1, 50);
         var tiers = GetRequiredTiers(ruleset);
 
-        // For spell-effect-only items with no stats, derive a synthetic budget from item_level
-        if (!hasStats && hasSpellEffects)
+        // Any stat-less base (plain white gear, or a spell-only item) has no stat
+        // budget to build on, so derive one from item_level. Previously this only
+        // fired for spell items, which left a stat-less white equippable at budget
+        // 0 — now that eligibility is "equippable, full stop", whites hit this too.
+        if (!hasStats)
         {
             int itemLevel = GetPropInt(baseItem, "item_level");
             baseBudget = EstimateBudgetFromItemLevel(itemLevel);
@@ -1346,8 +1509,8 @@ public class LootifierController : Controller
                     stats = RollStatsForSpellItem(rng, budgetRoll, eligibleList, family);
                 }
 
-                string tierLabel = tier.label;
-                string tierPosition = tier.position;
+                string canon = CanonicalTier(tier.label, budgetPct);
+                var (tierLabel, tierPosition) = ResolveBandNaming(baseQuality, canon, tier.label, tier.position);
                 string baseName = (string)baseItem.name;
                 string name = ApplyTierName(baseName, tierLabel, tierPosition);
 
@@ -1498,6 +1661,80 @@ public class LootifierController : Controller
             return baseName + " " + tierLabel;
     }
 
+    // ── Eligibility: equippable Weapon/Armor gear only ──
+    // A Use:/spell effect alone (recipes, potions, scrolls, trinket-charms that
+    // aren't equippable, etc.) does NOT make something lootifiable — it must be a
+    // Weapon/Armor class item that occupies an inventory slot.
+    private bool IsEquippableGear(dynamic item)
+    {
+        int cls = GetPropInt(item, "class");
+        int inv = GetPropInt(item, "inventory_type");
+        return (cls == ITEM_CLASS_WEAPON || cls == ITEM_CLASS_ARMOR) && inv > 0;
+    }
+
+    // ── Colour ladder (shared with Quest/Crafting Lootifiers) ──
+    // Canonical tier token for a naming label, by name first then boost bucket.
+    // Recognizes the high-rarity replacement labels so their colour resolves right.
+    private static string CanonicalTier(string label, float budgetPct)
+    {
+        var l = (label ?? "").ToLowerInvariant();
+        if (l.Contains("god") || l.Contains("legend") || l.Contains("immortal") || l.Contains("azeroth")) return "gods";
+        if (l.Contains("glory") || l.Contains("fury")) return "glory";
+        if (l.Contains("power")) return "power";
+        if (l.Contains("improv")) return "improved";
+        if (budgetPct >= 98f) return "gods";
+        if (budgetPct >= 90f) return "glory";
+        if (budgetPct >= 80f) return "power";
+        return "improved";
+    }
+
+    // Variant colour anchored at the BASE quality (relative tier ladder, matching
+    // the Crafting Lootifier). Improved/Power keep the base colour; of Glory is +1
+    // (capped at purple); of the Gods is +2 (legendary). A HARD FLOOR at the base
+    // quality guarantees a variant is never a lower rarity than the item it
+    // replaces. White floors to green. Per base:
+    //   white     → green / green / blue  / purple
+    //   green     → green / green / blue  / purple
+    //   blue      → blue  / blue  / purple/ orange
+    //   purple    → purple/ purple/ purple/ orange
+    //   legendary → orange/ orange/ orange/ orange
+    private static int VariantQuality(string tier, int baseQuality)
+    {
+        int b = baseQuality <= 1 ? 2 : baseQuality;      // white + stats floors at green
+        int q;
+        if (tier == "gods") q = Math.Min(b + 2, 5);      // legendary
+        else if (tier == "glory") q = Math.Min(b + 1, 4);// +1, capped at purple
+        else q = b;                                      // improved / power keep base colour
+        return Math.Clamp(Math.Max(b, q), 2, 5);         // never below the base's own quality
+    }
+
+    // Per-base-quality band naming (shared with Quest/Crafting). A purple or
+    // legendary base can never carry an "Improved"/"of Power" name:
+    //   Purple base : Improved/of Power → "of Fury"   of Glory → "of Glory"
+    //                 of the Gods       → "of Azeroth" (the purple→legendary step)
+    //   Legendary   : every tier        → "Immortal" (prefix) — can only stay legendary
+    // Green/blue/white keep the configured labels.
+    private static (string label, string position) ResolveBandNaming(int baseQuality, string canonicalTier,
+        string defaultLabel, string defaultPosition)
+    {
+        if (baseQuality >= 5)
+            return ("Immortal", "prefix");
+
+        if (baseQuality == 4)
+        {
+            return canonicalTier switch
+            {
+                "improved" => ("of Fury", "suffix"),
+                "power" => ("of Fury", "suffix"),
+                "glory" => ("of Glory", "suffix"),
+                "gods" => ("of Azeroth", "suffix"),
+                _ => (defaultLabel, defaultPosition)
+            };
+        }
+
+        return (defaultLabel, defaultPosition);
+    }
+
     /// <summary>Converts VariantData list to anonymous objects for JSON serialization.</summary>
     private List<object> VariantsToJson(List<VariantData> variants)
     {
@@ -1528,54 +1765,89 @@ public class LootifierController : Controller
         };
     }
 
+    // ADDITIVE ONLY (matches Quest/Crafting Lootifiers). Preserve every base stat
+    // line verbatim, then layer a bonus on top — never reduced, never dropped. The
+    // bonus is this roll's budget above the base budget (budgetRoll floors at
+    // base×1.02 in GenerateVariants; legendary uses base×1.5), floored at
+    // MIN_DELTA_BUDGET so even the lowest tier is a real upgrade. The bonus is
+    // split between bumping existing lines and adding new affixes.
     private List<StatRoll> RollStats(Random rng, float budgetRoll, int[] presentTypes,
         List<int> eligibleList, dynamic analysis, RulesetDto ruleset)
     {
-        int baseSlotCount = ((List<object>)analysis.stats).Count;
-        int slotCount = baseSlotCount;
-        if (ruleset.allowNewAffixes && rng.NextDouble() < 0.2 && baseSlotCount < 5)
-            slotCount = Math.Min(baseSlotCount + ruleset.maxAffixCountChange, 10);
+        float baseWeighted = (float)analysis.weightedBudget;
 
-        var chosenTypes = new List<int>();
-        var shuffledPresent = presentTypes.OrderBy(_ => rng.Next()).ToList();
-        chosenTypes.AddRange(shuffledPresent.Take(slotCount));
-        while (chosenTypes.Count < slotCount)
+        // Seed the variant with the base item's exact stat lines (preserved).
+        var lines = new Dictionary<int, int>();
+        foreach (var s in (List<object>)analysis.stats)
         {
-            var pool = eligibleList.Where(s => !chosenTypes.Contains(s)).ToList();
-            if (pool.Count == 0) break;
-            chosenTypes.Add(pool[rng.Next(pool.Count)]);
+            int st = (int)((dynamic)s).statType;
+            int sv = (int)((dynamic)s).statValue;
+            if (st > 0 && sv != 0) lines[st] = sv;
         }
 
-        var weights = chosenTypes.Select(t => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(t, 1.0f)).ToArray();
-        float totalWeight = weights.Sum();
-        var rolledStats = new List<StatRoll>();
+        float delta = Math.Max(MIN_DELTA_BUDGET, budgetRoll - baseWeighted);
 
-        float budgetRemaining = budgetRoll;
-        for (int s = 0; s < chosenTypes.Count; s++)
+        int slotRoom = Math.Max(0, 10 - lines.Count);
+        var newCandidates = eligibleList.Where(t => !lines.ContainsKey(t)).ToList();
+        bool canAddNew = ruleset.allowNewAffixes && slotRoom > 0 && newCandidates.Count > 0;
+
+        float split = (float)Math.Clamp(LOOT_BUMP_BIAS + (rng.NextDouble() * 0.4 - 0.2), 0.0, 1.0);
+        if (lines.Count == 0) split = 0f;   // nothing to bump → all bonus to new affixes
+        if (!canAddNew) split = 1f;         // no room/permission for new affixes → all bumps
+
+        float existingPortion = delta * split;
+        float newPortion = delta - existingPortion;
+
+        // Bump the preserved lines (weight-distributed).
+        if (existingPortion > 0f && lines.Count > 0)
         {
-            float share;
-            if (s == chosenTypes.Count - 1)
-                share = budgetRemaining;
-            else
+            var keys = lines.Keys.ToList();
+            float totalW = keys.Sum(k => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f));
+            foreach (var k in keys)
             {
-                float basePortion = budgetRoll * (weights[s] / totalWeight);
-                float jitter = (float)(rng.NextDouble() * 0.3 - 0.15) * basePortion;
-                share = Math.Max(1, basePortion + jitter);
+                float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
+                float share = existingPortion * (w / totalW);
+                int add = (int)Math.Round(share / w);
+                if (add > 0) lines[k] += add;
             }
-
-            int statValue = Math.Max(1, (int)Math.Round(share / weights[s]));
-            float actualCost = statValue * weights[s];
-            budgetRemaining -= actualCost;
-
-            rolledStats.Add(new StatRoll
-            {
-                statType = chosenTypes[s],
-                statValue = statValue,
-                name = STAT_NAMES.GetValueOrDefault(chosenTypes[s], $"Type{chosenTypes[s]}")
-            });
         }
 
-        return rolledStats;
+        // Add new affixes with the remaining bonus, or (if none allowed) pour the
+        // whole delta back into existing lines so the tier budget still lands.
+        if (canAddNew && newPortion > 0f)
+        {
+            int maxNew = Math.Min(Math.Max(1, ruleset.maxAffixCountChange), Math.Min(slotRoom, newCandidates.Count));
+            int newCount = 1 + rng.Next(maxNew);
+            var picks = newCandidates.OrderBy(_ => rng.Next()).Take(newCount).ToList();
+
+            float totalW = picks.Sum(k => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f));
+            foreach (var k in picks)
+            {
+                float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
+                float share = newPortion * (w / totalW);
+                int val = Math.Max(1, (int)Math.Round(share / w));
+                lines[k] = lines.GetValueOrDefault(k, 0) + val;
+            }
+        }
+        else if (existingPortion < delta && lines.Count > 0)
+        {
+            var keys = lines.Keys.ToList();
+            float totalW = keys.Sum(k => DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f));
+            float leftover = delta - existingPortion;
+            foreach (var k in keys)
+            {
+                float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
+                int add = (int)Math.Round(leftover * (w / totalW) / w);
+                if (add > 0) lines[k] += add;
+            }
+        }
+
+        return lines.Select(kv => new StatRoll
+        {
+            statType = kv.Key,
+            statValue = kv.Value,
+            name = STAT_NAMES.GetValueOrDefault(kv.Key, $"Type{kv.Key}")
+        }).ToList();
     }
 
     private string BuildFingerprint(dynamic analysis)
@@ -1714,16 +1986,17 @@ public class LootifierController : Controller
                 new { Mult = goldMult, Entry = newEntry });
         }
 
-        // Promote Glory (90%+) and Gods (98%+) variants to Epic quality
-        if (roll.budgetPct >= 90)
-        {
-            await conn.ExecuteAsync(
-                "UPDATE item_template SET quality = 4 WHERE entry = @Entry AND quality < 4",
-                new { Entry = newEntry });
-        }
+        // Variant quality via the shared tier ladder, floored at the base's own
+        // quality (never below what it replaces). Legendary results lose disenchant.
+        int baseQuality = GetPropInt(baseItem, "quality");
+        string tier = CanonicalTier(roll.tierLabel ?? "", roll.budgetPct);
+        int variantQuality = VariantQuality(tier, baseQuality);
+        await conn.ExecuteAsync(
+            "UPDATE item_template SET quality = @Q WHERE entry = @Entry",
+            new { Q = variantQuality, Entry = newEntry });
+        if (variantQuality >= 5)
+            await ClearDisenchant(conn, newEntry);
     }
-
-    // The original InsertVariantItem (used by single-source commit, unchanged)
 
     private async Task InsertVariantItem(MySqlConnector.MySqlConnection conn, dynamic baseItem, int newEntry, CommitRoll roll)
     {
@@ -1834,13 +2107,16 @@ public class LootifierController : Controller
                 new { Mult = goldMult, Entry = newEntry });
         }
 
-        // Promote Glory (90%+) and Gods (98%+) variants to Epic quality
-        if (roll.budgetPct >= 90)
-        {
-            await conn.ExecuteAsync(
-                "UPDATE item_template SET quality = 4 WHERE entry = @Entry AND quality < 4",
-                new { Entry = newEntry });
-        }
+        // Variant quality via the shared tier ladder, floored at the base's own
+        // quality (never below what it replaces). Legendary results lose disenchant.
+        int baseQuality = GetPropInt(baseItem, "quality");
+        string tier = CanonicalTier(roll.tierLabel ?? "", roll.budgetPct);
+        int variantQuality = VariantQuality(tier, baseQuality);
+        await conn.ExecuteAsync(
+            "UPDATE item_template SET quality = @Q WHERE entry = @Entry",
+            new { Q = variantQuality, Entry = newEntry });
+        if (variantQuality >= 5)
+            await ClearDisenchant(conn, newEntry);
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1881,7 +2157,7 @@ public class LootifierController : Controller
         var analysis = AnalyzeItemStats(item);
         bool hasStats = (int)analysis.totalStats > 0;
         bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
-        if (!hasStats && !hasSpellEffects) return null;
+        if (!IsEquippableGear(item)) return null;
 
         float baseBudget = (float)analysis.weightedBudget;
         if (!hasStats && hasSpellEffects)
@@ -1968,7 +2244,7 @@ public class LootifierController : Controller
         var analysis = AnalyzeItemStats(item);
         bool hasStats = (int)analysis.totalStats > 0;
         bool hasSpellEffects = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
-        if (!hasStats && !hasSpellEffects) return null;
+        if (!IsEquippableGear(item)) return null;
 
         float baseBudget = (float)analysis.weightedBudget;
         if (!hasStats && hasSpellEffects)
@@ -2008,8 +2284,12 @@ public class LootifierController : Controller
             await InsertVariantItem(mangosConn, item, newEntry, roll);
 
         await mangosConn.ExecuteAsync(
-            "UPDATE item_template SET name = @Name, quality = 5, DisenchantID = 0 WHERE entry = @Entry",
+            "UPDATE item_template SET name = @Name, quality = 5 WHERE entry = @Entry",
             new { Name = legendaryName, Entry = newEntry });
+
+        // Legendaries aren't disenchantable. Column is `disenchant_id` in VMaNGOS
+        // (resolved from the live schema — see ResolveDisenchantColumn).
+        await ClearDisenchant(mangosConn, newEntry);
 
         await mangosConn.ExecuteAsync(
             "UPDATE item_template SET buy_price = ROUND(buy_price * 3), sell_price = ROUND(sell_price * 3) WHERE entry = @Entry",
@@ -2502,6 +2782,149 @@ public class LootifierController : Controller
     }
 
     // ══════════════════════════════════════════════════════════════
+    //  ADDITIVE POOLS (tunable "% that anything drops", no dilution)
+    //
+    //  Builds ONE independent reference pool per creature holding all of its
+    //  lootified variants (+ base at a 0.5% fallback), attached via a groupid=0
+    //  pointer whose ChanceOrQuestChance IS the overall drop chance. Because the
+    //  pointer is an independent (non-grouped) roll, this ADDS drops without
+    //  touching the creature's existing loot. Mobs with no loot table get one
+    //  minted. Everything is tracked so Rollback removes it cleanly.
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>Next free minted creature loot_id (no-loot mobs in additive mode).</summary>
+    private async Task<int> GetNextLootifierLootId(MySqlConnector.MySqlConnection mangosConn)
+    {
+        var maxId = await mangosConn.ExecuteScalarAsync<int?>(
+            "SELECT MAX(entry) FROM creature_loot_template WHERE entry >= @Start",
+            new { Start = LOOTIFIER_LOOTID_START });
+        return maxId.HasValue ? maxId.Value + 1 : LOOTIFIER_LOOTID_START;
+    }
+
+    /// <summary>
+    /// Creatures that already have an additive pool (idempotent re-runs skip them;
+    /// rollback the creature first to rebuild). Keyed by creature_entry.
+    /// </summary>
+    private async Task<HashSet<int>> LoadAdditivizedCreatures(MySqlConnector.MySqlConnection adminConn)
+    {
+        var set = new HashSet<int>();
+        if (!await TableExists(adminConn, "lootifier_loot_entries")) return set;
+        var rows = await adminConn.QueryAsync<int>(
+            "SELECT DISTINCT creature_entry FROM lootifier_loot_entries WHERE action_type = 'add_ptr'");
+        foreach (var ce in rows) set.Add(ce);
+        return set;
+    }
+
+    /// <summary>
+    /// Build one additive pool for a creature from all of its collected variant
+    /// sets. The base items are moved out of the creature's direct drops into the
+    /// pool at BASE_FLOOR_PCT (0.5%); the variants split the remaining share to
+    /// 100 (member-floored). The pool attaches as an independent groupid=0 pointer
+    /// at poolDropPct — the tunable "% chance anything from the pool drops".
+    /// Returns the number of pool members written.
+    /// </summary>
+    private async Task<int> BuildAdditivePool(MySqlConnector.MySqlConnection mangosConn,
+        MySqlConnector.MySqlConnection adminConn,
+        List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>? trackingRows,
+        int creatureEntry, int lootId, bool lootIdMinted,
+        List<(int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls)> batch, float poolDropPct)
+    {
+        if (batch.Count == 0) return 0;
+
+        int refEntry = await GetNextLootifierRefEntry(mangosConn);
+
+        // Record a minted loot_id so rollback can zero it again.
+        if (lootIdMinted)
+            await TrackLoot(adminConn, trackingRows, creatureEntry, "creature_template",
+                lootId, 0, "add_lootid", 0f, lootId);
+
+        var baseItems = batch.Select(b => b.baseItemEntry).Distinct().ToList();
+
+        // Move each base out of the creature's DIRECT drops (recording its original
+        // chance for rollback). Refs/shared pools are left untouched.
+        int pMin = 0, pMax = 10;
+        foreach (var baseEntry in baseItems)
+        {
+            var directRow = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
+                SELECT ChanceOrQuestChance AS chance, maxcount, patch_min, patch_max FROM creature_loot_template
+                WHERE entry = @LootId AND item = @Item AND mincountOrRef > 0",
+                new { LootId = lootId, Item = baseEntry });
+
+            float origChance = 0f;
+            if (directRow != null)
+            {
+                origChance = (float)directRow.chance;
+                pMin = (int)directRow.patch_min;
+                pMax = (int)directRow.patch_max;
+                await mangosConn.ExecuteAsync(
+                    "DELETE FROM creature_loot_template WHERE entry = @LootId AND item = @Item AND mincountOrRef > 0",
+                    new { LootId = lootId, Item = baseEntry });
+            }
+            await TrackLoot(adminConn, trackingRows, creatureEntry, "creature_loot_template",
+                lootId, baseEntry, "add_base", origChance, 0f);
+        }
+
+        // Gather variant weights across all this creature's base items.
+        var variants = new List<(int entry, float weight)>();
+        foreach (var b in batch)
+        {
+            int n = Math.Min(b.variantEntries.Count, b.rolls.Length);
+            for (int i = 0; i < n; i++)
+                variants.Add((b.variantEntries[i], PoolWeight(b.rolls[i].budgetPct)));
+        }
+
+        float baseFloorTotal = baseItems.Count * BASE_FLOOR_PCT;
+        float variantBudget = Math.Max(0f, 100f - baseFloorTotal);
+
+        var rawWeights = variants.Select(v => v.weight).ToArray();
+        var shares = DistributeWithFloor(rawWeights, variantBudget, MEMBER_FLOOR_PCT);
+        if (shares == null)
+        {
+            _poolWarnings?.Add(
+                $"Creature {creatureEntry}: {variants.Count} variants can't all reach {MEMBER_FLOOR_PCT}% in the additive pool — using unfloored split. Lower Variants per Item.");
+            shares = new float[variants.Count];
+            float rawSum = rawWeights.Sum();
+            for (int i = 0; i < variants.Count; i++)
+                shares[i] = rawSum > 0 ? variantBudget * (rawWeights[i] / rawSum) : variantBudget / Math.Max(1, variants.Count);
+        }
+
+        int added = 0;
+
+        // Base members at the rare fallback floor.
+        foreach (var baseEntry in baseItems)
+        {
+            await UpsertRefMember(mangosConn, refEntry, baseEntry, RoundChance(BASE_FLOOR_PCT), POOL_GROUP_ID, 1, pMin, pMax);
+            await TrackLoot(adminConn, trackingRows, creatureEntry, "reference_loot_template",
+                refEntry, baseEntry, "add_member", 0f, BASE_FLOOR_PCT);
+            added++;
+        }
+
+        // Variant members.
+        for (int i = 0; i < variants.Count; i++)
+        {
+            float chance = Math.Max(MIN_POOL_CHANCE, RoundChance(shares[i]));
+            await UpsertRefMember(mangosConn, refEntry, variants[i].entry, chance, POOL_GROUP_ID, 1, pMin, pMax);
+            await TrackLoot(adminConn, trackingRows, creatureEntry, "reference_loot_template",
+                refEntry, variants[i].entry, "add_member", 0f, chance);
+            added++;
+        }
+
+        // Independent pointer: groupid=0 → its own roll at poolDropPct. The item
+        // field carries the first base entry (its direct slot is now free), matching
+        // the direct-mint pointer convention and keeping (entry,item) unique.
+        int pointerItem = baseItems[0];
+        await mangosConn.ExecuteAsync(@"
+            INSERT INTO creature_loot_template (entry, item, ChanceOrQuestChance, groupid, mincountOrRef, maxcount, patch_min, patch_max)
+            VALUES (@LootId, @Item, @Chance, 0, @Ref, 1, @PMin, @PMax)
+            ON DUPLICATE KEY UPDATE ChanceOrQuestChance = @Chance, groupid = 0, mincountOrRef = @Ref, maxcount = 1",
+            new { LootId = lootId, Item = pointerItem, Chance = RoundChance(Math.Clamp(poolDropPct, 0f, 100f)), Ref = -refEntry, PMin = pMin, PMax = pMax });
+        await TrackLoot(adminConn, trackingRows, creatureEntry, "creature_loot_template",
+            lootId, pointerItem, "add_ptr", 0f, poolDropPct);
+
+        return added;
+    }
+
+    // ══════════════════════════════════════════════════════════════
     //  ANALYSIS
     // ══════════════════════════════════════════════════════════════
 
@@ -2602,6 +3025,7 @@ public class LootifierController : Controller
                 itemName = item != null ? (string)item.name : $"Item #{row.item}",
                 quality = item != null ? (int)item.quality : 0,
                 itemClass = item != null ? (int)item.@class : 0,
+                equippable = item != null && IsEquippableGear(item),
                 displayId = item != null ? (uint)item.display_id : 0u,
                 requiredLevel = item != null ? (int)item.required_level : 0,
                 itemLevel = item != null ? (int)item.item_level : 0,
@@ -2642,7 +3066,7 @@ public class LootifierController : Controller
                 loot_table VARCHAR(64) NOT NULL,
                 loot_entry INT NOT NULL,
                 item_entry INT NOT NULL,
-                action_type VARCHAR(16) NOT NULL,
+                action_type VARCHAR(32) NOT NULL,
                 original_chance FLOAT DEFAULT 0,
                 new_chance FLOAT DEFAULT 0,
                 created_at DATETIME NOT NULL,
@@ -2650,6 +3074,21 @@ public class LootifierController : Controller
                 INDEX idx_pair (loot_entry, item_entry),
                 INDEX idx_item (item_entry)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+        // Existing installs were created with action_type VARCHAR(16), which is too
+        // narrow for newer action names and made MariaDB (strict mode) throw
+        // "Data too long for column 'action_type'" mid-commit. CREATE TABLE IF NOT
+        // EXISTS won't alter an existing table, so widen it explicitly — idempotent,
+        // and skipped entirely when it's already wide enough.
+        var actionWidth = await adminConn.ExecuteScalarAsync<int?>(@"
+            SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'lootifier_loot_entries'
+              AND COLUMN_NAME = 'action_type'");
+        if (actionWidth.HasValue && actionWidth.Value < 32)
+        {
+            await adminConn.ExecuteAsync(
+                "ALTER TABLE lootifier_loot_entries MODIFY action_type VARCHAR(32) NOT NULL");
+        }
     }
 
     private async Task<int> GetNextLootifierId(MySqlConnector.MySqlConnection adminConn)
@@ -2677,6 +3116,38 @@ public class LootifierController : Controller
         return await conn.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @T",
             new { T = tableName }) > 0;
+    }
+
+    // ── Disenchant column ──
+    // Legendary variants should lose disenchant, but the column name is NOT stable
+    // across VMaNGOS schema revisions (DisenchantID / disenchant_id / DisenchantId)
+    // and some builds don't have it at all. Hardcoding "DisenchantID" threw
+    // "Unknown column 'DisenchantID' in 'SET'" and 500'd the whole commit. Resolve
+    // it from the live schema instead, and simply skip the update when absent.
+    // Cached per request (controllers are request-scoped) so a batch of thousands
+    // of inserts costs one information_schema lookup.
+    private string? _disenchantCol;
+    private bool _disenchantResolved;
+
+    private async Task<string?> ResolveDisenchantColumn(MySqlConnector.MySqlConnection conn)
+    {
+        if (_disenchantResolved) return _disenchantCol;
+        _disenchantCol = await conn.ExecuteScalarAsync<string?>(@"
+            SELECT COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item_template'
+              AND COLUMN_NAME IN ('DisenchantID', 'disenchant_id', 'DisenchantId')
+            LIMIT 1");
+        _disenchantResolved = true;
+        return _disenchantCol;
+    }
+
+    /// <summary>Clear disenchant on a legendary variant, if the schema has the column.</summary>
+    private async Task ClearDisenchant(MySqlConnector.MySqlConnection conn, int entry)
+    {
+        var col = await ResolveDisenchantColumn(conn);
+        if (col == null) return;
+        await conn.ExecuteAsync(
+            $"UPDATE item_template SET `{col}` = 0 WHERE entry = @Entry", new { Entry = entry });
     }
 
     private int GetPropInt(dynamic obj, string name)
@@ -2746,7 +3217,8 @@ public class RulesetDto
     public int variantsPerItem { get; set; } = 10;
     public bool allowNewAffixes { get; set; } = true;
     public int maxAffixCountChange { get; set; } = 1;
-    public string dropChanceStrategy { get; set; } = "preserve";
+    public string dropChanceStrategy { get; set; } = "preserve";  // "preserve" | "additive"
+    public float poolDropChancePct { get; set; } = 100f;          // additive: overall % that the pool drops anything
     public NamingTierDto[]? namingTiers { get; set; }
     // Legendary system
     public bool generateLegendary { get; set; } = false;

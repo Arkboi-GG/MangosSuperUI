@@ -18,16 +18,27 @@ public sealed record ChatJob(
 /// reserve. Drop order under pressure: trim opinions (persona-internal), then 1) halve
 /// live window keeping newest, 2) halve era digest, 3) drop in-game snapshot, 4) drop
 /// few-shot lines. System frame, mood line, and incoming line are never dropped.
+///
+/// AMENDED 2026-07-13 (repetition fix):
+///   • FEW-SHOT IS NOW SHUFFLED. It used to be ExampleLines.Take(3) — the same three
+///     anchors, every call, for the life of the bot. Those anchors are what a small model
+///     actually imitates, so a frozen triple is a frozen voice. 3 random of 5 per call.
+///   • REGISTER LINE (§10.4 step 6b's prompt half): the persona's swear_level × the
+///     voice.banter_intensity slider, rendered as an explicit instruction. The prompt is
+///     the PRIMARY channel for register; SwearTables is the backstop for when the model
+///     flinches and types "heck" anyway.
 /// </summary>
 public class PromptAssembler
 {
     private readonly ConnectionFactory _db;
+    private readonly ChatSettingsService _settings;
     private readonly ILogger<PromptAssembler> _logger;
     private string? _realmName;
 
-    public PromptAssembler(ConnectionFactory db, ILogger<PromptAssembler> logger)
+    public PromptAssembler(ConnectionFactory db, ChatSettingsService settings, ILogger<PromptAssembler> logger)
     {
         _db = db;
+        _settings = settings;
         _logger = logger;
     }
 
@@ -52,7 +63,9 @@ public class PromptAssembler
             if (est <= cap || pass >= 6)
             {
                 var report = $"win={window.Count}L era={EstimateTokens(eraDigest)}t snap={includeSnapshot} " +
-                             $"fewshot={includeFewShot} opinions={opinions.Count} est={est}t cap={cap}t";
+                             $"fewshot={includeFewShot} opinions={opinions.Count} " +
+                             $"swear={SwearTables.EffectiveLevel(card.Typing.SwearLevel, Banter())} " +
+                             $"est={est}t cap={cap}t";
                 if (est > cap)
                     _logger.LogWarning("[CHAT-ENGINE] prompt over budget after all drops for {Bot}: {Report}", job.BotName, report);
                 return (system, user, est, report);
@@ -70,6 +83,8 @@ public class PromptAssembler
         var (sysF, userF) = Render(job, card, opinions, window, eraDigest, includeSnapshot, includeFewShot);
         return (sysF, userF, EstimateTokens(sysF) + EstimateTokens(userF), "exhausted");
     }
+
+    private float Banter() => _settings.GetFloat(0, "voice.banter_intensity", 0.5f);
 
     private (string System, string User) Render(ChatJob job, PersonaCard card, List<string> opinions,
         List<(string Speaker, string Line)> window, string eraDigest, bool snapshot, bool fewShot)
@@ -108,11 +123,11 @@ public class PromptAssembler
         sb.AppendLine(string.IsNullOrWhiteSpace(job.RelationshipSummary) ? "You don't know this person." : job.RelationshipSummary);
         sb.AppendLine();
 
-        // ── Few-shot anchors (3 of 5) ──
+        // ── Few-shot anchors: 3 RANDOM of 5, reshuffled every call (§10.3 amendment) ──
         if (fewShot && card.ExampleLines.Count > 0)
         {
             sb.AppendLine("How you type — examples of lines you have written:");
-            foreach (var line in card.ExampleLines.Take(3))
+            foreach (var line in card.ExampleLines.OrderBy(_ => Random.Shared.Next()).Take(3))
                 sb.AppendLine(line);
             sb.AppendLine();
         }
@@ -122,7 +137,14 @@ public class PromptAssembler
         sb.AppendLine("typing. No emojis. No quotation marks around your reply. If you don't know something,");
         sb.AppendLine("say so like a person would. You may talk about the game or your real life, whichever");
         sb.AppendLine("fits. Your character's class, race, faction, level, and location are EXACTLY as stated");
-        sb.Append("above — never claim different ones, and never invent dungeons or places. /no_think");
+        sb.AppendLine("above — never claim different ones, and never invent dungeons or places.");
+
+        // ── Register (§10.4 step 6b's prompt half) ──
+        var register = SwearTables.RegisterLine(SwearTables.EffectiveLevel(card.Typing.SwearLevel, Banter()));
+        if (!string.IsNullOrEmpty(register))
+            sb.AppendLine(register);
+
+        sb.Append("/no_think");
 
         // ── User: live window transcript, newest last, ending with the incoming line + cue ──
         var user = new StringBuilder();

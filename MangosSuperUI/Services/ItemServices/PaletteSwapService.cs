@@ -193,6 +193,597 @@ public class PaletteSwapService
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // SEEDED RECOLOR — deterministic, no LLM, no colour dictionary
+    //
+    // Everything the instruction path does — LLM recipe, colour-name lookup,
+    // fallback chain — exists to turn a WORD into a TargetColor(H, S, behavior).
+    // That is the whole job. So skip it: synthesise the targets from a seed.
+    //
+    // The seed is derived from (base item, tier), which buys three properties the
+    // theme path could not have:
+    //
+    //   • Tiers of ONE item look unrelated to each other — not a gradient of the
+    //     same hue, because the seed changes completely between tiers.
+    //   • The SAME tier across DIFFERENT items looks different — because the item
+    //     is in the seed. No "every epic is purple". The old DefaultTierTheme was
+    //     literally a rarity lookup table (improved→silver, power→cobalt,
+    //     glory→royal purple, gods→molten gold), which stamped the WoW quality
+    //     colour onto the texture and told you nothing about the item.
+    //   • It is STABLE. Same item, same tier, same colours after a regen or a
+    //     restart. A rebuild does not reshuffle the entire item database.
+    //
+    // Families are fanned out around the seed hue by the GOLDEN ANGLE so they can
+    // never collapse onto one another. Preserving the spread BETWEEN families is
+    // what preserves readability: the leather still reads apart from its metal
+    // trim. Collapsing everything toward a single target colour is precisely what
+    // made the theme path look like mush.
+    //
+    // Lightness is preserved per-pixel, so the hand-painted sculpting survives
+    // intact — only hue and saturation move.
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════
+    // RECOLOR THEORIES
+    //
+    // Each theory maps (seed, families, tier knobs) → per-family TargetColors.
+    // They exist to be A/B tested — the TheorySheet endpoint renders all of them
+    // side-by-side, and the queue can render extra theories into variant patch
+    // archives. Every theory attacks a specific measured defect of "fan":
+    //
+    //   fan         The original: golden-angle spread from a uniform-random hue.
+    //               Defects: uniform-random hue over-produces the perceptually
+    //               huge green band and the pink/magenta stretch; max-spread
+    //               families read as clash, not palette; tier changes only
+    //               intensity, never composition. Kept as baseline.
+    //
+    //   identity    "A better version of itself." Each family keeps its OWN hue,
+    //               shifted a modest seeded ±35°, so blue gear stays recognisably
+    //               blue-family. Tier drives saturation + contrast expansion.
+    //
+    //   analogous   One seeded mood. All families placed inside a ±30° analogous
+    //               band around the seed hue; dominant family goes rich/deep,
+    //               the smallest goes light — a designed colorway, not a fan.
+    //
+    //   accent      Analogous body + the SMALLEST family flipped to the
+    //               complement (base+180°), saturated, lifted: the "gold trim on
+    //               blue plate" structure real gear sets use. Tier scales how
+    //               loud the accent is.
+    //
+    //   luminance   Direction from the item's own value structure: dark items go
+    //               DARKER and richer with the brightest family pushed light as
+    //               an accent; light items go lighter and cleaner with one deep
+    //               saturated accent. Hue barely moves (±15°) — quality is
+    //               expressed in contrast, not hue roulette.
+    //
+    //   bank        Curated palette bank. The seed picks one of ~16 hand-chosen
+    //               palettes (each a coherent 3-hue set with assigned roles);
+    //               families map to palette roles by coverage rank. Trades
+    //               variety for guaranteed taste.
+    // ═══════════════════════════════════════════════════════════════════
+
+    public static readonly string[] RecolorTheories =
+        { "fan", "identity", "analogous", "accent", "luminance", "bank" };
+
+    /// <summary>Canonical hue centres per detected family — used by theories that
+    /// preserve family identity. Grey has no meaningful hue; callers substitute
+    /// the seed hue for it.</summary>
+    private static readonly Dictionary<string, float> FamilyHueCentre = new()
+    {
+        ["red"] = 2f,
+        ["orange"] = 28f,
+        ["brown"] = 28f,
+        ["gold"] = 48f,
+        ["green"] = 110f,
+        ["blue"] = 215f,
+        ["purple"] = 285f,
+    };
+
+    // Each palette: (name, hues for roles dominant/secondary/accent,
+    // accent gets a lightness lift). Sat values are pre-tier-scale.
+    private static readonly (string Name, (float H, float S)[] Roles)[] PaletteBank =
+    {
+        ("obsidian_ember",   new[] { (250f, .12f), (20f, .55f), (35f, .90f) }),
+        ("royal_gold",       new[] { (222f, .58f), (232f, .40f), (46f, .85f) }),
+        ("verdigris",        new[] { (165f, .45f), (150f, .30f), (40f, .70f) }),
+        ("bloodsteel",       new[] { (355f, .55f), (240f, .10f), (0f,  .85f) }),
+        ("ivory_rose",       new[] { (35f,  .15f), (350f, .35f), (345f, .75f) }),
+        ("deepsea",          new[] { (205f, .60f), (190f, .45f), (55f, .80f) }),
+        ("wraith",           new[] { (270f, .40f), (260f, .25f), (140f, .75f) }),
+        ("emberforge",       new[] { (15f,  .65f), (30f,  .50f), (50f, .95f) }),
+        ("frostrune",        new[] { (200f, .35f), (210f, .20f), (185f, .85f) }),
+        ("thornwood",        new[] { (95f,  .40f), (35f,  .45f), (75f, .80f) }),
+        ("duskfall",         new[] { (285f, .50f), (315f, .40f), (35f, .80f) }),
+        ("stormherald",      new[] { (225f, .50f), (235f, .30f), (55f, .90f) }),
+        ("ashen_jade",       new[] { (0f,   .08f), (160f, .40f), (150f, .80f) }),
+        ("sunfire",          new[] { (42f,  .70f), (25f,  .55f), (5f,  .85f) }),
+        ("midnight_violet",  new[] { (260f, .55f), (250f, .35f), (300f, .85f) }),
+        ("copperline",       new[] { (22f,  .50f), (30f,  .35f), (195f, .75f) }),
+    };
+
+    /// <summary>
+    /// Build per-family colour targets under the named theory. Families arrive
+    /// coverage-ordered (dominant first). Structural families (white/black) are
+    /// handled by the caller and never reach this method.
+    /// </summary>
+    private static List<(string Family, TargetColor Target)> BuildSeededTargets(
+        string theory, Random rng, float baseHue,
+        List<DetectedFamily> chromatic, float satScale, float lightBias)
+    {
+        var outp = new List<(string, TargetColor)>();
+        int n = chromatic.Count;
+        if (n == 0) return outp;
+
+        static float CircSigned(float a, float b) => ((a - b + 540f) % 360f) - 180f;
+
+        // TRIM = the family that carries the item's visual contrast: highest
+        // coverage x hue-distance-from-dominant. Coverage rank alone hands
+        // the accent role to invisible slivers (a 4% orange) while the real
+        // trim (31% gold buckles) gets a body hue — the "teal and green with
+        // no true colour delta" failure.
+        int trimIdx = -1;
+        if (n > 1)
+        {
+            float best = -1f;
+            for (int i = 1; i < n; i++)
+            {
+                float score = chromatic[i].Percent
+                    * Math.Abs(CircSigned(chromatic[i].MeanHue, chromatic[0].MeanHue)) / 180f;
+                if (score > best) { best = score; trimIdx = i; }
+            }
+        }
+
+        float Wrap(float h) => ((h % 360f) + 360f) % 360f;
+        float Sat(DetectedFamily f, float s) =>
+            Math.Clamp(Math.Max(Math.Max(f.MeanSat, CHROMA_SAT_FLOOR), s) * satScale, 0.05f, 0.95f);
+        float FamHue(DetectedFamily f) =>
+            FamilyHueCentre.TryGetValue(f.Family, out var h) ? h : baseHue;
+
+        // Contrast expansion shared by several theories: push each family away
+        // from mid-grey, scaled by the tier's lightBias.
+        (LBehavior b, float o) Expand(DetectedFamily f, float mult = 1f) =>
+            lightBias > 0.001f
+                ? (f.MeanLightness < 0.5f ? LBehavior.DropTo : LBehavior.LiftTo, lightBias * mult)
+                : (LBehavior.Preserve, 0f);
+
+        switch (theory)
+        {
+            case "identity":
+                {
+                    // Same colour story, told better. Seeded shift is shared across
+                    // the item so families move together; magnitude modest.
+                    float shift = (float)(rng.NextDouble() * 70.0 - 35.0);
+                    foreach (var f in chromatic)
+                    {
+                        var (b, o) = Expand(f);
+                        outp.Add((f.Family, new TargetColor(
+                            Wrap(FamHue(f) + shift), Sat(f, 0f), b, o)));
+                    }
+                    break;
+                }
+
+            case "analogous":
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        var f = chromatic[i];
+                        // Centre the band on the seed hue; spread families 25° apart
+                        // inside it. Dominant = deepest, smallest = lightest.
+                        float hue = Wrap(baseHue + (i - (n - 1) / 2f) * 25f
+                                         + (float)(rng.NextDouble() * 12 - 6));
+                        LBehavior b; float o;
+                        if (i == 0 && lightBias > 0.001f) { b = LBehavior.DropTo; o = lightBias; }
+                        else if (i == n - 1 && lightBias > 0.001f) { b = LBehavior.LiftTo; o = lightBias * 1.4f; }
+                        else (b, o) = Expand(f, 0.6f);
+                        outp.Add((f.Family, new TargetColor(hue, Sat(f, 0.30f), b, o)));
+                    }
+                    break;
+                }
+
+            case "accent":
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        var f = chromatic[i];
+                        bool isAccent = n > 1 && i == trimIdx;   // the item's visual trim
+                        float hue = isAccent
+                            ? Wrap(baseHue + 180f + (float)(rng.NextDouble() * 16 - 8))
+                            : Wrap(baseHue + i * 18f + (float)(rng.NextDouble() * 10 - 5));
+                        float sat = isAccent
+                            ? Math.Clamp(0.65f * satScale, 0.3f, 0.95f)   // accent gets LOUDER with tier
+                            : Sat(f, 0.28f);
+                        var (b, o) = isAccent
+                            ? (LBehavior.LiftTo, Math.Max(lightBias * 1.5f, 0.04f))
+                            : Expand(f, 0.7f);
+                        outp.Add((f.Family, new TargetColor(hue, sat, b, o)));
+                    }
+                    break;
+                }
+
+            case "luminance":
+                {
+                    // The user's thesis, formalized: quality reads as VALUE structure.
+                    // Direction comes from the item's own coverage-weighted lightness.
+                    float meanL = chromatic.Sum(f => f.MeanLightness * f.Percent)
+                                / Math.Max(1f, chromatic.Sum(f => f.Percent));
+                    bool dark = meanL < 0.48f;
+                    var brightest = chromatic.OrderByDescending(f => f.MeanLightness).First();
+                    var darkest = chromatic.OrderBy(f => f.MeanLightness).First();
+
+                    foreach (var f in chromatic)
+                    {
+                        float hue = Wrap(FamHue(f) + (float)(rng.NextDouble() * 30 - 15));
+                        float sat; LBehavior b; float o;
+                        if (dark)
+                        {
+                            // Darker and richer — except the brightest family, which
+                            // becomes the small light accent that makes dark read as
+                            // EXPENSIVE rather than muddy.
+                            bool accent = ReferenceEquals(f, brightest) && n > 1;
+                            sat = accent ? Math.Clamp(0.60f * satScale, .3f, .95f) : Sat(f, 0.30f);
+                            b = accent ? LBehavior.LiftTo : LBehavior.DropTo;
+                            o = (accent ? 1.8f : 1.0f) * Math.Max(lightBias, 0.03f);
+                        }
+                        else
+                        {
+                            // Lighter and cleaner — one deep saturated anchor so it
+                            // doesn't wash out.
+                            bool anchor = ReferenceEquals(f, darkest) && n > 1;
+                            sat = anchor ? Math.Clamp(0.65f * satScale, .3f, .95f) : Sat(f, 0.18f) * 0.85f;
+                            b = anchor ? LBehavior.DropTo : LBehavior.LiftTo;
+                            o = (anchor ? 1.6f : 1.0f) * Math.Max(lightBias, 0.03f);
+                        }
+                        outp.Add((f.Family, new TargetColor(hue, sat, b, o)));
+                    }
+                    break;
+                }
+
+            case "bank":
+                {
+                    var pal = PaletteBank[Math.Abs(rng.Next()) % PaletteBank.Length];
+                    for (int i = 0; i < n; i++)
+                    {
+                        var f = chromatic[i];
+                        (float H, float S) role;
+                        bool isAccent;
+                        if (n > 1 && i == trimIdx)
+                        {
+                            role = pal.Roles[pal.Roles.Length - 1];   // trim carries the palette's accent
+                            isAccent = true;
+                        }
+                        else
+                        {
+                            int slot = (trimIdx < 0 || i < trimIdx) ? i : i - 1;
+                            role = pal.Roles[Math.Min(slot, pal.Roles.Length - 2)];
+                            isAccent = false;
+                        }
+                        var (b, o) = isAccent
+                            ? (LBehavior.LiftTo, Math.Max(lightBias * 1.4f, 0.03f))
+                            : Expand(f, 0.8f);
+                        outp.Add((f.Family, new TargetColor(
+                            Wrap(role.H + (float)(rng.NextDouble() * 8 - 4)),
+                            Math.Clamp(role.S * satScale, 0.05f, 0.95f), b, o)));
+                    }
+                    break;
+                }
+
+            default: // "fan" — the original behaviour, verbatim
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        var f = chromatic[i];
+                        float jitter = (float)(rng.NextDouble() * 24.0 - 12.0);
+                        float hue = Wrap(baseHue + GOLDEN_ANGLE * i + jitter);
+                        float sat = Math.Clamp(Math.Max(f.MeanSat, CHROMA_SAT_FLOOR) * satScale, 0.05f, 0.95f);
+                        var (b, o) = Expand(f);
+                        outp.Add((f.Family, new TargetColor(hue, sat, b, o)));
+                    }
+                    break;
+                }
+        }
+
+        // PALETTE-SPAN GUARD: if the SOURCE was genuinely two-tone (dominant
+        // vs trim >= 60° apart), the target palette must keep that contrast:
+        // required = min(140°, srcSpan · 0.85). Rotate the trim target
+        // outward, preserving the side it already sits on. identity/fan/
+        // luminance pass by construction; analogous gets two-toned only when
+        // the source was. (Within-family contrast has spread re-injection;
+        // this is its between-family sibling.)
+        if (n > 1 && trimIdx > 0 && outp.Count > trimIdx)
+        {
+            float dSrc = Math.Abs(CircSigned(chromatic[trimIdx].MeanHue, chromatic[0].MeanHue));
+            if (dSrc >= 60f)
+            {
+                float required = Math.Min(140f, dSrc * 0.85f);
+                var domT = outp[0].Item2;
+                var (trimFam, trimT) = outp[trimIdx];
+                float dTgt = CircSigned(trimT.H, domT.H);
+                if (Math.Abs(dTgt) < required)
+                {
+                    float sign = dTgt == 0f ? 1f : Math.Sign(dTgt);
+                    float newH = Wrap(domT.H + sign * required);
+                    outp[trimIdx] = (trimFam, new TargetColor(newH, trimT.S, trimT.Behavior, trimT.Offset));
+                }
+            }
+        }
+        return outp;
+    }
+
+    /// <summary>
+    /// Cluster chromatic families whose (MeanHue, MeanSat) chroma-plane
+    /// positions nearly coincide — one visual MATERIAL oversegmented by the
+    /// overlapping family predicates (gold/brown/orange on a single buckle).
+    /// Measured on 5770: the warm trio sat within 0.2 of each other in the
+    /// chroma plane while holding three DIFFERENT palette roles, so the RBF
+    /// averaged their targets and collapsed the item's 161° two-tone to ~70°.
+    /// Greedy in coverage order; the representative keeps the heaviest
+    /// member's name so FamilyHueCentre lookups still resolve.
+    /// </summary>
+    private static List<(DetectedFamily Group, List<DetectedFamily> Members)> GroupMaterials(
+        List<DetectedFamily> fams, float threshold = 0.25f)
+    {
+        var groups = new List<(DetectedFamily Group, List<DetectedFamily> Members)>();
+        foreach (var f in fams)
+        {
+            double rad = f.MeanHue * Math.PI / 180.0;
+            double px = f.MeanSat * Math.Cos(rad), py = f.MeanSat * Math.Sin(rad);
+            bool placed = false;
+            for (int gi = 0; gi < groups.Count; gi++)
+            {
+                var (g, members) = groups[gi];
+                double grad = g.MeanHue * Math.PI / 180.0;
+                double gx = g.MeanSat * Math.Cos(grad), gy = g.MeanSat * Math.Sin(grad);
+                double d = Math.Sqrt((px - gx) * (px - gx) + (py - gy) * (py - gy));
+                if (d < threshold)
+                {
+                    float tot = g.Percent + f.Percent;
+                    double cx = (gx * g.Percent + px * f.Percent) / tot;
+                    double cy = (gy * g.Percent + py * f.Percent) / tot;
+                    var merged = new DetectedFamily(
+                        g.Family,
+                        g.PixelCount + f.PixelCount,
+                        tot,
+                        (float)Math.Sqrt(cx * cx + cy * cy),
+                        (g.MeanLightness * g.Percent + f.MeanLightness * f.Percent) / tot,
+                        (float)((Math.Atan2(cy, cx) * 180.0 / Math.PI + 360.0) % 360.0));
+                    members.Add(f);
+                    groups[gi] = (merged, members);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed)
+                groups.Add((f, new List<DetectedFamily> { f }));
+        }
+        return groups.OrderByDescending(g => g.Group.Percent).ToList();
+    }
+
+    /// <summary>Families that carry FORM, not colour. Left alone by default.</summary>
+    private static readonly HashSet<string> StructuralFamilies = new() { "white", "black" };
+
+    /// <summary>
+    /// Even a near-neutral family (bare steel, s≈0.12) must read as a colourway,
+    /// or a plate chestpiece would barely change between tiers. Floor its chroma.
+    /// </summary>
+    private const float CHROMA_SAT_FLOOR = 0.20f;
+
+    private const float GOLDEN_ANGLE = 137.507764f;
+
+    /// <summary>
+    /// Recolor a texture from a SEED rather than an instruction.
+    /// </summary>
+    /// <param name="seed">Stable per (item, tier). Same seed → same colours, always.</param>
+    /// <param name="satScale">Tier intensity. 1.0 = keep each family's own vividness.</param>
+    /// <param name="lightBias">&gt;0 pushes darks darker and lights lighter, widening
+    /// contrast with the tier rather than flattening it. 0 = leave lightness alone.</param>
+    /// <param name="tintStructural">When true, highlights/shadows take a whisper of the
+    /// seed hue. Default false: they stay neutral, which is what keeps a specular
+    /// highlight looking like a highlight instead of a coloured blob.</param>
+    /// <param name="theory">
+    /// Which colour strategy builds the family targets. The original "fan"
+    /// (golden-angle spread from a random hue) is kept as the default, but it has
+    /// two measured aesthetic defects: uniform-random hue over-produces the wide
+    /// green and pink perceptual bands ("blues getting green stuff, purples going
+    /// pink"), and maximum hue spread between families reads as clash, not
+    /// palette. See BuildSeededTargets for the alternatives.
+    /// </param>
+    /// <param name="tierKd">Tier stage — shadow toe. See the POST-TENT TIER STAGE
+    /// block in ApplySmoothMap. All four default to 0 = stage off (legacy
+    /// behaviour, byte-identical). Callers using the stage as the tier axis
+    /// MUST pass satScale=1 and lightBias=0 — stacking both double-darkens.</param>
+    /// <param name="tierKu">Tier stage — highlight drive toward white.</param>
+    /// <param name="tierM">Tier stage — saturation headroom curve.</param>
+    /// <param name="tierPop">Tier stage — specular pop on the top-4% brightest pixels.</param>
+    /// <param name="swapBudget">Tier policy — cumulative pixel share the tier may
+    /// replace, smallest material first (minimum one). Materials outside the
+    /// budget are pinned to their own source chroma. Default 1.01 = swap all.</param>
+    /// <param name="hueLeash">Tier policy — max hue distance a swapped material may
+    /// roll from its OWN hue. Tight = "slightly different trim, same item".
+    /// 180 = unleashed. Contrast (the span guard) outranks the leash.</param>
+    public async Task<string?> RecolorSeededAsync(
+        string sourcePngPath, string outputPath, int seed,
+        float satScale = 1.0f, float lightBias = 0.0f, bool tintStructural = false,
+        CancellationToken ct = default, string theory = "fan",
+        float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f,
+        float swapBudget = 1.01f, float hueLeash = 180f)
+    {
+        await Task.Yield();
+
+        try
+        {
+            if (!File.Exists(sourcePngPath))
+            {
+                _logger.LogWarning("PaletteSwap[seed]: source PNG not found: {Path}", sourcePngPath);
+                return null;
+            }
+
+            using var source = SKBitmap.Decode(sourcePngPath);
+            if (source == null)
+            {
+                _logger.LogWarning("PaletteSwap[seed]: failed to decode source PNG");
+                return null;
+            }
+
+            var present = DetectFamilies(sourcePngPath);
+            if (present.Count == 0)
+            {
+                _logger.LogWarning("PaletteSwap[seed]: no families detected in {Path}", sourcePngPath);
+                return null;
+            }
+
+            var rng = new Random(seed);
+            float baseHue = (float)(rng.NextDouble() * 360.0);
+
+            var resolved = new List<(string Family, TargetColor Target)>();
+            bool themed = !string.IsNullOrEmpty(theory) && theory != "fan";
+
+            // Chromatic families first, ordered by coverage, so the DOMINANT family
+            // anchors the colourway and the rest fan out around it.
+            var chromatic = present.Where(f => !StructuralFamilies.Contains(f.Family)).ToList();
+            var structural = present.Where(f => StructuralFamilies.Contains(f.Family)).ToList();
+
+            // A texture can legitimately be ALL structural — a near-black leather
+            // boot, a bleached bone-white tabard. Holding white/black neutral is the
+            // right call when there is chromatic content to carry the colourway, but
+            // when there ISN'T, it means recoloring nothing at all: the slot is
+            // dropped and the piece stays vanilla.
+            //
+            // So when nothing chromatic exists, promote the structural families and
+            // let them carry the colour themselves. Lightness is still preserved
+            // per-pixel, so a black boot stays black-VALUED — it just picks up a
+            // tint. Better a subtly tinted dark boot than an untouched one.
+            if (chromatic.Count == 0 && structural.Count > 0)
+            {
+                _logger.LogInformation(
+                    "PaletteSwap[seed {Seed}]: no chromatic families — promoting {N} structural family(s) to carry the colourway",
+                    seed, structural.Count);
+                chromatic = structural;
+                structural = new List<DetectedFamily>();
+            }
+
+            // Material grouping: one palette role per MATERIAL, not per
+            // predicate family (see GroupMaterials); the group's target fans
+            // out to every member so their near-coincident RBF anchors agree.
+            //
+            // TIER POLICY (progressive tiers — "how much of the item changes"):
+            //   swapBudget — the tier replaces materials totalling at most this
+            //     share of pixels, smallest material first (minimum one).
+            //     Everything outside the budget is PINNED to its own source
+            //     chroma: a self-anchor the RBF holds in place. improved
+            //     changes only the trim; gods swaps everything.
+            //   hueLeash — how far a swapped material may roll from its OWN
+            //     hue. Tight leash = "a slightly different trim on the same
+            //     item"; 180 = off.
+            // Contrast outranks the leash: the final span guard re-runs
+            // against the FINAL dominant hue, because a pinned dominant sits
+            // at its source hue, not the theory's roll.
+            static float CircSigned(float a, float b) => ((a - b + 540f) % 360f) - 180f;
+            static float WrapHue(float h) => ((h % 360f) + 360f) % 360f;
+
+            var matGroups = GroupMaterials(chromatic);
+            var groupFams = matGroups.Select(g => g.Group).ToList();
+            var groupTargets = BuildSeededTargets(theory, rng, baseHue, groupFams, satScale, lightBias);
+
+            var swappedIdx = new HashSet<int>();
+            {
+                float cum = 0f;
+                foreach (int gi in Enumerable.Range(0, matGroups.Count)
+                                             .OrderBy(i => matGroups[i].Group.Percent))
+                {
+                    if (swappedIdx.Count == 0 || cum + matGroups[gi].Group.Percent <= swapBudget * 100f)
+                    {
+                        swappedIdx.Add(gi);
+                        cum += matGroups[gi].Group.Percent;
+                    }
+                }
+            }
+
+            var finalTargets = new List<(string Family, TargetColor Target)>();
+            for (int gi = 0; gi < groupTargets.Count && gi < matGroups.Count; gi++)
+            {
+                var g = matGroups[gi].Group;
+                var tgt = groupTargets[gi].Target;
+                if (!swappedIdx.Contains(gi))
+                {
+                    tgt = new TargetColor(g.MeanHue, Math.Max(g.MeanSat, 0.02f), LBehavior.Preserve);   // pin
+                }
+                else if (hueLeash < 179f)
+                {
+                    float d = CircSigned(tgt.H, g.MeanHue);
+                    if (Math.Abs(d) > hueLeash)
+                        tgt = new TargetColor(WrapHue(g.MeanHue + (d > 0 ? hueLeash : -hueLeash)),
+                                              tgt.S, tgt.Behavior, tgt.Offset);
+                }
+                finalTargets.Add((groupTargets[gi].Family, tgt));
+            }
+
+            if (matGroups.Count > 1)
+            {
+                int tIdx = -1; float bestScore = -1f;
+                for (int i = 1; i < matGroups.Count; i++)
+                {
+                    float score = matGroups[i].Group.Percent
+                        * Math.Abs(CircSigned(matGroups[i].Group.MeanHue, matGroups[0].Group.MeanHue)) / 180f;
+                    if (score > bestScore) { bestScore = score; tIdx = i; }
+                }
+                if (tIdx > 0 && swappedIdx.Contains(tIdx))
+                {
+                    float dSrc = Math.Abs(CircSigned(matGroups[tIdx].Group.MeanHue, matGroups[0].Group.MeanHue));
+                    if (dSrc >= 60f)
+                    {
+                        float required = Math.Min(140f, dSrc * 0.85f);
+                        var domT = finalTargets[0].Target;
+                        var (trimFam, trimT) = finalTargets[tIdx];
+                        float dFin = CircSigned(trimT.H, domT.H);
+                        if (Math.Abs(dFin) < required)
+                        {
+                            float sign = dFin >= 0f ? 1f : -1f;
+                            finalTargets[tIdx] = (trimFam, new TargetColor(
+                                WrapHue(domT.H + sign * required), trimT.S, trimT.Behavior, trimT.Offset));
+                        }
+                    }
+                }
+            }
+
+            for (int gi = 0; gi < finalTargets.Count && gi < matGroups.Count; gi++)
+                foreach (var member in matGroups[gi].Members)
+                    resolved.Add((member.Family, finalTargets[gi].Target));
+
+            // Highlights and shadows: left alone unless explicitly asked for. This
+            // is the whole point of separating them out of "grey" — a spec highlight
+            // that gets grey's hue AND grey's saturation stops being a highlight.
+            foreach (var f in structural)
+            {
+                if (!tintStructural) continue;
+                float sat = Math.Min(f.MeanSat, 0.08f);   // a whisper, nothing more
+                resolved.Add((f.Family, new TargetColor(baseHue, sat, LBehavior.Preserve)));
+            }
+
+            if (resolved.Count == 0)
+            {
+                _logger.LogWarning("PaletteSwap[seed]: texture is entirely structural (all white/black) — nothing to recolor");
+                return null;
+            }
+
+            _logger.LogInformation(
+                "PaletteSwap[seed {Seed}]: {N} family(s), base H={Base:F0}°, satScale={SS:F2} → {List}",
+                seed, resolved.Count, baseHue, satScale,
+                string.Join(", ", resolved.Select(r => $"{r.Family}→H={r.Target.H:F0}° S={r.Target.S:F2}")));
+
+            using var remapped = ApplyPerPixel(source, resolved, null,
+                tierKd, tierKu, tierM, tierPop);
+
+            using var outStream = File.Create(outputPath);
+            remapped.Encode(outStream, SKEncodedImageFormat.Png, 100);
+            return outputPath;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "PaletteSwap[seed]: RecolorSeededAsync failed");
+            return null;
+        }
+    }
+
     /// <summary>
     /// Scan a source texture and return the color families actually present,
     /// ordered by pixel count (most common first). Deterministic — no model.
@@ -209,10 +800,30 @@ public class PaletteSwapService
         var counts = new Dictionary<string, int>();
         var satSum = new Dictionary<string, float>();
         var lSum = new Dictionary<string, float>();
+        var hueCos = new Dictionary<string, double>();   // circular mean hue —
+        var hueSin = new Dictionary<string, double>();   // arithmetic mean breaks at the 0/360 wrap
         int total = 0;
 
-        // All family names we can detect (the predicate set)
-        string[] families = { "grey", "gold", "brown", "blue", "red", "green", "orange", "purple" };
+        // The families we scan for, IN PRIORITY ORDER — first match wins per pixel.
+        //
+        // "white" and "black" used to be absent from this array entirely, even
+        // though MatchesFamily defines both and KnownFamilies lists both. The
+        // consequence was structural: "grey" runs first and its predicate is
+        // `s < 0.30` with NO LIGHTNESS BOUND, so it silently swallowed every
+        // specular highlight AND every deep shadow in every texture. They were
+        // reported as grey, given grey's hue, and — worse — given grey's mean
+        // saturation. That is why hand-painted vanilla textures came out flat:
+        // the white-hot highlight, the mid-tone steel and the black crevice all
+        // received the same chroma. The highlights are what make those textures
+        // read, and the recolor was painting over them.
+        //
+        // (It also explains why VariationRecipeService has to manually inject a
+        // "white" family on every call — the detector structurally could not
+        // report one. That injection is a symptom of this bug, not a feature.)
+        //
+        // White and black must therefore be evaluated BEFORE grey, or grey claims
+        // their pixels first and adding them to this list changes nothing.
+        string[] families = { "white", "black", "grey", "gold", "brown", "blue", "red", "green", "orange", "purple" };
 
         for (int y = 0; y < source.Height; y++)
         {
@@ -225,11 +836,27 @@ public class PaletteSwapService
                 // First family that claims it (same order semantics as apply)
                 foreach (var fam in families)
                 {
+                    // MatchesFamily("black") is `l <= 0.20` with NO saturation
+                    // bound, so on its own it would also swallow dark-but-SATURATED
+                    // pixels: the shadow side of a red cloak, the deep folds of a
+                    // blue robe. Those are not black — they are the dark end of a
+                    // chromatic family's gradient. Classifying them as black would
+                    // leave them un-recolored while the lit side shifted, giving you
+                    // a cape that is blue in the light and red in the shadow.
+                    //
+                    // Guard the DETECTION so only genuinely neutral darks are
+                    // claimed. MatchesFamily itself is left alone — the instruction
+                    // path ("black for navy") keeps its existing semantics.
+                    if (fam == "black" && s >= 0.35f) continue;
+
                     if (MatchesFamily(fam, h, s, l))
                     {
                         counts[fam] = counts.GetValueOrDefault(fam, 0) + 1;
                         satSum[fam] = satSum.GetValueOrDefault(fam, 0) + s;
                         lSum[fam] = lSum.GetValueOrDefault(fam, 0) + l;
+                        double hr = h * Math.PI / 180.0;
+                        hueCos[fam] = hueCos.GetValueOrDefault(fam, 0.0) + Math.Cos(hr);
+                        hueSin[fam] = hueSin.GetValueOrDefault(fam, 0.0) + Math.Sin(hr);
                         break;
                     }
                 }
@@ -240,9 +867,11 @@ public class PaletteSwapService
         {
             // Ignore trivial families (< 2% of pixels) as noise
             if (n < total * 0.02) continue;
+            float meanHue = (float)((Math.Atan2(hueSin[fam] / n, hueCos[fam] / n)
+                                     * 180.0 / Math.PI + 360.0) % 360.0);
             result.Add(new DetectedFamily(
                 fam, n, 100f * n / Math.Max(1, total),
-                satSum[fam] / n, lSum[fam] / n));
+                satSum[fam] / n, lSum[fam] / n, meanHue));
         }
 
         _logger.LogInformation("PaletteSwap: Detected families: {List}",
@@ -642,7 +1271,8 @@ public class PaletteSwapService
     private SKBitmap ApplySmoothMap(SKBitmap result,
         float[] srcH, float[] srcS, float[] srcL, byte[] alpha, bool[] locked, SKColor[] lockedColor,
         int W, int H, List<(string Family, TargetColor Target)> swaps,
-        int totalPixels, int boxLeave, int boxForce)
+        int totalPixels, int boxLeave, int boxForce,
+        float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f)
     {
         int n = W * H;
 
@@ -662,6 +1292,7 @@ public class PaletteSwapService
         var oa = new List<float>(); var ob = new List<float>();
         var ta = new List<float>(); var tb = new List<float>();
         var atc = new List<TargetColor>();   // per-anchor target, for its lightness behavior
+        var oms = new List<float>();         // per-anchor source MEAN SATURATION — see spread re-injection below
         var anchorNames = new List<string>();
         foreach (var (fam, target) in swaps)
         {
@@ -671,17 +1302,18 @@ public class PaletteSwapService
             // Lightness is preserved per pixel already, so they don't belong here.
             string fl = fam.ToLowerInvariant();
             if (fl == "white" || fl == "black") continue;
-            double sa = 0, sb = 0; int cnt = 0;
+            double sa = 0, sb = 0, ss = 0; int cnt = 0;
             for (int i = 0; i < n; i++)
             {
                 if (locked[i]) continue;
-                if (MatchesFamily(fam, srcH[i], srcS[i], srcL[i])) { sa += fa[i]; sb += fb[i]; cnt++; }
+                if (MatchesFamily(fam, srcH[i], srcS[i], srcL[i])) { sa += fa[i]; sb += fb[i]; ss += srcS[i]; cnt++; }
             }
             if (cnt < SmoothAnchorMinPx) continue;
             double trad = target.H * Math.PI / 180.0;
             oa.Add((float)(sa / cnt)); ob.Add((float)(sb / cnt));
             ta.Add((float)(target.S * Math.Cos(trad))); tb.Add((float)(target.S * Math.Sin(trad)));
             atc.Add(target);
+            oms.Add((float)Math.Max(ss / cnt, 0.02));
             anchorNames.Add(fam);
         }
         int A = oa.Count;
@@ -704,11 +1336,19 @@ public class PaletteSwapService
         double twoSigSq = 2.0 * sigma * sigma;
         int touched = 0;
 
+        // ── PASS 1: RBF remap + spread re-injection + tent, into planes. ──
+        // The tier stage below needs whole-image statistics (lightness pivot,
+        // specular threshold), so the final colour write happens in pass 2.
+        var outHArr = new float[n];
+        var outSArr = new float[n];
+        var outLArr = new float[n];
+        var reachable = new bool[n];
+
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
             {
                 int i = y * W + x;
-                if (locked[i]) { result.SetPixel(x, y, lockedColor[i]); continue; }
+                if (locked[i]) continue;
 
                 float pa = fa[i], pb = fb[i];
                 double na = 0, nb = 0, nl = 0, wsum = 0;
@@ -721,22 +1361,159 @@ public class PaletteSwapService
                     wsum += w;
                 }
 
-                float outH, outS, outL;
                 if (wsum < 1e-9)
                 {
-                    outH = srcH[i]; outS = srcS[i]; outL = srcL[i];   // beyond every anchor's reach — keep original
+                    // beyond every anchor's reach — keep original. The tier stage
+                    // skips these pixels too: an untouched pixel must stay untouched.
+                    outHArr[i] = srcH[i]; outSArr[i] = srcS[i]; outLArr[i] = srcL[i];
+                    continue;
+                }
+
+                na /= wsum; nb /= wsum;
+                float outS = (float)Math.Min(1.0, Math.Sqrt(na * na + nb * nb));
+                double ang = Math.Atan2(nb, na) * 180.0 / Math.PI; if (ang < 0) ang += 360.0;
+                float outH = (float)ang;
+                float outL = (float)(nl / wsum);   // weighted lightness — all-Preserve anchors give exactly srcL
+                touched++;
+                reachable[i] = true;
+
+                // ── WHY the raw map produced "one colour" ──
+                //
+                // A near-neutral material (grey mail, steel plate) is a TIGHT
+                // cluster at the chroma-plane origin. Mapping it to a target at
+                // radius target.S moves every pixel of the material to nearly
+                // the SAME point: white highlight, mid steel and dark link all
+                // land on identical chroma, differing only in preserved L. The
+                // "distance-preserving" property preserves the source's chroma
+                // spread — and a grey source has none to preserve. Result:
+                // "more teal / less teal" instead of vanilla's white→dark.
+                //
+                // Two corrections, applied AFTER the RBF so the map's smooth-
+                // ness (no seams, no banding) is untouched:
+
+                // (a) SPREAD RE-INJECTION — scale output chroma by the pixel's
+                //     own saturation relative to its neighbourhood's source
+                //     mean. The engraved line that was twice as vivid as the
+                //     surrounding metal stays twice as vivid; the worn matte
+                //     patch stays matte. Interpolate the anchors' mean-sats
+                //     with the same RBF weights so this is seamless too.
+                double msum = 0, mwsum = 0;
+                {
+                    float pa2 = fa[i], pb2 = fb[i];
+                    for (int k = 0; k < A; k++)
+                    {
+                        double da2 = pa2 - oa[k], db2 = pb2 - ob[k];
+                        double w2 = Math.Exp(-(da2 * da2 + db2 * db2) / twoSigSq);
+                        msum += w2 * oms[k]; mwsum += w2;
+                    }
+                }
+                float meanSrcS = mwsum > 1e-9 ? (float)(msum / mwsum) : 0.02f;
+                float spread = Math.Clamp(srcS[i] / Math.Max(meanSrcS, 0.02f), 0.35f, 2.2f);
+
+                //     NEAR-NEUTRAL DAMPING: on a grey/near-black material the
+                //     source saturation variation is mostly quantisation noise,
+                //     not artistic intent — dividing by a tiny family mean turns
+                //     that noise into large spread swings and crushes the dark
+                //     body of the texture toward zero chroma (the "whisper of
+                //     tint" failure on mostly-black items). Blend spread toward
+                //     1 as the source material approaches neutral; a colored
+                //     source (leather at meanS 0.4) keeps full spread behaviour.
+                float neutrality = Math.Clamp(1f - meanSrcS / 0.15f, 0f, 1f);
+                spread = spread + (1f - spread) * neutrality;
+                outS = Math.Min(0.95f, outS * spread);
+
+                // (b) ASYMMETRIC LIGHTNESS TENT.
+                //     First version was symmetric — chroma collapsed at BOTH
+                //     ends — and that is not what vanilla does. Hand-painted
+                //     vanilla shadows carry plenty of chroma (Dark Iron plate is
+                //     RED-black, not neutral black); it is the HIGHLIGHTS that
+                //     collapse to white. So: brutal gate on the bright end
+                //     (specular stays white-hot), gentle on the dark end
+                //     (shadows keep the colour identity, just deep).
+                float gate;
+                if (outL >= 0.5f)
+                {
+                    float t = (1f - outL) / 0.5f;                     // 1 at mid → 0 at white
+                    gate = 0.10f + 0.90f * (float)Math.Pow(t, 0.9);
                 }
                 else
                 {
-                    na /= wsum; nb /= wsum;
-                    outS = (float)Math.Min(1.0, Math.Sqrt(na * na + nb * nb));
-                    double ang = Math.Atan2(nb, na) * 180.0 / Math.PI; if (ang < 0) ang += 360.0;
-                    outH = (float)ang;
-                    outL = (float)(nl / wsum);   // weighted lightness — all-Preserve anchors give exactly srcL
-                    touched++;
+                    float t = outL / 0.5f;                            // 0 at black → 1 at mid
+                    gate = 0.55f + 0.45f * (float)Math.Pow(t, 0.6);   // shadows keep >=55%
+                }
+                outS *= gate;
+
+                outHArr[i] = outH; outSArr[i] = outS; outLArr[i] = outL;
+            }
+
+        // ── POST-TENT TIER STAGE (the tier ladder's value axis) ──
+        // satScale/lightBias cannot carry the tier read: satScale is applied
+        // upstream of spread/tent/clamp — machinery whose whole job is
+        // renormalizing saturation — and lightBias is a small uniform shift
+        // that reads as a brightness slider (and darker reads as WORSE, not
+        // higher-tier). Measured on display 5770: improved→gods came out as a
+        // few hundredths of uniform ΔL plus clamp-compressed ΔS. Invisible.
+        //
+        // This stage runs after the tent and owns the tier axis instead.
+        // Callers using it pass satScale=1, lightBias=0 (stacking both
+        // double-darkens — verified). Per tier:
+        //   kd  — shadow toe        L' = pivot·(L/pivot)^(1+kd)
+        //                           deepens shadows; a power curve through the
+        //                           origin, so it CANNOT crush to black
+        //   ku  — highlight drive   L' = 1-(1-pivot)·((1-L)/(1-pivot))^(1+ku)
+        //                           drives speculars toward white-hot
+        //   m   — sat headroom      S' = 1-(1-S)^(1+m)
+        //                           saturation rises without dying in the 0.95
+        //                           clamp the old satScale slammed into
+        //   pop — specular pop      +L on the top-4% brightest pixels — the
+        //                           glint that reads at thumbnail size
+        // Anchored at the item's own mean post-RBF lightness so identical
+        // knobs behave on dark and light items alike.
+        bool tierStage = tierKd > 0f || tierKu > 0f || tierM > 0f || tierPop > 0f;
+        float pivot = 0.5f, popThr = float.MaxValue;
+        if (tierStage)
+        {
+            double lsum = 0;
+            var lvals = new List<float>();
+            for (int i = 0; i < n; i++)
+                if (!locked[i] && reachable[i]) { lsum += outLArr[i]; lvals.Add(outLArr[i]); }
+            if (lvals.Count == 0) tierStage = false;
+            else
+            {
+                pivot = Math.Clamp((float)(lsum / lvals.Count), 0.05f, 0.6f);
+                lvals.Sort();
+                double pos = (lvals.Count - 1) * 0.96;   // linear-interpolated quantile
+                int lo = (int)pos; double frac = pos - lo;
+                popThr = lo + 1 < lvals.Count
+                    ? (float)(lvals[lo] + (lvals[lo + 1] - lvals[lo]) * frac)
+                    : lvals[lo];
+                _logger.LogInformation(
+                    "PaletteSwap: [tier] kd={Kd:F2} ku={Ku:F2} m={M:F2} pop={Pop:F2} pivot={Pivot:F3} popThr={Thr:F3}",
+                    tierKd, tierKu, tierM, tierPop, pivot, popThr);
+            }
+        }
+
+        // ── PASS 2: apply the tier stage and write pixels. ──
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+            {
+                int i = y * W + x;
+                if (locked[i]) { result.SetPixel(x, y, lockedColor[i]); continue; }
+
+                float oH = outHArr[i], oS = outSArr[i], oL = outLArr[i];
+                if (tierStage && reachable[i])
+                {
+                    double L = oL;
+                    double L2 = L < pivot
+                        ? pivot * Math.Pow(Math.Clamp(L / pivot, 0.0, 1.0), 1.0 + tierKd)
+                        : 1.0 - (1.0 - pivot) * Math.Pow(Math.Clamp((1.0 - L) / (1.0 - pivot), 0.0, 1.0), 1.0 + tierKu);
+                    double S2 = 1.0 - Math.Pow(Math.Clamp(1.0 - oS, 0.0, 1.0), 1.0 + tierM);
+                    if (tierPop > 0f && oL >= popThr) L2 += tierPop;
+                    oS = (float)Math.Clamp(S2, 0.0, 0.98);
+                    oL = (float)Math.Clamp(L2, 0.0, 1.0);
                 }
 
-                HslToRgb(outH, outS, outL, out byte r, out byte g, out byte b);   // lightness now anchor-driven (tonal targets)
+                HslToRgb(oH, oS, oL, out byte r, out byte g, out byte b);   // lightness now anchor-driven (tonal targets)
                 result.SetPixel(x, y, new SKColor(r, g, b, alpha[i]));
             }
 
@@ -750,7 +1527,8 @@ public class PaletteSwapService
 
     private SKBitmap ApplyPerPixel(SKBitmap source,
         List<(string Family, TargetColor Target)> swaps,
-        List<ResolvedBox>? boxes = null)
+        List<ResolvedBox>? boxes = null,
+        float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f)
     {
         int W = source.Width, H = source.Height;
         var result = new SKBitmap(W, H, SKColorType.Rgba8888, SKAlphaType.Unpremul);
@@ -844,7 +1622,8 @@ public class PaletteSwapService
         // pixel is remapped by one smooth function of its original chroma. ──
         if (smoothMap && swaps.Count > 0)
             return ApplySmoothMap(result, srcH, srcS, srcL, alpha, locked, lockedColor,
-                                  W, H, swaps, totalPixels, boxLeave, boxForce);
+                                  W, H, swaps, totalPixels, boxLeave, boxForce,
+                                  tierKd, tierKu, tierM, tierPop);
 
         // ── Pass 1b (region): segment SOURCE by neighbour similarity, name each
         // region by its saturated core, override the per-pixel labels. ──
@@ -2680,4 +3459,4 @@ public class BoxOverride
 }
 
 /// <summary>A color family detected in a source texture, with aggregate stats.</summary>
-public record DetectedFamily(string Family, int PixelCount, float Percent, float MeanSat, float MeanLightness);
+public record DetectedFamily(string Family, int PixelCount, float Percent, float MeanSat, float MeanLightness, float MeanHue = 0f);

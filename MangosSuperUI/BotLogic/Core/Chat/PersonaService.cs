@@ -13,11 +13,19 @@ public sealed record BotPersona(int Guid, PersonaCard Card, float MoodValence,
 /// Loads/creates bot_persona rows (CHAT_ARCHITECTURE §6). Creation is LAZY on first chat
 /// involvement (D3 timing). C6: creation assigns from the VOICE LIBRARY — the
 /// least-assigned non-retired voice (uniform among ties) — then jitters per §6.4:
-/// ±10% on numeric typing fields, ±0.1 on disposition floats, 20% chance to swap one
-/// interest. The library copy never changes; the bot's card diverges freely from here.
-/// Existing personas (including C2 seed-era ones, voice_id NULL) are left alone; the
-/// Capacity tab's "Reroll seed personas" action reassigns those on demand.
-/// Empty library → a generic fallback card + a loud log pointing at the build button.
+/// ±10% on numeric typing fields, ±0.1 on disposition floats, ±1 on swear_level (25%),
+/// 20% chance to swap one interest. The library copy never changes; the bot's card
+/// diverges freely from here. Existing personas (including C2 seed-era ones, voice_id
+/// NULL) are left alone; the Capacity tab's "Reroll seed personas" action reassigns those
+/// on demand.
+///
+/// EMPTY LIBRARY (fixed 2026-07-13): the fallback used to return a single hardcoded card
+/// BEFORE the jitter call, so an unbuilt library gave every bot in the fleet a
+/// byte-identical persona — same name, same disposition, same five example lines. Twenty-
+/// five bots, one voice, and the model dutifully parroted its three few-shot anchors back
+/// at the server all night. The fallback is still deliberately bland (build the library),
+/// but it is now jittered and name-varied so the degenerate case degrades instead of
+/// collapsing, and the warning is logged at ERROR so it cannot be missed.
 /// </summary>
 public class PersonaService
 {
@@ -66,8 +74,10 @@ public class PersonaService
             ON DUPLICATE KEY UPDATE voice_id=@voiceId, card_json=@cardJson, narrative=@narrative, updated_utc=UTC_TIMESTAMP()",
             new { guid, voiceId, cardJson = card.ToJson(), narrative });
 
-        _logger.LogInformation("[CHAT-ENGINE] persona assigned for {BotName} (guid={Guid}): '{Given}', {Age} {Region}, voice_id={VoiceId}",
-            botName, guid, card.GivenName, card.Age, card.Region, voiceId?.ToString() ?? "fallback");
+        _logger.LogInformation("[CHAT-ENGINE] persona assigned for {BotName} (guid={Guid}): '{Given}', {Age} {Region}, " +
+                               "swear={Swear} voice_id={VoiceId}",
+            botName, guid, card.GivenName, card.Age, card.Region, card.Typing.SwearLevel,
+            voiceId?.ToString() ?? "fallback");
 
         var created = new BotPersona(guid, card, 0, 0, "", narrative);
         _cache[guid] = created;
@@ -122,16 +132,20 @@ public class PersonaService
         var card = pick != null ? PersonaCard.Parse(pick.CardJson) : null;
         if (card == null)
         {
-            _logger.LogWarning("[CHAT-ENGINE] voice library EMPTY (or unparseable) — using generic fallback. " +
-                               "Build the library on the Chat Capacity page.");
-            return (FallbackCard(guid), null);
+            _logger.LogError("[CHAT-ENGINE] voice library EMPTY (or unparseable) — every bot is falling back to a " +
+                             "generic card. THIS IS THE REPETITION BUG: with no library there is no voice diversity, " +
+                             "and the model parrots the fallback card's few-shot lines. Build the library on the " +
+                             "Chat Capacity page.");
+            var fb = FallbackCard(guid);
+            Jitter(fb);                     // at least don't hand out N byte-identical clones
+            return (fb, null);
         }
 
         Jitter(card);
         return (card, pick!.Id);
     }
 
-    /// <summary>§6.4: ±10% numeric typing fields, ±0.1 disposition floats, 20% interest swap.</summary>
+    /// <summary>§6.4: ±10% numeric typing fields, ±0.1 disposition floats, ±1 swear_level (25%), 20% interest swap.</summary>
     private static void Jitter(PersonaCard card)
     {
         var rng = Random.Shared;
@@ -145,6 +159,11 @@ public class PersonaService
         t.ThinkMaxS = Math.Max(t.ThinkMinS + 1, (int)Math.Round(J10(rng, t.ThinkMaxS)));
         t.SplitThresholdChars = Math.Max(40, (int)J10(rng, t.SplitThresholdChars));
         t.AltTabChance = Math.Clamp(J10(rng, t.AltTabChance), 0f, 0.3f);
+
+        // Swear register: ±1 at 25%. Level 0 is a character trait, not a rounding error —
+        // a persona written as the one clean mouth in the zone stays that way.
+        if (t.SwearLevel > 0 && rng.NextDouble() < 0.25)
+            t.SwearLevel = Math.Clamp(t.SwearLevel + (rng.NextDouble() < 0.5 ? -1 : 1), 1, 3);
 
         var d = card.Disposition;
         d.Warmth = JDisp(rng, d.Warmth);
@@ -165,11 +184,16 @@ public class PersonaService
         $"{c.GamingBackground}. Plays a character named {botName} and mostly keeps to " +
         $"{string.Join(", ", c.Interests.Take(2))} talk when not playing.";
 
-    /// <summary>Empty-library fallback — deliberately bland so operators notice and build.</summary>
+    /// <summary>
+    /// Empty-library fallback — deliberately bland so operators notice and build, but NOT
+    /// identical across bots (see class doc). Name/age vary by guid; Jitter() runs on top.
+    /// </summary>
+    private static readonly string[] FallbackNames = { "Sam", "Chris", "Alex", "Pat", "Jamie", "Casey" };
+
     private static PersonaCard FallbackCard(int guid) => new()
     {
-        GivenName = "Sam",
-        Age = 21,
+        GivenName = FallbackNames[Math.Abs(guid) % FallbackNames.Length],
+        Age = 19 + Math.Abs(guid) % 9,
         Region = "US-Midwest",
         TimezoneOffset = -6,
         Occupation = "college student",
@@ -177,7 +201,7 @@ public class PersonaService
         Interests = new() { "video games", "music" },
         GamingBackground = "first MMO",
         Opinions = new() { "still figuring the game out" },
-        Typing = new PersonaTyping(),
+        Typing = new PersonaTyping { Tics = new() { "lol", "man" } },
         ExampleLines = new()
         {
             "hey", "lol nice", "anyone know where to go for quests", "brb", "gg"
