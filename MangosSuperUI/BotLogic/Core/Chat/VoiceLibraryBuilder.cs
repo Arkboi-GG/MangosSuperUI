@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Dapper;
 using Microsoft.AspNetCore.SignalR;
 using MangosSuperUI.Models;
@@ -13,28 +14,38 @@ namespace MangosSuperUI.BotLogic.Chat.Voice;
 /// <summary>
 /// CHAT_ARCHITECTURE §6.3 — builds the ~voice.library_target card library:
 ///
-///  1. STRATIFIED SKELETON FIRST (VoiceTables) — every diversity axis sampled before
-///     any LLM call. Triple quota checked pre-call: an (age band, region, occupation)
-///     triple with ≥4 accepted cards is resampled for free.
-///  2. ONE inference call per card, Batch class. The model writes ONLY occupation
-///     detail, life_situation_seed, opinions, example_lines — to fit the skeleton
-///     (+ active era pack source when one exists, §13.4(1)).
-///  3. MECHANICAL DEDUP: reject when example_lines share &gt;2 exact word-trigrams with
-///     any single accepted card. Prose regenerates (skeleton kept) up to 3 tries.
+///  1. STRATIFIED SKELETON FIRST (VoiceTables) — every diversity axis sampled before any
+///     LLM call, INCLUDING the given name (see below). Triple quota checked pre-call: an
+///     (age band, region, occupation) triple with ≥4 accepted cards is resampled for free,
+///     and so is a given name already used 4 times.
+///  2. ONE inference call per card, Batch class. The model writes ONLY occupation detail,
+///     life_situation_seed, opinions, example_lines — to fit the skeleton (+ active era
+///     pack source when one exists, §13.4(1)).
+///  3. MECHANICAL GUARDS, then dedup. Prose regenerates (skeleton kept) up to 4 tries.
 ///  4. Store in chat_voice. RESUMABLE: counts existing non-retired rows toward target.
 ///
-/// Runs as a fire-and-forget admin action from the Capacity tab; progress via SignalR
-/// ("VoiceLibraryProgress") + [CHAT-CAP] logs. One run at a time.
+/// WHAT THE FIRST 300-CARD BUILD TAUGHT US (4B batch model, 2026-07-13). The structural
+/// half worked perfectly — 300/300 distinct occupations, 1498/1500 distinct example
+/// lines, full spread on swear_level and caps. The LLM half collapsed in two places, and
+/// both are now closed HERE rather than by asking the model more nicely:
+///
+///   • 48 Dereks, 24 Dales — 76 distinct names in 300 cards. `given_name` was the one
+///     identity field the LLM invented, and a small model has favorites. It is now a
+///     VoiceTables axis; the model never sees a naming decision again.
+///   • ~230 of 1500 example lines opened with a swear-comma ("damn, ...", "shit, ...",
+///     "hell yeah, ..."). Told that register was the point, the model made profanity the
+///     SUBJECT instead of the texture — which is the same register collapse we were
+///     hired to fix, wearing different clothes. The prompt now says swearing goes
+///     mid-sentence, never as an opener, and the GUARDS below enforce it, because a 4B
+///     will ignore any instruction it finds inconvenient.
 ///
 /// THIS IS THE FLEET'S ONLY DIVERSITY SOURCE. Every persona descends from a card here,
 /// and the card's example_lines are what a small reactive model actually imitates — far
-/// more than the bio does. Two consequences, both handled below:
-///   • The prose prompt now states the skeleton's TYPING and SWEAR register and demands
-///     example_lines written IN that register, uncensored (§6.2 v2). A card whose anchors
-///     read "lol what a shitter" produces a bot that talks that way natively; no amount of
-///     post-pass rescues a library of polite Sams.
-///   • Run this on the biggest model you can serve (profile's model_batch). It is a
-///     one-time offline batch; quality here compounds across every bot forever.
+/// more than the bio does. Run it on the biggest model you can serve (profile's
+/// model_batch); the broker warns when it silently falls back to the reactive tag.
+///
+/// Runs as a fire-and-forget admin action from the Capacity tab; progress via SignalR
+/// ("VoiceLibraryProgress") + [CHAT-CAP] logs. One run at a time.
 /// </summary>
 public class VoiceLibraryBuilder
 {
@@ -46,10 +57,12 @@ public class VoiceLibraryBuilder
 
     private int _running;   // interlocked flag
 
+    /// <summary>RejectedShape added 2026-07-13 — the guard rejects, so a bad batch model is visible.</summary>
     public sealed record BuildStatus(bool Running, int Accepted, int Target,
-        int RejectedDedup, int RejectedParse, DateTime? StartedUtc, DateTime? FinishedUtc, string? Error);
+        int RejectedDedup, int RejectedParse, int RejectedShape,
+        DateTime? StartedUtc, DateTime? FinishedUtc, string? Error);
 
-    private volatile BuildStatus _status = new(false, 0, 0, 0, 0, null, null, null);
+    private volatile BuildStatus _status = new(false, 0, 0, 0, 0, 0, null, null, null);
     public BuildStatus Status => _status;
 
     public VoiceLibraryBuilder(ConnectionFactory db, ChatSettingsService settings,
@@ -70,11 +83,16 @@ public class VoiceLibraryBuilder
         return true;
     }
 
+    private const int MaxPerName = 4;       // no more Dereks
+    private const int MaxPerTriple = 4;     // §6.3
+    private const int ProseTries = 4;
+
     private async Task RunAsync()
     {
         int target = Math.Max(10, _settings.GetInt(0, "voice.library_target", 300));
-        int accepted = 0, rejectedDedup = 0, rejectedParse = 0;
+        int accepted = 0, rejectedDedup = 0, rejectedParse = 0, rejectedShape = 0;
         var started = DateTime.UtcNow;
+        var shapeReasons = new Dictionary<string, int>();
 
         try
         {
@@ -83,16 +101,17 @@ public class VoiceLibraryBuilder
             // Resumable: existing non-retired cards count toward the target.
             var existing = (await conn.QueryAsync<string>(
                 "SELECT card_json FROM chat_voice WHERE retired=0")).ToList();
+            var existingCards = existing.Select(PersonaCard.Parse).Where(c => c != null).Select(c => c!).ToList();
             accepted = existing.Count;
 
-            var acceptedTrigrams = existing
-                .Select(PersonaCard.Parse).Where(c => c != null)
-                .Select(c => Trigrams(c!.ExampleLines)).ToList();
+            var acceptedTrigrams = existingCards.Select(c => Trigrams(c.ExampleLines)).ToList();
             var tripleCounts = new Dictionary<(string, string, string), int>();
-            foreach (var c in existing.Select(PersonaCard.Parse).Where(c => c != null))
+            var nameCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in existingCards)
             {
-                var t = TripleOf(c!);
+                var t = TripleOf(c);
                 tripleCounts[t] = tripleCounts.GetValueOrDefault(t) + 1;
+                nameCounts[c.GivenName] = nameCounts.GetValueOrDefault(c.GivenName) + 1;
             }
 
             // Era pack source in the generation context when one is active (§13.4(1)).
@@ -102,24 +121,26 @@ public class VoiceLibraryBuilder
 
             _logger.LogInformation("[CHAT-CAP] voice library build started: {Existing} existing, target {Target}",
                 accepted, target);
-            await Publish(accepted, target, rejectedDedup, rejectedParse, started, null, null, running: true);
+            await Publish(accepted, target, rejectedDedup, rejectedParse, rejectedShape, started, null, null, running: true);
 
             var rng = Random.Shared;
-            int attempts = 0, maxAttempts = target * 4;
+            int attempts = 0, maxAttempts = target * 6;
 
             while (accepted < target && attempts < maxAttempts)
             {
                 attempts++;
 
-                // ── 1. Skeleton (free until the triple quota passes) ──
+                // ── 1. Skeleton — free resampling until the triple AND name quotas pass ──
                 VoiceTables.Skeleton skel;
                 int resamples = 0;
                 do { skel = VoiceTables.Sample(rng); }
-                while (tripleCounts.GetValueOrDefault(TripleOf(skel)) >= 4 && ++resamples < 50);
+                while ((tripleCounts.GetValueOrDefault(TripleOf(skel)) >= MaxPerTriple ||
+                        nameCounts.GetValueOrDefault(skel.GivenName) >= MaxPerName)
+                       && ++resamples < 200);
 
-                // ── 2. Prose: up to 3 tries per skeleton (§6.3: regenerate prose, keep skeleton) ──
+                // ── 2. Prose ──
                 PersonaCard? card = null;
-                for (int prose = 0; prose < 3 && card == null; prose++)
+                for (int prose = 0; prose < ProseTries && card == null; prose++)
                 {
                     using var lease = await _broker.TryAcquireAsync(TrafficClass.Batch,
                         TimeSpan.FromSeconds(30), CancellationToken.None);
@@ -142,14 +163,13 @@ public class VoiceLibraryBuilder
 
                     var candidate = Materialize(skel, parsed);
 
-                    // ── 3a. Content floor: a card is FOREVER — never let a floored line into
-                    //        the library, where it would be discarded at every single use. ──
-                    var floored = candidate.ExampleLines.FirstOrDefault(l => ContentFloor.IsBlocked(l, out _));
-                    if (floored != null)
+                    // ── 3a. Shape guards (the 4B ignores instructions; these do not) ──
+                    var bad = ShapeViolation(candidate);
+                    if (bad != null)
                     {
-                        _logger.LogInformation("[CHAT-CAP] voice build: candidate rejected on content floor");
-                        rejectedParse++;
-                        continue;
+                        rejectedShape++;
+                        shapeReasons[bad] = shapeReasons.GetValueOrDefault(bad) + 1;
+                        continue;   // regenerate prose, skeleton kept
                     }
 
                     // ── 3b. Mechanical dedup: >2 shared word-trigrams with ANY accepted card ──
@@ -157,13 +177,14 @@ public class VoiceLibraryBuilder
                     if (acceptedTrigrams.Any(a => a.Intersect(tris).Count() > 2))
                     {
                         rejectedDedup++;
-                        continue;   // regenerate prose, skeleton kept
+                        continue;
                     }
+
                     card = candidate;
                     acceptedTrigrams.Add(tris);
                 }
 
-                if (card == null) continue;   // skeleton exhausted its prose tries — resample next loop
+                if (card == null) continue;   // skeleton exhausted its prose tries — resample
 
                 // ── 4. Store ──
                 await conn.ExecuteAsync(
@@ -171,25 +192,30 @@ public class VoiceLibraryBuilder
                     new { json = card.ToJson() });
                 var triple = TripleOf(card);
                 tripleCounts[triple] = tripleCounts.GetValueOrDefault(triple) + 1;
+                nameCounts[card.GivenName] = nameCounts.GetValueOrDefault(card.GivenName) + 1;
                 accepted++;
 
                 if (accepted % 10 == 0)
                 {
-                    _logger.LogInformation("[CHAT-CAP] voice build: {Accepted}/{Target} (dedup-rej {Dedup}, parse-rej {Parse})",
-                        accepted, target, rejectedDedup, rejectedParse);
-                    await Publish(accepted, target, rejectedDedup, rejectedParse, started, null, null, running: true);
+                    _logger.LogInformation("[CHAT-CAP] voice build: {Accepted}/{Target} (rejects — dedup {Dedup}, parse {Parse}, shape {Shape})",
+                        accepted, target, rejectedDedup, rejectedParse, rejectedShape);
+                    await Publish(accepted, target, rejectedDedup, rejectedParse, rejectedShape, started, null, null, running: true);
                 }
             }
 
             var note = accepted >= target ? "complete" : $"stopped at attempt cap ({maxAttempts})";
-            _logger.LogInformation("[CHAT-CAP] voice library build {Note}: {Accepted}/{Target}, dedup-rej {Dedup}, parse-rej {Parse}",
-                note, accepted, target, rejectedDedup, rejectedParse);
-            await Publish(accepted, target, rejectedDedup, rejectedParse, started, DateTime.UtcNow, null, running: false);
+            _logger.LogInformation("[CHAT-CAP] voice library build {Note}: {Accepted}/{Target}, rejects — dedup {Dedup}, parse {Parse}, shape {Shape}",
+                note, accepted, target, rejectedDedup, rejectedParse, rejectedShape);
+            if (shapeReasons.Count > 0)
+                _logger.LogInformation("[CHAT-CAP] shape rejects by reason: {Reasons}",
+                    string.Join(", ", shapeReasons.OrderByDescending(k => k.Value).Select(k => $"{k.Key}={k.Value}")));
+
+            await Publish(accepted, target, rejectedDedup, rejectedParse, rejectedShape, started, DateTime.UtcNow, null, running: false);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "[CHAT-CAP] voice library build failed");
-            await Publish(accepted, target, rejectedDedup, rejectedParse, started, DateTime.UtcNow, ex.Message, running: false);
+            await Publish(accepted, target, rejectedDedup, rejectedParse, rejectedShape, started, DateTime.UtcNow, ex.Message, running: false);
         }
         finally
         {
@@ -197,38 +223,89 @@ public class VoiceLibraryBuilder
         }
     }
 
+    // ==================== Shape guards ====================
+
+    private static readonly Regex SwearOpener = new(
+        @"^\s*(fuck|fuckin|fucking|shit|damn|damned|goddamn|hell|crap|ass|asshole|bastard|bullshit|christ|jesus|piss|dick)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex GreetingOpener = new(
+        @"^\s*(hey|hi|hello|yo|sup|wassup|wazzup|what'?s up|howdy|greetings|good morning|good evening)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex Bowdlerism = new(
+        @"(?<![a-z0-9])(heck|darn|darned|freaking|freakin|frickin|friggin|gosh|golly|shucks)(?![a-z0-9])",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>How many of the five lines may contain profanity at all, by swear level.
+    /// Two is the ceiling even for a sailor: these are FEW-SHOT ANCHORS, and if most of
+    /// them swear, every reply the bot ever writes will swear.</summary>
+    private static int MaxSwearLines(int level) => level switch { 0 => 0, 1 => 1, _ => 2 };
+
+    /// <summary>Null = the card is fine; otherwise the reason, for the reject log.</summary>
+    public static string? ShapeViolation(PersonaCard c)
+    {
+        var lines = c.ExampleLines;
+        int level = c.Typing.SwearLevel;
+
+        int swearLines = lines.Count(SwearTables.ContainsSwear);
+        if (swearLines > MaxSwearLines(level)) return "swear-density";
+
+        // Profanity is texture, not the subject of the sentence. At most one of five may
+        // lead with it, and only for a persona who actually swears that much.
+        int swearOpeners = lines.Count(l => SwearOpener.IsMatch(l));
+        if (swearOpeners > (level >= 2 ? 1 : 0)) return "swear-opener";
+
+        // "hey guys" x5 is exactly how the fallback card collapsed the fleet.
+        int greetings = lines.Count(l => GreetingOpener.IsMatch(l));
+        if (greetings > 1) return "greeting-opener";
+
+        // A swearing persona whose anchors say "darn" teaches the bot to say "darn".
+        if (level >= 1 && lines.Any(l => Bowdlerism.IsMatch(l))) return "bowdlerized";
+
+        // The model likes writing the persona's own name into their chat lines
+        // ("hey kaito here again") — nobody types their own name at people.
+        if (!string.IsNullOrEmpty(c.GivenName) &&
+            lines.Any(l => l.Contains(c.GivenName, StringComparison.OrdinalIgnoreCase)))
+            return "self-name";
+
+        // Anchors must be chat, not prose. Five long lines produce a bot that writes essays.
+        if (lines.Count(l => l.Length > 90) > 1) return "too-long";
+
+        return null;
+    }
+
     // ==================== Prose prompt + parse ====================
 
     /// <summary>Plain-English register brief for the prose model (§6.2 v2 swear_level).</summary>
     private static string SwearBrief(int level) => level switch
     {
-        0 => "never swears — says \"darn\" and means it, the one clean mouth in the zone",
-        1 => "swears mildly when something goes wrong: damn, crap, hell",
-        2 => "swears casually the way most people did in 2005: damn, shit, ass, bastard; " +
-             "calls bad players shitters or scrubs; it's ordinary, not edgy",
-        _ => "swears constantly and casually — profanity is punctuation to this person",
+        0 => "never swears. Not once. This person says \"darn\" and means it — the one clean mouth in the zone. " +
+             "NONE of the five lines may contain profanity",
+        1 => "swears mildly, and only when something goes wrong: damn, crap, hell. AT MOST ONE of the five " +
+             "lines contains any profanity, and it falls mid-sentence, never at the start",
+        2 => "swears casually the way most people did in 2005: damn, shit, ass, bastard; will call a bad " +
+             "player a shitter or a scrub. AT MOST TWO of the five lines contain profanity, woven " +
+             "mid-sentence where the emphasis falls",
+        _ => "swears a lot — profanity is punctuation to this person. Even so, AT MOST TWO of the five lines " +
+             "contain profanity, woven mid-sentence rather than parked at the front",
     };
 
     private static (string System, string Prompt) BuildProsePrompt(VoiceTables.Skeleton s, string eraContext)
     {
         string system =
             "You write fictional 2005-era World of Warcraft player personas for an offline game server. " +
-            "You are given a fixed skeleton (age, region, occupation category, interests, typing style, " +
-            "swearing register) and write ONLY the prose fields to fit it. " +
-            "Era: 2005 — flip phones, dial-up jokes, no smartphones, no streaming, no post-2005 " +
-            "references of any kind. " +
-            "REGISTER IS THE POINT: real 2005 chat was profane and blunt. Write the example lines the " +
-            "way this specific person actually typed — if the skeleton says they swear, they swear, " +
-            "in full, never censored with asterisks and never softened to \"heck\", \"darn\" or " +
-            "\"freaking\". Ordinary profanity only: no slurs of any kind, and nothing sexual. " +
-            "Output ONLY a JSON object, no markdown fences.";
+            "You are given a fixed skeleton (name, age, region, occupation, interests, typing style, " +
+            "swearing register) and you write ONLY the prose fields to fit it. " +
+            "Era: 2005 — flip phones, dial-up jokes, no smartphones, no streaming, no post-2005 references. " +
+            "Write ordinary people, not characters. Output ONLY a JSON object, no markdown fences.";
 
         string era = string.IsNullOrWhiteSpace(eraContext) ? "" :
             $"\nActive era pack source (match its slang/references):\n{eraContext}\n";
 
         string prompt = $$"""
             Skeleton (fixed — do not contradict it):
-            - age: {{s.Age}} ({{s.Region}})
+            - name: {{s.GivenName}}, age {{s.Age}}, {{s.Region}}
             - occupation category: {{s.OccupationCategory}}
             - interests: {{string.Join(", ", s.Interests)}}
             - gaming background: {{s.GamingBackground}}
@@ -236,20 +313,30 @@ public class VoiceLibraryBuilder
             - typing: caps={{s.Typing.Caps}}, punctuation={{s.Typing.Punctuation}}, abbreviation level {{s.Typing.AbbrevLevel}}/3
             - swearing: level {{s.Typing.SwearLevel}}/3 — {{SwearBrief(s.Typing.SwearLevel)}}
             {{era}}
-            The five example_lines are the most important field: they are the only thing a small
-            model sees when it imitates this person. Make them ordinary, specific and unglamorous —
-            what this person types on a Tuesday night, not catchphrases. Vary the shape: not every
-            line is a greeting. They must match the caps, abbreviation and swearing levels above.
+            The five example_lines are the most important field by far: they are the ONLY thing a small
+            model sees when it imitates this person, so whatever pattern is in them is the pattern the
+            bot will repeat forever. Therefore:
+
+            - FIVE DIFFERENT SHAPES. At most ONE may be a greeting. Include at least one question and at
+              least one line about their life outside the game. Not every line is about WoW.
+            - PROFANITY IS TEXTURE, NOT THE SUBJECT. If this person swears, the swearing sits inside a
+              sentence about something else ("that quest is a damn maze") — it is NEVER the first word,
+              and it is NEVER the point of the line. Obey the swearing limit above exactly.
+            - Never write asterisks (f***) and never write "heck", "darn" or "freaking" unless this
+              person's swear level is 0.
+            - Never write {{s.GivenName}}'s own name into a chat line. Nobody types their own name.
+            - Ordinary, specific, unglamorous: what this person types on a Tuesday night. Not catchphrases,
+              not slogans, not one-liners.
+            - No slurs of any kind. Nothing sexual.
 
             Write JSON with EXACTLY these fields:
             {
-              "given_name": "one plausible first name for this person",
               "occupation": "one specific sentence expanding the occupation category",
               "life_situation_seed": "one line about their current life situation",
               "opinions": ["two short opinions about WoW or life", "..."],
-              "example_lines": ["EXACTLY five short chat lines this person would type in-game",
-                                "each under 15 words, matching the typing and swearing style above",
-                                "no emojis, era-correct, everyday chat not catchphrases", "...", "..."]
+              "example_lines": ["five short chat lines, each under 15 words, matching the typing and",
+                                "swearing style above, five different shapes, no emojis, era-correct",
+                                "...", "...", "..."]
             }
             """;
         return (system, prompt);
@@ -257,7 +344,6 @@ public class VoiceLibraryBuilder
 
     private sealed class ProseResult
     {
-        [JsonPropertyName("given_name")] public string GivenName { get; set; } = "";
         [JsonPropertyName("occupation")] public string Occupation { get; set; } = "";
         [JsonPropertyName("life_situation_seed")] public string LifeSituationSeed { get; set; } = "";
         [JsonPropertyName("opinions")] public List<string> Opinions { get; set; } = new();
@@ -274,7 +360,7 @@ public class VoiceLibraryBuilder
         {
             var r = JsonSerializer.Deserialize<ProseResult>(text[start..(end + 1)]);
             if (r == null) return null;
-            if (string.IsNullOrWhiteSpace(r.GivenName) || string.IsNullOrWhiteSpace(r.Occupation)) return null;
+            if (string.IsNullOrWhiteSpace(r.Occupation)) return null;
             if (r.ExampleLines.Count != 5 || r.ExampleLines.Any(string.IsNullOrWhiteSpace)) return null;
             if (r.ExampleLines.Any(l => l.Length > 120)) return null;
             if (r.Opinions.Count < 1) return null;
@@ -283,10 +369,15 @@ public class VoiceLibraryBuilder
         catch { return null; }
     }
 
+    /// <summary>
+    /// given_name now comes from the SKELETON, never from the model (see class doc).
+    /// Example lines get compound repair on the way in ("ass hole" → "asshole") — no point
+    /// burning a whole generation on a spelling mistake we can fix deterministically.
+    /// </summary>
     private static PersonaCard Materialize(VoiceTables.Skeleton s, ProseResult prose) => new()
     {
         V = 2,
-        GivenName = prose.GivenName.Trim(),
+        GivenName = s.GivenName,
         Age = s.Age,
         Region = s.Region,
         TimezoneOffset = s.TimezoneOffset,
@@ -297,7 +388,9 @@ public class VoiceLibraryBuilder
         GamingBackground = s.GamingBackground,
         Opinions = prose.Opinions.Take(3).Select(o => o.Trim()).ToList(),
         Typing = s.Typing,
-        ExampleLines = prose.ExampleLines.Take(5).Select(l => l.Trim()).ToList()
+        ExampleLines = prose.ExampleLines.Take(5)
+            .Select(l => SwearTables.RepairCompounds(l.Trim()))
+            .ToList()
     };
 
     // ==================== Dedup mechanics ====================
@@ -324,14 +417,14 @@ public class VoiceLibraryBuilder
         return set;
     }
 
-    private async Task Publish(int accepted, int target, int dedup, int parse,
+    private async Task Publish(int accepted, int target, int dedup, int parse, int shape,
         DateTime started, DateTime? finished, string? error, bool running)
     {
-        _status = new BuildStatus(running, accepted, target, dedup, parse, started, finished, error);
+        _status = new BuildStatus(running, accepted, target, dedup, parse, shape, started, finished, error);
         try
         {
             await _hub.Clients.All.SendAsync("VoiceLibraryProgress",
-                new { running, accepted, target, rejectedDedup = dedup, rejectedParse = parse, error });
+                new { running, accepted, target, rejectedDedup = dedup, rejectedParse = parse, rejectedShape = shape, error });
         }
         catch { /* dashboard push is best-effort */ }
     }

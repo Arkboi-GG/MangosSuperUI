@@ -43,6 +43,11 @@
 
                                 <div id="selectedItems" class="lf-selected" style="margin-top:12px;"></div>
 
+                                <div id="relootifyNote" class="lf-relootify-note" style="display:none;">
+                                    <i class="fa-solid fa-circle-info"></i>
+                                    <span>One or more picks are already lootified. Generating <strong>replaces them in kind</strong> — the same tiers are rolled fresh. Nothing is deleted: every player-owned copy is rerolled into a new variant of <strong>the same tier</strong> it had.</span>
+                                </div>
+
                                 <div id="rulesetPanel" style="display:none; margin-top:16px;">
                                     <div class="d-flex align-items-center justify-content-between" style="margin-bottom:8px;">
                                         <strong style="font-size:13px;">Customize</strong>
@@ -83,7 +88,7 @@
                                             <strong style="font-size:12px;">Bands</strong>
                                             <button class="btn-micro" id="btnAddBand"><i class="fa-solid fa-plus"></i> Add band</button>
                                         </div>
-                                        <div class="lf-band-head"><span>Name</span><span>Pos</span><span>Boost %</span><span>Slots</span><span></span></div>
+                                        <div class="lf-band-head"><span>Name</span><span>Pos</span><span>Boost %</span><span>Slots</span><span title="Gold price bump above base (%)">Gold +%</span><span title="Weapon damage bump above base (%) — weapons only, speed unchanged">DPS +%</span><span></span></div>
                                         <div id="bandEditor"></div>
                                         <div id="bandWarn" class="lf-band-warn" style="display:none;"></div>
                                     </div>
@@ -164,7 +169,7 @@
                                             <strong style="font-size:12px;">Bands</strong>
                                             <button class="btn-micro" id="pBtnAddBand"><i class="fa-solid fa-plus"></i> Add band</button>
                                         </div>
-                                        <div class="lf-band-head"><span>Name</span><span>Pos</span><span>Boost %</span><span>Slots</span><span></span></div>
+                                        <div class="lf-band-head"><span>Name</span><span>Pos</span><span>Boost %</span><span>Slots</span><span title="Gold price bump above base (%)">Gold +%</span><span title="Weapon damage bump above base (%) — weapons only, speed unchanged">DPS +%</span><span></span></div>
                                         <div id="pBandEditor"></div>
                                         <div id="pBandWarn" class="lf-band-warn" style="display:none;"></div>
                                     </div>
@@ -368,6 +373,38 @@
                 color: var(--status-warning);
             }
 
+            .lf-selected-item .lf-relootify {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                margin-left: auto;
+                font-size: 10.5px;
+                padding: 1px 7px;
+                border-radius: 9px;
+                background: rgba(120, 160, 255, 0.14);
+                color: var(--accent, #7aa0ff);
+                white-space: nowrap;
+                cursor: help;
+            }
+
+        .lf-relootify-note {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            margin-top: 10px;
+            padding: 8px 10px;
+            font-size: 11.5px;
+            line-height: 1.45;
+            border: 1px solid rgba(120, 160, 255, 0.30);
+            border-radius: var(--radius-sm);
+            background: rgba(120, 160, 255, 0.08);
+        }
+
+            .lf-relootify-note i {
+                margin-top: 2px;
+                color: var(--accent, #7aa0ff);
+            }
+
         .lf-field {
             margin-top: 10px;
         }
@@ -388,7 +425,7 @@
 
         .lf-band-head, .lf-band-row {
             display: grid;
-            grid-template-columns: 1fr 64px 96px 48px 24px;
+            grid-template-columns: 1fr 54px 88px 44px 60px 60px 22px;
             gap: 6px;
             align-items: center;
         }
@@ -470,6 +507,21 @@
             color: var(--text-muted);
             width: 52px;
             text-align: right;
+        }
+
+        .lf-dps {
+            font-size: 11px;
+            font-variant-numeric: tabular-nums;
+            color: var(--status-warning, #d08a2a);
+            white-space: nowrap;
+            padding: 0 4px;
+        }
+
+        .lf-dps-ref {
+            font-size: 11px;
+            font-variant-numeric: tabular-nums;
+            margin: 2px 0 6px;
+            opacity: 0.9;
         }
 
         .lf-stat-pill {

@@ -4,17 +4,33 @@
 
 $(function () {
 
+    // Help UI styles — injected once so the row (?) toggles don't depend on edits to
+    // Settings.cshtml. Uses the same CSS variables as the rest of the page.
+    if (!document.getElementById('chatfeel-help-styles')) {
+        var st = document.createElement('style');
+        st.id = 'chatfeel-help-styles';
+        st.textContent = [
+            '.help-toggle { background: none; border: none; padding: 0 2px; cursor: pointer; color: var(--text-muted); font-size: 12px; line-height: 1; vertical-align: baseline; }',
+            '.help-toggle:hover, .help-toggle.open { color: var(--accent); }',
+            '.help-text { margin-top: 6px; padding: 8px 10px; border-left: 2px solid var(--accent); background: rgba(127,127,127,0.06); border-radius: 0 6px 6px 0; font-size: 12px; line-height: 1.55; color: var(--text-muted); max-width: 640px; }',
+            '.setting-label .key { display: flex; align-items: center; gap: 4px; }'
+        ].join('\n');
+        document.head.appendChild(st);
+    }
+
     // §14.3 group order + display titles. 'global' is excluded here: the kill switches
     // live BIG on the Capacity page; active_preset shows in the header badge.
     var GROUPS = [
-        { id: 'density',        title: 'Density',              icon: 'fa-users', open: true },
-        { id: 'responsiveness', title: 'Responsiveness',       icon: 'fa-reply', open: true },
-        { id: 'noise',          title: 'Noise',                icon: 'fa-dice', open: false },
-        { id: 'voice',          title: 'Voice & Typing Feel',  icon: 'fa-keyboard', open: false },
-        { id: 'topicality',     title: 'Topicality',           icon: 'fa-tags', open: false },
-        { id: 'era',            title: 'Era & Memory',         icon: 'fa-brain', open: false, also: ['memory'] },
-        { id: 'budget',         title: 'Advanced — Budgets, Barks, LifeSim, Pairing, Tier 0',
-                                icon: 'fa-gears', open: false, also: ['barks', 'lifesim', 'pairing', 'tier0'] }
+        { id: 'density', title: 'Density', icon: 'fa-users', open: true },
+        { id: 'responsiveness', title: 'Responsiveness', icon: 'fa-reply', open: true },
+        { id: 'noise', title: 'Noise', icon: 'fa-dice', open: false },
+        { id: 'voice', title: 'Voice & Typing Feel', icon: 'fa-keyboard', open: false },
+        { id: 'topicality', title: 'Topicality', icon: 'fa-tags', open: false },
+        { id: 'era', title: 'Era & Memory', icon: 'fa-brain', open: false, also: ['memory'] },
+        {
+            id: 'budget', title: 'Advanced — Budgets, Barks, LifeSim, Pairing, Tier 0',
+            icon: 'fa-gears', open: false, also: ['barks', 'lifesim', 'pairing', 'tier0']
+        }
     ];
 
     var CURVE_HOURS = ['02h', '06h', '10h', '14h', '18h', '22h'];
@@ -83,11 +99,23 @@ $(function () {
 
     function renderRow(s) {
         var row = $('<div class="setting-row" data-key="' + esc(s.key) + '">');
-        row.append(
+        var hasHelp = s.help && s.help.length;
+        var label = $(
             '<div class="setting-label">' +
-            '  <div class="key">' + esc(s.key) + '</div>' +
+            '  <div class="key">' + esc(s.key) +
+            (hasHelp ? ' <button class="help-toggle" title="What does this do?" tabindex="0"><i class="fa-solid fa-circle-question"></i></button>' : '') +
+            '  </div>' +
             '  <div class="meaning">' + esc(s.meaning) + '</div>' +
+            (hasHelp ? '  <div class="help-text" hidden>' + esc(s.help) + '</div>' : '') +
             '</div>');
+        if (hasHelp) {
+            label.find('.help-toggle').on('click', function (e) {
+                e.stopPropagation();
+                label.find('.help-text').prop('hidden', function (_, h) { return !h; });
+                $(this).toggleClass('open');
+            });
+        }
+        row.append(label);
 
         if (s.type === 'bool') {
             var on = String(s.value).toLowerCase() === 'true';

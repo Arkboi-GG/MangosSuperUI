@@ -5,6 +5,7 @@ using MangosSuperUI.Services;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.BotLogic.Chat.Core;
 using MangosSuperUI.BotLogic.Chat.Voice;
+using MangosSuperUI.BotLogic.Chat.Health;
 using Dapper;
 using System.Text.Json;
 
@@ -13,11 +14,22 @@ namespace MangosSuperUI.Controllers;
 /// <summary>
 /// CHAT_ARCHITECTURE §14.3 — the two chat surfaces:
 ///   /BotChat/Settings  ("Chat Feel"):     preset bar + collapsible setting groups
-///   /BotChat/Capacity  ("Chat Capacity"): profiles, kill switches, broker panel (stub → C5)
+///   /BotChat/Capacity  ("Chat Capacity"): profiles, kill switches, broker panel, batch lane
 /// Every settings write logs [CHAT-SET] who/key/old/new (§15); profile switches log
 /// [CHAT-CAP]. Preset applies and profile changes additionally hit AuditService (house
 /// pattern). A SignalR "ChatSettingsChanged" ping follows every write so open dashboards
-/// refresh (§14.3). Profile writes are storage-only in C1 — the broker reads them in C5.
+/// refresh (§14.3).
+///
+/// AMENDED 2026-07-13 — NOTHING IN THE CHAT LAYER MAY REQUIRE A SQL CLIENT. The
+/// repetition bug was diagnosed with hand-written queries and repaired with hand-written
+/// UPDATEs, which is fine for the author and useless for anyone else running this server.
+/// Everything that diagnosis and repair needed is now an endpoint:
+///   Capacity/LibraryHealth        — is the voice library any good?
+///   Capacity/ChatHealth           — are the bots repeating themselves right now?
+///   Capacity/BuildPreflight       — can a build succeed, and on WHICH model?
+///   Capacity/ProbeModels          — what does that endpoint actually serve?
+///   Capacity/RebuildLibrary       — retire + detach + build, one button
+///   Capacity/ReassignAllPersonas  — every persona, not just the seed-era ones
 /// </summary>
 [Route("BotChat")]
 public class ChatSettingsController : Controller
@@ -26,18 +38,20 @@ public class ChatSettingsController : Controller
     private readonly ChatSettingsService _settings;
     private readonly VoiceLibraryBuilder _voiceBuilder;
     private readonly PersonaService _personas;
+    private readonly ChatHealthService _health;
     private readonly AuditService _audit;
     private readonly IHubContext<BotBridgeHub> _hub;
     private readonly ILogger<ChatSettingsController> _logger;
 
     public ChatSettingsController(ConnectionFactory db, ChatSettingsService settings,
-        VoiceLibraryBuilder voiceBuilder, PersonaService personas,
+        VoiceLibraryBuilder voiceBuilder, PersonaService personas, ChatHealthService health,
         AuditService audit, IHubContext<BotBridgeHub> hub, ILogger<ChatSettingsController> logger)
     {
         _db = db;
         _settings = settings;
         _voiceBuilder = voiceBuilder;
         _personas = personas;
+        _health = health;
         _audit = audit;
         _hub = hub;
         _logger = logger;
@@ -74,6 +88,7 @@ public class ChatSettingsController : Controller
                 group = d.Group,
                 type = d.Type,
                 meaning = d.Meaning,
+                help = d.Help,
                 min = d.Min,
                 max = d.Max,
                 step = d.Step,
@@ -177,6 +192,8 @@ public class ChatSettingsController : Controller
             "SELECT COUNT(*) FROM chat_voice WHERE retired=0");
         var seedPersonaCount = await conn.QuerySingleAsync<int>(
             "SELECT COUNT(*) FROM bot_persona WHERE voice_id IS NULL");
+        var personaCount = await conn.QuerySingleAsync<int>(
+            "SELECT COUNT(*) FROM bot_persona");
 
         return Json(new
         {
@@ -186,19 +203,56 @@ public class ChatSettingsController : Controller
             voiceCount,
             voiceTarget = _settings.GetInt(0, "voice.library_target", 300),
             seedPersonaCount,
+            personaCount,
+            banterIntensity = _settings.GetFloat(0, "voice.banter_intensity", 0.5f),
             voiceBuild = _voiceBuilder.Status
         });
     }
 
+    // ==================== Health + preflight (the no-SQL surface) ====================
+
+    [HttpGet("Capacity/LibraryHealth")]
+    public async Task<IActionResult> LibraryHealth() => Json(await _health.GetLibraryHealthAsync());
+
+    [HttpGet("Capacity/ChatHealth")]
+    public async Task<IActionResult> ChatHealth(int days = 7) => Json(await _health.GetChatHealthAsync(days));
+
+    [HttpGet("Capacity/BuildPreflight")]
+    public async Task<IActionResult> BuildPreflight() => Json(await _health.GetBuildPreflightAsync());
+
+    /// <summary>What does this endpoint actually serve? Feeds the model-tag dropdowns.</summary>
+    [HttpGet("Capacity/ProbeModels")]
+    public async Task<IActionResult> ProbeModels(string endpoint, string flavor = "ollama")
+    {
+        var models = await _health.ProbeModelsAsync(endpoint, (flavor ?? "ollama").ToLowerInvariant());
+        return Json(new { success = models.Count > 0, models });
+    }
+
     // ==================== Voice library (C6) ====================
 
+    public record BuildRequest(bool force);
+
+    /// <summary>
+    /// Top-up build (resumable). Refuses on a FAILING preflight unless the operator
+    /// explicitly forces it — a build against a dead endpoint or a missing model tag just
+    /// burns the attempt cap and leaves a half-library behind.
+    /// </summary>
     [HttpPost("Capacity/BuildVoiceLibrary")]
-    public async Task<IActionResult> BuildVoiceLibrary()
+    public async Task<IActionResult> BuildVoiceLibrary([FromBody] BuildRequest? req)
     {
+        var pre = await _health.GetBuildPreflightAsync();
+        if (!pre.CanBuild && !(req?.force ?? false))
+        {
+            var blockers = pre.Checks.Where(c => c.Status == "fail").Select(c => $"{c.Label}: {c.Detail}");
+            return Json(new { success = false, error = "Preflight failed — " + string.Join(" / ", blockers), preflight = pre });
+        }
+
         if (!_voiceBuilder.TryStart())
             return Json(new { success = false, error = "a build is already running" });
 
-        _logger.LogInformation("[CHAT-CAP] {Who} started a voice library build", Who);
+        _logger.LogInformation("[CHAT-CAP] {Who} started a voice library build on '{Model}'{Fallback}",
+            Who, pre.EffectiveBatchModel, pre.UsingReactiveFallback ? " (REACTIVE fallback — no model_batch set)" : "");
+
         await _audit.LogAsync(new AuditEntry
         {
             Operator = "admin",
@@ -209,15 +263,59 @@ public class ChatSettingsController : Controller
             TargetName = "library",
             IsReversible = false,
             Success = true,
-            Notes = "Voice library build started (Batch class)"
+            Notes = $"Voice library build started (Batch class, model '{pre.EffectiveBatchModel}')"
         });
-        return Json(new { success = true });
+        return Json(new { success = true, model = pre.EffectiveBatchModel, fallback = pre.UsingReactiveFallback });
+    }
+
+    /// <summary>
+    /// The destructive one, in a single button: retire every voice, detach every persona,
+    /// start a clean build. Replaces the "just run these three UPDATEs" instruction that
+    /// should never have existed.
+    /// </summary>
+    [HttpPost("Capacity/RebuildLibrary")]
+    public async Task<IActionResult> RebuildLibrary([FromBody] BuildRequest? req)
+    {
+        var pre = await _health.GetBuildPreflightAsync();
+        if (!pre.CanBuild && !(req?.force ?? false))
+        {
+            var blockers = pre.Checks.Where(c => c.Status == "fail").Select(c => $"{c.Label}: {c.Detail}");
+            return Json(new { success = false, error = "Preflight failed — " + string.Join(" / ", blockers), preflight = pre });
+        }
+
+        if (_voiceBuilder.Status.Running)
+            return Json(new { success = false, error = "a build is already running" });
+
+        int retired = await _health.RetireLibraryAsync();
+        int detached = await _health.DetachAllPersonasAsync();
+
+        if (!_voiceBuilder.TryStart())
+            return Json(new { success = false, error = "a build is already running" });
+
+        _logger.LogWarning("[CHAT-CAP] {Who} REBUILT the voice library from scratch — retired {Retired} voices, " +
+                           "detached {Detached} personas, building on '{Model}'",
+            Who, retired, detached, pre.EffectiveBatchModel);
+
+        await _audit.LogAsync(new AuditEntry
+        {
+            Operator = "admin",
+            OperatorIp = HttpContext.Connection.RemoteIpAddress?.ToString(),
+            Category = "bots",
+            Action = "voice_library_rebuild",
+            TargetType = "chat_voice",
+            TargetName = "library",
+            IsReversible = false,
+            Success = true,
+            Notes = $"Retired {retired} voices, detached {detached} personas, clean build on '{pre.EffectiveBatchModel}'"
+        });
+
+        return Json(new { success = true, retired, detached, model = pre.EffectiveBatchModel });
     }
 
     [HttpGet("Capacity/VoiceBuildStatus")]
     public IActionResult VoiceBuildStatus() => Json(_voiceBuilder.Status);
 
-    /// <summary>One-shot: reassign pre-library (seed-era) personas onto library voices.</summary>
+    /// <summary>Reassign pre-library (seed-era, voice_id IS NULL) personas onto library voices.</summary>
     [HttpPost("Capacity/RerollSeedPersonas")]
     public async Task<IActionResult> RerollSeedPersonas()
     {
@@ -225,6 +323,42 @@ public class ChatSettingsController : Controller
         _logger.LogInformation("[CHAT-CAP] {Who} rerolled {Count} seed-era personas onto the library", Who, count);
         return Json(new { success = true, rerolled = count });
     }
+
+    /// <summary>
+    /// Reassign EVERY persona, not just the unassigned ones. This is what you want after a
+    /// rebuild: the old cards descend from a library that no longer exists.
+    /// </summary>
+    [HttpPost("Capacity/ReassignAllPersonas")]
+    public async Task<IActionResult> ReassignAllPersonas()
+    {
+        using (var conn = _db.Admin())
+        {
+            var voices = await conn.QuerySingleAsync<int>("SELECT COUNT(*) FROM chat_voice WHERE retired=0");
+            if (voices == 0)
+                return Json(new { success = false, error = "the voice library is empty — build it first" });
+        }
+
+        int detached = await _health.DetachAllPersonasAsync();
+        int rerolled = await _personas.RerollSeedPersonasAsync();
+
+        _logger.LogWarning("[CHAT-CAP] {Who} reassigned ALL {Count} personas onto the current library", Who, rerolled);
+        await _audit.LogAsync(new AuditEntry
+        {
+            Operator = "admin",
+            OperatorIp = HttpContext.Connection.RemoteIpAddress?.ToString(),
+            Category = "bots",
+            Action = "persona_reassign_all",
+            TargetType = "bot_persona",
+            TargetName = "all",
+            IsReversible = false,
+            Success = true,
+            Notes = $"Detached {detached} personas and reassigned them from the voice library"
+        });
+
+        return Json(new { success = true, rerolled });
+    }
+
+    // ==================== Profiles ====================
 
     public class ProfileDto
     {
@@ -234,7 +368,7 @@ public class ChatSettingsController : Controller
         public string apiFlavor { get; set; } = "ollama";   // 'ollama' | 'openai' (vLLM etc.)
         public string modelReactive { get; set; } = "";
         public string modelAmbient { get; set; } = "";
-        public string modelBatch { get; set; } = "";      // '' = batch lane disabled
+        public string modelBatch { get; set; } = "";      // '' = batch falls back to reactive
         public int ctxBudgetTokens { get; set; } = 3000;
         public int concurrency { get; set; } = 2;
         public int reactiveReserved { get; set; } = 1;
@@ -298,7 +432,7 @@ public class ChatSettingsController : Controller
         return Json(new { success = true });
     }
 
-    /// <summary>Exactly-one-active flip. Storage-only in C1; the InferenceBroker reads it in C5.</summary>
+    /// <summary>Exactly-one-active flip. The broker re-reads the active row within 60 s.</summary>
     [HttpPost("Capacity/ActivateProfile")]
     public async Task<IActionResult> ActivateProfile([FromBody] ProfileIdRequest req)
     {
@@ -320,7 +454,7 @@ public class ChatSettingsController : Controller
             TargetName = name,
             IsReversible = true,
             Success = true,
-            Notes = $"Activated inference profile '{name}' (broker consumes in C5)"
+            Notes = $"Activated inference profile '{name}'"
         });
         return Json(new { success = true, name });
     }

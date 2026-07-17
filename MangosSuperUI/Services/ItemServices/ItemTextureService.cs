@@ -260,6 +260,43 @@ public class ItemTextureService
     /// </summary>
     /// <param name="displayId">The ORIGINAL vanilla displayId being retextured.</param>
     /// <param name="recoloredPngPath">Disk path to the already-rendered recolor PNG.</param>
+    /// <summary>
+    /// The geometry-sampled skin slots for a display's item model — the texture
+    /// indices the render batches actually sample (batch → TextureLookup → Textures),
+    /// minus overlay passes (spec/glow/env/reflect/smoke/skill), each with its raw M2
+    /// filename. EMPTY filename = a Type-2 slot the DBC's TextureName1 fills; a NON-empty
+    /// filename = a baked Type-0 skin. Callers recolor what the model actually renders
+    /// instead of trusting a possibly-dead TextureName1 override.
+    /// </summary>
+    public List<(int Index, string Filename)> GetSampledSkinSlots(uint displayId)
+    {
+        var result = new List<(int, string)>();
+        try
+        {
+            var modelInfo = _dbc.GetItemModelInfo(displayId);
+            if (modelInfo == null) return result;
+            string? modelName = !string.IsNullOrEmpty(modelInfo.Value.ModelName1)
+                ? modelInfo.Value.ModelName1
+                : modelInfo.Value.ModelName2;
+            if (string.IsNullOrEmpty(modelName)) return result;
+            var m2Data = FindAndExtractItemM2(modelName);
+            if (m2Data == null) return result;
+            var m2 = M2Reader.Parse(m2Data);
+            if (m2 == null || !m2.IsValid) return result;
+            foreach (int ti in GlbWriter.SampledTextureIndices(m2))
+            {
+                if (ti < 0 || ti >= m2.Textures.Count) continue;
+                string up = (m2.Textures[ti].Filename ?? "").ToUpperInvariant();
+                if (up.Contains("SPEC") || up.Contains("GLOW") || up.Contains("SMOKE") ||
+                    up.Contains("ENV") || up.Contains("REFLECT") || up.Contains("SKILLACTIVATED"))
+                    continue;
+                result.Add((ti, m2.Textures[ti].Filename ?? ""));
+            }
+        }
+        catch { /* best-effort diagnostics helper */ }
+        return result;
+    }
+
     public string? BuildPreviewGlb(uint displayId, string recoloredPngPath)
     {
         if (displayId == 0 || string.IsNullOrEmpty(recoloredPngPath) || !File.Exists(recoloredPngPath))
@@ -301,18 +338,82 @@ public class ItemTextureService
                 }
             }
 
-            // Determine the slot the recolor should occupy + its native
-            // dimensions/format, by reading the vanilla texture metadata.
-            int injectSlot = FindSkinTextureSlot(m2Model, new Dictionary<int, byte[]>());
+            // The recolor must land on the slot the GEOMETRY actually samples for the
+            // base skin (batch → TextureLookup → Textures), skipping overlay passes —
+            // NOT the "first Type-2" guess, which misses baked-skin weapons like Gressil
+            // (renders ITEM\OBJECTCOMPONENTS\WEAPON\1HSWD_02, a Type-0 slot).
+            // A weapon can render the SAME skin at MORE THAN ONE sampled slot
+            // (Corrupted Ashbringer's two visible pieces). Inject the recolor into
+            // EVERY sampled slot that shares the primary skin's filename so all pieces
+            // change, not just the first — again skipping overlay passes.
+            // The skin can be rendered at MULTIPLE sampled slots — as a baked Type-0
+            // texture AND as a Type-2 slot the DBC fills with the SAME skin (Corrupted
+            // Ashbringer: baked SWORD_2H_ASHBRINGERCORRUPT at one slot + a Type-2 slot
+            // TextureName1 fills with the same skin for its other piece). Inject into
+            // every such slot. A Type-2 slot has an EMPTY M2 filename, so it can't be
+            // matched by filename — match it by TextureName1 == the primary skin.
+            string t1Stem = Path.GetFileNameWithoutExtension(
+                (modelInfo.Value.TextureName1 ?? "").Replace('\\', '/'));
+            var skinSlots = new List<int>();
+            bool havePrimary = false;
+            string primaryStem = "";
+            foreach (int ti in GlbWriter.SampledTextureIndices(m2Model))
+            {
+                if (ti < 0 || ti >= m2Model.Textures.Count) continue;
+                string fn = m2Model.Textures[ti].Filename ?? "";
+                string up = fn.ToUpperInvariant();
+                if (up.Contains("SPEC") || up.Contains("GLOW") || up.Contains("SMOKE") ||
+                    up.Contains("ENV") || up.Contains("REFLECT") || up.Contains("SKILLACTIVATED"))
+                    continue;
+                string stem = Path.GetFileNameWithoutExtension(fn.Replace('\\', '/'));
+                if (!havePrimary) { havePrimary = true; primaryStem = stem; }
+                bool sameBaked = stem.Equals(primaryStem, StringComparison.OrdinalIgnoreCase);
+                bool dbcSameSkin = stem.Length == 0 &&
+                    (primaryStem.Length == 0 || t1Stem.Equals(primaryStem, StringComparison.OrdinalIgnoreCase));
+                if (sameBaked || dbcSameSkin)
+                    skinSlots.Add(ti);
+            }
+            if (skinSlots.Count == 0)
+            {
+                int fallback = FindSkinTextureSlot(m2Model, new Dictionary<int, byte[]>());
+                if (fallback >= 0) skinSlots.Add(fallback);
+            }
+
+            // TEMP DIAGNOSTIC: raw M2 texture layout + what we chose to inject into.
+            for (int di = 0; di < m2Model.Textures.Count; di++)
+                _logger.LogInformation("ItemTexture/DBG {Id} tex[{I}] Type={T} File='{F}'",
+                    displayId, di, m2Model.Textures[di].Type, m2Model.Textures[di].Filename);
+            _logger.LogInformation(
+                "ItemTexture/DBG {Id} Lookup=[{L}] Batches=[{B}] Sampled=[{S}] primaryStem='{P}' t1Stem='{T1}' skinSlots=[{K}]",
+                displayId, string.Join(",", m2Model.TextureLookup),
+                string.Join(" ", m2Model.Batches.Select(b => $"{b.SubmeshIndex}:{b.TextureIndex}")),
+                string.Join(",", GlbWriter.SampledTextureIndices(m2Model)),
+                primaryStem, t1Stem, string.Join(",", skinSlots));
+
+            // Native dims/format of the slot we inject into: the sampled slot's own
+            // texture; for a Type-2 slot (empty filename) the DBC fills, use TextureName1;
+            // else the first texture.
             int targetW = 0, targetH = 0;
             bool useDxt1 = false;
             var texMeta = GetTexturesForDisplay(displayId);
-            var firstTex = texMeta?.Textures.FirstOrDefault();
-            if (firstTex != null)
+            ItemTextureEntry? dimTex = null;
+            if (primaryStem.Length > 0)
+                dimTex = texMeta?.Textures.FirstOrDefault(t =>
+                    Path.GetFileNameWithoutExtension((t.Filename ?? "").Replace('\\', '/'))
+                        .Equals(primaryStem, StringComparison.OrdinalIgnoreCase));
+            if (dimTex == null && !string.IsNullOrEmpty(modelInfo.Value.TextureName1))
             {
-                targetW = firstTex.Width > 0 ? firstTex.Width : 0;
-                targetH = firstTex.Height > 0 ? firstTex.Height : 0;
-                useDxt1 = firstTex.Format == "DXT1";
+                string t1 = Path.GetFileNameWithoutExtension(modelInfo.Value.TextureName1.Replace('\\', '/'));
+                dimTex = texMeta?.Textures.FirstOrDefault(t =>
+                    Path.GetFileNameWithoutExtension((t.Filename ?? "").Replace('\\', '/'))
+                        .Equals(t1, StringComparison.OrdinalIgnoreCase));
+            }
+            dimTex ??= texMeta?.Textures.FirstOrDefault();
+            if (dimTex != null)
+            {
+                targetW = dimTex.Width > 0 ? dimTex.Width : 0;
+                targetH = dimTex.Height > 0 ? dimTex.Height : 0;
+                useDxt1 = dimTex.Format == "DXT1";
             }
             if (targetW == 0 || targetH == 0) { targetW = 256; targetH = 256; }
 
@@ -328,7 +429,7 @@ public class ItemTextureService
                 if (resized == null) return null;
                 var blpBytes = _blpWriter.EncodeBitmapToBlp(resized, useDxt1);
                 if (blpBytes == null) return null;
-                if (injectSlot >= 0) textures[injectSlot] = blpBytes;
+                foreach (int s in skinSlots) textures[s] = blpBytes;
             }
 
             // Write to a throwaway preview path (NOT the versioned cache).
@@ -344,8 +445,8 @@ public class ItemTextureService
                 return null;
             }
 
-            _logger.LogInformation("ItemTexture: built preview GLB {File} for displayId {Id}",
-                fileName, displayId);
+            _logger.LogInformation("ItemTexture: built preview GLB {File} for displayId {Id} (recolor → slot(s) {Slots})",
+                fileName, displayId, string.Join(",", skinSlots));
             return $"/item_models/_preview/{fileName}";
         }
         catch (Exception ex)

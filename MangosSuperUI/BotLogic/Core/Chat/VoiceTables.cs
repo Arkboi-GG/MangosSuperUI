@@ -7,23 +7,29 @@ using MangosSuperUI.BotLogic.Chat.Core;
 /// sampled independently BEFORE any LLM call, so the library cannot cluster the way an
 /// all-LLM (or scraped-corpus) approach would. The LLM only writes prose to fit.
 ///
-/// Axes: age bands (weighted 10/20/30/20/15/5), 12 regions with timezones, 40
-/// era-appropriate occupations (age-gated by category), 60 interests, 10 gaming
-/// backgrounds, per-age-band typing distributions (younger → lower caps, higher abbrev,
-/// higher wpm, more typos), humor + tic pools.
+/// AMENDED 2026-07-13 (a): swear_level is a sampled axis (§6.2 schema v2), keyed to age
+/// band AND disposition. Disposition is sampled BEFORE typing, because typing reads it.
+/// (Incidental fix: humor was being rolled twice into two different fields.)
 ///
-/// AMENDED 2026-07-13: swear_level is now a sampled axis (§6.2 schema v2). It is keyed
-/// to age band AND disposition — a hot-tempered 16-year-old and a warm 46-year-old bank
-/// teller do not swear at the same rate or with the same words, and before this they had
-/// no axis on which to differ. Disposition is therefore sampled BEFORE typing (it used to
-/// be after, and humor was rolled twice into two different fields — both fixed here).
+/// AMENDED 2026-07-13 (b): GIVEN NAME IS NOW A SKELETON AXIS. It was the one identity
+/// field left to the LLM, and the first 300-card build came back with 48 Dereks and 24
+/// Dales — 76 distinct names across 300 cards. A small model has favorites; every other
+/// identity axis is sampled here precisely so it cannot collapse one, and this was the
+/// hole. Pools are region-grouped and age-cohort-gated: these are people born 1947–1992,
+/// so a 14-year-old in 2005 is Tyler or Brandon and a 52-year-old is Gary or Cheryl,
+/// never the reverse. The builder additionally caps any single name at 4 cards.
+///
+/// Axes: age bands (weighted 10/20/30/20/15/5), 12 regions with timezones, given names by
+/// region × cohort, 40 era-appropriate occupations (age-gated), 60 interests, 10 gaming
+/// backgrounds, per-age-band typing distributions (younger → lower caps, higher abbrev,
+/// higher wpm, more typos), swear register, humor + tic pools.
 /// </summary>
 public static class VoiceTables
 {
     // ==================== Skeleton ====================
 
     public sealed record Skeleton(int Age, string AgeBand, string Region, int TimezoneOffset,
-        string OccupationCategory, string GamingBackground, string Humor,
+        string GivenName, string OccupationCategory, string GamingBackground, string Humor,
         List<string> Interests, PersonaTyping Typing, PersonaDisposition Disposition);
 
     public static Skeleton Sample(Random rng)
@@ -50,6 +56,7 @@ public static class VoiceTables
             AgeBand: band.Name,
             Region: region,
             TimezoneOffset: tz,
+            GivenName: SampleGivenName(rng, region, age),
             OccupationCategory: occ,
             GamingBackground: GamingBackgrounds[rng.Next(GamingBackgrounds.Length)],
             Humor: humor,
@@ -87,6 +94,75 @@ public static class VoiceTables
         ("US-West", -8), ("Canada", -5), ("UK", 0), ("Ireland", 0),
         ("Germany", 1), ("Scandinavia", 1), ("Netherlands", 1), ("Australia", 10),
     };
+
+    // ==================== Given names (region × cohort; these people were born 1947–1992) ====================
+
+    private static readonly string[] AngloTeenM = { "Tyler", "Brandon", "Austin", "Cody", "Dylan", "Jordan", "Zach", "Kyle", "Devin", "Trevor", "Corey", "Shane", "Colton", "Hunter", "Logan", "Bryce" };
+    private static readonly string[] AngloTeenF = { "Kayla", "Brittany", "Ashley", "Megan", "Amber", "Jessica", "Courtney", "Chelsea", "Alyssa", "Danielle", "Brooke", "Kelsey" };
+    private static readonly string[] AngloTwentiesM = { "Josh", "Ryan", "Justin", "Brian", "Eric", "Nick", "Matt", "Chris", "Dan", "Jeff", "Adam", "Sean", "Jason", "Aaron", "Derek", "Travis", "Marcus", "Andy" };
+    private static readonly string[] AngloTwentiesF = { "Amanda", "Sarah", "Nicole", "Heather", "Melissa", "Erin", "Kristen", "Lindsay", "Rachel", "Katie", "Steph", "Jenna" };
+    private static readonly string[] AngloAdultM = { "Mike", "Dave", "Scott", "Todd", "Greg", "Kevin", "Brad", "Doug", "Shawn", "Craig", "Rob", "Tim", "Mark", "Kurt", "Vince" };
+    private static readonly string[] AngloAdultF = { "Tracy", "Michelle", "Lisa", "Kim", "Julie", "Angela", "Christine", "Wendy", "Dawn", "Stacy", "Renee" };
+    private static readonly string[] AngloOlderM = { "Gary", "Dennis", "Randy", "Wayne", "Larry", "Ron", "Rick", "Steve", "Terry", "Glenn", "Dale", "Bruce", "Roger" };
+    private static readonly string[] AngloOlderF = { "Cheryl", "Debbie", "Karen", "Sandra", "Nancy", "Linda", "Pam", "Sue", "Barb", "Donna" };
+
+    private static readonly string[] BritYoungM = { "Liam", "Callum", "Connor", "Jack", "Aidan", "Niall", "Sean", "Ciaran", "Declan", "Lewis", "Ross", "Danny" };
+    private static readonly string[] BritYoungF = { "Aoife", "Siobhan", "Niamh", "Chloe", "Emma", "Hannah", "Sinead", "Lauren", "Gemma" };
+    private static readonly string[] BritAdultM = { "Gareth", "Stuart", "Neil", "Colin", "Alan", "Ian", "Gavin", "Eamon", "Padraig", "Dermot", "Graham", "Nigel", "Barry" };
+    private static readonly string[] BritAdultF = { "Fiona", "Claire", "Orla", "Louise", "Bernadette", "Deirdre", "Helen", "Julie" };
+
+    private static readonly string[] GerYoungM = { "Lukas", "Jonas", "Tobias", "Sebastian", "Florian", "Marcel", "Niklas", "Kevin", "Dennis", "Christoph" };
+    private static readonly string[] GerYoungF = { "Lena", "Anna", "Julia", "Lisa", "Vanessa", "Nadine", "Katrin" };
+    private static readonly string[] GerAdultM = { "Stefan", "Thomas", "Andreas", "Matthias", "Michael", "Jürgen", "Frank", "Uwe", "Ralf", "Dirk" };
+    private static readonly string[] GerAdultF = { "Sabine", "Petra", "Claudia", "Andrea", "Kerstin", "Birgit", "Silke" };
+
+    private static readonly string[] ScanYoungM = { "Erik", "Lars", "Magnus", "Anders", "Henrik", "Jonas", "Mikkel", "Kasper", "Eirik", "Sindre", "Emil" };
+    private static readonly string[] ScanYoungF = { "Ida", "Sofie", "Maja", "Linnea", "Hanne", "Elin" };
+    private static readonly string[] ScanAdultM = { "Björn", "Sven", "Nils", "Ole", "Gunnar", "Torsten", "Rune", "Jarl", "Per" };
+    private static readonly string[] ScanAdultF = { "Ingrid", "Kristin", "Astrid", "Marit", "Helle", "Bodil" };
+
+    private static readonly string[] NlYoungM = { "Sander", "Bram", "Daan", "Ruben", "Thijs", "Jeroen", "Bas", "Rick", "Stijn" };
+    private static readonly string[] NlYoungF = { "Femke", "Anouk", "Sanne", "Lotte", "Iris", "Marloes" };
+    private static readonly string[] NlAdultM = { "Joost", "Willem", "Dirk", "Hendrik", "Maarten", "Pieter", "Kees", "Bert" };
+    private static readonly string[] NlAdultF = { "Marieke", "Annelies", "Saskia", "Ellen", "Ineke" };
+
+    /// <summary>2005 WoW skewed male — but keep women in the fleet or the Barrens reads wrong.</summary>
+    private const double MaleShare = 0.72;
+
+    public static string SampleGivenName(Random rng, string region, int age)
+    {
+        bool male = rng.NextDouble() < MaleShare;
+
+        string[] pool = region switch
+        {
+            "UK" or "Ireland" => age <= 23
+                ? (male ? BritYoungM : BritYoungF)
+                : (male ? BritAdultM : BritAdultF),
+
+            "Germany" => age <= 23
+                ? (male ? GerYoungM : GerYoungF)
+                : (male ? GerAdultM : GerAdultF),
+
+            "Scandinavia" => age <= 23
+                ? (male ? ScanYoungM : ScanYoungF)
+                : (male ? ScanAdultM : ScanAdultF),
+
+            "Netherlands" => age <= 23
+                ? (male ? NlYoungM : NlYoungF)
+                : (male ? NlAdultM : NlAdultF),
+
+            // US-*, Canada, Australia — cohort-gated, because a first name is a birth-year stamp
+            _ => age switch
+            {
+                <= 18 => male ? AngloTeenM : AngloTeenF,
+                <= 30 => male ? AngloTwentiesM : AngloTwentiesF,
+                <= 45 => male ? AngloAdultM : AngloAdultF,
+                _ => male ? AngloOlderM : AngloOlderF,
+            }
+        };
+
+        return pool[rng.Next(pool.Length)];
+    }
 
     // ==================== Occupations (40, age-gated) ====================
 
@@ -147,12 +223,12 @@ public static class VoiceTables
     public static readonly string[] Interests =
     {
         "metal music", "punk rock", "emo bands", "classic rock", "rap", "country music",
-        "playing guitar", "playing drums", "his garage band", "DDR at the arcade",
+        "playing guitar", "playing drums", "their garage band", "DDR at the arcade",
         "CS 1.6", "Halo 2", "Runescape", "Diablo 2", "Starcraft", "Warcraft 3 custom maps",
         "Madden", "Gran Turismo", "GameCube games", "emulators and ROMs",
         "skateboarding", "BMX", "basketball", "football", "baseball", "hockey", "soccer",
         "WWE wrestling", "UFC", "paintball", "airsoft", "fishing", "hunting", "camping",
-        "working on his car", "import tuners", "motorcycles",
+        "working on their car", "import tuners", "motorcycles",
         "anime", "Dragonball Z", "Naruto", "manga", "comic books",
         "D&D", "Magic: The Gathering", "Warhammer minis", "Lord of the Rings",
         "Star Wars", "sci-fi novels", "fantasy novels", "horror movies", "kung fu movies",
@@ -188,7 +264,7 @@ public static class VoiceTables
 
     public static readonly string[] Humors = { "dry", "goofy", "gentle", "sarcastic", "deadpan", "corny" };
 
-    // ==================== Swear register (§6.2 v2, new axis) ====================
+    // ==================== Swear register (§6.2 v2) ====================
 
     /// <summary>P(level 0), P(1), P(2), P(3) per age band. Teenagers and young adults
     /// swore the most online in 2005; the 46+ band is where "darn" actually lived.</summary>
@@ -199,11 +275,11 @@ public static class VoiceTables
         ["19-23"] = new[] { 0.10f, 0.30f, 0.40f, 0.20f },
         ["24-30"] = new[] { 0.15f, 0.40f, 0.35f, 0.10f },
         ["31-45"] = new[] { 0.20f, 0.45f, 0.30f, 0.05f },
-        ["46+"]   = new[] { 0.40f, 0.45f, 0.15f, 0.00f },
+        ["46+"] = new[] { 0.40f, 0.45f, 0.15f, 0.00f },
     };
 
-    /// <summary>Band-weighted draw, then nudged by temperament: hot-tempered people swear
-    /// more, warm even-tempered people swear less. Clamped 0–3.</summary>
+    /// <summary>Band-weighted draw, nudged by temperament: hot-tempered people swear more,
+    /// warm even-tempered people swear less. Clamped 0–3.</summary>
     public static int SampleSwearLevel(Random rng, AgeBand band, PersonaDisposition d)
     {
         var w = SwearWeights.TryGetValue(band.Name, out var found) ? found : SwearWeights["19-23"];
@@ -234,7 +310,7 @@ public static class VoiceTables
             "19-23" => (new[] { 0.48f, 0.25f, 0.24f, 0.03f }, 1, 3, 58f, 12f, 0.02f, 0.06f),
             "24-30" => (new[] { 0.25f, 0.45f, 0.28f, 0.02f }, 1, 2, 52f, 12f, 0.02f, 0.05f),
             "31-45" => (new[] { 0.10f, 0.68f, 0.20f, 0.02f }, 0, 2, 42f, 10f, 0.01f, 0.04f),
-            _       => (new[] { 0.05f, 0.85f, 0.10f, 0.00f }, 0, 1, 32f, 8f, 0.01f, 0.04f),
+            _ => (new[] { 0.05f, 0.85f, 0.10f, 0.00f }, 0, 1, 32f, 8f, 0.01f, 0.04f),
         };
 
         string capsStyle = WeightedPick(rng, caps, new[] { "lower", "proper", "mixed", "CRUISE" });

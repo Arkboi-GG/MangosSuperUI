@@ -85,6 +85,19 @@ public class QuestLootifierController : Controller
     private const int ITEM_CLASS_WEAPON = 2;
     private const int ITEM_CLASS_ARMOR = 4;
 
+    // ── Weapon DPS by tier (damage-only; weapon SPEED/delay is never touched) ──
+    // Vanilla (pre-TBC) weapon DPS = Green(iLevel) × qualityMult, so at a FIXED
+    // iLevel the only lever between qualities is a flat multiplier on the damage
+    // range: blue (Superior) ×1.105, epic ×1.215 over the green line (Vanilla WoW
+    // Wiki item-DPS budget). A tier bump keeps the weapon's iLevel, hand type and
+    // delay, so scaling min+max damage by (1+p) raises DPS by exactly p%. These are
+    // DEFAULT proposals; legendary had no vanilla formula slot (Sulfuras ~+7% over
+    // an epic 2H, Thunderfury far below), so 1.30 is a nominal, override-me ceiling.
+    // Numbers live in DefaultBands (as %) and Meta.dpsReference (for the UI).
+    private const float DPS_GREEN_SLOPE = 0.6f;
+    private const float DPS_GREEN_INTERCEPT = 26.6f;
+    private const int DPS_GREEN_ILVL_FLOOR = 45;   // Green1H = (iLevel-45)*0.6 + 26.6 (valid ~iLevel 45-65)
+
     // ── Additive-generation dials (mirror CraftingLootifier) ──
     private const float MIN_DELTA_BUDGET = 2.0f;   // additive floor: every variant is a real upgrade over the base reward
     private const float QUEST_BUMP_BIAS = 0.5f;    // delta split: existing-line bumps vs new affixes (0 = all new, 1 = all bumps)
@@ -114,7 +127,15 @@ public class QuestLootifierController : Controller
         return Json(new
         {
             statNames = STAT_NAMES,
-            defaultRuleset = DefaultRuleset()
+            defaultRuleset = DefaultRuleset(),
+            // Vanilla weapon-DPS reference so the UI can propose per-tier damage
+            // bumps relative to blue/purple/legendary at the reward's level.
+            dpsReference = new
+            {
+                qualityMult = new { green = 1.000f, blue = 1.105f, purple = 1.215f, legendary = 1.300f },
+                greenOneHand = new { slope = DPS_GREEN_SLOPE, intercept = DPS_GREEN_INTERCEPT, ilvlFloor = DPS_GREEN_ILVL_FLOOR },
+                note = "blue +10.5% / purple +21.5% over green at the same level; legendary 1.30 is nominal (vanilla legendaries were hand-tuned)."
+            }
         });
     }
 
@@ -279,7 +300,9 @@ public class QuestLootifierController : Controller
             bool hasSpell = ((List<SpellEffectInfo>)analysis.spellEffects).Count > 0;
             if (!IsLootifiable(analysis)) continue;
 
-            var variants = VariantsToJson(GenerateVariants(item, analysis, ruleset), (int)analysis.itemQuality);
+            var wpn = WeaponDpsInfo(item);
+            var variants = VariantsToJson(GenerateVariants(item, analysis, ruleset), (int)analysis.itemQuality,
+                (bool)wpn.isWeapon, (float)wpn.baseDps, ruleset);
             uint displayId = (uint)item.display_id;
 
             // Sample legendary (preview only — not persisted). Same 150% budget +
@@ -300,6 +323,7 @@ public class QuestLootifierController : Controller
                 string qTitle = await GetQuestTitleForRewardItem(conn, itemEntry);
                 string legName = BuildQuestLegendaryName(qTitle, (string)item.name);
 
+                float legDpsBump = (bool)wpn.isWeapon ? ruleset.legendaryDpsBumpPct : 0f;
                 variants.Add(new
                 {
                     variantIndex = 999,
@@ -308,6 +332,8 @@ public class QuestLootifierController : Controller
                     tierLabel = "Legendary",
                     tierPosition = "full",
                     isLegendary = true,
+                    dpsBumpPct = (bool)wpn.isWeapon ? (float?)legDpsBump : null,
+                    dps = (bool)wpn.isWeapon ? (double?)Math.Round((float)wpn.baseDps * (1.0 + legDpsBump / 100.0), 1) : null,
                     stats = legStats.Select(s => (object)new { s.statType, s.statValue, s.name }).ToList()
                 });
             }
@@ -320,7 +346,8 @@ public class QuestLootifierController : Controller
                     name = (string)item.name,
                     quality = (int)item.quality,
                     displayId,
-                    iconPath = _dbc.GetItemIconPath(displayId)
+                    iconPath = _dbc.GetItemIconPath(displayId),
+                    weapon = wpn
                 },
                 analysis,
                 variants
@@ -402,23 +429,28 @@ public class QuestLootifierController : Controller
             // copies get repointed at the new set first (see below), and deferring
             // the delete also keeps GetNextLootifierId above the old ids.
             bool isRegen = regenerate && existing.Contains(baseEntry);
-            var oldEntries = isRegen
-                ? await GetQuestVariantEntries(adminConn, baseEntry)
-                : new List<int>();
+            var oldTierByEntry = isRegen
+                ? await GetQuestVariantTierMap(adminConn, baseEntry)
+                : new Dictionary<int, string>();
+            var oldEntries = oldTierByEntry.Keys.ToList();
 
             var variants = GenerateVariants(item, analysis, ruleset);
             int nextId = await GetNextLootifierId(adminConn);
 
-            var rerollPool = new List<int>();   // new variants owned copies can roll into
+            var rerollPool = new List<int>();                    // any-tier fallback pool
+            var newByTier = new Dictionary<string, List<int>>(); // tier -> new variants (same-tier reroll)
 
             foreach (var v in variants)
             {
                 int newEntry = nextId++;
                 var roll = VariantToCommitRoll(v);
                 await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll, ruleset.goldValueScalePct,
-                    ResolveBandGoldBump(ruleset.bands, roll.tierLabel, roll.budgetPct));
-                trackingRows.Add((newEntry, baseEntry, QUEST_SENTINEL_CREATURE, roll.budgetPct, roll.tierLabel ?? ""));
+                    ResolveBandGoldBump(ruleset.bands, roll.tierLabel, roll.budgetPct),
+                    ResolveBandDpsBump(ruleset.bands, roll.tierLabel, roll.budgetPct));
+                string tierKey = roll.tierLabel ?? "";
+                trackingRows.Add((newEntry, baseEntry, QUEST_SENTINEL_CREATURE, roll.budgetPct, tierKey));
                 rerollPool.Add(newEntry);
+                AddToTierPool(newByTier, tierKey, newEntry);
                 itemsCreated++;
             }
 
@@ -435,7 +467,11 @@ public class QuestLootifierController : Controller
                         itemsCreated++;
                         // The legendary is only a reroll target if explicitly opted in —
                         // otherwise a regen would hand out legendaries for free.
-                        if (ruleset.rerollIncludeLegendary) rerollPool.Add(leg.Value.entry);
+                        if (ruleset.rerollIncludeLegendary)
+                        {
+                            rerollPool.Add(leg.Value.entry);
+                            AddToTierPool(newByTier, "Legendary", leg.Value.entry);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -452,12 +488,12 @@ public class QuestLootifierController : Controller
             }
 
             // Regenerate: repoint every player-owned copy of the OLD variants at a
-            // random NEW variant of this same base (per-item roll), then drop the
-            // old templates. Owned copies are never orphaned; if generation yielded
-            // nothing, they fall back to the plain base item.
+            // NEW variant of the SAME tier (per-item roll), then drop the old
+            // templates. Owned copies are never orphaned; if the tier no longer
+            // exists they fall back to any new variant, then the plain base item.
             if (isRegen && oldEntries.Count > 0)
             {
-                itemsRemapped += await RemapOwnedVariants(mangosConn, oldEntries, rerollPool, baseEntry, rerollRng);
+                itemsRemapped += await RemapOwnedVariants(mangosConn, oldEntries, rerollPool, baseEntry, rerollRng, oldTierByEntry, newByTier);
                 await DeleteQuestVariants(mangosConn, adminConn, oldEntries);
             }
 
@@ -1016,7 +1052,10 @@ public class QuestLootifierController : Controller
         int newEntry = await GetNextLootifierId(adminConn);
         // goldBumpPct: 0 suppresses the band/curve multiplier on insert — the
         // legendary's price is set in ONE place below, from legendaryGoldBumpPct.
-        await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll, ruleset.goldValueScalePct, 0f);
+        // dpsBumpPct: the quest legendary carries its own damage bump (parallel to
+        // its own gold bump), independent of any band.
+        await InsertVariantItemFast(mangosConn, columns, item, newEntry, roll, ruleset.goldValueScalePct, 0f,
+            ruleset.legendaryDpsBumpPct);
 
         // Full-name override + legendary quality + explicit gold bump above base
         // (default 500% = the old x6 stock stack), master-scaled.
@@ -1128,6 +1167,14 @@ public class QuestLootifierController : Controller
             "SELECT generated_entry FROM lootifier_generated_items WHERE creature_entry = @CE AND base_entry = @B",
             new { CE = QUEST_SENTINEL_CREATURE, B = baseEntry })).ToList();
 
+    // generated_entry -> tier_name for one base, so a regen can reroll each owned
+    // copy into a NEW variant of the tier it already had.
+    private async Task<Dictionary<int, string>> GetQuestVariantTierMap(MySqlConnector.MySqlConnection adminConn, int baseEntry) =>
+        (await adminConn.QueryAsync(
+            "SELECT generated_entry, tier_name FROM lootifier_generated_items WHERE creature_entry = @CE AND base_entry = @B",
+            new { CE = QUEST_SENTINEL_CREATURE, B = baseEntry }))
+        .ToDictionary(r => (int)r.generated_entry, r => (string)(r.tier_name ?? ""));
+
     /// <summary>
     /// Delete a specific set of variant entries (templates + tracking rows).
     /// Keyed by explicit entry list rather than base_entry so it can't collide
@@ -1211,22 +1258,29 @@ public class QuestLootifierController : Controller
     /// of item instances remapped.
     /// </summary>
     private async Task<int> RemapOwnedVariants(MySqlConnector.MySqlConnection mangosConn,
-        List<int> oldEntries, List<int> newPool, int fallbackEntry, Random rng)
+        List<int> oldEntries, List<int> newPool, int fallbackEntry, Random rng,
+        Dictionary<int, string>? oldTierByEntry = null,
+        Dictionary<string, List<int>>? newByTier = null)
     {
         if (oldEntries == null || oldEntries.Count == 0) return 0;
         if (!await CharactersDbAvailable(mangosConn)) return 0;
 
-        var owned = (await mangosConn.QueryAsync<int>(
-            $"SELECT guid FROM `{CHARACTERS_DB}`.item_instance WHERE item_id IN @Old",
+        // guid + the OLD variant entry each copy currently holds, so it can be
+        // repointed at a NEW variant of the SAME tier (see PickRerollTarget).
+        var owned = (await mangosConn.QueryAsync(
+            $"SELECT guid, item_id FROM `{CHARACTERS_DB}`.item_instance WHERE item_id IN @Old",
             new { Old = oldEntries })).ToList();
         if (owned.Count == 0) return 0;
 
         var aux = await GetCharacterItemRefTables(mangosConn);
         int remapped = 0;
 
-        foreach (int itemGuid in owned)
+        foreach (var row in owned)
         {
-            int target = newPool.Count > 0 ? newPool[rng.Next(newPool.Count)] : fallbackEntry;
+            var d = (IDictionary<string, object>)row;
+            int itemGuid = Convert.ToInt32(d["guid"]);
+            int oldId = Convert.ToInt32(d["item_id"]);
+            int target = PickRerollTarget(oldId, newPool, fallbackEntry, rng, oldTierByEntry, newByTier);
             if (target <= 0) continue;
 
             await mangosConn.ExecuteAsync(
@@ -1241,6 +1295,26 @@ public class QuestLootifierController : Controller
             remapped++;
         }
         return remapped;
+    }
+
+    // Choose the replacement variant for one owned copy. Same tier as the copy
+    // held wins; otherwise any new variant of this base; otherwise the plain base.
+    private static int PickRerollTarget(int oldId, List<int> newPool, int fallbackEntry, Random rng,
+        Dictionary<int, string>? oldTierByEntry, Dictionary<string, List<int>>? newByTier)
+    {
+        if (oldTierByEntry != null && newByTier != null &&
+            oldTierByEntry.TryGetValue(oldId, out var tier) &&
+            newByTier.TryGetValue(tier, out var sameTier) && sameTier.Count > 0)
+            return sameTier[rng.Next(sameTier.Count)];
+        if (newPool.Count > 0) return newPool[rng.Next(newPool.Count)];
+        return fallbackEntry;
+    }
+
+    // Append a generated entry to its tier bucket (for same-tier reroll pools).
+    private static void AddToTierPool(Dictionary<string, List<int>> byTier, string tier, int entry)
+    {
+        if (!byTier.TryGetValue(tier, out var lst)) byTier[tier] = lst = new List<int>();
+        lst.Add(entry);
     }
 
     // ── Tracking table (shared schema with the loot Lootifier) ──
@@ -1323,10 +1397,18 @@ public class QuestLootifierController : Controller
     // ══════════════════════════════════════════════════════════════
 
     private async Task InsertVariantItemFast(MySqlConnector.MySqlConnection conn, List<string> columns,
-        dynamic baseItem, int newEntry, CommitRoll roll, float goldScalePct = 100f, float? goldBumpPct = null)
+        dynamic baseItem, int newEntry, CommitRoll roll, float goldScalePct = 100f, float? goldBumpPct = null,
+        float? dpsBumpPct = null)
     {
         int baseEntry = (int)baseItem.entry;
         int basePatch = GetPropInt(baseItem, "patch");
+
+        // Weapon DAMAGE bump for this variant (weapons only; speed/delay untouched,
+        // so DPS scales 1:1 with the damage range). Null/0 -> damage copied verbatim.
+        int itemClass = GetPropInt(baseItem, "class");
+        double dmgMult = (itemClass == ITEM_CLASS_WEAPON && dpsBumpPct.HasValue && dpsBumpPct.Value > 0f)
+            ? 1.0 + dpsBumpPct.Value / 100.0
+            : 1.0;
 
         var statTypes = new int[10];
         var statValues = new int[10];
@@ -1373,6 +1455,12 @@ public class QuestLootifierController : Controller
                 int idx = int.Parse(col.Replace("stat_value", "")) - 1;
                 selectParts.Add($"@SV{idx} AS `{col}`");
             }
+            else if (dmgMult != 1.0 && (col.StartsWith("dmg_min") || col.StartsWith("dmg_max")))
+            {
+                // dmg_min1..5 / dmg_max1..5 — scale every present damage band by the
+                // same factor (keeps min:max feel; delay/dmg_type untouched).
+                selectParts.Add($"ROUND(`{col}` * @DmgMult, 2) AS `{col}`");
+            }
             else
                 selectParts.Add($"`{col}`");
         }
@@ -1384,6 +1472,7 @@ public class QuestLootifierController : Controller
             BaseEntry = baseEntry,
             BasePatch = basePatch,
             TierLabel = tierLabel,
+            DmgMult = dmgMult,
             ST0 = statTypes[0],
             SV0 = statValues[0],
             ST1 = statTypes[1],
@@ -1447,6 +1536,44 @@ public class QuestLootifierController : Controller
             if (budgetPct >= b.minBoostPct && budgetPct <= b.maxBoostPct)
                 return b.goldBumpPct;
         return null;
+    }
+
+    // Per-band weapon DAMAGE bump (%), resolved like the gold bump: exact label
+    // first, then boost-range containment. Null = the band left DPS +% blank, so
+    // the weapon's damage is copied verbatim.
+    private static float? ResolveBandDpsBump(QuestBandDto[]? bands, string? tierLabel, float budgetPct)
+    {
+        if (bands == null || bands.Length == 0) return null;
+        if (!string.IsNullOrEmpty(tierLabel))
+            foreach (var b in bands)
+                if (string.Equals(b.label, tierLabel, StringComparison.OrdinalIgnoreCase))
+                    return b.dpsBumpPct;
+        foreach (var b in bands)
+            if (budgetPct >= b.minBoostPct && budgetPct <= b.maxBoostPct)
+                return b.dpsBumpPct;
+        return null;
+    }
+
+    // Current melee DPS of a base item (weapons only): avg of all damage bands over
+    // delay (ms). Returns isWeapon=false for non-weapons / zero-delay rows.
+    private dynamic WeaponDpsInfo(dynamic item)
+    {
+        int itemClass = GetPropInt(item, "class");
+        int delay = GetPropInt(item, "delay");
+        if (itemClass != ITEM_CLASS_WEAPON || delay <= 0)
+            return new { isWeapon = false, baseDps = 0f, delay = 0, twoHand = false };
+
+        float avg = 0f;
+        for (int i = 1; i <= 5; i++)
+        {
+            float lo = GetPropFloat(item, $"dmg_min{i}");
+            float hi = GetPropFloat(item, $"dmg_max{i}");
+            avg += (lo + hi) / 2f;
+        }
+        float dps = avg / (delay / 1000f);
+        int invType = GetPropInt(item, "inventory_type");
+        bool twoHand = invType == 17;   // INVTYPE_2HWEAPON
+        return new { isWeapon = true, baseDps = (float)Math.Round(dps, 1), delay, twoHand };
     }
 
     private float GetGoldMultiplier(float budgetPct)
@@ -1720,14 +1847,17 @@ public class QuestLootifierController : Controller
 
     private List<QuestBandDto> DefaultBands(bool includeGods)
     {
+        // dpsBumpPct: default DAMAGE bump per tier, from the vanilla same-level
+        // quality deltas — green is "just better" (no true analog), blue +10.5%,
+        // purple +21.5%, legendary a nominal +30% over the green line.
         var bands = new List<QuestBandDto>
         {
-            new() { label = "Improved", position = "prefix", minBoostPct = 10f, maxBoostPct = 20f, slots = 5, goldBumpPct = 25f },
-            new() { label = "of Power", position = "suffix", minBoostPct = 20f, maxBoostPct = 30f, slots = 2, goldBumpPct = 50f },
-            new() { label = "of Glory", position = "suffix", minBoostPct = 30f, maxBoostPct = 40f, slots = 2, goldBumpPct = 100f },
+            new() { label = "Improved", position = "prefix", minBoostPct = 10f, maxBoostPct = 20f, slots = 5, goldBumpPct = 25f, dpsBumpPct = 8f },
+            new() { label = "of Power", position = "suffix", minBoostPct = 20f, maxBoostPct = 30f, slots = 2, goldBumpPct = 50f, dpsBumpPct = 10.5f },
+            new() { label = "of Glory", position = "suffix", minBoostPct = 30f, maxBoostPct = 40f, slots = 2, goldBumpPct = 100f, dpsBumpPct = 21.5f },
         };
         if (includeGods)
-            bands.Add(new() { label = "of the Gods", position = "suffix", minBoostPct = 40f, maxBoostPct = 60f, slots = 1, goldBumpPct = 200f });
+            bands.Add(new() { label = "of the Gods", position = "suffix", minBoostPct = 40f, maxBoostPct = 60f, slots = 1, goldBumpPct = 200f, dpsBumpPct = 30f });
         return bands;
     }
 
@@ -1864,16 +1994,30 @@ public class QuestLootifierController : Controller
         return tierPosition == "prefix" ? tierLabel + " " + baseName : baseName + " " + tierLabel;
     }
 
-    private List<object> VariantsToJson(List<VariantData> variants, int baseQuality) =>
-        variants.Select((v, idx) => (object)new
+    private List<object> VariantsToJson(List<VariantData> variants, int baseQuality,
+        bool isWeapon = false, float baseDps = 0f, QuestRulesetDto? ruleset = null) =>
+        variants.Select((v, idx) =>
         {
-            variantIndex = idx,
-            name = v.name,
-            budgetPct = Math.Round(v.budgetPct, 1),
-            tierLabel = v.tierLabel,
-            tierPosition = v.tierPosition,
-            quality = VariantQualityForTier(v.tierLabel ?? "", v.budgetPct, baseQuality),
-            stats = v.stats.Select(s => (object)new { s.statType, s.statValue, s.name }).ToList()
+            float? dpsBump = null;
+            double? dps = null;
+            if (isWeapon)
+            {
+                float b = ResolveBandDpsBump(ruleset?.bands, v.tierLabel, v.budgetPct) ?? 0f;
+                dpsBump = b;
+                dps = Math.Round(baseDps * (1.0 + b / 100.0), 1);
+            }
+            return (object)new
+            {
+                variantIndex = idx,
+                name = v.name,
+                budgetPct = Math.Round(v.budgetPct, 1),
+                tierLabel = v.tierLabel,
+                tierPosition = v.tierPosition,
+                quality = VariantQualityForTier(v.tierLabel ?? "", v.budgetPct, baseQuality),
+                dpsBumpPct = dpsBump,
+                dps,
+                stats = v.stats.Select(s => (object)new { s.statType, s.statValue, s.name }).ToList()
+            };
         }).ToList();
 
     private CommitRoll VariantToCommitRoll(VariantData v) => new()
@@ -1957,6 +2101,14 @@ public class QuestLootifierController : Controller
         return 0;
     }
 
+    private float GetPropFloat(dynamic obj, string name)
+    {
+        var dict = obj as IDictionary<string, object>;
+        if (dict != null && dict.TryGetValue(name, out var val))
+            return val == null ? 0f : Convert.ToSingle(val);
+        return 0f;
+    }
+
     /// <summary>
     /// Central eligibility rule for a quest reward item, given its analysis.
     /// Must be equippable gear (Weapon/Armor in a slot) and NOT grey (quality 0).
@@ -2004,6 +2156,7 @@ public class QuestRulesetDto
     public bool rerollIncludeLegendary { get; set; } = false; // on regen, may an owned copy reroll INTO the legendary?
     public float goldValueScalePct { get; set; } = 100f;  // master scale on all gold bumps: 100 = as entered, 0 = prices untouched, 200 = double
     public float legendaryGoldBumpPct { get; set; } = 500f; // quest legendary price bump above base (%); 500 = the old x6 stock behavior
+    public float legendaryDpsBumpPct { get; set; } = 30f;   // quest legendary weapon DAMAGE bump above base (%); nominal — vanilla legendaries were hand-tuned
     public QuestBandDto[]? bands { get; set; }
 }
 
@@ -2015,6 +2168,7 @@ public class QuestBandDto
     public float maxBoostPct { get; set; }
     public int slots { get; set; } = 1;                   // variants to roll in this band
     public float? goldBumpPct { get; set; }               // price bump above base (%); null = legacy budget curve
+    public float? dpsBumpPct { get; set; }                // weapon DAMAGE bump above base (%) for this tier; null = damage copied verbatim
 }
 
 public class QuestGenerateRequest

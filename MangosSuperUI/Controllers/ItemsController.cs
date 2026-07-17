@@ -105,7 +105,8 @@ public class ItemsController : Controller
     /// </summary>
     [HttpGet]
     public async Task<IActionResult> Search(string? q, int? classFilter, int? subclassFilter,
-        int? qualityFilter, int? inventoryTypeFilter, int page = 1, int pageSize = 50)
+        int? qualityFilter, int? inventoryTypeFilter, int? minLevel, int? maxLevel,
+        int page = 1, int pageSize = 50)
     {
         using var conn = _db.Mangos();
 
@@ -148,6 +149,18 @@ public class ItemsController : Controller
         {
             where += " AND inventory_type = @InvType";
             parameters.Add("InvType", inventoryTypeFilter.Value);
+        }
+
+        if (minLevel.HasValue)
+        {
+            where += " AND required_level >= @MinLevel";
+            parameters.Add("MinLevel", minLevel.Value);
+        }
+
+        if (maxLevel.HasValue)
+        {
+            where += " AND required_level <= @MaxLevel";
+            parameters.Add("MaxLevel", maxLevel.Value);
         }
 
         var countSql = $"SELECT COUNT(*) FROM item_template {where}";

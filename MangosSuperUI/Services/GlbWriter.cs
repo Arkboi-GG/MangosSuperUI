@@ -487,6 +487,15 @@ public static class GlbWriter
     }
 
     /// <summary>
+    /// The distinct texture indices the geometry actually samples, resolved via the
+    /// same batch → TextureLookup → Textures chain the material builder uses. Anything
+    /// baking a recolor into the GLB must target one of THESE indices, not a Type
+    /// heuristic — otherwise the recolor lands on a slot no submesh references.
+    /// </summary>
+    public static IReadOnlyList<int> SampledTextureIndices(M2Model m2)
+        => BuildSubmeshTextureMap(m2).Values.Distinct().ToList();
+
+    /// <summary>
     /// Build a mapping of submeshIndex → static-alpha-in-idle-pose using
     /// the batch's transparency track chain:
     ///   batch.TextureWeightIndex (= vanilla transparencyIndex)

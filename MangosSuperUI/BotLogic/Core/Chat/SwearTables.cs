@@ -18,13 +18,16 @@ namespace MangosSuperUI.BotLogic.Chat.Engine;
 /// Blind injection ("prepend 'fuck' at 12%") produces tourist swearing; substitution
 /// produces the real thing. So this pass is, in order:
 ///
-///   1. DE-CENSOR   — heck→hell, freaking→fuckin, f***→fuck. Fixes what the model broke.
-///   2. ESCALATE    — stock words move up the register: noob→shitter, stuff→shit.
-///   3. INTENSIFY   — really/very/super → damn/fuckin.
-///   4. INTERJECT   — a frustrated line gets a lead-in: "ugh" / "shit" / "fuckin hell".
+///   0. REPAIR     — "ass hole" → "asshole". Small models split compounds. Always runs,
+///                   at every swear level, because the reactive model makes this mistake
+///                   too (observed: 17 "ass hole"s in a 300-card library build).
+///   1. DE-CENSOR  — heck→hell, freaking→fuckin, f***→fuck. Fixes what the model broke.
+///   2. ESCALATE   — stock words move up the register: noob→shitter, stuff→shit.
+///   3. INTENSIFY  — really/very/super → damn/fuckin.
+///   4. INTERJECT  — a frustrated line gets a lead-in: "ugh" / "shit" / "fuckin hell".
 ///
 /// Strength = persona typing.swear_level (0–3) × voice.banter_intensity (0–1), via
-/// EffectiveLevel(). banter 0.5 (default) is identity; banter 0 silences the pass
+/// EffectiveLevel(). banter 0.5 (default) is identity; banter 0 silences steps 1–4
 /// entirely; banter 1 doubles everyone. A per-line budget stops "fuckin fuck shit".
 ///
 /// ORDERING IS LOAD-BEARING: this runs AFTER caps/abbrev/typo/tics and BEFORE the
@@ -52,14 +55,49 @@ public static class SwearTables
     public static string RegisterLine(int effLevel) => effLevel switch
     {
         0 => "You don't swear — you're the one person in the zone who says \"darn\".",
-        1 => "You swear a little when something goes wrong (damn, crap, hell). Never censor yourself " +
-             "with asterisks, and never type \"heck\" or \"darn\" — nobody typed that.",
+        1 => "You swear a little when something goes wrong (damn, crap, hell) — never as an opener, " +
+             "just where the emphasis falls. Never censor yourself with asterisks, and never type " +
+             "\"heck\" or \"darn\".",
         2 => "You swear casually like everyone did in 2005 (damn, shit, ass, bastard) and you'll call " +
-             "a bad player a shitter or a scrub. It's normal, not edgy. Never censor yourself with " +
-             "asterisks, and never type \"heck\", \"darn\" or \"freaking\" — nobody typed that.",
-        _ => "You swear constantly and casually — it's punctuation to you. Never censor yourself with " +
-             "asterisks, and never type \"heck\", \"darn\" or \"freaking\" — nobody typed that.",
+             "a bad player a shitter or a scrub. It's texture, not the point of the sentence — it goes " +
+             "mid-sentence where the emphasis falls, not as an opener. Never censor yourself with " +
+             "asterisks, and never type \"heck\", \"darn\" or \"freaking\".",
+        _ => "You swear constantly and casually — it's punctuation to you, woven through the sentence " +
+             "rather than parked at the front. Never censor yourself with asterisks, and never type " +
+             "\"heck\", \"darn\" or \"freaking\".",
     };
+
+    // ==================== 0. Compound repair ====================
+
+    /// <summary>
+    /// Small models split compound profanity into two words — "ass hole", "dumb ass",
+    /// "bull shit" — and then use it as a vocative ("Ass hole, still running that farm"),
+    /// which is not English and not 2005. Repaired at every level, including 0: a clean
+    /// persona never emits these, but if the model produces one we fix the spelling and
+    /// let the content floor and the level gates decide what happens next.
+    /// Public because VoiceLibraryBuilder repairs candidate cards with the same table.
+    /// </summary>
+    private static readonly (Regex Rx, string To)[] Compounds =
+    {
+        (Rx(@"(?<![a-z0-9])ass\s+hole(?![a-z0-9])"), "asshole"),
+        (Rx(@"(?<![a-z0-9])dumb\s+ass(?![a-z0-9])"), "dumbass"),
+        (Rx(@"(?<![a-z0-9])jack\s+ass(?![a-z0-9])"), "jackass"),
+        (Rx(@"(?<![a-z0-9])smart\s+ass(?![a-z0-9])"), "smartass"),
+        (Rx(@"(?<![a-z0-9])bad\s+ass(?![a-z0-9])"), "badass"),
+        (Rx(@"(?<![a-z0-9])bull\s+shit(?![a-z0-9])"), "bullshit"),
+        (Rx(@"(?<![a-z0-9])dip\s+shit(?![a-z0-9])"), "dipshit"),
+        (Rx(@"(?<![a-z0-9])horse\s+shit(?![a-z0-9])"), "horseshit"),
+        (Rx(@"(?<![a-z0-9])mother\s+fucker(?![a-z0-9])"), "motherfucker"),
+        (Rx(@"(?<![a-z0-9])shit\s+ter(?![a-z0-9])"), "shitter"),
+    };
+
+    public static string RepairCompounds(string line)
+    {
+        if (string.IsNullOrEmpty(line)) return line;
+        foreach (var (rx, to) in Compounds)
+            line = rx.Replace(line, m => MatchCase(m.Value, to));
+        return line;
+    }
 
     // ==================== 1. De-censor ====================
 
@@ -174,18 +212,23 @@ public static class SwearTables
     // ==================== The pass ====================
 
     /// <summary>
-    /// Apply the register pass. Returns the line unchanged when the effective level is 0.
-    /// Never produces slurs or sexual content — the content floor (step 8) still runs after.
+    /// Apply the register pass. Compound repair always runs; steps 1–4 need an effective
+    /// level above 0. Never produces slurs or sexual content — the content floor (step 8)
+    /// still runs after this regardless.
     /// </summary>
     public static string Apply(PersonaCard card, string line, float banterIntensity,
                                float moodValence, Random rng)
     {
+        if (string.IsNullOrWhiteSpace(line)) return line;
+
+        // Step 0 — always, at every level (the model splits compounds regardless of persona).
+        line = RepairCompounds(line);
+
         int lvl = EffectiveLevel(card.Typing.SwearLevel, banterIntensity);
-        if (lvl <= 0 || string.IsNullOrWhiteSpace(line)) return line;
+        if (lvl <= 0) return line;
 
         // Strength scalar: 1.0 at level 3, 0.33 at level 1. Times the banter slider.
-        double strength = (lvl / 3.0) * Math.Clamp(banterIntensity, 0f, 1f) * 2.0;
-        strength = Math.Clamp(strength, 0.0, 1.0);
+        double strength = Math.Clamp((lvl / 3.0) * Math.Clamp(banterIntensity, 0f, 1f) * 2.0, 0.0, 1.0);
 
         // Budget: how many NEW swears we're allowed to add (de-censor doesn't count —
         // it replaces a word the model already chose to put there).
@@ -214,9 +257,8 @@ public static class SwearTables
             if (lvl < s.MinLevel) continue;
             if (s.LeadOnly)
             {
-                // Only as an interjection: line-initial, or right after a comma.
-                var lead = new Regex($@"^(\s*){Regex.Escape(s.From)}(?![a-z0-9])",
-                                     RegexOptions.IgnoreCase);
+                // Only as an interjection: line-initial. "shoot the boar" survives.
+                var lead = new Regex($@"^(\s*){Regex.Escape(s.From)}(?![a-z0-9])", RegexOptions.IgnoreCase);
                 line = lead.Replace(line, m => m.Groups[1].Value + s.To, 1);
                 continue;
             }
@@ -319,19 +361,23 @@ public static class SwearTables
 
     // ---------- helpers ----------
 
-    private static readonly string[] SwearMarkers =
+    /// <summary>Shared with VoiceLibraryBuilder's shape guards — one list, one truth.</summary>
+    public static readonly string[] SwearMarkers =
     {
         "fuck", "shit", "damn", "hell", "bitch", "bastard", "dick", "ass", "crap",
-        "piss", "prick", "dumbass", "shitter", "christ", "god",
+        "piss", "prick", "dumbass", "shitter", "christ", "bullshit", "asshole",
     };
 
-    private static bool AlreadySwears(string line)
+    public static bool ContainsSwear(string line)
     {
         var lower = line.ToLowerInvariant();
         foreach (var m in SwearMarkers)
             if (lower.Contains(m)) return true;
         return false;
     }
+
+    private static bool AlreadySwears(string line) => ContainsSwear(line) ||
+        line.Contains("god", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Strip leading/trailing punctuation off a token, keeping it for re-assembly.</summary>
     private static string Trim(string token, out string lead, out string tail)

@@ -191,7 +191,7 @@
 @section Styles {
     <style>
         /* WoW item-quality colors — defined per-page (same palette as the OG
-                   Lootifier; these classes are not global). */
+                           Lootifier; these classes are not global). */
         .quality-0 {
             color: #9d9d9d;
         }
@@ -581,6 +581,22 @@
                 width: 44px;
                 text-align: right;
             }
+
+            .ql-variant-row .ql-vdps {
+                color: var(--status-warning, #d08a2a);
+                font-family: monospace;
+                font-size: 11px;
+                white-space: nowrap;
+                margin-left: auto;
+                padding-right: 8px;
+            }
+
+        .ql-dps-ref {
+            font-family: monospace;
+            font-size: 11px;
+            padding: 3px 10px 5px;
+            opacity: 0.9;
+        }
     </style>
 }
 

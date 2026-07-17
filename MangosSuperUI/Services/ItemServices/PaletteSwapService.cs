@@ -34,7 +34,7 @@ namespace MangosSuperUI.Services;
 /// shadow-gold to bright spec-gold. They overlap intentionally —
 /// instruction order resolves ambiguity.
 /// </summary>
-public class PaletteSwapService
+public partial class PaletteSwapService
 {
     private readonly ILogger<PaletteSwapService> _logger;
 
@@ -605,7 +605,8 @@ public class PaletteSwapService
         float satScale = 1.0f, float lightBias = 0.0f, bool tintStructural = false,
         CancellationToken ct = default, string theory = "fan",
         float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f,
-        float swapBudget = 1.01f, float hueLeash = 180f)
+        float swapBudget = 1.01f, float hueLeash = 180f,
+        ValueSettings value = default)
     {
         await Task.Yield();
 
@@ -771,7 +772,7 @@ public class PaletteSwapService
                 string.Join(", ", resolved.Select(r => $"{r.Family}→H={r.Target.H:F0}° S={r.Target.S:F2}")));
 
             using var remapped = ApplyPerPixel(source, resolved, null,
-                tierKd, tierKu, tierM, tierPop);
+                tierKd, tierKu, tierM, tierPop, value);
 
             using var outStream = File.Create(outputPath);
             remapped.Encode(outStream, SKEncodedImageFormat.Png, 100);
@@ -1272,9 +1273,12 @@ public class PaletteSwapService
         float[] srcH, float[] srcS, float[] srcL, byte[] alpha, bool[] locked, SKColor[] lockedColor,
         int W, int H, List<(string Family, TargetColor Target)> swaps,
         int totalPixels, int boxLeave, int boxForce,
-        float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f)
+        float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f,
+        ValueSettings value = default)
     {
         int n = W * H;
+        bool inv = value.IsInvert;
+        int visThr = value.AlphaThreshold;
 
         // Source chroma plane (a, b) = (s·cosH, s·sinH).
         var fa = new float[n]; var fb = new float[n];
@@ -1305,7 +1309,7 @@ public class PaletteSwapService
             double sa = 0, sb = 0, ss = 0; int cnt = 0;
             for (int i = 0; i < n; i++)
             {
-                if (locked[i]) continue;
+                if (locked[i] || (inv && alpha[i] < visThr)) continue;
                 if (MatchesFamily(fam, srcH[i], srcS[i], srcL[i])) { sa += fa[i]; sb += fb[i]; ss += srcS[i]; cnt++; }
             }
             if (cnt < SmoothAnchorMinPx) continue;
@@ -1320,13 +1324,24 @@ public class PaletteSwapService
 
         if (A == 0)
         {
+            float[]? invL0 = inv ? ValueInvert(srcL, alpha, W, H, value) : null;
             // No anchors — pass the source through untouched.
             for (int i = 0; i < n; i++)
             {
                 int x0 = i % W, y0 = i / W;
                 if (locked[i]) { result.SetPixel(x0, y0, lockedColor[i]); continue; }
-                HslToRgb(srcH[i], srcS[i], srcL[i], out byte r0, out byte g0, out byte b0);
-                result.SetPixel(x0, y0, new SKColor(r0, g0, b0, alpha[i]));
+                if (invL0 != null)
+                {
+                    float fL = invL0[i];
+                    float s0 = Math.Clamp(srcS[i] * HighLTentGate(fL) * DarkDesatGate(fL, value), 0f, 0.98f);
+                    HslToRgb(srcH[i], s0, fL, out byte r0, out byte g0, out byte b0);
+                    result.SetPixel(x0, y0, new SKColor(r0, g0, b0, alpha[i]));
+                }
+                else
+                {
+                    HslToRgb(srcH[i], srcS[i], srcL[i], out byte r0, out byte g0, out byte b0);
+                    result.SetPixel(x0, y0, new SKColor(r0, g0, b0, alpha[i]));
+                }
             }
             _logger.LogWarning("PaletteSwap: [smooth] no anchors resolved from {N} swaps — source unchanged", swaps.Count);
             return result;
@@ -1343,6 +1358,7 @@ public class PaletteSwapService
         var outSArr = new float[n];
         var outLArr = new float[n];
         var reachable = new bool[n];
+        var outSpreadArr = inv ? new float[n] : null;   // pre-tent S when value axis owns L
 
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
@@ -1421,6 +1437,7 @@ public class PaletteSwapService
                 float neutrality = Math.Clamp(1f - meanSrcS / 0.15f, 0f, 1f);
                 spread = spread + (1f - spread) * neutrality;
                 outS = Math.Min(0.95f, outS * spread);
+                if (inv) outSpreadArr![i] = outS;   // capture PRE-tent S for PASS 2
 
                 // (b) ASYMMETRIC LIGHTNESS TENT.
                 //     First version was symmetric — chroma collapsed at BOTH
@@ -1446,6 +1463,11 @@ public class PaletteSwapService
                 outHArr[i] = outH; outSArr[i] = outS; outLArr[i] = outL;
             }
 
+        // ── VALUE AXIS: global lightness inversion (family-agnostic). Owns L
+        //    when active; computed once over the whole image, applied in PASS 2.
+        //    See PaletteSwapService.Value.cs / spec §5. ──
+        float[]? invL = inv ? ValueInvert(srcL, alpha, W, H, value) : null;
+
         // ── POST-TENT TIER STAGE (the tier ladder's value axis) ──
         // satScale/lightBias cannot carry the tier read: satScale is applied
         // upstream of spread/tent/clamp — machinery whose whole job is
@@ -1469,7 +1491,7 @@ public class PaletteSwapService
         //                           glint that reads at thumbnail size
         // Anchored at the item's own mean post-RBF lightness so identical
         // knobs behave on dark and light items alike.
-        bool tierStage = tierKd > 0f || tierKu > 0f || tierM > 0f || tierPop > 0f;
+        bool tierStage = !inv && (tierKd > 0f || tierKu > 0f || tierM > 0f || tierPop > 0f);
         float pivot = 0.5f, popThr = float.MaxValue;
         if (tierStage)
         {
@@ -1493,27 +1515,42 @@ public class PaletteSwapService
             }
         }
 
-        // ── PASS 2: apply the tier stage and write pixels. ──
+        // ── PASS 2: resolve final L/S (value axis or tier stage) and write. ──
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
             {
                 int i = y * W + x;
                 if (locked[i]) { result.SetPixel(x, y, lockedColor[i]); continue; }
 
-                float oH = outHArr[i], oS = outSArr[i], oL = outLArr[i];
-                if (tierStage && reachable[i])
+                float oH = outHArr[i];
+                float oS, oL;
+
+                if (inv)
                 {
-                    double L = oL;
-                    double L2 = L < pivot
-                        ? pivot * Math.Pow(Math.Clamp(L / pivot, 0.0, 1.0), 1.0 + tierKd)
-                        : 1.0 - (1.0 - pivot) * Math.Pow(Math.Clamp((1.0 - L) / (1.0 - pivot), 0.0, 1.0), 1.0 + tierKu);
-                    double S2 = 1.0 - Math.Pow(Math.Clamp(1.0 - oS, 0.0, 1.0), 1.0 + tierM);
-                    if (tierPop > 0f && oL >= popThr) L2 += tierPop;
-                    oS = (float)Math.Clamp(S2, 0.0, 0.98);
-                    oL = (float)Math.Clamp(L2, 0.0, 1.0);
+                    // Value axis owns L: the inverted composition, with BOTH tents
+                    // (high-L + dark-desat) evaluated against the FINAL L (spec §5).
+                    // The tier L/S stage is bypassed (tierStage is false here).
+                    oL = invL![i];
+                    float baseS = reachable[i] ? outSpreadArr![i] : outSArr[i];   // pre-tent S
+                    oS = Math.Clamp(baseS * HighLTentGate(oL) * DarkDesatGate(oL, value), 0f, 0.98f);
+                }
+                else
+                {
+                    oS = outSArr[i]; oL = outLArr[i];
+                    if (tierStage && reachable[i])
+                    {
+                        double L = oL;
+                        double L2 = L < pivot
+                            ? pivot * Math.Pow(Math.Clamp(L / pivot, 0.0, 1.0), 1.0 + tierKd)
+                            : 1.0 - (1.0 - pivot) * Math.Pow(Math.Clamp((1.0 - L) / (1.0 - pivot), 0.0, 1.0), 1.0 + tierKu);
+                        double S2 = 1.0 - Math.Pow(Math.Clamp(1.0 - oS, 0.0, 1.0), 1.0 + tierM);
+                        if (tierPop > 0f && oL >= popThr) L2 += tierPop;
+                        oS = (float)Math.Clamp(S2, 0.0, 0.98);
+                        oL = (float)Math.Clamp(L2, 0.0, 1.0);
+                    }
                 }
 
-                HslToRgb(oH, oS, oL, out byte r, out byte g, out byte b);   // lightness now anchor-driven (tonal targets)
+                HslToRgb(oH, oS, oL, out byte r, out byte g, out byte b);
                 result.SetPixel(x, y, new SKColor(r, g, b, alpha[i]));
             }
 
@@ -1528,7 +1565,8 @@ public class PaletteSwapService
     private SKBitmap ApplyPerPixel(SKBitmap source,
         List<(string Family, TargetColor Target)> swaps,
         List<ResolvedBox>? boxes = null,
-        float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f)
+        float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f,
+        ValueSettings value = default)
     {
         int W = source.Width, H = source.Height;
         var result = new SKBitmap(W, H, SKColorType.Rgba8888, SKAlphaType.Unpremul);
@@ -1561,7 +1599,20 @@ public class PaletteSwapService
 
                 if (px.Alpha < 16)
                 {
-                    labels[i] = LabelLocked; locked[i] = true; lockedColor[i] = px;
+                    // Transparent texels are normally locked to their source
+                    // colour. The value axis must invert EVERY texel (spec §4.1),
+                    // so in invert mode resolve their HSL and leave them UNLOCKED:
+                    // the RBF + invert write their RGB while alpha is preserved.
+                    // They stay OUT of anchor/histogram stats via the visibility
+                    // threshold in ApplySmoothMap.
+                    if (!value.IsInvert)
+                    {
+                        labels[i] = LabelLocked; locked[i] = true; lockedColor[i] = px;
+                        continue;
+                    }
+                    RgbToHsl(px.Red, px.Green, px.Blue, out float th, out float ts, out float tl);
+                    srcH[i] = th; srcS[i] = ts; srcL[i] = tl;
+                    labels[i] = LabelUnmatched;
                     continue;
                 }
                 totalPixels++;
@@ -1623,7 +1674,7 @@ public class PaletteSwapService
         if (smoothMap && swaps.Count > 0)
             return ApplySmoothMap(result, srcH, srcS, srcL, alpha, locked, lockedColor,
                                   W, H, swaps, totalPixels, boxLeave, boxForce,
-                                  tierKd, tierKu, tierM, tierPop);
+                                  tierKd, tierKu, tierM, tierPop, value);
 
         // ── Pass 1b (region): segment SOURCE by neighbour similarity, name each
         // region by its saturated core, override the per-pixel labels. ──

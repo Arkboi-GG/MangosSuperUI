@@ -15,7 +15,7 @@
         "home" or "console" or "players" or "accounts" or "realm" => "operations",
         "activity" or "serverlogs" or "livelogs" or "config" or "backup" => "server",
         "spells" or "patch" => "spells",
-        "items" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" => "content",
+        "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" => "content",
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
         "downloads" => "downloads",
@@ -185,6 +185,12 @@
                     <a asp-controller="Items" asp-action="Index" class="@NavClass("Items")">
                         <i class="fa-solid fa-box-open"></i>
                         Items
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="retextureengine">
+                    <a asp-controller="RetextureEngine" asp-action="Index" class="@NavClass("RetextureEngine")">
+                        <i class="fa-solid fa-palette"></i>
+                        Retexture Engine
                     </a>
                 </li>
                 <li class="sidebar-nav-item" data-nav-key="gameobjects">

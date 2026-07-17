@@ -67,6 +67,13 @@
         return Math.max(0, v);
     }
 
+    // Current Legendary DPS +% (weapon damage bump; survives re-renders; 30 nominal).
+    function legDpsValue() {
+        var v = parseFloat($('#qlLegDps').val());
+        if (isNaN(v)) v = 30;
+        return Math.max(0, v);
+    }
+
     function collectRuleset() {
         var bias = parseFloat($('#qlBumpBias').val());
         if (isNaN(bias)) bias = 0.5;
@@ -78,6 +85,7 @@
             includeGodsBand: true,
             goldValueScalePct: goldScaleValue(),
             legendaryGoldBumpPct: legGoldValue(),
+            legendaryDpsBumpPct: legDpsValue(),
             bands: readBands()
         };
     }
@@ -85,10 +93,10 @@
     // ── Band editor (tiers are band-chosen, mirroring the Crafting Lootifier) ──
     // Defaults match the server's DefaultBands so preview/commit agree out of the box.
     var DEFAULT_BANDS = [
-        { label: 'Improved', position: 'prefix', minBoostPct: 10, maxBoostPct: 20, slots: 5, goldBumpPct: 25 },
-        { label: 'of Power', position: 'suffix', minBoostPct: 20, maxBoostPct: 30, slots: 2, goldBumpPct: 50 },
-        { label: 'of Glory', position: 'suffix', minBoostPct: 30, maxBoostPct: 40, slots: 2, goldBumpPct: 100 },
-        { label: 'of the Gods', position: 'suffix', minBoostPct: 40, maxBoostPct: 60, slots: 1, goldBumpPct: 200 }
+        { label: 'Improved', position: 'prefix', minBoostPct: 10, maxBoostPct: 20, slots: 5, goldBumpPct: 25, dpsBumpPct: 8 },
+        { label: 'of Power', position: 'suffix', minBoostPct: 20, maxBoostPct: 30, slots: 2, goldBumpPct: 50, dpsBumpPct: 10.5 },
+        { label: 'of Glory', position: 'suffix', minBoostPct: 30, maxBoostPct: 40, slots: 2, goldBumpPct: 100, dpsBumpPct: 21.5 },
+        { label: 'of the Gods', position: 'suffix', minBoostPct: 40, maxBoostPct: 60, slots: 1, goldBumpPct: 200, dpsBumpPct: 30 }
     ];
 
     function bandRowHtml(b) {
@@ -102,6 +110,7 @@
             '<input class="ql-b-max" type="number" min="0" max="200" step="1" value="' + b.maxBoostPct + '" title="Maximum boost %" />' +
             '<input class="ql-b-slots" type="number" min="0" max="50" step="1" value="' + b.slots + '" title="Variants rolled in this band" />' +
             '<input class="ql-b-gold" type="number" min="0" max="10000" step="5" value="' + (b.goldBumpPct != null ? b.goldBumpPct : '') + '" placeholder="curve" title="Gold price bump above base (%) for this tier. Blank = legacy budget-derived curve." />' +
+            '<input class="ql-b-dps" type="number" min="0" max="500" step="0.5" value="' + (b.dpsBumpPct != null ? b.dpsBumpPct : '') + '" placeholder="0" title="Weapon DAMAGE bump above base (%) for this tier (weapons only; speed unchanged). Blank = damage left as-is." />' +
             '<button class="ql-b-del" title="Remove band"><i class="fa-solid fa-xmark"></i></button>' +
             '</div>';
     }
@@ -110,7 +119,7 @@
         var rows = (bands || DEFAULT_BANDS).map(bandRowHtml).join('');
         var html =
             '<div class="ql-band-title">Tiers (bands)</div>' +
-            '<div class="ql-band-head"><span>Tier name</span><span>Pos</span><span>Min %</span><span>Max %</span><span>Slots</span><span title="Gold price bump above base (%). Blank = legacy curve.">Gold +%</span><span></span></div>' +
+            '<div class="ql-band-head"><span>Tier name</span><span>Pos</span><span>Min %</span><span>Max %</span><span>Slots</span><span title="Gold price bump above base (%). Blank = legacy curve.">Gold +%</span><span title="Weapon damage bump above base (%) \u2014 weapons only, speed unchanged.">DPS +%</span><span></span></div>' +
             '<div id="qlBandRows">' + rows + '</div>' +
             '<div class="ql-band-actions">' +
             '<button id="qlAddBand" class="ql-band-btn"><i class="fa-solid fa-plus"></i> Add band</button>' +
@@ -119,6 +128,8 @@
             'Bump bias <input id="qlBumpBias" type="number" min="0" max="1" step="0.1" value="0.5" /></label>' +
             '<label class="ql-bump" title="Gold price bump above base (%) for the quest legendary. 500 = the old \u00d76 behavior.">' +
             'Legendary gold +% <input id="qlLegGold" type="number" min="0" max="10000" step="25" value="' + legGoldValue() + '" /></label>' +
+            '<label class="ql-bump" title="Weapon DAMAGE bump above base (%) for the quest legendary (weapons only; speed unchanged). Nominal \u2014 vanilla legendaries were hand-tuned.">' +
+            'Legendary DPS +% <input id="qlLegDps" type="number" min="0" max="500" step="0.5" value="' + legDpsValue() + '" /></label>' +
             '<label class="ql-bump" title="Master scale on ALL gold bumps: 100% = as entered, 0% = prices unchanged, 200% = double every bump.">' +
             'Gold scale % <input id="qlGoldScale" type="number" min="0" max="1000" step="5" value="' + goldScaleValue() + '" /></label>' +
             '<span id="qlBandTotal" class="text-muted"></span>' +
@@ -135,7 +146,7 @@
         $('<style id="qlBandGoldCss">' +
             '#qlBandEditor .ql-band-head, #qlBandEditor .ql-band-row {' +
             ' display: grid;' +
-            ' grid-template-columns: minmax(90px,1fr) 70px 58px 58px 52px 70px 28px;' +
+            ' grid-template-columns: minmax(84px,1fr) 66px 54px 54px 48px 64px 64px 26px;' +
             ' gap: 4px; align-items: center; }' +
             '</style>').appendTo('head');
     }
@@ -152,13 +163,15 @@
             if (max < min) { var t = min; min = max; max = t; }   // tolerate swapped entry
             if (isNaN(slots) || slots < 0) slots = 0;
             var gold = parseFloat($r.find('.ql-b-gold').val());
+            var dps = parseFloat($r.find('.ql-b-dps').val());
             bands.push({
                 label: ($r.find('.ql-b-label').val() || '').trim(),
                 position: $r.find('.ql-b-pos').val() || 'suffix',
                 minBoostPct: min,
                 maxBoostPct: max,
                 slots: slots,
-                goldBumpPct: isNaN(gold) ? null : Math.max(0, gold)
+                goldBumpPct: isNaN(gold) ? null : Math.max(0, gold),
+                dpsBumpPct: isNaN(dps) ? null : Math.max(0, dps)
             });
         });
         return bands;
@@ -434,6 +447,23 @@
         });
     });
 
+    // Vanilla weapon-DPS quality multipliers (mirror of the server's
+    // Meta.dpsReference, kept here so the preview stays self-contained).
+    var DPS_QUALITY_MULT = { 1: 1.0, 2: 1.0, 3: 1.105, 4: 1.215, 5: 1.30 };
+    function dpsQualMult(q) { return DPS_QUALITY_MULT[q] || 1.0; }
+
+    // "relative to that tier of that level": base DPS + what blue/purple/legendary
+    // SHOULD be at this reward's level (base DPS scaled by the vanilla quality ratio
+    // off the base's own quality). Non-weapons render nothing.
+    function dpsRefLine(w, baseQuality) {
+        if (!w || !w.isWeapon) return '';
+        var base = w.baseDps, bm = dpsQualMult(baseQuality);
+        function tgt(q) { return (base * dpsQualMult(q) / bm).toFixed(1); }
+        var speed = (w.delay / 1000).toFixed(2);
+        return '<div class="ql-dps-ref">\u2694 base <b>' + base.toFixed(1) + '</b> DPS \u00b7 ' + speed + 's' +
+            ' <span class="text-muted">\u2014 vanilla line: blue ' + tgt(3) + ' / purple ' + tgt(4) + ' / leg ' + tgt(5) + '</span></div>';
+    }
+
     function renderPreview(items) {
         if (items.length === 0) {
             $('#qlPreview').html('<div class="ql-empty">No previewable items.</div>');
@@ -446,14 +476,20 @@
             h += '<div class="ql-variant-block">' +
                 '<div class="ql-variant-head"><img src="' + esc(icon) + '" /> ' +
                 '<span class="' + qualClass(baseQ) + '">' + esc(it.baseItem.name) + '</span>' +
-                ' <span class="text-muted" style="font-weight:400;">' + it.variants.length + ' variants</span></div>';
+                ' <span class="text-muted" style="font-weight:400;">' + it.variants.length + ' variants</span></div>' +
+                dpsRefLine(it.baseItem.weapon, baseQ);
             it.variants.forEach(function (v) {
                 var statStr = v.stats.map(function (s) { return '+' + s.statValue + ' ' + s.name; }).join(', ');
                 var vq = v.isLegendary ? 5 : (v.quality != null ? v.quality : variantQuality(baseQ, v.budgetPct));
                 var budgetLabel = v.isLegendary ? 'LEG' : ('+' + v.budgetPct + '%');
+                var dpsChip = (v.dps != null)
+                    ? '<span class="ql-vdps" title="Resulting weapon DPS (damage-only bump; speed unchanged)">' + Number(v.dps).toFixed(1) + ' DPS' +
+                    (v.dpsBumpPct ? ' <span class="text-muted">+' + Number(v.dpsBumpPct).toFixed(1) + '%</span>' : '') + '</span>'
+                    : '';
                 h += '<div class="ql-variant-row">' +
                     '<span class="ql-vname ' + qualClass(vq) + '">' + esc(v.name) + '</span>' +
                     '<span class="ql-vstats">' + esc(statStr) + '</span>' +
+                    dpsChip +
                     '<span class="ql-vbudget">' + budgetLabel + '</span>' +
                     '</div>';
             });
@@ -503,7 +539,10 @@
         if (runState.active) return;
         var regenerate = $('#qlRegenerate').is(':checked');
         var confirmMsg = 'Generate variants for EVERY eligible quest reward item in the game'
-            + (regenerate ? ', REPLACING items already done' : '') + '? Reversible via Rollback All.';
+            + (regenerate
+                ? ', REPLACING items already done. This replaces them in kind (same tiers rolled fresh) — nothing is removed; player-owned copies are rerolled into a new variant of the same tier.'
+                : '.')
+            + ' Reversible via Rollback All.';
         if (!window.confirm(confirmMsg)) return;
 
         runState = { active: true, cancel: false };

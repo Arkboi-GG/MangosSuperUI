@@ -54,6 +54,7 @@
                     '<input type="number" class="form-input b-max" value="' + b.maxBoostPct + '" min="0" max="200" /></span>' +
                     '<input type="number" class="form-input b-slots" value="' + b.slots + '" min="0" max="30" />' +
                     '<input type="number" class="form-input b-gold" value="' + (b.goldBumpPct != null ? b.goldBumpPct : '') + '" min="0" max="10000" step="5" placeholder="curve" style="width:64px" title="Gold price bump above base (%) for this tier. Blank = legacy boost curve." />' +
+                    '<input type="number" class="form-input b-dps" value="' + (b.dpsBumpPct != null ? b.dpsBumpPct : '') + '" min="0" max="500" step="0.5" placeholder="0" style="width:60px" title="Weapon DAMAGE bump above base (%) for this tier (weapons only; speed unchanged). Blank = damage left as-is." />' +
                     '<span class="rmBand" data-band="' + i + '"><i class="fa-solid fa-xmark"></i></span>' +
                     '</div>';
             });
@@ -65,13 +66,15 @@
             var out = [];
             $('#' + ids.bandEditor + ' .lf-band-row').each(function () {
                 var gold = parseFloat($(this).find('.b-gold').val());
+                var dps = parseFloat($(this).find('.b-dps').val());
                 out.push({
                     label: $(this).find('.b-label').val() || '',
                     position: $(this).find('.b-pos').val() || 'suffix',
                     minBoostPct: parseFloat($(this).find('.b-min').val()) || 0,
                     maxBoostPct: parseFloat($(this).find('.b-max').val()) || 0,
                     slots: parseInt($(this).find('.b-slots').val()) || 0,
-                    goldBumpPct: isNaN(gold) ? null : Math.max(0, gold)
+                    goldBumpPct: isNaN(gold) ? null : Math.max(0, gold),
+                    dpsBumpPct: isNaN(dps) ? null : Math.max(0, dps)
                 });
             });
             return out;
@@ -116,6 +119,7 @@
         // (mirrors the Quest Lootifier's band-editor injection pattern). Anchors
         // after the Legendary checkbox's label; falls back to above the band editor.
         function ensureGoldInput() {
+            ensureBandGridCss();
             var inputCss = 'width:64px;padding:3px 5px;border-radius:5px;border:1px solid rgba(128,128,128,.35);background:rgba(0,0,0,.18);color:inherit;';
             var labelCss = 'font-size:11px;opacity:.85;display:inline-flex;align-items:center;gap:6px;margin-left:10px;';
             var $anchor = $('#' + ids.legendary).closest('label');
@@ -134,6 +138,27 @@
                 else if ($anchor.length) $(gh).insertAfter($anchor);
                 else $('#' + ids.bandEditor).before(gh);
             }
+            // Legendary weapon DAMAGE bump (%), parallel to legendary gold +%.
+            if (ids.legDps && $('#' + ids.legDps).length === 0) {
+                var dh = '<label style="' + labelCss + '" title="Weapon DAMAGE bump above base (%) for legendary (quality 5) weapons (speed unchanged). Nominal \u2014 vanilla legendaries were hand-tuned.">' +
+                    'Legendary DPS +% <input id="' + ids.legDps + '" type="number" min="0" max="500" step="0.5" value="30" style="' + inputCss + '" /></label>';
+                var $lg = $('#' + ids.legGold).closest('label');
+                if ($lg.length) $(dh).insertAfter($lg);
+                else if ($anchor.length) $(dh).insertAfter($anchor);
+                else $('#' + ids.bandEditor).before(dh);
+            }
+        }
+
+        // The band grid gains a DPS +% column (now 7 cells: name/pos/boost/slots/
+        // gold/dps/x). Pin the layout here so it's right regardless of the cshtml.
+        function ensureBandGridCss() {
+            if (document.getElementById('lfBandGridCss')) return;
+            $('<style id="lfBandGridCss">' +
+                '#bandEditor .lf-band-row, #pBandEditor .lf-band-row {' +
+                ' display:grid;' +
+                ' grid-template-columns: 1fr 54px 88px 44px 60px 60px 22px;' +
+                ' gap:6px; align-items:center; }' +
+                '</style>').appendTo('head');
         }
 
         state.seed = function (dr) {
@@ -152,6 +177,7 @@
             ensureGoldInput();
             $('#' + ids.gold).val(dr.goldValueScalePct != null ? dr.goldValueScalePct : 100);
             $('#' + ids.legGold).val(dr.legendaryGoldBumpPct != null ? dr.legendaryGoldBumpPct : 400);
+            if (ids.legDps) $('#' + ids.legDps).val(dr.legendaryDpsBumpPct != null ? dr.legendaryDpsBumpPct : 30);
             $('#' + ids.offset).val(0);
             $('#' + ids.offsetVal).text('+0');
             renderBands();
@@ -162,6 +188,8 @@
             if (isNaN(gold)) gold = 100;
             var legGold = parseFloat($('#' + ids.legGold).val());
             if (isNaN(legGold)) legGold = 400;
+            var legDps = ids.legDps ? parseFloat($('#' + ids.legDps).val()) : NaN;
+            if (isNaN(legDps)) legDps = 30;
             return {
                 variantsPerItem: 10,
                 allowNewAffixes: $('#' + ids.allowNew).is(':checked'),
@@ -170,6 +198,7 @@
                 includeLegendaryBand: $('#' + ids.legendary).is(':checked'),
                 goldValueScalePct: Math.max(0, gold),
                 legendaryGoldBumpPct: Math.max(0, legGold),
+                legendaryDpsBumpPct: Math.max(0, legDps),
                 bands: collectBands()
             };
         };
@@ -186,7 +215,7 @@
         });
         $('#' + ids.addBand).on('click', function () {
             syncFromInputs();
-            var nb = { label: 'New Band', position: 'suffix', minBoostPct: Math.max(0, 10 + state.offset), maxBoostPct: Math.max(0, 20 + state.offset), slots: 1 };
+            var nb = { label: 'New Band', position: 'suffix', minBoostPct: Math.max(0, 10 + state.offset), maxBoostPct: Math.max(0, 20 + state.offset), slots: 1, dpsBumpPct: 8 };
             nb._baseMin = 10; nb._baseMax = 20;
             state.bands.push(nb);
             renderBands();
@@ -206,12 +235,12 @@
 
     var genRuleset = RulesetEditor({
         bump: 'rsBumpBias', bumpVal: 'rsBumpBiasVal', allowNew: 'rsAllowNewAffixes',
-        maxAffix: 'rsMaxAffixChange', legendary: 'rsLegendaryBand', gold: 'rsGoldScale', legGold: 'rsLegGold', offset: 'rsOffset', offsetVal: 'rsOffsetVal',
+        maxAffix: 'rsMaxAffixChange', legendary: 'rsLegendaryBand', gold: 'rsGoldScale', legGold: 'rsLegGold', legDps: 'rsLegDps', offset: 'rsOffset', offsetVal: 'rsOffsetVal',
         bandEditor: 'bandEditor', bandWarn: 'bandWarn', addBand: 'btnAddBand', reset: 'btnResetRuleset'
     });
     var profRuleset = RulesetEditor({
         bump: 'pRsBumpBias', bumpVal: 'pRsBumpBiasVal', allowNew: 'pRsAllowNewAffixes',
-        maxAffix: 'pRsMaxAffixChange', legendary: 'pRsLegendaryBand', gold: 'pRsGoldScale', legGold: 'pRsLegGold', offset: 'pRsOffset', offsetVal: 'pRsOffsetVal',
+        maxAffix: 'pRsMaxAffixChange', legendary: 'pRsLegendaryBand', gold: 'pRsGoldScale', legGold: 'pRsLegGold', legDps: 'pRsLegDps', offset: 'pRsOffset', offsetVal: 'pRsOffsetVal',
         bandEditor: 'pBandEditor', bandWarn: 'pBandWarn', addBand: 'pBtnAddBand', reset: 'pBtnResetRuleset'
     });
 
@@ -251,6 +280,7 @@
             if (!info.eligible) { showToast(info.name + ' is not lootifiable gear.', 'error'); return; }
             selected[entry] = {
                 entry: entry, name: info.name, quality: info.quality,
+                lootified: !!info.lootified, variantCount: info.variantCount || 0,
                 baseTypes: (info.stats || []).map(function (s) { return s.statType; })
             };
             renderSelected();
@@ -259,16 +289,25 @@
 
     function renderSelected() {
         var keys = Object.keys(selected);
+        var anyLootified = false;
         var h = '';
         keys.forEach(function (k) {
             var it = selected[k];
+            if (it.lootified) anyLootified = true;
+            var badge = it.lootified
+                ? '<span class="lf-relootify" title="Already lootified. Generating replaces its ' + it.variantCount +
+                ' variants in kind — same tiers rolled fresh. Nothing is removed: any player-owned copy is rerolled into a new variant of the same tier.">' +
+                '<i class="fa-solid fa-rotate"></i> re-lootify \u00d7' + it.variantCount + '</span>'
+                : '';
             h += '<div class="lf-selected-item">' +
                 '<span class="quality-' + it.quality + '">' + esc(it.name) + '</span>' +
                 '<span class="text-muted">#' + it.entry + '</span>' +
+                badge +
                 '<span class="rm" data-entry="' + it.entry + '"><i class="fa-solid fa-xmark"></i></span>' +
                 '</div>';
         });
         $('#selectedItems').html(h);
+        $('#relootifyNote').toggle(anyLootified);
         $('#rulesetPanel').toggle(keys.length > 0);
         $('#btnGenerate').prop('disabled', keys.length === 0);
     }
@@ -299,13 +338,36 @@
         var h = '';
         res.items.forEach(function (item) {
             var baseTypes = (selected[item.entry] || {}).baseTypes || [];
+            var w = item.weapon;
             h += '<div class="lf-item-block">' +
-                '<div class="lf-item-title quality-' + item.quality + '">' + esc(item.name) + '</div>';
+                '<div class="lf-item-title quality-' + item.quality + '">' + esc(item.name) + '</div>' +
+                dpsReferenceLine(w, item.quality);
             item.variants.forEach(function (v) { h += renderVariantRow(v, baseTypes); });
             h += '</div>';
         });
         $('#previewContainer').html(h);
         $('#previewInfo').text(res.items.length + ' item(s) · 20% of crafts return the base');
+    }
+
+    // Map an item quality to the vanilla DPS multiplier key.
+    function dpsQualityMult(q) {
+        var m = (meta && meta.dpsReference && meta.dpsReference.qualityMult) || { green: 1, blue: 1.105, purple: 1.215, legendary: 1.3 };
+        if (q >= 5) return m.legendary;
+        if (q === 4) return m.purple;
+        if (q === 3) return m.blue;
+        return m.green; // green / white baseline
+    }
+
+    // "relative to that tier of that level": base DPS + what blue/purple/legendary
+    // SHOULD be at this weapon's level (base DPS scaled by the vanilla quality ratio
+    // off the base's own quality). Non-weapons render nothing.
+    function dpsReferenceLine(w, baseQuality) {
+        if (!w || !w.isWeapon) return '';
+        var base = w.baseDps, bm = dpsQualityMult(baseQuality);
+        function tgt(q) { return (base * dpsQualityMult(q) / bm).toFixed(1); }
+        var speed = (w.delay / 1000).toFixed(2);
+        return '<div class="lf-dps-ref">\u2694 base <b>' + base.toFixed(1) + '</b> DPS \u00b7 ' + speed + 's' +
+            ' <span class="text-muted">\u2014 vanilla line: blue ' + tgt(3) + ' / purple ' + tgt(4) + ' / leg ' + tgt(5) + '</span></div>';
     }
 
     function tierQuality(tier) {
@@ -324,11 +386,16 @@
             pills += '<span class="lf-stat-pill' + (isNew ? ' new' : '') + '">+' + s.statValue + ' ' + esc(s.name) + '</span>';
         });
         var q = (v.quality && v.quality >= 2) ? v.quality : tierQuality(v.tier);
+        var dpsChip = (v.dps != null)
+            ? '<span class="lf-dps" title="Resulting weapon DPS (damage-only bump; speed unchanged)">' + Number(v.dps).toFixed(1) + ' DPS' +
+            (v.dpsBumpPct ? ' <span class="text-muted">+' + Number(v.dpsBumpPct).toFixed(1) + '%</span>' : '') + '</span>'
+            : '';
         return '<div class="lf-variant-row">' +
             (v.iconPath ? '<img src="' + esc(v.iconPath) + '" />' : '') +
             '<span class="lf-variant-name quality-' + q + '">' + esc(v.name) + '</span>' +
             '<span class="lf-boost">' + Number(v.boostPct).toFixed(0) + '%</span>' +
             '<span class="lf-award">' + Number(v.awardPct).toFixed(1) + '%</span>' +
+            dpsChip +
             '<span style="flex:1;">' + pills + '</span>' +
             '</div>';
     }
@@ -343,7 +410,8 @@
             success: function (res) {
                 if (!res.success) { showToast(res.error || 'Generate failed', 'error'); }
                 else {
-                    showToast(res.itemsCreated + ' variants across ' + res.basesProcessed + ' items. ' + res.reloadHint, 'success');
+                    showToast(res.itemsCreated + ' variants across ' + res.basesProcessed + ' items' +
+                        (res.itemsRemapped ? ' (' + res.itemsRemapped + ' owned items rerolled)' : '') + '. ' + res.reloadHint, 'success');
                     loadStatus();
                 }
             },
@@ -408,7 +476,8 @@
             success: function (res) {
                 if (!res.success) { showToast(res.error || 'Batch failed', 'error'); }
                 else {
-                    showToast(res.profession + ': ' + res.itemsCreated + ' variants across ' + res.basesProcessed + ' items. ' + res.reloadHint, 'success');
+                    showToast(res.profession + ': ' + res.itemsCreated + ' variants across ' + res.basesProcessed + ' items' +
+                        (res.itemsRemapped ? ' (' + res.itemsRemapped + ' owned items rerolled)' : '') + '. ' + res.reloadHint, 'success');
                     loadStatus();
                     loadProfessions();
                 }

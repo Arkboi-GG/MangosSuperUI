@@ -11,6 +11,7 @@ $(function () {
     var batchData = null;
     var batchSelectedItems = {}; // creatureEntry → { itemEntry: true }
     var currentMode = 'single'; // 'single' or 'batch'
+    var tierState = null;       // editable tier bands (min/max/label/pos/slots/gold/dps); null until meta loads
 
     var RANK_NAMES = { 0: 'Normal', 1: 'Elite', 2: 'Rare Elite', 3: 'Boss', 4: 'Rare' };
     var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary'];
@@ -184,47 +185,105 @@ $(function () {
             '</div>';
     }
 
-    // ===================== NAMING TIERS =====================
+    // ===================== NAMING TIERS (editable bands) =====================
+
+    function ensureTierState() {
+        if (tierState) return true;
+        if (!meta || !meta.defaultNamingTiers) return false;
+        tierState = meta.defaultNamingTiers.map(function (t) {
+            return {
+                minPct: t.minPct, maxPct: t.maxPct, label: t.label, position: t.position,
+                slots: t.slots || 0,
+                goldBumpPct: (t.goldBumpPct != null ? t.goldBumpPct : null),
+                dpsBumpPct: (t.dpsBumpPct != null ? t.dpsBumpPct : null)
+            };
+        });
+        return true;
+    }
+
+    function tierRowHtml(t, i) {
+        return '<div class="lf-tier-row" data-tier="' + i + '">' +
+            '<input type="number" class="form-input lf-tier-min" data-tier="' + i + '" value="' + t.minPct + '" min="0" max="100" step="1" title="Budget % floor for this tier" />' +
+            '<span class="lf-tier-dash">–</span>' +
+            '<input type="number" class="form-input lf-tier-max" data-tier="' + i + '" value="' + t.maxPct + '" min="0" max="100" step="1" title="Budget % ceiling for this tier" />' +
+            '<select class="form-input lf-tier-position" data-tier="' + i + '" title="Prefix or suffix the tier name">' +
+            '<option value="prefix"' + (t.position === 'prefix' ? ' selected' : '') + '>Pre</option>' +
+            '<option value="suffix"' + (t.position === 'suffix' ? ' selected' : '') + '>Suf</option>' +
+            '</select>' +
+            '<input type="text" class="form-input lf-tier-input" data-tier="' + i + '" value="' + esc(t.label) + '" placeholder="Tier name" />' +
+            '<input type="number" class="form-input lf-tier-slots" data-tier="' + i + '" value="' + (t.slots ? t.slots : '') + '" min="0" max="30" step="1" placeholder="auto" title="Fixed number of variants for this tier. Blank/0 = auto (shares Variants-per-Item with the other auto tiers)." />' +
+            '<input type="number" class="form-input lf-tier-gold" data-tier="' + i + '" value="' + (t.goldBumpPct != null ? t.goldBumpPct : '') + '" min="0" max="10000" step="5" placeholder="curve" title="Gold price bump above base (%). Blank = legacy budget curve." />' +
+            '<input type="number" class="form-input lf-tier-dps" data-tier="' + i + '" value="' + (t.dpsBumpPct != null ? t.dpsBumpPct : '') + '" min="0" max="500" step="0.5" placeholder="0" title="Weapon DAMAGE bump above base (%) — weapons only, speed unchanged." />' +
+            '<span class="lf-tier-rm" data-tier="' + i + '" title="Remove this tier"><i class="fa-solid fa-xmark"></i></span>' +
+            '</div>';
+    }
 
     function renderNamingTiers() {
-        if (!meta || !meta.defaultNamingTiers) return;
-        var h = '';
-        meta.defaultNamingTiers.forEach(function (t, i) {
-            h += '<div class="lf-tier-row">' +
-                '<span class="lf-tier-range">' + t.minPct + '–' + t.maxPct + '%</span>' +
-                '<select class="form-input lf-tier-position" data-tier="' + i + '" style="width:72px;padding:3px 6px;font-size:11px;">' +
-                '<option value="prefix"' + (t.position === 'prefix' ? ' selected' : '') + '>Prefix</option>' +
-                '<option value="suffix"' + (t.position === 'suffix' ? ' selected' : '') + '>Suffix</option>' +
-                '</select>' +
-                '<input type="text" class="form-input lf-tier-input" data-tier="' + i + '" value="' + esc(t.label) + '" />' +
-                '</div>';
-        });
-        // Render into both single and batch panels
+        if (!ensureTierState()) return;
+        var head = '<div class="lf-tier-head">' +
+            '<span class="lf-tier-rangehead" title="Budget percentile window this tier rolls within">Range %</span>' +
+            '<span style="width:52px;">Pos</span>' +
+            '<span style="flex:1;">Tier name</span>' +
+            '<span style="width:48px;text-align:center;" title="Fixed count, or blank/0 for auto">Slots</span>' +
+            '<span style="width:50px;text-align:center;" title="Gold price bump above base (%). Blank = legacy curve.">Gold&nbsp;+%</span>' +
+            '<span style="width:48px;text-align:center;" title="Weapon damage bump above base (%) — weapons only, speed unchanged.">DPS&nbsp;+%</span>' +
+            '<span style="width:18px;"></span>' +
+            '</div>';
+        var h = head;
+        tierState.forEach(function (t, i) { h += tierRowHtml(t, i); });
+        h += '<button type="button" class="btn-micro lf-tier-add" style="margin-top:6px;"><i class="fa-solid fa-plus"></i> Add tier</button>';
+
         $('#namingTiers').html(h);
         $('#batchNamingTiers').html(h.replace(/data-tier="/g, 'data-batch-tier="'));
     }
 
-    function collectRuleset() {
-        // Determine which panel is active to read tier inputs from
-        var tierPrefix = currentMode === 'batch' ? 'batch-tier' : 'tier';
-        var tiers = [];
-        if (meta && meta.defaultNamingTiers) {
-            meta.defaultNamingTiers.forEach(function (t, i) {
-                var labelInput = $('input.lf-tier-input[data-' + tierPrefix + '="' + i + '"]');
-                var posSelect = $('select.lf-tier-position[data-' + tierPrefix + '="' + i + '"]');
-                // Fallback to single mode inputs if batch inputs not found
-                if (labelInput.length === 0) {
-                    labelInput = $('input.lf-tier-input[data-tier="' + i + '"]');
-                    posSelect = $('select.lf-tier-position[data-tier="' + i + '"]');
-                }
-                tiers.push({
-                    minPct: t.minPct,
-                    maxPct: t.maxPct,
-                    label: labelInput.val() || '',
-                    position: posSelect.val() || 'suffix'
-                });
+    // Read the tier bands out of one panel's DOM (single or batch), in row order.
+    function readTiersFromContainer(containerId) {
+        var out = [];
+        $('#' + containerId + ' .lf-tier-row').each(function () {
+            var $r = $(this);
+            var g = parseFloat($r.find('.lf-tier-gold').val());
+            var d = parseFloat($r.find('.lf-tier-dps').val());
+            var s = parseInt($r.find('.lf-tier-slots').val(), 10);
+            out.push({
+                minPct: parseFloat($r.find('.lf-tier-min').val()) || 0,
+                maxPct: parseFloat($r.find('.lf-tier-max').val()) || 0,
+                position: $r.find('.lf-tier-position').val() || 'suffix',
+                label: $r.find('.lf-tier-input').val() || '',
+                slots: isNaN(s) ? 0 : Math.max(0, s),
+                goldBumpPct: isNaN(g) ? null : Math.max(0, g),
+                dpsBumpPct: isNaN(d) ? null : Math.max(0, d)
             });
+        });
+        return out;
+    }
+
+    function activeTierContainer() {
+        return currentMode === 'batch' ? 'batchNamingTiers' : 'namingTiers';
+    }
+
+    // Add / remove operate on tierState, preserving current edits, then re-render both panels.
+    $(document).on('click', '.lf-tier-add', function () {
+        var container = $(this).closest('#namingTiers, #batchNamingTiers').attr('id') || activeTierContainer();
+        tierState = readTiersFromContainer(container);
+        tierState.push({ minPct: 0, maxPct: 100, label: 'New Tier', position: 'suffix', slots: 0, goldBumpPct: null, dpsBumpPct: null });
+        renderNamingTiers();
+    });
+
+    $(document).on('click', '.lf-tier-rm', function () {
+        var container = $(this).closest('#namingTiers, #batchNamingTiers').attr('id') || activeTierContainer();
+        var idx = $('#' + container + ' .lf-tier-row').index($(this).closest('.lf-tier-row'));
+        tierState = readTiersFromContainer(container);
+        if (idx >= 0 && tierState.length > 1) {
+            tierState.splice(idx, 1);
+            renderNamingTiers();
         }
+    });
+
+    function collectRuleset() {
+        // Tier bands are read live from the active panel (any count, editable ranges).
+        var tiers = readTiersFromContainer(activeTierContainer());
+        if (tiers.length === 0 && ensureTierState()) tiers = tierState.slice();
 
         // Read from correct panel: batch shared inputs sync to single IDs
         var budgetCeiling, variantsPerItem, allowNew, maxAffix;
@@ -247,6 +306,19 @@ $(function () {
         if (isNaN(poolDropPct)) poolDropPct = 100;
         poolDropPct = Math.min(100, Math.max(0, poolDropPct));
 
+        // Global value tuning (gold scale + legendary gold/dps). Batch mirrors sync
+        // to the single-mode IDs; read the active panel like budget ceiling does.
+        function tune(id, fallback) {
+            var v;
+            if (currentMode === 'batch') v = parseFloat($('.lf-rs-shared[data-target="' + id + '"]').val());
+            if (isNaN(v)) v = parseFloat($('#' + id).val());
+            if (isNaN(v)) v = fallback;
+            return Math.max(0, v);
+        }
+        var goldScale = tune('rsGoldScale', 100);
+        var legGold = tune('rsLegGold', 500);
+        var legDps = tune('rsLegDps', 30);
+
         return {
             budgetCeilingPct: budgetCeiling,
             variantsPerItem: variantsPerItem,
@@ -254,6 +326,9 @@ $(function () {
             maxAffixCountChange: maxAffix,
             dropChanceStrategy: dropStrategy,
             poolDropChancePct: poolDropPct,
+            goldValueScalePct: goldScale,
+            legendaryGoldBumpPct: legGold,
+            legendaryDpsBumpPct: legDps,
             namingTiers: tiers,
             // Legendary
             generateLegendary: currentMode === 'batch'
@@ -634,9 +709,10 @@ $(function () {
                 spellBadge +
                 '<span class="lf-preview-analysis">' + analysisStr + '</span>' +
                 '</div>';
+            h += dpsRefLine(base);
 
             h += '<table class="lf-variant-table"><thead><tr>' +
-                '<th>#</th><th>Name</th><th>Budget</th><th>Tier</th><th>Stats</th>' +
+                '<th>#</th><th>Name</th><th>Budget</th><th>Tier</th>' + dpsHeadCell(base) + '<th>Stats</th>' +
                 '</tr></thead><tbody>';
 
             variants.forEach(function (v, idx) {
@@ -649,6 +725,7 @@ $(function () {
                     '<td><span class="lf-budget-bar"><span class="lf-budget-fill" style="width:' + Math.min(100, v.budgetPct) + '%;background:' + budgetColor + ';"></span></span>' +
                     '<span style="font-family:monospace;font-size:11px;">' + v.budgetPct + '%</span></td>' +
                     '<td><span class="lf-tier-badge ' + tierClass + '">' + esc(v.tierLabel || '—') + '</span></td>' +
+                    dpsBodyCell(base, v) +
                     '<td>' + renderStatPills(v.stats, analysis.presentStatTypes) + '</td>' +
                     '</tr>';
             });
@@ -738,9 +815,10 @@ $(function () {
                 spellBadge +
                 '<span class="lf-preview-analysis">' + analysisStr + '</span>' +
                 '</div>';
+            h += dpsRefLine(base);
 
             h += '<table class="lf-variant-table"><thead><tr>' +
-                '<th>#</th><th>Name</th><th>Budget</th><th>Tier</th><th>Stats</th>' +
+                '<th>#</th><th>Name</th><th>Budget</th><th>Tier</th>' + dpsHeadCell(base) + '<th>Stats</th>' +
                 '</tr></thead><tbody>';
 
             variants.forEach(function (v, idx) {
@@ -753,6 +831,7 @@ $(function () {
                     '<td><span class="lf-budget-bar"><span class="lf-budget-fill" style="width:' + Math.min(100, v.budgetPct) + '%;background:' + budgetColor + ';"></span></span>' +
                     '<span style="font-family:monospace;font-size:11px;">' + v.budgetPct + '%</span></td>' +
                     '<td><span class="lf-tier-badge ' + tierClass + '">' + esc(v.tierLabel || '—') + '</span></td>' +
+                    dpsBodyCell(base, v) +
                     '<td>' + renderStatPills(v.stats, analysis.presentStatTypes) + '</td>' +
                     '</tr>';
             });
@@ -804,6 +883,35 @@ $(function () {
         return 'var(--text-muted)';
     }
 
+    // ── Weapon DPS preview (damage-only tier bump; speed unchanged) ──
+    // Vanilla quality multipliers (mirror of Meta.dpsReference).
+    var DPS_QUALITY_MULT = { 1: 1.0, 2: 1.0, 3: 1.105, 4: 1.215, 5: 1.30 };
+    function dpsQualMult(q) { return DPS_QUALITY_MULT[q] || 1.0; }
+
+    function isWeaponBase(base) { return base && base.weapon && base.weapon.isWeapon; }
+
+    // Header cell only when the base is a weapon.
+    function dpsHeadCell(base) { return isWeaponBase(base) ? '<th title="Resulting weapon DPS (damage-only bump; speed unchanged)">DPS</th>' : ''; }
+
+    // Per-variant DPS cell (empty string for non-weapons so the row still lines up).
+    function dpsBodyCell(base, v) {
+        if (!isWeaponBase(base)) return '';
+        if (v.dps == null) return '<td class="lf-dps-cell">—</td>';
+        var bump = v.dpsBumpPct ? ' <span style="color:var(--text-muted);">+' + Number(v.dpsBumpPct).toFixed(1) + '%</span>' : '';
+        return '<td class="lf-dps-cell">' + Number(v.dps).toFixed(1) + bump + '</td>';
+    }
+
+    // "relative to that tier of that level": base DPS + what blue/purple/legendary
+    // would be at this weapon's level (base DPS scaled by the vanilla quality ratio
+    // off the base's own quality).
+    function dpsRefLine(base) {
+        if (!isWeaponBase(base)) return '';
+        var w = base.weapon, bm = dpsQualMult(base.quality);
+        function tgt(q) { return (w.baseDps * dpsQualMult(q) / bm).toFixed(1); }
+        return '<div class="lf-dps-ref">⚔ base <b>' + w.baseDps.toFixed(1) + '</b> DPS · ' + (w.delay / 1000).toFixed(2) + 's' +
+            ' <span style="color:var(--text-muted);">— vanilla line: blue ' + tgt(3) + ' / purple ' + tgt(4) + ' / leg ' + tgt(5) + '</span></div>';
+    }
+
     function renderLegendaryCard(legendary) {
         if (!legendary) return '';
 
@@ -849,6 +957,7 @@ $(function () {
         var commitPayload = {
             creatureEntry: selectedCreature.entry,
             ruleset: collectRuleset(),
+            regenerate: $('#lfRegenerate').is(':checked'),
             variants: previewData.items.map(function (itemGroup) {
                 return {
                     baseItemEntry: itemGroup.baseItem.entry,
@@ -876,7 +985,11 @@ $(function () {
             success: function (result) {
                 $('#btnCommit').prop('disabled', false).html('<i class="fa-solid fa-bolt"></i> <span>Commit to Database</span>');
                 if (result.success) {
-                    showToast(result.totalItemsCreated + ' items created + ' + result.totalLootRowsCreated + ' loot rows added', 'success');
+                    var msg = result.totalItemsCreated + ' items created + ' + result.totalLootRowsCreated + ' loot rows added';
+                    if (result.regenReused) msg += ' · ' + result.regenReused + ' refreshed in place'
+                        + (result.regenRemapped ? ', ' + result.regenRemapped + ' owned copies rerolled' : '')
+                        + (result.regenRemoved ? ', ' + result.regenRemoved + ' removed' : '');
+                    showToast(msg, 'success');
                     if (selectedCreature) selectCreature(selectedCreature.entry);
                 } else {
                     showToast('Commit failed: ' + (result.error || ''), 'error');
@@ -918,12 +1031,15 @@ $(function () {
             url: '/Lootifier/BatchCommit',
             method: 'POST',
             contentType: 'application/json',
-            data: JSON.stringify({ creatures: creatures, ruleset: collectRuleset() }),
+            data: JSON.stringify({ creatures: creatures, ruleset: collectRuleset(), regenerate: $('#lfRegenerate').is(':checked') }),
             success: function (result) {
                 $('#btnCommit').prop('disabled', false).html('<i class="fa-solid fa-bolt"></i> <span>Commit to Database</span>');
                 if (result.success) {
                     var msg = result.totalItemsCreated + ' items + ' + result.totalLootRowsCreated + ' loot rows across ' + result.creaturesProcessed + ' creatures';
                     if (result.pairsSkipped > 0) msg += ' (' + result.pairsSkipped + ' already-lootified pairs skipped)';
+                    if (result.regenReused) msg += ' · ' + result.regenReused + ' refreshed in place'
+                        + (result.regenRemapped ? ', ' + result.regenRemapped + ' owned copies rerolled' : '')
+                        + (result.regenRemoved ? ', ' + result.regenRemoved + ' removed' : '');
                     showToast(msg, 'success');
                     if (result.warnings && result.warnings.length > 0) {
                         showToast(result.warnings.length + ' pool(s) exceeded floor capacity — ' + result.warnings[0], 'warning');
@@ -1168,6 +1284,7 @@ $(function () {
         $('#rsVariantsPerItem').val(10);
         $('#rsAllowNewAffixes').prop('checked', true);
         $('#rsMaxAffixChange').val(1);
+        tierState = null;   // rebuild the tier bands from meta defaults
         renderNamingTiers();
     });
 

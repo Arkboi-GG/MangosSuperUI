@@ -80,7 +80,7 @@
             server: ['activity', 'serverlogs', 'livelogs', 'config', 'backup'],
             spells: ['spells', 'patch', 'visuallab'],
             world: ['worldmap', 'worldeditor'],
-            content: ['items', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier'],
+            content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier'],
             bots: ['bots-fleet', 'bots-map', 'bots-dashboard', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
             wiki: ['wiki-code'],

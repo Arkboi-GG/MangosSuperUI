@@ -110,6 +110,22 @@
                                     <div class="filter-label" style="margin-top: 12px;">Naming Tiers <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">prefix or suffix per tier</span></div>
                                     <div id="namingTiers" class="lf-naming-tiers"></div>
 
+                                    <div class="filter-label" style="margin-top: 12px;">Value Tuning <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">gold &amp; weapon damage</span></div>
+                                    <div class="lf-ruleset-grid">
+                                        <div class="lf-ruleset-field">
+                                            <label title="Master scale on ALL gold bumps: 100 = as entered, 0 = prices untouched, 200 = double.">Gold Scale %</label>
+                                            <input type="number" class="form-input" id="rsGoldScale" value="100" min="0" max="1000" step="5" style="width:65px;" />
+                                        </div>
+                                        <div class="lf-ruleset-field">
+                                            <label title="Gold price bump above base (%) for the boss legendary. 500 = the old x6 behaviour.">Legendary Gold +%</label>
+                                            <input type="number" class="form-input" id="rsLegGold" value="500" min="0" max="10000" step="25" style="width:65px;" />
+                                        </div>
+                                        <div class="lf-ruleset-field">
+                                            <label title="Weapon DAMAGE bump above base (%) for the legendary (weapons only; speed unchanged). Nominal — vanilla legendaries were hand-tuned.">Legendary DPS +%</label>
+                                            <input type="number" class="form-input" id="rsLegDps" value="30" min="0" max="500" step="0.5" style="width:65px;" />
+                                        </div>
+                                    </div>
+
                                     <!-- Legendary System -->
                                     <div class="lf-legendary-section mt-3">
                                         <div class="filter-label d-flex align-items-center gap-2">
@@ -247,6 +263,22 @@
                                 <div class="filter-label" style="margin-top: 12px;">Naming Tiers <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">prefix or suffix per tier</span></div>
                                 <div id="batchNamingTiers" class="lf-naming-tiers"></div>
 
+                                <div class="filter-label" style="margin-top: 12px;">Value Tuning <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">gold &amp; weapon damage</span></div>
+                                <div class="lf-ruleset-grid">
+                                    <div class="lf-ruleset-field">
+                                        <label title="Master scale on ALL gold bumps: 100 = as entered, 0 = prices untouched, 200 = double.">Gold Scale %</label>
+                                        <input type="number" class="form-input lf-rs-shared" data-target="rsGoldScale" value="100" min="0" max="1000" step="5" style="width:65px;" />
+                                    </div>
+                                    <div class="lf-ruleset-field">
+                                        <label title="Gold price bump above base (%) for the boss legendary. 500 = the old x6 behaviour.">Legendary Gold +%</label>
+                                        <input type="number" class="form-input lf-rs-shared" data-target="rsLegGold" value="500" min="0" max="10000" step="25" style="width:65px;" />
+                                    </div>
+                                    <div class="lf-ruleset-field">
+                                        <label title="Weapon DAMAGE bump above base (%) for the legendary (weapons only; speed unchanged). Nominal — vanilla legendaries were hand-tuned.">Legendary DPS +%</label>
+                                        <input type="number" class="form-input lf-rs-shared" data-target="rsLegDps" value="30" min="0" max="500" step="0.5" style="width:65px;" />
+                                    </div>
+                                </div>
+
                                 <!-- Legendary System (batch — no item picker, auto-random per creature) -->
                                 <div class="lf-legendary-section mt-3">
                                     <div class="filter-label d-flex align-items-center gap-2">
@@ -340,6 +372,10 @@
                                     <div class="lf-commit-label">Base Items</div>
                                 </div>
                             </div>
+                            <label class="lf-toggle lf-regen-toggle" title="Re-lootify items that are already done: overwrite each existing variant in place, keeping its tier. Player-owned copies get a freshly-rolled item of the SAME tier — never orphaned, never demoted.">
+                                <input type="checkbox" id="lfRegenerate" />
+                                <span><i class="fa-solid fa-rotate"></i> Regenerate existing (replace in place, keep tier)</span>
+                            </label>
                             <button class="lf-commit-btn" id="btnCommit">
                                 <i class="fa-solid fa-bolt"></i>
                                 <span>Commit to Database</span>
@@ -917,7 +953,7 @@
         .lf-tier-row {
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 4px;
         }
 
         .lf-tier-range {
@@ -928,14 +964,84 @@
             min-width: 60px;
         }
 
+        .lf-tier-min, .lf-tier-max {
+            width: 42px;
+            padding: 3px 4px !important;
+            font-size: 11px !important;
+            text-align: center;
+        }
+
+        .lf-tier-dash {
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+
         .lf-tier-input {
             padding: 3px 8px !important;
             font-size: 12px !important;
             flex: 1;
+            min-width: 60px;
         }
 
         .lf-tier-position {
+            width: 52px;
             font-size: 11px !important;
+            padding: 3px 4px !important;
+        }
+
+        .lf-tier-slots {
+            width: 48px;
+            padding: 3px 4px !important;
+            font-size: 11px !important;
+            text-align: center;
+        }
+
+        .lf-tier-rm {
+            width: 18px;
+            text-align: center;
+            cursor: pointer;
+            color: var(--status-warning);
+            flex: 0 0 auto;
+        }
+
+            .lf-tier-rm:hover {
+                color: #e5534b;
+            }
+
+        .lf-tier-rangehead {
+            width: 90px;
+        }
+
+        .lf-tier-head {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            color: var(--text-muted);
+            padding: 0 2px 2px;
+        }
+
+        .lf-tier-gold, .lf-tier-dps {
+            width: 50px;
+            padding: 3px 4px !important;
+            font-size: 11px !important;
+            text-align: center;
+        }
+
+        .lf-dps-ref {
+            font-family: monospace;
+            font-size: 11px;
+            padding: 4px 4px 6px;
+            opacity: 0.9;
+        }
+
+        .lf-dps-cell {
+            font-family: monospace;
+            font-size: 11px;
+            white-space: nowrap;
+            color: var(--status-warning, #d08a2a);
         }
 
         /* ── Empty State ── */
@@ -1198,6 +1304,20 @@
             text-transform: uppercase;
             letter-spacing: 0.4px;
         }
+
+        .lf-regen-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            font-size: 12px;
+            color: var(--text-muted);
+            cursor: pointer;
+        }
+
+            .lf-regen-toggle i {
+                color: var(--accent);
+            }
 
         .lf-commit-btn {
             display: flex;

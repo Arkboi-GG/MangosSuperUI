@@ -35,6 +35,24 @@ public class StylePostPass
     private readonly ConcurrentDictionary<string, Queue<string>> _recent =
         new(StringComparer.OrdinalIgnoreCase);
 
+    // Discard tally, surfaced on the Capacity page's Chat Health panel. STATIC on purpose:
+    // the counters must survive whatever DI lifetime this class ends up with, and there is
+    // exactly one chat pipeline per process. Reset on restart, which is fine — this is a
+    // "why are my bots silent?" diagnostic, not an audit trail.
+    private static readonly ConcurrentDictionary<string, int> _discards = new();
+
+    /// <summary>Discard reasons since process start — floor:*, self-repeat, empty-after-*.</summary>
+    public static IReadOnlyDictionary<string, int> DiscardSnapshot() =>
+        new Dictionary<string, int>(_discards);
+
+    public static void ResetDiscardCounts() => _discards.Clear();
+
+    private static (string? Line, string? DiscardReason) Discard(string reason)
+    {
+        _discards.AddOrUpdate(reason, 1, (_, c) => c + 1);
+        return (null, reason);
+    }
+
     public StylePostPass(ChatSettingsService settings)
     {
         _settings = settings;
@@ -48,7 +66,7 @@ public class StylePostPass
         //           + trailing/leading "As {name}," / "Name:" artifact strip (§10.4.1) ──
         var line = CleanResponse(raw);
         line = StripSpeakerArtifacts(line, card.GivenName, botName);
-        if (string.IsNullOrWhiteSpace(line)) return (null, "empty-after-clean");
+        if (string.IsNullOrWhiteSpace(line)) return Discard("empty-after-clean");
 
         var t = card.Typing;
         var rng = Random.Shared;
@@ -124,7 +142,7 @@ public class StylePostPass
 
         // ── Step 8: content floor (non-configurable) ──
         if (ContentFloor.IsBlocked(line, out var stem))
-            return (null, $"floor:{stem}");
+            return Discard($"floor:{stem}");
 
         // ── Step 9: length cap 200 chars with sentence-boundary cut (client-safe) ──
         if (line.Length > MaxResponseLength)
@@ -136,10 +154,10 @@ public class StylePostPass
         }
 
         line = line.Trim();
-        if (string.IsNullOrWhiteSpace(line)) return (null, "empty-after-style");
+        if (string.IsNullOrWhiteSpace(line)) return Discard("empty-after-style");
 
         // ── Step 10: self-repeat ledger (§10.4 amendment) ──
-        if (IsSelfRepeat(botName, line)) return (null, "self-repeat");
+        if (IsSelfRepeat(botName, line)) return Discard("self-repeat");
         Remember(botName, line);
 
         return (line, null);

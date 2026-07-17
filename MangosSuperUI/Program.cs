@@ -1,19 +1,20 @@
-﻿using MangosSuperUI.Services;
-using MangosSuperUI.Models;
-using MangosSuperUI.Hubs;
-using Microsoft.AspNetCore.StaticFiles;
-using System.Diagnostics.Metrics;
-using MangosSuperUI.BotLogic.Core;
-using MangosSuperUI.BotLogic.Data;
-using MangosSuperUI.BotLogic.Tracking;
-using MangosSuperUI.BotLogic.Brain;
-using MangosSuperUI.BotLogic.Planners;
+﻿using MangosSuperUI.BotLogic.Brain;
+using MangosSuperUI.BotLogic.Chat.Capacity;
 using MangosSuperUI.BotLogic.Chat.Coordinator;
 using MangosSuperUI.BotLogic.Chat.Core;
 using MangosSuperUI.BotLogic.Chat.Engine;
-using MangosSuperUI.BotLogic.Chat.Capacity;
+using MangosSuperUI.BotLogic.Chat.Health;
 using MangosSuperUI.BotLogic.Chat.Memory;
 using MangosSuperUI.BotLogic.Chat.Voice;
+using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Planners;
+using MangosSuperUI.BotLogic.Tracking;
+using MangosSuperUI.Hubs;
+using MangosSuperUI.Models;
+using MangosSuperUI.Services;
+using Microsoft.AspNetCore.StaticFiles;
+using System.Diagnostics.Metrics;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -74,6 +75,7 @@ builder.Services.AddSingleton<VramManager>();
 builder.Services.AddSingleton<WikiDocStore>();
 builder.Services.AddSingleton<WikiIndexer>();
 builder.Services.AddSingleton<WikiSearchStore>();
+builder.Services.AddScoped<RetextureSupport>();
 
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();
@@ -104,6 +106,11 @@ builder.Services.AddSingleton<IBotPlanner, QuestPlanner>();   // P3: Goal.Questi
 builder.Services.AddSingleton<IBotPlanner, MaintenancePlanner>();
 builder.Services.AddSingleton<IBotPlanner, TrainingPlanner>();   // Goal.Training — class-trainer trip
 builder.Services.AddSingleton<IBotPlanner, HubErrandPlanner>();  // Goal.Vendoring — "do your rounds" hub errand (player-party, 2026-07-08 §3)
+
+// [ROTATION] Custom combat rotations — profile loading, assignment persistence, LOAD_ROTATION
+// push (2026-07-16). Self-wires into BotBridgeService for the HELLO re-push; the activation
+// line after Build() below is what actually constructs it before the first bot connects.
+builder.Services.AddSingleton<RotationService>();
 
 builder.Services.AddSingleton<BotBrain>();
 builder.Services.AddSingleton<BotDiagnosticsService>();
@@ -136,7 +143,7 @@ builder.Services.AddSingleton<VoiceLibraryBuilder>();
 builder.Services.AddSingleton<ChatCoordinator>();
 builder.Services.AddSingleton<IChatCoordinator>(sp => sp.GetRequiredService<ChatCoordinator>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ChatCoordinator>());
-
+builder.Services.AddSingleton<ChatHealthService>();
 
 // ---------- MVC + SignalR ----------
 builder.Services.AddControllersWithViews();
@@ -180,6 +187,11 @@ await app.Services.GetRequiredService<CreatureSpawnLoader>().LoadAsync();
 // stays empty and every training trip gives up ("no-loader" / "no-trainer-in-range"). Confirm the
 // "[SpellProgression] Loaded N trainer spawns across M classes" line at boot.
 await app.Services.GetRequiredService<SpellProgressionLoader>().LoadAsync();
+
+// [ROTATION] Eagerly construct RotationService so its SetRotationService(this) wire-in lands
+// BEFORE the bridge accepts the first HELLO — a lazily-resolved singleton would otherwise not
+// exist until the first API call, and every bot login before that would miss its re-push.
+app.Services.GetRequiredService<RotationService>();
 
 // ---------- Pipeline ----------
 if (!app.Environment.IsDevelopment())

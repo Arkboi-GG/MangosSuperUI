@@ -1,0 +1,918 @@
+@{
+    ViewData["Title"] = "Retexture Engine";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="re-wrap">
+            <header class="re-head">
+                <div>
+                    <h1 class="re-title"><i class="fa-solid fa-palette"></i> Retexture Engine</h1>
+                    <p class="re-sub">Seeded theory &middot; tier &middot; value recolor. Tune on the fast flat preview, survey with the contact sheet, then commit.</p>
+                </div>
+            </header>
+
+            <div class="re-grid">
+
+                <!-- ── LEFT: browse ─────────────────────────────────────── -->
+                <aside class="re-browse re-card">
+                    <div class="re-card-head">Items</div>
+                    <div class="re-browse-controls">
+                        <input type="text" id="reSearch" class="re-input" placeholder="Search items&hellip;" autocomplete="off" />
+                        <div class="re-filter-grid">
+                            <select id="reFClass" class="re-input re-input-xs"></select>
+                            <select id="reFSub" class="re-input re-input-xs"></select>
+                            <select id="reFSlot" class="re-input re-input-xs"></select>
+                            <select id="reFQuality" class="re-input re-input-xs"></select>
+                            <input type="number" id="reFMinLvl" class="re-input re-input-xs" min="0" max="63" placeholder="min lvl" />
+                            <input type="number" id="reFMaxLvl" class="re-input re-input-xs" min="0" max="63" placeholder="max lvl" />
+                        </div>
+                        <label class="re-check" title="Only items with a retextureable model/atlas/cape slot">
+                            <input type="checkbox" id="reRetexOnly" checked /> Retextureable only
+                        </label>
+                    </div>
+                    <div class="re-result-info" id="reResultInfo">Type to search.</div>
+                    <div class="re-selbar" id="reSelBar">
+                        <div class="re-selbar-top">
+                            <span class="re-selbar-count" id="reSelCount">0 selected</span>
+                            <button class="re-btn re-btn-sm" id="reSelClear">Clear</button>
+                        </div>
+                        <div class="re-selbar-controls">
+                            <label>
+                                Tier
+                                <select id="reSelTier" class="re-mini-select">
+                                    <option value="all">All tiers</option>
+                                    <option value="improved">Improved</option>
+                                    <option value="power">Power</option>
+                                    <option value="glory">Glory</option>
+                                    <option value="gods">Gods</option>
+                                </select>
+                            </label>
+                            <label class="re-check" title="Give the whole selection one shared colourway"><input type="checkbox" id="reAsSet" /> Treat as one set</label>
+                        </div>
+                        <button class="re-btn re-selbar-run" id="reSelRun"><i class="fa-solid fa-wand-magic-sparkles"></i> Retexture selection</button>
+                        <div class="re-selbar-status" id="reSelStatus"></div>
+                    </div>
+                    <div class="re-list" id="reList"></div>
+                    <div class="re-pager" id="rePager" style="display:none;">
+                        <button class="re-btn re-btn-sm" id="rePrev">Prev</button>
+                        <span id="rePageLabel"></span>
+                        <button class="re-btn re-btn-sm" id="reNext">Next</button>
+                    </div>
+                </aside>
+
+                <!-- ── CENTER: preview ─────────────────────────────────── -->
+                <section class="re-preview">
+                    <div class="re-selected" id="reSelected">
+                        <span class="re-selected-empty">No item selected &mdash; pick one from the list, or enter a display id.</span>
+                    </div>
+
+                    <div class="re-directid">
+                        <label>display id</label>
+                        <input type="number" id="reDisplayId" class="re-input re-input-sm" min="1" placeholder="e.g. 5770" />
+                        <button class="re-btn re-btn-sm" id="reLoadId">Load</button>
+                    </div>
+                    <div class="re-sources" id="reSources"></div>
+                    <div class="re-mode" id="reMode">
+                        <span class="re-mode-label">view</span>
+                        <button type="button" class="re-mode-btn active" data-mode="existing">Existing recolor</button>
+                        <button type="button" class="re-mode-btn" data-mode="new">New (theory reroll)</button>
+                    </div>
+
+                    <div class="re-toprow">
+                        <figure class="re-flat-sm">
+                            <figcaption>flat recolor <span class="re-hint">(queue pixels)</span></figcaption>
+                            <div class="re-img-wrap-sm" id="reFlatWrap">
+                                <img id="reFlat" alt="recolor preview" />
+                                <div class="re-img-msg" id="reFlatMsg">Select an item.</div>
+                            </div>
+                        </figure>
+                        <div class="re-variants">
+                            <div class="re-variants-head">tier variants <span class="re-hint">(click to switch tier)</span></div>
+                            <div class="re-variants-strip" id="reVariants"></div>
+                        </div>
+                    </div>
+
+                    <figure class="re-viewer-big">
+                        <figcaption>
+                            on model
+                            <select id="reRace" class="re-mini-select" title="Character race">
+                                <option value="Human">Human</option>
+                                <option value="Dwarf">Dwarf</option>
+                                <option value="NightElf">Night Elf</option>
+                                <option value="Gnome">Gnome</option>
+                                <option value="Orc">Orc</option>
+                                <option value="Tauren">Tauren</option>
+                                <option value="Troll">Troll</option>
+                                <option value="Scourge">Undead</option>
+                            </select>
+                            <select id="reGender" class="re-mini-select" title="Character gender">
+                                <option value="Male">Male</option>
+                                <option value="Female">Female</option>
+                            </select>
+                            <select id="reOutfitClass" class="re-mini-select" title="Dress the mannequin in a class tier set"></select>
+                            <select id="reOutfitTier" class="re-mini-select" title="Tier set"></select>
+                        </figcaption>
+                        <div class="re-canvas-wrap-big">
+                            <canvas id="char-preview-canvas" data-glb-url=""></canvas>
+                            <div class="re-img-msg" id="reViewerMsg">Pick an item to dress the character.</div>
+                        </div>
+                    </figure>
+
+                    <div class="re-actions">
+                        <button class="re-btn" id="reSheetBtn"><i class="fa-solid fa-table-cells"></i> Contact sheet (all theories &times; tiers)</button>
+                    </div>
+                    <div class="re-sheet-wrap" id="reSheetWrap" style="display:none;">
+                        <img id="reSheet" alt="theory contact sheet" />
+                    </div>
+                </section>
+
+                <!-- ── RIGHT: knobs ────────────────────────────────────── -->
+                <aside class="re-knobs re-card">
+                    <div class="re-card-head">Recolor</div>
+
+                    <div class="re-knob-group">
+                        <div class="re-knob-label">Theory</div>
+                        <div class="re-seg" id="reTheory"></div>
+                    </div>
+
+                    <div class="re-knob-group">
+                        <div class="re-knob-label">Tier</div>
+                        <div class="re-seg" id="reTier"></div>
+                        <label class="re-check">
+                            <input type="checkbox" id="reLadder" /> Ladder <span class="re-hint">(one identity deepening across tiers)</span>
+                        </label>
+                    </div>
+
+                    <div class="re-card-head re-card-head-sub">Value axis</div>
+                    <div class="re-knob-group">
+                        <div class="re-seg" id="reValueMode"></div>
+                        <p class="re-hint re-value-note">Invert flips the item&rsquo;s value composition (light&harr;dark) while keeping detail legible. Owns lightness; bypasses the tier lightness stage.</p>
+                    </div>
+
+                    <details class="re-adv">
+                        <summary>Advanced value knobs</summary>
+                        <div class="re-slider">
+                            <label>Blur &sigma; <output id="reSigmaOut">2.5</output></label>
+                            <input type="range" id="reSigma" min="1" max="5" step="0.1" value="2.5" />
+                        </div>
+                        <div class="re-slider">
+                            <label>Detail <output id="reDetailOut">1.0</output></label>
+                            <input type="range" id="reDetail" min="0" max="1.5" step="0.05" value="1.0" />
+                        </div>
+                        <div class="re-slider">
+                            <label>Blend <output id="reBlendOut">1.0</output></label>
+                            <input type="range" id="reBlend" min="0" max="1" step="0.05" value="1.0" />
+                        </div>
+                        <div class="re-slider">
+                            <label>Dark-desat knee <output id="reKneeOut">0.40</output></label>
+                            <input type="range" id="reKnee" min="0" max="0.6" step="0.02" value="0.40" />
+                        </div>
+                        <div class="re-slider">
+                            <label>Dark-desat floor <output id="reFloorOut">0.25</output></label>
+                            <input type="range" id="reFloor" min="0" max="1" step="0.05" value="0.25" />
+                        </div>
+                        <div class="re-slider">
+                            <label>Alpha threshold <output id="reAlphaOut">16</output></label>
+                            <input type="range" id="reAlpha" min="0" max="64" step="1" value="16" />
+                        </div>
+                        <label class="re-check"><input type="checkbox" id="reScale" checked /> Scale &sigma; with texture width</label>
+                    </details>
+
+                    <div class="re-knob-status" id="reStatus"></div>
+                </aside>
+
+            </div>
+
+            <section class="re-batch re-card">
+                <div class="re-card-head">Batch retexture &mdash; Lootifiers</div>
+                <p class="re-hint re-batch-intro">Queue one seeded recolor per (base item &times; tier) across the selected Lootifier sources, then run it (recolor &rarr; BLP &rarr; patch MPQ). Uses the seeded engine with each tier&rsquo;s shape + policy.</p>
+                <div class="re-batch-grid">
+                    <div class="re-batch-sources" id="reBatchSources"><span class="re-hint">Loading sources&hellip;</span></div>
+                    <div class="re-batch-run">
+                        <label class="re-check"><input type="checkbox" id="reRequeue" /> Requeue already-queued items</label>
+                        <div class="re-batch-using" id="reBatchUsing"></div>
+                        <div class="re-batch-btns">
+                            <button class="re-btn" id="reBuildBtn"><i class="fa-solid fa-layer-group"></i> Build queue</button>
+                            <button class="re-btn" id="reRunBtn"><i class="fa-solid fa-play"></i> Run queue</button>
+                            <button class="re-btn re-btn-sm" id="reResetBtn">Requeue failed</button>
+                            <button class="re-btn re-btn-sm" id="reClearBtn">Clear</button>
+                            <button class="re-btn re-btn-sm" id="reRebuildBtn">Rebuild patch</button>
+                        </div>
+                        <div class="re-queue-status" id="reQueueText">Queue: &mdash;</div>
+                        <div class="re-bar-wrap" id="reBarWrap"><div class="re-bar" id="reBar"></div></div>
+                        <div class="re-failures" id="reFailures"></div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/js/retextureengine.js" asp-append-version="true"></script>
+
+    @* Character viewer — same module dir + import map the items page uses. *@
+    <script type="importmap">
+        {
+        "imports": {
+        "three": "/lib/three/build/three.module.js",
+        "three/addons/": "/lib/three/examples/jsm/"
+        }
+        }
+    </script>
+    <script type="module" asp-append-version="true">
+        import { mountCharacterViewer } from '/js/character-viewer/embed.js';
+        import * as equip from '/js/character-viewer/equip.js';
+        import { TIER_SETS, TIER_CLASSES, TIER_IDS } from '/js/character-viewer/tier-sets.js';
+        window.mountCharacterViewer = mountCharacterViewer;
+        window.reEquip = equip;
+        window.reTierSets = { TIER_SETS: TIER_SETS, TIER_CLASSES: TIER_CLASSES, TIER_IDS: TIER_IDS };
+        window.dispatchEvent(new Event('re-viewer-ready'));
+    </script>
+}
+
+@section Styles {
+    <style>
+        /* The shared shell is a fixed 100vh frame (overflow:hidden); this section
+        is a tall scrolling page, so let its content area scroll. */
+        .main-content {
+        overflow-y: auto;
+        min-height: 0;
+        }
+
+        .re-wrap {
+        padding: 22px 26px 40px;
+        max-width: 1600px;
+        }
+
+        .re-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        margin-bottom: 18px;
+        }
+
+        .re-title {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin: 0;
+        }
+
+        .re-title i {
+        color: var(--accent);
+        margin-right: 8px;
+        }
+
+        .re-sub {
+        color: var(--text-secondary);
+        font-size: 13.5px;
+        margin: 4px 0 0;
+        }
+
+        .re-grid {
+        display: grid;
+        grid-template-columns: 320px minmax(0, 1fr) 300px;
+        gap: 18px;
+        align-items: start;
+        }
+
+        .re-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-light);
+        border-radius: var(--radius-md, 8px);
+        padding: 14px;
+        }
+
+        .re-card-head {
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--text-sidebar-heading, var(--text-muted));
+        margin-bottom: 10px;
+        }
+
+        .re-card-head-sub {
+        margin-top: 18px;
+        }
+
+        .re-input {
+        width: 100%;
+        padding: 8px 10px;
+        font-size: 13px;
+        background: var(--bg-input);
+        color: var(--text-primary);
+        border: 1px solid var(--border-medium);
+        border-radius: 6px;
+        }
+
+        .re-input-sm {
+        width: 120px;
+        }
+
+        .re-browse-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 8px;
+        }
+
+        .re-filter-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+        }
+
+        .re-input-xs {
+        padding: 4px 6px;
+        font-size: 11.5px;
+        width: 100%;
+        }
+
+        .re-check {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12.5px;
+        color: var(--text-secondary);
+        cursor: pointer;
+        }
+
+        .re-result-info {
+        font-size: 11.5px;
+        color: var(--text-muted);
+        margin-bottom: 6px;
+        }
+
+        .re-selbar {
+        display: none;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+        margin-bottom: 8px;
+        background: var(--bg-card-alt);
+        border: 1px solid var(--accent);
+        border-radius: 6px;
+        }
+
+        .re-selbar.active {
+        display: flex;
+        }
+
+        .re-selbar-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        }
+
+        .re-selbar-count {
+        font-size: 12.5px;
+        font-weight: 600;
+        color: var(--text-primary);
+        }
+
+        .re-selbar-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        }
+
+        .re-selbar-controls > label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        }
+
+        .re-selbar-run {
+        width: 100%;
+        justify-content: center;
+        }
+
+        .re-selbar-status {
+        font-size: 11px;
+        color: var(--text-muted);
+        min-height: 14px;
+        }
+
+        .re-selbox {
+        margin-right: 2px;
+        flex-shrink: 0;
+        }
+
+        .re-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        max-height: 62vh;
+        overflow-y: auto;
+        }
+
+        .re-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background 0.12s;
+        }
+
+        .re-row:hover {
+        background: var(--bg-card-alt);
+        }
+
+        .re-row.active {
+        background: var(--bg-sidebar-active, var(--bg-card-alt));
+        }
+
+        .re-row img {
+        width: 28px;
+        height: 28px;
+        border-radius: 4px;
+        flex-shrink: 0;
+        }
+
+        .re-row-name {
+        font-size: 12.5px;
+        color: var(--text-primary);
+        line-height: 1.2;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        }
+
+        .re-row-meta {
+        font-size: 10.5px;
+        color: var(--text-muted);
+        }
+
+        .re-pager {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        }
+
+        .re-preview {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        }
+
+        .re-selected {
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text-primary);
+        min-height: 22px;
+        }
+
+        .re-selected-empty {
+        font-weight: 400;
+        color: var(--text-muted);
+        font-size: 13px;
+        }
+
+        .re-selected .re-did {
+        color: var(--text-muted);
+        font-weight: 400;
+        font-size: 12px;
+        margin-left: 8px;
+        }
+
+        .re-directid {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        }
+
+        .re-directid label {
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        font-size: 10.5px;
+        }
+
+        .re-sources {
+        font-size: 11.5px;
+        color: var(--text-secondary);
+        line-height: 1.5;
+        }
+
+        .re-sources b {
+        color: var(--text-primary);
+        font-weight: 600;
+        }
+
+        .re-hint {
+        color: var(--text-muted);
+        font-weight: 400;
+        }
+
+        .re-mini-select {
+        background: var(--bg-input);
+        color: var(--text-primary);
+        border: 1px solid var(--border-medium);
+        border-radius: 4px;
+        font-size: 11px;
+        padding: 1px 4px;
+        margin-left: 4px;
+        }
+
+        figure.re-flat-sm, figure.re-viewer-big {
+        margin: 0;
+        }
+
+        figure.re-flat-sm figcaption, figure.re-viewer-big figcaption, .re-variants-head {
+        font-size: 11px;
+        color: var(--text-secondary);
+        margin-bottom: 5px;
+        }
+
+        /* TOP ROW: small flat recolor + tier-variant strip */
+        .re-mode {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        }
+
+        .re-mode-label {
+        font-size: 10.5px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        color: var(--text-muted);
+        }
+
+        .re-mode-btn {
+        font-size: 11.5px;
+        padding: 3px 10px;
+        border: 1px solid var(--border-medium);
+        background: var(--bg-input);
+        color: var(--text-secondary);
+        border-radius: 5px;
+        cursor: pointer;
+        }
+
+        .re-mode-btn.active {
+        background: var(--accent);
+        color: #fff;
+        border-color: var(--accent);
+        }
+
+        .re-toprow {
+        display: grid;
+        grid-template-columns: 176px 1fr;
+        gap: 16px;
+        align-items: start;
+        }
+
+        .re-img-wrap-sm {
+        position: relative;
+        width: 160px;
+        height: 160px;
+        background: #16181d;
+        border: 1px solid var(--border-light);
+        border-radius: 6px;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        }
+
+        .re-img-wrap-sm img {
+        max-width: 100%;
+        max-height: 100%;
+        image-rendering: pixelated;
+        }
+
+        .re-variants-strip {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+        }
+
+        .re-variant {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        }
+
+        .re-variant-label {
+        font-size: 10.5px;
+        font-weight: 600;
+        text-transform: capitalize;
+        color: var(--text-secondary);
+        text-align: center;
+        }
+
+        .re-variant-img {
+        position: relative;
+        aspect-ratio: 1 / 1;
+        background: #16181d;
+        border: 1px solid var(--border-light);
+        border-radius: 5px;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        }
+
+        .re-variant-img.active {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent);
+        }
+
+        .re-variant-img img {
+        max-width: 100%;
+        max-height: 100%;
+        image-rendering: pixelated;
+        }
+
+        /* CENTERPIECE: big 3D viewer */
+        .re-canvas-wrap-big {
+        position: relative;
+        height: 460px;
+        background: #16181d;
+        border: 1px solid var(--border-light);
+        border-radius: 8px;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        }
+
+        #char-preview-canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+        }
+
+        .re-img-msg {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 12px;
+        font-size: 12px;
+        color: var(--text-muted);
+        }
+
+        .re-img-wrap-sm img[src] + .re-img-msg {
+        display: none;
+        }
+
+        /* Item quality colours (WoW rarity) — quality-1 (common) keeps default text */
+        .re-row-name.quality-0 {
+        color: #9d9d9d;
+        }
+
+        .re-row-name.quality-2 {
+        color: #1eb100;
+        }
+
+        .re-row-name.quality-3 {
+        color: #0070dd;
+        }
+
+        .re-row-name.quality-4 {
+        color: #a335ee;
+        }
+
+        .re-row-name.quality-5 {
+        color: #ff8000;
+        }
+
+        .re-row-name.quality-6 {
+        color: #e6cc80;
+        }
+
+        .re-actions {
+        display: flex;
+        gap: 10px;
+        }
+
+        .re-sheet-wrap {
+        border: 1px solid var(--border-light);
+        border-radius: 8px;
+        overflow: auto;
+        background: #16181d;
+        padding: 6px;
+        }
+
+        .re-sheet-wrap img {
+        max-width: 100%;
+        display: block;
+        }
+
+        .re-btn {
+        padding: 8px 14px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        background: var(--accent);
+        color: var(--text-on-accent, #fff);
+        border: none;
+        border-radius: 6px;
+        }
+
+        .re-btn:hover {
+        background: var(--accent-hover, var(--accent));
+        }
+
+        .re-btn:disabled {
+        opacity: 0.5;
+        cursor: default;
+        }
+
+        .re-btn-sm {
+        padding: 5px 10px;
+        font-size: 12px;
+        background: transparent;
+        color: var(--text-secondary);
+        border: 1px solid var(--border-medium);
+        }
+
+        .re-btn-sm:hover {
+        background: var(--bg-card-alt);
+        }
+
+        .re-knob-group {
+        margin-bottom: 14px;
+        }
+
+        .re-knob-label {
+        font-size: 11.5px;
+        font-weight: 600;
+        color: var(--text-secondary);
+        margin-bottom: 6px;
+        }
+
+        .re-seg {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        }
+
+        .re-seg button {
+        padding: 5px 9px;
+        font-size: 11.5px;
+        cursor: pointer;
+        background: var(--bg-input);
+        color: var(--text-secondary);
+        border: 1px solid var(--border-medium);
+        border-radius: 5px;
+        }
+
+        .re-seg button.active {
+        background: var(--accent);
+        color: var(--text-on-accent, #fff);
+        border-color: var(--accent);
+        }
+
+        .re-adv {
+        margin-top: 8px;
+        }
+
+        .re-adv summary {
+        font-size: 12px;
+        color: var(--text-secondary);
+        cursor: pointer;
+        padding: 4px 0;
+        }
+
+        .re-slider {
+        margin: 8px 0;
+        }
+
+        .re-slider label {
+        display: flex;
+        justify-content: space-between;
+        font-size: 11.5px;
+        color: var(--text-secondary);
+        margin-bottom: 3px;
+        }
+
+        .re-slider output {
+        color: var(--text-primary);
+        font-variant-numeric: tabular-nums;
+        }
+
+        .re-slider input[type=range] {
+        width: 100%;
+        }
+
+        .re-value-note {
+        margin: 8px 0 0;
+        font-size: 11px;
+        line-height: 1.4;
+        }
+
+        .re-knob-status {
+        margin-top: 12px;
+        font-size: 11.5px;
+        color: var(--text-muted);
+        min-height: 16px;
+        }
+
+        .re-batch {
+        margin-top: 18px;
+        }
+
+        .re-batch-intro {
+        margin: 0 0 12px;
+        }
+
+        .re-batch-grid {
+        display: grid;
+        grid-template-columns: minmax(0,1fr) minmax(0,1.5fr);
+        gap: 20px;
+        align-items: start;
+        }
+
+        .re-batch-sources {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        }
+
+        .re-src-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        font-size: 12.5px;
+        color: var(--text-primary);
+        cursor: pointer;
+        }
+
+        .re-src-row input {
+        margin-top: 3px;
+        }
+
+        .re-src-meta {
+        color: var(--text-muted);
+        font-size: 11px;
+        }
+
+        .re-batch-using {
+        font-size: 12px;
+        color: var(--text-primary);
+        font-weight: 600;
+        margin: 6px 0;
+        }
+
+        .re-batch-btns {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 10px 0;
+        }
+
+        .re-queue-status {
+        font-size: 12.5px;
+        color: var(--text-secondary);
+        }
+
+        .re-bar-wrap {
+        height: 8px;
+        background: var(--bg-input);
+        border-radius: 5px;
+        overflow: hidden;
+        margin: 8px 0;
+        display: none;
+        }
+
+        .re-bar {
+        height: 100%;
+        width: 0;
+        background: var(--accent);
+        transition: width 0.3s;
+        }
+
+        .re-failures {
+        font-size: 11.5px;
+        color: #c0392b;
+        margin-top: 6px;
+        }
+
+        @@media (max-width: 1200px) {
+        .re-grid {
+        grid-template-columns: 1fr;
+        }
+
+        .re-toprow {
+        grid-template-columns: 1fr;
+        }
+        }
+    </style>
+}

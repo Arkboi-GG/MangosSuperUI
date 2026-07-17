@@ -396,6 +396,7 @@ public class BotBridgeService : BackgroundService
 
     // BotBrain integration — set after startup to avoid circular DI
     private BotBrainService? _brain;
+    private RotationService? _rotations;   // [ROTATION] late-wired by RotationService's ctor (see SetRotationService)
 
     // ChatCoordinator integration (C0, §5.5) — late-wired like the brain: the coordinator
     // constructor-injects this bridge (for SendSayTextAsync in C2+), so the bridge cannot
@@ -434,6 +435,17 @@ public class BotBridgeService : BackgroundService
     {
         _brain = brain;
         _logger.LogInformation("BotBridge: BotBrainService wired for event routing");
+    }
+
+    /// <summary>
+    /// [ROTATION] Called by RotationService from its constructor — the same late-wire
+    /// pattern as SetBrainService (Bridge ← Rotation → Bridge would otherwise be a DI
+    /// cycle). Enables the HELLO re-push so assignments survive restarts and relogs.
+    /// </summary>
+    public void SetRotationService(RotationService rotations)
+    {
+        _rotations = rotations;
+        _logger.LogInformation("BotBridge: RotationService wired for HELLO re-push");
     }
 
     /// <summary>
@@ -603,6 +615,11 @@ public class BotBridgeService : BackgroundService
             hello.Name, hello.Guid, hello.ClassId, hello.Level);
 
         await _hub.Clients.All.SendAsync("BotConnected", conn.State);
+
+        // [ROTATION] Re-push this bot's persisted rotation assignment, if any — fire and
+        // forget so a slow push can never delay the HELLO handshake. Failures log inside.
+        if (_rotations != null)
+            _ = _rotations.OnBotHelloAsync(hello.Guid, hello.Name);
     }
 
     private async Task HandleStateAsync(JsonElement payload, BotConnection conn)
@@ -681,6 +698,24 @@ public class BotBridgeService : BackgroundService
 
         switch (eventType)
         {
+            case "ROTATION_ACK":
+                {
+                    // [ROTATION] C++ resolved the pushed slate. skipped>0 = the profile names
+                    // spells this bot doesn't know (wrong rank / not yet trained) — warn loudly
+                    // so an under-performing rotation is a log line, not a mystery at the keyboard.
+                    var ackKv = ParsePipeDelimited(evt.Data ?? "");
+                    ackKv.TryGetValue("profile", out var ackProfile);
+                    ackKv.TryGetValue("loaded", out var ackLoaded);
+                    ackKv.TryGetValue("skipped", out var ackSkipped);
+                    if (int.TryParse(ackSkipped, out var nSkipped) && nSkipped > 0)
+                        _logger.LogWarning("[ROTATION] {Name} ACK '{Profile}': loaded={Loaded} SKIPPED={Skipped} — profile names unknown/unlearned spells",
+                            conn.State.Name, ackProfile ?? "?", ackLoaded ?? "?", nSkipped);
+                    else
+                        _logger.LogInformation("[ROTATION] {Name} ACK '{Profile}': loaded={Loaded} skipped={Skipped}",
+                            conn.State.Name, ackProfile ?? "?", ackLoaded ?? "0", ackSkipped ?? "0");
+                    break;
+                }
+
             case "KILL":
                 _logger.LogInformation("BotBridge: KILL by {Name} — creature entry={Entry} guid={CrGuid}",
                     conn.State.Name, evt.CreatureEntry, evt.CreatureGuid);
@@ -764,6 +799,37 @@ public class BotBridgeService : BackgroundService
                         conn.State.HubErrandUntil = null;
                         _logger.LogInformation("[HUB-ERRAND] {Name} cleared by {Sender}: 'lets move'",
                             conn.State.Name, evt.Sender ?? "?");
+                    }
+                    else
+                    {
+                        // [FOLLOW-CMD] "{bot} follow {player|me|auto}" (2026-07-16) — addressed
+                        // escort override. ONLY the named bot obeys (each connection checks the
+                        // first token against ITS OWN name — a party line reaches every bot's
+                        // CHAT_RECV, so no roster lookup is needed). "me" resolves to the speaker;
+                        // "auto" or a bare "follow" reverts to the GUIDLow-modulo split. C++ stores
+                        // the name and FindEscortBoss prefers it while that human is in the group,
+                        // falling back to the auto split otherwise — a typo'd name is therefore
+                        // harmless (and visible: the bot answers with the name it was given).
+                        // Documented in CHAT_COMMANDS.md — keep that file current when adding here.
+                        var tok = hubMsg.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        if (tok.Length >= 2
+                            && string.Equals(tok[0], conn.State.Name, StringComparison.OrdinalIgnoreCase)
+                            && tok[1] == "follow")
+                        {
+                            string target = tok.Length >= 3 ? tok[2] : "auto";
+                            if (target == "me")
+                                target = (evt.Sender ?? "").ToLowerInvariant();
+                            bool clearOverride = target is "auto" or "";
+
+                            await SendToBotAsync(conn.Guid, "SET_ESCORT",
+                                new { player_name = clearOverride ? "" : target });
+                            string followAck = clearOverride
+                                ? "Back to the usual spread."
+                                : $"Following {char.ToUpperInvariant(target[0]) + target[1..]}!";
+                            await SendSayTextAsync(conn.Guid, followAck, 1);
+                            _logger.LogInformation("[FOLLOW-CMD] {Name} escort override by {Sender}: '{Target}'",
+                                conn.State.Name, evt.Sender ?? "?", clearOverride ? "(auto)" : target);
+                        }
                     }
                 }
 
