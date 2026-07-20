@@ -153,7 +153,7 @@ A browser-based Three.js terrain renderer reading directly from WoW 1.12.1 MPQ a
 
 > **In Progress:** The commit-to-game-world pipeline (DBC patching + patch MPQ generation) is built and functional — place buildings, download the MPQ, restart the world + delete your WDB, and boot the client to see them. Client-side rendering of custom displayIds, cave/interior WMO geometry, and a few terrain "fall-through-floor" cases are still being worked.
 
-![World Viewer](C:\Users\nico\source\repos\MangosSuperUI\Screenshots\world-viewer.png)
+![World Viewer](Screenshots\world-viewer.png)
 
 ### Spell Creator
 
@@ -170,7 +170,7 @@ A complete custom spell creation pipeline from concept to playable in-game. Crea
 - **Trainer registration** — copy-from-source or add-to-all-class-trainers with SPELL_EFFECT_LEARN_SPELL wrapper generation
 - **Unified patch** — a single patch MPQ for all custom spells including DBC entries, icons, textures, and M2 particles
 
-![Spell Creator](C:\Users\nico\source\repos\MangosSuperUI\Screenshots\spell-creator.png)
+![Spell Creator](Screenshots\spell-creator.png)
 
 While trainer registration, icons, and visual changes all work - it is still a farcry from being a tool that allows you to add a coherent spell family, or make true novel spell effects. Can you turn frostbolt pink and change the particle speeds/density/emit patterns and make it arcane? Sure. Can you create a spell from scratch without choosing a base spell and easily understand what each spell phase does? No. It's a good start, but it needs a lot more.
 
@@ -201,7 +201,7 @@ Working, but still a far way from done. They level, they quest, and you can invi
 - Relationship panel with expand-to-see-rows navigation
 - Interactive SVG ER diagrams with radial layout
 
-![ER Diagram](C:\Users\nico\source\repos\MangosSuperUI\Screenshots\er-diagram.png)
+![ER Diagram](Screenshots\er-diagram.png)
 
 **Source Map** — C++ source tree explorer for VMaNGOS/SuperUI-Core development. 4-layer indexing (files, symbols, types, enums), interactive call graph visualization, inline source preview, Topic Explorer and Deep Dive context bundles. Built for understanding the core internals without an IDE.
 
