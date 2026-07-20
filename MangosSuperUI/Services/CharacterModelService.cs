@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using War3Net.Drawing.Blp;
 
 namespace MangosSuperUI.Services;
 
@@ -421,9 +420,7 @@ public class CharacterModelService
     {
         try
         {
-            using var blpStream = new MemoryStream(blpData);
-            var blpFile = new BlpFile(blpStream);
-            var pixels = blpFile.GetPixels(0, out int w, out int h);
+            var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
             if (w == 0 || h == 0 || pixels.Length == 0) return null;
 
             using var bitmap = new SkiaSharp.SKBitmap(w, h, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Unpremul);

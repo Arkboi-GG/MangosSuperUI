@@ -1,8 +1,8 @@
+using MangosSuperUI.Services.Mpq;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
-using War3Net.IO.Mpq;
 
 namespace MangosSuperUI.Services;
 
@@ -177,17 +177,11 @@ public static class AdtTerrainReader
 
             try
             {
-                using var stream = File.OpenRead(mpqPath);
-                using var archive = new MpqArchive(stream);
-
-                if (archive.TryOpenFile(internalPath, out var fileStream))
+                using var archive = MangosSuperUI.Services.Mpq.MpqArchive.Open(mpqPath);
+                if (archive != null)
                 {
-                    using (fileStream)
-                    {
-                        using var ms = new MemoryStream();
-                        fileStream.CopyTo(ms);
-                        return ms.ToArray();
-                    }
+                    var data = archive.ReadFile(internalPath);
+                    if (data != null) return data;
                 }
             }
             catch
@@ -812,9 +806,7 @@ public static class AdtTerrainReader
 
         try
         {
-            using var ms = new MemoryStream(blpData);
-            var blpFile = new War3Net.Drawing.Blp.BlpFile(ms);
-            var pixels = blpFile.GetPixels(0, out int w, out int h);
+            var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
 
             // War3Net returns BGRA — encode with SkiaSharp
             using var bitmap = new SkiaSharp.SKBitmap(w, h, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Unpremul);
@@ -841,9 +833,7 @@ public static class AdtTerrainReader
 
         try
         {
-            using var ms = new MemoryStream(blpData);
-            var blpFile = new War3Net.Drawing.Blp.BlpFile(ms);
-            var pixels = blpFile.GetPixels(0, out int w, out int h);
+            var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
             return (pixels, w, h);
         }
         catch

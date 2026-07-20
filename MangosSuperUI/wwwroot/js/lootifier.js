@@ -12,6 +12,7 @@ $(function () {
     var batchSelectedItems = {}; // creatureEntry → { itemEntry: true }
     var currentMode = 'single'; // 'single' or 'batch'
     var tierState = null;       // editable tier bands (min/max/label/pos/slots/gold/dps); null until meta loads
+    var legendaryBand = null;   // { min, max } boost band for the boss legendary; seeded from meta
 
     var RANK_NAMES = { 0: 'Normal', 1: 'Elite', 2: 'Rare Elite', 3: 'Boss', 4: 'Rare' };
     var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary'];
@@ -156,14 +157,19 @@ $(function () {
         var hasStats = item.totalStats > 0;
         var hasSpells = item.hasSpellEffects;
         var equippable = item.equippable !== false; // treat missing as equippable (older data)
-        var isLootifiable = equippable && (hasStats || hasSpells);
+        // Lootifier output already in this creature's pool. Never a valid base —
+        // lootifying it produces 'Improved Improved <name>' and squares the count.
+        var isGenerated = item.isGenerated === true;
+        var isLootifiable = equippable && !isGenerated && (hasStats || hasSpells);
         var noStatsClass = isLootifiable ? '' : ' no-stats';
         var isSelected = selectedItems[item.itemEntry] ? ' selected' : '';
 
         var chanceStr = item.chance === 0 ? 'equal' : formatChance(Math.abs(item.chance)) + '%';
 
         var familyBadge;
-        if (!equippable) {
+        if (isGenerated) {
+            familyBadge = '<span class="lf-item-family" style="color:var(--accent);">variant</span>';
+        } else if (!equippable) {
             familyBadge = '<span class="lf-item-family" style="color:var(--status-error);">not gear</span>';
         } else if (hasStats) {
             familyBadge = '<span class="lf-item-family">' + esc(item.detectedFamily) + '</span>';
@@ -190,10 +196,18 @@ $(function () {
     function ensureTierState() {
         if (tierState) return true;
         if (!meta || !meta.defaultNamingTiers) return false;
+        var dr = meta.defaultRuleset || {};
+        legendaryBand = {
+            min: (dr.legendaryBoostMinPct != null ? dr.legendaryBoostMinPct : 55),
+            max: (dr.legendaryBoostMaxPct != null ? dr.legendaryBoostMaxPct : 75),
+            drop: (dr.legendaryDropPct != null ? dr.legendaryDropPct : 0.2)
+        };
         tierState = meta.defaultNamingTiers.map(function (t) {
             return {
                 minPct: t.minPct, maxPct: t.maxPct, label: t.label, position: t.position,
                 slots: t.slots || 0,
+                minBoostPct: (t.minBoostPct != null ? t.minBoostPct : null),
+                maxBoostPct: (t.maxBoostPct != null ? t.maxBoostPct : null),
                 goldBumpPct: (t.goldBumpPct != null ? t.goldBumpPct : null),
                 dpsBumpPct: (t.dpsBumpPct != null ? t.dpsBumpPct : null)
             };
@@ -202,15 +216,21 @@ $(function () {
     }
 
     function tierRowHtml(t, i) {
+        // Range % (the old percentile-of-ceiling pair) is no longer rendered — Boost %
+        // replaced it. The values ride along hidden so an old saved ruleset round-trips.
         return '<div class="lf-tier-row" data-tier="' + i + '">' +
-            '<input type="number" class="form-input lf-tier-min" data-tier="' + i + '" value="' + t.minPct + '" min="0" max="100" step="1" title="Budget % floor for this tier" />' +
-            '<span class="lf-tier-dash">–</span>' +
-            '<input type="number" class="form-input lf-tier-max" data-tier="' + i + '" value="' + t.maxPct + '" min="0" max="100" step="1" title="Budget % ceiling for this tier" />' +
+            '<input type="hidden" class="lf-tier-min" value="' + t.minPct + '" />' +
+            '<input type="hidden" class="lf-tier-max" value="' + t.maxPct + '" />' +
             '<select class="form-input lf-tier-position" data-tier="' + i + '" title="Prefix or suffix the tier name">' +
             '<option value="prefix"' + (t.position === 'prefix' ? ' selected' : '') + '>Pre</option>' +
             '<option value="suffix"' + (t.position === 'suffix' ? ' selected' : '') + '>Suf</option>' +
             '</select>' +
             '<input type="text" class="form-input lf-tier-input" data-tier="' + i + '" value="' + esc(t.label) + '" placeholder="Tier name" />' +
+            '<span class="lf-tier-boost">' +
+            '<input type="number" class="form-input lf-tier-bmin" data-tier="' + i + '" value="' + (t.minBoostPct != null ? t.minBoostPct : 10) + '" min="0" max="500" step="1" title="How much stronger than the base item this tier rolls, as a % of the base stat budget. 30-40 = 30 to 40% above base." />' +
+            '<span class="lf-tier-dash">\u2013</span>' +
+            '<input type="number" class="form-input lf-tier-bmax" data-tier="' + i + '" value="' + (t.maxBoostPct != null ? t.maxBoostPct : 20) + '" min="0" max="500" step="1" title="Upper end of the boost over base for this tier (%)." />' +
+            '</span>' +
             '<input type="number" class="form-input lf-tier-slots" data-tier="' + i + '" value="' + (t.slots ? t.slots : '') + '" min="0" max="30" step="1" placeholder="auto" title="Fixed number of variants for this tier. Blank/0 = auto (shares Variants-per-Item with the other auto tiers)." />' +
             '<input type="number" class="form-input lf-tier-gold" data-tier="' + i + '" value="' + (t.goldBumpPct != null ? t.goldBumpPct : '') + '" min="0" max="10000" step="5" placeholder="curve" title="Gold price bump above base (%). Blank = legacy budget curve." />' +
             '<input type="number" class="form-input lf-tier-dps" data-tier="' + i + '" value="' + (t.dpsBumpPct != null ? t.dpsBumpPct : '') + '" min="0" max="500" step="0.5" placeholder="0" title="Weapon DAMAGE bump above base (%) — weapons only, speed unchanged." />' +
@@ -218,33 +238,81 @@ $(function () {
             '</div>';
     }
 
+    // The boss legendary sits on the SAME ladder as the naming tiers and is read in
+    // the same unit, so it gets a row here rather than a separate hardcoded budget
+    // you can't see. It is NOT a naming tier: the name comes from the boss/suffix
+    // rules, there is always exactly one per base item, and it only exists when the
+    // Boss Legendary checkbox is on — so name, pos, slots and remove are inert.
+    function legendaryRowHtml() {
+        var lo = (legendaryBand && legendaryBand.min != null) ? legendaryBand.min : 55;
+        var hi = (legendaryBand && legendaryBand.max != null) ? legendaryBand.max : 75;
+        var drop = (legendaryBand && legendaryBand.drop != null) ? legendaryBand.drop : 0.2;
+        return '<div class="lf-tier-row lf-tier-legendary" title="The boss legendary. Every knob that fits the ladder lives on this row.">' +
+            '<span class="lf-tier-legpos">\u2014</span>' +
+            '<span class="lf-tier-legname" title="Named from the boss, or from the melee/ranged/caster suffix below when the item drops from more than one creature."><i class="fa-solid fa-crown"></i> Boss Legendary</span>' +
+            '<span class="lf-tier-boost">' +
+            '<input type="number" class="form-input lf-tier-bmin lf-leg-bmin" value="' + lo + '" min="0" max="500" step="1" title="How much stronger than the base item the legendary rolls, as a % of the base stat budget \u2014 same unit as the tiers above." />' +
+            '<span class="lf-tier-dash">\u2013</span>' +
+            '<input type="number" class="form-input lf-tier-bmax lf-leg-bmax" value="' + hi + '" min="0" max="500" step="1" title="Upper end of the legendary boost over base (%)." />' +
+            '</span>' +
+            '<input type="number" class="form-input lf-tier-slots" value="1" disabled title="Always exactly one legendary per lootified base item - flagging it IS the slot." />' +
+            '<input type="number" class="form-input lf-tier-gold lf-leg-gold" min="0" max="10000" step="25" title="Legendary gold bump above base (%)." />' +
+            '<input type="number" class="form-input lf-tier-dps lf-leg-dps" min="0" max="500" step="0.5" title="Legendary weapon DAMAGE bump above base (%) \u2014 weapons only, speed unchanged." />' +
+            '<input type="number" class="form-input lf-tier-drop lf-leg-drop" value="' + drop + '" min="0.01" max="100" step="0.05" title="Effective drop %. Legendary only - naming tiers take their share from the base item original pool chance." />' +
+            '<span class="lf-tier-legtoggle" title="Include boss legendaries. Same switch as the old Boss Legendary checkbox."><input type="checkbox" class="lf-leg-on" /></span>' +
+            '</div>';
+    }
+
     function renderNamingTiers() {
         if (!ensureTierState()) return;
+        // Preserve an in-progress edit of the legendary band across a re-render
+        // (add/remove tier rebuilds the whole panel).
+        var $liveLeg = $('#' + activeTierContainer() + ' .lf-tier-legendary');
+        if ($liveLeg.length) {
+            var lm = parseFloat($liveLeg.find('.lf-leg-bmin').val());
+            var lx = parseFloat($liveLeg.find('.lf-leg-bmax').val());
+            var ld = parseFloat($liveLeg.find('.lf-leg-drop').val());
+            if (!isNaN(lm)) legendaryBand.min = lm;
+            if (!isNaN(lx)) legendaryBand.max = lx;
+            if (!isNaN(ld)) legendaryBand.drop = ld;
+        }
+        // Header cells are grid children in the SAME grid as every row, so they
+        // stay aligned no matter how the browser sizes the flexible name column.
         var head = '<div class="lf-tier-head">' +
-            '<span class="lf-tier-rangehead" title="Budget percentile window this tier rolls within">Range %</span>' +
-            '<span style="width:52px;">Pos</span>' +
-            '<span style="flex:1;">Tier name</span>' +
-            '<span style="width:48px;text-align:center;" title="Fixed count, or blank/0 for auto">Slots</span>' +
-            '<span style="width:50px;text-align:center;" title="Gold price bump above base (%). Blank = legacy curve.">Gold&nbsp;+%</span>' +
-            '<span style="width:48px;text-align:center;" title="Weapon damage bump above base (%) — weapons only, speed unchanged.">DPS&nbsp;+%</span>' +
-            '<span style="width:18px;"></span>' +
+            '<span>Pos</span>' +
+            '<span>Tier name</span>' +
+            '<span title="How much stronger than the base item this tier rolls, as a % of the base stat budget.">Boost&nbsp;%</span>' +
+            '<span title="Fixed count, or blank/0 for auto.">Slots</span>' +
+            '<span title="Gold price bump above base (%). Blank = legacy curve.">Gold&nbsp;+%</span>' +
+            '<span title="Weapon damage bump above base (%) - weapons only, speed unchanged.">DPS&nbsp;+%</span>' +
+            '<span title="Legendary only. Naming tiers inherit their share from the base item original pool chance.">Drop&nbsp;%</span>' +
+            '<span></span>' +
             '</div>';
         var h = head;
         tierState.forEach(function (t, i) { h += tierRowHtml(t, i); });
+        h += legendaryRowHtml();
         h += '<button type="button" class="btn-micro lf-tier-add" style="margin-top:6px;"><i class="fa-solid fa-plus"></i> Add tier</button>';
 
         $('#namingTiers').html(h);
         $('#batchNamingTiers').html(h.replace(/data-tier="/g, 'data-batch-tier="'));
+        syncLegendaryRow();
     }
 
     // Read the tier bands out of one panel's DOM (single or batch), in row order.
     function readTiersFromContainer(containerId) {
         var out = [];
-        $('#' + containerId + ' .lf-tier-row').each(function () {
+        $('#' + containerId + ' .lf-tier-row').not('.lf-tier-legendary').each(function () {
             var $r = $(this);
             var g = parseFloat($r.find('.lf-tier-gold').val());
             var d = parseFloat($r.find('.lf-tier-dps').val());
             var s = parseInt($r.find('.lf-tier-slots').val(), 10);
+            var bmin = parseFloat($r.find('.lf-tier-bmin').val());
+            var bmax = parseFloat($r.find('.lf-tier-bmax').val());
+            // Boost is the strength control now, so both bounds always go up. One
+            // blank is treated as 0 rather than dropping the tier to legacy mode.
+            if (isNaN(bmin) && isNaN(bmax)) { bmin = 0; bmax = 0; }
+            else if (isNaN(bmin)) bmin = bmax;
+            else if (isNaN(bmax)) bmax = bmin;
             out.push({
                 minPct: parseFloat($r.find('.lf-tier-min').val()) || 0,
                 maxPct: parseFloat($r.find('.lf-tier-max').val()) || 0,
@@ -252,7 +320,9 @@ $(function () {
                 label: $r.find('.lf-tier-input').val() || '',
                 slots: isNaN(s) ? 0 : Math.max(0, s),
                 goldBumpPct: isNaN(g) ? null : Math.max(0, g),
-                dpsBumpPct: isNaN(d) ? null : Math.max(0, d)
+                dpsBumpPct: isNaN(d) ? null : Math.max(0, d),
+                minBoostPct: Math.max(0, Math.min(bmin, bmax)),
+                maxBoostPct: Math.max(0, Math.max(bmin, bmax))
             });
         });
         return out;
@@ -266,7 +336,7 @@ $(function () {
     $(document).on('click', '.lf-tier-add', function () {
         var container = $(this).closest('#namingTiers, #batchNamingTiers').attr('id') || activeTierContainer();
         tierState = readTiersFromContainer(container);
-        tierState.push({ minPct: 0, maxPct: 100, label: 'New Tier', position: 'suffix', slots: 0, goldBumpPct: null, dpsBumpPct: null });
+        tierState.push({ minPct: 0, maxPct: 100, label: 'New Tier', position: 'suffix', slots: 0, goldBumpPct: null, dpsBumpPct: null, minBoostPct: 10, maxBoostPct: 20 });
         renderNamingTiers();
     });
 
@@ -289,12 +359,12 @@ $(function () {
         var budgetCeiling, variantsPerItem, allowNew, maxAffix;
         if (currentMode === 'batch') {
             budgetCeiling = parseFloat($('.lf-rs-shared[data-target="rsBudgetCeiling"]').val()) || 35;
-            variantsPerItem = parseInt($('.lf-rs-shared[data-target="rsVariantsPerItem"]').val()) || 10;
+            variantsPerItem = parseInt($('.lf-rs-shared[data-target="rsVariantsPerItem"]').val()) || 9;
             allowNew = $('.lf-rs-shared-check[data-target="rsAllowNewAffixes"]').is(':checked');
             maxAffix = parseInt($('.lf-rs-shared[data-target="rsMaxAffixChange"]').val()) || 1;
         } else {
             budgetCeiling = parseFloat($('#rsBudgetCeiling').val()) || 35;
-            variantsPerItem = parseInt($('#rsVariantsPerItem').val()) || 10;
+            variantsPerItem = parseInt($('#rsVariantsPerItem').val()) || 9;
             allowNew = $('#rsAllowNewAffixes').is(':checked');
             maxAffix = parseInt($('#rsMaxAffixChange').val()) || 1;
         }
@@ -315,9 +385,15 @@ $(function () {
             if (isNaN(v)) v = fallback;
             return Math.max(0, v);
         }
-        var goldScale = tune('rsGoldScale', 100);
         var legGold = tune('rsLegGold', 500);
         var legDps = tune('rsLegDps', 30);
+        // The legendary now has its own row in the band editor, so its strength is
+        // read from there in the same unit as every other tier.
+        var $legRow = $('#' + activeTierContainer() + ' .lf-tier-row.lf-tier-legendary');
+        var legBMin = parseFloat($legRow.find('.lf-tier-bmin').val());
+        var legBMax = parseFloat($legRow.find('.lf-tier-bmax').val());
+        if (isNaN(legBMin)) legBMin = 60;
+        if (isNaN(legBMax)) legBMax = 80;
 
         return {
             budgetCeilingPct: budgetCeiling,
@@ -326,9 +402,10 @@ $(function () {
             maxAffixCountChange: maxAffix,
             dropChanceStrategy: dropStrategy,
             poolDropChancePct: poolDropPct,
-            goldValueScalePct: goldScale,
             legendaryGoldBumpPct: legGold,
             legendaryDpsBumpPct: legDps,
+            legendaryBoostMinPct: Math.max(0, Math.min(legBMin, legBMax)),
+            legendaryBoostMaxPct: Math.max(0, Math.max(legBMin, legBMax)),
             namingTiers: tiers,
             // Legendary
             generateLegendary: currentMode === 'batch'
@@ -587,10 +664,10 @@ $(function () {
         var s = computeBatchSelection();
         // Read the variants-per-item from the field that actually drives the
         // commit in the current mode (batch has its own shared input; the
-        // single-mode #rsVariantsPerItem defaults to 10 and would mis-report).
+        // single-mode #rsVariantsPerItem defaults to 9 and would mis-report).
         var variantsPerItem = currentMode === 'batch'
-            ? (parseInt($('.lf-rs-shared[data-target="rsVariantsPerItem"]').val()) || 10)
-            : (parseInt($('#rsVariantsPerItem').val()) || 10);
+            ? (parseInt($('.lf-rs-shared[data-target="rsVariantsPerItem"]').val()) || 9)
+            : (parseInt($('#rsVariantsPerItem').val()) || 9);
 
         $('#previewInfo').text(s.distinct + ' unique items \u00b7 ' + s.pairs + ' placements across ' + s.creatures + ' creatures');
         $('#commitItemCount').text(s.distinct * variantsPerItem);
@@ -1041,6 +1118,12 @@ $(function () {
                         + (result.regenRemapped ? ', ' + result.regenRemapped + ' owned copies rerolled' : '')
                         + (result.regenRemoved ? ', ' + result.regenRemoved + ' removed' : '');
                     showToast(msg, 'success');
+                    // Weak bases can exhaust the distinct-stat-roll space, so fewer
+                    // variants land than were asked for. Say so instead of hiding it.
+                    if (result.variantsShort > 0) {
+                        showToast(result.variantsShort + ' variant slot(s) across ' + result.itemsShort +
+                            ' item(s) had no distinct stat roll left \u2014 those bases are too weak for that many tiers.', 'warning');
+                    }
                     if (result.warnings && result.warnings.length > 0) {
                         showToast(result.warnings.length + ' pool(s) exceeded floor capacity — ' + result.warnings[0], 'warning');
                     }
@@ -1136,10 +1219,27 @@ $(function () {
         return div.innerHTML;
     }
 
+    // Toasts go into one fixed stack rather than each pinning itself to the same
+    // bottom-right corner — a commit that also returns pool warnings fires two, and
+    // they used to land on top of each other and make both unreadable.
+    function toastStack() {
+        var $s = $('#lfToastStack');
+        if (!$s.length) $s = $('<div id="lfToastStack" class="lf-toast-stack"></div>').appendTo('body');
+        return $s;
+    }
+
     function showToast(msg, type) {
-        var el = $('<div class="lf-toast ' + type + '">' + esc(msg) + '</div>');
-        $('body').append(el);
-        setTimeout(function () { el.fadeOut(300, function () { el.remove(); }); }, 4000);
+        var $stack = toastStack();
+        // Newest first (column-reverse), and never more than 3 on screen.
+        var el = $('<div class="lf-toast ' + (type || '') + '">' + esc(msg) + '</div>');
+        $stack.append(el);
+        $stack.children('.lf-toast').slice(0, -3).remove();
+        setTimeout(function () {
+            el.fadeOut(300, function () {
+                el.remove();
+                if (!$stack.children().length) $stack.remove();
+            });
+        }, 4000);
     }
 
     function updateGenerateButton() {
@@ -1162,6 +1262,7 @@ $(function () {
         }
 
         items.forEach(function (item) {
+            if (item.isGenerated === true) return; // lootifier output, not a base
             if (item.totalStats > 0 || item.hasSpellEffects) {
                 var qualName = QUALITY_NAMES[item.quality] || '';
                 sel.append('<option value="' + item.itemEntry + '">' + esc(item.itemName) + ' (' + qualName + ')</option>');
@@ -1271,20 +1372,60 @@ $(function () {
     $('#btnViewStatus').on('click', showStatus);
 
     // Legendary toggle show/hide
-    $('#rsLegendaryToggle').on('change', function () {
-        $('#legendaryConfig').toggle($(this).is(':checked'));
+    // The legendary row is the single source of truth for everything that fits on
+    // the ladder: boost, drop %, gold, dps and the on/off switch. The old duplicate
+    // fields (Legendary Gold/DPS in Value Tuning, Effective Drop % and the checkbox
+    // in the Boss Legendary block) are now hidden inputs that simply follow the row,
+    // so collectRuleset and any existing handler keep working unchanged.
+    function pushLegendaryToHidden($row) {
+        function push(sel, id) {
+            var v = $row.find(sel).val();
+            if (v === undefined) return;
+            $('#' + id).val(v);
+            $('.lf-rs-shared[data-target="' + id + '"]').val(v);
+        }
+        push('.lf-leg-gold', 'rsLegGold');
+        push('.lf-leg-dps', 'rsLegDps');
+        var d = $row.find('.lf-leg-drop').val();
+        if (d !== undefined) { $('#rsLegendaryDropPct').val(d); $('.lf-batch-leg-drop').val(d); }
+        var on = $row.find('.lf-leg-on').is(':checked');
+        $('#rsLegendaryToggle').prop('checked', on);
+        $('.lf-batch-legendary-toggle').prop('checked', on);
+    }
+
+    function syncLegendaryRow() {
+        var gold = $('#rsLegGold').val();
+        var dps = $('#rsLegDps').val();
+        var on = $('#rsLegendaryToggle').is(':checked') || $('.lf-batch-legendary-toggle').is(':checked');
+        $('.lf-leg-gold').each(function () { if ($(this).val() !== gold) $(this).val(gold); });
+        $('.lf-leg-dps').each(function () { if ($(this).val() !== dps) $(this).val(dps); });
+        $('.lf-leg-on').prop('checked', on);
+        // Dim when off, but never disable: the operator must be able to set the
+        // numbers up before switching it on.
+        $('.lf-tier-legendary').toggleClass('lf-tier-off', !on);
+    }
+
+    $(document).on('input change', '.lf-tier-legendary input', function () {
+        pushLegendaryToHidden($(this).closest('.lf-tier-legendary'));
+        syncLegendaryRow();
     });
-    $(document).on('change', '.lf-batch-legendary-toggle', function () {
-        $('.lf-batch-legendary-config').toggle($(this).is(':checked'));
+    $(document).on('change', '#rsLegendaryToggle, .lf-batch-legendary-toggle', syncLegendaryRow);
+
+    // Suffix block visibility follows the legendary switch wherever it is set.
+    $(document).on('change', '#rsLegendaryToggle, .lf-batch-legendary-toggle, .lf-leg-on', function () {
+        var on = $('#rsLegendaryToggle').is(':checked') || $('.lf-batch-legendary-toggle').is(':checked');
+        $('#legendaryConfig').toggle(on);
+        $('.lf-batch-legendary-config').toggle(on);
     });
 
     // Reset ruleset
     $('#btnResetRuleset').on('click', function () {
         $('#rsBudgetCeiling').val(35);
-        $('#rsVariantsPerItem').val(10);
+        $('#rsVariantsPerItem').val(9);
         $('#rsAllowNewAffixes').prop('checked', true);
         $('#rsMaxAffixChange').val(1);
-        tierState = null;   // rebuild the tier bands from meta defaults
+        tierState = null;       // rebuild the tier bands from meta defaults
+        legendaryBand = null;   // ...and the legendary band with them
         renderNamingTiers();
     });
 

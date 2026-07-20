@@ -97,15 +97,28 @@ public class ItemsController : Controller
 
     public IActionResult Index() => View();
 
-    // ===================== SEARCH (existing, unchanged) =====================
+    // ===================== SEARCH =====================
 
     /// <summary>
-    /// GET /Items/Search?q=sword&classFilter=2&qualityFilter=4&page=1&pageSize=50
+    /// GET /Items/Search
+    ///   q                 name substring, or an exact entry id if numeric
+    ///   classFilter       item_template.class
+    ///   subclassFilter    item_template.subclass  (weapon type / armor material)
+    ///   qualityFilter     item_template.quality
+    ///   inventoryTypeFilter   equip slot
+    ///   minLevel/maxLevel     required_level range
+    ///   minItemLevel/maxItemLevel  item_level range
+    ///   customOnly        true = only entries in the custom range (900000+)
+    ///   hasDisplay        true = only rows with a display_id (things with a visual)
+    ///   sort              entry | name | quality | itemLevel | requiredLevel | dps
+    ///   dir               asc | desc
     /// Server-side search with pagination.
     /// </summary>
     [HttpGet]
     public async Task<IActionResult> Search(string? q, int? classFilter, int? subclassFilter,
         int? qualityFilter, int? inventoryTypeFilter, int? minLevel, int? maxLevel,
+        int? minItemLevel, int? maxItemLevel, bool? customOnly, bool? hasDisplay,
+        string? sort = null, string? dir = null,
         int page = 1, int pageSize = 50)
     {
         using var conn = _db.Mangos();
@@ -163,6 +176,43 @@ public class ItemsController : Controller
             parameters.Add("MaxLevel", maxLevel.Value);
         }
 
+        if (minItemLevel.HasValue)
+        {
+            where += " AND item_level >= @MinIlvl";
+            parameters.Add("MinIlvl", minItemLevel.Value);
+        }
+
+        if (maxItemLevel.HasValue)
+        {
+            where += " AND item_level <= @MaxIlvl";
+            parameters.Add("MaxIlvl", maxItemLevel.Value);
+        }
+
+        if (customOnly == true)
+        {
+            where += " AND entry >= @CustomStart";
+            parameters.Add("CustomStart", CUSTOM_RANGE_START);
+        }
+
+        if (hasDisplay == true)
+            where += " AND display_id > 0";
+
+        // Sort. Whitelisted — never interpolate a caller string into ORDER BY.
+        var sortColumn = (sort ?? "entry").ToLowerInvariant() switch
+        {
+            "name" => "name",
+            "quality" => "quality",
+            "itemlevel" => "item_level",
+            "requiredlevel" => "required_level",
+            // Average weapon damage over swing speed. delay 0 would divide by
+            // zero, so non-weapons fall to the bottom via the NULLIF guard.
+            "dps" => "((dmg_min1 + dmg_max1) / 2) / (NULLIF(delay, 0) / 1000)",
+            _ => "entry"
+        };
+        var sortDir = string.Equals(dir, "desc", StringComparison.OrdinalIgnoreCase) ? "DESC" : "ASC";
+        // Stable tiebreak so pagination can't repeat or drop rows.
+        var orderBy = sortColumn == "entry" ? $"entry {sortDir}" : $"{sortColumn} {sortDir}, entry ASC";
+
         var countSql = $"SELECT COUNT(*) FROM item_template {where}";
         var totalCount = await conn.ExecuteScalarAsync<int>(countSql, parameters);
 
@@ -186,7 +236,7 @@ public class ItemsController : Controller
                    spellid_1 AS spellId1, spelltrigger_1 AS spellTrigger1,
                    spellid_2 AS spellId2, spelltrigger_2 AS spellTrigger2
             FROM item_template {where}
-            ORDER BY entry ASC
+            ORDER BY {orderBy}
             LIMIT @PageSize OFFSET @Offset";
 
         var items = (await conn.QueryAsync<dynamic>(dataSql, parameters)).ToList();
@@ -206,8 +256,55 @@ public class ItemsController : Controller
             totalCount,
             page,
             pageSize,
-            totalPages = (int)Math.Ceiling((double)totalCount / pageSize)
+            totalPages = (int)Math.Ceiling((double)totalCount / pageSize),
+            sort = sortColumn,
+            dir = sortDir
         });
+    }
+
+    // ===================== SOURCES (where does this item come from?) =========
+
+    /// <summary>
+    /// GET /Items/Sources?entry=19019
+    /// Every known way to obtain the item: creature kills (including loot behind
+    /// reference tables — most dungeon and raid drops), skinning, pickpocketing,
+    /// chests and gathering nodes, container items, disenchanting, vendors,
+    /// quests (reward, choice, objective, and items that start one), and crafting.
+    ///
+    /// Probes that fail on this schema are reported in `notes` rather than
+    /// swallowed, so a missing source class is visible instead of looking like
+    /// an item with no sources.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> Sources(int entry)
+    {
+        if (entry <= 0) return Json(new { success = false, error = "entry required" });
+
+        using var conn = _db.Mangos();
+        try
+        {
+            var result = await ItemSourceResolver.ResolveAsync(conn, entry);
+            return Json(new
+            {
+                success = result.Success,
+                entry = result.Entry,
+                totalCount = result.TotalCount,
+                creatures = result.Creatures,
+                objects = result.Objects,
+                containers = result.Containers,
+                vendors = result.Vendors,
+                quests = result.Quests,
+                crafted = result.Crafted,
+                disenchant = result.Disenchant,
+                other = result.Other,
+                notes = result.Notes
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Items/Sources failed for entry {Entry}", entry);
+            return Json(new { success = false, error = ex.Message });
+        }
     }
 
     // ===================== DETAIL (existing, unchanged) =====================
@@ -3454,7 +3551,7 @@ public class ItemsController : Controller
         var results = paged.Select(kv => new
         {
             iconName = kv.Key,
-            iconPath = $"/icons/{kv.Key}.png",
+            iconPath = $"/Icon/Get?name={kv.Key}",
             displayIds = kv.Value
         });
 
@@ -4321,9 +4418,7 @@ public class ItemsController : Controller
         // Decode BLP → PNG
         try
         {
-            using var blpStream = new MemoryStream(blpBytes);
-            var blpFile = new War3Net.Drawing.Blp.BlpFile(blpStream);
-            var pixels = blpFile.GetPixels(0, out int w, out int h);
+            var pixels = BlpDecoder.GetPixels(blpBytes, 0, out int w, out int h);
             if (w == 0 || h == 0) return NotFound(new { error = "BLP decoded to 0×0" });
 
             using var bmp = new SkiaSharp.SKBitmap(w, h, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Unpremul);

@@ -1,5 +1,4 @@
 using SkiaSharp;
-using War3Net.Drawing.Blp;
 
 namespace MangosSuperUI.Services;
 
@@ -249,9 +248,7 @@ public class CharacterSkinCompositor
     {
         try
         {
-            using var ms = new MemoryStream(blpData);
-            var blp = new BlpFile(ms);
-            var pixels = blp.GetPixels(0, out int w, out int h);
+            var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
             if (w == 0 || h == 0 || pixels.Length == 0) return null;
 
             var bmp = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);

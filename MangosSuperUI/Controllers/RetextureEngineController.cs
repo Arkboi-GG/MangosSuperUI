@@ -2,16 +2,42 @@
 //
 // Backend for the Retexture Engine section. A NEW, parallel controller — it does
 // NOT touch ItemsController. Retexture LOGIC stays in C# (PaletteSwapService);
-// this controller only exposes the seeded theory + tier + VALUE knobs to the new
-// UI (retextureengine.js). Item browse, the batch queue, viewer-preview and
-// commit reuse the proven /Items/ routes for now.
+// this controller exposes the seeded theory + tier + VALUE knobs, the item
+// browse, and — as of this revision — the lootifier QUEUE, which the section
+// used to borrow from /Items/.
+//
+// WHY THE QUEUE MOVED HERE
+// ------------------------
+// The /Items/ queue endpoints know nothing about `source`, so the section could
+// BUILD a queue for one lootifier but never RUN, RESET or UNDO one — and every
+// re-run minted a fresh display id while orphaning the previous one inside
+// patch-4.MPQ, which is why re-running looked like it ADDED and never undid.
+// The versions here are all source-scoped and come with a real revert.
+// ItemsController's copies stay where they are, untouched, for the old Items UI.
 //
 // Endpoints:
-//   GET /RetextureEngine           -> the section view (Index)
-//   GET /RetextureEngine/Preview   -> one cell, full knobs (theory+tier+value) -> PNG url  [live tuning]
-//   GET /RetextureEngine/Sheet     -> theory x tier contact sheet, value-aware -> PNG url  [survey]
+//   GET  /RetextureEngine             -> the section view (Index)
+//   GET  /RetextureEngine/Preview     -> one cell, full knobs -> PNG url  [live tuning]
+//   GET  /RetextureEngine/Sheet       -> theory x tier contact sheet, value-aware
+//   GET  /RetextureEngine/PreviewOnModel -> recolored atlas slots or baked GLB
+//   POST /RetextureEngine/RetextureSelection -> ad-hoc selection, one tier or all
+//   GET  /RetextureEngine/Browse | /GeneratedEntries | /BaseVariants
+//        | /ItemSources | /SourceTexture
 //
-// Value knobs (query): value=keep|invert, vSigma, vDetail, vKnee, vFloor,
+//   -- lootifier queue; every verb takes an optional `source` --
+//   -- ("quest" | "crafting" | "loot"), omitted = all sources --
+//   GET  /RetextureEngine/Sources      -> per-lootifier counts for the panel
+//   POST /RetextureEngine/BuildQueue   -> { sources:[], requeue? }
+//   GET  /RetextureEngine/QueueStatus  -> ?source=
+//   POST /RetextureEngine/ProcessQueue -> { max, source?, theory, value, v* }
+//   POST /RetextureEngine/ResetQueue   -> { source?, mode: failed|all|clear }
+//   POST /RetextureEngine/RevertQueue  -> { source?, requeue? }   <- the undo
+//   POST /RetextureEngine/PurgeOrphans -> { apply? }
+//   POST /RetextureEngine/RebuildPatch
+//   GET  /RetextureEngine/PatchStatus
+//   GET  /RetextureEngine/DownloadPatch  -> the archive itself
+//
+// Value knobs (query or body): value=keep|invert, vSigma, vDetail, vKnee, vFloor,
 // vBlend, vAlpha, vScale. Omitted knobs fall back to the spec defaults.
 
 using System.Text.Json;
@@ -237,15 +263,182 @@ public class RetextureEngineController : Controller
         return Json(new { success = false, error = "no atlas slots and no recolorable model texture for this display" });
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  LOOTIFIER QUEUE
+    //
+    //  Every verb takes an optional `source` ("quest" | "crafting" | "loot");
+    //  omitted or unrecognised means all sources. That single parameter is what
+    //  makes "re-retexture only the ARPG items" expressible.
+    //
+    //  The three that did not exist before:
+    //    ResetQueue  mode=all   re-arm done rows            -> re-retexture
+    //    RevertQueue             base_display_id restored   -> the actual undo
+    //    PurgeOrphans            drop unreferenced displays -> shrink the patch
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// <summary>GET /RetextureEngine/Sources — per-lootifier counts for the batch panel.</summary>
+    [HttpGet]
+    public async Task<IActionResult> Sources()
+    {
+        try { return Json(await _support.LootifierSourcesAsync()); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/Sources failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>POST /RetextureEngine/BuildQueue — one job per (base x tier) for the
+    /// selected sources. Body: { sources:["loot"], requeue?: bool }.</summary>
+    [HttpPost]
+    public async Task<IActionResult> BuildQueue([FromBody] JsonElement body)
+    {
+        var sources = new List<string>();
+        if (body.ValueKind == JsonValueKind.Object
+            && body.TryGetProperty("sources", out var sEl) && sEl.ValueKind == JsonValueKind.Array)
+            foreach (var s in sEl.EnumerateArray())
+            {
+                var v = s.GetString();
+                if (!string.IsNullOrWhiteSpace(v)) sources.Add(v!);
+            }
+
+        bool requeue = body.ValueKind == JsonValueKind.Object
+                       && body.TryGetProperty("requeue", out var rq) && rq.ValueKind == JsonValueKind.True;
+
+        try { return Json(await _support.BuildQueueAsync(sources, requeue)); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/BuildQueue failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>GET /RetextureEngine/QueueStatus?source= — counts + recent failures.</summary>
+    [HttpGet]
+    public async Task<IActionResult> QueueStatus(string? source = null)
+    {
+        try { return Json(await _support.QueueStatusAsync(source)); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/QueueStatus failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
     /// <summary>POST /RetextureEngine/ProcessQueue — drain the lootifier retexture
-    /// queue under the CHOSEN theory + value. Body: { max, theory, value, vSigma... }.</summary>
+    /// queue under the CHOSEN theory + value, optionally scoped to ONE lootifier.
+    /// Body: { max, source?, theory, value, vSigma... }.</summary>
     [HttpPost]
     public async Task<IActionResult> ProcessQueue([FromBody] JsonElement body)
     {
         int max = body.ValueKind == JsonValueKind.Object
                   && body.TryGetProperty("max", out var m) && m.TryGetInt32(out var mv) ? Math.Clamp(mv, 1, 25) : 3;
-        var res = await _support.ProcessQueueAsync(TheoryFromBody(body), ValueFromBody(body), max, HttpContext.RequestAborted);
+        var res = await _support.ProcessQueueAsync(
+            TheoryFromBody(body), ValueFromBody(body), max, SourceFromBody(body), HttpContext.RequestAborted);
         return Json(res);
+    }
+
+    /// <summary>POST /RetextureEngine/ResetQueue — Body: { source?, mode }.
+    ///
+    ///   failed  requeue this source's failures (the old Reset behaviour).
+    ///   all     re-arm every done/failed/reverted row — RE-RETEXTURE. Keeps
+    ///           new_display_id, so the drain recycles the display it minted last
+    ///           time instead of orphaning it.
+    ///   clear   delete the rows. Applied retextures STAY applied; clearing the
+    ///           queue is NOT an undo. RevertQueue is the undo.</summary>
+    [HttpPost]
+    public async Task<IActionResult> ResetQueue([FromBody] JsonElement body)
+    {
+        string mode = body.ValueKind == JsonValueKind.Object
+                      && body.TryGetProperty("mode", out var md) && md.ValueKind == JsonValueKind.String
+            ? (md.GetString() ?? "failed") : "failed";
+
+        try { return Json(await _support.ResetQueueAsync(SourceFromBody(body), mode)); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/ResetQueue failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>POST /RetextureEngine/RevertQueue — put this source's variants back on
+    /// their ORIGINAL display (base_display_id), delete the displays minted for them,
+    /// rebuild patch-4.MPQ. Body: { source?, requeue?: bool } — requeue leaves the rows
+    /// pending so you can run again from clean.</summary>
+    [HttpPost]
+    public async Task<IActionResult> RevertQueue([FromBody] JsonElement body)
+    {
+        bool requeue = body.ValueKind == JsonValueKind.Object
+                       && body.TryGetProperty("requeue", out var rq) && rq.ValueKind == JsonValueKind.True;
+
+        try { return Json(await _support.RevertQueueAsync(SourceFromBody(body), requeue)); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/RevertQueue failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>POST /RetextureEngine/PurgeOrphans — minted displays nothing points at
+    /// any more (re-run debris, rolled-back lootifier items). Body: { apply?: bool },
+    /// default false = dry run.</summary>
+    [HttpPost]
+    public async Task<IActionResult> PurgeOrphans([FromBody] JsonElement body)
+    {
+        bool apply = body.ValueKind == JsonValueKind.Object
+                     && body.TryGetProperty("apply", out var a) && a.ValueKind == JsonValueKind.True;
+
+        try { return Json(await _support.PurgeOrphansAsync(apply)); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/PurgeOrphans failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// GET|HEAD /RetextureEngine/DownloadPatch[?file=patch-4.MPQ]
+    /// Hand over the archive this section builds. wwwroot is ephemeral, so a GET
+    /// for the current patch rebuilds it from the DB when the file is missing —
+    /// a HEAD probe does not. Deploying to the REAL client is still a manual copy
+    /// into C:\WoW Vanilla\Data\; the WSL folder the rebuild auto-copies to is
+    /// not what the game reads.
+    /// </summary>
+    [HttpGet]
+    [HttpHead]
+    public async Task<IActionResult> DownloadPatch(string? file = null)
+    {
+        bool build = string.Equals(Request.Method, "GET", StringComparison.OrdinalIgnoreCase);
+        var (path, name, err) = await _support.EnsurePatchFileAsync(file, build);
+        if (path == null) return NotFound(err);
+        return PhysicalFile(path, "application/octet-stream", name);
+    }
+
+    /// <summary>GET /RetextureEngine/PatchStatus — can a patch be produced, and
+    /// what is on disk right now (size / build time for the download button).</summary>
+    [HttpGet]
+    public async Task<IActionResult> PatchStatus()
+    {
+        try { return Json(await _support.PatchStatusAsync()); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/PatchStatus failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>POST /RetextureEngine/RebuildPatch — force a patch-4.MPQ rebuild from
+    /// the retexture tables. The drain does this automatically when the queue empties;
+    /// this is the escape hatch after an interrupted run.</summary>
+    [HttpPost]
+    public async Task<IActionResult> RebuildPatch()
+    {
+        try { return Json(await _support.RebuildPatchAsync()); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/RebuildPatch failed");
+            return Json(new { success = false, error = ex.Message });
+        }
     }
 
     /// <summary>POST /RetextureEngine/RetextureSelection — retexture an ad-hoc
@@ -285,6 +478,12 @@ public class RetextureEngineController : Controller
         return Array.IndexOf(PaletteSwapService.RecolorTheories, theory) >= 0 ? theory : "fan";
     }
 
+    /// <summary>"quest" | "crafting" | "loot"; anything else (or absent) = all sources.</summary>
+    private static string? SourceFromBody(JsonElement body) =>
+        body.ValueKind == JsonValueKind.Object
+        && body.TryGetProperty("source", out var s) && s.ValueKind == JsonValueKind.String
+            ? RetextureSupport.NormalizeSource(s.GetString()) : null;
+
     private static ValueSettings ValueFromBody(JsonElement body)
     {
         if (body.ValueKind != JsonValueKind.Object) return ValueSettings.Keep;
@@ -296,6 +495,33 @@ public class RetextureEngineController : Controller
             ? (e.ValueKind == JsonValueKind.True ? true : e.ValueKind == JsonValueKind.False ? false : d) : d;
         return ValueSettings.Invert(F("vSigma", 2.5f), F("vDetail", 1.0f), F("vKnee", 0.40f), F("vFloor", 0.25f),
             F("vBlend", 1.0f), I("vAlpha", 16), B("vScale", true));
+    }
+
+    /// <summary>
+    /// GET /RetextureEngine/Browse — the item list, filtered ENTIRELY server-side.
+    ///
+    /// Replaces the old "call /Items/Search then throw rows away in JS" pattern,
+    /// which paginated before filtering and so produced empty pages that the
+    /// pager still counted. Here totalCount/totalPages describe exactly the rows
+    /// that render, and `page` comes back clamped to the real range.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> Browse(
+        string? q, int? classFilter, int? subclassFilter, int? qualityFilter,
+        int? inventoryTypeFilter, int? minLevel, int? maxLevel,
+        bool retexOnly = true, int page = 1, int pageSize = 40)
+    {
+        try
+        {
+            return Json(await _support.BrowseAsync(
+                q, classFilter, subclassFilter, qualityFilter,
+                inventoryTypeFilter, minLevel, maxLevel, retexOnly, page, pageSize));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "RetextureEngine/Browse failed");
+            return Json(new { success = false, error = ex.Message });
+        }
     }
 
     /// <summary>GET /RetextureEngine/GeneratedEntries — ids the UI hides so browse lists bases.</summary>

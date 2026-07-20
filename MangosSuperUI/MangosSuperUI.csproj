@@ -20,8 +20,6 @@
 		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
 		<PackageReference Include="SkiaSharp" Version="3.119.2" />
 		<PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.119.2" />
-		<PackageReference Include="War3Net.Drawing.Blp" Version="6.0.2" />
-		<PackageReference Include="War3Net.IO.Mpq" Version="6.0.2" />
 	</ItemGroup>
 
 	<!-- Native StormLib binaries. Auto-discovered by .NET 8's DllImport

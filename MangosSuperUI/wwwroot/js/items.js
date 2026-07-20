@@ -137,17 +137,192 @@ $(function () {
 
     // ===================== SEARCH =====================
 
+    // ── Filter state ────────────────────────────────────────────────────────
+    //
+    // Every control here maps to a parameter /Items/Search understands, so all
+    // filtering is server-side and correct across pagination. Filter state is
+    // persisted, because losing your filters on every reload is the single most
+    // annoying thing a browse page can do.
+
+    var FILTER_KEY = 'msui_items_filters';
+
+    // Combined weapon-type / armor-material dropdown. Value is "class:subclass",
+    // so one pick implies both — no class -> subclass cascade to fight with, and
+    // "Dagger" or "Plate" is a single choice rather than two.
+    var TYPE_OPTIONS = [
+        ['2:0', 'Axe (One-Hand)'], ['2:1', 'Axe (Two-Hand)'], ['2:2', 'Bow'],
+        ['2:3', 'Gun'], ['2:4', 'Mace (One-Hand)'], ['2:5', 'Mace (Two-Hand)'],
+        ['2:6', 'Polearm'], ['2:7', 'Sword (One-Hand)'], ['2:8', 'Sword (Two-Hand)'],
+        ['2:10', 'Staff'], ['2:13', 'Fist Weapon'], ['2:14', 'Miscellaneous'],
+        ['2:15', 'Dagger'], ['2:16', 'Thrown'], ['2:17', 'Spear'],
+        ['2:18', 'Crossbow'], ['2:19', 'Wand'], ['2:20', 'Fishing Pole'],
+        ['4:0', 'Misc (Armor)'], ['4:1', 'Cloth'], ['4:2', 'Leather'],
+        ['4:3', 'Mail'], ['4:4', 'Plate'], ['4:6', 'Shield'],
+        ['4:7', 'Libram'], ['4:8', 'Idol'], ['4:9', 'Totem']
+    ];
+
+    function buildTypeFilter() {
+        var h = '<option value="">All types</option>';
+        TYPE_OPTIONS.forEach(function (o) {
+            h += '<option value="' + o[0] + '">' + esc(o[1]) + '</option>';
+        });
+        $('#filterType').html(h);
+    }
+
+    // Reads the controls into the exact parameter shape /Items/Search wants.
+    function readFilters() {
+        var f = {};
+
+        var q = ($('#itemSearch').val() || '').trim();
+        if (q) f.q = q;
+
+        // Type wins over Class: it already carries a class of its own.
+        var type = $('#filterType').val();
+        if (type) {
+            var parts = type.split(':');
+            f.classFilter = parts[0];
+            f.subclassFilter = parts[1];
+        } else {
+            var c = $('#filterClass').val();
+            if (c !== '' && c != null) f.classFilter = c;
+        }
+
+        function pick(sel, key) {
+            var v = $(sel).val();
+            if (v !== '' && v != null) f[key] = v;
+        }
+        pick('#filterSlot', 'inventoryTypeFilter');
+        pick('#filterQuality', 'qualityFilter');
+        pick('#filterMinLvl', 'minLevel');
+        pick('#filterMaxLvl', 'maxLevel');
+        pick('#filterMinIlvl', 'minItemLevel');
+        pick('#filterMaxIlvl', 'maxItemLevel');
+
+        if ($('#filterCustomOnly').is(':checked')) f.customOnly = true;
+        if ($('#filterHasDisplay').is(':checked')) f.hasDisplay = true;
+
+        f.sort = $('#filterSort').val() || 'entry';
+        f.dir = $('#filterDir').val() || 'asc';
+        return f;
+    }
+
+    function saveFilters() {
+        try { localStorage.setItem(FILTER_KEY, JSON.stringify(readFilters())); } catch (e) { }
+    }
+
+    function restoreFilters() {
+        var f = null;
+        try { f = JSON.parse(localStorage.getItem(FILTER_KEY) || 'null'); } catch (e) { }
+        if (!f) return false;
+
+        if (f.q) $('#itemSearch').val(f.q);
+        // A stored class+subclass pair round-trips back into the type dropdown.
+        if (f.subclassFilter != null && f.classFilter != null) {
+            $('#filterType').val(f.classFilter + ':' + f.subclassFilter);
+            if (!$('#filterType').val()) $('#filterClass').val(f.classFilter);
+        } else if (f.classFilter != null) {
+            $('#filterClass').val(f.classFilter);
+        }
+        if (f.inventoryTypeFilter != null) $('#filterSlot').val(f.inventoryTypeFilter);
+        if (f.qualityFilter != null) $('#filterQuality').val(f.qualityFilter);
+        if (f.minLevel != null) $('#filterMinLvl').val(f.minLevel);
+        if (f.maxLevel != null) $('#filterMaxLvl').val(f.maxLevel);
+        if (f.minItemLevel != null) $('#filterMinIlvl').val(f.minItemLevel);
+        if (f.maxItemLevel != null) $('#filterMaxIlvl').val(f.maxItemLevel);
+        $('#filterCustomOnly').prop('checked', !!f.customOnly);
+        $('#filterHasDisplay').prop('checked', !!f.hasDisplay);
+        if (f.sort) $('#filterSort').val(f.sort);
+        if (f.dir) $('#filterDir').val(f.dir);
+
+        // Any active filter means the advanced row was probably in use.
+        return true;
+    }
+
+    function clearFilters() {
+        $('#itemSearch').val('');
+        $('#filterClass, #filterType, #filterSlot, #filterQuality').val('');
+        $('#filterMinLvl, #filterMaxLvl, #filterMinIlvl, #filterMaxIlvl').val('');
+        $('#filterCustomOnly, #filterHasDisplay').prop('checked', false);
+        $('#filterSort').val('entry');
+        $('#filterDir').val('asc');
+        try { localStorage.removeItem(FILTER_KEY); } catch (e) { }
+        doSearch(1);
+    }
+
+    // A one-line summary of what's actually narrowing the list, each chip
+    // clickable to drop that one filter.
+    var SORT_LABELS = {
+        entry: 'Entry', name: 'Name', quality: 'Quality',
+        itemLevel: 'Item level', requiredLevel: 'Req level', dps: 'DPS'
+    };
+
+    function renderFilterChips() {
+        var chips = [];
+        function chip(label, targets) { chips.push({ label: label, targets: targets }); }
+
+        var q = ($('#itemSearch').val() || '').trim();
+        if (q) chip('"' + q + '"', ['#itemSearch']);
+
+        var type = $('#filterType').val();
+        if (type) {
+            var name = $('#filterType option:selected').text();
+            chip(name, ['#filterType']);
+        } else if ($('#filterClass').val()) {
+            chip($('#filterClass option:selected').text(), ['#filterClass']);
+        }
+        if ($('#filterSlot').val()) chip($('#filterSlot option:selected').text(), ['#filterSlot']);
+        if ($('#filterQuality').val()) chip($('#filterQuality option:selected').text(), ['#filterQuality']);
+
+        var lo = $('#filterMinLvl').val(), hi = $('#filterMaxLvl').val();
+        if (lo || hi) chip('Req lvl ' + (lo || '0') + '–' + (hi || '∞'), ['#filterMinLvl', '#filterMaxLvl']);
+
+        var ilo = $('#filterMinIlvl').val(), ihi = $('#filterMaxIlvl').val();
+        if (ilo || ihi) chip('Item lvl ' + (ilo || '0') + '–' + (ihi || '∞'), ['#filterMinIlvl', '#filterMaxIlvl']);
+
+        if ($('#filterCustomOnly').is(':checked')) chip('Custom only', ['#filterCustomOnly']);
+        if ($('#filterHasDisplay').is(':checked')) chip('Has display', ['#filterHasDisplay']);
+
+        var sort = $('#filterSort').val(), dir = $('#filterDir').val();
+        if (sort !== 'entry' || dir !== 'asc')
+            chip('Sort: ' + (SORT_LABELS[sort] || sort) + (dir === 'desc' ? ' ↓' : ' ↑'), null);
+
+        var $wrap = $('#itemFilterChips');
+        if (chips.length === 0) { $wrap.empty().hide(); return; }
+
+        var html = '';
+        chips.forEach(function (c, i) {
+            html += '<span class="filter-chip" data-chip="' + i + '">' + esc(c.label) +
+                (c.targets ? ' <i class="fa-solid fa-xmark"></i>' : '') + '</span>';
+        });
+        html += '<button type="button" class="filter-chip filter-chip-clear" id="btnClearFiltersChip">Clear all</button>';
+        $wrap.html(html).show();
+
+        $wrap.find('.filter-chip[data-chip]').each(function () {
+            var c = chips[parseInt($(this).data('chip'), 10)];
+            if (!c.targets) return;
+            $(this).on('click', function () {
+                c.targets.forEach(function (t) {
+                    var $t = $(t);
+                    if ($t.is(':checkbox')) $t.prop('checked', false); else $t.val('');
+                });
+                doSearch(1);
+            });
+        });
+        $('#btnClearFiltersChip').on('click', clearFilters);
+    }
+
     function doSearch(page) {
         currentPage = page || 1;
-        var params = {
-            q: $('#itemSearch').val(),
-            classFilter: $('#filterClass').val() || undefined,
-            qualityFilter: $('#filterQuality').val() || undefined,
-            inventoryTypeFilter: $('#filterSlot').val() || undefined,
-            page: currentPage,
-            pageSize: currentPageSize
-        };
-        Object.keys(params).forEach(function (k) { if (params[k] === undefined || params[k] === '') delete params[k]; });
+
+        var params = readFilters();
+        params.page = currentPage;
+        params.pageSize = currentPageSize;
+        Object.keys(params).forEach(function (k) {
+            if (params[k] === undefined || params[k] === '') delete params[k];
+        });
+
+        saveFilters();
+        renderFilterChips();
 
         $('#itemListContainer').html('<div class="text-center p-4"><i class="fa-solid fa-spinner fa-spin"></i> Searching...</div>');
 
@@ -158,19 +333,29 @@ $(function () {
             $('#resultInfo').text('Showing ' + data.items.length + ' of ' + data.totalCount.toLocaleString());
 
             if (data.items.length === 0) {
-                $('#itemListContainer').html('<div class="text-center p-4 text-muted">No items found</div>');
+                $('#itemListContainer').html('<div class="text-center p-4 text-muted">No items match these filters</div>');
                 $('#paginationBar').hide();
                 return;
             }
 
             var html = '';
             data.items.forEach(function (item) {
-                var iconPath = currentIcons[item.displayId] || '/icons/inv_misc_questionmark.png';
+                var iconPath = currentIcons[item.displayId] || '/Icon/Get?name=inv_misc_questionmark';
                 var qualityClass = 'quality-' + (item.quality || 0);
                 var slot = SLOT_NAMES[item.inventoryType] || '';
                 var cls = CLASS_NAMES[item.class] || '';
                 var isCustom = item.entry >= CUSTOM_RANGE_START;
-                var meta = [cls, slot, item.requiredLevel > 1 ? 'Req ' + item.requiredLevel : ''].filter(Boolean).join(' · ');
+
+                // Richer meta line: what it is, where it goes, how strong it is.
+                var meta = [cls, slot].filter(Boolean);
+                if (item.itemLevel > 0) meta.push('ilvl ' + item.itemLevel);
+                if (item.requiredLevel > 1) meta.push('Req ' + item.requiredLevel);
+                if (item.dmgMax1 > 0 && item.delay > 0) {
+                    var dps = ((item.dmgMin1 + item.dmgMax1) / 2) / (item.delay / 1000);
+                    meta.push(dps.toFixed(1) + ' dps');
+                } else if (item.armor > 0) {
+                    meta.push(item.armor + ' armor');
+                }
 
                 html += '<div class="item-row" data-entry="' + item.entry + '">' +
                     '<img class="item-icon" src="' + esc(iconPath) + '" alt="" loading="lazy" />' +
@@ -178,7 +363,7 @@ $(function () {
                     '<div class="item-name ' + qualityClass + '">' + esc(item.name) +
                     (isCustom ? ' <span style="font-size:9px;color:var(--status-online);">★</span>' : '') +
                     '</div>' +
-                    '<div class="item-meta">' + esc(meta) + '</div>' +
+                    '<div class="item-meta">' + esc(meta.join(' · ')) + '</div>' +
                     '</div>' +
                     '<div class="item-entry">#' + item.entry + '</div>' +
                     '</div>';
@@ -205,6 +390,92 @@ $(function () {
             }
         }).fail(function () {
             $('#itemListContainer').html('<div class="text-center p-4 text-muted">Search failed</div>');
+        });
+    }
+
+    // ===================== ITEM SOURCES =====================
+    //
+    // "Where does this come from?" — served by /Items/Sources, which walks the
+    // reference_loot_template graph rather than only reading flat loot rows, so
+    // dungeon and raid drops appear instead of silently resolving to nothing.
+    //
+    // Buckets are rendered in the order a player would care about them. Rows
+    // whose id is an ITEM entry (containers, recipes, disenchant sources) are
+    // clickable and load that item.
+
+    var SOURCE_SECTIONS = [
+        { key: 'creatures', label: 'Dropped by', icon: 'fa-skull', clickable: false },
+        { key: 'objects', label: 'Found in / gathered', icon: 'fa-box-archive', clickable: false },
+        { key: 'containers', label: 'Contained in', icon: 'fa-box-open', clickable: true },
+        { key: 'quests', label: 'Quests', icon: 'fa-scroll', clickable: false },
+        { key: 'vendors', label: 'Sold by', icon: 'fa-coins', clickable: false },
+        { key: 'crafted', label: 'Crafted', icon: 'fa-hammer', clickable: true },
+        { key: 'disenchant', label: 'Disenchanted from', icon: 'fa-wand-sparkles', clickable: true },
+        { key: 'other', label: 'Other', icon: 'fa-circle-question', clickable: false }
+    ];
+
+    function loadItemSources(entry) {
+        var $panel = $('#itemSourcesPanel'), $body = $('#itemSourcesContent');
+        if ($panel.length === 0) return;
+
+        $panel.show();
+        $body.html('<div class="text-center p-2" style="font-size:12px;color:var(--text-muted);">' +
+            '<i class="fa-solid fa-spinner fa-spin"></i> Resolving sources…</div>');
+
+        $.getJSON('/Items/Sources', { entry: entry }, function (data) {
+            // Guard against a slow response landing after the user moved on.
+            if (currentDetailEntry !== entry) return;
+
+            if (!data || !data.success) {
+                $body.html('<div class="src-empty">Source lookup failed: ' +
+                    esc((data && data.error) || 'unknown error') + '</div>');
+                return;
+            }
+
+            var html = '';
+            SOURCE_SECTIONS.forEach(function (sec) {
+                var rows = data[sec.key] || [];
+                if (rows.length === 0) return;
+
+                html += '<div class="src-section"><div class="src-section-title">' +
+                    '<i class="fa-solid ' + sec.icon + '"></i> ' + esc(sec.label) +
+                    ' <span class="src-count">' + rows.length + '</span></div>';
+
+                rows.forEach(function (row) {
+                    var clickable = sec.clickable && row.id > 0;
+                    html += '<div class="src-row' + (clickable ? ' src-clickable' : '') + '"' +
+                        (clickable ? ' data-entry="' + row.id + '"' : '') + '>' +
+                        '<span class="src-name">' + esc(row.name) + '</span>';
+                    if (row.detail) html += '<span class="src-detail">' + esc(row.detail) + '</span>';
+                    if (row.chance != null && row.chance > 0)
+                        html += '<span class="src-chance">' + row.chance.toFixed(row.chance < 1 ? 2 : 1) + '%</span>';
+                    else if (row.chance === 0)
+                        html += '<span class="src-chance src-chance-quest">quest/cond</span>';
+                    html += '</div>';
+                });
+                html += '</div>';
+            });
+
+            if (html === '')
+                html = '<div class="src-empty">No known source — this item is not on any loot table, vendor, quest or recipe.</div>';
+
+            // Diagnostics stay visible rather than being swallowed: a probe that
+            // failed is very different from an item that genuinely has no source.
+            if (data.notes && data.notes.length) {
+                html += '<div class="src-notes"><div class="src-notes-title">' +
+                    '<i class="fa-solid fa-triangle-exclamation"></i> Lookup notes</div>';
+                data.notes.forEach(function (n) { html += '<div class="src-note">' + esc(n) + '</div>'; });
+                html += '</div>';
+            }
+
+            $body.html(html);
+            $body.find('.src-clickable').on('click', function () {
+                if (editMode) return;
+                loadDetail(parseInt($(this).data('entry'), 10));
+            });
+        }).fail(function () {
+            if (currentDetailEntry !== entry) return;
+            $body.html('<div class="src-empty">Source request failed.</div>');
         });
     }
 
@@ -317,6 +588,9 @@ $(function () {
 
             // Load OG changelog
             loadItemChangelog(entry);
+
+            // Where the item comes from (drops / vendors / quests / crafting)
+            loadItemSources(entry);
 
             // Load textures from MPQ
             var did = item.display_id || 0;
@@ -1596,7 +1870,7 @@ $(function () {
         $('#editFormContainer').html(h);
 
         // Update header icon
-        $('#editHeaderIcon').attr('src', iconPath || '/icons/inv_misc_questionmark.png');
+        $('#editHeaderIcon').attr('src', iconPath || '/Icon/Get?name=inv_misc_questionmark');
 
         // Load textures into edit form
         var editDisplayId = item.display_id || 0;
@@ -1678,7 +1952,7 @@ $(function () {
 
     function buildIconPicker(iconPath, displayId) {
         return '<div class="icon-picker-trigger" id="iconPickerTrigger">' +
-            '<img id="editIconPreview" src="' + esc(iconPath || '/icons/inv_misc_questionmark.png') + '" />' +
+            '<img id="editIconPreview" src="' + esc(iconPath || '/Icon/Get?name=inv_misc_questionmark') + '" />' +
             '<div><div style="font-size: 13px; color: var(--text-primary);">Display ID: <span id="editDisplayIdLabel">' + (displayId || 0) + '</span></div>' +
             '<div class="change-text"><i class="fa-solid fa-images"></i> Change Icon</div></div>' +
             '<input type="hidden" id="editFieldDisplayId" value="' + (displayId || 0) + '" />' +
@@ -2067,7 +2341,7 @@ $(function () {
 
         // Use the first displayId
         var displayId = displayIds[0];
-        var iconPath = '/icons/' + iconName + '.png';
+        var iconPath = '/Icon/Get?name=' + iconName;
 
         $('#editFieldDisplayId').val(displayId);
         $('#editDisplayIdLabel').text(displayId);
@@ -2166,7 +2440,35 @@ $(function () {
     // Search
     $('#btnSearchItems').on('click', function () { doSearch(1); });
     $('#itemSearch').on('keydown', function (e) { if (e.key === 'Enter') doSearch(1); });
-    $('#filterClass, #filterQuality, #filterSlot').on('change', function () { doSearch(1); });
+    $('#filterClass, #filterType, #filterSlot, #filterQuality, #filterSort, #filterDir, #filterCustomOnly, #filterHasDisplay')
+        .on('change', function () { doSearch(1); });
+
+    // Level boxes: debounce so typing "60" doesn't fire a search on "6".
+    var levelTimer = null;
+    $('#filterMinLvl, #filterMaxLvl, #filterMinIlvl, #filterMaxIlvl').on('input', function () {
+        clearTimeout(levelTimer);
+        levelTimer = setTimeout(function () { doSearch(1); }, 400);
+    });
+
+    $('#btnClearFilters').on('click', clearFilters);
+
+    // Advanced row is collapsed until wanted — but opens itself if a stored
+    // filter set is using it, so restored state is never invisible.
+    $('#btnToggleAdvanced').on('click', function () {
+        var open = $('#itemFilterAdvanced').toggle().is(':visible');
+        $(this).find('.adv-chevron').toggleClass('fa-chevron-down', !open).toggleClass('fa-chevron-up', open);
+    });
+
+    // Populate the type dropdown, restore saved filters, and run the first search.
+    buildTypeFilter();
+    if (restoreFilters()) {
+        var usesAdvanced = $('#filterMinLvl').val() || $('#filterMaxLvl').val() ||
+            $('#filterMinIlvl').val() || $('#filterMaxIlvl').val() ||
+            $('#filterCustomOnly').is(':checked') || $('#filterHasDisplay').is(':checked') ||
+            ($('#filterSort').val() || 'entry') !== 'entry' || ($('#filterDir').val() || 'asc') !== 'asc';
+        if (usesAdvanced) $('#btnToggleAdvanced').trigger('click');
+    }
+    renderFilterChips();
 
     // Pagination
     $('#btnFirstPage').on('click', function () { doSearch(1); });
@@ -2385,6 +2687,11 @@ $(function () {
         if ($(e.target).closest('.btn-download-patch').length) return;
         $(this).toggleClass('collapsed');
         $('#itemTextureBody').toggleClass('collapsed');
+    });
+
+    $('#itemSourcesToggle').on('click', function () {
+        $(this).toggleClass('collapsed');
+        $('#itemSourcesBody').toggleClass('collapsed');
     });
 
     // ── Reset to OG ──

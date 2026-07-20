@@ -4,7 +4,6 @@ using SharpGLTF.Geometry.VertexTypes;
 using SharpGLTF.Materials;
 using SharpGLTF.Scenes;
 using SkiaSharp;
-using War3Net.Drawing.Blp;
 
 namespace MangosSuperUI.Services;
 
@@ -546,9 +545,7 @@ public static class GlbWriter
     {
         try
         {
-            using var blpStream = new MemoryStream(blpData);
-            var blpFile = new BlpFile(blpStream);
-            var pixels = blpFile.GetPixels(0, out int w, out int h);
+            var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
             if (w == 0 || h == 0 || pixels.Length == 0) return null;
 
             // War3Net returns BGRA pixels → SKBitmap

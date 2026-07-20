@@ -25,12 +25,13 @@
             <!-- Search & Filters -->
             <div class="card mb-4">
                 <div class="card-body">
-                    <div class="row g-3 align-items-end">
-                        <div class="col-md-4">
+                    <!-- Primary row: the four filters used most of the time -->
+                    <div class="item-filter-row">
+                        <div class="filter-field filter-grow">
                             <label class="cmd-label">Search by name or entry ID</label>
                             <input type="text" class="form-input" id="itemSearch" placeholder="e.g. Thunderfury or 19019" />
                         </div>
-                        <div class="col-md-2">
+                        <div class="filter-field">
                             <label class="cmd-label">Class</label>
                             <select class="form-input" id="filterClass">
                                 <option value="">All</option>
@@ -45,26 +46,22 @@
                                 <option value="15">Miscellaneous</option>
                             </select>
                         </div>
-                        <div class="col-md-2">
-                            <label class="cmd-label">Quality</label>
-                            <select class="form-input" id="filterQuality">
-                                <option value="">All</option>
-                                <option value="0">Poor</option>
-                                <option value="1">Common</option>
-                                <option value="2">Uncommon</option>
-                                <option value="3">Rare</option>
-                                <option value="4">Epic</option>
-                                <option value="5">Legendary</option>
-                                <option value="6">Artifact</option>
+                        <div class="filter-field">
+                            <label class="cmd-label" title="Weapon type or armor material. Overrides Class.">Type</label>
+                            <!-- Options are injected by items.js (TYPE_OPTIONS) as
+                                 "class:subclass" pairs, so one pick implies both. -->
+                            <select class="form-input" id="filterType">
+                                <option value="">All types</option>
                             </select>
                         </div>
-                        <div class="col-md-2">
+                        <div class="filter-field">
                             <label class="cmd-label">Slot</label>
                             <select class="form-input" id="filterSlot">
                                 <option value="">All</option>
                                 <option value="1">Head</option>
                                 <option value="2">Neck</option>
                                 <option value="3">Shoulder</option>
+                                <option value="4">Shirt</option>
                                 <option value="5">Chest</option>
                                 <option value="6">Waist</option>
                                 <option value="7">Legs</option>
@@ -78,17 +75,93 @@
                                 <option value="15">Ranged</option>
                                 <option value="16">Back</option>
                                 <option value="17">Two-Hand</option>
+                                <option value="19">Tabard</option>
+                                <option value="20">Robe</option>
                                 <option value="21">Main Hand</option>
                                 <option value="22">Off Hand</option>
                                 <option value="23">Held In Off-Hand</option>
+                                <option value="25">Thrown</option>
+                                <option value="26">Ranged (Relic)</option>
                             </select>
                         </div>
-                        <div class="col-md-2">
-                            <button class="btn-accent w-100" id="btnSearchItems">
+                        <div class="filter-field">
+                            <label class="cmd-label">Quality</label>
+                            <select class="form-input" id="filterQuality">
+                                <option value="">All</option>
+                                <option value="0">Poor</option>
+                                <option value="1">Common</option>
+                                <option value="2">Uncommon</option>
+                                <option value="3">Rare</option>
+                                <option value="4">Epic</option>
+                                <option value="5">Legendary</option>
+                                <option value="6">Artifact</option>
+                            </select>
+                        </div>
+                        <div class="filter-field filter-actions">
+                            <button class="btn-accent" id="btnSearchItems">
                                 <i class="fa-solid fa-magnifying-glass"></i> Search
+                            </button>
+                            <button class="btn-outline-subtle" id="btnToggleAdvanced" title="More filters">
+                                <i class="fa-solid fa-sliders"></i> <i class="fa-solid fa-chevron-down adv-chevron"></i>
                             </button>
                         </div>
                     </div>
+
+                    <!-- Advanced row: level ranges, flags, sort. Hidden until asked
+                         for, and re-opened automatically when restored filter state
+                         uses any of it (items.js). -->
+                    <div class="item-filter-row item-filter-advanced" id="itemFilterAdvanced" style="display:none;">
+                        <div class="filter-field filter-range">
+                            <label class="cmd-label">Required level</label>
+                            <div class="range-pair">
+                                <input type="number" class="form-input" id="filterMinLvl" placeholder="min" min="0" max="70" />
+                                <span class="range-sep">–</span>
+                                <input type="number" class="form-input" id="filterMaxLvl" placeholder="max" min="0" max="70" />
+                            </div>
+                        </div>
+                        <div class="filter-field filter-range">
+                            <label class="cmd-label">Item level</label>
+                            <div class="range-pair">
+                                <input type="number" class="form-input" id="filterMinIlvl" placeholder="min" min="0" />
+                                <span class="range-sep">–</span>
+                                <input type="number" class="form-input" id="filterMaxIlvl" placeholder="max" min="0" />
+                            </div>
+                        </div>
+                        <div class="filter-field">
+                            <label class="cmd-label">Sort by</label>
+                            <select class="form-input" id="filterSort">
+                                <option value="entry">Entry ID</option>
+                                <option value="name">Name</option>
+                                <option value="quality">Quality</option>
+                                <option value="itemLevel">Item level</option>
+                                <option value="requiredLevel">Required level</option>
+                                <option value="dps">Weapon DPS</option>
+                            </select>
+                        </div>
+                        <div class="filter-field filter-narrow">
+                            <label class="cmd-label">Order</label>
+                            <select class="form-input" id="filterDir">
+                                <option value="asc">Ascending</option>
+                                <option value="desc">Descending</option>
+                            </select>
+                        </div>
+                        <div class="filter-field filter-checks">
+                            <label class="filter-check" title="Only entries in the custom range (900000+)">
+                                <input type="checkbox" id="filterCustomOnly" /> <span>Custom only</span>
+                            </label>
+                            <label class="filter-check" title="Only items that have a display ID — i.e. something you can actually look at">
+                                <input type="checkbox" id="filterHasDisplay" /> <span>Has display</span>
+                            </label>
+                        </div>
+                        <div class="filter-field filter-actions">
+                            <button class="btn-outline-subtle" id="btnClearFilters" title="Reset every filter">
+                                <i class="fa-solid fa-eraser"></i> Clear
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Active filter summary. Each chip drops its own filter. -->
+                    <div class="filter-chips" id="itemFilterChips" style="display:none;"></div>
                 </div>
             </div>
 
@@ -208,6 +281,18 @@
                             </button>
                         </div>
 
+                        <!-- Item Sources Panel — every way to obtain this item.
+                             Same collapsible pattern as the texture panel below. -->
+                        <div id="itemSourcesPanel" style="display:none; border-top: 1px solid var(--border-light);">
+                            <div class="texture-panel-header" id="itemSourcesToggle">
+                                <i class="fa-solid fa-map-location-dot"></i> Sources
+                                <i class="fa-solid fa-chevron-down chevron" style="margin-left:auto;font-size:11px;color:var(--text-muted);transition:transform 0.2s;"></i>
+                            </div>
+                            <div class="texture-panel-body" id="itemSourcesBody">
+                                <div id="itemSourcesContent"></div>
+                            </div>
+                        </div>
+
                         <!-- Item Textures Panel -->
                         <div id="itemTexturePanel" style="display:none; border-top: 1px solid var(--border-light);">
                             <div class="texture-panel-header" id="itemTextureToggle">
@@ -235,7 +320,7 @@
                         <!-- Sticky header -->
                         <div class="card-header edit-panel-header" id="editHeader">
                             <div class="d-flex align-items-center gap-2" style="flex: 1; min-width: 0;">
-                                <img id="editHeaderIcon" class="detail-icon" style="width: 36px; height: 36px;" src="/icons/inv_misc_questionmark.png" />
+                                <img id="editHeaderIcon" class="detail-icon" style="width: 36px; height: 36px;" src="/Icon/Get?name=inv_misc_questionmark" />
                                 <div style="min-width: 0;">
                                     <div id="editHeaderName" style="font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">New Item</div>
                                     <span class="edit-badge" id="editBadge">CUSTOM</span>
@@ -1154,16 +1239,16 @@
         }
 
         /* ── Retexture Panel — slide-swaps with the edit card ──────────────
-                   Both #editPanel and #retexturePanel live in #colEdit. JS adds the
-                   .retex-swap-active class to #colEdit when the retexture panel
-                   should be visible; CSS transitions handle the slide.
+                           Both #editPanel and #retexturePanel live in #colEdit. JS adds the
+                           .retex-swap-active class to #colEdit when the retexture panel
+                           should be visible; CSS transitions handle the slide.
 
-                   Layout: the edit card stays at its normal `position: sticky` slot
-                   (which gives the column its height). The retexture panel is ALWAYS
-                   absolutely positioned over that same area, hidden offscreen-right
-                   by default and slid into place when .retex-swap-active fires.
-                   Keeping `position: absolute` constant (no position-switching mid-
-                   transition) avoids the layout-thrash that breaks transforms. */
+                           Layout: the edit card stays at its normal `position: sticky` slot
+                           (which gives the column its height). The retexture panel is ALWAYS
+                           absolutely positioned over that same area, hidden offscreen-right
+                           by default and slid into place when .retex-swap-active fires.
+                           Keeping `position: absolute` constant (no position-switching mid-
+                           transition) avoids the layout-thrash that breaks transforms. */
         #colEdit {
             position: relative;
             overflow: hidden;
@@ -1175,8 +1260,8 @@
                 will-change: transform, opacity;
             }
             /* Resting: edit visible, retexture parked offscreen-right + inert.
-                   top: 16px matches the sticky offset of #editPanel so the two cards
-                   occupy the exact same screen rectangle when one slides into place. */
+                           top: 16px matches the sticky offset of #editPanel so the two cards
+                           occupy the exact same screen rectangle when one slides into place. */
             #colEdit > #retexturePanel {
                 position: absolute;
                 top: 16px;
@@ -1200,7 +1285,7 @@
             }
 
         /* Retexture panel inner styling — uses the same .card chrome as the
-                   edit panel so the swap feels like one continuous surface. */
+                           edit panel so the swap feels like one continuous surface. */
         .retex-panel .retex-panel-header {
             padding: 12px 16px;
             border-bottom: 1px solid var(--border-light);
@@ -1261,8 +1346,8 @@
             }
 
         /* Variation/segmented gallery — compact clickable cards. 2-col in the
-                   panel (panel is narrower than the old modal), keeping cards
-                   readable while still showing all variants without excessive scroll. */
+                           panel (panel is narrower than the old modal), keeping cards
+                           readable while still showing all variants without excessive scroll. */
         .retex-card-grid {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
@@ -1534,9 +1619,9 @@
         }
 
         /* Inline controls hint in the Try On header — explains the
-                   non-obvious zoom keybinding. cursor:help lets the title attr
-                   expand the hint to also cover panning, which is even less
-                   discoverable. */
+                           non-obvious zoom keybinding. cursor:help lets the title attr
+                           expand the hint to also cover panning, which is even less
+                           discoverable. */
         .cv-controls-hint {
             margin-left: 10px;
             font-size: 11px;
@@ -1558,10 +1643,10 @@
             }
 
         /* Expanded mode — viewer card takes full row width and gets extra
-                   height. Triggered by JS adding .viewer-expanded to #mainLayout.
-                   Hiding the detail column with display:none rather than removing
-                   it from the DOM means the user's selected item / clone state
-                   isn't lost when they toggle back. */
+                           height. Triggered by JS adding .viewer-expanded to #mainLayout.
+                           Hiding the detail column with display:none rather than removing
+                           it from the DOM means the user's selected item / clone state
+                           isn't lost when they toggle back. */
         #mainLayout.viewer-expanded > #colDetail {
             display: none;
         }
@@ -1575,7 +1660,7 @@
             height: 620px;
         }
         /* In expanded mode, also widen the tier side panel a bit so the
-                   pieces breathe and the class column can show full names. */
+                           pieces breathe and the class column can show full names. */
         #mainLayout.viewer-expanded .cv-tier-side {
             width: 180px;
         }
@@ -1705,9 +1790,9 @@
 
         /* Tier picker — side panel inside the canvas wrap */
         /* Anchored to the right edge of the canvas wrap, full height,
-                   ~140px wide. Translates off-screen when .collapsed. The toggle
-                   button (top-right of canvas) flips both this and its own
-                   rotation indicator. */
+                           ~140px wide. Translates off-screen when .collapsed. The toggle
+                           button (top-right of canvas) flips both this and its own
+                           rotation indicator. */
         .cv-tier-side {
             position: absolute;
             top: 0;
@@ -1759,9 +1844,9 @@
             cursor: help;
         }
         /* Class icon — replaces the text abbreviation. Same 26px column
-                   width as .cv-tier-side-class (matches the grid template above).
-                   image-rendering:pixelated keeps the low-res WoW icons crisp
-                   rather than blurrily upscaled. */
+                           width as .cv-tier-side-class (matches the grid template above).
+                           image-rendering:pixelated keeps the low-res WoW icons crisp
+                           rather than blurrily upscaled. */
         .cv-tier-side-class-icon {
             width: 24px;
             height: 24px;
@@ -1824,6 +1909,230 @@
             .cv-tier-toggle.panel-collapsed {
                 color: var(--text-muted);
             }
+
+        /* ══════════════════════════════════════════════════════════════════
+                   FILTER BAR
+                   A flex row rather than bootstrap columns: filters have very
+                   different natural widths (a search box vs a level spinner) and
+                   fixed 12ths waste space on every one of them.
+                   ══════════════════════════════════════════════════════════════════ */
+        .item-filter-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: flex-end;
+            gap: 10px;
+        }
+
+        .item-filter-advanced {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-light);
+        }
+
+        .filter-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-width: 130px;
+        }
+
+            .filter-field.filter-grow {
+                flex: 1 1 240px;
+                min-width: 200px;
+            }
+
+            .filter-field.filter-narrow {
+                min-width: 110px;
+            }
+
+            .filter-field.filter-actions {
+                flex-direction: row;
+                gap: 8px;
+                align-items: flex-end;
+            }
+
+        .filter-range .range-pair {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+            .filter-range .range-pair input {
+                width: 74px;
+            }
+
+        .range-sep {
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        .filter-checks {
+            justify-content: flex-end;
+            gap: 6px;
+        }
+
+        .filter-check {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            white-space: nowrap;
+            margin: 0;
+        }
+
+            .filter-check input {
+                margin: 0;
+                cursor: pointer;
+            }
+
+        /* Active-filter chips — a running summary of what is narrowing the
+                   list, each one clickable to remove just that filter. */
+        .filter-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 12px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border-light);
+        }
+
+        .filter-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 9px;
+            font-size: 11.5px;
+            border-radius: 12px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-light);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all var(--transition-fast);
+        }
+
+            .filter-chip:hover {
+                border-color: var(--accent);
+                color: var(--text-primary);
+            }
+
+            .filter-chip i {
+                font-size: 9px;
+                opacity: 0.6;
+            }
+
+        .filter-chip-clear {
+            background: transparent;
+            border-style: dashed;
+        }
+
+        /* ══════════════════════════════════════════════════════════════════
+                   SOURCES PANEL
+                   ══════════════════════════════════════════════════════════════════ */
+        .src-section {
+            margin-bottom: 10px;
+        }
+
+            .src-section:last-child {
+                margin-bottom: 0;
+            }
+
+        .src-section-title {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--accent);
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .src-count {
+            font-size: 10px;
+            color: var(--text-muted);
+            background: var(--bg-input);
+            border-radius: 8px;
+            padding: 0 6px;
+        }
+
+        .src-row {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            padding: 3px 6px;
+            font-size: 12.5px;
+            border-radius: 3px;
+        }
+
+            .src-row:hover {
+                background: var(--bg-input);
+            }
+
+        .src-clickable {
+            cursor: pointer;
+        }
+
+            .src-clickable .src-name {
+                color: var(--accent);
+            }
+
+        .src-name {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .src-detail {
+            font-size: 10.5px;
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+
+        .src-chance {
+            font-size: 11px;
+            color: var(--text-secondary);
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+
+        .src-chance-quest {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .src-empty {
+            font-size: 12px;
+            color: var(--text-muted);
+            padding: 6px 2px;
+        }
+
+        /* Diagnostics from the resolver. Deliberately visible: a probe that
+                   failed on this schema is a very different thing from an item that
+                   genuinely drops from nothing, and hiding that difference is how the
+                   old three-query version looked like it worked. */
+        .src-notes {
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1px dashed var(--border-light);
+        }
+
+        .src-notes-title {
+            font-size: 10.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--status-warning, #d9a441);
+            margin-bottom: 4px;
+        }
+
+        .src-note {
+            font-size: 11px;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
     </style>
 }
 

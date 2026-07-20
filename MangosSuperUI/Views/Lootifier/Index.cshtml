@@ -82,17 +82,14 @@
                                     </div>
 
                                     <div class="lf-ruleset-grid">
-                                        <div class="lf-ruleset-field">
-                                            <label>Budget Ceiling</label>
-                                            <div class="d-flex align-items-center gap-1">
-                                                <span class="text-muted">+</span>
-                                                <input type="number" class="form-input" id="rsBudgetCeiling" value="35" min="5" max="200" style="width:65px;" />
-                                                <span class="text-muted">% above base</span>
-                                            </div>
-                                        </div>
+                                        @* Global "Budget Ceiling" removed: each tier's Boost % IS the
+                                           strength control now (same as the Crafting Lootifier). The input
+                                           is kept hidden so collectRuleset still posts a value for any
+                                           legacy tier that arrives with no Boost set. *@
+                                        <input type="hidden" id="rsBudgetCeiling" value="35" />
                                         <div class="lf-ruleset-field">
                                             <label>Variants per Item</label>
-                                            <input type="number" class="form-input" id="rsVariantsPerItem" value="10" min="1" max="50" style="width:65px;" />
+                                            <input type="number" class="form-input" id="rsVariantsPerItem" value="9" min="1" max="50" style="width:65px;" />
                                         </div>
                                         <div class="lf-ruleset-field">
                                             <label>Allow New Affixes</label>
@@ -110,41 +107,27 @@
                                     <div class="filter-label" style="margin-top: 12px;">Naming Tiers <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">prefix or suffix per tier</span></div>
                                     <div id="namingTiers" class="lf-naming-tiers"></div>
 
-                                    <div class="filter-label" style="margin-top: 12px;">Value Tuning <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">gold &amp; weapon damage</span></div>
                                     <div class="lf-ruleset-grid">
-                                        <div class="lf-ruleset-field">
-                                            <label title="Master scale on ALL gold bumps: 100 = as entered, 0 = prices untouched, 200 = double.">Gold Scale %</label>
-                                            <input type="number" class="form-input" id="rsGoldScale" value="100" min="0" max="1000" step="5" style="width:65px;" />
-                                        </div>
-                                        <div class="lf-ruleset-field">
-                                            <label title="Gold price bump above base (%) for the boss legendary. 500 = the old x6 behaviour.">Legendary Gold +%</label>
-                                            <input type="number" class="form-input" id="rsLegGold" value="500" min="0" max="10000" step="25" style="width:65px;" />
-                                        </div>
-                                        <div class="lf-ruleset-field">
-                                            <label title="Weapon DAMAGE bump above base (%) for the legendary (weapons only; speed unchanged). Nominal — vanilla legendaries were hand-tuned.">Legendary DPS +%</label>
-                                            <input type="number" class="form-input" id="rsLegDps" value="30" min="0" max="500" step="0.5" style="width:65px;" />
-                                        </div>
+                                        @* Legendary Gold +% / DPS +% moved onto the Boss Legendary row in
+                                           the naming-tier list — one place for everything on the ladder.
+                                           Kept hidden so collectRuleset keeps reading the same ids. *@
+                                        <input type="hidden" id="rsLegGold" value="500" />
+                                        <input type="hidden" id="rsLegDps" value="30" />
                                     </div>
 
                                     <!-- Legendary System -->
                                     <div class="lf-legendary-section mt-3">
                                         <div class="filter-label d-flex align-items-center gap-2">
-                                            <label class="lf-toggle" style="margin:0;">
-                                                <input type="checkbox" id="rsLegendaryToggle" />
-                                                <span style="font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:0.5px;color:var(--text-muted);">
-                                                    <i class="fa-solid fa-crown" style="color:#ff8000;"></i> Boss Legendary
-                                                </span>
-                                            </label>
+                                            @* Switch + Effective Drop % live on the Boss Legendary row in the
+                                               naming-tier list. Hidden mirrors keep the existing ids working. *@
+                                            <input type="checkbox" id="rsLegendaryToggle" style="display:none;" />
+                                            <input type="hidden" id="rsLegendaryDropPct" value="0.2" />
+                                            <span style="font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:0.5px;color:var(--text-muted);">
+                                                <i class="fa-solid fa-crown" style="color:#ff8000;"></i> Legendary Naming
+                                            </span>
                                         </div>
                                         <div id="legendaryConfig" class="lf-legendary-config" style="display:none;">
                                             <div class="lf-ruleset-grid" style="margin-top:8px;">
-                                                <div class="lf-ruleset-field">
-                                                    <label>Effective Drop %</label>
-                                                    <div class="d-flex align-items-center gap-1">
-                                                        <input type="number" class="form-input" id="rsLegendaryDropPct" value="0.2" min="0.01" max="5" step="0.05" style="width:65px;" />
-                                                        <span class="text-muted">%</span>
-                                                    </div>
-                                                </div>
                                                 <div class="lf-ruleset-field">
                                                     <label>Legendary Item</label>
                                                     <select class="form-input" id="rsLegendaryItem" style="font-size:11px;padding:5px 8px;">
@@ -235,17 +218,11 @@
                                     <span>Ruleset</span>
                                 </div>
                                 <div class="lf-ruleset-grid">
-                                    <div class="lf-ruleset-field">
-                                        <label>Budget Ceiling</label>
-                                        <div class="d-flex align-items-center gap-1">
-                                            <span class="text-muted">+</span>
-                                            <input type="number" class="form-input lf-rs-shared" data-target="rsBudgetCeiling" value="35" min="5" max="200" style="width:65px;" />
-                                            <span class="text-muted">%</span>
-                                        </div>
-                                    </div>
+                                    @* Global "Budget Ceiling" removed — see the single-mode panel. *@
+                                    <input type="hidden" class="lf-rs-shared" data-target="rsBudgetCeiling" value="35" />
                                     <div class="lf-ruleset-field">
                                         <label>Variants per Item</label>
-                                        <input type="number" class="form-input lf-rs-shared" data-target="rsVariantsPerItem" value="10" min="1" max="50" style="width:65px;" />
+                                        <input type="number" class="form-input lf-rs-shared" data-target="rsVariantsPerItem" value="9" min="1" max="50" style="width:65px;" />
                                     </div>
                                     <div class="lf-ruleset-field">
                                         <label>Allow New Affixes</label>
@@ -263,42 +240,24 @@
                                 <div class="filter-label" style="margin-top: 12px;">Naming Tiers <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">prefix or suffix per tier</span></div>
                                 <div id="batchNamingTiers" class="lf-naming-tiers"></div>
 
-                                <div class="filter-label" style="margin-top: 12px;">Value Tuning <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:10px;color:var(--accent);">gold &amp; weapon damage</span></div>
                                 <div class="lf-ruleset-grid">
-                                    <div class="lf-ruleset-field">
-                                        <label title="Master scale on ALL gold bumps: 100 = as entered, 0 = prices untouched, 200 = double.">Gold Scale %</label>
-                                        <input type="number" class="form-input lf-rs-shared" data-target="rsGoldScale" value="100" min="0" max="1000" step="5" style="width:65px;" />
-                                    </div>
-                                    <div class="lf-ruleset-field">
-                                        <label title="Gold price bump above base (%) for the boss legendary. 500 = the old x6 behaviour.">Legendary Gold +%</label>
-                                        <input type="number" class="form-input lf-rs-shared" data-target="rsLegGold" value="500" min="0" max="10000" step="25" style="width:65px;" />
-                                    </div>
-                                    <div class="lf-ruleset-field">
-                                        <label title="Weapon DAMAGE bump above base (%) for the legendary (weapons only; speed unchanged). Nominal — vanilla legendaries were hand-tuned.">Legendary DPS +%</label>
-                                        <input type="number" class="form-input lf-rs-shared" data-target="rsLegDps" value="30" min="0" max="500" step="0.5" style="width:65px;" />
-                                    </div>
+                                    @* Moved onto the Boss Legendary row — see the single-mode panel. *@
+                                    <input type="hidden" class="lf-rs-shared" data-target="rsLegGold" value="500" />
+                                    <input type="hidden" class="lf-rs-shared" data-target="rsLegDps" value="30" />
                                 </div>
 
                                 <!-- Legendary System (batch — no item picker, auto-random per creature) -->
                                 <div class="lf-legendary-section mt-3">
                                     <div class="filter-label d-flex align-items-center gap-2">
-                                        <label class="lf-toggle" style="margin:0;">
-                                            <input type="checkbox" class="lf-batch-legendary-toggle" />
-                                            <span style="font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:0.5px;color:var(--text-muted);">
-                                                <i class="fa-solid fa-crown" style="color:#ff8000;"></i> Boss Legendary
-                                            </span>
-                                        </label>
+                                        @* Switch lives on the Boss Legendary row in the naming-tier list. *@
+                                        <input type="checkbox" class="lf-batch-legendary-toggle" style="display:none;" />
+                                        <span style="font-size:11px;text-transform:uppercase;font-weight:700;letter-spacing:0.5px;color:var(--text-muted);">
+                                            <i class="fa-solid fa-crown" style="color:#ff8000;"></i> Legendary Naming
+                                        </span>
                                     </div>
                                     <div class="lf-legendary-config lf-batch-legendary-config" style="display:none;">
-                                        <div class="lf-ruleset-grid" style="margin-top:8px;">
-                                            <div class="lf-ruleset-field">
-                                                <label>Effective Drop %</label>
-                                                <div class="d-flex align-items-center gap-1">
-                                                    <input type="number" class="form-input lf-batch-leg-drop" value="0.2" min="0.01" max="5" step="0.05" style="width:65px;" />
-                                                    <span class="text-muted">%</span>
-                                                </div>
-                                            </div>
-                                        </div>
+                                        @* Switch + Effective Drop % live on the Boss Legendary row. *@
+                                        <input type="hidden" class="lf-batch-leg-drop" value="0.2" />
                                         <div class="lf-ruleset-grid" style="margin-top:6px;">
                                             <div class="lf-ruleset-field">
                                                 <label>Melee Suffix</label>
@@ -950,11 +909,24 @@
             gap: 4px;
         }
 
-        .lf-tier-row {
-            display: flex;
+        .lf-tier-grid,
+        .lf-tier-row,
+        .lf-tier-head {
+            display: grid;
+            grid-template-columns: 54px minmax(90px, 1fr) 96px 48px 54px 50px 54px 20px;
             align-items: center;
-            gap: 4px;
+            gap: 5px;
         }
+
+        .lf-tier-row {
+            margin-bottom: 4px;
+        }
+
+            /* Every cell fills its grid track; no per-cell widths fighting the grid. */
+            .lf-tier-row > *,
+            .lf-tier-head > * {
+                min-width: 0;
+            }
 
         .lf-tier-range {
             font-family: monospace;
@@ -977,31 +949,28 @@
         }
 
         .lf-tier-input {
+            width: 100%;
             padding: 3px 8px !important;
             font-size: 12px !important;
-            flex: 1;
-            min-width: 60px;
         }
 
         .lf-tier-position {
-            width: 52px;
+            width: 100%;
             font-size: 11px !important;
             padding: 3px 4px !important;
         }
 
         .lf-tier-slots {
-            width: 48px;
+            width: 100%;
             padding: 3px 4px !important;
             font-size: 11px !important;
             text-align: center;
         }
 
         .lf-tier-rm {
-            width: 18px;
             text-align: center;
             cursor: pointer;
             color: var(--status-warning);
-            flex: 0 0 auto;
         }
 
             .lf-tier-rm:hover {
@@ -1009,25 +978,116 @@
             }
 
         .lf-tier-rangehead {
-            width: 90px;
+            display: none;
         }
 
         .lf-tier-head {
-            display: flex;
-            align-items: center;
-            gap: 4px;
             font-size: 10px;
             text-transform: uppercase;
             letter-spacing: 0.4px;
             color: var(--text-muted);
-            padding: 0 2px 2px;
+            padding: 0 2px 3px;
         }
 
+            /* Headers sit over the middle of the numeric cells they label. */
+            .lf-tier-head > span:nth-child(n+3) {
+                text-align: center;
+            }
+
         .lf-tier-gold, .lf-tier-dps {
-            width: 50px;
+            width: 100%;
             padding: 3px 4px !important;
             font-size: 11px !important;
             text-align: center;
+        }
+
+        /* Per-tier stat boost over base (%). Both cells filled => this tier
+                   ignores the global Budget Ceiling and rolls that much above base. */
+        .lf-tier-boost {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+        }
+
+        .lf-tier-bmin, .lf-tier-bmax {
+            width: 42px;
+            padding: 3px 4px !important;
+            font-size: 11px !important;
+            text-align: center;
+        }
+
+
+        /* The boss legendary sits in the band list as its own row so its strength
+                   can be read on the same ladder as the tiers. Marked, not editable as a
+                   naming tier — it is governed by the Boss Legendary checkbox. */
+        .lf-tier-row.lf-tier-legendary {
+            margin-top: 4px;
+            padding-top: 6px;
+            border-top: 1px dashed rgba(128,128,128,.35);
+        }
+
+            .lf-tier-row.lf-tier-legendary .lf-tier-input[disabled],
+            .lf-tier-row.lf-tier-legendary .lf-tier-position[disabled],
+            .lf-tier-row.lf-tier-legendary .lf-tier-slots[disabled] {
+                opacity: .55;
+                cursor: default;
+            }
+
+        .lf-tier-row.lf-tier-off {
+            opacity: .45;
+        }
+
+        .lf-tier-legpos {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+
+        .lf-tier-legname {
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+            .lf-tier-legname i {
+                color: #ff8000;
+                font-size: 11px;
+            }
+
+        .lf-tier-legnote {
+            font-weight: 400;
+            font-size: 10px;
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .lf-tier-legtoggle {
+            text-align: center;
+        }
+
+        /* Drop % is a legendary-only cell. Naming tiers show an inert dash: their
+                   share comes from the base item's own chance in the pool, by design. */
+        .lf-tier-drop {
+            width: 100%;
+            padding: 3px 4px !important;
+            font-size: 11px !important;
+            text-align: center;
+        }
+
+        .lf-tier-drop-na {
+            color: var(--text-muted);
+            opacity: .5;
+            line-height: 24px;
+        }
+
+
+        /* Fixed at one legendary per base item. */
+        .lf-tier-legendary .lf-tier-slots[disabled] {
+            opacity: .5;
+            cursor: default;
         }
 
         .lf-dps-ref {
@@ -1341,17 +1401,31 @@
             }
 
         /* ── Toast ── */
-        .lf-toast {
+        /* Toasts live in a fixed column so two at once (commit result + pool
+                   capacity warning) stack instead of landing on the same coordinates. */
+        .lf-toast-stack {
             position: fixed;
             bottom: 24px;
             right: 24px;
             z-index: 9999;
+            display: flex;
+            flex-direction: column-reverse;
+            align-items: flex-end;
+            gap: 8px;
+            pointer-events: none;
+            max-width: min(420px, calc(100vw - 48px));
+        }
+
+        .lf-toast {
+            pointer-events: auto;
             padding: 12px 20px;
             border-radius: var(--radius-md);
             font-size: 13px;
             font-weight: 500;
+            line-height: 1.35;
             animation: lfToastIn 0.3s ease-out;
             box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            overflow-wrap: anywhere;
         }
 
             .lf-toast.success {
@@ -1362,6 +1436,11 @@
             .lf-toast.error {
                 background: var(--status-error);
                 color: white;
+            }
+
+            .lf-toast.warning {
+                background: var(--status-warning);
+                color: #1a1a1a;
             }
 
         @@keyframes lfToastIn {

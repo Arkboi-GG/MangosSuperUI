@@ -9,6 +9,10 @@
 // carries its own private copies for now (left untouched deliberately);
 // converge it onto this service once the Retexture Engine section is proven.
 //
+// PARTIAL: the lootifier retexture QUEUE (sources, build, status, reset, revert,
+// orphan purge, patch rebuild) lives in RetextureSupport.Queue.cs. Both halves
+// must ship together.
+//
 // DI: register in Program.cs  ->  builder.Services.AddScoped<RetextureSupport>();
 //
 // NOTE: ItemTextureEntry is whatever type ItemTextureService returns in its
@@ -20,7 +24,7 @@ using MangosSuperUI.Models;
 
 namespace MangosSuperUI.Services;
 
-public class RetextureSupport
+public partial class RetextureSupport
 {
     private readonly ItemTextureService _itemTextures;
     private readonly DbcService _dbc;
@@ -389,19 +393,36 @@ public class RetextureSupport
 
     /// <summary>
     /// Drain pending lootifier_retexture_queue jobs under the chosen theory + value.
-    /// Same queue table BuildRetextureQueue fills; rebuilds patch-4.MPQ once when
-    /// the queue drains. Returns a JSON-ready summary object.
+    ///
+    /// SCOPED. source = "quest" | "crafting" | "loot" drains ONE lootifier and
+    /// leaves the others' pending rows alone; null drains everything. Together with
+    /// ResetQueueAsync(source, "all") this is "re-retexture just the ARPG items".
+    ///
+    /// RECYCLES THE OLD DISPLAY. A job that already carries a new_display_id is a
+    /// RE-run. The commit path always mints a fresh display id, so without this the
+    /// previous one is orphaned in custom_item_retexture[_atlas] and RebuildPatchM
+    /// keeps packing it into patch-4.MPQ forever — which is why re-running looked
+    /// like it ADDED and never undid. Once the new display is committed and
+    /// item_template repointed, the old one is deleted (only if nothing references
+    /// it). Order matters: commit first, purge after, so a failed re-run leaves the
+    /// working retexture intact.
+    ///
+    /// Rebuilds patch-4.MPQ once, when the SCOPED queue drains.
     /// </summary>
-    public async Task<object> ProcessQueueAsync(string theory, ValueSettings value, int max, CancellationToken ct)
+    public async Task<object> ProcessQueueAsync(
+        string theory, ValueSettings value, int max, string? source, CancellationToken ct)
     {
         max = Math.Clamp(max, 1, 25);
+        source = NormalizeSource(source);
         using var adminConn = _db.Admin();
         using var mangosConn = _db.Mangos();
         await EnsureRetextureQueueTable(adminConn);
 
-        var jobs = (await adminConn.QueryAsync<RetextureJobRow>(
-            "SELECT * FROM lootifier_retexture_queue WHERE status = 'pending' ORDER BY id LIMIT @Max",
-            new { Max = max })).ToList();
+        var jobs = (await adminConn.QueryAsync<RetextureJobRow>(@"
+            SELECT * FROM lootifier_retexture_queue
+            WHERE status = 'pending' AND (@Src IS NULL OR source = @Src)
+            ORDER BY id LIMIT @Max",
+            new { Max = max, Src = source })).ToList();
 
         var invTypes = new Dictionary<int, int>();
         if (jobs.Count > 0)
@@ -412,12 +433,13 @@ public class RetextureSupport
                 invTypes[(int)r.entry] = Convert.ToInt32(r.inventory_type);
         }
 
-        int processed = 0, succeeded = 0, failed = 0, restyled = 0;
+        int processed = 0, succeeded = 0, failed = 0, restyled = 0, recycled = 0;
         var results = new List<object>();
 
         foreach (var job in jobs)
         {
             processed++;
+            int oldDid = job.new_display_id;   // > 0 only on a re-run
             try
             {
                 int invType = invTypes.GetValueOrDefault(job.base_entry, 0);
@@ -446,6 +468,10 @@ public class RetextureSupport
                 await adminConn.ExecuteAsync(
                     "UPDATE lootifier_retexture_queue SET status='done', new_display_id=@Did, error=NULL, processed_at=NOW() WHERE id=@Id",
                     new { Did = (int)newDid, Id = job.id });
+
+                if (oldDid > 0 && oldDid != (int)newDid
+                    && await PurgeCustomDisplayAsync(adminConn, mangosConn, oldDid) > 0) recycled++;
+
                 succeeded++;
                 results.Add(new { job.id, job.tier, ok = true, newDisplayId = newDid, variants = entries.Count });
             }
@@ -461,8 +487,9 @@ public class RetextureSupport
             }
         }
 
-        int remaining = await adminConn.ExecuteScalarAsync<int>(
-            "SELECT COUNT(*) FROM lootifier_retexture_queue WHERE status = 'pending'");
+        int remaining = await adminConn.ExecuteScalarAsync<int>(@"
+            SELECT COUNT(*) FROM lootifier_retexture_queue
+            WHERE status = 'pending' AND (@Src IS NULL OR source = @Src)", new { Src = source });
 
         bool patchRebuilt = false; string? patchError = null;
         if (remaining == 0 && succeeded > 0)
@@ -471,7 +498,7 @@ public class RetextureSupport
             patchRebuilt = rb.Success; patchError = rb.Error;
         }
 
-        return new { success = true, processed, succeeded, failed, remaining, restyled, patchRebuilt, patchError, results };
+        return new { success = true, source, processed, succeeded, failed, remaining, restyled, recycled, patchRebuilt, patchError, results };
     }
 
     /// <summary>
@@ -557,6 +584,139 @@ public class RetextureSupport
     // ══ Base-name navigation (lootifier bases <-> their tier variants) ══════
     /// <summary>All generated_entry ids across the lootifier — the UI hides these
     /// so the browse lists BASE items; a base's variants surface via the strip.</summary>
+    // ══════════════════════════════════════════════════════════════════════════
+    // BROWSE — server-side item search for the Retexture Engine list
+    //
+    // WHY THIS EXISTS (the "page 2 is empty" bug)
+    // -------------------------------------------
+    // The JS used to call /Items/Search, then throw rows away on the CLIENT:
+    // no displayId, not a retextureable inventory type, or a lootifier generated
+    // variant. The server had already paginated, so the pager was counting rows
+    // the list would never show. Any page whose 40 rows happened to be entirely
+    // filtered out rendered as EMPTY while the pager still promised N pages —
+    // which, since "Retextureable only" is on by default and item_template is
+    // full of consumables and trade goods, is most of them.
+    //
+    // The fix is not a better client filter; it is to stop filtering on the
+    // client at all. Every predicate now lives in the WHERE clause, so
+    // totalCount and totalPages describe exactly the rows that get rendered.
+    //
+    // Generated-variant exclusion needs both databases (the lootifier table
+    // lives in Admin, item_template in Mangos), which is why this is here in the
+    // service rather than a parameter on ItemsController.Search.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>Inventory types that have something to recolor (atlas + cape + model).</summary>
+    public static readonly int[] RetextureableInventoryTypes =
+    {
+        4, 5, 6, 7, 8, 9, 10, 19, 20,                    // atlas (painted armor)
+        16,                                              // cape
+        1, 3, 13, 14, 15, 17, 21, 22, 23, 25, 26         // model (own M2)
+    };
+
+    /// <summary>
+    /// Paged item browse with every filter applied server-side.
+    /// retexOnly restricts to <see cref="RetextureableInventoryTypes"/> and
+    /// display_id &gt; 0; generated lootifier variants are always hidden so the
+    /// list shows BASE items (their tier variants surface in the strip).
+    /// </summary>
+    public async Task<object> BrowseAsync(
+        string? q, int? classFilter, int? subclassFilter, int? qualityFilter,
+        int? inventoryTypeFilter, int? minLevel, int? maxLevel,
+        bool retexOnly, int page, int pageSize)
+    {
+        if (page < 1) page = 1;
+        pageSize = Math.Clamp(pageSize, 1, 200);
+
+        using var mangos = _db.Mangos();
+
+        var where = "WHERE patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)";
+        var p = new DynamicParameters();
+
+        if (!string.IsNullOrWhiteSpace(q))
+        {
+            if (uint.TryParse(q.Trim(), out var entryId))
+            {
+                where += " AND entry = @EntryId";
+                p.Add("EntryId", entryId);
+            }
+            else
+            {
+                where += " AND name LIKE @Search";
+                p.Add("Search", $"%{q.Trim()}%");
+            }
+        }
+
+        if (classFilter.HasValue) { where += " AND class = @Class"; p.Add("Class", classFilter.Value); }
+        if (subclassFilter.HasValue) { where += " AND subclass = @Subclass"; p.Add("Subclass", subclassFilter.Value); }
+        if (qualityFilter.HasValue) { where += " AND quality = @Quality"; p.Add("Quality", qualityFilter.Value); }
+        if (inventoryTypeFilter.HasValue) { where += " AND inventory_type = @InvType"; p.Add("InvType", inventoryTypeFilter.Value); }
+        if (minLevel.HasValue) { where += " AND required_level >= @MinLevel"; p.Add("MinLevel", minLevel.Value); }
+        if (maxLevel.HasValue) { where += " AND required_level <= @MaxLevel"; p.Add("MaxLevel", maxLevel.Value); }
+
+        // The two predicates the client used to apply after pagination.
+        if (retexOnly)
+        {
+            where += " AND display_id > 0 AND inventory_type IN @RetexTypes";
+            p.Add("RetexTypes", RetextureableInventoryTypes);
+        }
+        else
+        {
+            where += " AND display_id > 0";
+        }
+
+        // Hide lootifier variants so browse lists bases. Cross-database, so the
+        // ids come over as a parameter rather than a subquery.
+        var generated = await GeneratedEntriesAsync();
+        if (generated.Count > 0)
+        {
+            where += " AND entry NOT IN @Generated";
+            p.Add("Generated", generated);
+        }
+
+        var totalCount = await mangos.ExecuteScalarAsync<int>(
+            $"SELECT COUNT(*) FROM item_template {where}", p);
+
+        var totalPages = totalCount == 0 ? 1 : (int)Math.Ceiling((double)totalCount / pageSize);
+
+        // Clamp rather than return a blank page: a filter change can shrink the
+        // result set under the page you were on, and silently showing nothing is
+        // the exact failure this method exists to remove.
+        if (page > totalPages) page = totalPages;
+
+        p.Add("Offset", (page - 1) * pageSize);
+        p.Add("PageSize", pageSize);
+
+        var items = (await mangos.QueryAsync<dynamic>($@"
+            SELECT entry, name, class, subclass, quality,
+                   display_id AS displayId, inventory_type AS inventoryType,
+                   required_level AS requiredLevel, item_level AS itemLevel
+            FROM item_template {where}
+            ORDER BY name ASC, entry ASC
+            LIMIT @PageSize OFFSET @Offset", p)).ToList();
+
+        var icons = new Dictionary<uint, string>();
+        foreach (var it in items)
+        {
+            uint did = (uint)(it.displayId ?? 0);
+            if (did > 0 && !icons.ContainsKey(did))
+            {
+                try { icons[did] = _dbc.GetItemIconPath(did); } catch { /* icon is cosmetic */ }
+            }
+        }
+
+        return new
+        {
+            success = true,
+            items,
+            icons,
+            page,
+            pageSize,
+            totalCount,
+            totalPages
+        };
+    }
+
     public async Task<List<int>> GeneratedEntriesAsync()
     {
         try
@@ -662,37 +822,50 @@ public class RetextureSupport
     /// The creature-drop join uses loot_id == entry (true for the common case
     /// where a creature's loot template id equals its entry).
     /// </summary>
+    /// <summary>
+    /// Where an item comes from. Delegates to the shared ItemSourceResolver so
+    /// this page and the Items page agree — and so both get reference-table
+    /// resolution (most dungeon/raid drops), skinning/pickpocketing, chests and
+    /// nodes, container items, disenchanting, quest objectives and crafting,
+    /// none of which the old three flat queries here could see.
+    ///
+    /// The creatures/vendors/quests keys keep their old shape (arrays of display
+    /// strings) so retextureengine.js needs no change; the extra buckets and the
+    /// notes array are additive.
+    /// </summary>
     public async Task<object> ItemSourcesAsync(int entry)
     {
         using var m = _db.Mangos();
-        async Task<List<string>> Q(string sql)
+        ItemSourceResult res;
+        try
         {
-            try
-            {
-                var rows = await m.QueryAsync<string>(sql, new { E = entry });
-                return rows.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().Take(30).ToList();
-            }
-            catch { return new List<string>(); }
+            res = await ItemSourceResolver.ResolveAsync(m, entry);
+        }
+        catch (Exception ex)
+        {
+            return new { success = false, error = ex.Message };
         }
 
-        var creatures = await Q(
-            "SELECT DISTINCT ct.name FROM creature_loot_template clt " +
-            "JOIN creature_template ct ON ct.entry = clt.entry " +
-            "WHERE clt.item = @E ORDER BY ct.name LIMIT 30");
+        static List<string> Fmt(List<ItemSource> list) => list
+            .Select(s => s.Chance.HasValue && s.Chance.Value > 0
+                ? $"{s.Name} ({s.Chance.Value:0.#}%)"
+                : s.Name)
+            .ToList();
 
-        var vendors = await Q(
-            "SELECT DISTINCT ct.name FROM npc_vendor nv " +
-            "JOIN creature_template ct ON ct.entry = nv.entry " +
-            "WHERE nv.item = @E ORDER BY ct.name LIMIT 30");
-
-        var quests = await Q(
-            "SELECT DISTINCT Title FROM quest_template WHERE " +
-            "RewItemId1=@E OR RewItemId2=@E OR RewItemId3=@E OR RewItemId4=@E OR " +
-            "RewChoiceItemId1=@E OR RewChoiceItemId2=@E OR RewChoiceItemId3=@E OR " +
-            "RewChoiceItemId4=@E OR RewChoiceItemId5=@E OR RewChoiceItemId6=@E " +
-            "ORDER BY Title LIMIT 30");
-
-        return new { success = true, creatures, vendors, quests };
+        return new
+        {
+            success = true,
+            creatures = Fmt(res.Creatures),
+            vendors = Fmt(res.Vendors),
+            quests = Fmt(res.Quests),
+            objects = Fmt(res.Objects),
+            containers = Fmt(res.Containers),
+            crafted = Fmt(res.Crafted),
+            disenchant = Fmt(res.Disenchant),
+            other = Fmt(res.Other),
+            totalCount = res.TotalCount,
+            notes = res.Notes
+        };
     }
 
     private string? WebUrlOf(string diskPath)

@@ -885,33 +885,28 @@ public class WorldEditorController : Controller
             {
                 try
                 {
-                    using var stream = System.IO.File.OpenRead(mpqPath);
-                    using var archive = new War3Net.IO.Mpq.MpqArchive(stream);
-
-                    if (archive.TryOpenFile("(listfile)", out var listStream))
+                    using var archive = Services.Mpq.MpqArchive.Open(mpqPath);
+                    var lf = archive?.ReadFile("(listfile)");
+                    if (lf != null)
                     {
-                        using (listStream)
-                        using (var reader = new StreamReader(listStream))
+                        using var reader = new StringReader(System.Text.Encoding.UTF8.GetString(lf));
+                        string? line;
+                        while ((line = reader.ReadLine()) != null)
                         {
-                            string? line;
-                            while ((line = reader.ReadLine()) != null)
-                            {
-                                line = line.Trim();
-                                if (string.IsNullOrEmpty(line)) continue;
-                                if (!line.EndsWith(".wmo", StringComparison.OrdinalIgnoreCase)) continue;
+                            line = line.Trim();
+                            if (string.IsNullOrEmpty(line)) continue;
+                            if (!line.EndsWith(".wmo", StringComparison.OrdinalIgnoreCase)) continue;
 
-                                // Skip group files (e.g. building_000.wmo, building_001.wmo)
-                                // Group files have _NNN.wmo suffix where NNN is 3 digits
-                                string filename = Path.GetFileNameWithoutExtension(line);
-                                if (filename.Length >= 4 &&
-                                    filename[^4] == '_' &&
-                                    char.IsDigit(filename[^3]) &&
-                                    char.IsDigit(filename[^2]) &&
-                                    char.IsDigit(filename[^1]))
-                                    continue;
+                            // Skip group files (e.g. building_000.wmo, building_001.wmo)
+                            string filename = Path.GetFileNameWithoutExtension(line);
+                            if (filename.Length >= 4 &&
+                                filename[^4] == '_' &&
+                                char.IsDigit(filename[^3]) &&
+                                char.IsDigit(filename[^2]) &&
+                                char.IsDigit(filename[^1]))
+                                continue;
 
-                                allWmoPaths.Add(line.Replace('/', '\\'));
-                            }
+                            allWmoPaths.Add(line.Replace('/', '\\'));
                         }
                     }
                 }
@@ -4636,16 +4631,14 @@ public class WorldEditorController : Controller
             byte[] patchedAdt = null;
             string adtPathInMpq = null;
 
-            using var stream = System.IO.File.OpenRead(patchPath);
-            using var archive = new War3Net.IO.Mpq.MpqArchive(stream);
+            using var archive = MangosSuperUI.Services.Mpq.MpqArchive.Open(patchPath);
 
             // List all files in the MPQ
             var files = new List<string>();
-            if (archive.FileExists("(listfile)"))
+            var lf = archive?.ReadFile("(listfile)");
+            if (lf != null)
             {
-                using var lf = archive.OpenFile("(listfile)");
-                using var sr = new StreamReader(lf);
-                string content = sr.ReadToEnd();
+                string content = System.Text.Encoding.UTF8.GetString(lf);
                 files = content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).ToList();
             }
 
@@ -4655,11 +4648,8 @@ public class WorldEditorController : Controller
                 if (f.EndsWith(".adt", StringComparison.OrdinalIgnoreCase))
                 {
                     adtPathInMpq = f;
-                    using var entry = archive.OpenFile(f);
-                    using var ms = new MemoryStream();
-                    entry.CopyTo(ms);
-                    patchedAdt = ms.ToArray();
-                    break;
+                    patchedAdt = archive?.ReadFile(f);
+                    if (patchedAdt != null) break;
                 }
             }
 
@@ -4902,20 +4892,11 @@ public class WorldEditorController : Controller
                 return Json(new { error = "patch-Z.MPQ not found", diag });
 
             byte[] patched = null;
-            using (var stream = System.IO.File.OpenRead(patchPath))
-            using (var archive = new War3Net.IO.Mpq.MpqArchive(stream))
+            using (var archive = MangosSuperUI.Services.Mpq.MpqArchive.Open(patchPath))
             {
-                // Try both slash directions
-                string fwd = adtMpqPath.Replace('\\', '/');
-                string bck = adtMpqPath;
-                string tryPath = archive.FileExists(bck) ? bck : (archive.FileExists(fwd) ? fwd : null);
-                if (tryPath != null)
-                {
-                    using var entry = archive.OpenFile(tryPath);
-                    using var ms = new MemoryStream();
-                    entry.CopyTo(ms);
-                    patched = ms.ToArray();
-                }
+                var data = archive?.ReadFile(adtMpqPath);
+                if (data != null)
+                    patched = data;
             }
 
             if (patched == null)

@@ -1445,25 +1445,12 @@ public class PatchBuilderService
                 foreach (var mpqFile in mpqFiles)
                 {
                     string mpqName = Path.GetFileName(mpqFile);
-                    FileStream? fileStream = null;
-                    War3Net.IO.Mpq.MpqArchive? archive = null;
                     try
                     {
-                        fileStream = File.OpenRead(mpqFile);
-                        archive = new War3Net.IO.Mpq.MpqArchive(fileStream);
-
-                        if (archive.FileExists(normalizedPath))
+                        using var archive = MangosSuperUI.Services.Mpq.MpqArchive.Open(mpqFile);
+                        var data = archive?.ReadFile(normalizedPath);
+                        if (data != null)
                         {
-                            // Read ALL bytes before disposing anything
-                            var entryStream = archive.OpenFile(normalizedPath);
-                            var ms = new MemoryStream();
-                            entryStream.CopyTo(ms);
-                            var data = ms.ToArray();
-                            ms.Dispose();
-                            entryStream.Dispose();
-                            archive.Dispose();
-                            fileStream.Dispose();
-
                             _logger.LogInformation("ReadM2: Found '{Path}' in {Mpq} ({Size} bytes)",
                                 normalizedPath, mpqName, data.Length);
                             return data;
@@ -1473,11 +1460,6 @@ public class PatchBuilderService
                     {
                         _logger.LogWarning(ex, "ReadM2: FAILED to read from {Mpq} ({Size} bytes) — trying next",
                             mpqName, new FileInfo(mpqFile).Length);
-                    }
-                    finally
-                    {
-                        archive?.Dispose();
-                        fileStream?.Dispose();
                     }
                 }
             }

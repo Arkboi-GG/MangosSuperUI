@@ -1,6 +1,7 @@
 /* Retexture Engine — UI controller.
  *
- * Drives the /RetextureEngine backend (Preview / Sheet). Retexture LOGIC lives
+ * Drives the /RetextureEngine backend (Preview / Sheet / queue). Retexture LOGIC
+ * lives
  * in C# (PaletteSwapService); this file is UI only: browse retextureable items,
  * tune theory + tier + value knobs, and see the live flat recolor. Item search
  * reuses the proven /Items/Search endpoint.
@@ -90,11 +91,13 @@
         $('#rePrev').on('click', function () { if (page > 1) { page--; doSearch(); } });
         $('#reNext').on('click', function () { if (page < totalPages) { page++; doSearch(); } });
 
-        // base-name navigation: hide generated variants so the browse lists bases;
-        // a base's tier variants surface in the strip.
+        // Base-name navigation. Generated variants are now excluded server-side
+        // (RetextureSupport.BrowseAsync), so this set is only kept for local
+        // checks — and the first search no longer waits on it.
         $.getJSON('/RetextureEngine/GeneratedEntries', function (r) {
-            if (r && r.success) { generatedSet = new Set(r.entries || []); doSearch(); }
+            if (r && r.success) generatedSet = new Set(r.entries || []);
         });
+        doSearch();
 
         // filters
         buildFilters();
@@ -130,6 +133,13 @@
         $('#reResetBtn').on('click', resetFailed);
         $('#reClearBtn').on('click', clearQueue);
         $('#reRebuildBtn').on('click', rebuildPatch);
+        $('#reDownloadBtn').on('click', downloadPatch);
+        $('#reRedoBtn').on('click', redoAll);
+        $('#reRevertBtn').on('click', revertQueue);
+        $('#rePurgeBtn').on('click', purgeOrphans);
+        // Every batch button acts on the TICKED sources, so re-read the scope
+        // whenever they change.
+        $('#reBatchSources').on('change', '.re-src', function () { updateScope(); refreshQueue(); });
         updateBatchUsing();
 
         // selection (ad-hoc multi-item retexture)
@@ -226,38 +236,62 @@
         }
         $('#reResultInfo').text('Searching\u2026');
 
-        $.getJSON('/Items/Search', $.extend({ q: q, page: page, pageSize: pageSize }, f), function (data) {
+        // /RetextureEngine/Browse applies EVERY predicate in SQL — including
+        // "has a displayId", "is a retextureable inventory type" and "is not a
+        // lootifier generated variant". Those three used to be applied here, in
+        // JS, AFTER the server had already paginated: a page whose 40 rows were
+        // all filtered out rendered empty while the pager still counted them,
+        // which is why Next past page 1 so often showed nothing. Now totalCount
+        // and totalPages describe exactly the rows that get rendered.
+        var params = $.extend({
+            q: q,
+            page: page,
+            pageSize: pageSize,
+            retexOnly: $('#reRetexOnly').is(':checked')
+        }, f);
+
+        $.getJSON('/RetextureEngine/Browse', params, function (data) {
+            if (!data || !data.success) {
+                $('#reResultInfo').text((data && data.error) ? 'Search failed: ' + data.error : 'Search failed.');
+                $('#reList').empty();
+                $('#rePager').hide();
+                return;
+            }
+
             icons = data.icons || {};
             totalPages = data.totalPages || 1;
 
-            var retexOnly = $('#reRetexOnly').is(':checked');
-            var items = (data.items || []).filter(function (it) {
-                if (!it.displayId || it.displayId <= 0) return false;
-                if (retexOnly && !RETEX_INVTYPES.has(it.inventoryType)) return false;
-                if (generatedSet && generatedSet.has(it.entry)) return false;  // variants collapse into their base
-                return true;
-            });
+            // The server clamps the page when a filter change shrinks the result
+            // set under the page you were on; follow it rather than keeping a
+            // stale number that would make Prev/Next behave oddly.
+            if (data.page && data.page !== page) page = data.page;
 
+            var items = data.items || [];
             $('#reResultInfo').text(
-                'Showing ' + items.length + (retexOnly ? ' retextureable' : '') +
-                ' of ' + (data.totalCount || 0).toLocaleString());
+                'Showing ' + items.length + ' of ' +
+                (data.totalCount || 0).toLocaleString() +
+                ($('#reRetexOnly').is(':checked') ? ' retextureable' : '') + ' items');
 
             renderList(items);
             $('#rePager').toggle(totalPages > 1);
             $('#rePageLabel').text('Page ' + page + ' / ' + totalPages);
+            $('#rePrev').prop('disabled', page <= 1);
+            $('#reNext').prop('disabled', page >= totalPages);
         }).fail(function () {
             $('#reResultInfo').text('Search failed.');
+            $('#reList').empty();
+            $('#rePager').hide();
         });
     }
 
     function renderList(items) {
         var $list = $('#reList').empty();
         if (items.length === 0) {
-            $list.html('<div class="re-result-info">No retextureable items on this page.</div>');
+            $list.html('<div class="re-result-info">No items match these filters.</div>');
             return;
         }
         items.forEach(function (it) {
-            var icon = icons[it.displayId] || '/icons/inv_misc_questionmark.png';
+            var icon = icons[it.displayId] || '/Icon/Get?name=inv_misc_questionmark';
             var checked = selection[it.entry] ? ' checked' : '';
             var $row = $(
                 '<div class="re-row" data-did="' + it.displayId + '">' +
@@ -592,21 +626,85 @@
         }
     }
 
-    // ── Batch: Lootifier retexture queue (reuses the proven /Items/ endpoints) ──
+    // ══════════════════════════════════════════════════════════════════════
+    //  Batch: the Lootifier retexture queue — now served by /RetextureEngine/*
+    //
+    //  It used to call /Items/, whose queue endpoints have no notion of `source`:
+    //  you could BUILD a queue for one lootifier, but Run / Requeue / Clear always
+    //  hit the whole table, and none of them undid anything. Every button below
+    //  acts on the TICKED sources only, one scoped call each.
+    //
+    //  The verbs, in the order you actually use them:
+    //    Build queue   enqueue (base x tier) jobs for the ticked sources
+    //    Run queue     drain them at the current theory + value
+    //    Re-retexture  re-arm rows that are already done -> Run again picks them
+    //                  up and RECYCLES the display each one minted, so the patch
+    //                  does not grow
+    //    Revert        put the variants back on their original display and delete
+    //                  the minted ones. This is the undo. Clear is not.
+    //    Purge orphans sweep minted displays nothing points at any more
+    // ══════════════════════════════════════════════════════════════════════
+
+    function selectedSources() { return $('.re-src:checked').map(function () { return this.value; }).get(); }
+
+    function selectedLabels() {
+        var l = $('.re-src:checked').map(function () {
+            return $(this).closest('.re-src-row').find('strong').text();
+        }).get();
+        return l.length ? l.join(' + ') : 'nothing';
+    }
+
+    function updateScope() {
+        var n = selectedSources().length;
+        $('#reScopeText').text('Acting on: ' + selectedLabels())
+            .toggleClass('re-scope-empty', n === 0);
+    }
+
+    function post(url, body) {
+        return $.ajax({
+            url: url, method: 'POST', contentType: 'application/json',
+            data: JSON.stringify(body || {})
+        });
+    }
+
+    // Run fn(source) once per ticked source, in series. Resolves with the results.
+    function perSource(fn) {
+        var srcs = selectedSources();
+        if (srcs.length === 0) { $('#reQueueText').text('Tick at least one source first.'); return null; }
+        return srcs.reduce(function (chain, src) {
+            return chain.then(function (acc) {
+                return $.when(fn(src)).then(function (r) { acc.push(r || {}); return acc; });
+            });
+        }, $.Deferred().resolve([]).promise());
+    }
+
+    function sum(results, key) {
+        return results.reduce(function (n, r) { return n + (r[key] || 0); }, 0);
+    }
+
     function loadBatchSources() {
-        $.getJSON('/Items/LootifierRetextureSources', function (d) {
+        $.getJSON('/RetextureEngine/Sources', function (d) {
             if (!d || !d.success) { $('#reBatchSources').html('<span class="re-hint">Sources unavailable.</span>'); return; }
             var rows = (d.sources || []).map(function (s) {
                 var none = s.bases === 0;
+                var bits = [s.bases + ' base items \u00b7 ' + s.variants + ' variants'];
+                if (s.queued) {
+                    var q = s.done + '/' + s.queued + ' retextured';
+                    if (s.pending) q += ' \u00b7 ' + s.pending + ' pending';
+                    if (s.failed) q += ' \u00b7 ' + s.failed + ' failed';
+                    if (s.reverted) q += ' \u00b7 ' + s.reverted + ' reverted';
+                    bits.push(q);
+                }
                 return '<label class="re-src-row">' +
                     '<input type="checkbox" class="re-src" value="' + s.source + '"' + (none ? ' disabled' : ' checked') + ' />' +
                     '<span><strong>' + esc(s.label) + '</strong><br>' +
-                    '<span class="re-src-meta">' + s.bases + ' base items \u00b7 ' + s.variants + ' variants' +
-                    (s.queued ? ' \u00b7 ' + s.done + '/' + s.queued + ' retextured' : '') + '</span></span>' +
+                    '<span class="re-src-meta">' + bits.join('<br>') + '</span></span>' +
                     '</label>';
             }).join('');
             $('#reBatchSources').html(rows || '<span class="re-hint">No lootifier variants found yet.</span>');
+            updateScope();
             refreshQueue();
+            refreshPatchInfo();
         }).fail(function () { $('#reBatchSources').html('<span class="re-hint">Sources request failed.</span>'); });
     }
 
@@ -615,13 +713,20 @@
             '  (per-tier shape/policy per job)');
     }
 
-    function selectedSources() { return $('.re-src:checked').map(function () { return this.value; }).get(); }
-
+    // Counts are scoped when exactly one source is ticked; otherwise show the
+    // whole table, since that is what the buttons will span anyway.
     function refreshQueue() {
-        $.getJSON('/Items/RetextureQueueStatus', function (d) {
+        var srcs = selectedSources();
+        var url = '/RetextureEngine/QueueStatus' +
+            (srcs.length === 1 ? '?source=' + encodeURIComponent(srcs[0]) : '');
+        $.getJSON(url, function (d) {
             if (!d || !d.success) return;
-            var total = d.pending + d.done + d.failed;
-            $('#reQueueText').text('Queue: ' + d.pending + ' pending \u00b7 ' + d.done + ' done' + (d.failed ? ' \u00b7 ' + d.failed + ' failed' : ''));
+            var total = d.pending + d.done + d.failed + d.reverted;
+            var txt = 'Queue' + (d.source ? ' [' + d.source + ']' : '') + ': ' +
+                d.pending + ' pending \u00b7 ' + d.done + ' done';
+            if (d.failed) txt += ' \u00b7 ' + d.failed + ' failed';
+            if (d.reverted) txt += ' \u00b7 ' + d.reverted + ' reverted';
+            $('#reQueueText').text(txt);
             if (total > 0) { $('#reBarWrap').show(); $('#reBar').css('width', Math.round(((d.done + d.failed) / total) * 100) + '%'); }
             else { $('#reBarWrap').hide(); }
             if (d.failures && d.failures.length) {
@@ -634,52 +739,169 @@
 
     function buildQueue() {
         var sources = selectedSources();
-        if (sources.length === 0) { $('#reQueueText').text('Pick at least one source.'); return; }
+        if (sources.length === 0) { $('#reQueueText').text('Tick at least one source first.'); return; }
         var $b = $('#reBuildBtn').prop('disabled', true);
-        $.ajax({
-            url: '/Items/BuildRetextureQueue', method: 'POST', contentType: 'application/json',
-            data: JSON.stringify({ sources: sources, themes: {}, requeue: $('#reRequeue').is(':checked') })
-        })
+        post('/RetextureEngine/BuildQueue', { sources: sources, requeue: $('#reRequeue').is(':checked') })
             .done(function (r) {
-                if (!r.success) { $('#reQueueText').text(r.error || 'Build failed'); return; }
-                $('#reQueueText').text('Queued ' + r.queued + ' jobs across ' + r.basesCovered + ' items' + (r.skipped ? ' (' + r.skipped + ' already queued)' : ''));
-                refreshQueue();
+                if (!r || !r.success) { $('#reQueueText').text((r && r.error) || 'Build failed'); return; }
+                $('#reQueueText').text('Queued ' + r.queued + ' jobs across ' + r.basesCovered + ' items' +
+                    (r.skipped ? ' (' + r.skipped + ' already queued \u2014 tick Requeue to replace)' : ''));
+                loadBatchSources();
             }).fail(function () { $('#reQueueText').text('Build request failed'); })
             .always(function () { $b.prop('disabled', false); });
     }
 
+    // Drains one source at a time so a scoped run never touches another
+    // lootifier's pending jobs.
     var running = false;
     function runQueue() {
         if (running) return;
+        var srcs = selectedSources();
+        if (srcs.length === 0) { $('#reQueueText').text('Tick at least one source first.'); return; }
+
         running = true;
         var $b = $('#reRunBtn').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Running\u2026');
-        function stop() { running = false; $b.prop('disabled', false).html('<i class="fa-solid fa-play"></i> Run queue'); refreshQueue(); }
-        function step() {
-            $.ajax({ url: '/RetextureEngine/ProcessQueue', method: 'POST', contentType: 'application/json', data: JSON.stringify($.extend({ max: 3, theory: state.theory }, valueParams())) })
-                .done(function (r) {
-                    if (!r.success) { $('#reQueueText').text(r.error || 'Retexture failed'); return stop(); }
-                    refreshQueue();
-                    if (r.remaining > 0) step(); else { $('#reQueueText').text('Queue complete.'); stop(); }
-                }).fail(function () { $('#reQueueText').text('Retexture request failed'); stop(); });
+        function stop() {
+            running = false;
+            $b.prop('disabled', false).html('<i class="fa-solid fa-play"></i> Run queue');
+            loadBatchSources();
         }
-        step();
+
+        var i = 0;
+        function nextSource() {
+            if (i >= srcs.length) { $('#reQueueText').text('Queue complete.'); stop(); return; }
+            var src = srcs[i++];
+            (function step() {
+                post('/RetextureEngine/ProcessQueue',
+                    $.extend({ max: 3, source: src, theory: state.theory }, valueParams()))
+                    .done(function (r) {
+                        if (!r || !r.success) { $('#reQueueText').text((r && r.error) || 'Retexture failed'); return stop(); }
+                        refreshQueue();
+                        if (r.remaining > 0) step(); else nextSource();
+                    })
+                    .fail(function () { $('#reQueueText').text('Retexture request failed'); stop(); });
+            })();
+        }
+        nextSource();
     }
 
     function resetFailed() {
-        $.ajax({ url: '/Items/ResetRetextureQueue', method: 'POST', contentType: 'application/json', data: JSON.stringify({ clear: false }) })
-            .done(function (r) { $('#reQueueText').text('Requeued ' + (r.affected || 0) + ' failed jobs'); refreshQueue(); });
+        var p = perSource(function (src) {
+            return post('/RetextureEngine/ResetQueue', { source: src, mode: 'failed' });
+        });
+        if (p) p.then(function (res) {
+            $('#reQueueText').text('Requeued ' + sum(res, 'affected') + ' failed jobs');
+            loadBatchSources();
+        });
+    }
+
+    // RE-RETEXTURE: re-arm rows that already ran, keeping new_display_id so the
+    // drain recycles the display each job minted instead of orphaning it.
+    function redoAll() {
+        if (!confirm('Re-arm every processed job for ' + selectedLabels() + '?\n\n' +
+            'Nothing changes until you hit Run queue. Each job then re-recolors at the ' +
+            'current theory + value and DELETES the display it minted last time, so the ' +
+            'patch does not grow.')) return;
+        var p = perSource(function (src) {
+            return post('/RetextureEngine/ResetQueue', { source: src, mode: 'all' });
+        });
+        if (p) p.then(function (res) {
+            $('#reQueueText').text('Re-armed ' + sum(res, 'affected') + ' jobs \u2014 hit Run queue.');
+            loadBatchSources();
+        });
     }
 
     function clearQueue() {
-        if (!confirm('Clear the entire retexture queue? Already-applied retextures stay applied.')) return;
-        $.ajax({ url: '/Items/ResetRetextureQueue', method: 'POST', contentType: 'application/json', data: JSON.stringify({ clear: true }) })
-            .done(function (r) { $('#reQueueText').text('Cleared ' + (r.affected || 0) + ' rows'); refreshQueue(); });
+        if (!confirm('Delete the queue rows for ' + selectedLabels() + '?\n\n' +
+            'Already-applied retextures STAY APPLIED and their tracking rows go with the ' +
+            'queue \u2014 you lose the ability to revert them. Use Revert first if that is ' +
+            'what you meant.')) return;
+        var p = perSource(function (src) {
+            return post('/RetextureEngine/ResetQueue', { source: src, mode: 'clear' });
+        });
+        if (p) p.then(function (res) {
+            $('#reQueueText').text('Cleared ' + sum(res, 'affected') + ' rows');
+            loadBatchSources();
+        });
+    }
+
+    // THE UNDO. Restores base_display_id on every variant, deletes the displays
+    // that were minted for them, rebuilds the patch. Rows stay pending so you can
+    // run again from clean.
+    function revertQueue() {
+        if (!confirm('Revert all retextures for ' + selectedLabels() + '?\n\n' +
+            'Variants go back to their ORIGINAL display, the custom displays are deleted ' +
+            'and patch-4.MPQ is rebuilt without them. Jobs are left pending so you can ' +
+            'Run queue again.')) return;
+        var $b = $('#reRevertBtn').prop('disabled', true);
+        var p = perSource(function (src) {
+            return post('/RetextureEngine/RevertQueue', { source: src, requeue: true });
+        });
+        if (!p) { $b.prop('disabled', false); return; }
+        p.then(function (res) {
+            $('#reQueueText').text('Reverted ' + sum(res, 'reverted') + ' jobs \u00b7 ' +
+                sum(res, 'itemsRestored') + ' items restored \u00b7 ' +
+                sum(res, 'displaysPurged') + ' displays deleted \u00b7 patch rebuilt');
+            loadBatchSources();
+        }).always(function () { $b.prop('disabled', false); });
+    }
+
+    // Sweep minted displays nothing references any more: re-run debris from before
+    // recycling existed, plus anything left behind by a lootifier rollback.
+    function purgeOrphans() {
+        var $b = $('#rePurgeBtn').prop('disabled', true);
+        post('/RetextureEngine/PurgeOrphans', { apply: false })
+            .done(function (r) {
+                if (!r || !r.success) { $('#reQueueText').text((r && r.error) || 'Purge check failed'); return; }
+                if (!r.orphans) { $('#reQueueText').text('No orphaned displays (' + r.minted + ' minted, all referenced).'); return; }
+                if (!confirm(r.orphans + ' of ' + r.minted + ' minted displays are unreferenced.\n\n' +
+                    'Delete their BLP rows and rebuild patch-4.MPQ?')) return;
+                $b.prop('disabled', true);
+                post('/RetextureEngine/PurgeOrphans', { apply: true })
+                    .done(function (r2) {
+                        $('#reQueueText').text(r2 && r2.success
+                            ? 'Purged ' + r2.orphans + ' displays (' + r2.deleted + ' rows) \u00b7 patch now ' + r2.mpqFiles + ' files'
+                            : ((r2 && r2.error) || 'Purge failed'));
+                        loadBatchSources();
+                    })
+                    .fail(function () { $('#reQueueText').text('Purge request failed'); })
+                    .always(function () { $b.prop('disabled', false); });
+            })
+            .fail(function () { $('#reQueueText').text('Purge check failed'); })
+            .always(function () { $b.prop('disabled', false); });
+    }
+
+    // patch-4.MPQ itself. The rebuild auto-copies to the WSL client folder, but
+    // the REAL client reads C:\WoW Vanilla\Data\ — that copy is manual, which is
+    // what this button is for.
+    function refreshPatchInfo() {
+        $.getJSON('/RetextureEngine/PatchStatus', function (d) {
+            if (!d || !d.success) { $('#rePatchInfo').empty(); return; }
+            $('#reDownloadBtn').prop('disabled', !d.available);
+            if (!d.available) { $('#rePatchInfo').text('No retextures committed yet.'); return; }
+            var bits = [d.fileName];
+            if (d.onDisk) {
+                bits.push(d.sizeMb + ' MB');
+                if (d.builtUtc) bits.push('built ' + new Date(d.builtUtc).toLocaleString());
+            } else {
+                bits.push('will be rebuilt on download');
+            }
+            $('#rePatchInfo').text(bits.join(' \u00b7 ') + '  \u2014 copy into the client Data folder yourself');
+        }).fail(function () { $('#rePatchInfo').empty(); });
+    }
+
+    function downloadPatch() {
+        window.location = '/RetextureEngine/DownloadPatch';
     }
 
     function rebuildPatch() {
         var $b = $('#reRebuildBtn').prop('disabled', true);
-        $.ajax({ url: '/Items/RebuildRetexturePatch', method: 'POST', contentType: 'application/json', data: '{}' })
-            .done(function (r) { $('#reQueueText').text(r && r.success ? 'Patch rebuilt.' : ((r && r.error) || 'Rebuild done.')); })
+        post('/RetextureEngine/RebuildPatch', {})
+            .done(function (r) {
+                $('#reQueueText').text(r && r.success
+                    ? 'Patch rebuilt \u00b7 ' + r.mpqFiles + ' files'
+                    : ((r && r.error) || 'Rebuild done.'));
+            })
             .fail(function () { $('#reQueueText').text('Rebuild request failed'); })
             .always(function () { $b.prop('disabled', false); });
     }

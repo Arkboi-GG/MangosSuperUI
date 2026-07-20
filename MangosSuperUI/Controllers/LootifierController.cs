@@ -59,6 +59,17 @@ public class LootifierController : Controller
     private const int LOOTIFIER_ID_START = 950000;
     private const string CHARACTERS_DB = "characters"; // player item_instance lives here (same server, mangos user has rights)
 
+    // ── RECURSION GUARD ──
+    // Every item the Lootifier mints lands in item_template at entry >=
+    // LOOTIFIER_ID_START, and its pool row lands in reference_loot_template
+    // (mincountOrRef > 0) under a ref the creature points at. That makes a
+    // generated variant structurally indistinguishable from a vanilla shared-pool
+    // drop, so the NEXT batch scan picked it up as a BASE item and lootified it
+    // again — "Improved Improved Smite's Reaver", "Mr. Smite's Improved Smite's
+    // Reaver", and N^2 growth per run. Anything at or above this floor is our own
+    // output and can never be a base.
+    private static bool IsGeneratedEntry(int entry) => entry >= LOOTIFIER_ID_START;
+
     // Loot group used for freshly-minted direct-drop variant pools.
     private const int POOL_GROUP_ID = 98;
 
@@ -87,6 +98,18 @@ public class LootifierController : Controller
 
     // ── Additive-generation dials (mirror Quest/Crafting Lootifiers) ──
     private const float MIN_DELTA_BUDGET = 2.0f;   // additive floor: every variant is a real upgrade
+    // Minimum stat-budget SEPARATION between consecutive tiers. On a small base
+    // (Belt of the Fang: +3 Sta/+2 Agi = 5 weighted) a 10% and a 50% boost are only
+    // 0.5 and 2.5 budget apart, and MIN_DELTA_BUDGET floors BOTH to 2.0 — so every
+    // tier rolled an identical stat block, the fingerprint dedup killed the repeats,
+    // and 9 requested variants collapsed to 2. Each tier now gets a floor one step
+    // above the tier below it, guaranteeing the ladder stays distinguishable no
+    // matter how weak the base item is.
+    private const float MIN_TIER_STEP = 1.5f;
+
+    // Set by the most recent GenerateVariants call on this controller instance.
+    private int LastRequestedVariantCount;
+    private int LastProducedVariantCount;
     private const float LOOT_BUMP_BIAS = 0.5f;     // delta split: existing-line bumps vs new affixes
 
     // ── Weapon DPS by tier (damage-only; weapon SPEED/delay is never touched) ──
@@ -194,24 +217,28 @@ public class LootifierController : Controller
         {
             statNames = STAT_NAMES,
             defaultStatWeights = DEFAULT_STAT_WEIGHTS,
+            // minBoostPct/maxBoostPct = how much stronger than the base item this tier
+            // rolls, as a % of the base's weighted stat budget. This IS the strength
+            // control — same ladder the Crafting Lootifier ships with. minPct/maxPct
+            // are legacy and only consulted for a tier with no Boost set.
             defaultNamingTiers = new[]
             {
-                new { minPct = 0, maxPct = 79, label = "Improved", position = "prefix", goldBumpPct = 40f, dpsBumpPct = 8f, slots = 0 },
-                new { minPct = 80, maxPct = 89, label = "of Power", position = "suffix", goldBumpPct = 60f, dpsBumpPct = 10.5f, slots = 0 },
-                new { minPct = 90, maxPct = 97, label = "of Glory", position = "suffix", goldBumpPct = 80f, dpsBumpPct = 21.5f, slots = 0 },
-                new { minPct = 98, maxPct = 100, label = "of the Gods", position = "suffix", goldBumpPct = 100f, dpsBumpPct = 30f, slots = 0 }
+                new { minPct = 0, maxPct = 79, label = "Improved", position = "prefix", goldBumpPct = 40f, dpsBumpPct = 8f, slots = 5, minBoostPct = (float?)10f, maxBoostPct = (float?)20f },
+                new { minPct = 80, maxPct = 89, label = "of Power", position = "suffix", goldBumpPct = 60f, dpsBumpPct = 10.5f, slots = 2, minBoostPct = (float?)20f, maxBoostPct = (float?)30f },
+                new { minPct = 90, maxPct = 100, label = "of Glory", position = "suffix", goldBumpPct = 80f, dpsBumpPct = 21.5f, slots = 2, minBoostPct = (float?)30f, maxBoostPct = (float?)45f }
             },
             defaultRuleset = new
             {
                 budgetCeilingPct = 35,
-                variantsPerItem = 10,
+                variantsPerItem = 9,   // matches the default slot split 5 + 2 + 2
                 allowNewAffixes = true,
                 maxAffixCountChange = 1,
                 dropChanceStrategy = "preserve",
                 poolDropChancePct = 100,
-                goldValueScalePct = 100,
                 legendaryGoldBumpPct = 500,
-                legendaryDpsBumpPct = 30
+                legendaryDpsBumpPct = 30,
+                legendaryBoostMinPct = 55,
+                legendaryBoostMaxPct = 75
             },
             // Vanilla weapon-DPS reference so the UI can relate a tier's damage bump
             // to blue/purple/legendary at the base weapon's level.
@@ -357,6 +384,9 @@ public class LootifierController : Controller
 
         foreach (var itemEntry in request.itemEntries)
         {
+            // Recursion guard — a generated variant can never be a base item.
+            if (IsGeneratedEntry(itemEntry)) continue;
+
             var item = await conn.QueryFirstOrDefaultAsync<dynamic>(@"
                 SELECT * FROM item_template
                 WHERE entry = @E AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = @E)",
@@ -529,7 +559,12 @@ public class LootifierController : Controller
         // Note there's deliberately NO stat/spell requirement: a plain white
         // equippable with no stats is still a valid base — GenerateVariants mints
         // a budget from its item level.
-        string ItemFilter() => "(it.class IN (2, 4) AND it.inventory_type > 0)";
+        //
+        // The `it.entry < LOOTIFIER_ID_START` clause is the recursion guard: our
+        // own variants sit in reference_loot_template exactly like a vanilla
+        // shared pool, so without it the second run scans run one's output as
+        // base items and lootifies the lootified (see IsGeneratedEntry).
+        string ItemFilter() => $"(it.class IN (2, 4) AND it.inventory_type > 0 AND it.entry < {LOOTIFIER_ID_START})";
 
         var p1 = new DynamicParameters();
         var w1 = new List<string> { "lt.mincountOrRef > 0", ItemFilter() };
@@ -701,6 +736,9 @@ public class LootifierController : Controller
 
         foreach (var itemEntry in request.itemEntries)
         {
+            // Recursion guard — previews must show what will actually be built.
+            if (IsGeneratedEntry(itemEntry)) continue;
+
             var item = await conn.QueryFirstOrDefaultAsync<dynamic>(@"
                 SELECT * FROM item_template
                 WHERE entry = @E AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = @E)",
@@ -784,6 +822,8 @@ public class LootifierController : Controller
         int creaturesProcessed = 0;
         int pairsSkipped = 0;
         int regenReused = 0, regenRemoved = 0, regenRemapped = 0;
+        // Slots the fingerprint dedup couldn't fill (roll space exhausted on a weak base).
+        int variantsRequested = 0, variantsShort = 0, itemsShort = 0;
         var regenRng = new Random();
         // Regenerate re-expands prior-run pairs; still dedup within THIS run only.
         var thisRunPairs = new HashSet<(int, int)>();
@@ -824,6 +864,11 @@ public class LootifierController : Controller
 
             foreach (var itemEntry in creatureGroup.itemEntries)
             {
+                // Recursion guard: never lootify our own output. A stale client
+                // payload or a hand-built request can still carry a generated
+                // entry even with the scan filtered, so it's re-checked here.
+                if (IsGeneratedEntry(itemEntry)) { pairsSkipped++; continue; }
+
                 // Dedup: additive pools are per-creature; preserve pools per loot_id.
                 var dedupKey = additive ? (creatureGroup.creatureEntry, itemEntry) : (lootId, itemEntry);
                 if (request.regenerate)
@@ -907,6 +952,12 @@ public class LootifierController : Controller
                     else
                     {
                         var variants = GenerateVariants(item, analysis, ruleset);
+                        variantsRequested += LastRequestedVariantCount;
+                        if (LastProducedVariantCount < LastRequestedVariantCount)
+                        {
+                            variantsShort += LastRequestedVariantCount - LastProducedVariantCount;
+                            itemsShort++;
+                        }
 
                         int nextId = await GetNextLootifierId(adminConn);
                         var createdEntries = new List<int>();
@@ -1029,7 +1080,7 @@ public class LootifierController : Controller
                 + (request.regenerate ? $"; regenerate: {regenReused} refreshed in place, {regenRemoved} removed, {regenRemapped} owned copies rerolled" : "")
         });
 
-        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, creaturesProcessed, pairsSkipped, regenReused, regenRemoved, regenRemapped, warnings = _poolWarnings });
+        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, creaturesProcessed, pairsSkipped, regenReused, regenRemoved, regenRemapped, variantsRequested, variantsShort, itemsShort, warnings = _poolWarnings });
     }
 
     /// <summary>
@@ -1162,6 +1213,8 @@ public class LootifierController : Controller
         foreach (var itemGroup in request.variants)
         {
             if (itemGroup.rolls == null || itemGroup.rolls.Length == 0) continue;
+            // Recursion guard — a generated variant can never be a base item.
+            if (IsGeneratedEntry(itemGroup.baseItemEntry)) continue;
 
             var baseItem = await mangosConn.QueryFirstOrDefaultAsync<dynamic>(@"
                 SELECT * FROM item_template
@@ -1309,7 +1362,19 @@ public class LootifierController : Controller
         if (!await TableExists(adminConn, "lootifier_generated_items"))
             return Json(new { success = false, error = "No lootifier data found" });
 
-        string where = request.creatureEntry > 0 ? "WHERE creature_entry = @CE" : "WHERE 1=1";
+        // ── SCOPE GUARD ──
+        // All three lootifiers share lootifier_generated_items and are told
+        // apart by the creature_entry sentinel:
+        //     > 0  ARPG   (a real creature entry)
+        //     = 0  Quest  (QuestLootifier)
+        //     = -1 Crafting (CraftingLootifier)
+        // "Rollback All" used to be WHERE 1=1, which deleted the quest and
+        // crafting variants (and their tracking rows) along with the ARPG ones.
+        // Scoped to creature_entry > 0 so this endpoint only ever unwinds its
+        // own work; quest/crafting have their own rollback endpoints.
+        string where = request.creatureEntry > 0
+            ? "WHERE creature_entry = @CE"
+            : "WHERE creature_entry > 0";
 
         var generatedItems = (await adminConn.QueryAsync<dynamic>(
             $"SELECT generated_entry, base_entry, creature_entry FROM lootifier_generated_items {where}",
@@ -1543,10 +1608,14 @@ public class LootifierController : Controller
         if (!await TableExists(adminConn, "lootifier_generated_items"))
             return Json(new { active = false, totalItems = 0, creatures = Array.Empty<object>() });
 
-        var totalItems = await adminConn.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM lootifier_generated_items");
+        // creature_entry > 0 = ARPG only (0 = quest, -1 = crafting — see Rollback).
+        var totalItems = await adminConn.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM lootifier_generated_items WHERE creature_entry > 0");
         var creatures = await adminConn.QueryAsync<dynamic>(@"
             SELECT creature_entry AS creatureEntry, COUNT(*) AS variantCount, MIN(created_at) AS firstCreated
-            FROM lootifier_generated_items GROUP BY creature_entry ORDER BY creature_entry");
+            FROM lootifier_generated_items
+            WHERE creature_entry > 0
+            GROUP BY creature_entry ORDER BY creature_entry");
 
         return Json(new { active = totalItems > 0, totalItems, creatures });
     }
@@ -1579,7 +1648,33 @@ public class LootifierController : Controller
             baseBudget = EstimateBudgetFromItemLevel(itemLevel);
         }
 
-        float maxBudget = baseBudget * (1 + ruleset.budgetCeilingPct / 100f);
+        // ── How strong a variant rolls ──
+        // Boost % per tier is THE control, exactly like the Crafting Lootifier:
+        // a tier with Boost 30-40 rolls 30-40% above the base item's weighted
+        // budget. Nothing global caps it.
+        //
+        // budgetCeilingPct survives ONLY as a fallback for a tier that has no Boost
+        // set — an old saved ruleset, or an API caller still posting the pre-Boost
+        // shape. Such a tier keeps the legacy meaning of minPct/maxPct: a percentile
+        // slice of the [floor, base+ceiling] headroom. Nothing in the UI produces
+        // that shape any more.
+        //
+        // maxBudget is the top of the whole ladder and must cover every tier, so
+        // budgetPct (which feeds quality, gold, DPS and pool rarity) stays a
+        // meaningful 0-100 position on it.
+        float ceilingBoost = 0f;
+        bool anyBoost = false;
+        foreach (var t in tiers)
+            if (t.HasBoost)
+            {
+                anyBoost = true;
+                ceilingBoost = Math.Max(ceilingBoost, Math.Max(t.minBoostPct!.Value, t.maxBoostPct!.Value));
+            }
+        // Legacy tiers still need the global ceiling; boost-only rulesets ignore it.
+        if (!anyBoost || tiers.Any(t => !t.HasBoost))
+            ceilingBoost = Math.Max(ceilingBoost, ruleset.budgetCeilingPct);
+
+        float maxBudget = baseBudget * (1 + ceilingBoost / 100f);
         // Anchor the variant budget floor a hair above base (1.02×) so even the
         // lowest roll is a mild upgrade rather than a below-base sidegrade. Tiers
         // subdivide the headroom [floor, maxBudget] rather than [0, maxBudget].
@@ -1617,16 +1712,35 @@ public class LootifierController : Controller
 
             for (int s = 0; s < slotsForTier; s++)
             {
-                // Roll budget within this tier's range (anchored at floorBudget)
-                float tierMinBudget = floorBudget + budgetSpan * (tier.minPct / 100f);
-                float tierMaxBudget = floorBudget + budgetSpan * (Math.Min(tier.maxPct, 100f) / 100f);
+                // Roll budget within this tier's range.
+                //   boost set  -> absolute: base x (1 + boost%), floored at floorBudget
+                //                 so a 0% tier is still a hair above base, not below it
+                //   boost blank-> legacy: percentile position inside [floor, ceiling]
+                float tierMinBudget, tierMaxBudget;
+                if (tier.HasBoost)
+                {
+                    float lo = Math.Min(tier.minBoostPct!.Value, tier.maxBoostPct!.Value);
+                    float hi = Math.Max(tier.minBoostPct!.Value, tier.maxBoostPct!.Value);
+                    tierMinBudget = Math.Max(floorBudget, baseBudget * (1f + lo / 100f));
+                    tierMaxBudget = Math.Max(tierMinBudget, baseBudget * (1f + hi / 100f));
+                }
+                else
+                {
+                    tierMinBudget = floorBudget + budgetSpan * (tier.minPct / 100f);
+                    tierMaxBudget = floorBudget + budgetSpan * (Math.Min(tier.maxPct, 100f) / 100f);
+                }
                 float budgetRoll = tierMinBudget + (float)rng.NextDouble() * (tierMaxBudget - tierMinBudget);
                 float budgetPct = maxBudget > 0 ? (budgetRoll / maxBudget) * 100f : 0;
+
+                // Ordered floor: tier N is guaranteed at least MIN_TIER_STEP more
+                // budget than tier N-1, so a weak base still yields a real ladder
+                // instead of every tier flooring to the same MIN_DELTA_BUDGET.
+                float tierMinDelta = MIN_DELTA_BUDGET + tierIdx * MIN_TIER_STEP;
 
                 List<StatRoll> stats;
                 if (hasStats)
                 {
-                    stats = RollStats(rng, budgetRoll, presentTypes, eligibleList, analysis, ruleset);
+                    stats = RollStats(rng, budgetRoll, presentTypes, eligibleList, analysis, ruleset, tierMinDelta);
                 }
                 else
                 {
@@ -1659,7 +1773,7 @@ public class LootifierController : Controller
                         budgetPct = maxBudget > 0 ? (budgetRoll / maxBudget) * 100f : 0;
 
                         stats = hasStats
-                            ? RollStats(rng, budgetRoll, presentTypes, eligibleList, analysis, ruleset)
+                            ? RollStats(rng, budgetRoll, presentTypes, eligibleList, analysis, ruleset, tierMinDelta)
                             : RollStatsForSpellItem(rng, budgetRoll, eligibleList, family);
 
                         candidate = new VariantData
@@ -1681,6 +1795,12 @@ public class LootifierController : Controller
             }
         }
 
+        // Requested vs produced. The fingerprint dedup drops a slot when the roll
+        // space is exhausted (a very weak base has few distinct integer stat
+        // allocations), so callers can report the gap rather than silently
+        // shipping fewer variants than the operator asked for.
+        LastRequestedVariantCount = tierAllocations.Sum();
+        LastProducedVariantCount = variants.Count;
         return variants.OrderBy(v => v.budgetPct).ToList();
     }
 
@@ -1816,9 +1936,13 @@ public class LootifierController : Controller
         if (l.Contains("glory") || l.Contains("fury")) return "glory";
         if (l.Contains("power")) return "power";
         if (l.Contains("improv")) return "improved";
-        if (budgetPct >= 98f) return "gods";
-        if (budgetPct >= 90f) return "glory";
-        if (budgetPct >= 80f) return "power";
+        // Numeric fallback for a CUSTOM band name only (nothing matched above).
+        // budgetPct is this variant's position on the ladder, 0-100, where 100 is
+        // the strongest tier's ceiling — so the buckets are relative, not absolute.
+        // Name your bands Improved/Power/Glory/Gods and this never runs.
+        if (budgetPct >= 90f) return "gods";
+        if (budgetPct >= 70f) return "glory";
+        if (budgetPct >= 45f) return "power";
         return "improved";
     }
 
@@ -1832,13 +1956,20 @@ public class LootifierController : Controller
     //   blue      → blue  / blue  / purple/ orange
     //   purple    → purple/ purple/ purple/ orange
     //   legendary → orange/ orange/ orange/ orange
+    // Relative colour ladder: each rung is one quality step above the rung below,
+    // so a green base reads green / blue / purple / legendary instead of collapsing
+    // the first two rungs onto the base colour (which gave 7 greens + 2 blues on a
+    // 5/2/2 split when the operator expected 5 / 2 / 2).
+    //   improved -> base      power -> +1      glory -> +2 (capped purple)
+    //   gods/legendary -> 5
     private static int VariantQuality(string tier, int baseQuality)
     {
         int b = baseQuality <= 1 ? 2 : baseQuality;      // white + stats floors at green
         int q;
-        if (tier == "gods") q = Math.Min(b + 2, 5);      // legendary
-        else if (tier == "glory") q = Math.Min(b + 1, 4);// +1, capped at purple
-        else q = b;                                      // improved / power keep base colour
+        if (tier == "gods") q = 5;                       // legendary, always orange
+        else if (tier == "glory") q = Math.Min(b + 2, 4);// +2, capped at purple
+        else if (tier == "power") q = Math.Min(b + 1, 4);// +1, capped at purple
+        else q = b;                                      // improved keeps the base colour
         return Math.Clamp(Math.Max(b, q), 2, 5);         // never below the base's own quality
     }
 
@@ -1920,7 +2051,7 @@ public class LootifierController : Controller
     // MIN_DELTA_BUDGET so even the lowest tier is a real upgrade. The bonus is
     // split between bumping existing lines and adding new affixes.
     private List<StatRoll> RollStats(Random rng, float budgetRoll, int[] presentTypes,
-        List<int> eligibleList, dynamic analysis, RulesetDto ruleset)
+        List<int> eligibleList, dynamic analysis, RulesetDto ruleset, float minDelta = MIN_DELTA_BUDGET)
     {
         float baseWeighted = (float)analysis.weightedBudget;
 
@@ -1933,7 +2064,7 @@ public class LootifierController : Controller
             if (st > 0 && sv != 0) lines[st] = sv;
         }
 
-        float delta = Math.Max(MIN_DELTA_BUDGET, budgetRoll - baseWeighted);
+        float delta = Math.Max(minDelta, budgetRoll - baseWeighted);
 
         int slotRoom = Math.Max(0, 10 - lines.Count);
         var newCandidates = eligibleList.Where(t => !lines.ContainsKey(t)).ToList();
@@ -1955,7 +2086,7 @@ public class LootifierController : Controller
             {
                 float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
                 float share = existingPortion * (w / totalW);
-                int add = (int)Math.Round(share / w);
+                int add = (int)Math.Round(share / w, MidpointRounding.AwayFromZero);
                 if (add > 0) lines[k] += add;
             }
         }
@@ -1964,6 +2095,15 @@ public class LootifierController : Controller
         // whole delta back into existing lines so the tier budget still lands.
         if (canAddNew && newPortion > 0f)
         {
+            // "hybrid" always seeds the candidate pool alongside the detected family.
+            // A physical item's family is Agi/Str/Sta — with two of those already on
+            // the base there was exactly ONE new affix to pick from, so every roll
+            // produced the same stat line and the dedup threw the rest away.
+            if (newCandidates.Count < 2)
+            {
+                foreach (var t in STAT_FAMILIES["hybrid"])
+                    if (!lines.ContainsKey(t) && !newCandidates.Contains(t)) newCandidates.Add(t);
+            }
             int maxNew = Math.Min(Math.Max(1, ruleset.maxAffixCountChange), Math.Min(slotRoom, newCandidates.Count));
             int newCount = 1 + rng.Next(maxNew);
             var picks = newCandidates.OrderBy(_ => rng.Next()).Take(newCount).ToList();
@@ -1973,7 +2113,7 @@ public class LootifierController : Controller
             {
                 float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
                 float share = newPortion * (w / totalW);
-                int val = Math.Max(1, (int)Math.Round(share / w));
+                int val = Math.Max(1, (int)Math.Round(share / w, MidpointRounding.AwayFromZero));
                 lines[k] = lines.GetValueOrDefault(k, 0) + val;
             }
         }
@@ -1985,7 +2125,7 @@ public class LootifierController : Controller
             foreach (var k in keys)
             {
                 float w = DEFAULT_STAT_WEIGHTS.GetValueOrDefault(k, 1.0f);
-                int add = (int)Math.Round(leftover * (w / totalW) / w);
+                int add = (int)Math.Round(leftover * (w / totalW) / w, MidpointRounding.AwayFromZero);
                 if (add > 0) lines[k] += add;
             }
         }
@@ -2023,7 +2163,9 @@ public class LootifierController : Controller
                     maxPct = t.maxPct,
                     label = t.label ?? "",
                     position = t.position ?? "suffix",
-                    slots = Math.Max(0, t.slots)
+                    slots = Math.Max(0, t.slots),
+                    minBoostPct = t.minBoostPct,
+                    maxBoostPct = t.maxBoostPct
                 })
                 .ToList();
         }
@@ -2343,7 +2485,11 @@ public class LootifierController : Controller
         if (!hasStats && hasSpellEffects)
             baseBudget = EstimateBudgetFromItemLevel(GetPropInt(item, "item_level"));
 
-        float legendaryBudget = baseBudget * 1.50f;
+        // Roll inside the legendary's own Boost band, exactly like a naming tier.
+        float legLo = Math.Max(0f, Math.Min(ruleset.legendaryBoostMinPct, ruleset.legendaryBoostMaxPct));
+        float legHi = Math.Max(0f, Math.Max(ruleset.legendaryBoostMinPct, ruleset.legendaryBoostMaxPct));
+        float legBoost = legLo + (float)rng.NextDouble() * (legHi - legLo);
+        float legendaryBudget = baseBudget * (1f + legBoost / 100f);
         int[] presentTypes = (int[])analysis.presentStatTypes;
         string family = (string)analysis.detectedFamily;
 
@@ -2352,9 +2498,14 @@ public class LootifierController : Controller
         foreach (var s in familyStats) eligible.Add(s);
         var eligibleList = eligible.ToList();
 
+        // Floor the legendary one step above the highest naming tier. Without this
+        // it rolled at the bare MIN_DELTA_BUDGET while the top tier sat on
+        // MIN_DELTA_BUDGET + n*MIN_TIER_STEP, so on a low-budget base the purple
+        // came out stronger than the legendary.
+        float legMinDelta = MIN_DELTA_BUDGET + Math.Max(1, ruleset.namingTiers?.Length ?? 3) * MIN_TIER_STEP;
         List<StatRoll> stats;
         if (hasStats)
-            stats = RollStats(rng, legendaryBudget, presentTypes, eligibleList, analysis, ruleset);
+            stats = RollStats(rng, legendaryBudget, presentTypes, eligibleList, analysis, ruleset, legMinDelta);
         else
             stats = RollStatsForSpellItem(rng, legendaryBudget, eligibleList, family);
 
@@ -2431,7 +2582,11 @@ public class LootifierController : Controller
         if (!hasStats && hasSpellEffects)
             baseBudget = EstimateBudgetFromItemLevel(GetPropInt(item, "item_level"));
 
-        float legendaryBudget = baseBudget * 1.50f;
+        // Roll inside the legendary's own Boost band, exactly like a naming tier.
+        float legLo = Math.Max(0f, Math.Min(ruleset.legendaryBoostMinPct, ruleset.legendaryBoostMaxPct));
+        float legHi = Math.Max(0f, Math.Max(ruleset.legendaryBoostMinPct, ruleset.legendaryBoostMaxPct));
+        float legBoost = legLo + (float)rng.NextDouble() * (legHi - legLo);
+        float legendaryBudget = baseBudget * (1f + legBoost / 100f);
         int[] presentTypes = (int[])analysis.presentStatTypes;
         string family = (string)analysis.detectedFamily;
 
@@ -2440,8 +2595,13 @@ public class LootifierController : Controller
         foreach (var s in familyStats) eligible.Add(s);
         var eligibleList = eligible.ToList();
 
+        // Floor the legendary one step above the highest naming tier. Without this
+        // it rolled at the bare MIN_DELTA_BUDGET while the top tier sat on
+        // MIN_DELTA_BUDGET + n*MIN_TIER_STEP, so on a low-budget base the purple
+        // came out stronger than the legendary.
+        float legMinDelta = MIN_DELTA_BUDGET + Math.Max(1, ruleset.namingTiers?.Length ?? 3) * MIN_TIER_STEP;
         List<StatRoll> stats = hasStats
-            ? RollStats(rng, legendaryBudget, presentTypes, eligibleList, analysis, ruleset)
+            ? RollStats(rng, legendaryBudget, presentTypes, eligibleList, analysis, ruleset, legMinDelta)
             : RollStatsForSpellItem(rng, legendaryBudget, eligibleList, family);
 
         string itemName = (string)item.name;
@@ -2604,8 +2764,11 @@ public class LootifierController : Controller
             foreach (var t in tiers)
                 if (string.Equals(t.label, tierLabel, StringComparison.OrdinalIgnoreCase))
                     return t.goldBumpPct;
+        // Fallback only fires for an unlabelled roll. Skip boost-mode tiers: their
+        // minPct/maxPct are no longer percentile windows, so containment is meaningless.
         foreach (var t in tiers)
-            if (budgetPct >= t.minPct && budgetPct <= t.maxPct)
+            if (!(t.minBoostPct.HasValue && t.maxBoostPct.HasValue)
+                && budgetPct >= t.minPct && budgetPct <= t.maxPct)
                 return t.goldBumpPct;
         return null;
     }
@@ -2619,23 +2782,23 @@ public class LootifierController : Controller
                 if (string.Equals(t.label, tierLabel, StringComparison.OrdinalIgnoreCase))
                     return t.dpsBumpPct;
         foreach (var t in tiers)
-            if (budgetPct >= t.minPct && budgetPct <= t.maxPct)
+            if (!(t.minBoostPct.HasValue && t.maxBoostPct.HasValue)
+                && budgetPct >= t.minPct && budgetPct <= t.maxPct)
                 return t.dpsBumpPct;
         return null;
     }
 
     // Final buy/sell multiplier for a variant. An explicit per-tier (or legendary)
-    // Gold +% wins and is master-scaled; a blank tier falls back to the legacy
-    // budget curve, which the master scale still dials.
+    // Gold +% wins; a blank tier falls back to the legacy budget curve.
     private float EffectiveGoldMult(RulesetDto ruleset, string tierLabel, float budgetPct, bool isLegendary)
     {
-        float scale = Math.Max(0f, ruleset.goldValueScalePct) / 100f;
         float? bump = isLegendary
             ? (float?)ruleset.legendaryGoldBumpPct
             : ResolveTierGoldBump(ruleset.namingTiers, tierLabel, budgetPct);
+        // Gold +% is taken literally — what's typed on the row is what's applied.
         if (bump.HasValue)
-            return 1f + (bump.Value / 100f) * scale;
-        return 1f + (GetGoldMultiplier(budgetPct) - 1f) * scale;
+            return 1f + (bump.Value / 100f);
+        return GetGoldMultiplier(budgetPct);
     }
 
     // Current melee DPS of a base item (weapons only) from dmg_min/max over delay.
@@ -3517,6 +3680,9 @@ public class LootifierController : Controller
                 quality = item != null ? (int)item.quality : 0,
                 itemClass = item != null ? (int)item.@class : 0,
                 equippable = item != null && IsEquippableGear(item),
+                // Our own output. The UI greys these out so a generated variant
+                // can't be ticked as a base on the single-creature page.
+                isGenerated = IsGeneratedEntry(row.item),
                 displayId = item != null ? (uint)item.display_id : 0u,
                 requiredLevel = item != null ? (int)item.required_level : 0,
                 itemLevel = item != null ? (int)item.item_level : 0,
@@ -3685,6 +3851,13 @@ internal class TierRange
     public string label { get; set; } = "";
     public string position { get; set; } = "suffix";
     public int slots { get; set; } = 0;   // explicit count; 0 = auto
+    // Explicit stat boost over base for this tier, as a % of the base item's
+    // weighted budget (e.g. 20-30 = this tier rolls 20-30% stronger than base).
+    // Null = legacy behaviour: minPct/maxPct are read as percentile positions
+    // inside the single global Budget Ceiling headroom.
+    public float? minBoostPct { get; set; }
+    public float? maxBoostPct { get; set; }
+    public bool HasBoost => minBoostPct.HasValue && maxBoostPct.HasValue;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -3706,19 +3879,28 @@ public class LootifierLootRow
 public class RulesetDto
 {
     public float budgetCeilingPct { get; set; } = 35;
-    public int variantsPerItem { get; set; } = 10;
+    public int variantsPerItem { get; set; } = 9;    // default tier slots are 5 + 2 + 2
     public bool allowNewAffixes { get; set; } = true;
     public int maxAffixCountChange { get; set; } = 1;
     public string dropChanceStrategy { get; set; } = "preserve";  // "preserve" | "additive"
     public float poolDropChancePct { get; set; } = 100f;          // additive: overall % that the pool drops anything
     public NamingTierDto[]? namingTiers { get; set; }
     // Value tuning (mirrors Quest/Crafting lootifiers)
-    public float goldValueScalePct { get; set; } = 100f;   // master scale on all gold bumps: 100 = as entered, 0 = prices untouched
+    // RETIRED. Was a master multiplier over every Gold +%, which meant the number
+    // on a tier row was never the number applied. Kept only so an older payload
+    // still deserialises; it is not read anywhere.
+    public float goldValueScalePct { get; set; } = 100f;
     public float legendaryGoldBumpPct { get; set; } = 500f; // legendary price bump above base (%); 500 = the old x6 behaviour
     public float legendaryDpsBumpPct { get; set; } = 30f;   // legendary weapon DAMAGE bump above base (%); nominal — vanilla legendaries were hand-tuned
     // Legendary system
     public bool generateLegendary { get; set; } = false;
     public float legendaryDropPct { get; set; } = 0.2f;
+    // Legendary strength, in the SAME unit as a naming tier's Boost %: how far
+    // above the base item's weighted stat budget it rolls. Was a hardcoded 1.50f
+    // (a flat +50%), which sat INSIDE the default top tier's 40-60 band with no
+    // way to see it or change it. Defaults now put it clearly above the ladder.
+    public float legendaryBoostMinPct { get; set; } = 55f;
+    public float legendaryBoostMaxPct { get; set; } = 75f;
     public string legendarySuffixMelee { get; set; } = "of Destruction";
     public string legendarySuffixRanged { get; set; } = "of the Hunt";
     public string legendarySuffixCaster { get; set; } = "of Arcana";
@@ -3734,6 +3916,11 @@ public class NamingTierDto
     public float? goldBumpPct { get; set; }   // gold price bump above base (%) for this tier; null = legacy budget curve
     public float? dpsBumpPct { get; set; }     // weapon DAMAGE bump above base (%) for this tier; null = damage copied verbatim
     public int slots { get; set; } = 0;        // explicit variant count for this tier; 0 = auto (formula fills to variantsPerItem)
+    // Per-tier stat boost over base, as a % of the base's weighted budget.
+    // Both set => this tier ignores budgetCeilingPct and rolls in [min,max]% over
+    // base. Either null => legacy percentile-of-ceiling behaviour for this tier.
+    public float? minBoostPct { get; set; }
+    public float? maxBoostPct { get; set; }
 }
 
 public class GenerateRequest

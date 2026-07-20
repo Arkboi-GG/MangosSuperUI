@@ -2,7 +2,6 @@ using Dapper;
 using MangosSuperUI.Models;
 using System.Collections.Concurrent;
 using System.Text;
-using War3Net.Drawing.Blp;
 
 namespace MangosSuperUI.Services;
 
@@ -1565,9 +1564,7 @@ public class ItemTextureService
         if (!string.IsNullOrEmpty(dir))
             Directory.CreateDirectory(dir);
 
-        using var ms = new MemoryStream(blpData);
-        var blpFile = new BlpFile(ms);
-        var pixels = blpFile.GetPixels(0, out int w, out int h);
+        var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
 
         // War3Net returns BGRA pixels — convert to SkiaSharp SKBitmap
         using var bitmap = new SkiaSharp.SKBitmap(w, h, SkiaSharp.SKColorType.Bgra8888,

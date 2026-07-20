@@ -3,7 +3,6 @@ using Microsoft.Extensions.Configuration;
 using MangosSuperUI.Services;
 using SkiaSharp;
 using System.Runtime.InteropServices;
-using War3Net.Drawing.Blp;
 
 namespace MangosSuperUI.Controllers;
 
@@ -386,9 +385,7 @@ public partial class PatchController
     /// </summary>
     private static byte[] DecodeBlpToPng(byte[] blpData)
     {
-        using var ms = new MemoryStream(blpData);
-        var blpFile = new BlpFile(ms);
-        var pixels = blpFile.GetPixels(0, out int w, out int h);
+        var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
 
         // War3Net returns BGRA byte array → use Bgra8888 color type
         using var bitmap = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);

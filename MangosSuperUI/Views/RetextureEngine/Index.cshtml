@@ -194,14 +194,23 @@
                     <div class="re-batch-run">
                         <label class="re-check"><input type="checkbox" id="reRequeue" /> Requeue already-queued items</label>
                         <div class="re-batch-using" id="reBatchUsing"></div>
+                        @* Every button below acts on the TICKED sources only. Re-retexture
+                           re-arms processed jobs (Run then recycles the display each one
+                           minted); Revert is the actual undo; Clear is NOT. *@
+                        <div class="re-scope" id="reScopeText">Acting on: &mdash;</div>
                         <div class="re-batch-btns">
                             <button class="re-btn" id="reBuildBtn"><i class="fa-solid fa-layer-group"></i> Build queue</button>
                             <button class="re-btn" id="reRunBtn"><i class="fa-solid fa-play"></i> Run queue</button>
-                            <button class="re-btn re-btn-sm" id="reResetBtn">Requeue failed</button>
-                            <button class="re-btn re-btn-sm" id="reClearBtn">Clear</button>
+                            <button class="re-btn re-btn-sm" id="reRedoBtn" title="Re-arm every processed job for the ticked sources, then Run queue">Re-retexture</button>
+                            <button class="re-btn re-btn-sm" id="reResetBtn" title="Requeue only the failures">Requeue failed</button>
+                            <button class="re-btn re-btn-sm re-btn-warn" id="reRevertBtn" title="Undo: variants back to their original display, minted displays deleted">Revert</button>
+                            <button class="re-btn re-btn-sm" id="rePurgeBtn" title="Delete minted displays nothing points at any more">Purge orphans</button>
                             <button class="re-btn re-btn-sm" id="reRebuildBtn">Rebuild patch</button>
+                            <button class="re-btn re-btn-sm" id="reDownloadBtn"><i class="fa-solid fa-download"></i> Download patch-4</button>
+                            <button class="re-btn re-btn-sm re-btn-warn" id="reClearBtn" title="Delete queue rows. Applied retextures stay applied - this is not an undo">Clear</button>
                         </div>
                         <div class="re-queue-status" id="reQueueText">Queue: &mdash;</div>
+                        <div class="re-patch-info" id="rePatchInfo"></div>
                         <div class="re-bar-wrap" id="reBarWrap"><div class="re-bar" id="reBar"></div></div>
                         <div class="re-failures" id="reFailures"></div>
                     </div>
@@ -878,9 +887,30 @@
         margin: 10px 0;
         }
 
+        .re-scope {
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin-top: 8px;
+        }
+
+        .re-scope.re-scope-empty {
+        color: var(--danger, #d9534f);
+        }
+
+        .re-btn-warn {
+        border-color: var(--danger, #d9534f);
+        color: var(--danger, #d9534f);
+        }
+
         .re-queue-status {
         font-size: 12.5px;
         color: var(--text-secondary);
+        }
+
+        .re-patch-info {
+        font-size: 11.5px;
+        color: var(--text-muted);
+        margin-top: 4px;
         }
 
         .re-bar-wrap {

@@ -94,8 +94,8 @@ public partial class DbcService
     public string GetItemIconPath(uint displayId)
     {
         if (ItemDisplayIcons.TryGetValue(displayId, out var name))
-            return $"/icons/{name}.png";
-        return "/icons/inv_misc_questionmark.png";
+            return $"/Icon/Get?name={name}";
+        return "/Icon/Get?name=inv_misc_questionmark";
     }
 
     /// <summary>Resolve a spell's SpellIconID to an icon web path, or fallback.</summary>
