@@ -45,6 +45,9 @@
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
             gap: 16px;
+            /* each card is as tall as its own content, not as tall as the
+                       tallest card in the row */
+            align-items: start;
         }
 
         .dl-card {
@@ -53,7 +56,19 @@
             border-radius: var(--radius-md);
             padding: 20px;
             transition: border-color 0.15s;
+            /* A long README should not stretch the column it sits in. The card
+                       stops here and its README scrolls inside instead. */
+            max-height: 620px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
         }
+
+            /* header, stats, actions and the collapsibles keep their size; the
+                       README is the only part allowed to give up space */
+            .dl-card > * {
+                flex-shrink: 0;
+            }
 
             .dl-card:hover {
                 border-color: var(--accent);
@@ -286,7 +301,27 @@
             color: var(--text-secondary);
             line-height: 1.6;
             margin-bottom: 14px;
+            /* takes whatever height is left inside the card, then scrolls */
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            padding-right: 8px;
+            border-left: 2px solid var(--border-light);
+            padding-left: 12px;
         }
+
+            .dl-readme::-webkit-scrollbar {
+                width: 8px;
+            }
+
+            .dl-readme::-webkit-scrollbar-thumb {
+                background: var(--border-medium, rgba(255,255,255,0.18));
+                border-radius: 4px;
+            }
+
+            .dl-readme::-webkit-scrollbar-track {
+                background: transparent;
+            }
 
         .dl-readme-h {
             font-size: 13px;

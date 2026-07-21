@@ -165,14 +165,47 @@ public class CharacterModelService
                 _logger.LogWarning("CharacterModelService: no default skin BLP at {Path} — GLB will have fallback grey material", skinMpqPath);
             }
 
-            // ── Build texture dictionary, slotting the skin into the type-1 slot ──
-            // (Same approach ItemTextureService uses for weapons with DBC-resolved textures.)
+            // ── Composite the face overlay ONCE, up front ──
+            //
+            // Session R built this composite but only ever wrote it to disk for
+            // the client-side compositor to pick up. The GLB itself was still
+            // baked with the RAW skin BLP, so a freshly loaded character carried
+            // no face overlay at all — which is why eyes read as closed on every
+            // race whose base BLP has no eye detail painted in, and why the two
+            // that did work (Human Female, Troll Female) worked by accident.
+            //
+            // Compose here, then use the SAME bytes for both the GLB material
+            // and the client PNG, so the two can never disagree.
+            byte[]? skinPng = null;
+            if (skinBlp != null)
+            {
+                try { skinPng = _skinCompositor.ComposeDefaultSkin(race, gender, skinBlp); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "CharacterModelService: face composite threw for {Key}", key);
+                }
+                skinPng ??= BlpToPng(skinBlp);   // bare-skin fallback
+            }
+
+            // ── Build texture dictionary ──
+            // Values are BLP bytes EXCEPT the body-skin slot, which carries the
+            // composited PNG. SkinnedGlbWriter sniffs the PNG signature per slot.
             var textures = new Dictionary<int, byte[]>();
             if (skinBlp != null)
             {
                 int skinSlot = FindSkinTextureSlot(m2);
                 if (skinSlot >= 0)
-                    textures[skinSlot] = skinBlp;
+                {
+                    textures[skinSlot] = skinPng ?? skinBlp;
+                    _logger.LogInformation(
+                        "CharacterModelService: bound body skin for {Key} slot={Slot} ({Kind})",
+                        key, skinSlot, skinPng != null ? "composited PNG" : "raw BLP");
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "CharacterModelService: {Key} has NO Type=1 (SKIN) slot in M2 texture table", key);
+                }
             }
 
             // ── Extract default hair BLP and bind to the type-6 slot ──
@@ -180,10 +213,10 @@ public class CharacterModelService
             // Session S fix for the hair-textured-with-body-atlas bug.
             // Character M2s have a separate texture slot (Type=6,
             // TEX_COMPONENT_CHAR_HAIR) for the hair color BLP. Without it,
-            // SkinnedGlbWriter's material assignment falls through to
-            // materialsByTexIdx.Values.First() — the body atlas — and hair
-            // geosets render with body-atlas UVs. Visible as a duplicate
-            // face on Dwarf hair, body pixels on Tauren beard, etc.
+            // SkinnedGlbWriter's material assignment used to fall through to
+            // the body atlas and hair geosets rendered with body-atlas UVs.
+            // Visible as a duplicate face on Dwarf hair, body pixels on
+            // Tauren beard, etc.
             //
             // The hair partial path comes from CharSections.dbc (Hair row's
             // TextureName1). We use the same multi-candidate resolver the
@@ -211,7 +244,7 @@ public class CharacterModelService
                         else
                         {
                             _logger.LogWarning(
-                                "CharacterModelService: {Key} has no Type=6 (CHAR_HAIR) texture slot in M2 — hair will fall through to body atlas",
+                                "CharacterModelService: {Key} has no Type=6 (CHAR_HAIR) texture slot in M2 — hair will render MAGENTA",
                                 key);
                         }
                     }
@@ -236,13 +269,7 @@ public class CharacterModelService
             // Type-1 (body skin) and type-6 (hair) are resolved above from
             // DBC/CharSections. Type-0 entries have their BLP path baked
             // directly into the M2 binary — the WoW client loads them
-            // verbatim. These include the NightElf eye glow BLP and similar
-            // race-specific overlays.
-            //
-            // Without extracting these, the SkinnedGlbWriter has no texture
-            // for submeshes that reference type-0 slots, so they fall through
-            // to the body atlas material — painting body-skin pixels onto
-            // eye geometry, producing the "closed eyes" look.
+            // verbatim. These include race-specific overlays.
             for (int i = 0; i < m2.Textures.Count; i++)
             {
                 var tex = m2.Textures[i];
@@ -272,17 +299,22 @@ public class CharacterModelService
                 }
             }
 
-            // Also extract the skin PNG side-by-side for Session C texture compositing.
-            // The web canvas compositor reads from /character_textures/skin/<key>Skin00_00.v{N}.png.
-            // PNG is versioned independently of the GLB so a BLP-decode
-            // change doesn't force GLB regeneration and vice versa.
-            //
-            // Session R: hand off to CharacterSkinCompositor, which layers
-            // CharSections face textures onto FACE_LOWER and FACE_UPPER before
-            // encoding. Bare-BLP fallback so a CharSections lookup failure
-            // still produces a usable (if closed-eyed) PNG — better than an
-            // empty file or a 404.
-            if (skinBlp != null)
+            // Full texture-table dump — one line per slot, with whether we bound
+            // anything to it. This is the artifact that says at a glance which
+            // slot types go unbound on which race, instead of every failure
+            // looking identical on screen.
+            for (int i = 0; i < m2.Textures.Count; i++)
+            {
+                _logger.LogInformation(
+                    "CharacterModelService: {Key} texslot {Slot}: Type={Type} Flags={Flags} File='{File}' bound={Bound}",
+                    key, i, m2.Textures[i].Type, m2.Textures[i].Flags,
+                    m2.Textures[i].Filename, textures.ContainsKey(i));
+            }
+
+            // Write the client-side skin PNG — the same bytes already baked
+            // into the GLB above. The web canvas compositor reads it from
+            // /character_textures/skin/<key>Skin00_00.v{N}.png.
+            if (skinPng != null)
             {
                 Directory.CreateDirectory(CharacterSkinsDir);
                 var skinPngFilename = CacheVersionRegistry.MakeVersioned(
@@ -290,10 +322,7 @@ public class CharacterModelService
                 string skinPngPath = Path.Combine(CharacterSkinsDir, skinPngFilename);
                 try
                 {
-                    var pngBytes = _skinCompositor.ComposeDefaultSkin(race, gender, skinBlp)
-                                   ?? BlpToPng(skinBlp);
-                    if (pngBytes != null)
-                        await File.WriteAllBytesAsync(skinPngPath, pngBytes);
+                    await File.WriteAllBytesAsync(skinPngPath, skinPng);
                 }
                 catch (Exception ex)
                 {

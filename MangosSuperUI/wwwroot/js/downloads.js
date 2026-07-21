@@ -28,10 +28,11 @@ $(function () {
             var html = '';
             data.addons.forEach(function (addon) {
                 var isPlacer = addon.folder === 'MangosSuperUI_Placer';
+                var isBrowser = addon.folder === 'MSUI_LootBrowser';
 
                 html += '<div class="dl-card" data-addon="' + esc(addon.folder) + '">';
                 html += '<div class="dl-card-header">';
-                html += '<div class="dl-card-icon addon"><i class="fa-solid ' + (isPlacer ? 'fa-cubes' : 'fa-puzzle-piece') + '"></i></div>';
+                html += '<div class="dl-card-icon addon"><i class="fa-solid ' + (isPlacer ? 'fa-cubes' : isBrowser ? 'fa-book-open' : 'fa-puzzle-piece') + '"></i></div>';
                 html += '<div>';
                 html += '<div class="dl-card-title">' + esc(addon.title) + '</div>';
                 html += '<div class="dl-card-version">';
@@ -58,7 +59,17 @@ $(function () {
                     html += '<div class="dl-type-pills" id="placerTypePills"></div>';
                 }
 
+                if (isBrowser) {
+                    html += '<div class="dl-stats" id="lbStats">';
+                    html += '<div class="dl-stat">Packaged data: <span class="dl-stat-value" id="lbGenerated">checking\u2026</span></div>';
+                    html += '</div>';
+                    html += '<div class="dl-type-pills" id="lbFreshness"></div>';
+                }
+
                 html += '<div class="dl-actions">';
+                if (isBrowser) {
+                    html += '<button class="dl-btn btn-regen-lootbrowser"><i class="fa-solid fa-rotate"></i> Regenerate data</button>';
+                }
                 html += '<button class="dl-btn primary btn-download-addon" data-name="' + esc(addon.folder) + '">';
                 html += '<i class="fa-solid fa-download"></i> Download';
                 html += '</button>';
@@ -78,6 +89,12 @@ $(function () {
             // Load Placer-specific info if present
             if (data.addons.some(function (a) { return a.folder === 'MangosSuperUI_Placer'; })) {
                 loadPlacerInfo();
+            }
+
+            // MSUI LootBrowser ships a snapshot of the loot tables, so the only thing worth
+            // saying on this page is whether that snapshot still matches the database.
+            if (data.addons.some(function (a) { return a.folder === 'MSUI_LootBrowser'; })) {
+                loadBrowserStatus();
             }
         }).fail(function () {
             $('#addonCards').html('<div class="dl-placeholder"><i class="fa-solid fa-circle-exclamation"></i>Failed to load addon list.</div>');
@@ -132,7 +149,72 @@ $(function () {
         });
     }
 
+    // ===================== LOOTBROWSER FRESHNESS =====================
+
+    // /LootBrowser/Status compares the STAMP line inside the packaged
+    // MSUI_LootBrowserData.lua against live counts in the world and admin databases.
+    // It reports WHAT drifted, not just that something did.
+    function loadBrowserStatus() {
+        $('#lbFreshness').html('<span class="dl-type-pill">checking\u2026</span>');
+
+        $.getJSON('/LootBrowser/Status', function (data) {
+            if (!data.success) {
+                $('#lbFreshness').html('<span class="dl-type-pill">status failed<span class="pill-count">!</span></span>');
+                return;
+            }
+
+            $('#lbGenerated').text(data.generated ? data.generated.replace('T', ' ') : 'never generated');
+
+            var html = '';
+            if (!data.stale) {
+                html += '<span class="dl-type-pill" style="border-color:#3c8c3c;color:#7ec97e;">up to date</span>';
+            } else {
+                html += '<span class="dl-type-pill" style="border-color:#c0392b;color:#e08b80;">stale &mdash; regenerate before downloading</span>';
+                (data.reasons || []).forEach(function (r) {
+                    html += '<span class="dl-type-pill">' + esc(r) + '</span>';
+                });
+            }
+
+            if (data.live) {
+                html += '<span class="dl-type-pill">generated items<span class="pill-count">' +
+                    Number(data.live.variants).toLocaleString() + '</span></span>';
+                html += '<span class="dl-type-pill">custom items<span class="pill-count">' +
+                    Number(data.live.customItems).toLocaleString() + '</span></span>';
+            }
+
+            $('#lbFreshness').html(html);
+        }).fail(function () {
+            $('#lbFreshness').html('<span class="dl-type-pill">status unavailable</span>');
+        });
+    }
+
     // ===================== EVENTS =====================
+
+    $(document).on('click', '.btn-regen-lootbrowser', function () {
+        var $btn = $(this);
+        $btn.prop('disabled', true).html('<i class="fa-solid fa-rotate fa-spin"></i> Rebuilding\u2026');
+        $('#lbFreshness').html('<span class="dl-type-pill">rebuilding from the database\u2026</span>');
+
+        $.post('/LootBrowser/Regenerate', function (data) {
+            if (data && data.success) {
+                var t = data.totals || {};
+                $('#lbFreshness').html(
+                    '<span class="dl-type-pill" style="border-color:#3c8c3c;color:#7ec97e;">rebuilt</span>' +
+                    '<span class="dl-type-pill">bosses<span class="pill-count">' + (t.nodes || 0) + '</span></span>' +
+                    '<span class="dl-type-pill">items<span class="pill-count">' + (t.items || 0) + '</span></span>' +
+                    '<span class="dl-type-pill">variants<span class="pill-count">' + (t.variants || 0) + '</span></span>'
+                );
+                loadBrowserStatus();
+            } else {
+                $('#lbFreshness').html('<span class="dl-type-pill" style="border-color:#c0392b;color:#e08b80;">' +
+                    esc((data && data.error) || 'rebuild failed') + '</span>');
+            }
+        }).fail(function () {
+            $('#lbFreshness').html('<span class="dl-type-pill" style="border-color:#c0392b;color:#e08b80;">rebuild failed</span>');
+        }).always(function () {
+            $btn.prop('disabled', false).html('<i class="fa-solid fa-rotate"></i> Regenerate data');
+        });
+    });
 
     $(document).on('click', '.btn-download-addon', function () {
         var name = $(this).data('name');
@@ -151,38 +233,63 @@ $(function () {
 
     // ===================== HELPERS =====================
 
+    // A line break inside a paragraph is not a paragraph break. Markdown joins
+    // wrapped lines; rendering one <p> per line chops sentences in half, which is
+    // exactly what a hard-wrapped README looks like once it hits this page.
     function renderMarkdown(md) {
         if (!md) return '';
         var lines = md.split('\n');
         var html = '';
         var inList = false;
+        var para = [];
+        var item = null;
+
+        function flushPara() {
+            if (para.length) {
+                html += '<p class="dl-readme-p">' + inlineFormat(para.join(' ')) + '</p>';
+                para = [];
+            }
+        }
+        function flushItem() {
+            if (item !== null) {
+                html += '<li>' + inlineFormat(item) + '</li>';
+                item = null;
+            }
+        }
+        function closeList() {
+            flushItem();
+            if (inList) { html += '</ul>'; inList = false; }
+        }
 
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i];
+            var trimmed = line.replace(/^\s+|\s+$/g, '');
 
-            // Headers
-            if (line.match(/^### /)) { if (inList) { html += '</ul>'; inList = false; } html += '<h4 class="dl-readme-h">' + inlineFormat(line.substring(4)) + '</h4>'; continue; }
-            if (line.match(/^## /)) { if (inList) { html += '</ul>'; inList = false; } html += '<h3 class="dl-readme-h">' + inlineFormat(line.substring(3)) + '</h3>'; continue; }
-            if (line.match(/^# /)) { if (inList) { html += '</ul>'; inList = false; } html += '<h3 class="dl-readme-h">' + inlineFormat(line.substring(2)) + '</h3>'; continue; }
+            // headers
+            if (line.match(/^### /)) { flushPara(); closeList(); html += '<h4 class="dl-readme-h">' + inlineFormat(line.substring(4)) + '</h4>'; continue; }
+            if (line.match(/^## /)) { flushPara(); closeList(); html += '<h3 class="dl-readme-h">' + inlineFormat(line.substring(3)) + '</h3>'; continue; }
+            if (line.match(/^# /)) { flushPara(); closeList(); html += '<h3 class="dl-readme-h">' + inlineFormat(line.substring(2)) + '</h3>'; continue; }
 
-            // List items
+            // new list item
             if (line.match(/^[-*] /)) {
+                flushPara();
+                flushItem();
                 if (!inList) { html += '<ul class="dl-readme-list">'; inList = true; }
-                html += '<li>' + inlineFormat(line.substring(2)) + '</li>';
+                item = line.substring(2);
                 continue;
             }
 
-            // Blank line
-            if (line.trim() === '') {
-                if (inList) { html += '</ul>'; inList = false; }
-                continue;
-            }
+            // blank line ends whatever is open
+            if (trimmed === '') { flushPara(); closeList(); continue; }
 
-            // Paragraph
-            if (inList) { html += '</ul>'; inList = false; }
-            html += '<p class="dl-readme-p">' + inlineFormat(line) + '</p>';
+            // anything else continues the current list item, or the paragraph
+            if (item !== null) { item += ' ' + trimmed; continue; }
+            closeList();
+            para.push(trimmed);
         }
-        if (inList) html += '</ul>';
+
+        flushPara();
+        closeList();
         return html;
     }
 

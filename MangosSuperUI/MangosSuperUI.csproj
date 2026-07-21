@@ -52,6 +52,7 @@
 
 
 	<ItemGroup>
+		<Folder Include="wwwroot\addons\MSUI_LootBrowser\" />
 		<Folder Include="wwwroot\character_models\" />
 		<Folder Include="wwwroot\character_textures\" />
 	</ItemGroup>

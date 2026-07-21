@@ -1,0 +1,176 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.blizzard.com/wow/ui/ ..\FrameXML\UI.xsd">
+
+	<!-- Window shell only. The repeating rows in all three columns are created in
+	     Lua (MSUI_LootBrowser.lua), because the row count depends on data, not layout.
+
+	     Columns, left to right:
+	       MSUILB_Cat    macro categories (Dungeons / Raids / Crafting), expanding
+	                       to the instances inside them, ordered by level
+	       MSUILB_Nav    the selected instance's bosses, plus one "Trash Mobs" node
+	       MSUILB_List   the loot itself
+	-->
+
+	<Frame name="MSUILB_Frame" toplevel="true" movable="true" enableMouse="true" hidden="true" parent="UIParent">
+		<Size>
+			<AbsDimension x="880" y="520"/>
+		</Size>
+		<Anchors>
+			<Anchor point="CENTER"/>
+		</Anchors>
+		<!-- Flat fill rather than the tiled parchment: the window is a dense list
+		     and the dialog texture shows the world through it. Tinted to black in
+		     MSUILB_OnLoad via SetBackdropColor. -->
+		<Backdrop bgFile="Interface\Buttons\WHITE8X8"
+		          edgeFile="Interface\DialogFrame\UI-DialogBox-Border" tile="true">
+			<BackgroundInsets>
+				<AbsInset left="11" right="12" top="12" bottom="11"/>
+			</BackgroundInsets>
+			<TileSize>
+				<AbsValue val="32"/>
+			</TileSize>
+			<EdgeSize>
+				<AbsValue val="32"/>
+			</EdgeSize>
+		</Backdrop>
+
+		<Layers>
+			<Layer level="ARTWORK">
+				<FontString name="MSUILB_Title" inherits="GameFontNormal" text="MSUI LootBrowser">
+					<Anchors>
+						<Anchor point="TOP">
+							<Offset>
+								<AbsDimension x="0" y="-18"/>
+							</Offset>
+						</Anchor>
+					</Anchors>
+				</FontString>
+				<FontString name="MSUILB_Status" inherits="GameFontDisableSmall" justifyH="LEFT">
+					<Size>
+						<AbsDimension x="700" y="12"/>
+					</Size>
+					<Anchors>
+						<Anchor point="BOTTOMLEFT">
+							<Offset>
+								<AbsDimension x="24" y="20"/>
+							</Offset>
+						</Anchor>
+					</Anchors>
+				</FontString>
+			</Layer>
+		</Layers>
+
+		<Frames>
+			<Button name="MSUILB_Close" inherits="UIPanelCloseButton">
+				<Anchors>
+					<Anchor point="TOPRIGHT">
+						<Offset>
+							<AbsDimension x="-8" y="-8"/>
+						</Offset>
+					</Anchor>
+				</Anchors>
+			</Button>
+
+			<!-- COLUMN 1: categories -> instances -->
+			<Frame name="MSUILB_Cat">
+				<Size>
+					<AbsDimension x="186" y="380"/>
+				</Size>
+				<Anchors>
+					<Anchor point="TOPLEFT">
+						<Offset>
+							<AbsDimension x="22" y="-74"/>
+						</Offset>
+					</Anchor>
+				</Anchors>
+			</Frame>
+
+			<ScrollFrame name="MSUILB_CatScroll" inherits="FauxScrollFrameTemplate">
+				<Size>
+					<AbsDimension x="168" y="380"/>
+				</Size>
+				<Anchors>
+					<Anchor point="TOPLEFT" relativeTo="MSUILB_Cat" relativePoint="TOPLEFT"/>
+				</Anchors>
+				<Scripts>
+					<OnVerticalScroll>
+						FauxScrollFrame_OnVerticalScroll(20, MSUILB_CatUpdate);
+					</OnVerticalScroll>
+				</Scripts>
+			</ScrollFrame>
+
+			<!-- COLUMN 2: bosses of the selected instance -->
+			<Frame name="MSUILB_Nav">
+				<Size>
+					<AbsDimension x="186" y="380"/>
+				</Size>
+				<Anchors>
+					<Anchor point="TOPLEFT" relativeTo="MSUILB_Cat" relativePoint="TOPRIGHT">
+						<Offset>
+							<AbsDimension x="12" y="0"/>
+						</Offset>
+					</Anchor>
+				</Anchors>
+			</Frame>
+
+			<ScrollFrame name="MSUILB_NavScroll" inherits="FauxScrollFrameTemplate">
+				<Size>
+					<AbsDimension x="168" y="380"/>
+				</Size>
+				<Anchors>
+					<Anchor point="TOPLEFT" relativeTo="MSUILB_Nav" relativePoint="TOPLEFT"/>
+				</Anchors>
+				<Scripts>
+					<OnVerticalScroll>
+						FauxScrollFrame_OnVerticalScroll(20, MSUILB_NavUpdate);
+					</OnVerticalScroll>
+				</Scripts>
+			</ScrollFrame>
+
+			<!-- COLUMN 3: loot -->
+			<Frame name="MSUILB_List">
+				<Size>
+					<AbsDimension x="410" y="374"/>
+				</Size>
+				<Anchors>
+					<Anchor point="TOPLEFT" relativeTo="MSUILB_Nav" relativePoint="TOPRIGHT">
+						<Offset>
+							<AbsDimension x="14" y="0"/>
+						</Offset>
+					</Anchor>
+				</Anchors>
+			</Frame>
+
+			<ScrollFrame name="MSUILB_ListScroll" inherits="FauxScrollFrameTemplate">
+				<Size>
+					<AbsDimension x="392" y="374"/>
+				</Size>
+				<Anchors>
+					<Anchor point="TOPLEFT" relativeTo="MSUILB_List" relativePoint="TOPLEFT"/>
+				</Anchors>
+				<Scripts>
+					<OnVerticalScroll>
+						FauxScrollFrame_OnVerticalScroll(34, MSUILB_ListUpdate);
+					</OnVerticalScroll>
+				</Scripts>
+			</ScrollFrame>
+		</Frames>
+
+		<Scripts>
+			<OnLoad>
+				MSUILB_OnLoad();
+			</OnLoad>
+			<OnMouseDown>
+				this:StartMoving();
+			</OnMouseDown>
+			<OnMouseUp>
+				this:StopMovingOrSizing();
+				MSUILB_SavePosition();
+			</OnMouseUp>
+			<OnShow>
+				MSUILB_Refresh();
+			</OnShow>
+		</Scripts>
+	</Frame>
+</Ui>

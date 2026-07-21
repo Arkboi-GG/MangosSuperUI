@@ -91,10 +91,10 @@ public static class SkinnedGlbWriter
     /// empty array to skip animation baking entirely (bind pose only).
     /// </summary>
     public static bool SaveSkinnedGlb(
-        M2Model m2,
-        Dictionary<int, byte[]> textures,
-        string outputPath,
-        IReadOnlyList<int> animationsToBake)
+            M2Model m2,
+            Dictionary<int, byte[]> textures,
+            string outputPath,
+            IReadOnlyList<int> animationsToBake)
     {
         if (!m2.IsValid) return false;
         if (!m2.HasSkeleton) return false;   // no bones → use GlbWriter instead
@@ -102,11 +102,20 @@ public static class SkinnedGlbWriter
         try
         {
             // ── Materials ───────────────────────────────────────────────────
+            // Values may be raw BLP (straight from the MPQ) or an already-
+            // decoded PNG. CharacterModelService hands us a composited PNG for
+            // the body-skin slot so the CharSections face overlay is baked into
+            // the GLB itself, rather than depending on a client-side texture
+            // swap that may never fire.
             var materialsByTexIdx = new Dictionary<int, MaterialBuilder>();
-            foreach (var (texIdx, blpData) in textures)
+            foreach (var (texIdx, imageData) in textures)
             {
-                var pngBytes = ConvertBlpToPngBytes(blpData);
-                if (pngBytes == null) continue;
+                var pngBytes = IsPng(imageData) ? imageData : ConvertBlpToPngBytes(imageData);
+                if (pngBytes == null)
+                {
+                    Console.WriteLine($"[SkinnedGlbWriter] texture slot {texIdx} failed to decode — slot left UNBOUND");
+                    continue;
+                }
 
                 var img = new SharpGLTF.Memory.MemoryImage(pngBytes);
                 var mat = new MaterialBuilder($"mat_{texIdx}")
@@ -114,6 +123,30 @@ public static class SkinnedGlbWriter
                     .WithBaseColor(img);
                 materialsByTexIdx[texIdx] = mat;
             }
+
+            // An unbound texture slot must NEVER silently inherit the body
+            // atlas. The old fallback was materialsByTexIdx.Values.First(),
+            // which is insertion-ordered and therefore always the body skin —
+            // so every unresolved slot (cape = type 2, facial hair = type 7,
+            // skin extra = type 8, and any type-0 whose BLP is missing from the
+            // MPQ) rendered with body-skin pixels. That is the long-running
+            // "hair and capes look like skin" bug, and because it rendered
+            // plausibly rather than failing, it hid every upstream error.
+            //
+            //   * slots the client dresses at equip time render fully
+            //     transparent, so the geoset is simply absent until something
+            //     is equipped;
+            //   * anything else renders MAGENTA so it cannot be overlooked.
+            var transparentMat = new MaterialBuilder("unbound_transparent")
+                .WithUnlitShader()
+                .WithAlpha(SharpGLTF.Materials.AlphaMode.BLEND)
+                .WithChannelParam(KnownChannel.BaseColor, KnownProperty.RGBA,
+                    new Vector4(0f, 0f, 0f, 0f));
+
+            var unboundMat = new MaterialBuilder("unbound_missing")
+                .WithUnlitShader()
+                .WithChannelParam(KnownChannel.BaseColor, KnownProperty.RGBA,
+                    new Vector4(1f, 0f, 1f, 1f));
 
             var fallbackMat = new MaterialBuilder("default")
                 .WithUnlitShader()
@@ -143,13 +176,21 @@ public static class SkinnedGlbWriter
             Console.WriteLine($"[SkinnedGlbWriter] baked {animsBaked}/{animationsToBake.Count} requested animations");
 
             // ── Mesh ────────────────────────────────────────────────────────
-            // Diagnostic: dump every submesh geoset ID so we can see if
-            // cat 17 / cat 32 exist in the parsed M2. Remove once verified.
             var allGeoIds = m2.Submeshes.Select(s => s.Id).ToList();
             var catSummary = allGeoIds.GroupBy(id => id / 100)
                 .OrderBy(g => g.Key)
                 .Select(g => $"cat{g.Key}=[{string.Join(",", g.Select(id => id.ToString()))}]");
             Console.WriteLine($"[SkinnedGlbWriter] {m2.Submeshes.Count} submeshes, geoset IDs: {string.Join(" ", catSummary)}");
+
+            // Texture-table dump. One line, every slot, so an unbound slot is
+            // obvious from the log without attaching a debugger.
+            for (int i = 0; i < m2.Textures.Count; i++)
+            {
+                Console.WriteLine(
+                    $"[SkinnedGlbWriter] texslot {i}: Type={m2.Textures[i].Type} " +
+                    $"Flags={m2.Textures[i].Flags} File='{m2.Textures[i].Filename}' " +
+                    $"bound={materialsByTexIdx.ContainsKey(i)}");
+            }
 
             var scene = new SceneBuilder("scene");
             var submeshTexture = BuildSubmeshTextureMap(m2);
@@ -161,8 +202,27 @@ public static class SkinnedGlbWriter
                 if (submesh.IndexCount == 0 || submesh.IndexCount % 3 != 0) continue;
 
                 int texIdx = submeshTexture.ContainsKey(subIdx) ? submeshTexture[subIdx] : subIdx;
-                var mat = materialsByTexIdx.ContainsKey(texIdx) ? materialsByTexIdx[texIdx] :
-                          materialsByTexIdx.Count > 0 ? materialsByTexIdx.Values.First() : fallbackMat;
+
+                MaterialBuilder mat;
+                if (materialsByTexIdx.TryGetValue(texIdx, out var boundMat))
+                {
+                    mat = boundMat;
+                }
+                else if (materialsByTexIdx.Count == 0)
+                {
+                    mat = fallbackMat;
+                }
+                else
+                {
+                    uint slotType = (texIdx >= 0 && texIdx < m2.Textures.Count)
+                        ? m2.Textures[texIdx].Type : 0u;
+                    // 2 = OBJECT_SKIN (cape/item), 7 = CHAR_FACIAL_HAIR, 8 = SKIN_EXTRA
+                    bool clientFilled = slotType == 2 || slotType == 7 || slotType == 8;
+                    mat = clientFilled ? transparentMat : unboundMat;
+                    Console.WriteLine(
+                        $"[SkinnedGlbWriter] submesh {subIdx} (geoset {submesh.Id}) → texture slot {texIdx} " +
+                        $"(M2 type {slotType}) UNBOUND → {(clientFilled ? "transparent" : "MAGENTA")}");
+                }
 
                 int geosetId = submesh.Id;
                 int geosetCategory = geosetId / 100;
@@ -208,7 +268,6 @@ public static class SkinnedGlbWriter
             return false;
         }
     }
-
     // ────────────────────────────────────────────────────────────────────────
     // Bone armature
     // ────────────────────────────────────────────────────────────────────────
@@ -580,6 +639,18 @@ public static class SkinnedGlbWriter
         }
         return map;
     }
+
+
+    /// <summary>
+    /// True if the buffer starts with the 8-byte PNG signature. Lets the
+    /// texture dictionary carry either raw BLP or an already-composited PNG
+    /// per slot — the body-skin slot arrives as PNG with the face overlay
+    /// already painted on.
+    /// </summary>
+    private static bool IsPng(byte[] d) =>
+        d != null && d.Length >= 8 &&
+        d[0] == 0x89 && d[1] == 0x50 && d[2] == 0x4E && d[3] == 0x47 &&
+        d[4] == 0x0D && d[5] == 0x0A && d[6] == 0x1A && d[7] == 0x0A;
 
     // ────────────────────────────────────────────────────────────────────────
     // BLP → PNG (same as GlbWriter)
