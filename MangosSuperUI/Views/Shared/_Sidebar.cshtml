@@ -30,7 +30,7 @@
         "operations" or "server" => "admin",
         "content" or "spells" or "world" => "tuning",
         "bots" => "aibots",
-        "data" => "devdata",
+        "data" or "devtools" => "devdata",
         "wiki" => "wiki",
         "superui" => "superui",
         _ => "admin"
@@ -349,6 +349,16 @@
             </ul>
         </div>
 
+        <!-- Development -->
+        <div class="sidebar-section" data-group="devtools" data-section="devdata">
+            <div class="sidebar-section-title" data-toggle-group="devtools">
+                <span>Development</span>
+                <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
+            </div>
+            <ul class="sidebar-nav sidebar-nav-collapsible">
+            </ul>
+        </div>
+
         <!-- ========== Wiki ========== -->
         <!-- Documentation -->
         <div class="sidebar-section" data-group="wiki" data-section="wiki">
@@ -358,9 +368,15 @@
             </div>
             <ul class="sidebar-nav sidebar-nav-collapsible">
                 <li class="sidebar-nav-item" data-nav-key="wiki-code">
-                    <a asp-controller="Wiki" asp-action="Index" class="@NavClass("Wiki")">
+                    <a asp-controller="Wiki" asp-action="Index" class="@(currentController.Equals("Wiki", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("Index", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
                         <i class="fa-solid fa-book"></i>
-                        Code Docs
+                        C++ SuperUI Docs
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="wiki-lua">
+                    <a asp-controller="Wiki" asp-action="Lua" class="@(currentController.Equals("Wiki", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("Lua", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
+                        <i class="fa-solid fa-code"></i>
+                        Lua &amp; UI Docs
                     </a>
                 </li>
             </ul>

@@ -1,0 +1,380 @@
+@{
+    ViewData["Title"] = "Lua & UI Docs";
+}
+
+@section Styles {
+    <style>
+        /* ============================================================
+           MangosSuperUI — Lua & UI Docs  (prefix: lua-)
+           The 1.12 client-side counterpart to the C++ corpus. Same shell
+           as Wiki/Index.cshtml (content-header + content-body), same
+           per-page CSS model. Razor: at-rules escape as @@media.
+           ============================================================ */
+
+        .lua-body {
+            --lua-mono: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+            padding: 0 !important;
+            overflow: hidden !important;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 420px;
+            gap: 0;
+            align-items: stretch;
+        }
+
+        .lua-left {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            border-right: 1px solid var(--border-light);
+            overflow: hidden;
+        }
+
+        .lua-right {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        /* ------------------------------------------------- search + scopes */
+
+        .lua-searchbar {
+            padding: 14px 18px 10px;
+            border-bottom: 1px solid var(--border-light);
+            flex-shrink: 0;
+        }
+
+        .lua-input {
+            width: 100%;
+            padding: 9px 11px;
+            font-size: 13.5px;
+            background: var(--bg-input);
+            color: var(--text-primary);
+            border: 1px solid var(--border-medium);
+            border-radius: 6px;
+        }
+
+        .lua-scopes {
+            display: flex;
+            gap: 4px;
+            margin-top: 9px;
+            flex-wrap: wrap;
+        }
+
+        .lua-scope {
+            background: transparent;
+            border: 1px solid var(--border-medium);
+            border-radius: 20px;
+            color: var(--text-muted);
+            font-size: 11.5px;
+            padding: 3px 11px;
+            cursor: pointer;
+        }
+
+            .lua-scope.active {
+                background: var(--accent);
+                border-color: var(--accent);
+                color: #fff;
+            }
+
+        .lua-count {
+            font-size: 11.5px;
+            color: var(--text-muted);
+            margin-top: 8px;
+        }
+
+        /* ------------------------------------------------- results */
+
+        .lua-results {
+            flex: 1;
+            overflow-y: auto;
+            padding: 6px 10px 30px;
+        }
+
+        .lua-hit {
+            padding: 8px 8px;
+            border-bottom: 1px solid var(--border-light);
+            cursor: pointer;
+        }
+
+            .lua-hit:hover {
+                background: var(--bg-input);
+            }
+
+            .lua-hit.selected {
+                background: var(--bg-input);
+                box-shadow: inset 2px 0 0 var(--accent);
+            }
+
+        .lua-hit-top {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .lua-hit-name {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-family: var(--lua-mono);
+            word-break: break-all;
+        }
+
+        .lua-kind {
+            font-size: 9.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border: 1px solid var(--border-medium);
+            border-radius: 4px;
+            padding: 0 5px;
+            color: var(--text-muted);
+        }
+
+        .lua-kind-template { border-color: var(--accent); color: var(--accent); }
+
+        .lua-warn { border-color: #c0392b; color: #c0392b; }
+
+        .lua-cite {
+            font-size: 11px;
+            color: var(--text-muted);
+            font-family: var(--lua-mono);
+            margin-top: 2px;
+            word-break: break-all;
+        }
+
+        /* ------------------------------------------------- detail */
+
+        .lua-detail {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 18px 30px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+        .lua-detail h2 {
+            font-size: 16px;
+            margin: 0 0 4px;
+            color: var(--text-primary);
+            font-family: var(--lua-mono);
+            word-break: break-all;
+        }
+
+        .lua-facts {
+            list-style: none;
+            padding: 0;
+            margin: 12px 0 0;
+        }
+
+            .lua-facts li {
+                font-size: 12.5px;
+                color: var(--text-secondary);
+                padding: 4px 0;
+                border-bottom: 1px solid var(--border-light);
+            }
+
+            .lua-facts b {
+                color: var(--text-primary);
+                font-weight: 600;
+            }
+
+        .lua-flag {
+            display: block;
+            font-size: 12px;
+            border-radius: 5px;
+            padding: 7px 9px;
+            margin-top: 10px;
+            background: var(--bg-input);
+        }
+
+        .lua-flag-err { border-left: 3px solid #c0392b; }
+        .lua-flag-warn { border-left: 3px solid #d68910; }
+
+        /* ------------------------------------------------- context panel */
+
+        .lua-ctx {
+            flex-shrink: 0;
+            padding: 12px 18px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 52%;
+        }
+
+        .lua-ctx-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-sidebar-heading, var(--text-muted));
+        }
+
+        .lua-ctx-opts {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            font-size: 11.5px;
+            color: var(--text-secondary);
+        }
+
+            .lua-ctx-opts label {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                cursor: pointer;
+            }
+
+        .lua-ctx-out {
+            flex: 1;
+            min-height: 120px;
+            overflow: auto;
+            background: var(--bg-input);
+            border: 1px solid var(--border-light);
+            border-radius: 6px;
+            padding: 10px;
+            font-family: var(--lua-mono);
+            font-size: 11px;
+            line-height: 1.5;
+            color: var(--text-primary);
+            white-space: pre-wrap;
+            margin: 0;
+        }
+
+        .lua-btn {
+            background: var(--bg-input);
+            color: var(--text-primary);
+            border: 1px solid var(--border-medium);
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-size: 12.5px;
+            cursor: pointer;
+        }
+
+            .lua-btn:hover { border-color: var(--accent); }
+
+        .lua-btn-primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+        }
+
+        .lua-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .lua-muted {
+            font-size: 11.5px;
+            color: var(--text-muted);
+        }
+
+        .lua-empty {
+            font-size: 12.5px;
+            color: var(--text-muted);
+            padding: 18px 4px;
+            line-height: 1.6;
+        }
+
+            .lua-empty code {
+                background: var(--bg-input);
+                border-radius: 4px;
+                padding: 1px 5px;
+                font-size: 11px;
+            }
+
+        @@media (max-width: 1200px) {
+            .lua-body {
+                grid-template-columns: minmax(0, 1fr);
+                overflow-y: auto !important;
+            }
+
+            .lua-left { border-right: none; }
+        }
+    </style>
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header">
+            <div>
+                <h1><i class="fa-solid fa-code" style="color: var(--accent);"></i> Lua &amp; UI Docs</h1>
+                <p>
+                    WoW 1.12.1 client-side ground truth &mdash; <span id="luaCounts">loading&hellip;</span>.
+                    Every record cites file and line, and the context bundle is built to be pasted into a chat.
+                </p>
+            </div>
+        </div>
+
+        <div class="content-body lua-body">
+
+            <!-- LEFT: search + results -->
+            <section class="lua-left">
+                <div class="lua-searchbar">
+                    <input type="text" id="luaQuery" class="lua-input" autocomplete="off" spellcheck="false"
+                           placeholder="Search templates, frames, textures, Lua functions and globals&hellip;  ( / )" />
+                    <div class="lua-scopes" id="luaScopes">
+                        <button type="button" class="lua-scope active" data-scope="all">Everything</button>
+                        <button type="button" class="lua-scope" data-scope="templates">Templates</button>
+                        <button type="button" class="lua-scope" data-scope="frames">Frames</button>
+                        <button type="button" class="lua-scope" data-scope="textures">Textures</button>
+                        <button type="button" class="lua-scope" data-scope="api">Lua API</button>
+                    </div>
+                    <div class="lua-count" id="luaCount"></div>
+                </div>
+                <div class="lua-results" id="luaResults">
+                    <div class="lua-empty">
+                        Start typing. This searches the harvested 1.12 FrameXML &mdash; the templates Blizzard
+                        actually shipped, the frames that exist at runtime, the real texture paths, and every
+                        Lua function and global defined in the UI code.
+                    </div>
+                </div>
+            </section>
+
+            <!-- RIGHT: record detail + context bundle -->
+            <aside class="lua-right">
+                <div class="lua-detail" id="luaDetail">
+                    <div class="lua-empty">Pick a result to see its resolved record.</div>
+                </div>
+
+                <div class="lua-ctx">
+                    <div class="lua-ctx-head">
+                        <span>Context bundle</span>
+                        <span class="lua-muted" id="luaCtxSize"></span>
+                    </div>
+                    <div class="lua-ctx-opts">
+                        <label><input type="checkbox" id="luaOptRules" checked /> hard rules</label>
+                        <label><input type="checkbox" id="luaOptDocs" checked /> project docs</label>
+                        <label><input type="checkbox" id="luaOptCaps" checked /> capabilities</label>
+                        <label>
+                            budget
+                            <select id="luaBudget" class="lua-btn" style="padding:2px 6px;">
+                                <option value="4000">4k</option>
+                                <option value="8000" selected>8k</option>
+                                <option value="16000">16k</option>
+                                <option value="32000">32k</option>
+                            </select>
+                        </label>
+                    </div>
+                    <div class="lua-row">
+                        <button type="button" class="lua-btn lua-btn-primary" id="luaBuild">Build bundle</button>
+                        <button type="button" class="lua-btn" id="luaCopy">Copy</button>
+                        <button type="button" class="lua-btn" id="luaDownload">Download .md</button>
+                        <span class="lua-muted" id="luaCtxState"></span>
+                    </div>
+                    <pre class="lua-ctx-out" id="luaCtxOut">Search for something, then build a bundle. It carries the 1.12 rules, the matching records with citations, matching project docs, and what this app can reach.</pre>
+                </div>
+            </aside>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/js/wiki-lua.js" asp-append-version="true"></script>
+}

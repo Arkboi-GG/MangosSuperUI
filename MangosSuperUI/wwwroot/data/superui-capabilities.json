@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "updated": "2026-07-20",
+  "note": "Hand-curated. This file exists because a model answering from memory assumes a vanilla WoW admin panel is read-only web pages, and narrows every answer it gives to fit that assumption. Each entry below is a real road in or out of this app. Edit it freely - it is meant to be maintained by hand, and every entry should be checkable by hitting its route.",
+
+  "capabilities": [
+    {
+      "id": "mpq-read",
+      "title": "Read any file out of the client archives",
+      "direction": "read",
+      "what": "Fully managed MPQ v1 reader mounts the vanilla archives and extracts any path (models, textures, DBCs, FrameXML). Native StormLib and War3Net are both gone.",
+      "code": "Services/SuperUiMPQ/MpqReaderService.cs",
+      "caveat": "Live patches (patch-4/patch-5) are read from private scratch COPIES and never held open. AdtTerrainReader does its own per-call open because it reads patch-Z, which MpqReaderService deliberately skips."
+    },
+    {
+      "id": "blp-decode",
+      "title": "Decode BLP textures to PNG",
+      "direction": "read",
+      "what": "Managed BLP decoder, used for icons, item textures and terrain layers.",
+      "code": "Services/SuperUiMPQ/BlpDecoder.cs"
+    },
+    {
+      "id": "icon-serve",
+      "title": "Serve any client icon by name",
+      "direction": "read",
+      "what": "Sanitizes a name, extracts Interface\\Icons\\{name}.blp straight from the MPQ, decodes it and returns PNG.",
+      "route": "GET /Icon/Get?name=INV_Sword_04",
+      "caveat": "404 on any miss by design - no disk fallback and no questionmark substitution, so a broken path stays visible instead of being masked."
+    },
+    {
+      "id": "dbc",
+      "title": "Read client DBC data",
+      "direction": "read",
+      "what": "DBC tables straight out of the archives: item display info, spell visuals, icon paths and the rest of the client-side reference data.",
+      "code": "Services/DbcService.cs"
+    },
+    {
+      "id": "framexml-catalog",
+      "title": "Query the 1.12 UI catalog",
+      "direction": "read",
+      "what": "233 virtual templates, 3280 named frames, 379 texture paths, 35 font objects, 1265 Lua functions, 6060 Lua globals and 1954 XML->Lua bindings, harvested from the real FrameXML. Every record carries file and line, so answers are citable rather than recalled.",
+      "route": "GET /Wiki/LuaSearch?q=&scope=templates|frames|textures|api",
+      "caveat": "Regenerated offline by framexml_index.py + framexml_split.py into wwwroot/data/framexml. Re-run after any FrameXML change; the harvester reports parse errors."
+    },
+    {
+      "id": "cpp-corpus",
+      "title": "Read the documented VMaNGOS core",
+      "direction": "read",
+      "what": "A folder-mirrored Markdown corpus, one page per C++ unit, cross-linked Unit/Member, with a machine-true MAP table per page. Full-text searchable through the docs_* index the app provisions itself.",
+      "route": "GET /Wiki/Search?q=",
+      "code": "Services/WikiDocStore.cs, WikiIndexer.cs, WikiSearchStore.cs"
+    },
+    {
+      "id": "source-index",
+      "title": "Query the C++ source index directly",
+      "direction": "read",
+      "what": "Live symbol/callgraph index over the core source, plus a research bundle per database column.",
+      "route": "GET /SourceMap/FkResearchBundle",
+      "code": "Services/SourceIndexerService.cs"
+    },
+    {
+      "id": "db-explore",
+      "title": "Query the game databases",
+      "direction": "read",
+      "what": "Full schema for 255 tables with 749 curated foreign-key edges, so a question like 'what points at this creature' is answerable without guessing at joins.",
+      "route": "GET /Database",
+      "code": "wwwroot/data/curated-relationships.json"
+    },
+    {
+      "id": "db-write",
+      "title": "Write game data",
+      "direction": "write",
+      "what": "Items, loot, spells, game objects and instance loot are edited through their own pages, not just read.",
+      "route": "GET /Items, /LootTuner, /Spells, /GameObjects"
+    },
+    {
+      "id": "retexture",
+      "title": "Generate and commit new item textures",
+      "direction": "write",
+      "what": "Seeded palette-swap recolor with theory/tier/value knobs, applied to a selection or drained from a queue, minting new display ids and writing them into the retexture tables.",
+      "route": "POST /RetextureEngine/ProcessQueue, /RetextureEngine/RetextureSelection",
+      "caveat": "Every re-run used to mint a fresh display id while orphaning the previous one. Use the source-scoped revert, and PurgeOrphans for debris."
+    },
+    {
+      "id": "patch-build",
+      "title": "Build and hand over a client patch archive",
+      "direction": "write",
+      "what": "Rebuilds patch-4.MPQ from the retexture tables and serves it for download.",
+      "route": "POST /RetextureEngine/RebuildPatch, GET /RetextureEngine/DownloadPatch",
+      "caveat": "The WSL folder the rebuild auto-copies to is NOT what the game reads. Deploying to the real client is still a manual copy into C:\\WoW Vanilla\\Data\\."
+    },
+    {
+      "id": "world-edit",
+      "title": "Read and write terrain",
+      "direction": "write",
+      "what": "Parses ADT terrain (MCNK/MODF/MDDF/MCVT/MCLY/MCAL) and VMaNGOS .map heightmaps, renders them in 3D, and writes ADTs back out.",
+      "route": "GET /WorldEditor",
+      "code": "Services/AdtTerrainReader.cs, AdtPatcherService.cs"
+    },
+    {
+      "id": "character-render",
+      "title": "Render a character or item in 3D",
+      "direction": "read",
+      "what": "Reads M2 models out of the MPQ, composites the character skin, and emits a skinned GLB the browser renders - so an item can be previewed on a real model rather than as a flat icon.",
+      "code": "Services/M2Handlers/M2Reader.cs, SkinnedGlbWriter.cs, CharacterModelService.cs"
+    },
+    {
+      "id": "server-control",
+      "title": "Drive the running server",
+      "direction": "write",
+      "what": "Console commands, player and account administration, realm state, config editing and backups against the live realm.",
+      "route": "GET /Console, /Players, /Accounts, /Realm, /Config, /Backup"
+    },
+    {
+      "id": "bots",
+      "title": "Command the bot fleet",
+      "direction": "write",
+      "what": "Fleet state, per-bot control, live map positions and the chat personality/capacity settings for the AiBot population.",
+      "route": "GET /Bots/Fleet, /ChatSettings"
+    }
+  ]
+}

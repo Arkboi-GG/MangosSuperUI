@@ -236,6 +236,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             }
         }
 
+        _scheduler.NoteStimulus(raw.HearerGuid, $"{raw.Sender}|{ChatKind.Whisper}", raw.Utc);
         await _reactiveJobs.Writer.WriteAsync(new ReactiveJob(raw.HearerGuid, raw.Sender,
             raw.SenderGuid, raw.Message, ChatKind.Whisper, "", raw.Utc, threadActive, depth), ct);
     }
@@ -354,6 +355,13 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
         {
             // Tier 0: the incoming line enters the speaker's window so the reply threads
             _tracker.Append(guid, fold.Sender, fold.Kind, fold.Sender, fold.Message);
+
+            // SUPERSEDE (2026-07-20): stamp the newest stimulus for this (bot, conversation)
+            // BEFORE the job is queued, so a reply still being generated — or already held on
+            // the timeline — can be recognised as stale at send time. Key must match the
+            // convKey built in ProcessReactiveAsync.
+            _scheduler.NoteStimulus(guid, $"{fold.Sender}|{fold.Kind}", fold.FirstUtc);
+
             await _reactiveJobs.Writer.WriteAsync(new ReactiveJob(guid, fold.Sender,
                 fold.SenderGuid, fold.Message, fold.Kind, fold.ChannelName, fold.FirstUtc,
                 threadActive, stimulusDepth), ct);
@@ -445,7 +453,8 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             Message: job.Message,
             Kind: job.Kind,
             ChannelName: job.ChannelName,
-            RecvUtc: job.RecvUtc);
+            RecvUtc: job.RecvUtc,
+            Activity: ActivityOf(state));
 
         var rawReply = await _engine.ComposeReplyAsync(chatJob, ct);
         if (rawReply == null) return;
@@ -475,6 +484,28 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             _logger.LogInformation(
                 "[CHAT-COORD] schedule bot={Bot} kind={Kind} → {Target} sendUtc={SendUtc:HH:mm:ss.f} (holdUntil={Hold:HH:mm:ss.f} readyAt={Ready:HH:mm:ss.f}) \"{Line}\"",
                 state.Name, job.Kind, target ?? channel ?? "nearby", s.SendUtc, s.HoldUntil, s.ReadyAt, s.Text);
+    }
+
+    /// <summary>
+    /// Live activity for the prompt's situational framing (2026-07-20). Same state
+    /// BuildSnapshotLine reads, given to the assembler as a value instead of prose so the
+    /// prompt can branch on it. An earlier prompt hardcoded "you're stood around doing
+    /// nothing", which is wrong the moment the bot is fighting, dead or running somewhere —
+    /// and what a bot is doing changes how it would type.
+    /// </summary>
+    private static ChatActivity ActivityOf(BotState state)
+    {
+        if (state.IsDead) return ChatActivity.Dead;
+        if (state.InCombat) return ChatActivity.Fighting;
+        return (state.TaskActivity ?? "").ToLowerInvariant() switch
+        {
+            "traveling" or "travelling" => ChatActivity.Travelling,
+            "searching" => ChatActivity.Grinding,
+            "engaged" => ChatActivity.Fighting,
+            "recovering" => ChatActivity.Recovering,
+            "blocked" => ChatActivity.Stuck,
+            _ => ChatActivity.Idle
+        };
     }
 
     private static string BuildSnapshotLine(BotState state)
@@ -542,6 +573,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
                 sweepCounter = 0;
                 _tracker.Sweep();
                 _chain.Sweep();
+                _scheduler.SweepStimulusLedger(DateTime.UtcNow);
             }
         }
     }

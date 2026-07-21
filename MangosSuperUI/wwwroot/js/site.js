@@ -78,7 +78,7 @@
         { key: 'admin', label: 'Server Administration', icon: 'fa-server', groups: ['operations', 'server'] },
         { key: 'tuning', label: 'Gameplay Tuning', icon: 'fa-sliders', groups: ['content', 'spells', 'world'] },
         { key: 'aibots', label: 'AI Bot Control', icon: 'fa-robot', groups: ['bots'] },
-        { key: 'devdata', label: 'Data & Development', icon: 'fa-database', groups: ['data'] },
+        { key: 'devdata', label: 'Data & Development', icon: 'fa-database', groups: ['data', 'devtools'] },
         { key: 'wiki', label: 'Wiki', icon: 'fa-book', groups: ['wiki'] },
         { key: 'superui', label: 'SuperUI', icon: 'fa-toolbox', groups: ['superui'] }
     ];
@@ -92,6 +92,7 @@
         world: { name: 'World & Maps', icon: 'fa-map-location-dot' },
         bots: { name: 'Bots', icon: 'fa-robot' },
         data: { name: 'Data', icon: 'fa-database' },
+        devtools: { name: 'Development', icon: 'fa-code' },
         wiki: { name: 'Documentation', icon: 'fa-book' },
         superui: { name: 'App', icon: 'fa-toolbox' }
     };
@@ -105,7 +106,7 @@
 
     // Default group order + item order within each group
     var DEFAULT_ORDER = {
-        groups: ['operations', 'server', 'content', 'spells', 'world', 'bots', 'data', 'wiki', 'superui'],
+        groups: ['operations', 'server', 'content', 'spells', 'world', 'bots', 'data', 'devtools', 'wiki', 'superui'],
         items: {
             operations: ['home', 'console', 'players', 'accounts', 'realm'],
             server: ['activity', 'serverlogs', 'livelogs', 'config', 'backup'],
@@ -114,7 +115,8 @@
             world: ['worldmap', 'worldeditor'],
             bots: ['bots-fleet', 'bots-map', 'bots-dashboard', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
-            wiki: ['wiki-code'],
+            devtools: [],
+            wiki: ['wiki-code', 'wiki-lua'],
             superui: ['downloads-page', 'settings']
         }
     };
@@ -470,7 +472,7 @@
             craftinglootifier: { icon: 'fa-hammer', label: 'Crafting Lootifier' },
             retextureengine: { icon: 'fa-palette', label: 'Retexture Engine' },
             worldeditor: { icon: 'fa-mountain-sun', label: '3D World Editor' },
-            'downloads-page': { icon: 'fa-arrow-down-to-line', label: 'Downloads' },
+            'downloads-page': { icon: 'fa-download', label: 'Downloads' },
             settings: { icon: 'fa-gear', label: 'Settings' },
             'bots-fleet': { icon: 'fa-tower-broadcast', label: 'Fleet View' },
             'bots-map': { icon: 'fa-location-crosshairs', label: 'Bot Map Viewer' },
@@ -479,7 +481,8 @@
             'bots-chatcapacity': { icon: 'fa-server', label: 'Chat Capacity' },
             database: { icon: 'fa-database', label: 'Database Explorer' },
             sourcemap: { icon: 'fa-sitemap', label: 'Source Map' },
-            'wiki-code': { icon: 'fa-book', label: 'Code Docs' }
+            'wiki-code': { icon: 'fa-book', label: 'C++ SuperUI Docs' },
+            'wiki-lua': { icon: 'fa-code', label: 'Lua & UI Docs' }
         };
 
         // Rendered section by section; groups can only be dragged within their section
