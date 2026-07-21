@@ -4,11 +4,6 @@
 
 @section Styles {
     <style>
-        .dl-page {
-            display: flex;
-            height: 100vh;
-        }
-
         .dl-content {
             flex: 1;
             overflow-y: auto;
@@ -328,7 +323,7 @@
     </style>
 }
 
-<div class="dl-page">
+<div class="app-shell">
     @await Html.PartialAsync("_Sidebar")
 
     <div class="dl-content">

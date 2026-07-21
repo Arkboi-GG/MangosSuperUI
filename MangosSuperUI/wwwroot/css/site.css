@@ -1,5 +1,5 @@
-/* ============================================================
-   MangosSuperUI — Global Styles
+ï»¿/* ============================================================
+   MangosSuperUI ï¿½ Global Styles
    Palette: Slate/cool-gray base, steel-blue accent
    ============================================================ */
 
@@ -20,7 +20,7 @@
     --text-sidebar-active: #ffffff;
     --text-sidebar-heading: #5c6a7a;
     --text-on-accent: #ffffff;
-    /* Accent — steel blue */
+    /* Accent ï¿½ steel blue */
     --accent: #3b82c4;
     --accent-hover: #2d6da8;
     --accent-light: #e8f1fa;
@@ -40,7 +40,9 @@
     /* Layout */
     --sidebar-width: 250px;
     --sidebar-collapsed-width: 64px;
-    --topbar-height: 0px;
+    /* Slim section bar. Stays slim at any resolution - the logo lives in the
+       sidebar, where there is room for it to be large. */
+    --topbar-height: clamp(42px, 3.6vh, 54px);
     /* Radius */
     --radius-sm: 4px;
     --radius-md: 6px;
@@ -72,7 +74,159 @@ html, body {
 .app-shell {
     display: flex;
     height: 100vh;
+    padding-top: var(--topbar-height);
     overflow: hidden;
+}
+
+/* ---- Top Navigation (macro sections) ---- */
+
+.topnav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--topbar-height);
+    background: var(--bg-sidebar);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    display: flex;
+    align-items: stretch;
+    z-index: 200;
+}
+
+/* Wordmark only - matches the sidebar width so the tabs start where the
+   sidebar ends. The logo itself sits at the top of the sidebar. */
+.topnav-brand {
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 12px;
+    text-decoration: none;
+    border-right: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.topnav-brand-sub {
+    font-size: 15px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -0.01em;
+}
+
+.topnav-sections {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    padding: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+
+    .topnav-sections::-webkit-scrollbar {
+        display: none;
+    }
+
+/* Only the selected tab carries a background - everything else is plain text */
+.topnav-tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 16px;
+    white-space: nowrap;
+    text-decoration: none;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-sidebar);
+    transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+    .topnav-tab:hover {
+        color: #d1d9e6;
+    }
+
+    .topnav-tab.active {
+        background: var(--bg-sidebar-active);
+        color: var(--text-sidebar-active);
+    }
+
+    .topnav-tab i {
+        font-size: 14px;
+        opacity: 0.7;
+    }
+
+    .topnav-tab.active i {
+        opacity: 1;
+    }
+
+/* ---- Section-scoped sidebar ---- */
+
+/* Every group is rendered; only the groups belonging to the active macro
+   section are shown. site.js may still override with inline display:none
+   for groups hidden via the Customize > Visibility tab. */
+.sidebar-groups .sidebar-section {
+    display: none;
+}
+
+.sidebar-groups[data-active-section="admin"] .sidebar-section[data-section="admin"],
+.sidebar-groups[data-active-section="tuning"] .sidebar-section[data-section="tuning"],
+.sidebar-groups[data-active-section="aibots"] .sidebar-section[data-section="aibots"],
+.sidebar-groups[data-active-section="devdata"] .sidebar-section[data-section="devdata"],
+.sidebar-groups[data-active-section="wiki"] .sidebar-section[data-section="wiki"],
+.sidebar-groups[data-active-section="superui"] .sidebar-section[data-section="superui"] {
+    display: block;
+}
+
+.sidebar-head {
+    padding: 16px 16px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+/* Sized off the sidebar, not off a pixel count, so it scales the way the
+   old sidebar brand did. Raise max-width to make it bigger. */
+.sidebar-logo {
+    display: block;
+    width: 100%;
+    max-width: 180px;
+    height: auto;
+    margin: 0 auto;
+    border-radius: var(--radius-md);
+}
+
+.sidebar-head-row {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+}
+
+    .sidebar-head-row > i {
+        color: var(--accent);
+        font-size: 15px;
+        width: 20px;
+        text-align: center;
+        flex-shrink: 0;
+    }
+
+.sidebar-head-text {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.2;
+    min-width: 0;
+}
+
+.sidebar-head-title {
+    font-size: 14.5px;
+    font-weight: 700;
+    color: #fff;
+}
+
+.sidebar-head-sub {
+    font-size: 11px;
+    color: var(--text-sidebar-heading);
+    font-weight: 500;
 }
 
 /* ---- Sidebar ---- */
@@ -80,7 +234,7 @@ html, body {
 .sidebar {
     width: var(--sidebar-width);
     min-width: var(--sidebar-width);
-    height: 100vh;
+    height: 100%;
     background: var(--bg-sidebar);
     display: flex;
     flex-direction: column;
@@ -502,7 +656,7 @@ html, body {
 
 
 /* ============================================================
-   Customize Modal — Sidebar Order & Theme Editor
+   Customize Modal ï¿½ Sidebar Order & Theme Editor
    ============================================================ */
 
 .customize-overlay {

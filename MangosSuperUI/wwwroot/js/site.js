@@ -1,6 +1,6 @@
 ﻿/* ============================================================
    MangosSuperUI — site.js
-   Global: Sidebar collapse, reorder, theme customization
+   Global: Top-nav macro sections, sidebar collapse, reorder, theme customization
    Runs on every page via _Layout.cshtml
    ============================================================ */
 
@@ -72,19 +72,50 @@
 
     var ORDER_STORAGE_KEY = 'msui_sidebar_order';
 
+    // Macro sections shown in the top navbar. Group membership is fixed here
+    // and mirrored by data-section="" on each .sidebar-section in _Sidebar.cshtml.
+    var SECTIONS = [
+        { key: 'admin', label: 'Server Administration', icon: 'fa-server', groups: ['operations', 'server'] },
+        { key: 'tuning', label: 'Gameplay Tuning', icon: 'fa-sliders', groups: ['content', 'spells', 'world'] },
+        { key: 'aibots', label: 'AI Bot Control', icon: 'fa-robot', groups: ['bots'] },
+        { key: 'devdata', label: 'Data & Development', icon: 'fa-database', groups: ['data'] },
+        { key: 'wiki', label: 'Wiki', icon: 'fa-book', groups: ['wiki'] },
+        { key: 'superui', label: 'SuperUI', icon: 'fa-toolbox', groups: ['superui'] }
+    ];
+
+    // Display name + icon for every sidebar group (used by the Customize modal)
+    var GROUP_META = {
+        operations: { name: 'Operations', icon: 'fa-gauge' },
+        server: { name: 'Server', icon: 'fa-server' },
+        content: { name: 'Items & Loot', icon: 'fa-box-open' },
+        spells: { name: 'Spells', icon: 'fa-wand-sparkles' },
+        world: { name: 'World & Maps', icon: 'fa-map-location-dot' },
+        bots: { name: 'Bots', icon: 'fa-robot' },
+        data: { name: 'Data', icon: 'fa-database' },
+        wiki: { name: 'Documentation', icon: 'fa-book' },
+        superui: { name: 'App', icon: 'fa-toolbox' }
+    };
+
+    function getSection(sectionKey) {
+        for (var i = 0; i < SECTIONS.length; i++) {
+            if (SECTIONS[i].key === sectionKey) return SECTIONS[i];
+        }
+        return null;
+    }
+
     // Default group order + item order within each group
     var DEFAULT_ORDER = {
-        groups: ['operations', 'server', 'spells', 'world', 'content', 'bots', 'data', 'wiki', 'downloads'],
+        groups: ['operations', 'server', 'content', 'spells', 'world', 'bots', 'data', 'wiki', 'superui'],
         items: {
             operations: ['home', 'console', 'players', 'accounts', 'realm'],
             server: ['activity', 'serverlogs', 'livelogs', 'config', 'backup'],
+            content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier'],
             spells: ['spells', 'patch', 'visuallab'],
             world: ['worldmap', 'worldeditor'],
-            content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier'],
             bots: ['bots-fleet', 'bots-map', 'bots-dashboard', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
             wiki: ['wiki-code'],
-            downloads: ['downloads-page']
+            superui: ['downloads-page', 'settings']
         }
     };
 
@@ -163,6 +194,44 @@
 
         // Apply hidden groups
         applySidebarVisibility();
+
+        // Point each top-nav tab at the first page of its section
+        applySectionTabs();
+    }
+
+
+    // =========================================================
+    //  2C. TOP NAV — macro section tabs
+    // =========================================================
+
+    // Each tab links to the first *visible* page of its section, honouring the
+    // user's group/item order and their hidden-group choices. Falls back to the
+    // server-rendered href if the section has nothing visible.
+    function applySectionTabs() {
+        var container = document.getElementById('sidebarGroups');
+        var nav = document.getElementById('topNavSections');
+        if (!container || !nav) return;
+
+        var hidden = getHiddenGroups();
+        var order = getSidebarOrder();
+
+        nav.querySelectorAll('.topnav-tab').forEach(function (tab) {
+            var meta = getSection(tab.getAttribute('data-section'));
+            if (!meta) return;
+
+            var href = null;
+            order.groups.forEach(function (groupKey) {
+                if (href) return;
+                if (meta.groups.indexOf(groupKey) === -1) return;
+                if (hidden.indexOf(groupKey) !== -1) return;
+                var sec = container.querySelector('.sidebar-section[data-group="' + groupKey + '"]');
+                if (!sec) return;
+                var link = sec.querySelector('.sidebar-nav-item a[href]');
+                if (link) href = link.getAttribute('href');
+            });
+
+            if (href) tab.setAttribute('href', href);
+        });
     }
 
 
@@ -208,6 +277,7 @@
     // =========================================================
 
     var COLLAPSE_STORAGE_KEY = 'msui_sidebar_expanded';
+    var COLLAPSED_STORAGE_KEY = 'msui_sidebar_collapsed';
 
     function getExpandedGroups() {
         try {
@@ -219,27 +289,46 @@
         localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify(expanded));
     }
 
+    // Groups the user explicitly collapsed. A group in the active section is
+    // open by default; it only stays shut if the user shut it themselves.
+    function getCollapsedGroups() {
+        try {
+            return JSON.parse(localStorage.getItem(COLLAPSED_STORAGE_KEY)) || [];
+        } catch { return []; }
+    }
+
+    function saveCollapsedGroups(collapsed) {
+        localStorage.setItem(COLLAPSED_STORAGE_KEY, JSON.stringify(collapsed));
+    }
+
     function initSidebarCollapse() {
         var container = document.getElementById('sidebarGroups');
         if (!container) return;
 
         var activeGroup = container.getAttribute('data-active-group') || '';
+        var activeSection = container.getAttribute('data-active-section') || '';
+        var sectionMeta = getSection(activeSection);
+        var sectionGroups = sectionMeta ? sectionMeta.groups : [];
+
         var expanded = getExpandedGroups();
+        var collapsed = getCollapsedGroups();
 
-        // On first visit (nothing stored), only expand the active group
-        if (!localStorage.getItem(COLLAPSE_STORAGE_KEY)) {
-            expanded = activeGroup ? [activeGroup] : [];
-        }
+        // Every group in the active section opens by default (the sidebar only
+        // shows one section now, so there is room), unless it was shut by hand.
+        sectionGroups.forEach(function (g) {
+            if (collapsed.indexOf(g) === -1 && expanded.indexOf(g) === -1) expanded.push(g);
+        });
 
-        // Always ensure active group is expanded
-        if (activeGroup && expanded.indexOf(activeGroup) === -1) {
-            expanded.push(activeGroup);
+        // The group holding the current page is always open
+        if (activeGroup) {
+            collapsed = collapsed.filter(function (g) { return g !== activeGroup; });
+            if (expanded.indexOf(activeGroup) === -1) expanded.push(activeGroup);
         }
 
         var sections = container.querySelectorAll('.sidebar-section');
         sections.forEach(function (sec) {
             var groupKey = sec.getAttribute('data-group');
-            if (expanded.indexOf(groupKey) !== -1) {
+            if (expanded.indexOf(groupKey) !== -1 && collapsed.indexOf(groupKey) === -1) {
                 sec.classList.add('expanded');
             } else {
                 sec.classList.remove('expanded');
@@ -247,6 +336,7 @@
         });
 
         saveExpandedGroups(expanded);
+        saveCollapsedGroups(collapsed);
         updateLanderVisibility();
 
         // Click handlers for section titles
@@ -255,16 +345,20 @@
                 var groupKey = this.getAttribute('data-toggle-group');
                 var sec = this.closest('.sidebar-section');
                 var exp = getExpandedGroups();
+                var col = getCollapsedGroups();
 
                 if (sec.classList.contains('expanded')) {
                     sec.classList.remove('expanded');
                     exp = exp.filter(function (g) { return g !== groupKey; });
+                    if (col.indexOf(groupKey) === -1) col.push(groupKey);
                 } else {
                     sec.classList.add('expanded');
                     if (exp.indexOf(groupKey) === -1) exp.push(groupKey);
+                    col = col.filter(function (g) { return g !== groupKey; });
                 }
 
                 saveExpandedGroups(exp);
+                saveCollapsedGroups(col);
                 updateLanderVisibility();
             });
         });
@@ -273,7 +367,19 @@
     function updateLanderVisibility() {
         var lander = document.getElementById('sidebarLander');
         if (!lander) return;
-        var anyExpanded = document.querySelectorAll('.sidebar-section.expanded').length > 0;
+        var container = document.getElementById('sidebarGroups');
+        var anyExpanded = false;
+
+        if (container) {
+            var activeSection = container.getAttribute('data-active-section') || '';
+            container.querySelectorAll('.sidebar-section.expanded').forEach(function (sec) {
+                // Only groups actually on screen (right section, not hidden) count
+                if (sec.getAttribute('data-section') !== activeSection) return;
+                if (sec.style.display === 'none') return;
+                anyExpanded = true;
+            });
+        }
+
         if (anyExpanded) {
             lander.classList.add('hidden');
         } else {
@@ -339,18 +445,6 @@
 
         var order = getSidebarOrder();
 
-        // Group display names
-        var groupNames = {
-            operations: 'Operations',
-            server: 'Server',
-            spells: 'Spells',
-            content: 'Content',
-            bots: 'Bots',
-            data: 'Data',
-            wiki: 'Wiki',
-            downloads: 'Downloads & Uploads'
-        };
-
         // Item display info (key -> {icon, label})
         var itemInfo = {
             home: { icon: 'fa-gauge', label: 'Dashboard' },
@@ -374,43 +468,70 @@
             lootifier: { icon: 'fa-dragon', label: 'ARPG Lootifier' },
             questlootifier: { icon: 'fa-scroll', label: 'Quest Lootifier' },
             craftinglootifier: { icon: 'fa-hammer', label: 'Crafting Lootifier' },
+            retextureengine: { icon: 'fa-palette', label: 'Retexture Engine' },
+            worldeditor: { icon: 'fa-mountain-sun', label: '3D World Editor' },
             'downloads-page': { icon: 'fa-arrow-down-to-line', label: 'Downloads' },
+            settings: { icon: 'fa-gear', label: 'Settings' },
             'bots-fleet': { icon: 'fa-tower-broadcast', label: 'Fleet View' },
             'bots-map': { icon: 'fa-location-crosshairs', label: 'Bot Map Viewer' },
             'bots-dashboard': { icon: 'fa-robot', label: 'IBot Monitor' },
+            'bots-chatfeel': { icon: 'fa-comments', label: 'Chat Feel' },
+            'bots-chatcapacity': { icon: 'fa-server', label: 'Chat Capacity' },
             database: { icon: 'fa-database', label: 'Database Explorer' },
-            sourcemap: { icon: 'fa-sitemap', label: 'Source Map' }
+            sourcemap: { icon: 'fa-sitemap', label: 'Source Map' },
+            'wiki-code': { icon: 'fa-book', label: 'Code Docs' }
         };
 
-        order.groups.forEach(function (groupKey) {
-            var groupDiv = document.createElement('div');
-            groupDiv.className = 'reorder-group';
-            groupDiv.setAttribute('data-reorder-group', groupKey);
-            groupDiv.draggable = true;
+        // Rendered section by section; groups can only be dragged within their section
+        SECTIONS.forEach(function (section) {
+            var sectionGroups = order.groups.filter(function (g) {
+                return section.groups.indexOf(g) !== -1;
+            });
+            if (sectionGroups.length === 0) return;
 
-            var header = document.createElement('div');
-            header.className = 'reorder-group-header';
-            header.innerHTML = '<i class="fa-solid fa-grip-vertical drag-handle"></i> ' + (groupNames[groupKey] || groupKey);
-            groupDiv.appendChild(header);
+            var label = document.createElement('div');
+            label.className = 'customize-section-label';
+            label.innerHTML = '<i class="fa-solid ' + section.icon + '"></i> ' + section.label;
+            list.appendChild(label);
 
-            var ul = document.createElement('ul');
-            ul.className = 'reorder-item-list';
+            var sectionWrap = document.createElement('div');
+            sectionWrap.className = 'reorder-section';
+            sectionWrap.setAttribute('data-reorder-section', section.key);
 
-            (order.items[groupKey] || []).forEach(function (itemKey) {
-                var info = itemInfo[itemKey] || { icon: 'fa-circle', label: itemKey };
-                var li = document.createElement('li');
-                li.className = 'reorder-item';
-                li.setAttribute('data-reorder-item', itemKey);
-                li.draggable = true;
-                li.innerHTML =
-                    '<i class="fa-solid fa-grip-vertical drag-handle"></i>' +
-                    '<i class="fa-solid ' + info.icon + '"></i> ' +
-                    info.label;
-                ul.appendChild(li);
+            sectionGroups.forEach(function (groupKey) {
+                var meta = GROUP_META[groupKey] || { name: groupKey, icon: 'fa-folder' };
+
+                var groupDiv = document.createElement('div');
+                groupDiv.className = 'reorder-group';
+                groupDiv.setAttribute('data-reorder-group', groupKey);
+                groupDiv.draggable = true;
+
+                var header = document.createElement('div');
+                header.className = 'reorder-group-header';
+                header.innerHTML = '<i class="fa-solid fa-grip-vertical drag-handle"></i> ' + meta.name;
+                groupDiv.appendChild(header);
+
+                var ul = document.createElement('ul');
+                ul.className = 'reorder-item-list';
+
+                (order.items[groupKey] || []).forEach(function (itemKey) {
+                    var info = itemInfo[itemKey] || { icon: 'fa-circle', label: itemKey };
+                    var li = document.createElement('li');
+                    li.className = 'reorder-item';
+                    li.setAttribute('data-reorder-item', itemKey);
+                    li.draggable = true;
+                    li.innerHTML =
+                        '<i class="fa-solid fa-grip-vertical drag-handle"></i>' +
+                        '<i class="fa-solid ' + info.icon + '"></i> ' +
+                        info.label;
+                    ul.appendChild(li);
+                });
+
+                groupDiv.appendChild(ul);
+                sectionWrap.appendChild(groupDiv);
             });
 
-            groupDiv.appendChild(ul);
-            list.appendChild(groupDiv);
+            list.appendChild(sectionWrap);
         });
 
         initGroupDragAndDrop(list);
@@ -439,6 +560,8 @@
 
             var target = e.target.closest('.reorder-group');
             if (!target || target === draggedGroup) return;
+            // Groups belong to a fixed macro section - no cross-section moves
+            if (target.closest('.reorder-section') !== draggedGroup.closest('.reorder-section')) return;
 
             // Clear all indicators
             container.querySelectorAll('.reorder-group').forEach(function (g) { g.classList.remove('drag-over'); });
@@ -449,8 +572,9 @@
             if (!draggedGroup) return;
             e.preventDefault();
             var target = e.target.closest('.reorder-group');
-            if (target && target !== draggedGroup) {
-                container.insertBefore(draggedGroup, target);
+            if (target && target !== draggedGroup &&
+                target.closest('.reorder-section') === draggedGroup.closest('.reorder-section')) {
+                target.parentNode.insertBefore(draggedGroup, target);
             }
             commitGroupOrder(container);
         });
@@ -538,63 +662,53 @@
         var hidden = getHiddenGroups();
         var order = getSidebarOrder();
 
-        var groupNames = {
-            operations: 'Operations',
-            server: 'Server',
-            spells: 'Spells',
-            content: 'Content',
-            bots: 'Bots',
-            data: 'Data',
-            wiki: 'Wiki',
-            downloads: 'Downloads & Uploads'
-        };
-
-        var groupIcons = {
-            operations: 'fa-gauge',
-            server: 'fa-server',
-            spells: 'fa-wand-sparkles',
-            content: 'fa-box-open',
-            bots: 'fa-robot',
-            data: 'fa-database',
-            wiki: 'fa-book',
-            downloads: 'fa-arrow-down-to-line'
-        };
-
-        order.groups.forEach(function (groupKey) {
-            var isHidden = hidden.indexOf(groupKey) !== -1;
-            var isActive = groupKey === activeGroup;
-            var name = groupNames[groupKey] || groupKey;
-            var icon = groupIcons[groupKey] || 'fa-folder';
-
-            var row = document.createElement('div');
-            row.className = 'visibility-row' + (isHidden ? ' hidden-group' : '');
-            row.innerHTML =
-                '<div class="visibility-info">' +
-                '<i class="fa-solid ' + icon + '" style="color: var(--accent); font-size: 13px; width: 18px; text-align: center;"></i>' +
-                '<span>' + name + '</span>' +
-                (isActive ? '<span class="visibility-active-badge">current</span>' : '') +
-                '</div>' +
-                '<label class="visibility-toggle">' +
-                '<input type="checkbox" ' + (!isHidden ? 'checked' : '') + ' ' + (isActive ? 'disabled' : '') +
-                ' data-vis-group="' + groupKey + '" />' +
-                '<span class="visibility-slider"></span>' +
-                '</label>';
-
-            row.querySelector('input').addEventListener('change', function () {
-                var gk = this.getAttribute('data-vis-group');
-                var h = getHiddenGroups();
-                if (this.checked) {
-                    h = h.filter(function (g) { return g !== gk; });
-                } else {
-                    if (h.indexOf(gk) === -1) h.push(gk);
-                }
-                saveHiddenGroups(h);
-                applySidebarVisibility();
-                // Update row styling
-                row.classList.toggle('hidden-group', !this.checked);
+        SECTIONS.forEach(function (section) {
+            var sectionGroups = order.groups.filter(function (g) {
+                return section.groups.indexOf(g) !== -1;
             });
+            if (sectionGroups.length === 0) return;
 
-            list.appendChild(row);
+            var label = document.createElement('div');
+            label.className = 'customize-section-label';
+            label.innerHTML = '<i class="fa-solid ' + section.icon + '"></i> ' + section.label;
+            list.appendChild(label);
+
+            sectionGroups.forEach(function (groupKey) {
+                var meta = GROUP_META[groupKey] || { name: groupKey, icon: 'fa-folder' };
+                var isHidden = hidden.indexOf(groupKey) !== -1;
+                var isActive = groupKey === activeGroup;
+
+                var row = document.createElement('div');
+                row.className = 'visibility-row' + (isHidden ? ' hidden-group' : '');
+                row.innerHTML =
+                    '<div class="visibility-info">' +
+                    '<i class="fa-solid ' + meta.icon + '" style="color: var(--accent); font-size: 13px; width: 18px; text-align: center;"></i>' +
+                    '<span>' + meta.name + '</span>' +
+                    (isActive ? '<span class="visibility-active-badge">current</span>' : '') +
+                    '</div>' +
+                    '<label class="visibility-toggle">' +
+                    '<input type="checkbox" ' + (!isHidden ? 'checked' : '') + ' ' + (isActive ? 'disabled' : '') +
+                    ' data-vis-group="' + groupKey + '" />' +
+                    '<span class="visibility-slider"></span>' +
+                    '</label>';
+
+                row.querySelector('input').addEventListener('change', function () {
+                    var gk = this.getAttribute('data-vis-group');
+                    var h = getHiddenGroups();
+                    if (this.checked) {
+                        h = h.filter(function (g) { return g !== gk; });
+                    } else {
+                        if (h.indexOf(gk) === -1) h.push(gk);
+                    }
+                    saveHiddenGroups(h);
+                    applySidebarVisibility();
+                    applySectionTabs();
+                    // Update row styling
+                    row.classList.toggle('hidden-group', !this.checked);
+                });
+
+                list.appendChild(row);
+            });
         });
     }
 
