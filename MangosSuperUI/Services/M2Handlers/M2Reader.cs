@@ -44,6 +44,12 @@ public class M2Model
     // happens up front via TryFindSequenceIndexByAnimationId.
     public List<M2Sequence> Sequences { get; set; } = new();
 
+    /// <summary>Independent animation-loop durations in milliseconds.</summary>
+    public List<uint> GlobalSequenceDurations { get; set; } = new();
+
+    /// <summary>Category-0 hair geoset selected from CharHairGeosets.dbc.</summary>
+    public int DefaultHairGeosetId { get; set; } = -1;
+
     public bool IsValid => Vertices.Count > 0 && Indices.Count >= 3;
     public bool HasSkeleton => Bones.Count > 0;
 
@@ -254,13 +260,10 @@ public class M2Sequence
 /// shared global timeline. So we must slice the M2's shared keys/timestamps
 /// into per-sequence sub-arrays at bake time.
 ///
-/// === GlobalSequence (NOT supported here) ===
+/// === GlobalSequence ===
 /// When globalSequence &gt; -1, the track loops independently of any
-/// AnimationData sequence (used for spell effects, particle pulses, etc.).
-/// Character bone tracks don't use global sequences in practice — we treat
-/// any track with globalSequence != -1 as "no per-sequence data" via
-/// <see cref="UsesSequence"/>. If a future character M2 turns out to need
-/// global-sequence support, this is the place to wire it up.
+/// AnimationData sequence. Character models use these tracks for the eye
+/// layer scale animation that opens the eyes and produces periodic blinks.
 /// </summary>
 public class M2AnimTrack<T> where T : struct
 {
@@ -275,6 +278,10 @@ public class M2AnimTrack<T> where T : struct
     public List<T> Keys { get; set; } = new();
 
     public bool IsLinear => InterpolationType == 1;
+
+    public bool UsesGlobalSequence(int globalSequenceIndex) =>
+        GlobalSequence == globalSequenceIndex &&
+        Timestamps.Count > 0 && Timestamps.Count == Keys.Count;
 
     /// <summary>
     /// True if this track has at least one keyframe whose timestamp falls
@@ -291,7 +298,7 @@ public class M2AnimTrack<T> where T : struct
     /// </summary>
     public bool UsesSequence(uint startTimestampMs, uint endTimestampMs)
     {
-        if (GlobalSequence > -1) return false; // see class doc — not supported
+        if (GlobalSequence > -1) return false; // emitted as an independent clip
         if (Timestamps.Count == 0) return false;
         if (endTimestampMs < startTimestampMs) return false;
 
@@ -326,6 +333,14 @@ public class M2AnimTrack<T> where T : struct
             if (t > endTimestampMs) break; // Timestamps is monotonic
             yield return (t - startTimestampMs, Keys[i]);
         }
+    }
+
+    public IEnumerable<(uint timeMs, T value)> EnumerateGlobalKeys(int globalSequenceIndex)
+    {
+        if (!UsesGlobalSequence(globalSequenceIndex)) yield break;
+
+        for (int i = 0; i < Timestamps.Count; i++)
+            yield return (Timestamps[i], Keys[i]);
     }
 }
 
@@ -411,6 +426,8 @@ public class M2Reader
             uint ofsName = ReadUInt32(data, 0x0C);
             if (nName > 0 && ofsName > 0 && ofsName + nName <= data.Length)
                 model.Name = Encoding.ASCII.GetString(data, (int)ofsName, (int)nName).TrimEnd('\0');
+
+            ParseGlobalSequences(data, ReadUInt32(data, 0x014), ReadUInt32(data, 0x018), model);
 
             // ── Sequences (Session O) ───────────────────────────────────────
             // Parsed BEFORE bones, because bone TRS tracks reference sequence
@@ -564,6 +581,16 @@ public class M2Reader
                 Flags = ReadUInt32(data, off + 16),
             });
         }
+    }
+
+    private static void ParseGlobalSequences(byte[] data, uint count, uint offset, M2Model model)
+    {
+        if (count == 0 || offset == 0) return;
+        if (offset + count * 4 > data.Length) return;
+
+        model.GlobalSequenceDurations.Capacity = (int)count;
+        for (uint i = 0; i < count; i++)
+            model.GlobalSequenceDurations.Add(ReadUInt32(data, (int)(offset + i * 4)));
     }
 
     // ── Bones ───────────────────────────────────────────────────────────────

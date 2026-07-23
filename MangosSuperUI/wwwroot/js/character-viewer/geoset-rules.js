@@ -212,13 +212,9 @@ export const SLOT_RULES = {
     // 2 = NECK — atlas-only / no geoset change.  [VERIFIED-EMPTY]
     2: { groups: [] },
 
-    // 3 = SHOULDER — paints into cat 15 (shoulders+cape). The shoulder
-    //   slot adds optional shoulder pad geometry on top of the default
-    //   shoulders. Vanilla cat 15 has variants 1-6; v1 is "no shoulder
-    //   pads" and v2-6 are pad shapes. We don't yet know which
-    //   geosetGroup index controls them.
-    //   [UNVERIFIED] — need a real shoulder item DBC to confirm.
-    3: { groups: [[15, 0, 0]] },
+    // 3 = SHOULDER. Shoulder armor is a pair of attached M2s and does not
+    // alter the character's cape category.
+    3: { groups: [] },
 
     // 4 = SHIRT (cosmetic undershirt) — adds cat 8 sleeves and cat 10
     //   shirt-tail.  [HAND-TUNED only]
@@ -292,14 +288,11 @@ export const SLOT_RULES = {
     17: { groups: [] }, 21: { groups: [] }, 22: { groups: [] },
     23: { groups: [] }, 25: { groups: [] }, 26: { groups: [] },
 
-    // 16 = BACK (cape) — cat 15 again, but selecting cape variants 2-6.
-    //   [UNVERIFIED] — no cape item tested. Probably geosetGroup[0]
-    //   with offset 1 (so DBC variant 1 selects cape variant 2 = first
-    //   real cape style).
+    // 16 = BACK (cape). 1501 is no cape; 1502 is the fixed cape cloth.
+    // The cloak's model texture fills the M2 type-2 texture slot separately.
     16: {
-        groups: [
-            [15, 0, 1],
-        ]
+        groups: [],
+        setVariants: { 15: 2 },
     },
 
     // 19 = TABARD — cat 12 (tabard-bottom).
@@ -393,8 +386,14 @@ export function resolveVisibleGeosets(geosetList, items) {
         const cat0Variants = [...new Set(cat0Meshes
             .map(m => m.userData?.geosetVariant)
             .filter(v => typeof v === 'number' && v > 0))];
+        const mappedHairGeosetId = cat0Meshes
+            .map(m => m.userData?.defaultHairGeosetId)
+            .find(id => typeof id === 'number' && id > 0);
+        const mappedHairVariant = mappedHairGeosetId == null ? null : mappedHairGeosetId % 100;
         let hairVariant;
-        if (cat0Variants.includes(PREFERRED_HAIR_VARIANT)) {
+        if (mappedHairVariant != null && cat0Variants.includes(mappedHairVariant)) {
+            hairVariant = mappedHairVariant;
+        } else if (cat0Variants.includes(PREFERRED_HAIR_VARIANT)) {
             hairVariant = PREFERRED_HAIR_VARIANT;
         } else if (cat0Variants.length > 0) {
             hairVariant = Math.max(...cat0Variants);

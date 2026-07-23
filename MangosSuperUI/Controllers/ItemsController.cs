@@ -3104,6 +3104,12 @@ public class ItemsController : Controller
             if (weaponUrl != null) attachments["weapon"] = weaponUrl;
         }
 
+        // Cloaks are character geoset 1502, not attached M2s. Their
+        // ItemDisplayInfo model texture fills the character M2's type-2 slot.
+        string? capeTextureUrl = null;
+        if (inventoryType == 16)
+            capeTextureUrl = _itemTextures.GetCapeTexture(displayId)?.PreviewPngPath;
+
         // Session L diagnostic: echo the ItemDisplayInfo.dbc model/texture
         // name fields (fields [1..4] of the DBC record) so the client side
         // can drive helm/shoulder attachment rendering. For body-atlas
@@ -3124,6 +3130,7 @@ public class ItemsController : Controller
             bodyTextures = info.Value.BodyTextures ?? new string[8],
             slotUrls = atlas?.SlotUrls ?? new Dictionary<int, string>(),
             attachments,
+            capeTextureUrl,
             modelName1 = info.Value.ModelName1 ?? "",
             modelName2 = info.Value.ModelName2 ?? "",
             textureName1 = info.Value.TextureName1 ?? "",

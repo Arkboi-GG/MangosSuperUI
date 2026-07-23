@@ -349,5 +349,9 @@ function isBodySkinnedGeoset(category, variant) {
     // slot pipeline doesn't paint. Keep its original M2 texture.
     if (category === 7) return false;
 
+    // Geoset 1502 is cape cloth and samples the replaceable type-2 item
+    // texture, never the character body atlas.
+    if (category === 15 && variant === 2) return false;
+
     return true;
 }

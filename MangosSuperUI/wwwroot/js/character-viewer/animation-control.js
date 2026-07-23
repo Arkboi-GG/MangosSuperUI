@@ -52,6 +52,10 @@ export function mountAnimationControl(opts) {
         return null;
     }
 
+    const globalClips = animations.filter(c => c.name.startsWith('GlobalSequence_'));
+    const selectableAnimations = animations.filter(c => !c.name.startsWith('GlobalSequence_'));
+    if (selectableAnimations.length === 0) return null;
+
     // Remove any prior mount (idempotency).
     const existing = document.getElementById(PANEL_ID);
     if (existing) existing.remove();
@@ -89,8 +93,8 @@ export function mountAnimationControl(opts) {
         font: 'inherit',
         minWidth: '120px',
     });
-    for (let i = 0; i < animations.length; i++) {
-        const clip = animations[i];
+    for (let i = 0; i < selectableAnimations.length; i++) {
+        const clip = selectableAnimations[i];
         const opt = document.createElement('option');
         opt.value = String(i);                    // index, not name (clip names may collide)
         opt.textContent = friendlyClipName(clip.name);
@@ -153,12 +157,34 @@ export function mountAnimationControl(opts) {
 
     // ── State ───────────────────────────────────────────────────────────
     let currentAction = null;
+    const globalActions = globalClips.map(clip => mixer.clipAction(clip));
     let isPlaying = true;
     let timeScale = 1.0;
 
+    const LOOP_REPEAT = 2201;
+    for (const action of globalActions) {
+        action.reset();
+        action.setLoop(LOOP_REPEAT, Infinity);
+        action.clampWhenFinished = false;
+        action.timeScale = timeScale;
+        action.play();
+    }
+
     function playByIndex(idx) {
-        const clip = animations[idx];
+        const clip = selectableAnimations[idx];
         if (!clip) return;
+
+        // A caller may have used stop() and then play(name). Bring the
+        // independent blink/global loops back with the foreground clip.
+        for (const action of globalActions) {
+            if (!action.isRunning()) {
+                action.reset();
+                action.setLoop(LOOP_REPEAT, Infinity);
+                action.play();
+            }
+            action.paused = false;
+            action.timeScale = timeScale;
+        }
 
         // Stop the previous action — see "Single-action discipline" above.
         if (currentAction) {
@@ -177,7 +203,6 @@ export function mountAnimationControl(opts) {
         // file is an ES module and the rest of the viewer treats THREE as
         // a global script tag — there's no `import THREE` in scope here.
         // The numeric value of LoopRepeat has been stable since r58 (2013).
-        const LOOP_REPEAT = 2201;
         action.setLoop(LOOP_REPEAT, Infinity);
         action.clampWhenFinished = false;
         action.timeScale = timeScale;
@@ -191,10 +216,12 @@ export function mountAnimationControl(opts) {
         if (!currentAction) return;
         if (isPlaying) {
             currentAction.paused = true;
+            for (const action of globalActions) action.paused = true;
             isPlaying = false;
             playBtn.textContent = 'Play';
         } else {
             currentAction.paused = false;
+            for (const action of globalActions) action.paused = false;
             isPlaying = true;
             playBtn.textContent = 'Pause';
         }
@@ -203,6 +230,7 @@ export function mountAnimationControl(opts) {
     function setSpeed(v) {
         timeScale = v;
         if (currentAction) currentAction.timeScale = v;
+        for (const action of globalActions) action.timeScale = v;
         speedLabel.textContent = v.toFixed(2).replace(/\.?0+$/, '') + '×';
     }
 
@@ -220,10 +248,10 @@ export function mountAnimationControl(opts) {
     // then the first available clip.
     let initialIdx = 0;
     if (opts.defaultClipName) {
-        const idx = animations.findIndex(c => c.name === opts.defaultClipName);
+        const idx = selectableAnimations.findIndex(c => c.name === opts.defaultClipName);
         if (idx >= 0) initialIdx = idx;
     } else {
-        const idx = animations.findIndex(c => c.name === 'Stand');
+        const idx = selectableAnimations.findIndex(c => c.name === 'Stand');
         if (idx >= 0) initialIdx = idx;
     }
     select.value = String(initialIdx);
@@ -233,10 +261,11 @@ export function mountAnimationControl(opts) {
     return {
         destroy() {
             if (currentAction) currentAction.stop();
+            for (const action of globalActions) action.stop();
             panel.remove();
         },
         play(name) {
-            const idx = animations.findIndex(c => c.name === name);
+            const idx = selectableAnimations.findIndex(c => c.name === name);
             if (idx >= 0) {
                 select.value = String(idx);
                 playByIndex(idx);
@@ -247,6 +276,7 @@ export function mountAnimationControl(opts) {
                 currentAction.stop();
                 currentAction = null;
             }
+            for (const action of globalActions) action.stop();
             isPlaying = false;
             playBtn.textContent = 'Play';
         },

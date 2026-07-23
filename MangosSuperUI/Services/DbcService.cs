@@ -57,6 +57,10 @@ public partial class DbcService
     public IReadOnlyList<CharSectionDbc> CharacterSections { get; private set; }
         = Array.Empty<CharSectionDbc>();
 
+    /// <summary>(race, sex, hairstyle) to the matching category-0 M2 geoset.</summary>
+    public IReadOnlyDictionary<(uint Race, uint Sex, uint Style), int> CharacterHairGeosets { get; private set; }
+        = new Dictionary<(uint Race, uint Sex, uint Style), int>();
+
     /// <summary>
     /// HelmetGeosetVisData.dbc — vanilla 1.12, 6 fields × 24 bytes, ~16 rows.
     /// Maps helmetGeosetVisID → race-indexed bitmasks for hiding hair, facial
@@ -163,6 +167,34 @@ public partial class DbcService
                 && row.ColorIndex == 0)
                 return row;
         }
+        return null;
+    }
+
+    /// <summary>
+    /// Resolve a visible default hairstyle whose texture and geometry describe
+    /// the same character-creation choice. Style 9 preserves the established
+    /// SuperUI look; races without it fall back through their available styles.
+    /// </summary>
+    public CharacterHairAppearance? GetPreferredHairAppearance(uint race, uint sex)
+    {
+        var styles = CharacterHairGeosets.Keys
+            .Where(k => k.Race == race && k.Sex == sex)
+            .Select(k => k.Style)
+            .Distinct()
+            .OrderByDescending(style => style == 9)
+            .ThenByDescending(style => style);
+
+        foreach (uint style in styles)
+        {
+            var section = CharacterSections.FirstOrDefault(row =>
+                row.Race == race && row.Sex == sex &&
+                row.BaseSection == 3 && row.VariationIndex == style && row.ColorIndex == 0);
+
+            if (section == null) continue;
+            if (!CharacterHairGeosets.TryGetValue((race, sex, style), out int geosetId)) continue;
+            return new CharacterHairAppearance(style, geosetId, section);
+        }
+
         return null;
     }
 
@@ -394,6 +426,7 @@ public partial class DbcService
             SpellRanges = LoadSpellRange(Path.Combine(DbcPath, "SpellRange.dbc"));
             SpellEntries = LoadSpellEntries(Path.Combine(DbcPath, "Spell.dbc"));
             CharacterSections = LoadCharSections(Path.Combine(DbcPath, "CharSections.dbc"));
+            CharacterHairGeosets = LoadCharHairGeosets(Path.Combine(DbcPath, "CharHairGeosets.dbc"));
             HelmetGeosetVisData = LoadHelmetGeosetVisData(Path.Combine(DbcPath, "HelmetGeosetVisData.dbc"));
             WorldMapZones = LoadWorldMapArea(Path.Combine(DbcPath, "WorldMapArea.dbc"));
 
@@ -871,6 +904,40 @@ public partial class DbcService
     /// All rows are kept — no filtering at parse time. Callers query via
     /// GetDefaultFaceSection (and future helpers for skin tones / hair styles).
     /// </summary>
+    private Dictionary<(uint Race, uint Sex, uint Style), int> LoadCharHairGeosets(string filePath)
+    {
+        var dict = new Dictionary<(uint Race, uint Sex, uint Style), int>();
+        if (!File.Exists(filePath))
+        {
+            _logger.LogWarning("DbcService: CharHairGeosets.dbc not found at {Path}", filePath);
+            LoadedCounts["CharHairGeosets"] = 0;
+            return dict;
+        }
+
+        var (records, _, recordSize) = ReadDbcFile(filePath);
+        int recordCount = records.Length / recordSize;
+        if (recordSize < 20)
+        {
+            _logger.LogWarning("DbcService: CharHairGeosets.dbc recordSize={Size} (expected at least 20)", recordSize);
+            return dict;
+        }
+
+        for (int i = 0; i < recordCount; i++)
+        {
+            int offset = i * recordSize;
+            uint race = BitConverter.ToUInt32(records, offset + 4);
+            uint sex = BitConverter.ToUInt32(records, offset + 8);
+            uint style = BitConverter.ToUInt32(records, offset + 12);
+            uint geoset = BitConverter.ToUInt32(records, offset + 16);
+            bool showsScalp = recordSize >= 24 && BitConverter.ToUInt32(records, offset + 20) != 0;
+            dict[(race, sex, style)] = showsScalp ? 1 : (int)geoset;
+        }
+
+        LoadedCounts["CharHairGeosets"] = dict.Count;
+        _logger.LogInformation("DbcService: Parsed {Count} CharHairGeosets mappings", dict.Count);
+        return dict;
+    }
+
     private List<CharSectionDbc> LoadCharSections(string filePath)
     {
         var list = new List<CharSectionDbc>();
@@ -1145,6 +1212,11 @@ public record CharSectionDbc(
     string TextureName2,
     string TextureName3,
     uint Flags);
+
+public record CharacterHairAppearance(
+    uint Style,
+    int GeosetId,
+    CharSectionDbc Section);
 
 /// <summary>
 /// One row of HelmetGeosetVisData.dbc (6 fields, 24 bytes per record).

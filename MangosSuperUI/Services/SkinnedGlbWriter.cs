@@ -173,7 +173,8 @@ public static class SkinnedGlbWriter
             // SceneBuilder is finalized via ToGltf2(), so this needs to
             // happen before that call.
             int animsBaked = EmitAnimations(m2, boneNodes, animationsToBake);
-            Console.WriteLine($"[SkinnedGlbWriter] baked {animsBaked}/{animationsToBake.Count} requested animations");
+            int globalsBaked = EmitGlobalSequences(m2, boneNodes);
+            Console.WriteLine($"[SkinnedGlbWriter] baked {animsBaked}/{animationsToBake.Count} requested animations + {globalsBaked} global loops");
 
             // ── Mesh ────────────────────────────────────────────────────────
             var allGeoIds = m2.Submeshes.Select(s => s.Id).ToList();
@@ -281,7 +282,10 @@ public static class SkinnedGlbWriter
     // (Session O) replace these at runtime when a clip is playing.
     private static NodeBuilder[] BuildBoneArmature(M2Model m2)
     {
-        var armatureRoot = new NodeBuilder("Armature");
+        string armatureName = m2.DefaultHairGeosetId >= 0
+            ? $"Armature_HairGeoset_{m2.DefaultHairGeosetId}"
+            : "Armature";
+        var armatureRoot = new NodeBuilder(armatureName);
         var nodes = new NodeBuilder[m2.Bones.Count];
 
         for (int i = 0; i < m2.Bones.Count; i++)
@@ -501,6 +505,86 @@ public static class SkinnedGlbWriter
             baked++;
             Console.WriteLine($"[SkinnedGlbWriter]   ✓ {clipName} (animId={animId}, seqIdx={seqIdx}, dur={sequence.DurationMs}ms, " +
                               $"looping={sequence.IsLooping}, animatedBones={bonesTouched}/{m2.Bones.Count})");
+        }
+
+        return baked;
+    }
+
+    /// <summary>
+    /// Bake M2 global sequences as separate clips. The browser plays these
+    /// alongside Stand/Walk/Run, preserving independent loops such as blinking.
+    /// </summary>
+    private static int EmitGlobalSequences(M2Model m2, NodeBuilder[] boneNodes)
+    {
+        int baked = 0;
+        for (int globalIdx = 0; globalIdx < m2.GlobalSequenceDurations.Count; globalIdx++)
+        {
+            uint durationMs = m2.GlobalSequenceDurations[globalIdx];
+            if (durationMs == 0) continue;
+
+            string clipName = $"GlobalSequence_{globalIdx}";
+            float durationSec = durationMs / 1000f;
+            int tracksEmitted = 0;
+
+            for (int boneIdx = 0; boneIdx < m2.Bones.Count; boneIdx++)
+            {
+                var bone = m2.Bones[boneIdx];
+                var node = boneNodes[boneIdx];
+                Vector3 restTranslation = bone.ParentBone >= 0 && bone.ParentBone < m2.Bones.Count
+                    ? bone.Pivot - m2.Bones[bone.ParentBone].Pivot
+                    : bone.Pivot;
+
+                var translationKeys = bone.Translation.EnumerateGlobalKeys(globalIdx)
+                    .Where(k => k.timeMs <= durationMs).ToList();
+                if (translationKeys.Count > 0)
+                {
+                    var curve = node.UseTranslation(clipName);
+                    Vector3 first = restTranslation + translationKeys[0].value;
+                    if (translationKeys[0].timeMs > 0) curve.WithPoint(0, first);
+                    foreach (var (timeMs, value) in translationKeys)
+                        curve.WithPoint(timeMs / 1000f, restTranslation + value);
+                    if (translationKeys[^1].timeMs < durationMs)
+                        curve.WithPoint(durationSec, first);
+                    tracksEmitted++;
+                }
+
+                var rotationKeys = bone.Rotation.EnumerateGlobalKeys(globalIdx)
+                    .Where(k => k.timeMs <= durationMs).ToList();
+                if (rotationKeys.Count > 0)
+                {
+                    var curve = node.UseRotation(clipName);
+                    Quaternion first = NormalizeQuaternion(new Quaternion(
+                        rotationKeys[0].value.X, rotationKeys[0].value.Y,
+                        rotationKeys[0].value.Z, rotationKeys[0].value.W));
+                    if (rotationKeys[0].timeMs > 0) curve.WithPoint(0, first);
+                    foreach (var (timeMs, value) in rotationKeys)
+                        curve.WithPoint(timeMs / 1000f, NormalizeQuaternion(new Quaternion(
+                            value.X, value.Y, value.Z, value.W)));
+                    if (rotationKeys[^1].timeMs < durationMs)
+                        curve.WithPoint(durationSec, first);
+                    tracksEmitted++;
+                }
+
+                var scaleKeys = bone.Scale.EnumerateGlobalKeys(globalIdx)
+                    .Where(k => k.timeMs <= durationMs).ToList();
+                if (scaleKeys.Count > 0)
+                {
+                    var curve = node.UseScale(clipName);
+                    Vector3 first = scaleKeys[0].value;
+                    if (scaleKeys[0].timeMs > 0) curve.WithPoint(0, first);
+                    foreach (var (timeMs, value) in scaleKeys)
+                        curve.WithPoint(timeMs / 1000f, value);
+                    if (scaleKeys[^1].timeMs < durationMs)
+                        curve.WithPoint(durationSec, first);
+                    tracksEmitted++;
+                }
+            }
+
+            if (tracksEmitted > 0)
+            {
+                baked++;
+                Console.WriteLine($"[SkinnedGlbWriter]   global {globalIdx}: {durationMs}ms, {tracksEmitted} track(s)");
+            }
         }
 
         return baked;

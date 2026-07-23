@@ -156,6 +156,62 @@ function loadGlb(url) {
     });
 }
 
+function loadTexture(url) {
+    return new Promise((resolve, reject) => {
+        new THREE.TextureLoader().load(url, texture => {
+            texture.flipY = false;
+            if (THREE.SRGBColorSpace) texture.colorSpace = THREE.SRGBColorSpace;
+            resolve(texture);
+        }, undefined, reject);
+    });
+}
+
+// Cloaks are character geoset 1502. Their ItemDisplayInfo model texture
+// replaces the character M2's type-2 texture slot at equip time.
+async function applyCapeTexture(character, url) {
+    if (!url) {
+        character._capeTexture?.dispose?.();
+        character._capeTexture = null;
+        return;
+    }
+
+    let texture;
+    try {
+        texture = await loadTexture(url);
+    } catch (err) {
+        console.warn('[equip] cape texture failed to load:', url, err);
+        for (const mesh of character.geosetList) {
+            if (mesh.userData?.geosetId === 1502) mesh.visible = false;
+        }
+        return;
+    }
+
+    character._capeTexture?.dispose?.();
+
+    const capeMeshes = character.geosetList.filter(m => m.userData?.geosetId === 1502);
+    for (const mesh of capeMeshes) {
+        if (!mesh.userData._capeMaterialIsolated) {
+            mesh.material = Array.isArray(mesh.material)
+                ? mesh.material.map(mat => mat.clone())
+                : mesh.material.clone();
+            mesh.userData._capeMaterialIsolated = true;
+        }
+
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const mat of mats) {
+            mat.map = texture;
+            mat.color?.set(0xffffff);
+            mat.opacity = 1;
+            mat.transparent = true;
+            mat.alphaTest = 0.35;
+            mat.side = THREE.DoubleSide;
+            mat.depthWrite = true;
+            mat.needsUpdate = true;
+        }
+    }
+    character._capeTexture = texture;
+}
+
 /**
  * Vanilla character body texture paint order (bottom layer first).
  *
@@ -465,7 +521,8 @@ export async function equipBodyAtlasRetextureDirect(character, slotUrls, opts = 
  */
 function getCurrentBodyAtlasImage(character) {
     const isBody = (cat, variant) =>
-        cat === 0 ? variant === 0 : (cat === 7 ? false : true);
+        cat === 0 ? variant === 0 :
+            (cat === 7 || (cat === 15 && variant === 2) ? false : true);
     let fallback = null;
     for (const m of character.geosetList) {
         const cat = m.userData?.geosetCategory;
@@ -646,6 +703,8 @@ export async function equipDisplay(character, displayId, itemId = 0, opts = {}) 
         geosetGroup: dressing.geosetGroup,
         hidesHair: dressing.hidesHair,
     }]);
+    await applyCapeTexture(character,
+        inventoryType === 16 ? dressing.capeTextureUrl : null);
 
     // 2. Body atlas paint. Weapons have empty slotUrls so this branch
     //    short-circuits for them.
@@ -715,6 +774,8 @@ export async function equipMultiple(character, equipment, opts = {}) {
         hidesHair: r.d.hidesHair,
     }));
     dresser.applyItemFilters(character, items);
+    const cape = resolved.find(r => r.invType === 16 && r.d.capeTextureUrl);
+    await applyCapeTexture(character, cape?.d.capeTextureUrl ?? null);
 
     // 2. Body atlas — sort into paint order and composite each item as
     //    a separate layer onto one canvas. Stable sort: same-priority
@@ -765,6 +826,7 @@ export async function equipMultiple(character, equipment, opts = {}) {
  */
 export async function unequipAll(character, opts = {}) {
     dresser.showDefaultGeosets(character);
+    await applyCapeTexture(character, null);
     clearAllAttachments(character);
     const baseSkin = opts.baseSkin ?? await loadDefaultSkin(character);
     if (baseSkin) {

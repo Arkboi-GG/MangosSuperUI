@@ -75,8 +75,14 @@ function indexCharacter(gltf) {
     const attachmentList = [];
     const geosets = {};
     const geosetList = [];
+    let defaultHairGeosetId = null;
 
     root.traverse((n) => {
+        if (n.name && n.name.startsWith('Armature_HairGeoset_')) {
+            const id = parseInt(n.name.substring('Armature_HairGeoset_'.length), 10);
+            if (!Number.isNaN(id)) defaultHairGeosetId = id;
+        }
+
         // Bones — both glTF skin joints (n.isBone === true) and our named bone
         // NodeBuilders should be matched. We use the name prefix as the key
         // source because SharpGLTF's joint nodes don't always set isBone reliably
@@ -119,6 +125,12 @@ function indexCharacter(gltf) {
         }
     });
 
+    // Carry the server-selected CharHairGeosets.dbc mapping into the
+    // visibility resolver without a second API request.
+    for (const mesh of geosetList) {
+        mesh.userData.defaultHairGeosetId = defaultHairGeosetId;
+    }
+
     // Sanity: warn (don't throw) if we got zero of any expected bucket. Helps
     // debugging when the server hasn't redeployed the new naming yet.
     if (boneList.length === 0) {
@@ -150,6 +162,7 @@ function indexCharacter(gltf) {
         attachmentList,
         geosets,
         geosetList,
+        defaultHairGeosetId,
         animations,
     };
 }

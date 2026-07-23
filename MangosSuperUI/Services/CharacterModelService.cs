@@ -226,9 +226,18 @@ public class CharacterModelService
             uint sexId = gender.Equals("Female", StringComparison.OrdinalIgnoreCase) ? 1u : 0u;
             if (raceId > 0)
             {
-                var hairRow = _dbcResolver.GetDefaultHairSection(raceId, sexId);
+                var hairAppearance = _dbcResolver.GetPreferredHairAppearance(raceId, sexId);
+                var hairRow = hairAppearance?.Section ?? _dbcResolver.GetDefaultHairSection(raceId, sexId);
                 if (hairRow != null && !string.IsNullOrEmpty(hairRow.TextureName1))
                 {
+                    if (hairAppearance != null)
+                    {
+                        m2.DefaultHairGeosetId = hairAppearance.GeosetId;
+                        _logger.LogInformation(
+                            "CharacterModelService: {Key} hair style {Style} maps to geoset {Geoset}",
+                            key, hairAppearance.Style, hairAppearance.GeosetId);
+                    }
+
                     var hairBlp = CharacterSkinCompositor.ResolveCharacterTextureBlp(
                         _mpq, hairRow.TextureName1, race, gender);
                     if (hairBlp != null)
