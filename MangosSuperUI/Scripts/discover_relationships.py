@@ -190,10 +190,14 @@ def type_compatible(candidate_type, target_type):
 
 def sample_distinct_values(conn, database, table, column, limit=200):
     """Get a sample of distinct non-null values from a column."""
+    db_esc = database.replace('`', '``')
+    tbl_esc = table.replace('`', '``')
+    col_esc = column.replace('`', '``')
     cursor = conn.cursor()
     try:
-        cursor.execute(f"SELECT DISTINCT `{column}` FROM `{database}`.`{table}` "
-                       f"WHERE `{column}` IS NOT NULL AND `{column}` != 0 LIMIT {limit}")
+        cursor.execute(f"SELECT DISTINCT `{col_esc}` FROM `{db_esc}`.`{tbl_esc}` "
+                       f"WHERE `{col_esc}` IS NOT NULL AND `{col_esc}` != 0 LIMIT %s",
+                       (int(limit),))
         values = [row[0] for row in cursor.fetchall()]
         return values
     except Exception as e:
@@ -204,10 +208,13 @@ def sample_distinct_values(conn, database, table, column, limit=200):
 
 def count_distinct(conn, database, table, column):
     """Get count of distinct non-null non-zero values."""
+    db_esc = database.replace('`', '``')
+    tbl_esc = table.replace('`', '``')
+    col_esc = column.replace('`', '``')
     cursor = conn.cursor()
     try:
-        cursor.execute(f"SELECT COUNT(DISTINCT `{column}`) FROM `{database}`.`{table}` "
-                       f"WHERE `{column}` IS NOT NULL AND `{column}` != 0")
+        cursor.execute(f"SELECT COUNT(DISTINCT `{col_esc}`) FROM `{db_esc}`.`{tbl_esc}` "
+                       f"WHERE `{col_esc}` IS NOT NULL AND `{col_esc}` != 0")
         return cursor.fetchone()[0]
     except:
         return 0
