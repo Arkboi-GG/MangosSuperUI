@@ -1,3 +1,5 @@
+using MangosSuperUI.Models;
+
 namespace MangosSuperUI.Services;
 
 /// <summary>
@@ -73,6 +75,13 @@ public class PatchBuilderService
     private const int FIELD_TOOLTIP_ENUS = 147;        // Fireball → "$s2 Fire damage..."
     private const int FIELD_TOOLTIP_FLAGS = 155;       // 0x003F007E
     private const int FIELD_SCHOOL_MASK = 1;           // category / school area
+
+    // ── Spell.dbc reagent offsets (Profession Tuning) ──
+    // ReagentCount[0..7] = fields 50..57. Anchored to the same confirmed 1.12.1
+    // layout as Effect[0] @ 61 and EffectItemType[0] @ 103:
+    //   40-41 Totem[2] | 42-49 Reagent[8] | 50-57 ReagentCount[8]
+    //   58-60 EquippedItem* | 61-63 Effect[3]
+    private const int FIELD_REAGENT_COUNT_0 = 50;
     private const uint LOCALE_FLAGS = 0x003F007E;      // enUS locale flags pattern
     private const uint SPELL_ATTR_HIDDEN = 0x80;       // SPELL_ATTR_HIDDEN_CLIENTSIDE
 
@@ -143,19 +152,22 @@ public class PatchBuilderService
         ?? "/opt/mangossuperui/wwwroot/patches";
 
     /// <summary>
-    /// Path to pre-extracted M2 files from the client's patch.MPQ (fallback).
+    /// Path to pre-extracted M2 files from the client's patch.MPQ (optional cache).
     /// 
-    /// War3Net has a known bug reading from large (~2GB) MPQs: MpqStream gets
-    /// prematurely disposed (ObjectDisposedException), causing reads to silently
-    /// fall through to model.MPQ which has older M2 versions with stale texture
-    /// paths (green "missing texture" blocks in-game).
+    /// HISTORY: this directory was a mandatory workaround. War3Net had a bug on
+    /// large (~2GB) MPQs where MpqStream was prematurely disposed
+    /// (ObjectDisposedException), so reads silently fell through to model.MPQ —
+    /// older M2 versions with stale texture paths (green "missing texture" blocks
+    /// in-game).
     /// 
-    /// The pipeline tries MPQ reading first. If that fails, it falls back to
-    /// pre-extracted static files in this directory. If neither source has the
-    /// file, an ERROR is logged (not silently skipped).
+    /// War3Net is GONE. ReadFileFromClientMpq now uses the managed
+    /// Mpq.MpqArchive, which reads those archives correctly, so this directory is
+    /// a fast path rather than a requirement. Order is static files first, then
+    /// the patch MPQs; if neither source has the file an ERROR is logged (never
+    /// silently skipped).
     /// 
-    /// Pre-extract spell M2 files from patch.MPQ (via Ladik's MPQ Editor) into
-    /// this directory, preserving the MPQ path structure:
+    /// To populate it, extract spell M2s from patch.MPQ into this directory,
+    /// preserving the MPQ path structure:
     ///   {ClientM2Path}/Spells/Fire_Cast_Hand.m2
     ///   {ClientM2Path}/Spells/Fire_Precast_Hand.m2
     ///   {ClientM2Path}/Spells/Fireball_Missile_Low.m2
@@ -165,14 +177,24 @@ public class PatchBuilderService
     private string ClientM2Path => _config["Vmangos:ClientM2Path"]
         ?? "/home/wowvmangos/wowclient/m2";
 
+    /// <summary>
+    /// OPTIONAL. Only used to read Profession Tuning's reagent overrides when
+    /// rebuilding the CLIENT copy of Spell.dbc. Nullable + defaulted so DI fills
+    /// it automatically and no existing call site has to change; if it is null,
+    /// the pipeline behaves exactly as it did before Profession Tuning existed.
+    /// </summary>
+    private readonly ConnectionFactory? _db;
+
     public PatchBuilderService(
         IConfiguration config,
         BlpWriterService blpWriter,
-        ILogger<PatchBuilderService> logger)
+        ILogger<PatchBuilderService> logger,
+        ConnectionFactory? db = null)
     {
         _config = config;
         _blpWriter = blpWriter;
         _logger = logger;
+        _db = db;
     }
 
     /// <summary>
@@ -798,14 +820,73 @@ public class PatchBuilderService
                 _logger.LogInformation("PatchBuilder: Added {Count} trainer wrapper entries to Spell.dbc", wrappersPatched);
 
             // ── Step 3: Serialize all DBCs ──
-            byte[] spellDbcBytes = spellDbc.Write();
+            //
+            // Spell.dbc is serialized TWICE, on purpose.
+            //
+            // The SERVER copy must stay reagent-PRISTINE, because it is the clean
+            // base ReadCleanDbc loads on the next rebuild. If Profession Tuning's
+            // reduced reagent counts were written there, that file would become a
+            // poisoned base: a later restore would drop the override but the
+            // reduced count would already be baked into DbcPath and every future
+            // patch-3 would inherit it. mangosd would never notice (it reads
+            // reagents from spell_template, not the DBC), so the corruption would
+            // be silent and permanent.
+            //
+            // Only the CLIENT copy that goes into patch-3 carries the overrides.
+            // That makes the profession_tuning table the single source of truth
+            // for what the client sees: drop a row → next rebuild is pristine for
+            // that recipe, which is exactly what "restore" has to mean.
+            byte[] spellDbcServerBytes = spellDbc.Write();      // pristine — server
             byte[] visualDbcBytes = visualDbc.Write();
             byte[] kitDbcBytes = kitDbc.Write();
             byte[] efnDbcBytes = effectNameDbc.Write();
             byte[] slaDbcBytes = skillLineAbilityDbc.Write();
             byte[] iconDbcBytes = spellIconDbc.Write();
 
-            mpqBuilder.AddFile("DBFilesClient\\Spell.dbc", spellDbcBytes);
+            // ── Step 3b: fold Profession Tuning reagent counts into the CLIENT copy ──
+            // The server reads reagents from spell_template, but the 1.12.1 client
+            // reads them from Spell.dbc — for the tradeskill tooltip AND for the
+            // client-side "Create" gate. Without this the client keeps blocking at
+            // the old count and the reduction is unusable in game.
+            byte[] spellDbcClientBytes = spellDbcServerBytes;
+            int reagentRowsPatched = 0;
+            if (_db != null)
+            {
+                try
+                {
+                    using var tuningConn = _db.Admin();
+                    var reagentOverrides = await ProfessionTuningStore.GetReagentOverridesAsync(tuningConn);
+                    if (reagentOverrides.Count > 0)
+                    {
+                        foreach (var kvp in reagentOverrides)
+                        {
+                            uint tunedSpell = kvp.Key;
+                            uint[] counts = kvp.Value;
+                            if (spellDbc.GetRow(tunedSpell) == null) continue;   // not in this DBC
+                            for (int i = 0; i < 8; i++)
+                                spellDbc.PatchRow(tunedSpell, FIELD_REAGENT_COUNT_0 + i, counts[i]);
+                            reagentRowsPatched++;
+                        }
+
+                        if (reagentRowsPatched > 0)
+                        {
+                            spellDbcClientBytes = spellDbc.Write();
+                            _logger.LogInformation(
+                                "PatchBuilder: applied Profession Tuning reagent counts to {Count} Spell.dbc row(s) (client copy only)",
+                                reagentRowsPatched);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Profession Tuning must never be able to break a spell patch
+                    // rebuild. Fall back to the pristine bytes and carry on.
+                    _logger.LogWarning(ex, "PatchBuilder: Profession Tuning reagent overrides skipped");
+                    spellDbcClientBytes = spellDbcServerBytes;
+                }
+            }
+
+            mpqBuilder.AddFile("DBFilesClient\\Spell.dbc", spellDbcClientBytes);
             mpqBuilder.AddFile("DBFilesClient\\SpellVisual.dbc", visualDbcBytes);
             mpqBuilder.AddFile("DBFilesClient\\SpellVisualKit.dbc", kitDbcBytes);
             mpqBuilder.AddFile("DBFilesClient\\SpellVisualEffectName.dbc", efnDbcBytes);
@@ -815,7 +896,7 @@ public class PatchBuilderService
             // ── Step 4: Write server DBCs ──
             try
             {
-                File.WriteAllBytes(Path.Combine(DbcPath, "Spell.dbc"), spellDbcBytes);
+                File.WriteAllBytes(Path.Combine(DbcPath, "Spell.dbc"), spellDbcServerBytes);   // pristine, NOT the client copy
                 File.WriteAllBytes(Path.Combine(DbcPath, "SpellVisual.dbc"), visualDbcBytes);
                 File.WriteAllBytes(Path.Combine(DbcPath, "SpellVisualKit.dbc"), kitDbcBytes);
                 File.WriteAllBytes(Path.Combine(DbcPath, "SpellVisualEffectName.dbc"), efnDbcBytes);
@@ -839,7 +920,10 @@ public class PatchBuilderService
             foreach (var old in Directory.GetFiles(PatchOutputPath, "patch-custom-*.MPQ"))
                 File.Delete(old);
 
-            if (mpqBuilder.FileCount > 6) // More than just the 6 DBCs = has actual content
+            // > 6 files means there is real content beyond the 6 DBCs. reagentRowsPatched
+            // is ORed in so a tuning-only change still produces a patch when there are
+            // no custom spells to push the file count up.
+            if (mpqBuilder.FileCount > 6 || reagentRowsPatched > 0)
             {
                 if (!mpqBuilder.Build(fullPath))
                 {
@@ -1373,17 +1457,23 @@ public class PatchBuilderService
     }
 
     /// <summary>
-    /// Read an M2 file from client data. Attempts MPQ reading first, then falls back
-    /// to pre-extracted static files on disk.
+    /// Read an M2 file from client data: pre-extracted static files first, then
+    /// the patch MPQs via the managed reader.
     /// 
-    /// KNOWN ISSUE: War3Net throws ObjectDisposedException ("Cannot access a closed
-    /// Stream") when reading from large MPQs (~2GB patch.MPQ). The MpqStream is
-    /// prematurely disposed during CopyTo. This causes the read to silently fall
-    /// through to model.MPQ, which has older M2 versions with stale texture paths
-    /// (e.g. WORLD\SKILLACTIVATED\CONTAINERS\FLARE.BLP instead of correct
+    /// HISTORY: static-files-first started as a WORKAROUND. War3Net threw
+    /// ObjectDisposedException ("Cannot access a closed Stream") on large MPQs
+    /// (~2GB patch.MPQ) because MpqStream was disposed mid-CopyTo, so the read
+    /// silently fell through to model.MPQ — older M2s with stale texture paths
+    /// (WORLD\SKILLACTIVATED\CONTAINERS\FLARE.BLP instead of the correct
     /// ITEM\OBJECTCOMPONENTS\WEAPON\FLARE.BLP) → green "missing texture" blocks.
     /// 
-    /// WORKAROUND: Pre-extract spell M2 files from patch.MPQ (via Ladik's MPQ Editor)
+    /// War3Net is GONE; the MPQ path now uses the managed Mpq.MpqArchive, which
+    /// has no such bug. Static-files-first is KEPT because it is still faster and
+    /// is the known-good extraction, but it is no longer load-bearing — if the
+    /// directory is empty the MPQ read is now expected to succeed on its own.
+    /// The model.MPQ exclusion below still matters and must stay.
+    /// 
+    /// To populate the (optional) static cache, extract spell M2s from patch.MPQ
     /// into ClientM2Path, preserving the MPQ directory structure:
     ///   {ClientM2Path}/Spells/Fire_Cast_Hand.m2
     ///   {ClientM2Path}/Spells/Fire_Precast_Hand.m2
@@ -1447,8 +1537,18 @@ public class PatchBuilderService
                     string mpqName = Path.GetFileName(mpqFile);
                     try
                     {
-                        using var archive = MangosSuperUI.Services.Mpq.MpqArchive.Open(mpqFile);
-                        var data = archive?.ReadFile(normalizedPath);
+                        // Managed reader (Services/SuperUiMPQ). Open() returns null when
+                        // the file carries no MPQ header; ReadFile() returns null when the
+                        // entry is absent, and normalizes '/' → '\\' internally, so the old
+                        // open/exists/openfile/CopyTo dance collapses to two calls.
+                        using var archive = Mpq.MpqArchive.Open(mpqFile);
+                        if (archive == null)
+                        {
+                            _logger.LogWarning("ReadM2: {Mpq} has no MPQ header — trying next", mpqName);
+                            continue;
+                        }
+
+                        var data = archive.ReadFile(normalizedPath);
                         if (data != null)
                         {
                             _logger.LogInformation("ReadM2: Found '{Path}' in {Mpq} ({Size} bytes)",

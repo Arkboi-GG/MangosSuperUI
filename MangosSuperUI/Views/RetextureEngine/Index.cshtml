@@ -117,7 +117,7 @@
                         </figcaption>
                         <div class="re-canvas-wrap-big">
                             <canvas id="char-preview-canvas" data-glb-url=""></canvas>
-                            <div class="re-img-msg" id="reViewerMsg">Pick an item to dress the character.</div>
+                            <div class="re-img-msg" id="reViewerMsg">Loading character&hellip;</div>
                         </div>
                     </figure>
 
@@ -235,9 +235,11 @@
     <script type="module" asp-append-version="true">
         import { mountCharacterViewer } from '/js/character-viewer/embed.js';
         import * as equip from '/js/character-viewer/equip.js';
+        import * as dresser from '/js/character-viewer/dresser.js';
         import { TIER_SETS, TIER_CLASSES, TIER_IDS } from '/js/character-viewer/tier-sets.js';
         window.mountCharacterViewer = mountCharacterViewer;
         window.reEquip = equip;
+        window.reDresser = dresser;
         window.reTierSets = { TIER_SETS: TIER_SETS, TIER_CLASSES: TIER_CLASSES, TIER_IDS: TIER_IDS };
         window.dispatchEvent(new Event('re-viewer-ready'));
     </script>
@@ -675,6 +677,8 @@
         padding: 12px;
         font-size: 12px;
         color: var(--text-muted);
+        /* It covers the whole canvas; without this it eats orbit drags. */
+        pointer-events: none;
         }
 
         .re-img-wrap-sm img[src] + .re-img-msg {

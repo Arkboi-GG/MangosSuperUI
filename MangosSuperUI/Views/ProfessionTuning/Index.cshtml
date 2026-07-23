@@ -1,0 +1,475 @@
+@{
+    ViewData["Title"] = "Profession Tuning";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header d-flex align-items-start justify-content-between">
+            <div>
+                <h1><i class="fa-solid fa-scale-balanced" style="color: var(--accent);"></i> Profession Tuning</h1>
+                <p>Reduce reagent costs across whole professions &mdash; server + client, matched via patch-3.MPQ</p>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="btn-sm btn-outline-subtle" id="btnRollbackAll" style="border-color: var(--status-warning); color: var(--status-warning);">
+                    <i class="fa-solid fa-trash-can"></i> Rollback All
+                </button>
+            </div>
+        </div>
+
+        <div class="content-body">
+            <div class="pt-tabs mb-3">
+                <button class="pt-tab active" data-tab="tune">Reduce Mats</button>
+                <button class="pt-tab" data-tab="status">Currently Tuned</button>
+            </div>
+
+            <!-- ============================ TUNE ============================ -->
+            <div id="tab-tune">
+
+                <!-- Step 1 collapses to a slim bar once a profession is chosen,
+                     handing the full width to the recipe list below. -->
+                <div class="card mb-3 pt-picker" id="profCard">
+                    <div class="card-header pt-picker-head" id="profToggle" role="button" tabindex="0"
+                         title="Show / hide the profession list">
+                        <span class="pt-picker-title">
+                            <i class="fa-solid fa-chevron-down pt-chevron"></i>
+                            <strong>1 &middot; Pick a profession</strong>
+                        </span>
+                        <span class="pt-picker-current" id="profCurrent"></span>
+                    </div>
+                    <div class="card-body pt-picker-body" id="profList">
+                        <div class="text-muted">Loading professions&hellip;</div>
+                    </div>
+                </div>
+
+                <div id="tunePanel" style="display:none;">
+                    <div class="card mb-3">
+                        <div class="card-header d-flex align-items-center justify-content-between">
+                            <strong>2 &middot; <span id="tuneProfName">Profession</span> recipes</strong>
+                            <span class="pt-header-right">
+                                <span class="text-muted" id="ptRebuildState"></span>
+                                <span class="text-muted" id="ptCheckedCount"></span>
+                                <span class="pt-select-links">
+                                    <button type="button" class="pt-link" id="btnSelectAll">All</button>
+                                    <span class="pt-link-sep">/</span>
+                                    <button type="button" class="pt-link" id="btnSelectNone">None</button>
+                                </span>
+                            </span>
+                        </div>
+                        <div class="card-body">
+                            <div class="pt-controls">
+                                <div class="pt-field">
+                                    <label for="ptSort">Sort by</label>
+                                    <select class="form-input" id="ptSort" style="width:170px;">
+                                        <option value="name">Name (A&ndash;Z)</option>
+                                        <option value="name-desc">Name (Z&ndash;A)</option>
+                                        <option value="level">Skill level (low first)</option>
+                                        <option value="level-desc">Skill level (high first)</option>
+                                        <option value="rarity-desc">Rarity (best first)</option>
+                                        <option value="rarity">Rarity (worst first)</option>
+                                        <option value="tuned">Already tuned first</option>
+                                    </select>
+                                </div>
+
+                                <div class="pt-field">
+                                    <label for="ptPct">Reduce mats by</label>
+                                    <div class="d-flex align-items-center gap-1">
+                                        <input type="number" class="form-input" id="ptPct" value="25" min="1" max="90" step="1" style="width:80px;" />
+                                        <span class="text-muted">%</span>
+                                    </div>
+                                </div>
+
+                                <button class="btn-accent" id="btnApply" disabled>
+                                    <i class="fa-solid fa-wand-magic-sparkles"></i> Apply
+                                </button>
+
+                                <div class="pt-hint text-muted">
+                                    Applied to every <strong>checked</strong> recipe, computed off the original count
+                                    (re-applying never compounds). Each reagent stack floors at 1 &mdash; a recipe never
+                                    drops to zero mats. The list previews the result live; nothing is written until you
+                                    hit Apply.
+                                </div>
+                            </div>
+
+                            <div id="recipeList" class="pt-recipe-list">
+                                <div class="text-muted" style="padding:16px;">Select a profession to load its recipes.</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="tunePlaceholder" class="card">
+                    <div class="card-body text-muted">
+                        Pick a profession above to browse its recipes and batch-reduce their reagent costs.
+                        Every recipe starts selected &mdash; untoggle any you want to leave untouched, set a
+                        percentage, and apply.
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============================ STATUS ============================ -->
+            <div id="tab-status" style="display:none;">
+                <div class="card">
+                    <div class="card-header"><strong>Currently tuned recipes</strong></div>
+                    <div class="card-body" id="statusList">
+                        <div class="text-muted">Loading&hellip;</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Styles {
+    <style>
+        .pt-tabs {
+            display: flex;
+            gap: 4px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .pt-tab {
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-muted);
+            padding: 8px 16px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+            .pt-tab.active {
+                color: var(--text);
+                border-bottom-color: var(--accent);
+            }
+
+        /* ── collapsible profession picker ──
+           Collapsed it is just the title bar + chevron + the current selection,
+           so the recipe list owns the full width. */
+        .pt-picker-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            cursor: pointer;
+            user-select: none;
+        }
+
+            .pt-picker-head:hover .pt-picker-title {
+                color: var(--accent);
+            }
+
+        .pt-picker-title {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .pt-chevron {
+            font-size: 11px;
+            color: var(--text-muted);
+            transition: transform 0.15s ease;
+        }
+
+        .pt-picker.collapsed .pt-chevron {
+            transform: rotate(-90deg);
+        }
+
+        .pt-picker.collapsed .pt-picker-body {
+            display: none;
+        }
+
+        .pt-picker-current {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        /* profession grid */
+        .pt-prof-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 10px;
+        }
+
+        .pt-prof-card {
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 12px;
+            cursor: pointer;
+        }
+
+            .pt-prof-card:hover {
+                background: rgba(255,255,255,0.04);
+            }
+
+            .pt-prof-card.active {
+                border-color: var(--accent);
+                box-shadow: 0 0 0 1px var(--accent) inset;
+            }
+
+        .pt-prof-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .pt-done-tag {
+            font-size: 10px;
+            color: #1a8f27;
+            margin-top: 4px;
+        }
+
+        /* controls */
+        .pt-controls {
+            display: flex;
+            align-items: flex-end;
+            flex-wrap: wrap;
+            gap: 12px;
+            padding-bottom: 12px;
+            margin-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .pt-field label {
+            display: block;
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+
+        .pt-hint {
+            font-size: 11px;
+            flex: 1 1 320px;
+            min-width: 280px;
+            line-height: 1.4;
+            margin-left: auto;
+            text-align: right;
+        }
+
+        /* header right cluster: status, count, select links */
+        .pt-header-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 12px;
+        }
+
+        #ptRebuildState {
+            display: none;
+        }
+
+        .pt-select-links {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .pt-link {
+            background: none;
+            border: none;
+            padding: 0;
+            font-size: 12px;
+            color: var(--text-muted);
+            cursor: pointer;
+            text-decoration: underline;
+            text-underline-offset: 2px;
+        }
+
+            .pt-link:hover {
+                color: var(--accent);
+            }
+
+        .pt-link-sep {
+            color: var(--border);
+        }
+
+        /* recipe list */
+        /* vh-based so the extra width from collapsing the picker is matched by
+           extra height, instead of a fixed box floating in a tall empty page */
+        .pt-recipe-list {
+            max-height: calc(100vh - 330px);
+            min-height: 320px;
+            overflow-y: auto;
+        }
+
+        .pt-recipe-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 4px;
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+        }
+
+        .pt-check {
+            flex: 0 0 auto;
+            cursor: pointer;
+        }
+
+        .pt-out-icon {
+            width: 22px;
+            height: 22px;
+            border-radius: 3px;
+            flex: 0 0 auto;
+            object-fit: cover;
+        }
+
+        .pt-out-none {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--border);
+        }
+
+        .pt-recipe-name {
+            flex: 0 0 200px;
+            min-width: 160px;
+            font-weight: 500;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        /* required skill level — fixed width so the reagent columns stay aligned
+           whether or not a recipe has a rank */
+        .pt-rank {
+            flex: 0 0 34px;
+            text-align: right;
+            font-size: 11px;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .pt-spell-id {
+            font-size: 10px;
+            font-weight: 400;
+            margin-left: 6px;
+        }
+
+        .pt-tuned-badge {
+            flex: 0 0 auto;
+            font-size: 10px;
+            color: #b8791a;
+            border: 1px solid rgba(184,121,26,0.45);
+            background: rgba(184,121,26,0.08);
+            border-radius: 3px;
+            padding: 1px 5px;
+        }
+
+        .pt-reagents {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            flex: 1 1 auto;
+        }
+
+        .pt-reagent {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 1px 6px 1px 2px;
+        }
+
+            .pt-reagent img {
+                width: 16px;
+                height: 16px;
+                border-radius: 2px;
+            }
+
+        /* ── WoW item quality colours ──
+           Blizzard's canonical values, with two adjustments so they stay legible
+           on a LIGHT canvas as well as a dark one:
+             q1 (common) is #ffffff in game — invisible on white, so it inherits
+             the theme's text colour instead;
+             q2 (uncommon #1eff00) and q6 (artifact #e6cc80) are neon/pale on
+             white, so they're darkened just enough to read either way. */
+        .q0 { color: #9d9d9d; }                 /* poor      */
+        .q1 { color: inherit; }                 /* common    */
+        .q2 { color: #23b000; }                 /* uncommon  */
+        .q3 { color: #0070dd; }                 /* rare      */
+        .q4 { color: #a335ee; }                 /* epic      */
+        .q5 { color: #ff8000; }                 /* legendary */
+        .q6 { color: #c79c3f; }                 /* artifact  */
+
+        /* live preview: struck original + the count it WOULD become */
+        .pt-was {
+            color: var(--text-muted);
+            opacity: 0.65;
+        }
+
+        /* green = what Apply would write; amber = what's already committed.
+           Both chosen to hold contrast on light and dark backgrounds. */
+        .pt-new {
+            color: #1a8f27;
+            font-weight: 700;
+        }
+
+        .pt-applied {
+            color: #b8791a;
+            font-weight: 700;
+        }
+
+        .pt-recipe-row.pt-off {
+            opacity: 0.45;
+        }
+
+        .pt-reagent-name {
+            max-width: 140px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .pt-restore {
+            flex: 0 0 auto;
+            margin-left: auto;
+        }
+
+        /* status table */
+        .pt-status-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+            .pt-status-table th, .pt-status-table td {
+                text-align: left;
+                padding: 6px 10px;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .pt-status-table th {
+                color: var(--text-muted);
+                font-weight: 600;
+            }
+
+        /* toast (self-contained; mirrors the lootifier's) */
+        .pt-toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #1f2430;
+            color: #f3f4f6;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-left: 3px solid var(--accent);
+            padding: 10px 16px;
+            border-radius: var(--radius-sm);
+            z-index: 9999;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+            font-size: 13px;
+            max-width: 460px;
+        }
+
+            .pt-toast.success {
+                border-left-color: #1eff00;
+            }
+
+            .pt-toast.error {
+                border-left-color: #ff6b6b;
+            }
+    </style>
+}
+
+@section Scripts {
+    <script src="~/js/professiontuning.js" asp-append-version="true"></script>
+}

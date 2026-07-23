@@ -15,7 +15,7 @@
         "home" or "console" or "players" or "accounts" or "realm" => "operations",
         "activity" or "serverlogs" or "livelogs" or "config" or "backup" => "server",
         "spells" or "patch" => "spells",
-        "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" => "content",
+        "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" or "professiontuning" => "content",
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
         "bots" or "chatsettings" => "bots",
@@ -230,6 +230,12 @@
                     <a asp-controller="CraftingLootifier" asp-action="Index" class="@NavClass("CraftingLootifier")">
                         <i class="fa-solid fa-hammer"></i>
                         Crafting Lootifier
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="professiontuning">
+                    <a asp-controller="ProfessionTuning" asp-action="Index" class="@NavClass("ProfessionTuning")">
+                        <i class="fa-solid fa-scale-balanced"></i>
+                        Profession Tuning
                     </a>
                 </li>
             </ul>

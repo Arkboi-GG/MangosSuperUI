@@ -8,6 +8,9 @@
  *
  * Viewer seam: on-model preview mounts via window.mountCharacterViewer once the
  * character-viewer module + a character-GLB source are wired (see Index.cshtml).
+ * The mannequin is dressed at MOUNT time, not at first item selection — a GLB
+ * straight out of the loader has every geoset variant switched on at once and
+ * looks like melted wax until something resolves them (see showOnModel).
  */
 (function () {
     'use strict';
@@ -492,11 +495,15 @@
     // needs recolored assets fed to equipBodyAtlasRetextureDirect(slotUrls) [armor] /
     // equipWeaponGlbDirect(glbUrl) [weapon] — pending the recolor-to-asset endpoints.
     var viewerHandle = null;
+    var viewerPromise = null;    // in-flight mount, so two callers can't mount twice
     var equipToken = 0;
 
     window.addEventListener('re-viewer-ready', function () {
         buildOutfitPicker();
-        ensureViewer().then(function () { if (state.displayId) showOnModel(); });
+        // Dress the mannequin straight away. It used to wait for an item
+        // selection, which left a raw all-geosets-visible GLB on screen for as
+        // long as the page sat idle. See showOnModel().
+        showOnModel();
     });
 
     // The mannequin's clothes: a class tier set (if picked) plus the starter
@@ -538,36 +545,71 @@
         });
     }
 
-    async function ensureViewer() {
-        if (viewerHandle) return viewerHandle;
+    // Mount exactly once. Boot and a fast first click can both land in the same
+    // tick now that boot no longer waits for a selection, so the in-flight
+    // promise is memoised — otherwise two mountCharacterViewer() calls race and
+    // the loser's equips write into a viewer nobody is looking at.
+    function ensureViewer() {
+        if (viewerHandle) return Promise.resolve(viewerHandle);
+        if (viewerPromise) return viewerPromise;
+        viewerPromise = mountViewer().then(function (h) {
+            viewerHandle = h;
+            viewerPromise = null;
+            return h;
+        }, function (err) {
+            viewerPromise = null;
+            $('#reViewerMsg').text('viewer error: ' + (err && err.message || err)).show();
+            return null;
+        });
+        return viewerPromise;
+    }
+
+    async function mountViewer() {
         if (typeof window.mountCharacterViewer !== 'function') return null;
         var canvas = document.getElementById('char-preview-canvas');
         if (!canvas) return null;
+        $('#reViewerMsg').text('Loading character\u2026').show();
         var urls = await fetchCharacterUrls(character.race, character.gender);
         if (!urls.glbUrl) { $('#reViewerMsg').text('No character model for ' + character.race + ' ' + character.gender + '.').show(); return null; }
-        $('#reViewerMsg').hide();
+        var h = await window.mountCharacterViewer({ canvas: canvas, glbUrl: urls.glbUrl, skinUrl: urls.skinUrl });
+        // Resolve geoset categories the instant the geometry lands. unequipAll()
+        // does this too, but it awaits a base-skin fetch first, and that gap is
+        // long enough to show a frame of the all-variants mannequin. This call is
+        // synchronous, so there is no such frame.
         try {
-            viewerHandle = await window.mountCharacterViewer({ canvas: canvas, glbUrl: urls.glbUrl, skinUrl: urls.skinUrl });
-            return viewerHandle;
-        } catch (err) {
-            $('#reViewerMsg').text('viewer error: ' + (err && err.message || err)).show();
-            return null;
-        }
+            if (window.reDresser && h && h.cv && h.cv.character) {
+                window.reDresser.showDefaultGeosets(h.cv.character);
+            }
+        } catch (e) { /* older embed handle shape — unequipAll still covers it */ }
+        $('#reViewerMsg').hide();
+        return h;
     }
 
+    // Put the character into a presentable state, then equip the selected item
+    // over it if there is one.
+    //
+    // The baseline is the whole point of this function. A GLB out of loader.js
+    // has EVERY geoset visible simultaneously — all sleeve variants, all leg
+    // variants, every hair style stacked on the same skull. unequipAll() runs the
+    // category/variant resolver (dresser.showDefaultGeosets) and repaints a clean
+    // base-skin atlas, which is what turns that back into a person. So it has to
+    // run on every mount and every race swap, NOT only when an item is picked —
+    // that missing call is exactly what made a cold page load look wrong.
     async function showOnModel() {
-        if (!state.displayId || typeof window.mountCharacterViewer !== 'function') return;
         var h = await ensureViewer();
         if (!h || !window.reEquip) return;
         var token = ++equipToken;                 // guard against out-of-order equips
         try {
-            // Dress the mannequin: strip, apply the starter outfit so it is never
-            // naked, then equip the selected item over it. The retexture overlay
-            // then repaints/remounts with the recolored assets.
+            // Strip to default geosets + base skin, then apply the starter outfit
+            // (or the picked tier set) so the mannequin is never naked.
             await window.reEquip.unequipAll(h.cv.character);
             if (token !== equipToken) return;
             try { await window.reEquip.equipMultiple(h.cv.character, outfitPayload()); } catch (e) { }
             if (token !== equipToken) return;
+
+            // Nothing selected — the dressed baseline IS the finished state.
+            if (!state.displayId) { $('#reViewerMsg').hide(); return; }
+
             var res = await window.reEquip.equipDisplay(h.cv.character, state.displayId, state.itemId);
             if (token !== equipToken) return;
             if (res && res.applied === false) {
@@ -614,13 +656,29 @@
         }
     }
 
+    // Race / gender change. Last click wins — clicking through the race list
+    // faster than the GLBs load used to leave whichever request happened to
+    // return last on screen.
+    var swapSeq = 0;
     async function swapCharacter() {
-        if (!viewerHandle) { showOnModel(); return; }
-        var urls = await fetchCharacterUrls(character.race, character.gender);
-        if (!urls.glbUrl) { $('#reViewerMsg').text('No character model for ' + character.race + ' ' + character.gender + '.').show(); return; }
+        if (!viewerHandle) { showOnModel(); return; }   // not mounted yet: mount at the new race
+        var seq = ++swapSeq;
+        var race = character.race, gender = character.gender;
+        $('#reViewerMsg').text('Loading character\u2026').show();
+        var urls = await fetchCharacterUrls(race, gender);
+        if (seq !== swapSeq) return;
+        if (!urls.glbUrl) { $('#reViewerMsg').text('No character model for ' + race + ' ' + gender + '.').show(); return; }
         try {
             await viewerHandle.swap({ glbUrl: urls.glbUrl, skinUrl: urls.skinUrl });
-            showOnModel();
+            if (seq !== swapSeq) return;
+            try {
+                if (window.reDresser && viewerHandle.cv && viewerHandle.cv.character) {
+                    window.reDresser.showDefaultGeosets(viewerHandle.cv.character);
+                }
+            } catch (e) { }
+            // The swapped-in GLB arrives all-variants-visible exactly like the
+            // first one did, so re-dress it whether or not an item is selected.
+            await showOnModel();
         } catch (err) {
             $('#reViewerMsg').text('swap error: ' + (err && err.message || err)).show();
         }

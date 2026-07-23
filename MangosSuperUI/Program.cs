@@ -13,6 +13,7 @@ using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
+using MangosSuperUI.Services.WorldExport;
 using Microsoft.AspNetCore.StaticFiles;
 using System.Diagnostics.Metrics;
 
@@ -76,6 +77,13 @@ builder.Services.AddSingleton<WikiDocStore>();
 builder.Services.AddSingleton<WikiIndexer>();
 builder.Services.AddSingleton<WikiSearchStore>();
 builder.Services.AddScoped<RetextureSupport>();
+
+// ---------- MSUI Client: world export (design doc §5) ----------
+// Offline bake of ADT terrain + vmap collision into GLB/PNG/JSON under
+// wwwroot/world/, consumed by the browser client. Singletons because both
+// hold a parsed-model cache that is worth keeping warm across bakes.
+builder.Services.AddSingleton<TerrainTileExporter>();
+builder.Services.AddSingleton<CollisionTileExporter>();
 
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();
@@ -202,9 +210,26 @@ if (!app.Environment.IsDevelopment())
 // Static files with custom MIME types (GLB for 3D model-viewer)
 var contentTypeProvider = new FileExtensionContentTypeProvider();
 contentTypeProvider.Mappings[".glb"] = "model/gltf-binary";
+// Serve /client/ -> /client/index.html for the MSUI Client SPA. Without this,
+// UseStaticFiles only serves exact file paths and /client/ returns 404 even
+// though index.html is sitting right there.
+app.UseDefaultFiles(new DefaultFilesOptions
+{
+    DefaultFileNames = new List<string> { "index.html" }
+});
+
 app.UseStaticFiles(new StaticFileOptions
 {
     ContentTypeProvider = contentTypeProvider
+});
+
+// ---------- MSUI Client: WebSocket ↔ TCP bridge (design doc DD-4) ----------
+// MUST come before UseRouting so the upgrade is handled ahead of MVC route
+// matching. UseWebSockets is required even though SignalR is registered —
+// SignalR brings its own transport handling and does not enable raw WS.
+app.UseWebSockets(new WebSocketOptions
+{
+    KeepAliveInterval = TimeSpan.FromSeconds(30)
 });
 
 app.UseRouting();

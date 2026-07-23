@@ -1895,6 +1895,44 @@ public partial class PatchController : Controller
 
     // ===================== HELPERS =====================
 
+    // ===================== CLIENT PATCH REBUILD (Profession Tuning) =====================
+
+    /// <summary>
+    /// Rebuild patch-3.MPQ from the saved spell configs, on demand.
+    ///
+    /// Exists so Profession Tuning can refresh the client's Spell.dbc after it
+    /// changes reagent counts in spell_template. It deliberately goes through the
+    /// SAME config-driven path every other caller uses, so every custom spell is
+    /// re-added from _spellConfig — a tuning rebuild can never drop them.
+    ///
+    /// Profession Tuning must NOT ship a patch of its own: DBCs do not merge
+    /// across patch MPQs, so a higher-numbered patch carrying Spell.dbc would
+    /// override patch-3 wholesale and silently remove every custom spell in the
+    /// client. Folding into patch-3 is the only correct delivery.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> RebuildClientPatch()
+    {
+        try
+        {
+            var result = await RebuildUnifiedPatchFromConfigsAsync();
+            return Json(new
+            {
+                success = result?.Success ?? false,
+                patchFileName = result?.PatchFileName,
+                patchFilePath = result?.PatchFilePath,
+                totalFiles = result?.TotalFiles ?? 0,
+                spellsIncluded = result?.SpellsIncluded?.Count ?? 0,
+                errors = result?.Errors
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Patch: RebuildClientPatch failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
     /// <summary>
     /// Load all saved spell configs and rebuild the unified patch-3.MPQ.
     /// Called after every Generate or Delete operation.

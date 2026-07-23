@@ -45,6 +45,7 @@ public static class AdtTerrainReader
     private static readonly uint MAGIC_MCAL = ChunkId("MCAL");
     private static readonly uint MAGIC_MCSH = ChunkId("MCSH");
     private static readonly uint MAGIC_MCVT = ChunkId("MCVT");
+    private static readonly uint MAGIC_MCNR = ChunkId("MCNR");
     private static readonly uint MAGIC_MCLQ = ChunkId("MCLQ");
 
     // ADT grid constants — same as VmangosMapParser
@@ -63,6 +64,10 @@ public static class AdtTerrainReader
 
     // MCNK header size (128 bytes before sub-chunks)
     private const int MCNK_HEADER_SIZE = 128;
+
+    // MCVT / MCNR vertex count per chunk: 9 outer rows of 9 + 8 inner rows of 8
+    // = 81 + 64 = 145. Both sub-chunks use this same interleaved ordering.
+    public const int MCVT_VERTEX_COUNT = 145;
 
     // MCLQ liquid block size
     //   float min_height + float max_height
@@ -1393,13 +1398,65 @@ public static class AdtTerrainReader
         chunk.Holes = BitConverter.ToUInt16(data, mcnkDataStart + 0x3C);
         int nLayers = (int)BitConverter.ToUInt32(data, mcnkDataStart + 0x0C);
 
+        // Chunk world origin, MCNK header offsets 0x68/0x6C/0x70.
+        // NOTE the field order in the file is (Y, X, Z) — position[0] is the
+        // NORTH-SOUTH coordinate in WoW's axis convention, not "X" in the
+        // usual sense. MCVT heights are stored relative to BaseZ.
+        chunk.BaseY = BitConverter.ToSingle(data, mcnkDataStart + 0x68);
+        chunk.BaseX = BitConverter.ToSingle(data, mcnkDataStart + 0x6C);
+        chunk.BaseZ = BitConverter.ToSingle(data, mcnkDataStart + 0x70);
+
         // Sub-chunk offsets are relative to mcnkBase (chunk start including IFF header)
+        uint ofsHeight = BitConverter.ToUInt32(data, mcnkDataStart + 0x14);
+        uint ofsNormal = BitConverter.ToUInt32(data, mcnkDataStart + 0x18);
         uint ofsLayer = BitConverter.ToUInt32(data, mcnkDataStart + 0x1C);
         uint ofsAlpha = BitConverter.ToUInt32(data, mcnkDataStart + 0x24);
         uint sizeAlpha = BitConverter.ToUInt32(data, mcnkDataStart + 0x28);
         // MCLQ — per-chunk liquid (water/lava/slime). Vanilla 1.x stores liquid here.
         uint ofsLiquid = BitConverter.ToUInt32(data, mcnkDataStart + 0x60);
         uint sizeLiquid = BitConverter.ToUInt32(data, mcnkDataStart + 0x64);
+
+        // Parse MCVT (vertex heights) — 145 floats, RELATIVE to BaseZ.
+        // Layout is interleaved outer/inner rows, NOT a flat 9×9 then 8×8:
+        //   row 0: 9 outer verts, row 1: 8 inner verts, row 2: 9 outer, ...
+        // 9 outer rows + 8 inner rows = 81 + 64 = 145.
+        // See HeightAt()/WorldHeightAt() for indexing that doesn't require
+        // callers to know this.
+        if (ofsHeight > 0 && mcnkBase + ofsHeight + 8 <= data.Length)
+        {
+            int mcvtPos = mcnkBase + (int)ofsHeight;
+            if (BitConverter.ToUInt32(data, mcvtPos) == MAGIC_MCVT)
+            {
+                int mcvtData = mcvtPos + 8;
+                if (mcvtData + MCVT_VERTEX_COUNT * 4 <= data.Length)
+                {
+                    var heights = new float[MCVT_VERTEX_COUNT];
+                    for (int i = 0; i < MCVT_VERTEX_COUNT; i++)
+                        heights[i] = BitConverter.ToSingle(data, mcvtData + i * 4);
+                    chunk.Heights = heights;
+                }
+            }
+        }
+
+        // Parse MCNR (vertex normals) — 145 × 3 signed bytes, same interleaved
+        // ordering as MCVT. Stored as (x, z, y) in WoW axis terms with 127 = 1.0.
+        // The chunk is documented as 448 bytes but only 435 are normals; the
+        // trailing 13 are padding that some tools mis-report as part of the size.
+        if (ofsNormal > 0 && mcnkBase + ofsNormal + 8 <= data.Length)
+        {
+            int mcnrPos = mcnkBase + (int)ofsNormal;
+            if (BitConverter.ToUInt32(data, mcnrPos) == MAGIC_MCNR)
+            {
+                int mcnrData = mcnrPos + 8;
+                if (mcnrData + MCVT_VERTEX_COUNT * 3 <= data.Length)
+                {
+                    var normals = new sbyte[MCVT_VERTEX_COUNT * 3];
+                    for (int i = 0; i < normals.Length; i++)
+                        normals[i] = unchecked((sbyte)data[mcnrData + i]);
+                    chunk.Normals = normals;
+                }
+            }
+        }
 
         // Parse MCLY (texture layers)
         if (ofsLayer > 0 && mcnkBase + ofsLayer + 8 <= data.Length)
@@ -1727,6 +1784,30 @@ public static class AdtTerrainReader
         public MclyLayer[] Layers { get; set; } = Array.Empty<MclyLayer>();
 
         /// <summary>
+        /// Chunk origin in world space, from MCNK header 0x68/0x6C/0x70.
+        /// The file stores them in (Y, X, Z) order; these properties are
+        /// already untangled into WoW's convention (X north, Y west, Z up).
+        /// </summary>
+        public float BaseX { get; set; }
+        public float BaseY { get; set; }
+        public float BaseZ { get; set; }
+
+        /// <summary>
+        /// MCVT vertex heights, RELATIVE to <see cref="BaseZ"/>. 145 entries in
+        /// the interleaved outer/inner layout (9,8,9,8,…). Null when the chunk
+        /// had no MCVT sub-chunk. Prefer <see cref="WorldHeightAt"/> over
+        /// indexing this directly.
+        /// </summary>
+        public float[]? Heights { get; set; }
+
+        /// <summary>
+        /// MCNR vertex normals, 3 signed bytes per vertex (127 = 1.0), same
+        /// 145-entry interleaved ordering as <see cref="Heights"/>. Null when
+        /// the chunk had no MCNR sub-chunk.
+        /// </summary>
+        public sbyte[]? Normals { get; set; }
+
+        /// <summary>
         /// Low-resolution terrain hole bitmask from MCNK header offset 0x3C.
         /// A 4×4 grid mapped onto the 8×8 cell grid — each bit controls a 2×2
         /// cell block. Use HoletabH/HoletabV lookup (same as VMaNGOS GridMap)
@@ -1739,6 +1820,54 @@ public static class AdtTerrainReader
         /// Each layer has a 9×9 vertex grid and 8×8 tile mask.
         /// </summary>
         public List<MclqLayer>? Liquid { get; set; }
+
+        /// <summary>
+        /// Height of an OUTER grid vertex (0..8, 0..8), relative to BaseZ.
+        /// Outer row r starts at index r*17 in the interleaved MCVT array.
+        /// </summary>
+        public float OuterHeight(int col, int row)
+        {
+            if (Heights == null) return 0f;
+            int i = row * 17 + col;
+            return (uint)i < (uint)Heights.Length ? Heights[i] : 0f;
+        }
+
+        /// <summary>
+        /// Height of an INNER grid vertex (0..7, 0..7), relative to BaseZ.
+        /// Inner row r starts at index r*17 + 9, sitting at the centre of the
+        /// four surrounding outer verts.
+        /// </summary>
+        public float InnerHeight(int col, int row)
+        {
+            if (Heights == null) return 0f;
+            int i = row * 17 + 9 + col;
+            return (uint)i < (uint)Heights.Length ? Heights[i] : 0f;
+        }
+
+        /// <summary>Absolute world height of an outer grid vertex.</summary>
+        public float WorldHeightAt(int col, int row) => BaseZ + OuterHeight(col, row);
+
+        /// <summary>Unit normal of a vertex by raw MCVT index (0..144).</summary>
+        public (float X, float Y, float Z) NormalAt(int index)
+        {
+            if (Normals == null || index < 0 || index * 3 + 2 >= Normals.Length)
+                return (0f, 0f, 1f);
+            // Stored (x, z, y) with 127 = 1.0; reordered here to (x, y, z).
+            return (Normals[index * 3 + 0] / 127f,
+                    Normals[index * 3 + 2] / 127f,
+                    Normals[index * 3 + 1] / 127f);
+        }
+
+        /// <summary>
+        /// True when the 2×2 cell block containing cell (col,row) — both 0..7 —
+        /// is punched out by the hole mask. Matches VMaNGOS GridMap behaviour.
+        /// </summary>
+        public bool IsHole(int col, int row)
+        {
+            if (Holes == 0) return false;
+            int bit = (row / 2) * 4 + (col / 2);
+            return (Holes & (1 << bit)) != 0;
+        }
     }
 
     /// <summary>One MCLQ liquid layer inside an MCNK chunk (vanilla 1.x format).</summary>

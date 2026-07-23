@@ -110,7 +110,7 @@
         items: {
             operations: ['home', 'console', 'players', 'accounts', 'realm'],
             server: ['activity', 'serverlogs', 'livelogs', 'config', 'backup'],
-            content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier'],
+            content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier', 'professiontuning'],
             spells: ['spells', 'patch', 'visuallab'],
             world: ['worldmap', 'worldeditor'],
             bots: ['bots-fleet', 'bots-map', 'bots-dashboard', 'bots-chatfeel', 'bots-chatcapacity'],
@@ -470,6 +470,7 @@
             lootifier: { icon: 'fa-dragon', label: 'ARPG Lootifier' },
             questlootifier: { icon: 'fa-scroll', label: 'Quest Lootifier' },
             craftinglootifier: { icon: 'fa-hammer', label: 'Crafting Lootifier' },
+            professiontuning: { icon: 'fa-scale-balanced', label: 'Profession Tuning' },
             retextureengine: { icon: 'fa-palette', label: 'Retexture Engine' },
             worldeditor: { icon: 'fa-mountain-sun', label: '3D World Editor' },
             'downloads-page': { icon: 'fa-download', label: 'Downloads' },
