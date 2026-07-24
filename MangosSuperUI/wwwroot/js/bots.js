@@ -1,5 +1,8 @@
 // MangosSuperUI — Bot Monitor JS (BotBridge + BotBrain SignalR client)
 // Session 25: Stale bot cleanup — AllBots purges old entries, BotDisconnected auto-removes after 30s
+// Cockpit pass: fleet census strip (counts per zone / level / class / activity, click to filter),
+//   sortable + groupable roster, and the old page-wide command bar folded into a per-bot control
+//   suite inside the bot modal. No BotsController changes — every action rides an existing endpoint.
 
 $(function () {
 
@@ -40,6 +43,64 @@ $(function () {
         0: 'Poor', 1: 'Common', 2: 'Uncommon', 3: 'Rare',
         4: 'Epic', 5: 'Legendary', 6: 'Artifact'
     };
+
+    // Legible-on-page variants of the WoW quality colours. QUALITY_COLORS above is tuned for a
+    // black game background — Common (#ffffff) is invisible on this page's light card surface,
+    // which is exactly why backpack item names looked blank while the hover tooltip showed them.
+    // QUALITY_COLORS stays for the dark floating tooltip; QUALITY_TEXT is what the page uses.
+    var QUALITY_TEXT = {
+        0: '#8a8f98', // Poor
+        1: 'var(--text-primary)', // Common — theme text, never white-on-white
+        2: '#16a34a', // Uncommon
+        3: '#0062c4', // Rare
+        4: '#8b2fd6', // Epic
+        5: '#d97706', // Legendary
+        6: '#a67c2e'  // Artifact
+    };
+
+    // Zone ids as they come off AreaTable.dbc (the spine reports ctx.ZoneId; quest_template
+    // reuses the same ids in ZoneOrSort, with negatives meaning "class sort" rather than a zone).
+    // Anything not listed falls back to "Zone N" — add ids here as you meet them, nothing else
+    // depends on this table being complete.
+    var ZONE_NAMES = {
+        1: 'Dun Morogh', 3: 'Badlands', 4: 'Blasted Lands', 8: 'Swamp of Sorrows',
+        9: 'Northshire Valley', 10: 'Duskwood', 11: 'Wetlands', 12: 'Elwynn Forest',
+        14: 'Durotar', 15: 'Dustwallow Marsh', 16: 'Azshara', 17: 'The Barrens',
+        25: 'Blackrock Mountain', 28: 'Western Plaguelands', 33: 'Stranglethorn Vale',
+        36: 'Alterac Mountains', 38: 'Loch Modan', 40: 'Westfall', 41: 'Deadwind Pass',
+        44: 'Redridge Mountains', 45: 'Arathi Highlands', 46: 'Burning Steppes',
+        47: 'The Hinterlands', 51: 'Searing Gorge', 85: 'Tirisfal Glades',
+        130: 'Silverpine Forest', 139: 'Eastern Plaguelands', 141: 'Teldrassil',
+        148: 'Darkshore', 215: 'Mulgore', 267: 'Hillsbrad Foothills', 331: 'Ashenvale',
+        357: 'Feralas', 361: 'Felwood', 400: 'Thousand Needles', 405: 'Desolace',
+        406: 'Stonetalon Mountains', 440: 'Tanaris', 490: "Un'Goro Crater",
+        493: 'Moonglade', 618: 'Winterspring', 796: 'Scarlet Monastery',
+        1176: "Zul'Farrak", 1337: 'Uldaman', 1377: 'Silithus',
+        1417: 'The Temple of Atal\'Hakkar', 1497: 'Undercity', 1519: 'Stormwind City',
+        1537: 'Ironforge', 1581: 'The Deadmines', 1583: 'Blackrock Spire',
+        1584: 'Blackrock Depths', 1637: 'Orgrimmar', 1638: 'Thunder Bluff',
+        1657: 'Darnassus', 1977: "Zul'Gurub", 2017: 'Stratholme', 2057: 'Scholomance',
+        2100: 'Maraudon', 2159: "Onyxia's Lair", 2257: 'Deeprun Tram',
+        2597: 'Alterac Valley', 2717: 'Molten Core', 3277: 'Warsong Gulch',
+        3358: 'Arathi Basin', 3428: "Ahn'Qiraj", 3429: "Ruins of Ahn'Qiraj",
+        3456: 'Naxxramas',
+        // quest_template ZoneOrSort negatives (class-sorted quests, not zones)
+        '-81': 'Warrior', '-141': 'Paladin', '-261': 'Mage'
+    };
+
+    // Map ids — used as the zone fallback when the brain has no live context for a bot
+    // (bridge STATE always carries mapId; zoneId only arrives with the spine projection).
+    var MAP_NAMES = {
+        0: 'Eastern Kingdoms', 1: 'Kalimdor', 30: 'Alterac Valley', 33: 'Shadowfang Keep',
+        34: 'The Stockade', 36: 'The Deadmines', 43: 'Wailing Caverns', 47: 'Razorfen Kraul',
+        48: 'Blackfathom Deeps', 70: 'Uldaman', 90: 'Gnomeregan', 109: 'Sunken Temple',
+        129: 'Razorfen Downs', 189: 'Scarlet Monastery', 209: "Zul'Farrak",
+        229: 'Blackrock Spire', 230: 'Blackrock Depths', 249: "Onyxia's Lair",
+        289: 'Scholomance', 309: "Zul'Gurub", 329: 'Stratholme', 349: 'Maraudon',
+        389: 'Ragefire Chasm', 409: 'Molten Core', 429: 'Dire Maul', 469: 'Blackwing Lair',
+        489: 'Warsong Gulch', 509: "Ruins of Ahn'Qiraj", 529: 'Arathi Basin',
+        531: "Temple of Ahn'Qiraj", 533: 'Naxxramas'
+    };
     var EQUIP_SLOT_NAMES = {
         0: 'Non-equip', 1: 'Head', 2: 'Neck', 3: 'Shoulder', 4: 'Shirt',
         5: 'Chest', 6: 'Waist', 7: 'Legs', 8: 'Feet', 9: 'Wrists',
@@ -66,6 +127,18 @@ $(function () {
     var engineEnabled = false;
     var maxTimelineEntries = 100;
     var inventoryCache = {};  // guid → inventory data from /Bots/Inventory
+
+    // Cockpit (fleet census + roster ordering). liveFleet is the /Bots/LiveFleet projection
+    // keyed by guid — it carries zoneId/goal/step, which bridge STATE does not, and is the only
+    // reason the roster can group by zone. It is optional: with the brain off the cockpit still
+    // works off bridge state alone and zones fall back to map names.
+    var liveFleet = {};             // guid -> live spine projection
+    var fleetPollTimer = null;
+    var rosterDirty = false;        // in-place card updates set this; the re-sort runs on a timer
+    var rosterSort = localStorage.getItem('msui_bots_sort') || 'level_desc';
+    var rosterGroupBy = localStorage.getItem('msui_bots_group') || 'none';
+    var rosterSearch = '';
+    var cockpitFilter = null;       // { kind:'zone'|'level'|'class'|'activity'|'group'|'flag', key }
 
     // Live tab (real-time BotContext feed)
     var detailTab = 'overview';   // 'overview' | 'live'
@@ -274,81 +347,431 @@ $(function () {
         $('#bridgeStatusText').text(labels[state] || state);
     }
 
-    // ===================== ROSTER =====================
+    // ===================== COCKPIT + ROSTER =====================
+    // The roster is a sortable / groupable / filterable fleet list. The cockpit strip above it
+    // is the census (how many bots per zone, per level band, per class, per activity) and it
+    // doubles as the filter control: clicking a tile or a chip filters the roster to that slice.
+
+    // ---- derived facts about a bot (single source of truth for both the cards and the census)
+
+    function levelBandKey(lvl) {
+        lvl = parseInt(lvl, 10) || 0;
+        if (lvl >= 60) return 60;
+        if (lvl < 10) return 0;
+        return Math.floor(lvl / 10) * 10;
+    }
+
+    function levelBandLabel(k) {
+        k = parseInt(k, 10) || 0;
+        if (k >= 60) return 'L60';
+        if (k === 0) return 'L1-9';
+        return 'L' + k + '-' + (k + 9);
+    }
+
+    function botZoneKey(guid) {
+        var lf = liveFleet[guid];
+        if (lf && lf.zoneId) return 'z' + lf.zoneId;
+        var s = botStates[guid];
+        return 'm' + ((s && s.mapId) || 0);
+    }
+
+    function zoneKeyLabel(key) {
+        key = String(key);
+        if (key.charAt(0) === 'z') {
+            var z = parseInt(key.slice(1), 10);
+            return ZONE_NAMES[z] || ('Zone ' + z);
+        }
+        var m = parseInt(key.slice(1), 10);
+        return (MAP_NAMES[m] || ('Map ' + m));
+    }
+
+    // What the bot is doing, in priority order: brain decision > live spine goal > bridge state.
+    function botActivity(guid) {
+        var s = botStates[guid];
+        if (!s) return { text: 'IDLE', cls: 'bt-act-idle' };
+        if (s.taskState === 'DISCONNECTED') return { text: 'OFFLINE', cls: 'bt-act-idle' };
+
+        var brain = botBrains[guid];
+        var lf = liveFleet[guid];
+        var text = null;
+        if (brain && brain.lastDecision && brain.lastDecision.newActivity) text = brain.lastDecision.newActivity;
+        else if (lf && lf.goal) text = lf.goal;
+        else if (s.inCombat) text = 'COMBAT';
+        else if (s.taskState && s.taskState !== 'IDLE') text = s.taskState;
+        if (!text) text = 'IDLE';
+
+        text = String(text);
+        var cls = 'bt-act-' + text.toLowerCase();
+        if (text.toUpperCase() === 'COMBAT') cls = 'bt-act-grinding';
+        return { text: text.toUpperCase(), cls: cls };
+    }
+
+    function botGold(guid) { var s = botStates[guid]; return (s && s.copper) || 0; }
+    function botHpPct(guid) {
+        var s = botStates[guid];
+        if (!s || !s.maxHealth) return 100;
+        return Math.round((s.health || 0) / s.maxHealth * 100);
+    }
+
+    // ---- filtering
+
+    function passesCockpitFilter(guid) {
+        if (!cockpitFilter) return true;
+        var s = botStates[guid];
+        if (!s) return false;
+        var f = cockpitFilter;
+        if (f.kind === 'zone') return botZoneKey(guid) === String(f.key);
+        if (f.kind === 'level') return levelBandKey(s.level) === (parseInt(f.key, 10) || 0);
+        if (f.kind === 'class') return (s.classId || 0) === (parseInt(f.key, 10) || 0);
+        if (f.kind === 'activity') return botActivity(guid).text === String(f.key);
+        if (f.kind === 'group') return (groupOf[guid] || 0) === (parseInt(f.key, 10) || 0);
+        if (f.kind === 'flag') {
+            if (f.key === 'combat') return !!s.inCombat;
+            if (f.key === 'dead') return !!s.isDead;
+            if (f.key === 'idle') return botActivity(guid).text === 'IDLE';
+            if (f.key === 'grouped') return !!groupOf[guid];
+            if (f.key === 'bagsfull') return (s.freeSlots != null && s.freeSlots <= 0);
+            if (f.key === 'offline') return s.taskState === 'DISCONNECTED';
+        }
+        return true;
+    }
+
+    function cockpitFilterLabel() {
+        if (!cockpitFilter) return '';
+        var f = cockpitFilter;
+        if (f.kind === 'zone') return 'zone: ' + zoneKeyLabel(f.key);
+        if (f.kind === 'level') return 'level: ' + levelBandLabel(f.key);
+        if (f.kind === 'class') return 'class: ' + (CLASS_NAMES[f.key] || f.key);
+        if (f.kind === 'activity') return 'doing: ' + f.key;
+        if (f.kind === 'group') return 'group #' + f.key;
+        return f.key;
+    }
+
+    function setCockpitFilter(kind, key) {
+        if (cockpitFilter && cockpitFilter.kind === kind && String(cockpitFilter.key) === String(key)) cockpitFilter = null;
+        else cockpitFilter = { kind: kind, key: key };
+        renderCockpit();
+        renderRoster();
+    }
+
+    // ---- sorting
+
+    function rosterComparator(a, b) {
+        var sa = botStates[a] || {}, sb = botStates[b] || {};
+        var byName = function () { return (sa.name || '').localeCompare(sb.name || ''); };
+        switch (rosterSort) {
+            case 'level_asc': return ((sa.level || 0) - (sb.level || 0)) || byName();
+            case 'name': return byName();
+            case 'class':
+                return String(CLASS_NAMES[sa.classId] || 'z').localeCompare(String(CLASS_NAMES[sb.classId] || 'z'))
+                    || ((sb.level || 0) - (sa.level || 0)) || byName();
+            case 'zone':
+                return zoneKeyLabel(botZoneKey(a)).localeCompare(zoneKeyLabel(botZoneKey(b)))
+                    || ((sb.level || 0) - (sa.level || 0)) || byName();
+            case 'activity':
+                return botActivity(a).text.localeCompare(botActivity(b).text) || byName();
+            case 'gold': return (botGold(b) - botGold(a)) || byName();
+            case 'hp': return (botHpPct(a) - botHpPct(b)) || byName();
+            case 'group':
+                return ((groupOf[a] || 9999) - (groupOf[b] || 9999))
+                    || ((leaderOf[b] ? 1 : 0) - (leaderOf[a] ? 1 : 0)) || byName();
+            case 'level_desc':
+            default: return ((sb.level || 0) - (sa.level || 0)) || byName();
+        }
+    }
+
+    // ---- bucketing (group-by)
+
+    function rosterBucket(guid) {
+        var s = botStates[guid] || {};
+        switch (rosterGroupBy) {
+            case 'zone': return { key: botZoneKey(guid), label: zoneKeyLabel(botZoneKey(guid)), sort: zoneKeyLabel(botZoneKey(guid)) };
+            case 'level': var k = levelBandKey(s.level); return { key: 'L' + k, label: levelBandLabel(k), sort: 1000 - k };
+            case 'class': return { key: 'C' + (s.classId || 0), label: CLASS_NAMES[s.classId] || 'Unknown', sort: CLASS_NAMES[s.classId] || 'zz' };
+            case 'activity': var a = botActivity(guid); return { key: 'A' + a.text, label: a.text, sort: a.text };
+            case 'group':
+                var g = groupOf[guid] || 0;
+                return { key: 'G' + g, label: g ? ('Group #' + g) : 'Ungrouped', sort: g ? g : 9999 };
+            default: return null;
+        }
+    }
+
+    // ---- roster render
+
+    var rosterSig = '';   // ordered guid+bucket signature of the last DOM build
+
+    function rosterSignature(guids) {
+        var parts = [];
+        for (var i = 0; i < guids.length; i++) {
+            var g = guids[i];
+            parts.push(rosterGroupBy === 'none' ? g : (g + ':' + rosterBucket(g).key));
+        }
+        return parts.join(',');
+    }
+
+    // Called on a timer when cards report themselves dirty: re-sorts the DOM only if the order
+    // or the bucketing actually moved, so a stream of STATE packets doesn't rebuild the list
+    // under the operator's cursor every few seconds.
+    function rosterResortIfNeeded() {
+        renderCockpit();
+        if (!rosterDirty) return;
+        var guids = rosterVisibleGuids();
+        if (rosterSignature(guids) !== rosterSig) renderRoster();
+        else rosterDirty = false;
+    }
+
+    function rosterVisibleGuids() {
+        var q = (rosterSearch || '').toLowerCase();
+        var out = [];
+        var keys = Object.keys(botStates);
+        for (var i = 0; i < keys.length; i++) {
+            var g = parseInt(keys[i], 10);
+            var s = botStates[g];
+            if (!s) continue;
+            if (q && String(s.name || '').toLowerCase().indexOf(q) < 0) continue;
+            if (!passesCockpitFilter(g)) continue;
+            out.push(g);
+        }
+        out.sort(rosterComparator);
+        return out;
+    }
 
     function renderRoster() {
-        var guids = Object.keys(botStates).sort(function (a, b) {
-            return (botStates[a].name || '').localeCompare(botStates[b].name || '');
-        });
+        var $r = $('#botRoster');
+        if ($r.length === 0) return;
 
-        if (guids.length === 0) {
+        var total = Object.keys(botStates).length;
+        if (total === 0) {
             $('#rosterEmpty').show();
-            $('#botRoster .bt-roster-card').remove();
+            $r.find('.bt-roster-card, .bt-roster-ghead').remove();
+            $('#rosterCount').text('0');
+            renderCockpit();
             return;
         }
         $('#rosterEmpty').hide();
 
-        // Session 25: Remove DOM cards for bots no longer in botStates
-        $('#botRoster .bt-roster-card').each(function () {
-            var cardGuid = $(this).data('guid');
-            if (!botStates[cardGuid]) $(this).remove();
-        });
+        var guids = rosterVisibleGuids();
+        $('#rosterCount').text(guids.length === total ? String(total) : (guids.length + ' / ' + total));
 
-        var existing = {};
-        $('#botRoster .bt-roster-card').each(function () { existing[$(this).data('guid')] = true; });
-
-        for (var i = 0; i < guids.length; i++) {
-            var guid = parseInt(guids[i]);
-            if (!existing[guid]) {
-                $('#botRoster').append('<div class="bt-roster-card" data-guid="' + guid + '" id="roster-' + guid + '"></div>');
+        var html = '';
+        if (rosterGroupBy === 'none') {
+            for (var i = 0; i < guids.length; i++) html += rosterCardHtml(guids[i]);
+        } else {
+            var buckets = {}, order = [];
+            for (var j = 0; j < guids.length; j++) {
+                var b = rosterBucket(guids[j]);
+                if (!buckets[b.key]) { buckets[b.key] = { meta: b, guids: [] }; order.push(b.key); }
+                buckets[b.key].guids.push(guids[j]);
             }
-            renderRosterCard(guid);
+            order.sort(function (x, y) {
+                var mx = buckets[x].meta.sort, my = buckets[y].meta.sort;
+                if (typeof mx === 'number' && typeof my === 'number') return mx - my;
+                return String(mx).localeCompare(String(my));
+            });
+            for (var k = 0; k < order.length; k++) {
+                var bk = buckets[order[k]];
+                html += '<div class="bt-roster-ghead">' + esc(bk.meta.label) +
+                    '<span class="bt-roster-gcount">' + bk.guids.length + '</span></div>';
+                for (var m = 0; m < bk.guids.length; m++) html += rosterCardHtml(bk.guids[m]);
+            }
         }
+
+        $r.find('.bt-roster-card, .bt-roster-ghead').remove();
+        $r.append(html);
+        rosterSig = rosterSignature(guids);
+        rosterDirty = false;
         updateBotDropdown();
+        renderCockpit();
     }
 
+    function rosterCardHtml(guid) {
+        var s = botStates[guid] || {};
+        var cls = 'bt-roster-card' +
+            (s.taskState === 'DISCONNECTED' ? ' disconnected' : '') +
+            (selectedGuid === guid ? ' selected' : '');
+        return '<div class="' + cls + '" data-guid="' + guid + '" id="roster-' + guid + '">' +
+            rosterCardInner(guid) + '</div>';
+    }
+
+    function rosterCardInner(guid) {
+        var s = botStates[guid];
+        if (!s) return '';
+        var isDisc = s.taskState === 'DISCONNECTED';
+        var isDead = s.isDead;
+        var dotCls = isDisc ? 'offline' : (isDead ? 'dead' : 'alive');
+        var act = botActivity(guid);
+        var className = CLASS_NAMES[s.classId] || '?';
+        var raceName = RACE_NAMES[s.race] || '?';
+        var hp = botHpPct(guid);
+        var hpColor = hp < 35 ? '#f7768e' : (hp < 70 ? '#e0af68' : '#9ece6a');
+        var zone = zoneKeyLabel(botZoneKey(guid));
+        var bags = (s.freeSlots != null && s.totalSlots) ? (s.totalSlots - s.freeSlots) + '/' + s.totalSlots : null;
+
+        return '<span class="bt-roster-dot ' + dotCls + '"></span>' +
+            '<div class="bt-roster-info">' +
+            '<div class="bt-roster-name">' + esc(s.name) +
+            '<span class="bt-roster-lvl">L' + (s.level || 0) + '</span>' +
+            '<span class="bt-class-badge ' + (CLASS_CSS[s.classId] || '') + '">' + className + '</span>' +
+            groupBadgeHtml(guid) + '</div>' +
+            '<div class="bt-roster-meta">' +
+            '<span class="bt-roster-zone" title="' + esc(zone) + '"><i class="fa-solid fa-location-dot"></i> ' + esc(zone) + '</span>' +
+            '<span style="color:' + hpColor + ';">' + hp + '%</span>' +
+            '<span style="color:#e0af68;">' + formatGold(botGold(guid)) + '</span>' +
+            (bags ? '<span title="bag slots used">' + bags + '</span>' : '') +
+            '<span class="bt-roster-race">' + raceName + '</span>' +
+            '</div></div>' +
+            '<div class="bt-roster-right">' +
+            '<span class="bt-roster-activity ' + act.cls + '">' + esc(act.text) + '</span>' +
+            '<button class="bt-roster-ctl btnBotControl" data-guid="' + guid + '" title="Open control suite for this bot">' +
+            '<i class="fa-solid fa-sliders"></i></button>' +
+            '</div>';
+    }
+
+    // In-place refresh of one card. Called from every state / brain / decision event, so it must
+    // stay cheap and must NOT re-sort — reordering on every STATE packet makes the list unusable.
+    // It flags the roster dirty instead; the 3s tick below re-sorts once.
     function renderRosterCard(guid) {
         var s = botStates[guid];
         if (!s) return;
         var $card = $('#roster-' + guid);
-        if ($card.length === 0) return;
+        if ($card.length === 0) { rosterDirty = true; return; }
+        $card.html(rosterCardInner(guid));
+        $card.toggleClass('disconnected', s.taskState === 'DISCONNECTED');
+        $card.toggleClass('selected', selectedGuid === guid);
+        rosterDirty = true;
+    }
 
-        var isDisc = s.taskState === 'DISCONNECTED';
-        var isDead = s.isDead;
-        var dotCls = isDisc ? 'offline' : (isDead ? 'dead' : 'alive');
+    // ---- cockpit census
 
-        var brain = botBrains[guid];
-        var actText = 'IDLE';
-        var actCls = 'bt-act-idle';
-        if (brain && brain.lastDecision) {
-            actText = brain.lastDecision.newActivity;
-            actCls = 'bt-act-' + actText.toLowerCase();
-        } else if (s.inCombat) {
-            actText = 'COMBAT';
-            actCls = 'bt-act-grinding';
-        } else if (s.taskState && s.taskState !== 'IDLE') {
-            actText = s.taskState;
+    function cockpitTile(label, val, color, flag, title) {
+        var on = cockpitFilter && cockpitFilter.kind === 'flag' && cockpitFilter.key === flag;
+        return '<div class="bt-tile' + (flag ? ' clickable' : '') + (on ? ' on' : '') + '"' +
+            (flag ? ' data-flag="' + flag + '"' : '') +
+            (title ? ' title="' + esc(title) + '"' : '') + '>' +
+            '<div class="bt-tile-val" style="color:' + color + ';">' + val + '</div>' +
+            '<div class="bt-tile-lbl">' + esc(label) + '</div></div>';
+    }
+
+    function cockpitChip(kind, key, label, count) {
+        var on = cockpitFilter && cockpitFilter.kind === kind && String(cockpitFilter.key) === String(key);
+        return '<span class="bt-chip' + (on ? ' on' : '') + '" data-fk="' + kind + '" data-fv="' + esc(String(key)) + '">' +
+            esc(label) + '<b>' + count + '</b></span>';
+    }
+
+    function chipRow(icon, title, kind, counts, labelFn) {
+        var keys = Object.keys(counts);
+        if (keys.length === 0) return '';
+        keys.sort(function (a, b) { return counts[b] - counts[a] || String(a).localeCompare(String(b)); });
+        var html = '<div class="bt-chiprow"><span class="bt-chiprow-h"><i class="fa-solid ' + icon + '"></i>' + esc(title) + '</span>';
+        for (var i = 0; i < keys.length; i++) html += cockpitChip(kind, keys[i], labelFn(keys[i]), counts[keys[i]]);
+        return html + '</div>';
+    }
+
+    function renderCockpit() {
+        var $tiles = $('#fleetTiles');
+        if ($tiles.length === 0) return;
+
+        var guids = Object.keys(botStates).map(function (g) { return parseInt(g, 10); });
+        var online = 0, dead = 0, combat = 0, idle = 0, grouped = 0, bagsFull = 0, offline = 0;
+        var gold = 0, lvlSum = 0, lvlN = 0;
+        var zones = {}, bands = {}, classes = {}, acts = {};
+
+        for (var i = 0; i < guids.length; i++) {
+            var g = guids[i], s = botStates[g];
+            if (!s) continue;
+            if (s.taskState === 'DISCONNECTED') { offline++; continue; }
+            online++;
+            if (s.isDead) dead++;
+            if (s.inCombat) combat++;
+            if (groupOf[g]) grouped++;
+            if (s.freeSlots != null && s.freeSlots <= 0) bagsFull++;
+            gold += (s.copper || 0);
+            if (s.level) { lvlSum += s.level; lvlN++; }
+
+            var a = botActivity(g);
+            if (a.text === 'IDLE') idle++;
+            acts[a.text] = (acts[a.text] || 0) + 1;
+
+            var zk = botZoneKey(g); zones[zk] = (zones[zk] || 0) + 1;
+            var bk = levelBandKey(s.level); bands[bk] = (bands[bk] || 0) + 1;
+            var ck = s.classId || 0; classes[ck] = (classes[ck] || 0) + 1;
         }
 
-        var className = CLASS_NAMES[s.classId] || '?';
-        var raceName = RACE_NAMES[s.race] || '?';
+        var avgLvl = lvlN ? (lvlSum / lvlN).toFixed(1) : '—';
+        var tiles = '';
+        tiles += cockpitTile('Online', online, 'var(--text-primary)', null, 'Bots connected on the bridge');
+        tiles += cockpitTile('In combat', combat, '#f7768e', 'combat', 'Filter to bots in combat');
+        tiles += cockpitTile('Dead', dead, '#f7768e', 'dead', 'Filter to corpses');
+        tiles += cockpitTile('Idle', idle, '#8d96a0', 'idle', 'Filter to bots with no activity');
+        tiles += cockpitTile('Grouped', grouped, '#7aa2f7', 'grouped', 'Filter to bots in a group');
+        tiles += cockpitTile('Bags full', bagsFull, '#e0af68', 'bagsfull', 'Filter to bots with 0 free slots');
+        tiles += cockpitTile('Avg level', avgLvl, '#9ece6a', null, 'Mean level of connected bots');
+        tiles += cockpitTile('Fleet gold', formatGold(gold), '#e0af68', null, 'Total copper carried by the fleet');
+        if (offline > 0) tiles += cockpitTile('Offline', offline, '#5f6b7a', 'offline', 'Bots that dropped the bridge');
+        $tiles.html(tiles);
 
-        // Gold in roster card (from enriched STATE copper field)
-        var copper = s.copper || 0;
-        var goldStr = formatGold(copper);
+        var bd = '';
+        bd += chipRow('fa-map-location-dot', 'Zones', 'zone', zones, function (k) { return zoneKeyLabel(k); });
+        bd += chipRow('fa-arrow-up-9-1', 'Levels', 'level', bands, function (k) { return levelBandLabel(k); });
+        bd += chipRow('fa-shield-halved', 'Classes', 'class', classes, function (k) { return CLASS_NAMES[k] || ('Class ' + k); });
+        bd += chipRow('fa-person-running', 'Doing', 'activity', acts, function (k) { return k; });
+        $('#fleetBreakdown').html(bd);
 
-        $card.html(
-            '<span class="bt-roster-dot ' + dotCls + '"></span>' +
-            '<div class="bt-roster-info">' +
-            '<div class="bt-roster-name">' + esc(s.name) + '</div>' +
-            '<div class="bt-roster-meta">L' + (s.level || 0) + ' ' + raceName + ' <span class="bt-class-badge ' + (CLASS_CSS[s.classId] || '') + '">' + className + '</span>' + groupBadgeHtml(guid) +
-            ' <span style="color:#e0af68;margin-left:4px;">' + goldStr + '</span></div>' +
-            '</div>' +
-            '<span class="bt-roster-activity ' + actCls + '">' + actText + '</span>'
-        );
+        var $fp = $('#cockpitFilterPill');
+        if (cockpitFilter) $fp.html('<i class="fa-solid fa-filter"></i> ' + esc(cockpitFilterLabel()) + ' <i class="fa-solid fa-xmark"></i>').show();
+        else $fp.hide();
+    }
 
-        $card.toggleClass('disconnected', isDisc);
-        $card.toggleClass('selected', selectedGuid === guid);
+    // ---- cockpit / roster controls
+
+    $(document).on('click', '#fleetTiles .bt-tile.clickable', function () {
+        setCockpitFilter('flag', $(this).data('flag'));
+    });
+    $(document).on('click', '#fleetBreakdown .bt-chip', function () {
+        setCockpitFilter($(this).data('fk'), $(this).data('fv'));
+    });
+    $(document).on('click', '#cockpitFilterPill', function () {
+        cockpitFilter = null; renderCockpit(); renderRoster();
+    });
+    $(document).on('input', '#rosterSearch', function () {
+        rosterSearch = $(this).val() || '';
+        renderRoster();
+    });
+    $(document).on('change', '#rosterSort', function () {
+        rosterSort = $(this).val();
+        localStorage.setItem('msui_bots_sort', rosterSort);
+        renderRoster();
+    });
+    $(document).on('change', '#rosterGroup', function () {
+        rosterGroupBy = $(this).val();
+        localStorage.setItem('msui_bots_group', rosterGroupBy);
+        renderRoster();
+    });
+    $(document).on('click', '#cockpitToggle', function () {
+        var off = $('.bt-page').toggleClass('cockpit-off').hasClass('cockpit-off');
+        localStorage.setItem('msui_bots_cockpit', off ? '0' : '1');
+        $(this).find('i').attr('class', off ? 'fa-solid fa-chevron-down' : 'fa-solid fa-chevron-up');
+    });
+
+    // ---- live fleet poll (zone + goal enrichment; harmless when the brain is off)
+
+    function fetchFleet() {
+        $.getJSON('/Bots/LiveFleet', function (d) {
+            var arr = (d && d.bots) || [];
+            var next = {};
+            for (var i = 0; i < arr.length; i++) {
+                var b = arr[i];
+                if (b && b.guid != null) next[b.guid] = b;
+            }
+            liveFleet = next;
+            renderRoster();
+        }).fail(function () { /* brain off / endpoint busy — cockpit falls back to bridge state */ });
+    }
+
+    function startFleetPoll() {
+        fetchFleet();
+        if (fleetPollTimer) clearInterval(fleetPollTimer);
+        fleetPollTimer = setInterval(fetchFleet, 8000);
     }
 
     // ===================== DETAIL PANEL =====================
@@ -1086,7 +1509,10 @@ $(function () {
             '<div><span style="font-size:16px;font-weight:700;">' + esc(s.name) + '</span> ' +
             '<span class="bt-class-badge ' + (CLASS_CSS[s.classId] || '') + '">' + className + '</span>' +
             ' <button class="btn-sm btnOpenModal" data-guid="' + s.guid + '" style="font-size:10px;padding:2px 10px;cursor:pointer;background:var(--bg-card-alt,#24283b);border:1px solid var(--border-light,#414868);border-radius:3px;color:var(--accent,#7aa2f7);margin-left:8px;">' +
-            '<i class="fa-solid fa-up-right-from-square" style="margin-right:3px;"></i>Details</button></div>' +
+            '<i class="fa-solid fa-up-right-from-square" style="margin-right:3px;"></i>Details</button>' +
+            ' <button class="btn-sm btnBotControl" data-guid="' + s.guid + '" title="Move, say, quest, grind, trace — everything for this bot" ' +
+            'style="font-size:10px;padding:2px 10px;cursor:pointer;background:var(--accent-subtle,#24283b);border:1px solid var(--accent,#7aa2f7);border-radius:3px;color:var(--accent,#7aa2f7);margin-left:6px;">' +
+            '<i class="fa-solid fa-sliders" style="margin-right:3px;"></i>Control</button></div>' +
             '<div style="font-size:12px;color:var(--text-muted);">L' + (s.level || 0) + ' ' + raceName + ' — Map ' + (s.mapId || 0) + ' (' + posX + ', ' + posY + ')</div>' +
             '</div>' +
             '<div class="d-flex gap-3" style="font-size:12px;">' +
@@ -1324,7 +1750,12 @@ $(function () {
     });
 
     function renderInventoryPanel(data) {
-        var $panel = $('#inventoryPanel');
+        $('#inventoryPanel').html(inventoryHtml(data)).show();
+    }
+
+    // Inventory markup, split out of renderInventoryPanel so the page's Economy section and the
+    // modal's Gear tab render from exactly one place.
+    function inventoryHtml(data) {
         var html = '';
         var icons = data.icons || {};
 
@@ -1373,13 +1804,15 @@ $(function () {
                 '</div>';
         }
 
-        $panel.html(html).show();
+        return html;
     }
 
     function renderInvItem(item, isEquipped, icons) {
-        var qColor = QUALITY_COLORS[item.quality] || '#fff';
+        // Page-surface colour, NOT the game-background colour: QUALITY_COLORS[1] is #ffffff, which
+        // is why Common items rendered as blank space on the card while the dark tooltip showed them.
+        var qColor = QUALITY_TEXT[item.quality] || 'var(--text-primary)';
         var slotLabel = isEquipped ? (EQUIP_SLOT_NAMES[item.inventoryType] || 'Slot ' + item.slot) : '';
-        var iconPath = (item.displayId && icons[item.displayId]) ? icons[item.displayId] : '/icons/inv_misc_questionmark.png';
+        var iconPath = (item.displayId && icons[item.displayId]) ? icons[item.displayId] : '/Icon/Get?name=inv_misc_questionmark';
         var count = item.stackCount || 1;
 
         return '<div class="bt-inv-item"' +
@@ -1398,7 +1831,7 @@ $(function () {
             '<img class="bt-inv-icon" src="' + esc(iconPath) + '" alt="" loading="lazy" />' +
             (count > 1 ? '<span class="bt-inv-count">' + count + '</span>' : '') +
             '</div>' +
-            '<span class="bt-inv-name" style="color:' + qColor + ';">' + esc(item.name) + '</span>' +
+            '<span class="bt-inv-name" style="color:' + qColor + ';" title="' + esc(item.name) + '">' + esc(item.name) + '</span>' +
             (isEquipped ? '<span class="bt-inv-slot">' + slotLabel + '</span>' : '') +
             (item.armor > 0 ? '<span class="bt-inv-stat">' + item.armor + ' armor</span>' : '') +
             '</div>';
@@ -1483,19 +1916,25 @@ $(function () {
         $('#statDpm').text(dpm);
     }
 
+    // Fills every bot picker on the page or in the modal. Any <select data-botlist> gets the
+    // connected roster; data-exclude="<guid>" drops one bot (the group leader picks followers).
     function updateBotDropdown() {
-        var $sel = $('#cmdBotSelect');
-        var current = $sel.val();
-        $sel.find('option:not(:first)').remove();
         var guids = Object.keys(botStates).sort(function (a, b) {
             return (botStates[a].name || '').localeCompare(botStates[b].name || '');
         });
-        for (var i = 0; i < guids.length; i++) {
-            var s = botStates[guids[i]];
-            if (s.taskState === 'DISCONNECTED') continue;
-            $sel.append('<option value="' + s.guid + '">' + s.name + ' (L' + s.level + ')</option>');
-        }
-        if (current) $sel.val(current);
+        $('[data-botlist]').each(function () {
+            var $sel = $(this);
+            var current = $sel.val();
+            var exclude = parseInt($sel.attr('data-exclude'), 10) || 0;
+            $sel.find('option[data-bot]').remove();
+            for (var i = 0; i < guids.length; i++) {
+                var s = botStates[guids[i]];
+                if (!s || s.taskState === 'DISCONNECTED') continue;
+                if (exclude && s.guid === exclude) continue;
+                $sel.append('<option data-bot value="' + s.guid + '">' + esc(s.name) + ' (L' + s.level + ')</option>');
+            }
+            if (current) $sel.val(current);
+        });
     }
 
     // ===================== PERIODIC BRAIN REFRESH =====================
@@ -1758,74 +2197,10 @@ $(function () {
     });
 
     // ===================== COMMAND BAR =====================
-
-    $('#cmdType').on('change', function () {
-        var type = $(this).val();
-        $('#cmdParamsMoveTo, #cmdParamsSay, #cmdParamsQuest, #cmdParamsSpell, #cmdParamsTarget').hide();
-        switch (type) {
-            case 'move_to': $('#cmdParamsMoveTo').show(); break;
-            case 'say': case 'yell': $('#cmdParamsSay').show(); break;
-            case 'accept_quest': case 'complete_quest': case 'abandon_quest': $('#cmdParamsQuest').show(); break;
-            case 'learn_spell': $('#cmdParamsSpell').show(); break;
-            case 'attack_target': case 'interact_npc': $('#cmdParamsTarget').show(); break;
-        }
-    });
-
-    $('#btnSendCmd').on('click', function () {
-        if (!connected) return;
-        var guid = parseInt($('#cmdBotSelect').val());
-        var cmdType = $('#cmdType').val();
-
-        switch (cmdType) {
-            case 'move_to':
-                var m = parseInt($('#cmdMapId').val()) || 0, x = parseFloat($('#cmdX').val()) || 0;
-                var y = parseFloat($('#cmdY').val()) || 0, z = parseFloat($('#cmdZ').val()) || 0;
-                if (guid === 0) connection.invoke('SendMoveToAll', m, x, y, z).catch(logErr);
-                else connection.invoke('SendMoveTo', guid, m, x, y, z).catch(logErr);
-                break;
-            case 'say': case 'yell':
-                var text = $('#cmdText').val().trim();
-                if (!text) return;
-                var chatType = (cmdType === 'yell') ? 6 : 0;
-                if (guid === 0) {
-                    Object.keys(botStates).forEach(function (g) {
-                        if (botStates[g].taskState !== 'DISCONNECTED')
-                            connection.invoke('SendSayText', parseInt(g), text, chatType).catch(logErr);
-                    });
-                } else connection.invoke('SendSayText', guid, text, chatType).catch(logErr);
-                $('#cmdText').val('');
-                break;
-            case 'accept_quest':
-                var qid = parseInt($('#cmdQuestId').val()) || 0;
-                if (qid && guid) connection.invoke('SendAcceptQuest', guid, qid).catch(logErr);
-                break;
-            case 'complete_quest':
-                var qid = parseInt($('#cmdQuestId').val()) || 0;
-                if (qid && guid) connection.invoke('SendCompleteQuest', guid, qid).catch(logErr);
-                break;
-            case 'abandon_quest':
-                var qid = parseInt($('#cmdQuestId').val()) || 0;
-                if (qid && guid) connection.invoke('SendAbandonQuest', guid, qid).catch(logErr);
-                break;
-            case 'learn_spell':
-                var sid = parseInt($('#cmdSpellId').val()) || 0;
-                if (sid && guid) connection.invoke('SendLearnSpell', guid, sid).catch(logErr);
-                break;
-            case 'attack_target':
-                var tg = parseInt($('#cmdTargetGuid').val()) || 0;
-                if (tg && guid) connection.invoke('SendAttackTarget', guid, tg).catch(logErr);
-                break;
-            case 'interact_npc':
-                var ng = parseInt($('#cmdTargetGuid').val()) || 0;
-                if (ng && guid) connection.invoke('SendInteractNpc', guid, ng).catch(logErr);
-                break;
-        }
-        function logErr(err) { console.error('Cmd send failed:', err); }
-    });
-
-    $('#cmdText').on('keydown', function (e) {
-        if (e.key === 'Enter') { e.preventDefault(); $('#btnSendCmd').click(); }
-    });
+    // Gone from the page. Everything it did (and Move To / Say / quests / spells / targeting)
+    // now lives in the per-bot control suite: the modal's Control tab, opened by the sliders
+    // button on any roster card, the Control button on the detail panel, or "Fleet control"
+    // in the header for a broadcast. See the CONTROL SUITE section near the bottom of this file.
 
     // ===================== HELPERS =====================
 
@@ -1857,11 +2232,7 @@ $(function () {
     var QUEST_STATUS_NAMES = { 0: 'None', 1: 'In Progress', 3: 'Complete', 6: 'Failed' };
     var QUEST_STATUS_ICONS = { 0: 'fa-circle-xmark', 1: 'fa-spinner', 3: 'fa-circle-check', 6: 'fa-skull' };
     var QUEST_STATUS_COLORS = { 0: '#5f6b7a', 1: '#7aa2f7', 3: '#e0af68', 6: '#f7768e' };
-    var ZONE_NAMES = {
-        9: 'Northshire Valley', 12: 'Elwynn Forest', 1: 'Dun Morogh', 14: 'Durotar',
-        85: 'Tirisfal Glades', 141: 'Teldrassil', 215: 'Mulgore',
-        '-81': 'Warrior', '-141': 'Paladin', '-261': 'Mage'
-    };
+    // ZONE_NAMES / MAP_NAMES now live in the CONSTANTS block at the top (shared with the cockpit).
     var questStatusCache = {};
 
     // Inject modal styles
@@ -1910,7 +2281,8 @@ $(function () {
         '<button class="bm-close" id="bmClose"><i class="fa-solid fa-xmark"></i></button>' +
         '</div>' +
         '<div class="bm-tabs">' +
-        '<div class="bm-tab active" data-tab="quests"><i class="fa-solid fa-scroll" style="margin-right:5px;"></i>Quests</div>' +
+        '<div class="bm-tab active" data-tab="control"><i class="fa-solid fa-sliders" style="margin-right:5px;"></i>Control</div>' +
+        '<div class="bm-tab" data-tab="quests"><i class="fa-solid fa-scroll" style="margin-right:5px;"></i>Quests</div>' +
         '<div class="bm-tab" data-tab="gear"><i class="fa-solid fa-shield-halved" style="margin-right:5px;"></i>Gear</div>' +
         '<div class="bm-tab" data-tab="brain"><i class="fa-solid fa-brain" style="margin-right:5px;"></i>Brain</div>' +
         '</div>' +
@@ -2159,34 +2531,50 @@ $(function () {
         openBotModal(guid);
     });
 
-    function openBotModal(guid) {
+    // guid 0 opens the modal in FLEET mode: control only, every command broadcasts.
+    function openBotModal(guid, tab) {
+        guid = parseInt(guid, 10) || 0;
         var s = botStates[guid];
-        if (!s) return;
-        var brain = botBrains[guid];
-        var className = CLASS_NAMES[s.classId] || '?';
+        if (guid > 0 && !s) return;
 
-        $('#bmTitle').html(
-            '<span style="color:var(--text-primary);">' + esc(s.name) + '</span>' +
-            ' <span class="bt-class-badge ' + (CLASS_CSS[s.classId] || '') + '" style="font-size:11px;">' + className + '</span>' +
-            ' <span style="font-weight:400;font-size:12px;color:var(--text-muted);">L' + (s.level || 0) + '</span>'
-        );
+        if (guid === 0) {
+            $('#bmTitle').html('<span style="color:var(--text-primary);">Fleet control</span>' +
+                ' <span style="font-weight:400;font-size:12px;color:var(--text-muted);">every connected bot</span>');
+            $('.bm-tab[data-tab!="control"]').hide();
+            tab = 'control';
+        } else {
+            var className = CLASS_NAMES[s.classId] || '?';
+            $('#bmTitle').html(
+                '<span style="color:var(--text-primary);">' + esc(s.name) + '</span>' +
+                ' <span class="bt-class-badge ' + (CLASS_CSS[s.classId] || '') + '" style="font-size:11px;">' + className + '</span>' +
+                ' <span style="font-weight:400;font-size:12px;color:var(--text-muted);">L' + (s.level || 0) +
+                ' \u00b7 ' + esc(zoneKeyLabel(botZoneKey(guid))) + '</span>'
+            );
+            $('.bm-tab').show();
+        }
+
         $('#botModal').data('guid', guid).addClass('active');
-        $('.bm-tab').first().click(); // load first tab
+        var $t = $('.bm-tab[data-tab="' + (tab || 'control') + '"]');
+        ($t.length ? $t : $('.bm-tab:visible').first()).click();
     }
 
     function loadModalTab(tab) {
         var guid = $('#botModal').data('guid');
-        if (!guid) return;
+        if (guid == null) return;
+        guid = parseInt(guid, 10) || 0;
+
+        if (tab === 'control') { renderControlTab(guid); return; }
+        if (guid === 0) { renderControlTab(0); return; }
 
         switch (tab) {
             case 'quests':
                 loadQuestTab(guid);
                 break;
             case 'gear':
-                $('#bmBody').html('<div class="bq-loading"><i class="fa-solid fa-hammer" style="margin-right:6px;"></i>Coming soon</div>');
+                renderGearTab(guid);
                 break;
             case 'brain':
-                $('#bmBody').html('<div class="bq-loading"><i class="fa-solid fa-hammer" style="margin-right:6px;"></i>Coming soon</div>');
+                renderBrainTab(guid);
                 break;
         }
     }
@@ -2459,6 +2847,18 @@ $(function () {
     setInterval(updateStats, 5000);
     startRosterPoll();
 
+    // --- cockpit boot -------------------------------------------------------------------
+    startFleetPoll();                                             // zone/goal enrichment
+    setInterval(rosterResortIfNeeded, 3000);                      // debounced re-sort + census
+    setInterval(refreshGroupingStatus, 15000);                    // keeps group badges + census live
+    $('#rosterSort').val(rosterSort);
+    $('#rosterGroup').val(rosterGroupBy);
+    if (localStorage.getItem('msui_bots_cockpit') === '0') {
+        $('.bt-page').addClass('cockpit-off');
+        $('#cockpitToggle i').attr('class', 'fa-solid fa-chevron-down');
+    }
+    renderCockpit();
+
     // ===================== ITEM TOOLTIP =====================
     // Floating tooltip that appears on hover over inventory items
 
@@ -2546,5 +2946,424 @@ $(function () {
         if (x + tw > window.innerWidth - 10) x = e.clientX - tw - 12;
         if (y + th > window.innerHeight - 10) y = e.clientY - th - 12;
         $tooltip.css({ left: x + 'px', top: y + 'px' });
+    }
+    // ===================== CONTROL SUITE (modal) =====================
+    // Everything that used to live in the page-wide command bar now lives here, scoped to one
+    // bot (or broadcast to the whole fleet). Every action posts to the existing BotsController
+    // REST endpoints — no new server code, no hub method assumptions.
+
+    var bcGuid = 0;            // 0 = fleet mode (no single bot selected)
+    var bcBroadcast = false;   // true = apply to every connected bot
+
+    function bcTargets() {
+        if (bcGuid > 0 && !bcBroadcast) return [bcGuid];
+        var out = [];
+        Object.keys(botStates).forEach(function (g) {
+            var s = botStates[g];
+            if (s && s.taskState !== 'DISCONNECTED') out.push(parseInt(g, 10));
+        });
+        return out;
+    }
+
+    function bcTargetLabel() {
+        var t = bcTargets();
+        if (t.length === 1 && botStates[t[0]]) return botStates[t[0]].name;
+        return t.length + ' bots';
+    }
+
+    // Fire one POST per target and report a single rolled-up toast.
+    function bcSend(url, build, verb) {
+        var targets = bcTargets();
+        if (!targets.length) { showToast('No target bots', true); return; }
+        var done = 0, failed = 0, firstErr = null;
+        targets.forEach(function (g) {
+            $.ajax({ url: url, type: 'POST', contentType: 'application/json', data: JSON.stringify(build(g)) })
+                .done(function (r) {
+                    if (r && r.success === false) { failed++; if (!firstErr) firstErr = r.error; }
+                    else done++;
+                })
+                .fail(function (x) { failed++; if (!firstErr) firstErr = 'HTTP ' + x.status; })
+                .always(function () {
+                    if (done + failed !== targets.length) return;
+                    if (failed) showToast(verb + ' — ' + done + ' ok, ' + failed + ' failed' + (firstErr ? ' (' + firstErr + ')' : ''), true);
+                    else showToast(verb + ' \u2192 ' + (targets.length === 1 ? bcTargetLabel() : targets.length + ' bots'));
+                });
+        });
+    }
+
+    function bcCard(icon, title, body, note) {
+        return '<div class="bc-card"><div class="bc-card-h"><i class="fa-solid ' + icon + '"></i>' + esc(title) +
+            (note ? '<span class="bc-note">' + esc(note) + '</span>' : '') + '</div>' +
+            '<div class="bc-card-b">' + body + '</div></div>';
+    }
+
+    function bcNum(id, ph, val, w) {
+        return '<input type="number" class="form-input bc-in" id="' + id + '" placeholder="' + esc(ph) + '" value="' +
+            (val == null ? '' : val) + '" style="width:' + (w || 82) + 'px;" />';
+    }
+
+    function bcBtn(id, icon, label, kind) {
+        return '<button class="bc-btn' + (kind ? ' ' + kind : '') + '" id="' + id + '"><i class="fa-solid ' + icon + '"></i>' + esc(label) + '</button>';
+    }
+
+    function renderControlTab(guid) {
+        bcGuid = parseInt(guid, 10) || 0;
+        if (bcGuid === 0) bcBroadcast = true;
+        var s = botStates[bcGuid];
+        var html = '';
+
+        // --- target strip -------------------------------------------------------------
+        var tgt = '<div class="bc-target">';
+        tgt += '<span class="bc-target-l">Apply to</span>';
+        if (bcGuid > 0 && s) {
+            tgt += '<label class="bc-radio"><input type="radio" name="bcScope" value="one"' + (bcBroadcast ? '' : ' checked') + '> ' +
+                esc(s.name) + '</label>';
+        }
+        tgt += '<label class="bc-radio"><input type="radio" name="bcScope" value="all"' + (bcBroadcast ? ' checked' : '') + '> ' +
+            'all connected bots</label>';
+        tgt += '<span class="bc-target-n" id="bcTargetCount">' + bcTargets().length + ' target(s)</span>';
+        tgt += '</div>';
+        html += tgt;
+
+        if (bcGuid > 0 && s) {
+            var hp = botHpPct(bcGuid);
+            var act = botActivity(bcGuid);
+            html += '<div class="bc-vitals">' +
+                '<span><b>L' + (s.level || 0) + '</b> ' + esc(CLASS_NAMES[s.classId] || '?') + '</span>' +
+                '<span>' + esc(zoneKeyLabel(botZoneKey(bcGuid))) + '</span>' +
+                '<span>map ' + (s.mapId || 0) + ' @ ' + Math.round(s.x || 0) + ', ' + Math.round(s.y || 0) + ', ' + Math.round(s.z || 0) + '</span>' +
+                '<span style="color:' + (hp < 35 ? '#f7768e' : '#9ece6a') + ';">HP ' + hp + '%</span>' +
+                '<span style="color:#e0af68;">' + formatGold(s.copper || 0) + '</span>' +
+                '<span class="bt-roster-activity ' + act.cls + '">' + esc(act.text) + '</span>' +
+                (s.isDead ? '<span style="color:#f7768e;font-weight:700;">DEAD</span>' : '') +
+                (s.inCombat ? '<span style="color:#f7768e;font-weight:700;">IN COMBAT</span>' : '') +
+                '</div>';
+        }
+
+        html += '<div class="bc-grid">';
+
+        // --- movement -----------------------------------------------------------------
+        var mv = '<div class="bc-row">' +
+            bcNum('bcMap', 'map', s ? (s.mapId || 0) : 0, 62) +
+            bcNum('bcX', 'X', s ? Math.round(s.x || 0) : '', 92) +
+            bcNum('bcY', 'Y', s ? Math.round(s.y || 0) : '', 92) +
+            bcNum('bcZ', 'Z', s ? Math.round(s.z || 0) : '', 92) +
+            bcBtn('bcMoveTo', 'fa-location-arrow', 'Move to', 'primary') +
+            '</div>' +
+            '<div class="bc-row">' +
+            '<select class="form-input bc-in" id="bcGotoBot" data-botlist style="width:200px;"><option value="0">-- copy coords from bot --</option></select>' +
+            bcBtn('bcMoveToBot', 'fa-people-arrows', 'Send to that bot') +
+            (bcGuid > 0 ? bcBtn('bcFillSelf', 'fa-crosshairs', 'Reset to current position') : '') +
+            '</div>';
+        html += bcCard('fa-person-walking', 'Movement', mv, 'MOVE_TO — the bot walks, it does not teleport');
+
+        // --- grind task ---------------------------------------------------------------
+        var gr = '<div class="bc-row">' +
+            bcNum('bcGrindX', 'X', s ? Math.round(s.x || 0) : '', 92) +
+            bcNum('bcGrindY', 'Y', s ? Math.round(s.y || 0) : '', 92) +
+            bcNum('bcGrindZ', 'Z', s ? Math.round(s.z || 0) : '', 92) +
+            bcNum('bcGrindR', 'radius', 60, 78) +
+            '</div><div class="bc-row">' +
+            bcNum('bcGrindEntry', 'creature entry', '', 130) +
+            bcNum('bcGrindKills', 'kills', 10, 74) +
+            bcBtn('bcSetGrind', 'fa-skull', 'Set grind task', 'primary') +
+            '</div>';
+        html += bcCard('fa-skull-crossbones', 'Grind task', gr, 'SET_TASK_GRIND — entry 0 = anything in radius');
+
+        // --- chat ---------------------------------------------------------------------
+        var ch = '<div class="bc-row">' +
+            '<input type="text" class="form-input bc-in" id="bcText" placeholder="text to say..." style="flex:1;min-width:220px;" />' +
+            '<select class="form-input bc-in" id="bcChatType" style="width:120px;">' +
+            '<option value="0">Say (0)</option><option value="6">Yell (6)</option><option value="custom">Custom...</option>' +
+            '</select>' +
+            bcNum('bcChatCustom', 'type', 0, 70) +
+            bcBtn('bcSay', 'fa-paper-plane', 'Send', 'primary') +
+            '</div>';
+        html += bcCard('fa-comment', 'Chat', ch, 'SAY_TEXT — chat type is the raw server enum, unchanged from the old command bar');
+
+        // --- quests -------------------------------------------------------------------
+        var qs = '<div class="bc-row">' +
+            bcNum('bcQuestId', 'quest id', '', 110) +
+            bcBtn('bcQAccept', 'fa-plus', 'Accept') +
+            bcBtn('bcQComplete', 'fa-check', 'Complete') +
+            bcBtn('bcQAbandon', 'fa-xmark', 'Abandon', 'danger') +
+            '</div>';
+        html += bcCard('fa-scroll', 'Quests', qs);
+
+        // --- spells + targeting -------------------------------------------------------
+        var sp = '<div class="bc-row">' +
+            bcNum('bcSpellId', 'spell id', '', 110) + bcBtn('bcLearn', 'fa-book', 'Learn spell') +
+            '</div><div class="bc-row">' +
+            bcNum('bcTargetGuid', 'target guid', '', 120) +
+            bcBtn('bcAttack', 'fa-crosshairs', 'Attack', 'danger') +
+            bcBtn('bcInteract', 'fa-hand-point-up', 'Interact') +
+            '</div>';
+        html += bcCard('fa-wand-sparkles', 'Spells & targeting', sp);
+
+        // --- flight -------------------------------------------------------------------
+        var fl = '<div class="bc-row">' +
+            bcNum('bcFlySrc', 'source node', '', 110) + bcNum('bcFlyDst', 'dest node', '', 110) +
+            bcBtn('bcTakeFlight', 'fa-plane', 'Take flight') +
+            '</div>';
+        html += bcCard('fa-plane-departure', 'Flight path', fl, 'TAKE_FLIGHT — taxi node ids');
+
+        // --- grouping -----------------------------------------------------------------
+        var grp = '';
+        if (bcGuid > 0) {
+            grp += '<div class="bc-row"><span class="bc-lbl">Leader: <b>' + esc(s ? s.name : ('#' + bcGuid)) + '</b></span></div>';
+            grp += '<div class="bc-row"><select multiple class="form-input" id="bcFollowers" data-botlist data-exclude="' + bcGuid +
+                '" style="min-width:240px;height:88px;"></select>' +
+                bcBtn('bcFormGroup', 'fa-users', 'Form group', 'primary') +
+                (groupOf[bcGuid] ? bcBtn('bcDisband', 'fa-users-slash', 'Disband group #' + groupOf[bcGuid], 'danger') : '') +
+                '</div>';
+        } else {
+            grp += '<div class="bc-row">' + bcBtn('bcAutoForm', 'fa-users', 'Auto-form groups') + '</div>';
+        }
+        html += bcCard('fa-users', 'Grouping', grp, 'grouping mode must not be Off');
+
+        // --- diagnostics ---------------------------------------------------------------
+        var dg = '<div class="bc-row">' +
+            bcBtn('bcTraceOn', 'fa-record-vinyl', 'Trace on') + bcBtn('bcTraceOff', 'fa-stop', 'Trace off') +
+            bcBtn('bcStoryOn', 'fa-book-open', 'Story on') + bcBtn('bcStoryOff', 'fa-stop', 'Story off') +
+            (bcGuid > 0 ? bcBtn('bcReport', 'fa-bolt', 'Bot report') : '') +
+            '</div><div class="bc-row"><span class="bc-lbl" id="bcTraceState">trace: —</span></div>';
+        html += bcCard('fa-microscope', 'Diagnostics', dg, 'per-guid flight recorder + causal story log');
+
+        html += '</div>';
+
+        $('#bmBody').html(html);
+        updateBotDropdown();
+        $('#bcChatCustom').hide();
+        refreshTraceState();
+    }
+
+    function refreshTraceState() {
+        $.getJSON('/Bots/TraceStatus', function (d) {
+            if (!d) return;
+            var targets = d.targets || [];
+            var mine = bcGuid > 0 ? (targets.indexOf(bcGuid) >= 0) : false;
+            $('#bcTraceState').text('trace: ' + (d.enabled ? 'enabled' : 'disabled') +
+                ' \u00b7 ' + targets.length + ' target(s)' + (bcGuid > 0 ? (mine ? ' \u00b7 this bot IS traced' : ' \u00b7 this bot is not traced') : ''));
+        }).fail(function () { $('#bcTraceState').text('trace: status unavailable'); });
+    }
+
+    // ---- control handlers (delegated — the modal body is rebuilt on every open)
+
+    $(document).on('change', 'input[name="bcScope"]', function () {
+        bcBroadcast = $(this).val() === 'all';
+        $('#bcTargetCount').text(bcTargets().length + ' target(s)');
+    });
+
+    $(document).on('change', '#bcChatType', function () {
+        if ($(this).val() === 'custom') $('#bcChatCustom').show(); else $('#bcChatCustom').hide();
+    });
+
+    $(document).on('click', '#bcMoveTo', function () {
+        var m = parseInt($('#bcMap').val(), 10) || 0;
+        var x = parseFloat($('#bcX').val()) || 0, y = parseFloat($('#bcY').val()) || 0, z = parseFloat($('#bcZ').val()) || 0;
+        bcSend('/Bots/MoveTo', function (g) { return { guid: g, mapId: m, x: x, y: y, z: z }; }, 'MOVE_TO');
+    });
+
+    $(document).on('click', '#bcMoveToBot', function () {
+        var other = parseInt($('#bcGotoBot').val(), 10) || 0;
+        var t = botStates[other];
+        if (!t) { showToast('Pick a bot to travel to', true); return; }
+        $('#bcMap').val(t.mapId || 0); $('#bcX').val(Math.round(t.x || 0));
+        $('#bcY').val(Math.round(t.y || 0)); $('#bcZ').val(Math.round(t.z || 0));
+        bcSend('/Bots/MoveTo', function (g) { return { guid: g, mapId: t.mapId || 0, x: t.x, y: t.y, z: t.z }; }, 'MOVE_TO ' + t.name);
+    });
+
+    $(document).on('click', '#bcFillSelf', function () {
+        var s = botStates[bcGuid]; if (!s) return;
+        $('#bcMap').val(s.mapId || 0); $('#bcX').val(Math.round(s.x || 0));
+        $('#bcY').val(Math.round(s.y || 0)); $('#bcZ').val(Math.round(s.z || 0));
+    });
+
+    $(document).on('click', '#bcSetGrind', function () {
+        var p = {
+            x: parseFloat($('#bcGrindX').val()) || 0,
+            y: parseFloat($('#bcGrindY').val()) || 0,
+            z: parseFloat($('#bcGrindZ').val()) || 0,
+            radius: parseFloat($('#bcGrindR').val()) || 60,
+            creatureEntry: parseInt($('#bcGrindEntry').val(), 10) || 0,
+            killCount: parseInt($('#bcGrindKills').val(), 10) || 0
+        };
+        bcSend('/Bots/SetTaskGrind', function (g) {
+            return { guid: g, x: p.x, y: p.y, z: p.z, radius: p.radius, creatureEntry: p.creatureEntry, killCount: p.killCount };
+        }, 'SET_TASK_GRIND');
+    });
+
+    $(document).on('click', '#bcSay', function () {
+        var text = $.trim($('#bcText').val() || '');
+        if (!text) { showToast('Nothing to say', true); return; }
+        var ct = $('#bcChatType').val();
+        var chatType = ct === 'custom' ? (parseInt($('#bcChatCustom').val(), 10) || 0) : (parseInt(ct, 10) || 0);
+        bcSend('/Bots/SayText', function (g) { return { guid: g, text: text, chatType: chatType }; }, 'SAY_TEXT');
+        $('#bcText').val('');
+    });
+    $(document).on('keydown', '#bcText', function (e) { if (e.key === 'Enter') { e.preventDefault(); $('#bcSay').click(); } });
+
+    function bcQuest(url, verb) {
+        var qid = parseInt($('#bcQuestId').val(), 10) || 0;
+        if (!qid) { showToast('Quest id required', true); return; }
+        bcSend(url, function (g) { return { guid: g, questId: qid }; }, verb);
+    }
+    $(document).on('click', '#bcQAccept', function () { bcQuest('/Bots/AcceptQuest', 'ACCEPT_QUEST'); });
+    $(document).on('click', '#bcQComplete', function () { bcQuest('/Bots/CompleteQuest', 'COMPLETE_QUEST'); });
+    $(document).on('click', '#bcQAbandon', function () { bcQuest('/Bots/AbandonQuest', 'ABANDON_QUEST'); });
+
+    $(document).on('click', '#bcLearn', function () {
+        var sid = parseInt($('#bcSpellId').val(), 10) || 0;
+        if (!sid) { showToast('Spell id required', true); return; }
+        bcSend('/Bots/LearnSpell', function (g) { return { guid: g, spellId: sid }; }, 'LEARN_SPELL');
+    });
+    $(document).on('click', '#bcAttack', function () {
+        var t = parseInt($('#bcTargetGuid').val(), 10) || 0;
+        if (!t) { showToast('Target guid required', true); return; }
+        bcSend('/Bots/AttackTarget', function (g) { return { guid: g, targetGuid: t }; }, 'ATTACK_TARGET');
+    });
+    $(document).on('click', '#bcInteract', function () {
+        var t = parseInt($('#bcTargetGuid').val(), 10) || 0;
+        if (!t) { showToast('Target guid required', true); return; }
+        bcSend('/Bots/InteractNpc', function (g) { return { guid: g, targetGuid: t }; }, 'INTERACT_NPC');
+    });
+    $(document).on('click', '#bcTakeFlight', function () {
+        var src = parseInt($('#bcFlySrc').val(), 10) || 0, dst = parseInt($('#bcFlyDst').val(), 10) || 0;
+        if (!src || !dst) { showToast('Source + dest node required', true); return; }
+        bcSend('/Bots/TakeFlight', function (g) { return { guid: g, sourceNode: src, destNode: dst }; }, 'TAKE_FLIGHT');
+    });
+
+    $(document).on('click', '#bcFormGroup', function () {
+        var followers = ($('#bcFollowers').val() || []).map(function (v) { return parseInt(v, 10); });
+        if (!followers.length) { showToast('Pick at least one follower', true); return; }
+        $.ajax({
+            url: '/Bots/FormGroup', type: 'POST', contentType: 'application/json',
+            data: JSON.stringify({ leaderGuid: bcGuid, followerGuids: followers })
+        }).done(function (r) {
+            if (r && r.success) { showToast('Group #' + r.groupId + ' formed'); refreshGroupingStatus(); renderControlTab(bcGuid); }
+            else showToast((r && r.error) || 'Formation failed', true);
+        }).fail(function (x) { showToast('FormGroup failed (' + x.status + ')', true); });
+    });
+    $(document).on('click', '#bcDisband', function () {
+        var gid = groupOf[bcGuid];
+        if (!gid) return;
+        window.disbandGroup(gid);
+        setTimeout(function () { renderControlTab(bcGuid); }, 400);
+    });
+    $(document).on('click', '#bcAutoForm', function () { $('#autoFormGroups').click(); });
+
+    function bcDiag(url, enabled, verb) {
+        var targets = bcTargets();
+        $.ajax({ url: url, type: 'POST', contentType: 'application/json', data: JSON.stringify({ enabled: enabled, guids: targets }) })
+            .done(function () { showToast(verb + ' \u2192 ' + targets.length + ' bot(s)'); refreshTraceState(); })
+            .fail(function (x) { showToast(verb + ' failed (' + x.status + ')', true); });
+    }
+    $(document).on('click', '#bcTraceOn', function () { bcDiag('/Bots/SetTrace', true, 'trace on'); });
+    $(document).on('click', '#bcTraceOff', function () { bcDiag('/Bots/SetTrace', false, 'trace off'); });
+    $(document).on('click', '#bcStoryOn', function () { bcDiag('/Bots/SetStory', true, 'story on'); });
+    $(document).on('click', '#bcStoryOff', function () { bcDiag('/Bots/SetStory', false, 'story off'); });
+    $(document).on('click', '#bcReport', function () {
+        var st = bcGuid ? botStates[bcGuid] : null;
+        if (!st || !st.name) return;
+        $('#brTitle').html('<i class="fa-solid fa-bolt"></i> Report \u2014 ' + esc(st.name));
+        $('#brBody').html('<div class="br-loading"><i class="fa-solid fa-spinner fa-spin"></i> reading buffered log\u2026</div>');
+        $('#botReportModal').addClass('active');
+        $.getJSON('/Bots/BotReport', { name: st.name }, function (data) {
+            if (!data || data.error) { $('#brBody').html('<div class="br-loading">' + esc((data && data.error) || 'no data') + '</div>'); return; }
+            $('#brBody').html(renderBotReport(data));
+        }).fail(function () { $('#brBody').html('<div class="br-loading">request failed</div>'); });
+    });
+
+    // Open the control suite for a bot (0 = fleet-wide) — the roster button, the detail-panel
+    // button and the header "Fleet control" button all land here.
+    function openBotControl(guid) {
+        openBotModal(guid, 'control');
+    }
+    $(document).on('click', '.btnBotControl', function (e) {
+        e.stopPropagation();
+        openBotControl(parseInt($(this).data('guid'), 10) || 0);
+    });
+    $(document).on('click', '#btnFleetControl', function () { openBotControl(0); });
+
+    // ===================== MODAL: GEAR + BRAIN TABS =====================
+
+    function renderGearTab(guid) {
+        var $b = $('#bmBody');
+        if (inventoryCache[guid]) { $b.html(inventoryHtml(inventoryCache[guid])); return; }
+        $b.html('<div class="bq-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading inventory...</div>');
+        $.getJSON('/Bots/Inventory', { guid: guid }, function (data) {
+            if (!data || data.error) { $b.html('<div class="bq-loading">' + esc((data && data.error) || 'no data') + '</div>'); return; }
+            inventoryCache[guid] = data;
+            $b.html(inventoryHtml(data));
+        }).fail(function () { $b.html('<div class="bq-loading">Failed to load inventory</div>'); });
+    }
+
+    function renderBrainTab(guid) {
+        var $b = $('#bmBody');
+        var brain = botBrains[guid];
+        var html = '';
+
+        $.getJSON('/Bots/LiveState/' + guid, function (d) {
+            var live = '';
+            if (d && !d.error) {
+                live += '<div class="bc-card"><div class="bc-card-h"><i class="fa-solid fa-satellite-dish"></i>Live spine</div><div class="bc-card-b">' +
+                    '<div class="bc-row"><b style="font-size:15px;color:' + (GOAL_COLOR[d.goal] || 'var(--accent)') + ';">' + esc(d.goal || '') + '</b>' +
+                    '<span style="color:var(--text-secondary);">/ ' + esc(d.step || '') + '</span></div>' +
+                    (d.why ? '<div class="bc-row" style="font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--text-muted);">why = ' + esc(d.why) + '</div>' : '') +
+                    '<div class="bc-row">' +
+                    '<span class="bc-lbl">zone ' + (d.zoneId || 0) + ' \u00b7 map ' + (d.mapId || 0) + '</span>' +
+                    '<span class="bc-lbl">HP ' + (d.hpPct || 0) + '%</span>' +
+                    '<span class="bc-lbl">durability ' + (d.durability != null ? d.durability + '%' : '—') + '</span>' +
+                    '<span class="bc-lbl">free bags ' + (d.freeSlots != null ? d.freeSlots : '—') + '</span>' +
+                    '</div>' +
+                    (d.pending ? '<div class="bc-row"><span class="bc-lbl">outstanding: <b>' + esc(d.pending.cmd) + '</b> waiting ' + esc(d.pending.expect) + ' (' + (d.pending.ageSec || 0) + 's)</span></div>' : '<div class="bc-row"><span class="bc-lbl">no outstanding command</span></div>') +
+                    (d.failure ? '<div class="bc-row" style="color:#f7768e;">last failure: ' + esc(d.failure.cmd) + ' \u2190 ' + esc(d.failure.reason) + '</div>' : '') +
+                    (d.stall ? '<div class="bc-row" style="color:#f7768e;font-weight:700;">STALLED — ' + esc(d.stall.reason) + '</div>' : '') +
+                    '</div></div>';
+            } else {
+                live = '<div class="bc-card"><div class="bc-card-b" style="color:var(--text-muted);font-size:12px;">No live context — the brain engine is off for this bot.</div></div>';
+            }
+            $('#bmBrainLive').html(live);
+        });
+
+        html += '<div id="bmBrainLive"><div class="bq-loading"><i class="fa-solid fa-spinner fa-spin"></i> reading live context…</div></div>';
+
+        if (brain && brain.personality) {
+            var p = brain.personality;
+            var traits = ['patience', 'greed', 'curiosity', 'sociability', 'aggression', 'efficiency', 'cautiousness', 'indecisiveness', 'spontaneity'];
+            var t = '';
+            for (var i = 0; i < traits.length; i++) {
+                var k = traits[i], meta = TRAIT_META[k] || { icon: 'fa-circle', color: '#888' }, pct = Math.round((p[k] || 0) * 100);
+                t += '<div class="bt-trait"><span class="bt-trait-icon"><i class="fa-solid ' + meta.icon + '" style="color:' + meta.color + ';"></i></span>' +
+                    '<span class="bt-trait-label">' + capitalize(k) + '</span>' +
+                    '<div class="bt-trait-bar-track"><div class="bt-trait-bar-fill" style="width:' + pct + '%;background:' + meta.color + ';"></div></div>' +
+                    '<span class="bt-trait-val">' + pct + '</span></div>';
+            }
+            if (p.quirks && p.quirks.length) {
+                t += '<div style="margin-top:10px;">';
+                for (var qi = 0; qi < p.quirks.length; qi++)
+                    t += '<span class="bt-quirk" title="' + esc(p.quirks[qi].description || '') + '"><i class="fa-solid fa-star" style="font-size:9px;"></i> ' + esc(p.quirks[qi].name) + '</span>';
+                t += '</div>';
+            }
+            html += bcCard('fa-fingerprint', 'Personality', t, p.chatStyle + ' / ' + p.temperament);
+        }
+
+        if (brain && brain.lastDecision && brain.lastDecision.weights) {
+            html += bcCard('fa-scale-balanced', 'Decision weights', '<div class="bt-weights">' + renderWeightsHtml(brain.lastDecision.weights) + '</div>');
+        }
+
+        var entries = decisionLog[guid] || [];
+        if (entries.length) {
+            var log = '<div class="bt-timeline" style="max-height:220px;">';
+            for (var e = Math.max(0, entries.length - 40); e < entries.length; e++) {
+                var en = entries[e];
+                log += '<div class="' + (en.activityChanged ? 'bt-tl-switch' : 'bt-tl-stay') + '">[' +
+                    new Date(en.timestamp).toLocaleTimeString() + '] ' + esc(en.decision) + '</div>';
+            }
+            log += '</div>';
+            html += bcCard('fa-clock-rotate-left', 'Decision timeline', log);
+        }
+
+        $b.html(html);
     }
 });

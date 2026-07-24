@@ -13,7 +13,6 @@ using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
-using MangosSuperUI.Services.WorldExport;
 using Microsoft.AspNetCore.StaticFiles;
 using System.Diagnostics.Metrics;
 
@@ -78,12 +77,6 @@ builder.Services.AddSingleton<WikiIndexer>();
 builder.Services.AddSingleton<WikiSearchStore>();
 builder.Services.AddScoped<RetextureSupport>();
 
-// ---------- MSUI Client: world export (design doc §5) ----------
-// Offline bake of ADT terrain + vmap collision into GLB/PNG/JSON under
-// wwwroot/world/, consumed by the browser client. Singletons because both
-// hold a parsed-model cache that is worth keeping warm across bakes.
-builder.Services.AddSingleton<TerrainTileExporter>();
-builder.Services.AddSingleton<CollisionTileExporter>();
 
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();

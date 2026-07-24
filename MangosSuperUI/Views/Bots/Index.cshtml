@@ -1,10 +1,10 @@
 @{
-    ViewData["Title"] = "Individual Bot Monitor";
+    ViewData["Title"] = "Bot Cockpit";
 }
 
 @section Styles {
     <style>
-        /* ====== Bot Monitor ====== */
+        /* ====== Bot Monitor / Cockpit ====== */
 
         /* --- Header Stats --- */
         .bt-stat {
@@ -67,12 +67,211 @@
                 color: var(--status-online);
             }
 
+        /* --- Cockpit strip (fleet census + filter control) --- */
+        .bt-cockpit {
+            background: var(--bg-card);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            margin-bottom: 12px;
+        }
+
+        .bt-cockpit-head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 7px 12px;
+            border-bottom: 1px solid var(--border-light);
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+        }
+
+            .bt-cockpit-head i.head-i {
+                color: var(--accent);
+            }
+
+        .bt-cockpit-spacer {
+            flex: 1;
+        }
+
+        #cockpitFilterPill {
+            display: none;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: none;
+            letter-spacing: 0;
+            color: var(--accent);
+            background: var(--accent-subtle);
+            border: 1px solid var(--accent);
+            border-radius: 20px;
+            padding: 2px 10px;
+            cursor: pointer;
+        }
+
+        #cockpitToggle {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 12px;
+            padding: 2px 4px;
+        }
+
+            #cockpitToggle:hover {
+                color: var(--text-primary);
+            }
+
+        .bt-page.cockpit-off .bt-cockpit-body {
+            display: none;
+        }
+
+        .bt-cockpit-body {
+            padding: 10px 12px;
+        }
+
+        .bt-tiles {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .bt-tile {
+            flex: 1 1 92px;
+            min-width: 92px;
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-sm);
+            padding: 7px 6px;
+            text-align: center;
+            transition: border-color var(--transition-fast), background var(--transition-fast);
+        }
+
+            .bt-tile.clickable {
+                cursor: pointer;
+            }
+
+                .bt-tile.clickable:hover {
+                    border-color: var(--accent);
+                }
+
+            .bt-tile.on {
+                border-color: var(--accent);
+                background: var(--accent-light);
+            }
+
+        .bt-tile-val {
+            font-size: 17px;
+            font-weight: 800;
+            line-height: 1.1;
+        }
+
+        .bt-tile-lbl {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-top: 3px;
+        }
+
+        .bt-chiprow {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+
+        .bt-chiprow-h {
+            font-size: 9px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            min-width: 74px;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+            .bt-chiprow-h i {
+                color: var(--accent);
+                font-size: 10px;
+            }
+
+        .bt-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 20px;
+            border: 1px solid var(--border-light);
+            background: var(--bg-card-alt);
+            color: var(--text-secondary);
+            cursor: pointer;
+            white-space: nowrap;
+            transition: all var(--transition-fast);
+        }
+
+            .bt-chip:hover {
+                border-color: var(--accent);
+                color: var(--text-primary);
+            }
+
+            .bt-chip b {
+                font-variant-numeric: tabular-nums;
+                color: var(--text-primary);
+            }
+
+            .bt-chip.on {
+                border-color: var(--accent);
+                background: var(--accent-light);
+                color: var(--accent);
+            }
+
+                .bt-chip.on b {
+                    color: var(--accent);
+                }
+
         /* --- Layout --- */
         .bt-layout {
             display: grid;
-            grid-template-columns: 320px 1fr;
+            grid-template-columns: 340px 1fr;
             gap: 16px;
-            height: calc(100vh - 140px);
+            height: calc(100vh - 360px);
+            min-height: 420px;
+        }
+
+        .bt-page.cockpit-off .bt-layout {
+            height: calc(100vh - 215px);
+        }
+
+        /* --- Roster toolbar --- */
+        .bt-roster-bar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-bottom: 8px;
+            flex-shrink: 0;
+        }
+
+            .bt-roster-bar .form-input {
+                font-size: 11px;
+                padding: 2px 6px;
+                height: 26px;
+            }
+
+        .bt-roster-count {
+            margin-left: auto;
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
         }
 
         /* --- Bot Roster (Left) --- */
@@ -81,17 +280,39 @@
             padding-right: 4px;
         }
 
+        .bt-roster-ghead {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            padding: 8px 2px 4px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid var(--border-light);
+            margin-bottom: 6px;
+        }
+
+        .bt-roster-gcount {
+            margin-left: auto;
+            background: var(--bg-card-alt);
+            border-radius: 10px;
+            padding: 0 7px;
+            font-variant-numeric: tabular-nums;
+        }
+
         .bt-roster-card {
             background: var(--bg-card);
             border: 1px solid var(--border-light);
             border-radius: var(--radius-md);
-            padding: 10px 12px;
+            padding: 8px 10px;
             margin-bottom: 6px;
             cursor: pointer;
             transition: border-color var(--transition-fast), background var(--transition-fast);
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 9px;
         }
 
             .bt-roster-card:hover {
@@ -138,12 +359,68 @@
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .bt-roster-lvl {
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
         }
 
         .bt-roster-meta {
-            font-size: 11px;
+            font-size: 10.5px;
             color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
         }
+
+        .bt-roster-zone {
+            max-width: 128px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+            .bt-roster-zone i {
+                font-size: 9px;
+                opacity: 0.7;
+            }
+
+        .bt-roster-race {
+            opacity: 0.7;
+        }
+
+        .bt-roster-right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+
+        .bt-roster-ctl {
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-light);
+            color: var(--text-muted);
+            border-radius: 4px;
+            width: 24px;
+            height: 24px;
+            font-size: 11px;
+            cursor: pointer;
+            line-height: 1;
+            transition: all var(--transition-fast);
+        }
+
+            .bt-roster-ctl:hover {
+                color: var(--accent);
+                border-color: var(--accent);
+            }
 
         .bt-roster-activity {
             font-size: 10px;
@@ -155,7 +432,7 @@
             flex-shrink: 0;
         }
 
-        .bt-act-idle {
+        .bt-act-idle, .bt-act-offline {
             background: rgba(141,150,160,0.12);
             color: var(--text-muted);
         }
@@ -191,6 +468,16 @@
         }
 
         .bt-act-training, .bt-act-travelingtotrainer {
+            background: rgba(255,158,100,0.12);
+            color: #ff9e64;
+        }
+
+        .bt-act-following {
+            background: rgba(115,218,202,0.12);
+            color: #73daca;
+        }
+
+        .bt-act-maintenance {
             background: rgba(255,158,100,0.12);
             color: #ff9e64;
         }
@@ -407,20 +694,247 @@
             margin-top: 2px;
         }
 
-        /* --- Command Bar --- */
-        .bt-cmd-bar {
-            background: var(--bg-card);
-            border: 1px solid var(--border-light);
-            border-radius: var(--radius-md);
-            padding: 10px 14px;
-            margin-bottom: 12px;
-        }
-
-        .bt-cmd-row {
+        /* --- Control suite (inside the bot modal) --- */
+        .bc-target {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 14px;
             flex-wrap: wrap;
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 8px 12px;
+            margin-bottom: 10px;
+        }
+
+        .bc-target-l {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+        }
+
+        .bc-radio {
+            font-size: 12px;
+            color: var(--text-secondary);
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            margin: 0;
+            cursor: pointer;
+        }
+
+        .bc-target-n {
+            margin-left: auto;
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .bc-vitals {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            flex-wrap: wrap;
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+            padding: 0 2px;
+        }
+
+        .bc-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+            gap: 10px;
+        }
+
+        .bc-card {
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+
+        .bc-card-h {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 12px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-light);
+        }
+
+            .bc-card-h i {
+                color: var(--accent);
+            }
+
+        .bc-note {
+            margin-left: auto;
+            font-size: 10px;
+            font-weight: 400;
+            text-transform: none;
+            letter-spacing: 0;
+            color: var(--text-muted);
+        }
+
+        .bc-card-b {
+            padding: 10px 12px;
+        }
+
+        .bc-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-bottom: 7px;
+        }
+
+            .bc-row:last-child {
+                margin-bottom: 0;
+            }
+
+        .bc-in {
+            font-size: 12px;
+            padding: 3px 7px;
+            height: 28px;
+        }
+
+        .bc-lbl {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .bc-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 5px 11px;
+            border-radius: 6px;
+            border: 1px solid var(--border-light);
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all var(--transition-fast);
+        }
+
+            .bc-btn:hover {
+                border-color: var(--accent);
+                color: var(--accent);
+            }
+
+            .bc-btn.primary {
+                border-color: var(--accent);
+                background: var(--accent-light);
+                color: var(--accent);
+            }
+
+            .bc-btn.danger {
+                border-color: #f7768e66;
+                color: #f7768e;
+            }
+
+                .bc-btn.danger:hover {
+                    border-color: #f7768e;
+                    background: rgba(247,118,142,0.10);
+                }
+
+        /* --- Inventory Panel --- */
+        .bt-inv-section-title {
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+            .bt-inv-section-title i {
+                margin-right: 4px;
+                font-size: 10px;
+            }
+
+        .bt-inv-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+
+        .bt-inv-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 8px 3px 4px;
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-light);
+            border-radius: 3px;
+            font-size: 11px;
+            cursor: default;
+            transition: border-color var(--transition-fast);
+        }
+
+            .bt-inv-item:hover {
+                border-color: var(--accent);
+            }
+
+        /* icon + stack-count badge (the JS emits these; they had no CSS before, so the
+                   count floated as loose text next to the icon and pushed the name out of view) */
+        .bt-inv-icon-wrap {
+            position: relative;
+            width: 20px;
+            height: 20px;
+            flex-shrink: 0;
+            line-height: 0;
+        }
+
+        .bt-inv-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 2px;
+            flex-shrink: 0;
+            image-rendering: pixelated;
+        }
+
+        .bt-inv-count {
+            position: absolute;
+            right: -3px;
+            bottom: -4px;
+            font-size: 9px;
+            font-weight: 700;
+            line-height: 1;
+            padding: 1px 3px;
+            border-radius: 3px;
+            background: rgba(0,0,0,0.72);
+            color: #fff;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .bt-inv-name {
+            font-weight: 500;
+            white-space: nowrap;
+            max-width: 190px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .bt-inv-slot {
+            font-size: 9px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            flex-shrink: 0;
+        }
+
+        .bt-inv-stat {
+            font-size: 9px;
+            color: var(--text-muted);
+            flex-shrink: 0;
         }
 
         /* --- WoW Class Colors --- */
@@ -478,74 +992,6 @@
             letter-spacing: 0.04em;
         }
 
-        /* --- Inventory Panel --- */
-        .bt-inv-section-title {
-            font-size: 11px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--text-muted);
-            margin-bottom: 6px;
-        }
-
-            .bt-inv-section-title i {
-                margin-right: 4px;
-                font-size: 10px;
-            }
-
-        .bt-inv-grid {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 4px;
-        }
-
-        .bt-inv-item {
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            padding: 3px 8px 3px 4px;
-            background: var(--bg-card-alt);
-            border: 1px solid var(--border-light);
-            border-radius: 3px;
-            font-size: 11px;
-            cursor: default;
-            transition: border-color var(--transition-fast);
-        }
-
-            .bt-inv-item:hover {
-                border-color: var(--accent);
-            }
-
-        .bt-inv-icon {
-            width: 20px;
-            height: 20px;
-            border-radius: 2px;
-            flex-shrink: 0;
-            image-rendering: pixelated;
-        }
-
-        .bt-inv-name {
-            font-weight: 500;
-            white-space: nowrap;
-            max-width: 140px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .bt-inv-slot {
-            font-size: 9px;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            letter-spacing: 0.03em;
-            flex-shrink: 0;
-        }
-
-        .bt-inv-stat {
-            font-size: 9px;
-            color: var(--text-muted);
-            flex-shrink: 0;
-        }
-
         /* --- Scrollbar Styling --- */
         .bt-roster::-webkit-scrollbar,
         .bt-detail::-webkit-scrollbar,
@@ -572,10 +1018,13 @@
     <div class="main-content">
         <div class="content-header d-flex align-items-start justify-content-between">
             <div>
-                <h1><i class="fa-solid fa-brain" style="color: var(--accent);"></i> Individual Bot Monitor</h1>
-                <p>Per-bot drill-down — personality, decisions, economy, and live spine state</p>
+                <h1><i class="fa-solid fa-brain" style="color: var(--accent);"></i> Bot Cockpit</h1>
+                <p>Fleet census, roster and per-bot control — personality, decisions, economy, live spine state</p>
             </div>
             <div class="d-flex align-items-center gap-3">
+                <button id="btnFleetControl" class="btn-accent" style="font-size:11px;padding:4px 10px;height:26px;white-space:nowrap;" title="Broadcast a command to every connected bot">
+                    <i class="fa-solid fa-sliders"></i> Fleet Control
+                </button>
                 <button id="btnAddBots" class="btn-accent" style="font-size:11px;padding:4px 10px;height:26px;white-space:nowrap;" title="Quick-spawn bots via .bot addai">
                     <i class="fa-solid fa-user-plus"></i> Add Bots
                 </button>
@@ -608,51 +1057,51 @@
             </div>
         </div>
 
-        <div class="content-body">
+        <div class="content-body bt-page">
 
-            <!-- Command Bar (global) -->
-            <div class="bt-cmd-bar">
-                <div class="bt-cmd-row">
-                    <select class="form-input" id="cmdBotSelect" style="width:180px;">
-                        <option value="0">-- All Bots --</option>
-                    </select>
-                    <select class="form-input" id="cmdType" style="width:140px;">
-                        <option value="move_to">Move To</option>
-                        <option value="say">Say</option>
-                        <option value="yell">Yell</option>
-                        <option value="accept_quest">Accept Quest</option>
-                        <option value="complete_quest">Complete Quest</option>
-                        <option value="abandon_quest">Abandon Quest</option>
-                        <option value="learn_spell">Learn Spell</option>
-                        <option value="attack_target">Attack Target</option>
-                        <option value="interact_npc">Interact NPC</option>
-                    </select>
-                    <div id="cmdParamsMoveTo" class="d-flex gap-2">
-                        <input type="number" class="form-input" id="cmdMapId" placeholder="Map" value="0" style="width:65px;" />
-                        <input type="number" class="form-input" id="cmdX" placeholder="X" step="0.1" style="width:85px;" />
-                        <input type="number" class="form-input" id="cmdY" placeholder="Y" step="0.1" style="width:85px;" />
-                        <input type="number" class="form-input" id="cmdZ" placeholder="Z" step="0.1" style="width:85px;" />
-                    </div>
-                    <div id="cmdParamsSay" class="d-flex gap-2" style="display:none;">
-                        <input type="text" class="form-input" id="cmdText" placeholder="Text to say..." style="width:240px;" />
-                    </div>
-                    <div id="cmdParamsQuest" class="d-flex gap-2" style="display:none;">
-                        <input type="number" class="form-input" id="cmdQuestId" placeholder="Quest ID" style="width:120px;" />
-                    </div>
-                    <div id="cmdParamsSpell" class="d-flex gap-2" style="display:none;">
-                        <input type="number" class="form-input" id="cmdSpellId" placeholder="Spell ID" style="width:120px;" />
-                    </div>
-                    <div id="cmdParamsTarget" class="d-flex gap-2" style="display:none;">
-                        <input type="number" class="form-input" id="cmdTargetGuid" placeholder="Target GUID" style="width:120px;" />
-                    </div>
-                    <button class="btn-accent" id="btnSendCmd"><i class="fa-solid fa-paper-plane"></i> Send</button>
+            <!-- Fleet cockpit: census + filter control. Every tile and chip is a roster filter. -->
+            <div class="bt-cockpit">
+                <div class="bt-cockpit-head">
+                    <i class="fa-solid fa-gauge head-i"></i> Fleet
+                    <div class="bt-cockpit-spacer"></div>
+                    <span id="cockpitFilterPill"></span>
+                    <button id="cockpitToggle" title="Collapse / expand the fleet strip"><i class="fa-solid fa-chevron-up"></i></button>
+                </div>
+                <div class="bt-cockpit-body">
+                    <div class="bt-tiles" id="fleetTiles"></div>
+                    <div id="fleetBreakdown"></div>
                 </div>
             </div>
 
             <!-- Main Layout -->
             <div class="bt-layout">
-                <!-- Left: Bot Roster + Groups -->
+                <!-- Left: Roster toolbar + Bot Roster + Groups -->
                 <div style="display:flex;flex-direction:column;overflow:hidden;">
+
+                    <div class="bt-roster-bar">
+                        <input type="text" class="form-input" id="rosterSearch" placeholder="Search name..." style="width:120px;" />
+                        <select class="form-input" id="rosterSort" title="Sort order" style="width:auto;">
+                            <option value="level_desc">Level ↓</option>
+                            <option value="level_asc">Level ↑</option>
+                            <option value="name">Name</option>
+                            <option value="class">Class</option>
+                            <option value="zone">Zone</option>
+                            <option value="activity">Doing</option>
+                            <option value="gold">Gold</option>
+                            <option value="hp">Lowest HP</option>
+                            <option value="group">Group</option>
+                        </select>
+                        <select class="form-input" id="rosterGroup" title="Group the roster by" style="width:auto;">
+                            <option value="none">No grouping</option>
+                            <option value="zone">By zone</option>
+                            <option value="level">By level band</option>
+                            <option value="class">By class</option>
+                            <option value="activity">By activity</option>
+                            <option value="group">By party</option>
+                        </select>
+                        <span class="bt-roster-count" id="rosterCount">0</span>
+                    </div>
+
                     <div class="bt-roster" id="botRoster" style="flex:1;overflow-y:auto;">
                         <div class="bt-detail-empty" id="rosterEmpty">
                             <i class="fa-solid fa-robot"></i>
@@ -660,6 +1109,7 @@
                             <div style="font-size:12px;margin-top:4px;">Waiting for AiBotAI on TCP 3444...</div>
                         </div>
                     </div>
+
                     <!-- Groups Panel -->
                     <div class="bt-section" style="margin-top:8px;flex-shrink:0;max-height:200px;overflow-y:auto;">
                         <div class="bt-section-header">
@@ -677,7 +1127,7 @@
                     <div class="bt-detail-empty" id="detailEmpty">
                         <i class="fa-solid fa-brain"></i>
                         <div style="font-size:14px;">Select a bot to inspect</div>
-                        <div style="font-size:12px;margin-top:4px;">Personality traits, decision weights, activity timeline</div>
+                        <div style="font-size:12px;margin-top:4px;">Click the <i class="fa-solid fa-sliders"></i> button on any bot to drive it</div>
                     </div>
                 </div>
             </div>
