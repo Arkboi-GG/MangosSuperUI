@@ -10,6 +10,7 @@
 //   7. Viewport (renderer, scene assembly, animate loop, resize, input dispatch)
 
 import * as THREE from 'three';
+import { applyWorldLighting, syncWorldLighting } from './world-light.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -44,10 +45,131 @@ export function isWireframe() { return wireframeOn; }
 export function setMaxAnisotropy(v) { maxAnisotropyVal = v; }
 export function maxAnisotropy() { return maxAnisotropyVal; }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TERRAIN DETAIL OVERLAY  (M4.2c)
+//
+// The server bakes ALL texture layers into ONE composite per tile — MCLY layer
+// order, MCAL alpha maps, the lot — and stretches it 0..1 over a 533-yard tile.
+// At the default pixelsPerChunk of 128 that is 2048 texels across 533 yards, or
+// about 0.26 yards per texel. Underfoot you are magnifying a single texel across
+// a quarter of a yard, which is the smeared, out-of-focus ground you can see.
+//
+// For contrast, MSUIClient does what the real client does: keeps the 4 layers
+// separate and repeats each one 8 times per 33.3-yard chunk. That is roughly
+// 61 texels per yard — about 16x the effective detail, and it is why its terrain
+// looks sharp and this does not.
+//
+// THE REAL FIX IS RUNTIME SPLATTING: ship MTEX names + MCLY + MCAL to the
+// browser and blend four repeating layers in a shader, instead of baking. That
+// is a server-and-shader change of real size and it belongs in its own pass.
+//
+// What this is: a high-frequency detail map multiplied over the composite at a
+// steep repeat rate. It does not add correct detail — it cannot, the per-layer
+// information is already gone by the time the browser sees the tile — but it
+// restores the high-frequency variation the human eye reads as "in focus" and
+// removes most of the smear. It is a mitigation with an honest name.
+//
+// Procedural, so there is no asset to ship or 404.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let detailEnabled = true;
+let detailStrength = 0.45;
+const DETAIL_REPEATS_PER_YARD = 0.35;   // ~2.9 yards per tile of detail
+let _detailTex = null;
+const _detailMaterials = new Set();
+
+export function setTerrainDetail(on, strength) {
+    detailEnabled = !!on;
+    if (strength !== undefined) detailStrength = strength;
+    for (const m of _detailMaterials) {
+        if (m.userData._detailUniforms) {
+            m.userData._detailUniforms.uDetailStrength.value =
+                detailEnabled ? detailStrength : 0.0;
+        }
+    }
+}
+export function isTerrainDetailOn() { return detailEnabled; }
+
+function detailTexture() {
+    if (_detailTex) return _detailTex;
+    const S = 128;
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = S;
+    const ctx = cv.getContext('2d');
+    const img = ctx.createImageData(S, S);
+    // Two octaves of value noise, wrapped so the tile edges meet.
+    const grid = (n) => {
+        const g = new Float32Array(n * n);
+        for (let i = 0; i < n * n; i++) g[i] = Math.random();
+        return g;
+    };
+    const g1 = grid(8), g2 = grid(32);
+    const samp = (g, n, x, y) => {
+        const fx = x * n, fy = y * n;
+        const x0 = Math.floor(fx) % n, y0 = Math.floor(fy) % n;
+        const x1 = (x0 + 1) % n, y1 = (y0 + 1) % n;
+        const tx = fx - Math.floor(fx), ty = fy - Math.floor(fy);
+        const sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty);
+        const a = g[y0 * n + x0], b = g[y0 * n + x1];
+        const c = g[y1 * n + x0], d = g[y1 * n + x1];
+        return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+    };
+    for (let y = 0; y < S; y++) {
+        for (let x = 0; x < S; x++) {
+            const u = x / S, v = y / S;
+            let n = samp(g1, 8, u, v) * 0.65 + samp(g2, 32, u, v) * 0.35;
+            const c = Math.max(0, Math.min(255, Math.round(n * 255)));
+            const i = (y * S + x) * 4;
+            img.data[i] = img.data[i + 1] = img.data[i + 2] = c;
+            img.data[i + 3] = 255;
+        }
+    }
+    ctx.putImageData(img, 0, 0);
+    _detailTex = new THREE.CanvasTexture(cv);
+    _detailTex.wrapS = _detailTex.wrapT = THREE.RepeatWrapping;
+    _detailTex.minFilter = THREE.LinearMipmapLinearFilter;
+    _detailTex.magFilter = THREE.LinearFilter;
+    _detailTex.generateMipmaps = true;
+    _detailTex.anisotropy = maxAnisotropy();
+    return _detailTex;
+}
+
+function applyDetailOverlay(mat) {
+    mat.onBeforeCompile = (shader) => {
+        shader.uniforms.uDetail = { value: detailTexture() };
+        shader.uniforms.uDetailScale = { value: DETAIL_REPEATS_PER_YARD };
+        shader.uniforms.uDetailStrength = {
+            value: detailEnabled ? detailStrength : 0.0
+        };
+        mat.userData._detailUniforms = shader.uniforms;
+
+        shader.vertexShader =
+            'varying vec3 vDetailWorld;\n' +
+            shader.vertexShader.replace(
+                '#include <begin_vertex>',
+                '#include <begin_vertex>\n' +
+                '  vDetailWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+
+        shader.fragmentShader =
+            'uniform sampler2D uDetail;\n' +
+            'uniform float uDetailScale;\n' +
+            'uniform float uDetailStrength;\n' +
+            'varying vec3 vDetailWorld;\n' +
+            shader.fragmentShader.replace(
+                '#include <map_fragment>',
+                '#include <map_fragment>\n' +
+                '  float dTex = texture2D(uDetail, vDetailWorld.xz * uDetailScale).r;\n' +
+                '  diffuseColor.rgb *= mix(1.0, dTex * 1.6 + 0.2, uDetailStrength);');
+    };
+    // Materials with different onBeforeCompile output must not share a program.
+    mat.customProgramCacheKey = () => 'terrain-detail-v1';
+    _detailMaterials.add(mat);
+}
+
 export function makeTerrainMaterial(opts) {
     opts = opts || {};
     if (litMode) {
-        return new THREE.MeshStandardMaterial({
+        const m = new THREE.MeshStandardMaterial({
             map: opts.map || null,
             color: opts.color || 0xffffff,
             side: THREE.FrontSide,
@@ -56,6 +178,10 @@ export function makeTerrainMaterial(opts) {
             fog: true,
             wireframe: wireframeOn
         });
+        // Only worth doing on a textured tile — on the flat-colour fallback it
+        // would just add noise to a solid green plane.
+        if (opts.map) applyDetailOverlay(m);
+        return m;
     }
     return new THREE.MeshBasicMaterial({
         map: opts.map || null,
@@ -66,10 +192,14 @@ export function makeTerrainMaterial(opts) {
     });
 }
 
+let _worldLightRig = null;
+/** Set once by Viewport so material factories can reach the rig. */
+export function setWorldLightRig(rig) { _worldLightRig = rig; }
+
 export function makeDoodadMaterial(opts) {
     opts = opts || {};
     if (litMode) {
-        return new THREE.MeshStandardMaterial({
+        return applyWorldLighting(new THREE.MeshStandardMaterial({
             map: opts.map || null,
             color: opts.color || 0x808080,
             side: opts.side || THREE.DoubleSide,
@@ -79,7 +209,7 @@ export function makeDoodadMaterial(opts) {
             roughness: 0.7,
             metalness: 0.0,
             fog: true
-        });
+        }), _worldLightRig);
     }
     return new THREE.MeshBasicMaterial({
         map: opts.map || null,
@@ -95,7 +225,7 @@ export function makeDoodadMaterial(opts) {
 export function makeWmoMaterial(opts) {
     opts = opts || {};
     if (litMode) {
-        return new THREE.MeshStandardMaterial({
+        return applyWorldLighting(new THREE.MeshStandardMaterial({
             map: opts.map || null,
             color: opts.color || 0xaaaaaa,
             side: opts.side || THREE.FrontSide,
@@ -106,7 +236,7 @@ export function makeWmoMaterial(opts) {
             metalness: 0.05,
             fog: true,
             wireframe: wireframeOn
-        });
+        }), _worldLightRig);
     }
     return new THREE.MeshBasicMaterial({
         map: opts.map || null,
@@ -215,6 +345,26 @@ export function addGroundPlane(scene) {
 // directly via mouse delta. The state lives here so input handlers can
 // mutate it without exporting globals.
 
+// M1.1 — ground-probe reach, in yards. Scene Y is true world height, so the
+// probe is anchored to the camera rather than to a fixed altitude.
+const PROBE_ABOVE = 300;
+const PROBE_BELOW = 700;
+
+// Real 1.12 eye height. Was 2 in the old squashed space where it meant
+// nothing in particular; it is now 2.1 actual yards (MSUIClient MovementConfig).
+const EYE_HEIGHT = 2.1;
+
+// M1.2 — ground-snap smoothing, expressed as a RATE (1/s) instead of a
+// per-frame lerp factor. alpha = 1 - exp(-rate * dt) is the frame-rate
+// independent form of the old `* 0.3` at 60fps:
+//     0.3 = 1 - exp(-rate/60)  →  rate = -60 * ln(0.7) ≈ 21.4
+const SNAP_RATE = 21.4;
+
+// Terrain probe cadence. Was "every 3rd frame", which meant 20Hz at 60fps but
+// 48Hz on a 144Hz display and 10Hz on a 30fps one — the probe got cheaper
+// exactly when the machine was struggling. Now a real 20Hz.
+const SNAP_HZ = 20;
+
 export class CameraRig {
     constructor(canvas) {
         this.camera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
@@ -237,7 +387,7 @@ export class CameraRig {
 
         this.walk = {
             mode: false,
-            eyeHeight: 2,
+            eyeHeight: EYE_HEIGHT,
             yaw: 0,
             pitch: 0,
             inited: false,
@@ -247,9 +397,56 @@ export class CameraRig {
         };
     }
 
+    /**
+     * M1.1 — place the camera against TRUE world height.
+     *
+     * Before 1:1 scale the scene was centred on Y=0 by construction, so a
+     * hard-coded (0, 30, 80) always looked at something. Now terrain sits at
+     * its real altitude (Elwynn ~50-200, Un'Goro ~-150, Blackrock Spire past
+     * +400), and a fixed Y is underground or in orbit depending on the zone.
+     *
+     * groundY: measured terrain height under the target, when known.
+     * fallbackY: the block's height range midpoint, used until a probe lands.
+     */
+    frameTerrain(groundY, opts) {
+        opts = opts || {};
+        const x = (opts.x !== undefined) ? opts.x : 0;
+        const z = (opts.z !== undefined) ? opts.z : 0;
+        const y = (groundY !== undefined && groundY !== null && isFinite(groundY))
+            ? groundY : 0;
+
+        if (this.walk.mode) {
+            this.camera.position.set(x, y + this.walk.eyeHeight, z);
+            this.applyWalkLook();
+        } else {
+            // Orbit: sit back and above, looking at the ground point.
+            const back = (opts.distance !== undefined) ? opts.distance : 80;
+            const up = (opts.elevation !== undefined) ? opts.elevation : 30;
+            this.camera.position.set(x, y + up, z + back);
+            this.controls.target.set(x, y, z);
+            this.controls.update();
+        }
+    }
+
+    /**
+     * Measure terrain height at an XZ position by probing straight down.
+     * Returns null when nothing is under the point (tile not streamed yet).
+     */
+    probeGroundY(meshes, x, z, fromY) {
+        if (!meshes || meshes.length === 0) return null;
+        const start = (fromY !== undefined && isFinite(fromY))
+            ? fromY + PROBE_ABOVE
+            : PROBE_ABOVE + PROBE_BELOW;
+        const ray = new THREE.Raycaster(
+            new THREE.Vector3(x, start, z), new THREE.Vector3(0, -1, 0));
+        ray.far = PROBE_ABOVE + PROBE_BELOW * 2;
+        const hits = ray.intersectObjects(meshes, false);
+        return hits.length > 0 ? hits[0].point.y : null;
+    }
+
     enterWalkMode() {
         this.walk.mode = true;
-        this.walk.eyeHeight = 2;
+        this.walk.eyeHeight = EYE_HEIGHT;
         this.controls.enableRotate = false;
         this.controls.enablePan = false;
         const dir = new THREE.Vector3();
@@ -308,12 +505,16 @@ export class WalkMode {
         this._wmoMeshCacheFrame = -999;  // frame when cache was built
     }
 
-    updateSnap() {
+    updateSnap(dt) {
+        if (!(dt > 0)) dt = 1 / 60;
+        // Frame-rate independent approach to the target height.
+        const snapAlpha = 1 - Math.exp(-SNAP_RATE * dt);
         const rig = this.editor.viewport.rig;
         if (!rig.walk.mode) return;
         if (!this.editor.tileGrid) return;
 
         this._snapFrame++;
+        this._snapAccum = (this._snapAccum || 0) + dt;
 
         // ── DUNGEON MODE ─────────────────────────────────────────────────
         // Dungeon meshes have BVH → fast raycast. Run every frame, no throttle needed.
@@ -321,9 +522,12 @@ export class WalkMode {
             const dungeonMeshes = this.editor.tileGrid.dungeonMeshes;
             if (!dungeonMeshes || dungeonMeshes.length === 0) return;
 
-            const origin = new THREE.Vector3(rig.camera.position.x, 500, rig.camera.position.z);
+            // M1.1: scene Y is true world height (can exceed 500), so the probe
+            // starts relative to the camera instead of at a fixed altitude.
+            const origin = new THREE.Vector3(
+                rig.camera.position.x, rig.camera.position.y + PROBE_ABOVE, rig.camera.position.z);
             this._rayDown.set(origin, this._down);
-            this._rayDown.far = 1000;
+            this._rayDown.far = PROBE_ABOVE + PROBE_BELOW;
 
             const hits = this._rayDown.intersectObjects(dungeonMeshes, false);
             if (hits.length > 0) {
@@ -337,7 +541,7 @@ export class WalkMode {
                 if (bestY === null) bestY = hits[hits.length - 1].point.y;
 
                 const targetY = bestY + rig.walk.eyeHeight;
-                const dy = (targetY - rig.camera.position.y) * 0.3;
+                const dy = (targetY - rig.camera.position.y) * snapAlpha;
                 rig.camera.position.y += dy;
                 rig.controls.target.y += dy;
             }
@@ -346,14 +550,16 @@ export class WalkMode {
 
         // ── NORMAL TERRAIN MODE (with throttled WMO raycast) ─────────────
 
-        // PERF: full raycast at ~20Hz (every 3rd frame at 60fps).
+        // PERF: full raycast at a real SNAP_HZ regardless of frame rate.
         // Between samples, keep smoothing toward the last known target Y.
-        const doFullRaycast = (this._snapFrame % 3 === 0);
+        const doFullRaycast = (this._snapAccum >= 1 / SNAP_HZ);
+        if (doFullRaycast) this._snapAccum = 0;
 
         if (doFullRaycast) {
-            const origin = new THREE.Vector3(rig.camera.position.x, 500, rig.camera.position.z);
+            const origin = new THREE.Vector3(
+                rig.camera.position.x, rig.camera.position.y + PROBE_ABOVE, rig.camera.position.z);
             this._rayDown.set(origin, this._down);
-            this._rayDown.far = 1000;
+            this._rayDown.far = PROBE_ABOVE + PROBE_BELOW;
 
             // Terrain raycast — BVH-accelerated, always fast
             const terrainMeshes = this.editor.tileGrid.terrainMeshes();
@@ -394,7 +600,7 @@ export class WalkMode {
         // Apply smoothed Y snap (runs every frame for smooth movement)
         if (this._cachedBestY !== null) {
             const targetY = this._cachedBestY + rig.walk.eyeHeight;
-            const dy = (targetY - rig.camera.position.y) * 0.3;
+            const dy = (targetY - rig.camera.position.y) * snapAlpha;
             rig.camera.position.y += dy;
             rig.controls.target.y += dy;
         }
@@ -512,6 +718,10 @@ export class Viewport {
 
         // Lighting + sky + ground
         this.lighting = new LightingRig(this.scene);
+        // Material factories are module-level functions with no viewport
+        // reference; hand them the rig once so every lit material can join the
+        // world lighting model.
+        setWorldLightRig(this.lighting);
         addSkyDome(this.scene);
         this.ground = addGroundPlane(this.scene);
 
@@ -557,6 +767,12 @@ export class Viewport {
 
         // External per-frame callbacks (registered by index.js)
         this._tickers = [];
+
+        // M1.2 — frame clock. Everything that moves is now expressed per
+        // SECOND, not per frame; a 144Hz machine used to travel 2.4x further
+        // per keypress than a 60Hz one.
+        this._clock = new THREE.Clock();
+        this.deltaTime = 1 / 60;
 
         // Phase 6: depth prepass for collision-aware ghost rendering. Must
         // be constructed AFTER this.ground exists (added to exclusions in
@@ -655,6 +871,12 @@ export class Viewport {
     }
 
     _animate() {
+        // M1.2 — clamp dt so a backgrounded tab (rAF stops, then fires with a
+        // multi-second delta) cannot teleport the camera across the map on
+        // return. 100ms = 10fps floor; below that, motion just slows down.
+        const dt = Math.min(this._clock.getDelta(), 0.1);
+        this.deltaTime = dt;
+
         requestAnimationFrame(this._animate);
         this._fpsCounter++;
 
@@ -668,13 +890,13 @@ export class Viewport {
 
         // Walk-mode hooks (terrain snap + WMO collision)
         if (this.editor.walkModeImpl) {
-            this.editor.walkModeImpl.updateSnap();
+            this.editor.walkModeImpl.updateSnap(dt);
             this.editor.walkModeImpl.updateCollision();
         }
 
         // External tickers (movement, compass, hud, etc.)
         for (let i = 0; i < this._tickers.length; i++) {
-            try { this._tickers[i](this); } catch (err) { console.error('ticker', err); }
+            try { this._tickers[i](this, dt); } catch (err) { console.error('ticker', err); }
         }
 
         // Progressive terrain check (~500ms)
@@ -682,6 +904,10 @@ export class Viewport {
         if (this._progressiveTimer >= 30 && this.editor.tileGrid && this.editor.currentPreset) {
             this._progressiveTimer = 0;
             this.editor.tileGrid.checkProgressive(this.rig.controls.target);
+            // Splat materials are ShaderMaterials, so three.js does not update
+            // their fog/light uniforms for us.
+            if (this.editor.tileGrid.syncSplat) this.editor.tileGrid.syncSplat();
+            syncWorldLighting(this.lighting);
             // Slide ground plane to follow the camera so its corners stay
             // hidden behind the fog horizon.
             if (this.ground) {
@@ -711,6 +937,14 @@ export class Viewport {
             if (active && typeof active.updateHelpers === 'function') {
                 try { active.updateHelpers(); } catch (err) { console.error('updateHelpers', err); }
             }
+        }
+
+        // M4.2 — character mode. The controller owns the character's position
+        // AND the camera, so it must run after the walk-mode snap (which it
+        // disables anyway) and before the render.
+        const cc = this.editor.characterController;
+        if (cc && cc.enabled) {
+            try { cc.update(dt); } catch (err) { console.error('character', err); }
         }
 
         // Phase 6: depth prepass for ghost collision viz. No-op when no

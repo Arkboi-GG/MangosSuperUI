@@ -230,17 +230,53 @@ public class CharacterSkinCompositor
     }
 
     /// <summary>
-    /// Paint a source bitmap into a destination rectangle on the canvas,
-    /// stretching to fit. Mirrors the canvas.drawImage(src, x, y, w, h)
-    /// semantics the client-side compositor uses.
+    /// Paint a CharSections face texture onto the body atlas.
+    ///
+    /// THE CLOSED-EYES BUG
+    ///   This used to unconditionally stretch the WHOLE source into the target
+    ///   rectangle: src = (0,0,source.W,source.H) -> dst = (0,192,128,64).
+    ///   That is right only if the BLP is already a face-sized strip.
+    ///
+    ///   CharSections face textures are, for most race/gender combinations,
+    ///   FULL-CANVAS 256x256 overlays: a mostly-transparent sheet with the face
+    ///   detail already positioned where it belongs on the atlas. Squashing one
+    ///   of those into a 128x64 rectangle crushes the eyes into a couple of
+    ///   texels of smeared skin tone — which is exactly "the eyes are closed".
+    ///
+    ///   WoWee composites these as full-canvas layers (compositePlayerSkin
+    ///   stacks [bodySkin, faceLower, faceUpper, ...underwear] at 1:1).
+    ///   MSUIClient flagged this as the prime suspect but never confirmed it:
+    ///   "If SuperUI is squashing a full-canvas texture into a 128x64 rect,
+    ///   that is the eyes bug."
+    ///
+    /// THE FIX IS SELF-SELECTING
+    ///   The source tells us which kind it is. If it is atlas-sized, draw it
+    ///   1:1 over the whole canvas and let its own alpha place it. Otherwise it
+    ///   really is a strip, and the original rect-stretch is correct.
+    ///
+    ///   That means this cannot regress the combinations that already worked
+    ///   (Human Female and Troll Female rendered open eyes), because for those
+    ///   the branch taken is unchanged unless the source is genuinely
+    ///   full-canvas — in which case they were being squashed too and simply
+    ///   survived it better.
     /// </summary>
     private static void PaintRegion(SKBitmap canvas, SKBitmap source,
         int x, int y, int w, int h)
     {
         using var surface = new SKCanvas(canvas);
+        using var paint = new SKPaint { FilterQuality = SKFilterQuality.High };
+
+        bool fullCanvas = source.Width == canvas.Width && source.Height == canvas.Height;
+        if (fullCanvas)
+        {
+            // 1:1 overlay. The texture's own alpha decides where it lands; the
+            // region rectangle is not involved at all.
+            surface.DrawBitmap(source, 0, 0, paint);
+            return;
+        }
+
         var dst = new SKRect(x, y, x + w, y + h);
         var src = new SKRect(0, 0, source.Width, source.Height);
-        using var paint = new SKPaint { FilterQuality = SKFilterQuality.Low };
         surface.DrawBitmap(source, src, dst, paint);
     }
 

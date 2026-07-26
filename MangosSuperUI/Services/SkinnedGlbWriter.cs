@@ -78,7 +78,33 @@ public static class SkinnedGlbWriter
     /// don't animate during walk/run (only the hips, legs, arms, and
     /// spine have keyframes — fingers, jaw, eye bones are static).
     /// </summary>
-    public static readonly int[] DefaultAnimationsToBake = { 0, 4, 5 };
+    /// <remarks>
+    /// Extended 2026-07-26 for the world editor's walkable character.
+    ///
+    /// AnimationData.dbc ids (vanilla 1.12, verified against MSUIClient's table):
+    ///   0  Stand          4  Walk           5  Run
+    ///   13 WalkBackwards  37 JumpStart      38 Jump
+    ///   39 JumpEnd        40 Fall
+    ///
+    /// 13 lands first: vanilla has a DISTINCT backpedal speed (MOVE_RUN_BACK,
+    /// 4.5 yd/s) and playing Walk while moving backwards reads as moonwalking.
+    /// 37/38/39/40 are the jump chain, ready for when the controller grows
+    /// gravity in M5.
+    ///
+    /// NOT ADDED: 11/12 ShuffleLeft/ShuffleRight. There are no strafe clips on
+    /// land in vanilla — strafing reuses Walk/Run and rotates the torso. Baking
+    /// them would invite the wrong implementation.
+    ///
+    /// TRAP for whoever wires 37/39 up: M2Sequence's 0x20 flag is NOT a loop
+    /// flag. It reads CLEAR on Stand/Walk/Run, so trusting it makes every clip a
+    /// one-shot that clamps and holds. Real looping lives in the repetition
+    /// fields at +24/+28, which the reader skips. JumpStart(37) and JumpEnd(39)
+    /// are the only one-shots; everything else loops.
+    ///
+    /// Cache: SkinnedGlbVersion is derived from this assembly's MVID, so editing
+    /// this file regenerates every character GLB automatically. No manual bump.
+    /// </remarks>
+    public static readonly int[] DefaultAnimationsToBake = { 0, 4, 5, 13, 37, 38, 39, 40 };
 
     /// <summary>
     /// Backward-compatible entry point — bakes the default animation set.

@@ -33,6 +33,36 @@ public class WorldEditorController : Controller
     private readonly ConnectionFactory? _db;
     private readonly MpqReaderService? _mpqReader;
 
+    // ═══════════════════════════════════════════════════════════════
+    // M1.1 — TRUE 1:1 WORLD SCALE  (2026-07-26)
+    //
+    // Terrain Y used to be squashed into a "comfortable visual range":
+    //     globalHeightScale = min(3.5, 350 / heightRange)      // up to 3.5x
+    //     meshY             = (worldHeight - globalMidHeight) * globalHeightScale
+    //
+    // That left the world NON-UNIFORMLY SCALED: X and Z were true yards, Y was
+    // not. Gravity, step height, slope limits, eye height, WMO portal planes and
+    // every fog distance out of Light.dbc are meaningless on a scaled vertical
+    // axis, so the transform is now the identity: mesh Y IS the WoW world height
+    // (world Z), in yards, 1:1 with X and Z.
+    //
+    // X/Z are still TILE-LOCAL (centred on the preset's centre tile). Only the
+    // SCALE is normalised here, not the origin — making X/Z absolute world
+    // coordinates is a separate change with a much wider blast radius.
+    //
+    // The globalMidHeight / globalHeightScale query parameters are still ACCEPTED
+    // by the endpoints that used to take them, and ignored, so a browser holding
+    // a cached copy of the pre-M1.1 JS does not break. Drop the parameters once
+    // every client has reloaded.
+    // ═══════════════════════════════════════════════════════════════
+    public const float WORLD_HEIGHT_SCALE = 1.0f;
+    public const float WORLD_MID_HEIGHT = 0.0f;
+
+    // Legacy transform constants. Retained ONLY so rows written before M1.1
+    // (mesh-Y space) can be migrated to world height — see MigrateLegacyCoords.
+    private const float LEGACY_MAX_HEIGHT_SCALE = 3.5f;
+    private const float LEGACY_TARGET_RANGE = 350.0f;
+
     public WorldEditorController(IConfiguration config, ILogger<WorldEditorController> logger,
         ConnectionFactory? db = null, MpqReaderService? mpqReader = null)
     {
@@ -204,10 +234,9 @@ public class WorldEditorController : Controller
         if (parsed.Count == 0)
             return Json(new { success = false, error = "No map tiles found." });
 
-        // Global height transform — same for all tiles so they stitch
-        float globalMidHeight = (globalMin + globalMax) * 0.5f;
-        float globalHeightRange = globalMax - globalMin;
-        float globalHeightScale = globalHeightRange > 0 ? Math.Min(3.5f, 350.0f / globalHeightRange) : 3.5f;
+        // M1.1: no global height transform. Heights are emitted raw (world Z).
+        // globalMin/globalMax are still computed and returned so the client can
+        // frame the camera without guessing where the ground is.
 
         // Full tile = 128 cells wide → 128 * CELL_SIZE in mesh units
         float tileWidthMesh = 128 * VmangosMapParser.CELL_SIZE;
@@ -231,13 +260,14 @@ public class WorldEditorController : Controller
                 float origZ = tr.Positions[i * 3 + 2];
                 float origY = tr.Positions[i * 3 + 1];
 
-                // Undo the per-tile height transform, apply global
+                // Undo the parser's per-tile normalisation to recover true world height.
+                // M1.1: that raw world height IS the mesh Y — no global rescale.
                 float rawHeight = tr.HeightScale > 0
                     ? (origY / tr.HeightScale) + ((tr.MinHeight + tr.MaxHeight) * 0.5f)
                     : (tr.MinHeight + tr.MaxHeight) * 0.5f;
 
                 positions[i * 3 + 0] = origX + tileOffsetX;
-                positions[i * 3 + 1] = (rawHeight - globalMidHeight) * globalHeightScale;
+                positions[i * 3 + 1] = rawHeight;
                 positions[i * 3 + 2] = origZ + tileOffsetZ;
             }
 
@@ -247,6 +277,7 @@ public class WorldEditorController : Controller
             int gxTile = p.gridX + dy;
             int gyTile = p.gridY + dx;
             int[]? tileHoles = null;
+            string? tileNormals = null;
             if (!string.IsNullOrEmpty(clientDataPath))
             {
                 try
@@ -258,8 +289,9 @@ public class WorldEditorController : Controller
                         for (int ci = 0; ci < adt.Chunks.Length && ci < 256; ci++)
                             tileHoles[ci] = adt.Chunks[ci].Holes;
                     }
+                    tileNormals = BuildTileNormalsBase64(adt);
                 }
-                catch { /* ADT not available — no holes */ }
+                catch { /* ADT not available — no holes, no normals */ }
             }
 
             tiles.Add(new
@@ -274,7 +306,8 @@ public class WorldEditorController : Controller
                 vertsHeight = vertsH,
                 chunksWidth = tr.ChunksWidth,
                 chunksHeight = tr.ChunksHeight,
-                holes = tileHoles
+                holes = tileHoles,
+                normalsBase64 = tileNormals
             });
         }
 
@@ -285,8 +318,12 @@ public class WorldEditorController : Controller
             label = p.label,
             mapId = p.mapId,
             tileCount = tiles.Count,
-            heightScale = globalHeightScale,
-            midHeight = globalMidHeight,
+            // Back-compat: pre-M1.1 clients multiply by these. Identity now.
+            heightScale = WORLD_HEIGHT_SCALE,
+            midHeight = WORLD_MID_HEIGHT,
+            // M1.1: real world-height range of the loaded tiles, for camera framing.
+            minHeight = globalMin,
+            maxHeight = globalMax,
             tileWidthMesh,
             tiles
         });
@@ -353,30 +390,15 @@ public class WorldEditorController : Controller
         if (string.IsNullOrEmpty(clientDataPath))
             return Json(new { success = false, error = "Client data path not configured." });
 
-        string mapsDir = GetMapsDirectory();
         tileRadius = Math.Clamp(tileRadius, 0, 1);
         const int cx = 8, cy = 8, radius = 8;
         float tileWidthMesh = 128 * VmangosMapParser.CELL_SIZE;
 
-        // Global height range (same calc as Heightmap)
-        float globalMin = float.MaxValue, globalMax = float.MinValue;
-        for (int dy = -tileRadius; dy <= tileRadius; dy++)
-        {
-            for (int dx = -tileRadius; dx <= tileRadius; dx++)
-            {
-                int gx = p.gridX + dy;
-                int gy = p.gridY + dx;
-                string mp = Path.Combine(mapsDir, VmangosMapParser.BuildFilename(p.mapId, gx, gy));
-                if (!System.IO.File.Exists(mp)) continue;
-                var tr = VmangosMapParser.Parse(mp, cx, cy, radius);
-                if (tr == null) continue;
-                if (tr.MinHeight < globalMin) globalMin = tr.MinHeight;
-                if (tr.MaxHeight > globalMax) globalMax = tr.MaxHeight;
-            }
-        }
-        float globalMidHeight = (globalMin + globalMax) * 0.5f;
-        float globalHeightRange = globalMax - globalMin;
-        float globalHeightScale = globalHeightRange > 0 ? Math.Min(3.5f, 350.0f / globalHeightRange) : 3.5f;
+        // M1.1: identity height transform — see WORLD_HEIGHT_SCALE. The 3x3
+        // min/max scan that used to run here (9 full .map parses per request,
+        // purely to derive a scale factor) is deleted.
+        const float globalMidHeight = WORLD_MID_HEIGHT;
+        const float globalHeightScale = WORLD_HEIGHT_SCALE;
 
         var allDoodads = new List<object>();
         var allWmos = new List<object>();
@@ -430,13 +452,13 @@ public class WorldEditorController : Controller
                         {
                             model = w.ModelPath,
                             x = offsetX + (col - v9StartX) * AdtTerrainReader.CELL_SIZE + tileOffX,
-                            y = (w.PosY - globalMidHeight) * globalHeightScale,
+                            y = w.PosY,
                             z = offsetZ + (row - v9StartY) * AdtTerrainReader.CELL_SIZE + tileOffZ,
                             rotX = w.RotX,
                             rotY = w.RotY,
                             rotZ = w.RotZ,
                             sizeX = Math.Abs(w.BbMaxX - w.BbMinX) * AdtTerrainReader.CELL_SIZE / AdtTerrainReader.GRID_SIZE * 128,
-                            sizeY = Math.Abs(w.BbMaxY - w.BbMinY) * globalHeightScale,
+                            sizeY = Math.Abs(w.BbMaxY - w.BbMinY),
                             sizeZ = Math.Abs(w.BbMaxZ - w.BbMinZ) * AdtTerrainReader.CELL_SIZE / AdtTerrainReader.GRID_SIZE * 128
                         });
                     }
@@ -465,6 +487,18 @@ public class WorldEditorController : Controller
     private static readonly Dictionary<string, object?> _doodadModelCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object _doodadModelCacheLock = new();
 
+    /// <summary>
+    /// Rewrite a model path's extension to what actually lives in the MPQ.
+    /// .mdx and .mdl are both authoring-era names for the same .m2 asset.
+    /// </summary>
+    private static string ResolveModelExtension(string path)
+    {
+        if (path.EndsWith(".mdx", StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
+            return path[..^4] + ".m2";
+        return path;
+    }
+
     [HttpGet]
     public IActionResult DoodadModel(string? path)
     {
@@ -482,9 +516,14 @@ public class WorldEditorController : Controller
 
         try
         {
-            string mpqPath = path;
-            if (mpqPath.EndsWith(".mdx", StringComparison.OrdinalIgnoreCase))
-                mpqPath = mpqPath[..^4] + ".m2";
+            // MDDF and the WMO MODN name blob both store MODEL paths with the
+            // Warcraft-3-era extensions .mdx and .mdl; the files in the MPQ are
+            // .m2. Only .mdx was rewritten here, so every .mdl-referenced doodad
+            // 404'd and silently vanished from the scene — kobold camp props,
+            // volumetric light shafts, spider webs, lanterns, mine carts.
+            // (Client-side these are negative-cached after one miss, so it was a
+            // one-off 404 per model, not a retry loop — just a lot of them.)
+            string mpqPath = ResolveModelExtension(path);
 
             byte[]? m2Data = AdtTerrainReader.ReadFileFromMpqs(clientDataPath, mpqPath)
                           ?? AdtTerrainReader.ReadFileFromMpqs(clientDataPath, path);
@@ -1111,7 +1150,195 @@ public class WorldEditorController : Controller
         ALTER TABLE custom_wmo_placements
             ADD COLUMN IF NOT EXISTS go_entry INT DEFAULT NULL,
             ADD COLUMN IF NOT EXISTS go_guid INT DEFAULT NULL,
-            ADD COLUMN IF NOT EXISTS committed TINYINT NOT NULL DEFAULT 0;";
+            ADD COLUMN IF NOT EXISTS committed TINYINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS coord_version TINYINT NOT NULL DEFAULT 1;";
+
+    private const string ALTER_SCULPTS_ADD_COLS = @"
+        ALTER TABLE custom_terrain_sculpts
+            ADD COLUMN IF NOT EXISTS coord_version TINYINT NOT NULL DEFAULT 1;";
+
+    // ═══════════════════════════════════════════════════════════════
+    // M1.1 COORDINATE MIGRATION
+    //
+    // custom_wmo_placements.mesh_y and custom_terrain_sculpts.delta_y were
+    // written in the old squashed mesh-Y space:
+    //     meshY = (worldHeight - legacyMid) * legacyScale
+    // Post-M1.1 they hold true world height. Rows written before the change
+    // carry coord_version = 1 and are converted in place, once:
+    //     mesh_y  →  mesh_y / legacyScale + legacyMid
+    //     delta_y →  delta_y / legacyScale          (a delta has no offset)
+    //
+    // legacyScale/legacyMid are recomputed from the preset's own 3x3 .map
+    // block exactly as the pre-M1.1 code did, so the conversion is exact.
+    // Idempotent: rows are stamped coord_version = 2 in the same statement.
+    // ═══════════════════════════════════════════════════════════════
+    private const byte COORD_VERSION_WORLD = 2;
+    private static bool _coordsMigrated;
+    // Re-entrancy guard. C# `lock` is re-entrant on the same thread, so the
+    // lock below does NOT prevent recursion — this does. See the incident note
+    // on MigrateLegacyCoords.
+    [ThreadStatic] private static bool _coordMigrationRunning;
+    private static int _coordMigrationAttempts;
+    private const int COORD_MIGRATION_MAX_ATTEMPTS = 3;
+    private static readonly object _coordMigrationLock = new();
+
+    /// <summary>
+    /// Recompute the pre-M1.1 (scale, mid) pair for a preset's 3x3 .map block.
+    /// Returns false if no .map files are readable, in which case the rows are
+    /// left alone rather than corrupted with a guessed transform.
+    /// </summary>
+    private bool TryGetLegacyHeightTransform(int mapId, int gridX, int gridY,
+        out float legacyScale, out float legacyMid)
+    {
+        legacyScale = 0; legacyMid = 0;
+        string mapsDir = GetMapsDirectory();
+        if (string.IsNullOrEmpty(mapsDir)) return false;
+
+        float gMin = float.MaxValue, gMax = float.MinValue;
+        bool any = false;
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                string mp = Path.Combine(mapsDir,
+                    VmangosMapParser.BuildFilename(mapId, gridX + dy, gridY + dx));
+                // The legacy transform was derived from vanilla heights where a
+                // backup exists — match that, or the conversion drifts on sculpted tiles.
+                string vp = mp + ".vanilla";
+                string sp = System.IO.File.Exists(vp) ? vp : mp;
+                if (!System.IO.File.Exists(sp)) continue;
+                var tr = VmangosMapParser.Parse(sp, 8, 8, 8);
+                if (tr == null) continue;
+                any = true;
+                if (tr.MinHeight < gMin) gMin = tr.MinHeight;
+                if (tr.MaxHeight > gMax) gMax = tr.MaxHeight;
+            }
+        }
+        if (!any) return false;
+
+        legacyMid = (gMin + gMax) * 0.5f;
+        float range = gMax - gMin;
+        legacyScale = range > 0
+            ? Math.Min(LEGACY_MAX_HEIGHT_SCALE, LEGACY_TARGET_RANGE / range)
+            : LEGACY_MAX_HEIGHT_SCALE;
+        return legacyScale > 0;
+    }
+
+    /// <summary>
+    /// One-shot, idempotent conversion of pre-M1.1 rows to world-height space.
+    /// Safe to call on every request; does real work at most once per process
+    /// and at most once per row ever.
+    /// </summary>
+    private void MigrateLegacyCoords(System.Data.IDbConnection conn)
+    {
+        if (_coordsMigrated) return;
+        if (_coordMigrationRunning) return;   // re-entrancy guard — see field comment
+
+        // Kill switch. Set "WorldEditor:SkipCoordMigration": true in
+        // appsettings to disable this entirely — pre-M1.1 placements will then
+        // read at the wrong height, but the editor comes up.
+        if (_config.GetValue<bool>("WorldEditor:SkipCoordMigration"))
+        {
+            _coordsMigrated = true;
+            _logger.LogInformation("M1.1 coord migration: SKIPPED by config.");
+            return;
+        }
+
+        lock (_coordMigrationLock)
+        {
+            if (_coordsMigrated) return;
+            if (_coordMigrationAttempts >= COORD_MIGRATION_MAX_ATTEMPTS)
+            {
+                // Stop retrying on every request. Whatever is wrong is not
+                // transient, and re-parsing .map tiles per request is expensive.
+                _coordsMigrated = true;
+                _logger.LogWarning("M1.1 coord migration: giving up after {N} attempts.",
+                    _coordMigrationAttempts);
+                return;
+            }
+            _coordMigrationAttempts++;
+            _coordMigrationRunning = true;
+
+            // Logged BEFORE any work so that if the process dies during the
+            // migration, the journal shows it started and never finished.
+            _logger.LogInformation("M1.1 coord migration: START (attempt {N}).",
+                _coordMigrationAttempts);
+            try
+            {
+                conn.Execute(CREATE_PLACEMENTS_TABLE);
+                try { conn.Execute(ALTER_PLACEMENTS_ADD_COLS); } catch { }
+                conn.Execute(CREATE_SCULPT_TABLE);
+                try { conn.Execute(ALTER_SCULPTS_ADD_COLS); } catch { }
+
+                var presets = conn.Query<string>(
+                    @"SELECT preset FROM custom_wmo_placements WHERE coord_version < @V
+                      UNION
+                      SELECT preset FROM custom_terrain_sculpts WHERE coord_version < @V",
+                    new { V = COORD_VERSION_WORLD }).ToList();
+
+                if (presets.Count == 0)
+                {
+                    _coordsMigrated = true;
+                    _logger.LogInformation("M1.1 coord migration: nothing to convert.");
+                    return;
+                }
+                _logger.LogInformation("M1.1 coord migration: {N} preset(s) to convert: {Presets}",
+                    presets.Count, string.Join(", ", presets));
+
+                foreach (var presetKey in presets)
+                {
+                    if (!TryResolvePreset(presetKey, out var p, out var perr))
+                    {
+                        _logger.LogWarning(
+                            "M1.1 coord migration: SKIPPED preset '{Preset}' — {Error}. " +
+                            "Its rows keep coord_version=1 and will be retried.", presetKey, perr);
+                        continue;
+                    }
+                    if (!TryGetLegacyHeightTransform(p.mapId, p.gridX, p.gridY,
+                                                     out float lScale, out float lMid))
+                    {
+                        _logger.LogWarning(
+                            "M1.1 coord migration: SKIPPED preset '{Preset}' — no readable .map " +
+                            "tiles at ({GX},{GY}), cannot recover the legacy transform.",
+                            presetKey, p.gridX, p.gridY);
+                        continue;
+                    }
+
+                    int nPlace = conn.Execute(
+                        @"UPDATE custom_wmo_placements
+                          SET mesh_y = mesh_y / @Scale + @Mid, coord_version = @V
+                          WHERE preset = @Preset AND coord_version < @V",
+                        new { Scale = lScale, Mid = lMid, V = COORD_VERSION_WORLD, Preset = presetKey });
+
+                    int nSculpt = conn.Execute(
+                        @"UPDATE custom_terrain_sculpts
+                          SET delta_y = delta_y / @Scale, coord_version = @V
+                          WHERE preset = @Preset AND coord_version < @V",
+                        new { Scale = lScale, V = COORD_VERSION_WORLD, Preset = presetKey });
+
+                    _logger.LogInformation(
+                        "M1.1 coord migration: preset '{Preset}' legacyScale={Scale:F6} legacyMid={Mid:F4} " +
+                        "→ {NPlace} placement(s), {NSculpt} sculpt vertex/vertices converted to world height.",
+                        presetKey, lScale, lMid, nPlace, nSculpt);
+                }
+
+                _coordsMigrated = true;
+                _logger.LogInformation("M1.1 coord migration: DONE.");
+            }
+            catch (Exception ex)
+            {
+                // Never block the request, and never take the process down.
+                _logger.LogWarning(ex,
+                    "M1.1 coord migration: FAILED (attempt {N} of {Max}) — the editor " +
+                    "still works; pre-M1.1 placements may sit at the wrong height.",
+                    _coordMigrationAttempts, COORD_MIGRATION_MAX_ATTEMPTS);
+            }
+            finally
+            {
+                _coordMigrationRunning = false;
+            }
+        }
+    }
 
     [HttpPost]
     public IActionResult SavePlacement([FromBody] WmoPlacementDto dto)
@@ -1128,6 +1355,7 @@ public class WorldEditorController : Controller
             // Ensure table exists (and has new columns if upgraded)
             conn.Execute(CREATE_PLACEMENTS_TABLE);
             try { conn.Execute(ALTER_PLACEMENTS_ADD_COLS); } catch { /* columns already exist */ }
+            MigrateLegacyCoords(conn);
 
             int id;
             bool patchRebuilt = false;
@@ -1137,9 +1365,9 @@ public class WorldEditorController : Controller
                 conn.Execute(@"
                     UPDATE custom_wmo_placements
                     SET mesh_x = @MeshX, mesh_y = @MeshY, mesh_z = @MeshZ,
-                        rot_y = @RotY, scale_val = @Scale
+                        rot_y = @RotY, scale_val = @Scale, coord_version = @CoordV
                     WHERE id = @Id",
-                    new { dto.MeshX, dto.MeshY, dto.MeshZ, dto.RotY, Scale = dto.Scale, Id = dto.Id.Value });
+                    new { dto.MeshX, dto.MeshY, dto.MeshZ, dto.RotY, Scale = dto.Scale, Id = dto.Id.Value, CoordV = COORD_VERSION_WORLD });
                 id = dto.Id.Value;
 
                 // If this placement is committed, the patch-Z.MPQ has stale
@@ -1157,10 +1385,10 @@ public class WorldEditorController : Controller
             {
                 // INSERT new placement
                 id = conn.ExecuteScalar<int>(@"
-                    INSERT INTO custom_wmo_placements (preset, map_id, wmo_path, wmo_name, mesh_x, mesh_y, mesh_z, rot_y, scale_val)
-                    VALUES (@Preset, @MapId, @WmoPath, @WmoName, @MeshX, @MeshY, @MeshZ, @RotY, @Scale);
+                    INSERT INTO custom_wmo_placements (preset, map_id, wmo_path, wmo_name, mesh_x, mesh_y, mesh_z, rot_y, scale_val, coord_version)
+                    VALUES (@Preset, @MapId, @WmoPath, @WmoName, @MeshX, @MeshY, @MeshZ, @RotY, @Scale, @CoordV);
                     SELECT LAST_INSERT_ID();",
-                    new { dto.Preset, MapId = dto.MapId, dto.WmoPath, WmoName = dto.WmoName ?? "", dto.MeshX, dto.MeshY, dto.MeshZ, dto.RotY, Scale = dto.Scale });
+                    new { dto.Preset, MapId = dto.MapId, dto.WmoPath, WmoName = dto.WmoName ?? "", dto.MeshX, dto.MeshY, dto.MeshZ, dto.RotY, Scale = dto.Scale, CoordV = COORD_VERSION_WORLD });
             }
 
             _logger.LogInformation("SavePlacement: Saved WMO {Name} at ({X},{Y},{Z}) for preset {Preset}, id={Id}",
@@ -1188,6 +1416,7 @@ public class WorldEditorController : Controller
 
             // Ensure table exists (first load might precede any save)
             conn.Execute(CREATE_PLACEMENTS_TABLE);
+            MigrateLegacyCoords(conn);
 
             var rows = conn.Query(@"
                 SELECT id, preset, map_id AS mapId, wmo_path AS wmoPath, wmo_name AS wmoName,
@@ -1382,7 +1611,7 @@ public class WorldEditorController : Controller
     //
     // Coordinate transform (mesh → MODF):
     //   modfPosX = (meshX / (128 * CELL_SIZE) + 0.5 + gridY) * GRID_SIZE
-    //   modfPosY = meshY / heightScale + midHeight
+    //   modfPosY = meshY                      (M1.1 — mesh Y IS world height)
     //   modfPosZ = (meshZ / (128 * CELL_SIZE) + 0.5 + gridX) * GRID_SIZE
 
     [HttpPost]
@@ -1756,6 +1985,7 @@ public class WorldEditorController : Controller
             vertex_index INT NOT NULL,
             delta_y      FLOAT NOT NULL,
             committed    TINYINT NOT NULL DEFAULT 0,
+            coord_version TINYINT NOT NULL DEFAULT 1,
             created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             UNIQUE KEY uq_tile_vertex (preset, tile_grid_x, tile_grid_y, vertex_index),
@@ -1803,6 +2033,7 @@ public class WorldEditorController : Controller
             using var conn = _db.Admin();
             conn.Open();
             conn.Execute(CREATE_SCULPT_TABLE);
+            MigrateLegacyCoords(conn);
 
             // Batch upsert deltas
             int upserted = 0;
@@ -1812,16 +2043,17 @@ public class WorldEditorController : Controller
                 float delta = kv.Value;
 
                 conn.Execute(@"
-                    INSERT INTO custom_terrain_sculpts (preset, tile_grid_x, tile_grid_y, vertex_index, delta_y)
-                    VALUES (@Preset, @GridX, @GridY, @VertIdx, @Delta)
-                    ON DUPLICATE KEY UPDATE delta_y = delta_y + @Delta, updated_at = CURRENT_TIMESTAMP",
+                    INSERT INTO custom_terrain_sculpts (preset, tile_grid_x, tile_grid_y, vertex_index, delta_y, coord_version)
+                    VALUES (@Preset, @GridX, @GridY, @VertIdx, @Delta, @CoordV)
+                    ON DUPLICATE KEY UPDATE delta_y = delta_y + @Delta, coord_version = @CoordV, updated_at = CURRENT_TIMESTAMP",
                     new
                     {
                         Preset = request.Preset,
                         GridX = request.TileGridX,
                         GridY = request.TileGridY,
                         VertIdx = vertexIndex,
-                        Delta = delta
+                        Delta = delta,
+                        CoordV = COORD_VERSION_WORLD
                     });
                 upserted++;
             }
@@ -1861,34 +2093,15 @@ public class WorldEditorController : Controller
                 "CommitSculptedTerrain: preset={Preset} tile=({GX},{GY})",
                 request.Preset, gridX, gridY);
 
-            // ── Compute global height scale (same as Heightmap endpoint) ──
-            // Needed to convert mesh-Y deltas to world-height deltas.
+            // M1.1: mesh Y IS world height, so DB sculpt deltas need no conversion.
+            // The 3x3 .map scan that used to derive a mesh-Y→world scale is gone.
             string mapsDir = GetMapsDirectory();
-            float gMin = float.MaxValue, gMax = float.MinValue;
-            for (int dy = -1; dy <= 1; dy++)
-            {
-                for (int dx = -1; dx <= 1; dx++)
-                {
-                    int gx2 = p.gridX + dy, gy2 = p.gridY + dx;
-                    string mp2 = Path.Combine(mapsDir, VmangosMapParser.BuildFilename(p.mapId, gx2, gy2));
-                    // For height range, use vanilla backup if it exists
-                    string vp2 = mp2 + ".vanilla";
-                    string sp2 = System.IO.File.Exists(vp2) ? vp2 : mp2;
-                    if (!System.IO.File.Exists(sp2)) continue;
-                    var tr2 = VmangosMapParser.Parse(sp2, 8, 8, 8);
-                    if (tr2 == null) continue;
-                    if (tr2.MinHeight < gMin) gMin = tr2.MinHeight;
-                    if (tr2.MaxHeight > gMax) gMax = tr2.MaxHeight;
-                }
-            }
-            float globalMid = (gMin + gMax) * 0.5f;
-            float globalRange = gMax - gMin;
-            float globalScale = globalRange > 0 ? Math.Min(3.5f, 350.0f / globalRange) : 3.5f;
 
             // ── Load sculpt deltas from DB ──
             using var dbConn = _db.Admin();
             dbConn.Open();
             dbConn.Execute(CREATE_SCULPT_TABLE);
+            MigrateLegacyCoords(dbConn);
 
             var deltas = dbConn.Query(
                 @"SELECT vertex_index, delta_y FROM custom_terrain_sculpts
@@ -1901,24 +2114,19 @@ public class WorldEditorController : Controller
                 return Json(new { success = false, error = "No sculpt data found in database for this tile" });
             }
 
-            // Convert mesh-Y deltas to world-height deltas (= MCVT deltas).
-            // meshY = (worldH - globalMid) * globalScale
-            // so deltaWorldH = deltaMeshY / globalScale
-            // MCVT stores worldH - baseHeight, so deltaMCVT = deltaWorldH
+            // M1.1: mesh Y IS world height, so a mesh-Y delta IS a world-height
+            // delta. MCVT stores worldH - baseHeight, so deltaMCVT = deltaWorldH.
+            // (Rows written before M1.1 are rescaled by MigrateLegacyCoords.)
             var worldDeltas = new Dictionary<int, float>();
             foreach (var d in deltas)
             {
                 int vi = (int)d.vertex_index;
-                float deltaInMeshY = (float)d.delta_y;
-                float deltaWorld = globalScale != 0 ? deltaInMeshY / globalScale : 0;
-                worldDeltas[vi] = deltaWorld;
+                worldDeltas[vi] = (float)d.delta_y;
             }
 
             _logger.LogInformation(
-                "CommitSculptedTerrain: {Count} DB deltas, globalScale={Scale:F4}, globalMid={Mid:F2}, sample delta[0]: meshY={MeshY:F4} → world={World:F4}",
-                deltas.Count, globalScale, globalMid,
-                deltas.Count > 0 ? (float)deltas[0].delta_y : 0f,
-                deltas.Count > 0 ? (worldDeltas.Values.First()) : 0f);
+                "CommitSculptedTerrain: {Count} DB deltas (1:1 world height), sample delta[0]={Delta:F4}",
+                deltas.Count, deltas.Count > 0 ? (float)deltas[0].delta_y : 0f);
 
             // ── Read original ADT ──
             string clientDataPath = GetClientDataDirectory();
@@ -2002,7 +2210,7 @@ public class WorldEditorController : Controller
                         string wmoPath = ((string)row.wmoPath).Replace('/', '\\');
 
                         float modfPosX = (meshX / (128f * cellSz) + 0.5f + p.gridY) * gridSz;
-                        float modfPosY = meshY / globalScale + globalMid;
+                        float modfPosY = meshY; // M1.1
                         float modfPosZ = (meshZ / (128f * cellSz) + 0.5f + p.gridX) * gridSz;
 
                         float bbExtent = 50f;
@@ -2182,6 +2390,7 @@ public class WorldEditorController : Controller
             using var conn = _db.Admin();
             conn.Open();
             conn.Execute(CREATE_SCULPT_TABLE);
+            MigrateLegacyCoords(conn);
 
             int totalRows = conn.ExecuteScalar<int>(
                 "SELECT COUNT(*) FROM custom_terrain_sculpts WHERE preset = @Preset",
@@ -2221,6 +2430,7 @@ public class WorldEditorController : Controller
                 using var conn = _db.Admin();
                 conn.Open();
                 conn.Execute(CREATE_SCULPT_TABLE);
+                MigrateLegacyCoords(conn);
                 deletedRows = conn.Execute(
                     "DELETE FROM custom_terrain_sculpts WHERE preset = @Preset",
                     new { Preset = dto.Preset });
@@ -3012,41 +3222,16 @@ public class WorldEditorController : Controller
                         "RebuildPatchMpq: applying {Count} sculpt vertex deltas before MODF patching",
                         sculptRows.Count);
 
-                    // Compute global height scale to convert mesh-Y deltas to world-height deltas
-                    string mapsDir0 = GetMapsDirectory();
-                    float sMin = float.MaxValue, sMax = float.MinValue;
-                    for (int sdy = -1; sdy <= 1; sdy++)
-                    {
-                        for (int sdx = -1; sdx <= 1; sdx++)
-                        {
-                            int sgx = p.gridX + sdy, sgy = p.gridY + sdx;
-                            string smp = Path.Combine(mapsDir0, VmangosMapParser.BuildFilename(p.mapId, sgx, sgy));
-                            string svp = smp + ".vanilla";
-                            string ssp = System.IO.File.Exists(svp) ? svp : smp;
-                            if (!System.IO.File.Exists(ssp)) continue;
-                            var str = VmangosMapParser.Parse(ssp, 8, 8, 8);
-                            if (str == null) continue;
-                            if (str.MinHeight < sMin) sMin = str.MinHeight;
-                            if (str.MaxHeight > sMax) sMax = str.MaxHeight;
-                        }
-                    }
-                    float sMid = (sMin + sMax) * 0.5f;
-                    float sRange = sMax - sMin;
-                    float sScale = sRange > 0 ? Math.Min(3.5f, 350.0f / sRange) : 3.5f;
-
-                    // Convert DB deltas to world-height deltas and apply via PatchMcvtDeltas
+                    // M1.1: DB deltas are already world-height deltas — the 3x3
+                    // .map scan that used to derive a conversion scale is deleted.
                     var sculptDeltas = new Dictionary<int, float>();
                     foreach (var sr in sculptRows)
-                    {
-                        int vi = (int)sr.vertexIndex;
-                        float meshDelta = (float)sr.deltaY;
-                        sculptDeltas[vi] = sScale != 0 ? meshDelta / sScale : 0;
-                    }
+                        sculptDeltas[(int)sr.vertexIndex] = (float)sr.deltaY;
 
                     originalAdt = PatchMcvtDeltas(originalAdt, sculptDeltas);
                     _logger.LogInformation(
-                        "RebuildPatchMpq: applied {Count} sculpt MCVT deltas (globalScale={Scale:F4})",
-                        sculptDeltas.Count, sScale);
+                        "RebuildPatchMpq: applied {Count} sculpt MCVT deltas (1:1 world height)",
+                        sculptDeltas.Count);
                 }
             }
             catch (Exception ex)
@@ -3054,29 +3239,9 @@ public class WorldEditorController : Controller
                 _logger.LogWarning(ex, "RebuildPatchMpq: sculpt MCVT patching failed — proceeding with MODF only");
             }
 
-            // Load height data for coordinate transform
-            // MUST use same multi-tile loop as Heightmap endpoint (tileRadius=1 → 3×3 grid)
-            string mapsDir = GetMapsDirectory();
-            float globalMin = float.MaxValue, globalMax = float.MinValue;
-            int commitTileRadius = 1;
-            for (int dy = -commitTileRadius; dy <= commitTileRadius; dy++)
-            {
-                for (int dx = -commitTileRadius; dx <= commitTileRadius; dx++)
-                {
-                    int gx = p.gridX + dy;
-                    int gy = p.gridY + dx;
-                    string mp = Path.Combine(mapsDir, VmangosMapParser.BuildFilename(p.mapId, gx, gy));
-                    if (!System.IO.File.Exists(mp)) continue;
-                    var tr = VmangosMapParser.Parse(mp, 8, 8, 8);
-                    if (tr == null) continue;
-                    if (tr.MinHeight < globalMin) globalMin = tr.MinHeight;
-                    if (tr.MaxHeight > globalMax) globalMax = tr.MaxHeight;
-                }
-            }
-            float globalMidHeight = (globalMin + globalMax) * 0.5f;
-            float globalHeightRange = globalMax - globalMin;
-            float globalHeightScale = globalHeightRange > 0 ? Math.Min(3.5f, 350.0f / globalHeightRange) : 3.5f;
-
+            // M1.1: mesh Y IS world height, so the reverse transform for the
+            // vertical axis is the identity and the 3x3 height scan that used to
+            // derive globalMidHeight/globalHeightScale is gone.
             float cellSize = AdtTerrainReader.CELL_SIZE;
             float gridSize = AdtTerrainReader.GRID_SIZE;
 
@@ -3090,7 +3255,7 @@ public class WorldEditorController : Controller
                 string wmoPath = ((string)row.wmoPath).Replace('/', '\\');
 
                 float modfPosX = (meshX / (128f * cellSize) + 0.5f + p.gridY) * gridSize;
-                float modfPosY = meshY / globalHeightScale + globalMidHeight;
+                float modfPosY = meshY; // M1.1
                 float modfPosZ = (meshZ / (128f * cellSize) + 0.5f + p.gridX) * gridSize;
 
                 // Read WMO bounding box for MODF entry
@@ -3480,6 +3645,744 @@ public class WorldEditorController : Controller
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // TERRAIN SPLAT — the tileset, per-chunk layer indices and the alpha
+    // atlas, so the BROWSER can do vanilla's 4-layer blend instead of
+    // receiving one pre-baked composite.
+    //
+    // WHY THIS EXISTS
+    //   BuildCompositeTexture flattens MTEX + MCLY + MCAL into a single image
+    //   stretched across a 533-yard tile. At the default 128 pixels-per-chunk
+    //   that is 2048 texels over 533 yards — 0.26 yards per texel. Underfoot you
+    //   are magnifying one texel across a quarter of a yard, which is the
+    //   out-of-focus ground everyone notices immediately.
+    //
+    //   MSUIClient does what the real client does: keeps the layers separate and
+    //   REPEATS each one ~8 times per 33.3-yard chunk. A 256x256 tileset texture
+    //   at 8 repeats per chunk is ~61 texels per yard — roughly 16x the detail,
+    //   from the same source data, because nothing is resampled.
+    //
+    // THE FORMAT (ported from MSUIClient World/TerrainTextures.cs)
+    //   - Every MTEX texture becomes one layer of a 2D array texture. Array
+    //     textures demand uniform dimensions, so anything not matching the first
+    //     decoded size is dropped and reported rather than silently stretched.
+    //   - Each of the 256 MCNK chunks picks up to 4 of them (MCLY). Layer 0 is
+    //     the base and has NO alpha map — it shows wherever the others do not
+    //     cover it.
+    //   - Layers 1..3 carry 64x64 alpha masks (MCAL). All 256 chunks pack into
+    //     one 1024x1024 RGBA atlas: R = layer 1, G = layer 2, B = layer 3.
+    //
+    //   ParseMcal already normalises every MCAL encoding to 64x64 stride-64, so
+    //   this is a straight copy.
+    //
+    // ALPHA ORIENTATION IS UNVERIFIED UPSTREAM TOO
+    //   MSUIClient carries a TransposeAlpha switch because whether the within-
+    //   chunk alpha X axis runs north-south or east-west was never pinned down.
+    //   Its current setting is FALSE (verified in-client). The same switch is
+    //   exposed here as ?transposeAlpha=true. If the ground shows the right
+    //   materials in the WRONG PLACES, that is the switch — not the UVs.
+    // ═══════════════════════════════════════════════════════════════
+
+    public const int SPLAT_ALPHA_SIZE = 64;
+    public const int SPLAT_CHUNKS_PER_SIDE = 16;
+    public const int SPLAT_ATLAS_SIZE = SPLAT_CHUNKS_PER_SIDE * SPLAT_ALPHA_SIZE;  // 1024
+
+    private static readonly Dictionary<string, object?> _splatCache = new();
+    private static readonly object _splatCacheLock = new();
+
+    [HttpGet]
+    public IActionResult TerrainSplat(string? preset, int tileGridX = -1, int tileGridY = -1,
+        bool transposeAlpha = false)
+    {
+        if (!TryResolvePreset(preset, out var p, out var error))
+            return Json(new { success = false, error });
+
+        int gx = tileGridX >= 0 ? tileGridX : p.gridX;
+        int gy = tileGridY >= 0 ? tileGridY : p.gridY;
+
+        string cacheKey = $"{p.mapId}_{gx}_{gy}_{(transposeAlpha ? 1 : 0)}";
+        lock (_splatCacheLock)
+        {
+            if (_splatCache.TryGetValue(cacheKey, out var hit))
+                return hit == null ? Json(new { success = false, error = "No ADT" }) : Json(hit);
+        }
+
+        string clientDataPath = GetClientDataDirectory();
+        if (string.IsNullOrEmpty(clientDataPath))
+            return Json(new { success = false, error = "Client data path not configured." });
+
+        try
+        {
+            var adt = AdtTerrainReader.ReadFromMpq(clientDataPath, MapIdToName(p.mapId), gx, gy);
+            if (adt == null)
+            {
+                lock (_splatCacheLock) { _splatCache[cacheKey] = null; }
+                return Json(new { success = false, error = $"ADT not found for ({gx},{gy})" });
+            }
+
+            // ── Tileset: MTEX -> array layers, uniform size only ──────────────
+            var names = adt.Textures ?? new List<string>();
+            var keptNames = new List<string>();
+            var keptPng = new List<string>();
+            var remap = new Dictionary<int, int>();      // MTEX index -> array layer
+            var notes = new List<string>();
+            int expectW = 0, expectH = 0;
+
+            for (int i = 0; i < names.Count; i++)
+            {
+                var decoded = AdtTerrainReader.ReadBlpPixels(clientDataPath, names[i]);
+                if (decoded == null) { notes.Add($"missing: {names[i]}"); continue; }
+                var (bgra, w, h) = decoded.Value;
+
+                if (expectW == 0) { expectW = w; expectH = h; }
+                else if (w != expectW || h != expectH)
+                {
+                    // Vanilla tilesets are uniformly 256x256; anything else is an
+                    // oddity worth surfacing rather than silently resampling.
+                    notes.Add($"size mismatch {names[i]} {w}x{h} != {expectW}x{expectH}");
+                    continue;
+                }
+
+                byte[]? png = BgraToPng(bgra, w, h);
+                if (png == null) { notes.Add($"encode failed: {names[i]}"); continue; }
+
+                remap[i] = keptPng.Count;
+                keptPng.Add(Convert.ToBase64String(png));
+                keptNames.Add(names[i]);
+            }
+
+            // ── Per-chunk layer indices + packed alpha atlas ───────────────────
+            var chunkLayers = new int[SPLAT_CHUNKS_PER_SIDE * SPLAT_CHUNKS_PER_SIDE * 4];
+            for (int i = 0; i < chunkLayers.Length; i++) chunkLayers[i] = -1;
+
+            var atlas = new byte[SPLAT_ATLAS_SIZE * SPLAT_ATLAS_SIZE * 4];
+            // Alpha 255 everywhere would make every overlay fully cover the base;
+            // 0 is "show what is underneath", which is the correct default.
+            for (int i = 3; i < atlas.Length; i += 4) atlas[i] = 255;   // opaque A
+
+            if (adt.Chunks != null)
+            {
+                foreach (var chunk in adt.Chunks)
+                {
+                    if (chunk?.Layers == null) continue;
+                    int cx = chunk.IndexX, cy = chunk.IndexY;
+                    if (cx < 0 || cx >= SPLAT_CHUNKS_PER_SIDE) continue;
+                    if (cy < 0 || cy >= SPLAT_CHUNKS_PER_SIDE) continue;
+
+                    int chunkIndex = cy * SPLAT_CHUNKS_PER_SIDE + cx;
+
+                    for (int li = 0; li < chunk.Layers.Length && li < 4; li++)
+                    {
+                        int mtex = chunk.Layers[li].TextureIndex;
+                        chunkLayers[chunkIndex * 4 + li] =
+                            remap.TryGetValue(mtex, out int mapped) ? mapped : -1;
+                    }
+
+                    // Layers 1..3 carry alpha; layer 0 is the implicit base.
+                    for (int li = 1; li < chunk.Layers.Length && li < 4; li++)
+                    {
+                        var alpha = chunk.Layers[li].AlphaMap;
+                        if (alpha == null || alpha.Length < SPLAT_ALPHA_SIZE * SPLAT_ALPHA_SIZE)
+                            continue;
+
+                        for (int py = 0; py < SPLAT_ALPHA_SIZE; py++)
+                        {
+                            for (int px = 0; px < SPLAT_ALPHA_SIZE; px++)
+                            {
+                                byte value = alpha[py * SPLAT_ALPHA_SIZE + px];
+                                int ax = cx * SPLAT_ALPHA_SIZE + (transposeAlpha ? py : px);
+                                int ay = cy * SPLAT_ALPHA_SIZE + (transposeAlpha ? px : py);
+                                atlas[(ay * SPLAT_ATLAS_SIZE + ax) * 4 + (li - 1)] = value;
+                            }
+                        }
+                    }
+                }
+            }
+
+            byte[]? atlasPng = BgraToPng(RgbaToBgra(atlas), SPLAT_ATLAS_SIZE, SPLAT_ATLAS_SIZE);
+
+            var payload = new
+            {
+                success = true,
+                gridX = gx,
+                gridY = gy,
+                textureWidth = expectW,
+                textureHeight = expectH,
+                textureCount = keptPng.Count,
+                textureNames = keptNames,
+                texturesBase64 = keptPng,
+                chunkLayers,
+                chunksPerSide = SPLAT_CHUNKS_PER_SIDE,
+                alphaAtlasBase64 = atlasPng == null ? null : Convert.ToBase64String(atlasPng),
+                alphaAtlasSize = SPLAT_ATLAS_SIZE,
+                transposeAlpha,
+                notes
+            };
+
+            lock (_splatCacheLock) { _splatCache[cacheKey] = payload; }
+            return Json(payload);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "TerrainSplat failed for ({GX},{GY})", gx, gy);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Encode BGRA bytes as PNG. Mirrors AdtTerrainReader.ReadBlpAsPng's proven
+    /// SkiaSharp pattern rather than inventing a second one.
+    /// </summary>
+    private static byte[]? BgraToPng(byte[] bgra, int w, int h)
+    {
+        try
+        {
+            var info = new SKImageInfo(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+            if (bgra.Length < info.BytesSize) return null;
+            using var img = SKImage.FromPixelCopy(info, bgra);
+            using var data = img.Encode(SKEncodedImageFormat.Png, 100);
+            return data.ToArray();
+        }
+        catch { return null; }
+    }
+
+    /// <summary>The alpha atlas is authored RGBA; BgraToPng expects BGRA.</summary>
+    private static byte[] RgbaToBgra(byte[] rgba)
+    {
+        var outp = new byte[rgba.Length];
+        for (int i = 0; i + 3 < rgba.Length; i += 4)
+        {
+            outp[i + 0] = rgba[i + 2];
+            outp[i + 1] = rgba[i + 1];
+            outp[i + 2] = rgba[i + 0];
+            outp[i + 3] = rgba[i + 3];
+        }
+        return outp;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // TERRAIN NORMALS — MCNR, the normals the artists actually shipped.
+    //
+    // The client was calling computeVertexNormals() on each tile in isolation.
+    // That is wrong in one specific, visible way: a tile's edge vertices have no
+    // neighbours across the seam, so their averaged normal leans inward and every
+    // tile boundary picks up a lighting crease that follows the ADT grid. It is
+    // also wrong at holes, where the missing triangles pull the surrounding
+    // normals sideways.
+    //
+    // MCNR is the authored answer and it is per-VERTEX, so there is nothing to
+    // average and no seam to get wrong: neighbouring tiles agree because the
+    // artists' values agree.
+    //
+    // THE INDEX MAPPING IS NOT GUESSED. It is the one PatchMcvtDeltas already
+    // uses to write sculpted heights back into MCVT, which round-trips through
+    // the real client:
+    //
+    //     V9 vertex (row, col) of chunk (IndexX, IndexY)
+    //       -> grid index (IndexY*8 + row) * 129 + (IndexX*8 + col)
+    //       -> MCVT/MCNR entry  row*17 + col          (9 outer + 8 inner per row)
+    //
+    // Note the swap — the grid ROW comes from IndexY and the grid COL from
+    // IndexX. It looks like a typo. It is not; it is the same swap the foliage
+    // scatter depends on, and it is what makes grid col -> three.js +X and grid
+    // row -> three.js +Z.
+    //
+    // AXIS CONVERSION HAPPENS HERE, ONCE. MCNR stores (x, z, y) with 127 = 1.0,
+    // in WoW space (X north, Y west, Z up). The scene is Y-up with
+    // sceneX = -wowY and sceneZ = -wowX, so:
+    //
+    //     scene.x = -raw[2]     scene.y = raw[1]     scene.z = -raw[0]
+    //
+    // Flat ground is stored (0, 127, 0) and comes out as (0, 1, 0), which is the
+    // check to run first if terrain ever lights as though it were on its side.
+    //
+    // Emitted as base64 signed bytes: 129*129*3 = 49,923 bytes, versus roughly
+    // 350 KB of JSON for the same values as numbers. (The POSITIONS in the same
+    // responses are still plain JSON float arrays — half a megabyte per tile.
+    // That is the next thing worth packing, and it is listed in the handoff.)
+    // ═══════════════════════════════════════════════════════════════
+
+    private const int TERRAIN_VERTS_PER_SIDE = 129;
+
+    /// <summary>
+    /// MCNR for a whole tile as a 129x129 grid of signed-byte normals, already
+    /// in scene axes. Null when the ADT has no usable normals, so the caller can
+    /// fall back to computeVertexNormals() rather than render an unlit tile.
+    /// </summary>
+    private static string? BuildTileNormalsBase64(AdtTerrainReader.AdtResult? adt)
+    {
+        if (adt?.Chunks == null) return null;
+
+        const int N = TERRAIN_VERTS_PER_SIDE;
+        var outp = new sbyte[N * N * 3];
+        bool any = false;
+
+        foreach (var chunk in adt.Chunks)
+        {
+            if (chunk?.Normals == null || chunk.Normals.Length < 145 * 3) continue;
+            int ix = chunk.IndexX, iy = chunk.IndexY;
+            if (ix < 0 || ix >= 16 || iy < 0 || iy >= 16) continue;
+
+            for (int row = 0; row <= 8; row++)
+            {
+                for (int col = 0; col <= 8; col++)
+                {
+                    int gridRow = iy * 8 + row;
+                    int gridCol = ix * 8 + col;
+                    if (gridRow >= N || gridCol >= N) continue;
+
+                    int src = (row * 17 + col) * 3;
+                    int dst = (gridRow * N + gridCol) * 3;
+
+                    outp[dst + 0] = (sbyte)(-chunk.Normals[src + 2]);   // scene X = -wowY
+                    outp[dst + 1] = chunk.Normals[src + 1];             // scene Y =  wowZ
+                    outp[dst + 2] = (sbyte)(-chunk.Normals[src + 0]);   // scene Z = -wowX
+                    any = true;
+                }
+            }
+        }
+
+        if (!any) return null;
+
+        var bytes = new byte[outp.Length];
+        // -128 negates to -128 in two's complement; clamp so a pathological
+        // value cannot flip sign instead of merely saturating.
+        for (int i = 0; i < outp.Length; i++) bytes[i] = unchecked((byte)Math.Max((int)outp[i], -127));
+        return Convert.ToBase64String(bytes);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // EXTERIOR LIGHTING — the Light.dbc chain, per map.
+    //
+    // PORTED FROM MSUIClient World/ExteriorLighting.cs + SYSTEM_EXTERIOR_LIGHTING.md.
+    //
+    // THE BAR
+    //   Vanilla has a complete authored lighting chain: which light applies
+    //   where, what colour every part of the sky is at every minute of the day,
+    //   and how far fog reaches. The bar is to follow it, exactly as foliage
+    //   follows GroundEffectTexture.dbc.
+    //
+    //   This is unusually well-conditioned work, because the yardstick is a
+    //   NUMBER IN A FILE rather than a screenshot. "Is the ambient right" is a
+    //   subtraction. MSUIClient records what happened without one: a 2026-07-23
+    //   tuning pass rejected a blue-biased ambient of (0.42, 0.50, 0.60) as
+    //   "what made the world look cool" and replaced it with a warm invention.
+    //   The AUTHORED value at Azeroth noon is (0.408, 0.510, 0.604). The tune
+    //   was fighting the data almost exactly, and it had no way to know.
+    //
+    // WHY THIS SENDS THE WHOLE MAP RATHER THAN A RESOLVED SAMPLE
+    //   The resolve depends on where the camera is (falloff blending across
+    //   zones) and on the time of day (every value is a curve). Both change
+    //   continuously, so a per-sample endpoint would be a round trip per frame
+    //   — or a step function with a visible seam every time it refetched.
+    //
+    //   So the browser gets the map's zone list and the curves those zones
+    //   reference, and does the same resolve MSUIClient does, every frame, for
+    //   free. What stays here is the file format, the two unit traps, and the
+    //   coordinate convention: the parts that are settled facts rather than
+    //   live state.
+    //
+    //   Size: one fetch per preset, cached process-wide, and small next to a
+    //   single tile's 1024x1024 alpha atlas.
+    //
+    // WHAT IS PARSED AND NOT SENT (deliberate, and listed so it is not
+    // rediscovered as a bug): the storm / underwater / death weather params,
+    // LightSkybox, and the cloud bands 9-12. MSUIClient reads ParamsClear only
+    // too. Water bands 13-16 and the LightParams alphas ARE sent, because the
+    // liquid renderer is the next consumer and they cost five numbers.
+    // ═══════════════════════════════════════════════════════════════
+
+    private static readonly Dictionary<string, object?> _lightingCache = new();
+    private static readonly object _lightingCacheLock = new();
+
+    [HttpGet]
+    public IActionResult Lighting(string? preset)
+    {
+        if (!TryResolvePreset(preset, out var p, out var error))
+            return Json(new { success = false, error });
+
+        string cacheKey = "map_" + p.mapId;
+        lock (_lightingCacheLock)
+        {
+            if (_lightingCache.TryGetValue(cacheKey, out var hit) && hit != null)
+                return Json(hit);
+        }
+
+        string clientDataPath = GetClientDataDirectory();
+        if (string.IsNullOrEmpty(clientDataPath))
+            return Json(new { success = false, error = "Client data path not configured." });
+
+        try
+        {
+            if (!ExteriorLightData.Load(clientDataPath))
+                return Json(new { success = false, error = "Light DBCs unavailable",
+                                  notes = ExteriorLightData.Notes });
+
+            var notes = new List<string>(ExteriorLightData.Notes);
+            uint mapId = (uint)p.mapId;
+
+            var zones = ExteriorLightData.Lights!.ForMap(mapId);
+            if (zones.Count == 0)
+                notes.Add($"no Light.dbc rows for map {mapId} — the world stays on the fallback rig");
+
+            var emittedZones = new List<object>(zones.Count);
+            var wanted = new HashSet<uint>();
+            foreach (var z in zones)
+            {
+                var (wx, wy, wz) = ExteriorLightData.ToWorld(z);
+                emittedZones.Add(new
+                {
+                    id = z.Id,
+                    // WoW world yards: X north, Y west, Z up. The DBC's Y-up,
+                    // positive-space storage is already converted.
+                    x = z.IsMapDefault ? 0f : wx,
+                    y = z.IsMapDefault ? 0f : wy,
+                    z = z.IsMapDefault ? 0f : wz,
+                    start = z.FalloffStart,
+                    end = z.FalloffEnd,
+                    paramsId = z.ParamsClear,
+                    isDefault = z.IsMapDefault,
+                });
+                if (z.ParamsClear != 0) wanted.Add(z.ParamsClear);
+            }
+
+            var emittedParams = new Dictionary<string, object>();
+            int colourBandsSent = 0, floatBandsSent = 0;
+            foreach (uint pid in wanted)
+            {
+                var colours = new object?[LightIntBandTable.BandsPerParams];
+                for (int b = 0; b < LightIntBandTable.BandsPerParams; b++)
+                {
+                    var band = ExteriorLightData.IntBands!.Band(pid, b);
+                    if (band is null) { colours[b] = null; continue; }
+                    colourBandsSent++;
+                    // Colours stay PACKED (0x00RRGGBB). The browser decodes both
+                    // bracketing keys and interpolates per channel; a packed
+                    // value interpolated as a number lands on a colour belonging
+                    // to neither key.
+                    colours[b] = new { t = Round(band.Hours), v = band.Raw };
+                }
+
+                var floats = new object?[LightFloatBandTable.BandsPerParams];
+                for (int b = 0; b < LightFloatBandTable.BandsPerParams; b++)
+                {
+                    var band = ExteriorLightData.FloatBands!.Band(pid, b);
+                    if (band is null) { floats[b] = null; continue; }
+                    floatBandsSent++;
+                    var values = new float[band.Raw.Length];
+                    for (int i = 0; i < band.Raw.Length; i++)
+                    {
+                        float v = BitConverter.Int32BitsToSingle(unchecked((int)band.Raw[i]));
+                        // Band 0 (fog end) is a distance and is stored x36 like
+                        // Light.dbc's radii. Undone per KEY rather than after
+                        // interpolation — identical for a linear curve, and it
+                        // means the browser has no special case to remember.
+                        if (b == LightFloatBandTable.FogEndBand) v /= LightTable.DbcDistanceScale;
+                        values[i] = v;
+                    }
+                    floats[b] = new { t = Round(band.Hours), v = values };
+                }
+
+                var row = ExteriorLightData.Params!.Get(pid);
+                emittedParams[pid.ToString()] = new
+                {
+                    colours,
+                    floats,
+                    // Resolved and sent, consumed by nothing yet. Named so the
+                    // next consumer does not have to add an endpoint.
+                    skyboxId = row?.SkyboxId ?? 0,
+                    glow = row?.Glow ?? 0f,
+                    waterShallowAlpha = row?.WaterShallowAlpha ?? 0f,
+                    waterDeepAlpha = row?.WaterDeepAlpha ?? 0f,
+                    oceanShallowAlpha = row?.OceanShallowAlpha ?? 0f,
+                    oceanDeepAlpha = row?.OceanDeepAlpha ?? 0f,
+                };
+            }
+
+            notes.Add($"map {mapId}: {emittedZones.Count} zone(s), {emittedParams.Count} params, " +
+                      $"{colourBandsSent} colour band(s), {floatBandsSent} float band(s)");
+
+            var payload = new
+            {
+                success = true,
+                mapId = p.mapId,
+                zones = emittedZones,
+                lightParams = emittedParams,
+                bandNames = LightIntBandTable.BandNames,
+                floatBandNames = LightFloatBandTable.BandNames,
+                notes
+            };
+
+            lock (_lightingCacheLock) { _lightingCache[cacheKey] = payload; }
+            return Json(payload);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Lighting failed for map {MapId}", p.mapId);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>Band times to 3dp — they are half-minutes, so 3dp is exact.</summary>
+    private static float[] Round(float[] src)
+    {
+        var outp = new float[src.Length];
+        for (int i = 0; i < src.Length; i++) outp[i] = MathF.Round(src[i], 3);
+        return outp;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FOLIAGE — the authored ground-effect chain, per tile.
+    //
+    // PORTED FROM MSUIClient World/FoliageRenderer.cs + SYSTEM_FOLIAGE.md.
+    //
+    // THE BAR (SYSTEM_FOLIAGE 0)
+    //   Foliage is not decoration scattered by taste. Vanilla has a complete
+    //   authored data chain that says which clutter appears on which square of
+    //   ground. The single clearest test of whether it is right: GRASS MUST NOT
+    //   CREEP ONTO THE NORTHSHIRE COBBLESTONE. Every wrong version fails that
+    //   test, and the two mechanisms that pass it are hand-authored data the
+    //   artists baked in, not anything derivable from the alpha maps:
+    //
+    //     MCNK header 0x40 — the per-cell texture LAYER map. Road cells name the
+    //                        road layer, whose recipe holds one pebble.
+    //     MCNK header 0x50 — the per-cell "place nothing here" bitmap. In
+    //                        Azeroth_32_48 it covers 303 cells, 195 of them road.
+    //
+    // WHAT THIS ENDPOINT SENDS, AND WHY IT IS SHAPED THIS WAY
+    //   The browser does the scatter (it is camera-dependent and must re-run as
+    //   you walk), so the server's job is to hand over the authored answer for
+    //   every cell of the tile, already resolved through both DBCs.
+    //
+    //   Cells are indexed by MESH GRID position, not by chunk order:
+    //
+    //       gridCol = chunk.IndexX * 8 + cx      -> three.js +X
+    //       gridRow = chunk.IndexY * 8 + cy      -> three.js +Z
+    //       index   = gridRow * 128 + gridCol
+    //
+    //   That derivation is load-bearing and it is NOT obvious, because the ADT
+    //   index axes are swapped relative to WoW world axes. Working it through
+    //   from MSUIClient's own maths:
+    //
+    //     MSUIClient: chunkX(WoW north) = originX - IndexY*8*cell,  cellX = chunkX - cy*cell
+    //                 chunkY(WoW west)  = originY - IndexX*8*cell,  cellY = chunkY - cx*cell
+    //                 originX = (32 - row)*533.33,  originY = (32 - col)*533.33
+    //     ADT space:  posX = 32*533.33 - wowY,  posZ = 32*533.33 - wowX
+    //       => posX = col*533.33 + (IndexX*8 + cx)*cell
+    //          posZ = row*533.33 + (IndexY*8 + cy)*cell
+    //     This reader: localCol(->three X) = (posX/533.33 - gridY)*128, gridY = col
+    //                  localRow(->three Z) = (posZ/533.33 - gridX)*128, gridX = row
+    //       => localCol = IndexX*8 + cx,  localRow = IndexY*8 + cy   (cell = 533.33/128)
+    //
+    //   So the client needs no index maths at all: cell N of the array is at
+    //   mesh grid (N % 128, N / 128), which is where its terrain vertices are.
+    //
+    // BOTH LAYER SOURCES ARE SENT
+    //   cellRecipe      — the authored 0x40 map (with the alpha-dominant guess
+    //                     as fallback on chunks the artists never filled in,
+    //                     exactly as FoliageRenderer does).
+    //   cellRecipeAlpha — the pure alpha-sampling guess.
+    //   Sending both is what makes SYSTEM_FOLIAGE 1.2's A/B switch possible in
+    //   the browser without a refetch. The alpha one is the DIAGNOSTIC; the
+    //   authored one is correct.
+    // ═══════════════════════════════════════════════════════════════
+
+    public const int FOLIAGE_CELLS_PER_SIDE = 128;   // 16 chunks x 8 cells
+
+    private static readonly Dictionary<string, object?> _foliageCache = new();
+    private static readonly object _foliageCacheLock = new();
+
+    [HttpGet]
+    public IActionResult Foliage(string? preset, int tileGridX = -1, int tileGridY = -1)
+    {
+        if (!TryResolvePreset(preset, out var p, out var error))
+            return Json(new { success = false, error });
+
+        int gx = tileGridX >= 0 ? tileGridX : p.gridX;
+        int gy = tileGridY >= 0 ? tileGridY : p.gridY;
+
+        string cacheKey = $"{p.mapId}_{gx}_{gy}";
+        lock (_foliageCacheLock)
+        {
+            if (_foliageCache.TryGetValue(cacheKey, out var hit))
+                return hit == null ? Json(new { success = false, error = "No ADT" }) : Json(hit);
+        }
+
+        string clientDataPath = GetClientDataDirectory();
+        if (string.IsNullOrEmpty(clientDataPath))
+            return Json(new { success = false, error = "Client data path not configured." });
+
+        try
+        {
+            var recipeTable = GroundEffectData.Recipes(clientDataPath);
+            var notes = new List<string>(GroundEffectData.Notes);
+
+            if (recipeTable == null || recipeTable.Count == 0)
+                return Json(new { success = false, error = "Ground-effect DBCs unavailable", notes });
+
+            var adt = AdtTerrainReader.ReadFromMpq(clientDataPath, MapIdToName(p.mapId), gx, gy);
+            if (adt?.Chunks == null)
+            {
+                lock (_foliageCacheLock) { _foliageCache[cacheKey] = null; }
+                return Json(new { success = false, error = $"ADT not found for ({gx},{gy})" });
+            }
+
+            const int N = FOLIAGE_CELLS_PER_SIDE * FOLIAGE_CELLS_PER_SIDE;   // 16384
+
+            var cellRecipe = new ushort[N];
+            var cellRecipeAlpha = new ushort[N];
+            var cellFlags = new byte[N];
+            for (int i = 0; i < N; i++) { cellRecipe[i] = 0xFFFF; cellRecipeAlpha[i] = 0xFFFF; }
+
+            // effectId -> index into the emitted recipe list. Only effects that
+            // actually appear on this tile AND resolve to a real model are sent.
+            var effectToSlot = new Dictionary<int, int>();
+            var emitted = new List<object>();
+            var unresolved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int layerMapChunks = 0, alphaFallbackChunks = 0;
+
+            int SlotFor(int effectId)
+            {
+                if (effectToSlot.TryGetValue(effectId, out int have)) return have;
+
+                var recipe = recipeTable.Get(effectId);
+                int slot = -1;
+                if (recipe != null && recipe.Doodads.Length > 0)
+                {
+                    var doodads = new List<object>(recipe.Doodads.Length);
+                    foreach (var (model, weight) in recipe.Doodads)
+                    {
+                        string? resolved = GroundEffectData.ResolveModelPath(clientDataPath, model);
+                        if (resolved == null) { unresolved.Add(model); continue; }
+                        doodads.Add(new
+                        {
+                            path = resolved,
+                            weight,
+                            kind = GroundEffectData.Classify(model).ToString()
+                        });
+                    }
+                    if (doodads.Count > 0)
+                    {
+                        slot = emitted.Count;
+                        emitted.Add(new { effectId, density = recipe.Density, doodads });
+                    }
+                }
+                effectToSlot[effectId] = slot;
+                return slot;
+            }
+
+            foreach (var chunk in adt.Chunks)
+            {
+                if (chunk?.Layers == null || chunk.Layers.Length == 0) continue;
+                int ix = chunk.IndexX, iy = chunk.IndexY;
+                if (ix < 0 || ix >= 16 || iy < 0 || iy >= 16) continue;
+
+                bool authored = chunk.HasGroundEffectLayerMap;
+                if (authored) layerMapChunks++; else alphaFallbackChunks++;
+
+                for (int cy = 0; cy < 8; cy++)
+                for (int cx = 0; cx < 8; cx++)
+                {
+                    int idx = (iy * 8 + cy) * FOLIAGE_CELLS_PER_SIDE + (ix * 8 + cx);
+
+                    byte flags = 0;
+                    if (chunk.NoGroundEffect(cx, cy)) flags |= 1;
+                    if (chunk.IsHole(cx, cy)) flags |= 2;
+                    cellFlags[idx] = flags;
+
+                    // The authored answer. FoliageRenderer falls back to the
+                    // alpha guess only when the artists left 0x40 empty.
+                    int domAuthored = authored ? chunk.GroundEffectLayer(cx, cy)
+                                               : FoliageDominantLayer(chunk, cx, cy);
+                    if (domAuthored < 0 || domAuthored >= chunk.Layers.Length) domAuthored = 0;
+                    int effA = chunk.Layers[domAuthored].EffectId;
+                    if (effA > 0)
+                    {
+                        int slot = SlotFor(effA);
+                        if (slot >= 0) cellRecipe[idx] = (ushort)slot;
+                    }
+
+                    // The pure alpha guess, for the A/B switch.
+                    int domAlpha = FoliageDominantLayer(chunk, cx, cy);
+                    if (domAlpha < 0 || domAlpha >= chunk.Layers.Length) domAlpha = 0;
+                    int effB = chunk.Layers[domAlpha].EffectId;
+                    if (effB > 0)
+                    {
+                        int slot = SlotFor(effB);
+                        if (slot >= 0) cellRecipeAlpha[idx] = (ushort)slot;
+                    }
+                }
+            }
+
+            if (unresolved.Count > 0)
+                notes.Add($"{unresolved.Count} ground-effect model(s) not found in the MPQs: " +
+                          string.Join(", ", unresolved.Take(8)) +
+                          (unresolved.Count > 8 ? ", ..." : ""));
+
+            var payload = new
+            {
+                success = true,
+                gridX = gx,
+                gridY = gy,
+                cellsPerSide = FOLIAGE_CELLS_PER_SIDE,
+                recipes = emitted,
+                cellRecipeBase64 = Convert.ToBase64String(UShortsToBytes(cellRecipe)),
+                cellRecipeAlphaBase64 = Convert.ToBase64String(UShortsToBytes(cellRecipeAlpha)),
+                cellFlagsBase64 = Convert.ToBase64String(cellFlags),
+                layerMapChunks,
+                alphaFallbackChunks,
+                notes
+            };
+
+            lock (_foliageCacheLock) { _foliageCache[cacheKey] = payload; }
+            return Json(payload);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Foliage failed for ({GX},{GY})", gx, gy);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// The alpha-sampling guess at a cell's dominant texture layer — sample each
+    /// overlay's alpha map at the cell centre and take the strongest, unless
+    /// layer 0 still shows through more than any of them.
+    ///
+    /// This is the DIAGNOSTIC path, not the correct one: at a road edge the blend
+    /// is genuinely ambiguous and the authored answer in MCNK 0x40 is not.
+    /// Ported from MSUIClient FoliageRenderer.DominantLayer.
+    /// </summary>
+    private static int FoliageDominantLayer(AdtTerrainReader.McnkChunk chunk, int cx, int cy)
+    {
+        int px = Math.Clamp(cx * 8 + 4, 0, 63);
+        int py = Math.Clamp(cy * 8 + 4, 0, 63);
+
+        int best = 0, bestA = 0, sum = 0;
+        for (int li = 1; li < chunk.Layers.Length; li++)
+        {
+            var a = chunk.Layers[li].AlphaMap;
+            if (a is null || a.Length < 64 * 64) continue;
+            int val = a[py * 64 + px];
+            sum += val;
+            if (val > bestA) { bestA = val; best = li; }
+        }
+        int baseCoverage = 255 - Math.Min(sum, 255);   // layer 0 shows through the rest
+        return bestA > baseCoverage ? best : 0;
+    }
+
+    /// <summary>Little-endian byte view of a ushort array, for base64 transport.</summary>
+    private static byte[] UShortsToBytes(ushort[] src)
+    {
+        var outp = new byte[src.Length * 2];
+        for (int i = 0; i < src.Length; i++)
+        {
+            outp[i * 2] = (byte)(src[i] & 0xFF);
+            outp[i * 2 + 1] = (byte)(src[i] >> 8);
+        }
+        return outp;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // SINGLE TILE HEIGHTMAP — for progressive loading
     // ═══════════════════════════════════════════════════════════════
 
@@ -3487,6 +4390,8 @@ public class WorldEditorController : Controller
     public IActionResult SingleTileHeightmap(string? preset, int tileGridX = -1, int tileGridY = -1,
         float globalMidHeight = 0, float globalHeightScale = 2.0f)
     {
+        // M1.1: globalMidHeight / globalHeightScale are accepted and IGNORED.
+        _ = globalMidHeight; _ = globalHeightScale;
         if (!TryResolvePreset(preset, out var p, out var error))
             return Json(new { success = false, error });
 
@@ -3516,12 +4421,13 @@ public class WorldEditorController : Controller
                 : (tr.MinHeight + tr.MaxHeight) * 0.5f;
 
             positions[i * 3 + 0] = tr.Positions[i * 3 + 0]; // X centered
-            positions[i * 3 + 1] = (rawHeight - globalMidHeight) * globalHeightScale;
+            positions[i * 3 + 1] = rawHeight;               // M1.1: true world height
             positions[i * 3 + 2] = tr.Positions[i * 3 + 2]; // Z centered
         }
 
-        // Extract terrain holes from the ADT in the MPQ
+        // Extract terrain holes and the authored MCNR normals from the ADT.
         int[]? tileHoles = null;
+        string? tileNormals = null;
         try
         {
             string clientDataPath = GetClientDataDirectory();
@@ -3534,9 +4440,10 @@ public class WorldEditorController : Controller
                     for (int ci = 0; ci < adt.Chunks.Length && ci < 256; ci++)
                         tileHoles[ci] = adt.Chunks[ci].Holes;
                 }
+                tileNormals = BuildTileNormalsBase64(adt);
             }
         }
-        catch { /* ADT not available — no holes */ }
+        catch { /* ADT not available — no holes, no normals */ }
 
         return Json(new
         {
@@ -3549,7 +4456,8 @@ public class WorldEditorController : Controller
             vertsHeight = vertsH,
             minHeight = tr.MinHeight,
             maxHeight = tr.MaxHeight,
-            holes = tileHoles
+            holes = tileHoles,
+            normalsBase64 = tileNormals
         });
     }
 
@@ -3561,6 +4469,8 @@ public class WorldEditorController : Controller
     public IActionResult SingleTileDoodads(string? preset, int tileGridX = -1, int tileGridY = -1,
         float globalMidHeight = 0, float globalHeightScale = 2.0f)
     {
+        // M1.1: identity height transform — incoming values ignored.
+        globalMidHeight = WORLD_MID_HEIGHT; globalHeightScale = WORLD_HEIGHT_SCALE;
         if (!TryResolvePreset(preset, out var p, out var error))
             return Json(new { success = false, error });
 
@@ -3594,13 +4504,13 @@ public class WorldEditorController : Controller
                 {
                     model = w.ModelPath,
                     x = offsetX + (col - v9StartX) * AdtTerrainReader.CELL_SIZE,
-                    y = (w.PosY - globalMidHeight) * globalHeightScale,
+                    y = w.PosY,
                     z = offsetZ + (row - v9StartX) * AdtTerrainReader.CELL_SIZE,
                     rotX = w.RotX,
                     rotY = w.RotY,
                     rotZ = w.RotZ,
                     sizeX = Math.Abs(w.BbMaxX - w.BbMinX) * AdtTerrainReader.CELL_SIZE / AdtTerrainReader.GRID_SIZE * 128,
-                    sizeY = Math.Abs(w.BbMaxY - w.BbMinY) * globalHeightScale,
+                    sizeY = Math.Abs(w.BbMaxY - w.BbMinY),
                     sizeZ = Math.Abs(w.BbMaxZ - w.BbMinZ) * AdtTerrainReader.CELL_SIZE / AdtTerrainReader.GRID_SIZE * 128
                 };
             }).ToList();
@@ -3645,6 +4555,8 @@ public class WorldEditorController : Controller
     public IActionResult Water(string? preset, int tileGridX = -1, int tileGridY = -1,
         float globalMidHeight = 0, float globalHeightScale = 2.0f)
     {
+        // M1.1: identity height transform — incoming values ignored.
+        globalMidHeight = WORLD_MID_HEIGHT; globalHeightScale = WORLD_HEIGHT_SCALE;
         if (!TryResolvePreset(preset, out var p, out var error))
             return Json(new { success = false, error });
 
@@ -3668,6 +4580,12 @@ public class WorldEditorController : Controller
 
         var quadPositions = new List<float>();
         var quadIndices = new List<int>();
+        // One legacy liquid-type code PER VERTEX. The tile-wide `liquidType`
+        // below is kept for back-compat, but it was never enough: one tile
+        // routinely carries a river running into the sea, or a WMO lava pool
+        // inside a mountain, and a single code made every surface the same
+        // colour. 1 = ocean, 3 = slime, 4 = river, 6 = magma.
+        var quadTypes = new List<byte>();
         int vertexBase = 0;
         int chunksWithWater = 0;
         int totalLayers = 0;
@@ -3709,11 +4627,11 @@ public class WorldEditorController : Controller
                         hSW = Math.Clamp(hSW, minH, maxH);
                         hSE = Math.Clamp(hSE, minH, maxH);
 
-                        // Transform to mesh-Y
-                        float yNW = (hNW - globalMidHeight) * globalHeightScale;
-                        float yNE = (hNE - globalMidHeight) * globalHeightScale;
-                        float ySW = (hSW - globalMidHeight) * globalHeightScale;
-                        float ySE = (hSE - globalMidHeight) * globalHeightScale;
+                        // M1.1: mesh-Y IS world height.
+                        float yNW = hNW;
+                        float yNE = hNE;
+                        float ySW = hSW;
+                        float ySE = hSE;
 
                         // Tile cell coords in 0..128 grid
                         int cellX = chunkCellX + tx;
@@ -3728,6 +4646,7 @@ public class WorldEditorController : Controller
                         quadPositions.Add(mx1); quadPositions.Add(yNE); quadPositions.Add(mz0); // NE
                         quadPositions.Add(mx0); quadPositions.Add(ySW); quadPositions.Add(mz1); // SW
                         quadPositions.Add(mx1); quadPositions.Add(ySE); quadPositions.Add(mz1); // SE
+                        for (int q = 0; q < 4; q++) quadTypes.Add(layer.LiquidType);
 
                         quadIndices.Add(vertexBase); quadIndices.Add(vertexBase + 2); quadIndices.Add(vertexBase + 1);
                         quadIndices.Add(vertexBase + 1); quadIndices.Add(vertexBase + 2); quadIndices.Add(vertexBase + 3);
@@ -3837,7 +4756,7 @@ public class WorldEditorController : Controller
                         double row = (wzd / gridSize - gx) * 128.0;
                         float mX = (float)((col - 64.0) * cellSize);
                         float mZ = (float)((row - 64.0) * cellSize);
-                        float mY = (float)((wyd - globalMidHeight) * globalHeightScale);
+                        float mY = (float)wyd; // M1.1: world height
 
                         return (mX, mY, mZ, (float)wxd, (float)wzd);
                     }
@@ -3870,6 +4789,9 @@ public class WorldEditorController : Controller
                             quadPositions.Add(p10.mx); quadPositions.Add(p10.my); quadPositions.Add(p10.mz);
                             quadPositions.Add(p01.mx); quadPositions.Add(p01.my); quadPositions.Add(p01.mz);
                             quadPositions.Add(p11.mx); quadPositions.Add(p11.my); quadPositions.Add(p11.mz);
+                            // MLIQ tile flags carry the legacy type in bits 0..2.
+                            byte quadType = (byte)(tflag & 0x07);
+                            for (int q = 0; q < 4; q++) quadTypes.Add(quadType);
 
                             quadIndices.Add(vertexBase); quadIndices.Add(vertexBase + 2); quadIndices.Add(vertexBase + 1);
                             quadIndices.Add(vertexBase + 1); quadIndices.Add(vertexBase + 2); quadIndices.Add(vertexBase + 3);
@@ -3908,7 +4830,9 @@ public class WorldEditorController : Controller
             positions = quadPositions.ToArray(),
             indices = quadIndices.ToArray(),
             cellsEmitted = emittedQuads,
-            liquidType = (int)firstLiquidType
+            // Kept so an older client still renders something.
+            liquidType = (int)firstLiquidType,
+            liquidTypesBase64 = Convert.ToBase64String(quadTypes.ToArray())
         });
     }
 
@@ -3917,7 +4841,7 @@ public class WorldEditorController : Controller
     // ═══════════════════════════════════════════════════════════════
 
     // Cache parsed placement data per tile — avoids re-parsing MPQs every 600ms.
-    // Key: "mapId_gx_gy_heightScale_midHeight" → TilePlacementData
+    // Key: "v2_mapId_gx_gy" → TilePlacementData  (M1.1: no scale/mid in the key)
     private static readonly Dictionary<string, TilePlacementData?> _placementCache = new(StringComparer.Ordinal);
     private static readonly object _placementCacheLock = new();
 
@@ -4249,7 +5173,7 @@ public class WorldEditorController : Controller
                 if (localRow < -16 || localRow > 128 + 16) continue;
 
                 float threeX = offsetXZ + localCol * AdtTerrainReader.CELL_SIZE;
-                float threeY = (worldPosY - midHeight) * heightScale;
+                float threeY = worldPosY; // M1.1: mesh-Y IS world height
                 float threeZ = offsetXZ + localRow * AdtTerrainReader.CELL_SIZE;
 
                 // ── DIAG: dump landmark MODDs per logged WMO ──────────────
@@ -4344,8 +5268,10 @@ public class WorldEditorController : Controller
     private TilePlacementData? GetOrBuildPlacements(string clientDataPath, int mapId, int gx, int gy,
         float globalHeightScale, float globalMidHeight, bool diag = false)
     {
-        // Round scale/mid to avoid cache misses from float precision
-        string cacheKey = $"{mapId}_{gx}_{gy}_{globalHeightScale:F4}_{globalMidHeight:F1}";
+        // M1.1: the height transform is the identity, so scale/mid no longer
+        // participate in the key. "v2" distinguishes these entries from any
+        // pre-M1.1 key shape still sitting in a warm process.
+        string cacheKey = $"v2_{mapId}_{gx}_{gy}";
         // When diag is set, bypass the cache entirely: don't read, don't write.
         // Every WMO touched in this build will hit ComposeWmoDoodadsIntoTile
         // with diag=true and log. Subsequent non-diag calls re-populate cache.
@@ -4403,7 +5329,7 @@ public class WorldEditorController : Controller
                 Id = $"w_{gx}_{gy}_{wi}",
                 Model = w.ModelPath,
                 LocalX = offsetXZ + col * AdtTerrainReader.CELL_SIZE,
-                Y = (w.PosY - globalMidHeight) * globalHeightScale,
+                Y = w.PosY, // M1.1: world height
                 LocalZ = offsetXZ + row * AdtTerrainReader.CELL_SIZE,
                 RotX = w.RotX,
                 RotY = w.RotY,
@@ -4462,6 +5388,9 @@ public class WorldEditorController : Controller
     {
         if (!TryResolvePreset(preset, out var p, out var error))
             return Json(new { success = false, error });
+
+        // M1.1: identity height transform — incoming values ignored.
+        globalMidHeight = WORLD_MID_HEIGHT; globalHeightScale = WORLD_HEIGHT_SCALE;
 
         string clientDataPath = GetClientDataDirectory();
         if (string.IsNullOrEmpty(clientDataPath))
@@ -5138,12 +6067,13 @@ public class WorldEditorController : Controller
                 if (tr.MaxHeight > globalMax) globalMax = tr.MaxHeight;
             }
         }
-        float midHeight = (globalMin + globalMax) * 0.5f;
-        float range2 = globalMax - globalMin;
-        float heightScale = range2 > 0 ? Math.Min(3.5f, 350.0f / range2) : 3.5f;
+        // M1.1: the height transform is the identity. Kept as named locals so the
+        // formulas below still read as formulas rather than disappearing.
+        const float midHeight = WORLD_MID_HEIGHT;
+        const float heightScale = WORLD_HEIGHT_SCALE;
         sb.AppendLine();
         sb.AppendLine($"Multi-tile: globalMin={globalMin:F4}  globalMax={globalMax:F4}");
-        sb.AppendLine($"  midHeight={midHeight:F4}  heightScale={heightScale:F6}");
+        sb.AppendLine($"  M1.1 1:1 world scale — midHeight={midHeight:F4}  heightScale={heightScale:F6} (identity)");
 
         // ── Saved placements from DB ──
         sb.AppendLine();
@@ -5162,8 +6092,8 @@ public class WorldEditorController : Controller
             float meshX = (float)row.mesh_x, meshY = (float)row.mesh_y, meshZ = (float)row.mesh_z;
             sb.AppendLine($"  Placement #{row.id}: committed={row.committed}");
             sb.AppendLine($"    DB meshY = {meshY:F4}");
-            sb.AppendLine($"    Reverse transform → modfPosY = {meshY:F4} / {heightScale:F6} + {midHeight:F4} = {meshY / heightScale + midHeight:F4}");
-            sb.AppendLine($"    Round-trip streamedY = (modfPosY - midHeight) * heightScale = {meshY:F4}  (should equal DB meshY)");
+            sb.AppendLine($"    Reverse transform → modfPosY = meshY = {meshY:F4}  (M1.1: identity)");
+            sb.AppendLine($"    Round-trip streamedY = modfPosY = {meshY:F4}  (should equal DB meshY)");
         }
 
         // ── Vanilla WMOs from ADT (what streaming sees) ──
@@ -5183,7 +6113,7 @@ public class WorldEditorController : Controller
                         float streamedY = (w.PosY - midHeight) * heightScale;
                         sb.AppendLine($"  WMO: {w.ModelPath}");
                         sb.AppendLine($"    MODF PosY (raw) = {w.PosY:F4}");
-                        sb.AppendLine($"    streamedY = ({w.PosY:F4} - {midHeight:F4}) * {heightScale:F6} = {streamedY:F4}");
+                        sb.AppendLine($"    streamedY = worldZ = {streamedY:F4}");
                         sb.AppendLine($"    MODF Pos = ({w.PosX:F2}, {w.PosY:F2}, {w.PosZ:F2})");
                     }
                 }

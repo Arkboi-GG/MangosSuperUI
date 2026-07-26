@@ -8,7 +8,11 @@
 //   5. addToolbarShortcuts — Walk + Map toolbar buttons
 
 import * as THREE from 'three';
-import { setLitMode, setWireframe } from './render.js';
+import { setLitMode, setWireframe, setTerrainDetail, isTerrainDetailOn } from './render.js';
+import { MOVEMENT_DEFAULTS } from './input.js';
+import { setSplatEnabled, isSplatEnabled } from './terrain-splat.js';
+import { setAuthoredNormals, isAuthoredNormals } from './streaming.js';
+import { FOLIAGE_DEFAULTS } from './foliage.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Status — bottom status bar
@@ -329,6 +333,10 @@ export class OptionsModal {
         html += divider('Rendering');
         html += row('Draw Distance', 'optDraw', 'slider', { min: 1, max: 30, val: 10, display: '1.0x' });
         html += row('Lighting', 'optLit', 'toggle', { active: true, textOn: 'Lit' });
+        html += row('Terrain Splat', 'optSplat', 'toggle', { active: true, textOn: 'On' });
+        html += row('Detail Overlay', 'optDetailOverlay', 'toggle',
+            { active: true, textOn: 'On' });
+        html += row('MCNR Normals', 'optMcnr', 'toggle', { active: true, textOn: 'On' });
         html += row('Terrain Detail', 'optDetail', 'select', {
             val: '128',
             options: [
@@ -337,6 +345,48 @@ export class OptionsModal {
                 { value: '256', label: 'High (4096²)' }
             ]
         });
+
+        // FOLIAGE. Three knobs, not the fifteen MSUIClient's dev panel carries:
+        // this is a player-facing surface. The authenticity switches
+        // (UseCellLayerMap / UseNoDoodadMask / SkipHoles) are deliberately NOT
+        // here — SYSTEM_FOLIAGE calls them diagnostics, not settings, and they
+        // stay reachable on window.we.foliage for A/B work.
+        //
+        // Coverage and visibility are ONE intent: FoliageField links the fade
+        // window to Radius by default, because a fixed 45-yard fade against a
+        // 120-yard Radius slider scattered grass nobody could see.
+        // WORLD LIGHTING. The one switch that decides whether the client
+        // believes Light.dbc. MSUIClient shipped a build where the equivalent
+        // switch was accidentally the DevTools flag, so the resolve never ran
+        // and every colour silently fell back to the invented constants the
+        // system exists to replace. Keep this a user setting and nothing else.
+        //
+        // Sun and ambient STRENGTH are deliberately not exposed: 1.0 means
+        // "use the data exactly", which is the correctness check, and a slider
+        // that quietly moves off 1.0 destroys it. They live on
+        // window.we.lighting for A/B work.
+        html += divider('World Lighting');
+        html += row('Light.dbc', 'optWorldLight', 'toggle', { active: false, textOn: 'Off' });
+        html += row('Authored Sky', 'optWorldSky', 'toggle', { active: true, textOn: 'On' });
+        html += row('Time of Day', 'optTimeOfDay', 'slider',
+            { min: 0, max: 1440, val: 720, display: '12:00' });
+        html += row('Day Cycle', 'optDayCycle', 'select', {
+            val: '0',
+            options: [
+                { value: '0', label: 'Frozen' },
+                { value: '0.0167', label: '1 hour / minute' },
+                { value: '0.1', label: '1 hour / 10 sec' }
+            ]
+        });
+
+        html += divider('Foliage');
+        html += row('Foliage', 'optFoliage', 'toggle', { active: false, textOn: 'Off' });
+        html += row('Density', 'optFoliageDensity', 'slider',
+            { min: 0, max: 20, val: Math.round(FOLIAGE_DEFAULTS.densityScale * 10),
+              display: FOLIAGE_DEFAULTS.densityScale.toFixed(1) + 'x' });
+        html += row('Draw Radius', 'optFoliageRadius', 'slider',
+            { min: 15, max: 120, val: FOLIAGE_DEFAULTS.radius,
+              display: FOLIAGE_DEFAULTS.radius + 'yd' });
 
         html += divider('Visibility');
         html += row('Doodads', 'optDoodads', 'toggle', { active: true, textOn: 'On' });
@@ -353,8 +403,9 @@ export class OptionsModal {
         const speedVal = modal.querySelector('#optSpeedVal');
         speedSlider.addEventListener('input', () => {
             const mult = parseInt(speedSlider.value) / 10;
-            this._movementTicker.setMoveSpeed(3.0 * mult);
-            this._movementTicker.setSprintSpeed(10.0 * mult);
+            // M1.2: speeds are yards/second now (see input.js MOVEMENT_DEFAULTS).
+            this._movementTicker.setMoveSpeed(MOVEMENT_DEFAULTS.move * mult);
+            this._movementTicker.setSprintSpeed(MOVEMENT_DEFAULTS.sprint * mult);
             speedVal.textContent = mult.toFixed(1) + 'x';
         });
 
@@ -397,6 +448,181 @@ export class OptionsModal {
             syncWalkBtn();
         });
         editor.signals.walkModeChanged.add(syncWalkBtn);
+
+        // Terrain splat. Real 4-layer blending vs the server-baked composite.
+        // Switching reloads the preset because it changes how every tile's
+        // material is built, and rebuilding them in place is not worth the code.
+        const splatBtn = modal.querySelector('#optSplat');
+        if (splatBtn) {
+            const syncSplat = () => {
+                const on = isSplatEnabled();
+                splatBtn.textContent = on ? 'On' : 'Off';
+                splatBtn.classList.toggle('active', on);
+                splatBtn.classList.toggle('btn-outline-warning', on);
+                splatBtn.classList.toggle('btn-outline-secondary', !on);
+            };
+            splatBtn.addEventListener('click', () => {
+                setSplatEnabled(!isSplatEnabled());
+                syncSplat();
+                if (this._loadPresetByKey && editor.currentPreset) {
+                    const el = document.getElementById('wePresetSelect');
+                    const opt = el ? el.options[el.selectedIndex] : null;
+                    this._loadPresetByKey(editor.currentPreset,
+                        opt ? opt.textContent : editor.currentPreset);
+                }
+            });
+            syncSplat();
+        }
+
+        // Terrain detail overlay (M4.2c). A toggle rather than a fixed
+        // behaviour because it injects a shader chunk into every terrain
+        // material — if a driver rejects it, turning this off restores plain
+        // terrain without a reload.
+        const detailBtn = modal.querySelector('#optDetailOverlay');
+        if (detailBtn) {
+            const syncDetail = () => {
+                const on = isTerrainDetailOn();
+                detailBtn.textContent = on ? 'On' : 'Off';
+                detailBtn.classList.toggle('active', on);
+                detailBtn.classList.toggle('btn-outline-warning', on);
+                detailBtn.classList.toggle('btn-outline-secondary', !on);
+            };
+            detailBtn.addEventListener('click', () => {
+                setTerrainDetail(!isTerrainDetailOn());
+                syncDetail();
+            });
+            syncDetail();
+        }
+
+        // World lighting: Light.dbc -> LightParams -> Light(Int|Float)Band.
+        const wlBtn = modal.querySelector('#optWorldLight');
+        if (wlBtn) {
+            const syncWl = () => {
+                const on = !!(editor.worldLighting && editor.worldLighting.enabled);
+                wlBtn.textContent = on ? 'On' : 'Off';
+                wlBtn.classList.toggle('active', on);
+                wlBtn.classList.toggle('btn-outline-warning', on);
+                wlBtn.classList.toggle('btn-outline-secondary', !on);
+            };
+            wlBtn.addEventListener('click', () => {
+                if (!editor.worldLighting) return;
+                editor.worldLighting.setEnabled(!editor.worldLighting.enabled);
+                syncWl();
+            });
+            syncWl();
+        }
+
+        const skyBtn = modal.querySelector('#optWorldSky');
+        if (skyBtn) {
+            const syncSky = () => {
+                const on = !!(editor.worldLighting && editor.worldLighting.skyEnabled);
+                skyBtn.textContent = on ? 'On' : 'Off';
+                skyBtn.classList.toggle('active', on);
+                skyBtn.classList.toggle('btn-outline-warning', on);
+                skyBtn.classList.toggle('btn-outline-secondary', !on);
+            };
+            skyBtn.addEventListener('click', () => {
+                if (!editor.worldLighting) return;
+                editor.worldLighting.setSkyEnabled(!editor.worldLighting.skyEnabled);
+                syncSky();
+            });
+            syncSky();
+        }
+
+        const todSlider = modal.querySelector('#optTimeOfDay');
+        const todVal = modal.querySelector('#optTimeOfDayVal');
+        if (todSlider) {
+            const paint = (h) => {
+                const hh = Math.floor(h) % 24;
+                const mm = Math.round((h - Math.floor(h)) * 60);
+                todVal.textContent = String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+            };
+            todSlider.addEventListener('input', () => {
+                const h = parseInt(todSlider.value) / 60;   // slider is minutes
+                paint(h);
+                if (editor.worldLighting) editor.worldLighting.timeHours = h;
+            });
+            paint(12);
+        }
+
+        const cycleSelect = modal.querySelector('#optDayCycle');
+        if (cycleSelect) {
+            cycleSelect.addEventListener('change', () => {
+                if (!editor.worldLighting) return;
+                // Vanilla's day IS real time — one game day per real day — so a
+                // visible cycle is a viewing aid, not emulation. Frozen is the
+                // default for exactly that reason.
+                editor.worldLighting.cycleSpeed = parseFloat(cycleSelect.value) || 0;
+            });
+        }
+
+        // Foliage: ground-effect clutter. Off by default; the first switch-on
+        // fetches a per-tile payload and the grass models, so the button is
+        // honest about the fact that nothing appears instantly.
+        const foliageBtn = modal.querySelector('#optFoliage');
+        if (foliageBtn) {
+            const syncFoliage = () => {
+                const on = !!(editor.foliage && editor.foliage.enabled);
+                foliageBtn.textContent = on ? 'On' : 'Off';
+                foliageBtn.classList.toggle('active', on);
+                foliageBtn.classList.toggle('btn-outline-warning', on);
+                foliageBtn.classList.toggle('btn-outline-secondary', !on);
+            };
+            foliageBtn.addEventListener('click', () => {
+                if (!editor.foliage) return;
+                editor.foliage.setEnabled(!editor.foliage.enabled);
+                syncFoliage();
+            });
+            syncFoliage();
+        }
+
+        const foliageDensity = modal.querySelector('#optFoliageDensity');
+        const foliageDensityVal = modal.querySelector('#optFoliageDensityVal');
+        if (foliageDensity) {
+            foliageDensity.addEventListener('input', () => {
+                const v = parseInt(foliageDensity.value) / 10;
+                foliageDensityVal.textContent = v.toFixed(1) + 'x';
+                if (!editor.foliage) return;
+                editor.foliage.densityScale = v;
+                editor.foliage.forceRescatter();
+            });
+        }
+
+        const foliageRadius = modal.querySelector('#optFoliageRadius');
+        const foliageRadiusVal = modal.querySelector('#optFoliageRadiusVal');
+        if (foliageRadius) {
+            foliageRadius.addEventListener('input', () => {
+                const v = parseInt(foliageRadius.value);
+                foliageRadiusVal.textContent = v + 'yd';
+                if (!editor.foliage) return;
+                // Cost scales with AREA, so doubling this roughly quadruples the
+                // instance count — maxInstances (24,000) is the backstop.
+                editor.foliage.radius = v;
+                editor.foliage.forceRescatter();
+            });
+        }
+
+        // Authored terrain normals. A toggle because a wrong axis conversion
+        // lights the whole world as though it were on its side, and the way out
+        // of that must not be a reload.
+        const mcnrBtn = modal.querySelector('#optMcnr');
+        if (mcnrBtn) {
+            const syncMcnr = () => {
+                const on = isAuthoredNormals();
+                mcnrBtn.textContent = on ? 'On' : 'Off';
+                mcnrBtn.classList.toggle('active', on);
+                mcnrBtn.classList.toggle('btn-outline-warning', on);
+                mcnrBtn.classList.toggle('btn-outline-secondary', !on);
+            };
+            mcnrBtn.addEventListener('click', () => {
+                setAuthoredNormals(!isAuthoredNormals());
+                syncMcnr();
+                if (editor.tileGrid && editor.tileGrid.applyNormalSource) {
+                    editor.tileGrid.applyNormalSource();
+                }
+            });
+            syncMcnr();
+        }
 
         // Lighting
         const litBtn = modal.querySelector('#optLit');

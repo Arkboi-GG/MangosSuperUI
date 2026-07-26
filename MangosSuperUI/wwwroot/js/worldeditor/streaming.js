@@ -7,7 +7,12 @@
 //   4. TileGrid                    — progressive ADT terrain + water
 
 import * as THREE from 'three';
+import {
+    buildSplatResources, makeSplatMaterial, syncSplatUniforms,
+    disposeSplatResources, isSplatEnabled
+} from './terrain-splat.js';
 import { getJSON } from './net.js';
+import { partitionByType, waterTypeName } from './water.js';
 import { tagEntity } from './core.js';
 import {
     makeTerrainMaterial,
@@ -31,6 +36,56 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Texture / model builders
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authored terrain normals (MCNR)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// computeVertexNormals() averages the faces around each vertex, which is right
+// in the middle of a tile and wrong at its edge: the edge vertices have no
+// neighbours across the seam, so their normals lean inward and every ADT
+// boundary picks up a lighting crease that follows the tile grid. Holes do the
+// same thing on a smaller scale, because the missing triangles pull the
+// surrounding normals sideways.
+//
+// MCNR is the authored per-vertex answer, so there is nothing to average and
+// neighbouring tiles agree by construction. The server converts it to scene axes
+// and sends it as signed bytes (WorldEditorController.BuildTileNormalsBase64).
+//
+// It stays a TOGGLE rather than a replacement: if the axis conversion is wrong
+// the whole world lights as though it were on its side, and turning this off has
+// to restore the previous behaviour without a reload. So both sets are kept on
+// the geometry and swapping is an array copy.
+
+let authoredNormalsOn = true;
+export function setAuthoredNormals(v) { authoredNormalsOn = !!v; }
+export function isAuthoredNormals() { return authoredNormalsOn; }
+
+function b64ToUint8(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+function b64ToInt8(b64) {
+    const bin = atob(b64);
+    const out = new Int8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = (bin.charCodeAt(i) << 24) >> 24;
+    return out;
+}
+
+/** Copy whichever normal set is currently selected into the live attribute. */
+export function applyNormalSource(geo) {
+    if (!geo || !geo.userData) return;
+    const src = (authoredNormalsOn && geo.userData.authoredNormals)
+        ? geo.userData.authoredNormals
+        : geo.userData.computedNormals;
+    const attr = geo.attributes && geo.attributes.normal;
+    if (!src || !attr || attr.array.length !== src.length) return;
+    attr.array.set(src);
+    attr.needsUpdate = true;
+}
 
 function makeTextureFromDataURI(dataURI) {
     const tex = new THREE.TextureLoader().load(dataURI);
@@ -178,7 +233,24 @@ export function buildTerrainGeometry(tile) {
     }
 
     geo.setIndex(new THREE.BufferAttribute(new Uint32Array(idxList), 1));
+
+    // Compute first so the fallback set always exists, then overlay the
+    // authored one. Both are kept so the toggle is instant.
     geo.computeVertexNormals();
+    geo.userData.computedNormals = Float32Array.from(geo.attributes.normal.array);
+
+    if (tile.normalsBase64) {
+        const raw = b64ToInt8(tile.normalsBase64);
+        if (raw.length === geo.attributes.normal.array.length) {
+            const authored = new Float32Array(raw.length);
+            for (let i = 0; i < raw.length; i++) authored[i] = raw[i] / 127;
+            geo.userData.authoredNormals = authored;
+        } else {
+            console.warn('[terrain] MCNR normal count', raw.length, '!=', 
+                geo.attributes.normal.array.length, '- keeping computed normals');
+        }
+    }
+    applyNormalSource(geo);
     return geo;
 }
 
@@ -208,11 +280,11 @@ export class InstancePool {
         // Parent groups with independent visibility toggles.
         this.doodadGroup = new THREE.Group();
         this.doodadGroup.name = 'allDoodads';
-        this.doodadGroup.position.y = -0.5;
+        this.doodadGroup.position.y = 0; // M1.1: 1:1 world height
 
         this.wmoGroup = new THREE.Group();
         this.wmoGroup.name = 'allWmos';
-        this.wmoGroup.position.y = -0.5;
+        this.wmoGroup.position.y = 0; // M1.1: 1:1 world height
     }
 
     attachTo(scene) {
@@ -684,8 +756,15 @@ export class TileGrid {
         this.tiles = {};
         this.loading = {};
         this.tileWidthMesh = 0;
+        // M1.1: the height transform is the identity. These are kept so the
+        // coord readout and the sculpt round-trip still read as formulas.
         this.globalMidHeight = 0;
-        this.globalHeightScale = 2.0;
+        this.globalHeightScale = 1.0;
+        // M1.1: true world-height range of the loaded block (yards).
+        this.worldMinHeight = 0;
+        this.worldMaxHeight = 0;
+        // Live splat materials, so fog and light changes can be pushed to them.
+        this._splatMaterials = new Set();
         this.centerGridX = 0;
         this.centerGridY = 0;
         this.mapId = 0;
@@ -722,10 +801,25 @@ export class TileGrid {
 
     setTextureRes(r) { this.textureRes = r; }
 
+    /** Push the authored/computed normal choice into every loaded tile. */
+    applyNormalSource() {
+        for (const k in this.tiles) {
+            const t = this.tiles[k];
+            if (t && t.geo) applyNormalSource(t.geo);
+        }
+    }
+
     cameraToGrid(controlsTarget) {
         const dx = Math.round(controlsTarget.x / this.tileWidthMesh);
         const dy = Math.round(controlsTarget.z / this.tileWidthMesh);
         return { gridX: this.centerGridX + dy, gridY: this.centerGridY + dx };
+    }
+
+    /** Keep splat materials tracking the scene's fog and lighting. */
+    syncSplat() {
+        if (this._splatMaterials.size === 0) return;
+        const vp = this.editor.viewport;
+        syncSplatUniforms(this._splatMaterials, vp.lighting, vp.scene.fog);
     }
 
     updateFogForRadius(scene, camera, r) {
@@ -745,6 +839,43 @@ export class TileGrid {
         camera.updateProjectionMatrix();
     }
 
+    /**
+     * M1.1 — put the camera on the ground at the centre of the loaded block.
+     *
+     * Probes the terrain under (0,0) — the centre tile's origin — and hands the
+     * measured height to the rig. Falls back to the block's height-range midpoint
+     * if the probe misses (hole, water-only tile, geometry not ready).
+     */
+    frameCameraOnCentre(x, z) {
+        const rig = this.editor.viewport && this.editor.viewport.rig;
+        if (!rig || !rig.frameTerrain) return;
+
+        const px = (x !== undefined) ? x : 0;
+        const pz = (z !== undefined) ? z : 0;
+
+        const meshes = this.terrainMeshes();
+        const mid = (isFinite(this.worldMinHeight) && isFinite(this.worldMaxHeight))
+            ? (this.worldMinHeight + this.worldMaxHeight) * 0.5
+            : 0;
+
+        let groundY = rig.probeGroundY(meshes, px, pz, this.worldMaxHeight);
+        if (groundY === null || !isFinite(groundY)) groundY = mid;
+
+        rig.frameTerrain(groundY, { x: px, z: pz });
+
+        // M1.1: the backdrop ground plane was pinned at y=-5, which only read as
+        // "below the world" when the scene was centred on zero. Drop it under the
+        // lowest loaded terrain instead.
+        const scene = this.editor.viewport && this.editor.viewport.scene;
+        const ground = scene && scene.getObjectByName('ground');
+        if (ground) {
+            const floor = isFinite(this.worldMinHeight) ? this.worldMinHeight : groundY;
+            ground.position.y = floor - 5;
+        }
+
+        return groundY;
+    }
+
     objectRadiiForCurrent() {
         const base = this.tileWidthMesh || 400;
         const load = Math.max(150, (this.TILE_RADIUS + 0.5) * base * 0.6);
@@ -762,8 +893,12 @@ export class TileGrid {
         this.loading = {};
 
         this.tileWidthMesh = 0;
+        // M1.1: the height transform is the identity. These are kept so the
+        // coord readout and the sculpt round-trip still read as formulas.
         this.globalMidHeight = 0;
-        this.globalHeightScale = 2.0;
+        this.globalHeightScale = 1.0;
+        this.worldMinHeight = 0;
+        this.worldMaxHeight = 0;
         this.isDungeon = false;
 
         if (presetKey.startsWith('dungeon:')) {
@@ -778,9 +913,13 @@ export class TileGrid {
                     return null;
                 }
                 this.tileWidthMesh = hm.tileWidthMesh;
-                this.globalMidHeight = hm.midHeight;
-                this.globalHeightScale = hm.heightScale;
+                this.globalMidHeight = (hm.midHeight !== undefined) ? hm.midHeight : 0;
+                this.globalHeightScale = (hm.heightScale > 0) ? hm.heightScale : 1;
                 this.mapId = hm.mapId || 0;
+                // M1.1: true world-height range of the loaded block, so the
+                // camera and ground plane can be placed without guessing.
+                this.worldMinHeight = (hm.minHeight !== undefined) ? hm.minHeight : 0;
+                this.worldMaxHeight = (hm.maxHeight !== undefined) ? hm.maxHeight : 0;
 
                 const center = hm.tiles.find((t) => t.dx === 0 && t.dy === 0);
                 if (center) {
@@ -798,6 +937,11 @@ export class TileGrid {
                         mesh: null, gridX: tile.gridX, gridY: tile.gridY,
                         dx: tile.dx, dy: tile.dy,
                         geo: buildTerrainGeometry(tile),
+                        // Grid dimensions, so consumers that index the vertex
+                        // grid (foliage height sampling) do not have to infer
+                        // them from the attribute length.
+                        vertsWidth: tile.vertsWidth,
+                        vertsHeight: tile.vertsHeight,
                         loading: false
                     };
                     this.tiles[key] = entry;
@@ -820,6 +964,10 @@ export class TileGrid {
                                 if (this.mapId <= 1) {
                                     toLoad.forEach((e) => this._loadWater(e));
                                 }
+                                // M1.1: terrain is now at true world height, so a
+                                // fixed camera Y is underground or in orbit depending
+                                // on the zone. Frame against the real surface.
+                                this.frameCameraOnCentre();
                                 editor.signals.presetLoaded.dispatch(presetKey);
                                 resolve(hm);
                             }
@@ -892,8 +1040,13 @@ export class TileGrid {
                 const maxDim = Math.max(size.x, size.y, size.z);
 
                 this.tileWidthMesh = maxDim;
-                this.globalMidHeight = center.y;
+                // M1.1: dungeon WMO geometry is already true world height —
+                // folding the bbox centre in here double-counted it in the
+                // .gps readout. Identity, same as the terrain path.
+                this.globalMidHeight = 0;
                 this.globalHeightScale = 1.0;
+                this.worldMinHeight = bbox.min.y;
+                this.worldMaxHeight = bbox.max.y;
 
                 const scene = editor.viewport.scene;
                 const camera = editor.viewport.rig.camera;
@@ -1013,13 +1166,17 @@ export class TileGrid {
             const geo = buildTerrainGeometry(hm);
             const dx = gy - this.centerGridY;
             const dy = gx - this.centerGridX;
-            const entry = { mesh: null, gridX: gx, gridY: gy, dx, dy, geo, loading: true };
+            const entry = {
+                mesh: null, gridX: gx, gridY: gy, dx, dy, geo,
+                vertsWidth: hm.vertsWidth, vertsHeight: hm.vertsHeight,
+                loading: true
+            };
             this.tiles[key] = entry;
             this._loadTexture(entry, () => {
                 if (entry.mesh) {
                     entry.mesh.position.x = dx * this.tileWidthMesh;
                     entry.mesh.position.z = dy * this.tileWidthMesh;
-                    entry.mesh.position.y = -0.5;
+                    entry.mesh.position.y = 0; // M1.1
                 }
                 delete this.loading[key];
                 if (this.mapId <= 1) this._loadWater(entry);
@@ -1027,7 +1184,43 @@ export class TileGrid {
         }).catch(() => { delete this.loading[key]; });
     }
 
+    /**
+     * Load a tile's ground texturing.
+     *
+     * Prefers real 4-layer splatting (terrain-splat.js): the tileset, the
+     * per-chunk layer indices and the packed alpha atlas, blended on the GPU at
+     * ~8 texture repeats per chunk. Falls back to the server-baked composite if
+     * splat is switched off, if the tile has no usable tileset, or if anything
+     * in the splat path throws — a blurry tile beats a missing one.
+     */
     _loadTexture(entry, callback) {
+        if (isSplatEnabled()) {
+            const splatUrl = '/WorldEditor/TerrainSplat?preset=' +
+                encodeURIComponent(this.editor.currentPreset) +
+                '&tileGridX=' + entry.gridX + '&tileGridY=' + entry.gridY;
+            getJSON(splatUrl)
+                .then((d) => buildSplatResources(d, maxAnisotropy()))
+                .then((res) => {
+                    if (!res) throw new Error('no splat data');
+                    const vp = this.editor.viewport;
+                    const mat = makeSplatMaterial(res, vp.lighting, vp.scene.fog);
+                    entry.splat = res;
+                    this._splatMaterials.add(mat);
+                    this._finishTile(entry, mat);
+                    if (callback) callback();
+                })
+                .catch((err) => {
+                    console.warn('[terrain] splat failed for tile',
+                        entry.gridX, entry.gridY, '- falling back to composite:',
+                        err && err.message);
+                    this._loadComposite(entry, callback);
+                });
+            return;
+        }
+        this._loadComposite(entry, callback);
+    }
+
+    _loadComposite(entry, callback) {
         const url = '/WorldEditor/Textures?preset=' + encodeURIComponent(this.editor.currentPreset) +
             '&tileGridX=' + entry.gridX + '&tileGridY=' + entry.gridY +
             '&pixelsPerChunk=' + this.textureRes;
@@ -1061,7 +1254,7 @@ export class TileGrid {
 
     _finishTile(entry, mat) {
         entry.mesh = new THREE.Mesh(entry.geo, mat);
-        entry.mesh.position.y = -0.5;
+        entry.mesh.position.y = 0; // M1.1
 
         // Phase 8: tag terrain mesh with tile identity for sculpt tool
         entry.mesh.userData.tileKey = this._key(entry.gridX, entry.gridY);
@@ -1089,13 +1282,22 @@ export class TileGrid {
             if (t.mesh.geometry) t.mesh.geometry.dispose();
             if (t.mesh.material) {
                 if (t.mesh.material.map) t.mesh.material.map.dispose();
+                this._splatMaterials.delete(t.mesh.material);
                 t.mesh.material.dispose();
             }
         }
+        // The tileset array, alpha atlas and chunk LUT are per-tile GPU
+        // allocations — the biggest ones the editor makes. Streaming leaks them
+        // in minutes if eviction forgets.
+        if (t.splat) { disposeSplatResources(t.splat); t.splat = null; }
         if (t.waterMesh) {
             scene.remove(t.waterMesh);
             if (t.waterMesh.geometry) t.waterMesh.geometry.dispose();
-            if (t.waterMesh.material) t.waterMesh.material.dispose();
+            // Water is now one material PER LIQUID TYPE on the same mesh, so this
+            // is an array. Missing that leaks one material per tile per type.
+            const wm = t.waterMesh.material;
+            if (Array.isArray(wm)) wm.forEach((m) => m && m.dispose());
+            else if (wm) wm.dispose();
         }
         delete this.tiles[key];
     }
@@ -1119,15 +1321,25 @@ export class TileGrid {
 
             const geo = new THREE.BufferGeometry();
             geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(w.positions), 3));
-            geo.setIndex(new THREE.BufferAttribute(new Uint32Array(w.indices), 1));
             geo.computeVertexNormals();
 
-            const mat = new THREE.MeshBasicMaterial({
-                color: 0x2266aa, transparent: true, opacity: 0.45,
-                side: THREE.DoubleSide, depthWrite: false, fog: true
-            });
+            // Split by liquid type so lava is not blue. The server now sends one
+            // legacy type code per vertex; without it (older server) everything
+            // falls back to the tile-wide code, which is what used to happen.
+            const types = w.liquidTypesBase64 ? b64ToUint8(w.liquidTypesBase64) : null;
+            const split = partitionByType(w.indices, types, w.liquidType);
+            if (!split) return;
 
-            const waterMesh = new THREE.Mesh(geo, mat);
+            geo.setIndex(new THREE.BufferAttribute(split.index, 1));
+            geo.clearGroups();
+            for (const g of split.groups) geo.addGroup(g.start, g.count, g.materialIndex);
+
+            if (split.materials.length > 1) {
+                console.info('[water] tile', entry.gridX, entry.gridY, 'has',
+                    split.materials.map((m) => waterTypeName(m.userData.liquidType)).join(' + '));
+            }
+
+            const waterMesh = new THREE.Mesh(geo, split.materials);
             const dx = entry.gridY - this.centerGridY;
             const dy = entry.gridX - this.centerGridX;
             waterMesh.position.x = dx * this.tileWidthMesh;

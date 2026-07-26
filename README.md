@@ -4,7 +4,15 @@ https://discord.gg/AzCdnyPHPY - Community Discord for updates, questions, bugs, 
 
 https://www.youtube.com/@Yafrovon — Video walkthroughs and feature demos
 
-MangosSuperUI is a browser-based platform for running, editing, and extending a [VMaNGOS](https://github.com/vmangos/core) 1.12.1 vanilla WoW server — server operations, content and loot authoring, item retexturing, 3D terrain and building editing, a full custom-spell pipeline, and a fleet of AI-driven playerbots, all from one web UI. It's paired with **SuperUI-Core**, a companion VMaNGOS fork that carries the C++ side of the platform: the bot fleet, in-core loot generation, the combat-rotation system, and the bridge the web app talks to. Built with ASP.NET Core 8.0 MVC, jQuery, SignalR, Three.js, and MariaDB/MySQL. Runs on Linux, developed on Windows.
+MangosSuperUI is an integrated development platform for building a deeply modified Vanilla WoW experience around a [VMaNGOS](https://github.com/vmangos/core) fork (SuperUi-Core).
+
+It combines a browser-based operations and content-authoring platform, a companion VMaNGOS fork, an autonomous playerbot simulation, custom loot and spell pipelines, world-editing tools, and an engineering knowledge base.
+
+I am not designing these as isolated utilities. They are instead designed as one system: SuperUI allows you to modify and tweak the gameplay feel from a UI and operates the world, while SuperUI-Core executes the server-side mechanics and bots (the VMaNGOS fork).
+
+It is the tooling and runtime stack I'm building for the particular version of Vanilla I want to build and play. It can absolutely still be used with stock VMaNGOS - but many of the features (the SuperUI bots, lootifiers, and other future changes) simply won't work as there is no mechanism within stock VMaNGOS for those actions to happen.
+
+
 
 <!-- Nico: leaving "Why This Exists" untouched per your note that you're rewriting it. -->
 
@@ -12,7 +20,7 @@ MangosSuperUI is a browser-based platform for running, editing, and extending a 
 
 I run a 1.12 VMaNGOS emulation server at home — not public, just for me. 
 
-We all have our own idea of what vanilla could have been, or what we wanted it to be. To make that happen for myself, I needed a way to modify and tune the gameworld in large, batched jobs, so that I could achieve that perfect vision.
+We all have our own idea of what vanilla could have been, or what we wanted it to be. To make that happen for myself, I needed a way to modify and tune the gameworld in large, batched jobs, so that I could achieve that vision, and replay later with potentially a slightly new take.
 
 My end goal is a living game world with thousands of AI-driven bots that feel real enough, custom spells, items, gameplay loop additions that feel vanilla but add flavor, and the tooling to iterate on all of it rapidly and repeatedly from a single coherent tool that works via intuitive user interfaces instead of retooling myself mentally for each separate subsystem.
 
@@ -102,8 +110,6 @@ The fork is functional and stable. Everything is additive. Your base unmodified 
 
 > The **Vendors**, **Creatures**, and **Quests** editors are still on the roadmap — see Planned
 
-
-
 ![Content Editing](Screenshots/3d-armory.png)
 
 ### Lootifiers
@@ -134,8 +140,6 @@ A dedicated section for recoloring items into full tier sets — its own control
 Currently its only doing recolors / palette swaps. It's all CPU, and you have different mathematical/logical loops for the existing 7 "theories". While the items page has a pathway that goes to ComfyUI for actual retexturing - at the moment this is too random and uncontrolled. The end goal is to be able to generate coherent retextures that fit the gameworld look.
 
 You can choose to apply a palette change to lootified items in their various tiers (green/blue/epic/legendary) across the current three major lootifier avenues: Crafting, Questing, and Dungeon/Raid/Openworld. 
-
-
 
 ![Content Editing](Screenshots/retexture-engine.png)
 
@@ -174,8 +178,6 @@ A complete custom spell creation pipeline from concept to playable in-game. Crea
 
 While trainer registration, icons, and visual changes all work - it is still a farcry from being a tool that allows you to add a coherent spell family, or make true novel spell effects. Can you turn frostbolt pink and change the particle speeds/density/emit patterns and make it arcane? Sure. Can you create a spell from scratch without choosing a base spell and easily understand what each spell phase does? No. It's a good start, but it needs a lot more.
 
-
-
 ### AI Playerbots — Barrens Chat
 
 **Status: 4/10**
@@ -211,8 +213,6 @@ Working, but still a far way from done. They level, they quest, and you can invi
 
 **Settings** — Full path and credential configuration through the web UI. DBC file status, ComfyUI node pool monitoring, Ollama connectivity. Configuration override system (`server-config.json` over `appsettings.json`).
 
-
-
 ### Wiki
 
 **Status: 3/10**
@@ -230,8 +230,6 @@ Only after all of that is assembled does the local model get involved, and it ge
 Every page is then checked before it's accepted. Mechanical verifiers confirm that each mined member actually appears in the narrative, that documented boundaries are grounded in real code spans, and that nothing was invented: a config key that isn't in the mined key set, or a table that isn't in the real schema, fails the page and sends it back for another pass. Degenerate output retries automatically. 
 
 The documents provide a very useful way to modify and add functionality to the core, as all of the empirical calls/callees & other data allows a frontier model to 99% pinpoint exactly which source files we need to make a given modification.
-
-
 
 ### Profession Tuning
 
@@ -327,9 +325,13 @@ Everything in the status board above at 3/10 or higher. Server management, conte
 ### Planned
 
 - **Vendors & Creatures** — NPC browsing, vendor inventory editing, trainer spell lists
+
 - **Quests** — quest template editor
+
 - **Game Tuning** — XP/honor/reputation rate sliders
+
 - **Adding items to professions** — the larger Profession Tuning goal
+
 - **Docker Compose** packaging for one-command deployment
 
 - **Sound integration** for Spell Creator via SoundEntries.dbc

@@ -26,6 +26,10 @@ import {
     SelectTool
 } from './selection.js';
 import { TransformGizmoManager } from './transform.js';
+import { PlayerCharacter } from './character.js';
+import { FoliageField } from './foliage.js';
+import { WorldLighting } from './world-lighting.js';
+import { CharacterController } from './character-control.js';
 import {
     createMovementTicker,
     attachWalkLook,
@@ -122,6 +126,24 @@ editor.objectStream = objectStream;
 editor.placementStore = placementStore;
 editor.walkModeImpl = new WalkMode(editor);
 
+// ── Ground-effect foliage (grass, ferns, flowers, pebbles) ───────────────────
+//
+// Off until switched on in Options. The scatter is cheap but it does hold a
+// per-tile payload and a handful of instanced draws, and a world editor is not
+// always a place you want grass in the way.
+const foliage = new FoliageField(editor);
+editor.foliage = foliage;
+viewport.addTicker((vp, dt) => foliage.tick(vp, dt));
+
+// ── Authored exterior lighting (Light.dbc) ──────────────────────────────────
+//
+// Off until switched on in Options, and it OWNS the lighting rig while on:
+// sun colour, ambient colour, fog colour, fog distances and the sky all come
+// from the data. Switching it off restores the rig exactly as it was.
+const worldLighting = new WorldLighting(editor);
+editor.worldLighting = worldLighting;
+viewport.addTicker((vp, dt) => worldLighting.tick(vp, dt));
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tools — 'select' (real picker, Phase 4) + 'place-wmo' + 'sculpt' (Phase 8).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,7 +177,13 @@ editor.tools.setActive('select');
 // ─────────────────────────────────────────────────────────────────────────────
 
 const movementTicker = createMovementTicker(editor);
-viewport.addTicker(movementTicker);
+viewport.addTicker((vp, dt) => {
+    // Character mode owns the camera. Running the flycam ticker alongside it
+    // means two writers on camera.position — the exact shape of the M4.1
+    // runaway. One authority at a time.
+    if (editor.characterController && editor.characterController.enabled) return;
+    movementTicker(vp, dt);
+});
 attachWalkLook(editor);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,14 +215,16 @@ function loadPresetByKey(presetKey, label) {
 
         // Apply pending teleport if any.
         if (pendingTeleport) {
-            const cam = editor.viewport.rig.camera;
-            const ctl = editor.viewport.rig.controls;
-            cam.position.set(pendingTeleport.meshX, 30, pendingTeleport.meshZ);
-            ctl.target.set(pendingTeleport.meshX, 25, pendingTeleport.meshZ - 10);
-            if (!editor.viewport.rig.walk.mode) {
-                editor.viewport.rig.enterWalkMode();
+            const rig = editor.viewport.rig;
+            if (!rig.walk.mode) {
+                rig.enterWalkMode();
                 editor.signals.walkModeChanged.dispatch(true);
             }
+            // M1.1: land ON the terrain at the teleport target. The old code
+            // hard-coded y=30, which only worked because the scene used to be
+            // centred on Y=0; at true world height it drops you underground in
+            // high zones and in mid-air in low ones.
+            tileGrid.frameCameraOnCentre(pendingTeleport.meshX, pendingTeleport.meshZ);
             pendingTeleport = null;
         }
     });
@@ -236,6 +266,113 @@ addToolbarShortcuts(editor);
         sculptBtn.className = toolId === 'sculpt'
             ? 'btn btn-sm btn-success'
             : 'btn btn-sm btn-dark';
+    });
+})();
+
+// ── M4.1: player character ───────────────────────────────────────────────────
+//
+// Loaded lazily on first toggle — the GLB is a few MB and the server may have
+// to generate it, so paying that cost on page load for a feature nobody has
+// asked for yet would be rude.
+//
+// The button reports its own state honestly: "Loading..." while the fetch is in
+// flight, and the failure reason in the title attribute if the server could not
+// build the model (usually a missing MPQ or a stale SkinnedGlbVersion).
+const playerCharacter = new PlayerCharacter(editor);
+editor.playerCharacter = playerCharacter;
+
+const characterController = new CharacterController(editor, playerCharacter);
+editor.characterController = characterController;
+
+(function addCharacterButton() {
+    const anchor = document.getElementById('weLoadBtn');
+    if (!anchor || !anchor.parentElement) return;
+    const container = anchor.parentElement;
+
+    const btn = document.createElement('button');
+    btn.id = 'weCharacterBtn';
+    btn.textContent = 'Character';
+    btn.className = 'btn btn-sm btn-dark';
+    btn.style.cssText = 'margin-left:8px;font-size:12px;padding:2px 8px;';
+    btn.title = 'Play as a character. W/S move, A/D turn, Q/E strafe, ' +
+                'Shift walk, right-drag steer (swaps A/D to strafe), ' +
+                'left-drag look without turning, wheel zoom, PgUp/PgDn tilt.';
+
+    function paint(state, detail) {
+        if (state === 'loading') {
+            btn.textContent = 'Loading...';
+            btn.className = 'btn btn-sm btn-secondary';
+            btn.disabled = true;
+        } else {
+            btn.disabled = false;
+            btn.textContent = 'Character';
+            btn.className = characterController.enabled
+                ? 'btn btn-sm btn-success'
+                : 'btn btn-sm btn-dark';
+        }
+        if (detail) btn.title = detail;
+    }
+
+    function spawnHere() {
+        // Drop the character on the ground under the current view pivot, facing
+        // the way the camera is looking.
+        const rig = editor.viewport.rig;
+        const t = rig.controls.target;
+        // Face the way the camera is looking. Derived from the camera's own
+        // basis rather than allocating a Vector3, so index.js does not need a
+        // THREE import for one lookup.
+        const e = rig.camera.matrixWorld.elements;
+        const yaw = Math.atan2(-e[8], -e[10]);   // -Z column = view direction
+
+        // Probe for real ground rather than trusting the pivot's height.
+        const tg = editor.tileGrid;
+        let meshes = null;
+        if (tg) {
+            meshes = tg.isDungeon
+                ? tg.dungeonMeshes
+                : (tg.terrainMeshes ? tg.terrainMeshes() : null);
+        }
+        const hit = rig.probeGroundY(meshes, t.x, t.z, rig.camera.position.y);
+        characterController.spawnAt(
+            t.x, (hit !== null && isFinite(hit)) ? hit : t.y, t.z, yaw);
+    }
+
+    btn.addEventListener('click', async () => {
+        btn.blur();
+        if (characterController.enabled) {
+            characterController.disable();
+            playerCharacter.setVisible(false);
+            paint('idle', 'Play as a character');
+            Status.set('Character off');
+            return;
+        }
+
+        if (!playerCharacter.isLoaded) {
+            paint('loading');
+            try {
+                await playerCharacter.load('Human', 'Male');
+            } catch (err) {
+                console.error('[character]', err);
+                paint('idle', 'Failed: ' + err.message);
+                Status.set('Character failed: ' + err.message);
+                return;
+            }
+        }
+
+        playerCharacter.setVisible(true);
+        spawnHere();
+        characterController.enable();
+        paint('idle');
+        Status.set('Character on — W/S move, A/D turn, Q/E strafe, wheel zoom');
+    });
+
+    container.appendChild(btn);
+
+    // A preset swap moves the world out from under the character.
+    editor.signals.presetClearing.add(() => {
+        if (characterController.enabled) characterController.disable();
+        if (playerCharacter.isLoaded) playerCharacter.setVisible(false);
+        paint('idle');
     });
 })();
 
@@ -293,6 +430,8 @@ window.we = {
     placement: placementStore,
     objectStream: objectStream,
     tileGrid: tileGrid,
+    foliage: foliage,
+    lighting: worldLighting,
     selection: editor.selection,
     outlineProxies: outlineProxies,
     transformGizmo: transformGizmo,

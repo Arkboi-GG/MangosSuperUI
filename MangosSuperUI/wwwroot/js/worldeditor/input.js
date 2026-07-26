@@ -9,6 +9,25 @@ import * as THREE from 'three';
 
 const MOUSE_LOOK_SENSITIVITY = 0.0045;
 
+// M1.2 — all movement is now YARDS PER SECOND (M1.1 made a yard a real yard).
+// These reproduce the old per-frame feel at 60fps (3.0 and 10.0 per frame) so
+// the editor flycam handles exactly as before on a 60Hz display, but a 144Hz
+// machine no longer moves 2.4x faster for the same keypress.
+//
+// They are FLYCAM speeds, not character speeds — for reference, a 1.12 player
+// walks at 2.5 yd/s and runs at 7.0 yd/s. Those land with the character in M4.
+const DEFAULT_MOVE_SPEED = 180.0;   // yd/s  (= 3.0/frame at 60fps)
+const DEFAULT_SPRINT_SPEED = 600.0; // yd/s  (= 10.0/frame at 60fps)
+
+// Arrow-key look, radians per second (= 0.03 and 0.015 per frame at 60fps).
+const TURN_SPEED = 1.8;
+const TILT_SPEED = 0.9;
+
+export const MOVEMENT_DEFAULTS = {
+    move: DEFAULT_MOVE_SPEED,
+    sprint: DEFAULT_SPRINT_SPEED
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Movement ticker
 // ─────────────────────────────────────────────────────────────────────────────
@@ -20,8 +39,8 @@ const MOUSE_LOOK_SENSITIVITY = 0.0045;
 export function createMovementTicker(editor) {
     const moveKeys = {};
     let sprinting = false;
-    let moveSpeed = 3.0;
-    let sprintSpeed = 10.0;
+    let moveSpeed = DEFAULT_MOVE_SPEED;
+    let sprintSpeed = DEFAULT_SPRINT_SPEED;
 
     document.addEventListener('keydown', (e) => {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT') {
@@ -36,7 +55,9 @@ export function createMovementTicker(editor) {
         if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') sprinting = false;
     });
 
-    const ticker = (vp) => {
+    const ticker = (vp, dt) => {
+        // Tolerate a caller that predates the dt argument.
+        if (!(dt > 0)) dt = (vp && vp.deltaTime > 0) ? vp.deltaTime : 1 / 60;
         if (editor.tools.activeId === 'place-wmo') return; // suppress during placement
 
         const camera = vp.rig.camera;
@@ -60,14 +81,14 @@ export function createMovementTicker(editor) {
         if (moveKeys['KeyQ']) delta.y -= 1;
 
         if (delta.lengthSq() > 0) {
-            const speed = sprinting ? sprintSpeed : moveSpeed;
+            const speed = (sprinting ? sprintSpeed : moveSpeed) * dt;
             delta.normalize().multiplyScalar(speed);
             camera.position.add(delta);
             controls.target.add(delta);
         }
 
-        const turnSpeed = 0.03;
-        const tiltSpeed = 0.015;
+        const turnSpeed = TURN_SPEED * dt;
+        const tiltSpeed = TILT_SPEED * dt;
         const arrowPressed = moveKeys['ArrowLeft'] || moveKeys['ArrowRight'] ||
             moveKeys['ArrowUp'] || moveKeys['ArrowDown'];
         if (!arrowPressed) return;
