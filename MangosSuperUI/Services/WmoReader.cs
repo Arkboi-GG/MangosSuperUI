@@ -67,6 +67,9 @@ public class WmoReader
     private static readonly uint MAGIC_MONR = ChunkId("MONR");
     private static readonly uint MAGIC_MOTV = ChunkId("MOTV");
     private static readonly uint MAGIC_MOBA = ChunkId("MOBA");
+    // MOCV = baked per-vertex interior lighting (warm tavern glow, dark mine).
+    // See SYSTEM_WMO_INTERIOR_LIGHTING.md.
+    private static readonly uint MAGIC_MOCV = ChunkId("MOCV");
     // MLIQ = liquid inside the WMO group (Stormwind canals, Undercity slime, etc.).
     // Present only when MOGP.GroupFlags bit 0x1000 (SMOGroup::LIQUIDSURFACE) is set.
     private static readonly uint MAGIC_MLIQ = ChunkId("MLIQ");
@@ -370,6 +373,28 @@ public class WmoReader
                             }
                         }
                     }
+                    else if (subMagic == MAGIC_MOCV)
+                    {
+                        // MOCV — Blizzard's baked per-vertex interior light, BGRA
+                        // bytes, one per MOVT vertex. Only the FIRST MOCV is read
+                        // (a second chunk is Cataclysm-era). Swizzled to RGBA.
+                        // This is the warm interior glow the walls carry; the
+                        // shader applies it via the batch-type branch. See
+                        // SYSTEM_WMO_INTERIOR_LIGHTING.md.
+                        if (group.VertexColors.Count == 0)
+                        {
+                            int colCount = (int)(subSize / 4);
+                            for (int i = 0; i < colCount; i++)
+                            {
+                                int cOfs = subData + i * 4;
+                                byte b = data[cOfs + 0];
+                                byte g = data[cOfs + 1];
+                                byte r = data[cOfs + 2];
+                                byte a = data[cOfs + 3];
+                                group.VertexColors.Add((r, g, b, a));
+                            }
+                        }
+                    }
                     else if (subMagic == MAGIC_MOBA)
                     {
                         // Render batches, 24 bytes each
@@ -584,6 +609,8 @@ public class WmoGroupData
     /// <summary>MOGP +0x2C: exterior batch count (always visible from outside).</summary>
     public ushort ExtBatchCount { get; set; }
     public List<(byte flags, byte materialId)> TriMaterials { get; set; } = new();
+    /// <summary>MOCV baked interior light, RGBA, one per MOVT vertex (empty = none).</summary>
+    public List<(byte r, byte g, byte b, byte a)> VertexColors { get; set; } = new();
     public List<ushort> Indices { get; set; } = new();
     public List<(float x, float y, float z)> Vertices { get; set; } = new();
     public List<(float x, float y, float z)> Normals { get; set; } = new();

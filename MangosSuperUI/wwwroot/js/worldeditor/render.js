@@ -10,7 +10,7 @@
 //   7. Viewport (renderer, scene assembly, animate loop, resize, input dispatch)
 
 import * as THREE from 'three';
-import { applyWorldLighting, syncWorldLighting } from './world-light.js';
+import { applyWorldLighting, applyWmoLighting, syncWorldLighting } from './world-light.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -24,7 +24,10 @@ import { DepthPrepass } from './collision.js';
 
 export const SKY_TOP = 0x2a4f8a;
 export const SKY_HORIZON = 0xe8a840;
-export const FOG_COLOR = 0xc49a50;
+// MSUIClient WorldAtmosphere DayFog (0.56, 0.71, 0.85) — the light-blue vanilla
+// noon horizon. Was a tan 0xc49a50, which read nothing like the real client and,
+// with the old orange sky dome, is the "big fat sun" this replaces.
+export const FOG_COLOR = 0x8fb5d9;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. Material factories
@@ -198,34 +201,58 @@ export function setWorldLightRig(rig) { _worldLightRig = rig; }
 
 export function makeDoodadMaterial(opts) {
     opts = opts || {};
+    const depthWrite = (opts.depthWrite !== undefined) ? opts.depthWrite : true;
+
+    // Unlit (M2 render flag 0x01): lantern glows, candle flames and glow planes
+    // are authored full-bright and must IGNORE lighting — a lantern cannot go dark
+    // in a shadowed room. MeshBasicMaterial does exactly that; additive blending
+    // (set by the caller) then makes the flame ADD its glow to the scene.
+    if (opts.unlit) {
+        const m = new THREE.MeshBasicMaterial({
+            map: opts.map || null,
+            color: (opts.color !== undefined) ? opts.color : 0xffffff,
+            side: opts.side || THREE.DoubleSide,
+            alphaTest: opts.alphaTest || 0,
+            transparent: opts.transparent || false,
+            depthWrite,
+            fog: true
+        });
+        if (opts.blending) m.blending = opts.blending;
+        return m;
+    }
+
     if (litMode) {
-        return applyWorldLighting(new THREE.MeshStandardMaterial({
+        const mat = applyWorldLighting(new THREE.MeshStandardMaterial({
             map: opts.map || null,
             color: opts.color || 0x808080,
             side: opts.side || THREE.DoubleSide,
             alphaTest: opts.alphaTest || 0,
             transparent: opts.transparent || false,
-            depthWrite: true,
+            depthWrite,
             roughness: 0.7,
             metalness: 0.0,
             fog: true
         }), _worldLightRig);
+        if (opts.blending) mat.blending = opts.blending;
+        return mat;
     }
-    return new THREE.MeshBasicMaterial({
+    const bm = new THREE.MeshBasicMaterial({
         map: opts.map || null,
         color: opts.color || 0x808080,
         side: opts.side || THREE.DoubleSide,
         alphaTest: opts.alphaTest || 0,
         transparent: opts.transparent || false,
-        depthWrite: true,
+        depthWrite,
         fog: true
     });
+    if (opts.blending) bm.blending = opts.blending;
+    return bm;
 }
 
 export function makeWmoMaterial(opts) {
     opts = opts || {};
     if (litMode) {
-        return applyWorldLighting(new THREE.MeshStandardMaterial({
+        const mat = new THREE.MeshStandardMaterial({
             map: opts.map || null,
             color: opts.color || 0xaaaaaa,
             side: opts.side || THREE.FrontSide,
@@ -236,7 +263,13 @@ export function makeWmoMaterial(opts) {
             metalness: 0.05,
             fog: true,
             wireframe: wireframeOn
-        }), _worldLightRig);
+        });
+        // When the geometry carries baked MOCV vertex colours (batchType set),
+        // light interiors with the vanilla baked model; otherwise the plain
+        // world daylight model. Exterior batches (type 3) are identical either way.
+        return (opts.batchType !== undefined)
+            ? applyWmoLighting(mat, _worldLightRig, opts.batchType)
+            : applyWorldLighting(mat, _worldLightRig);
     }
     return new THREE.MeshBasicMaterial({
         map: opts.map || null,
@@ -262,17 +295,34 @@ export function makeWmoMaterial(opts) {
 export class LightingRig {
     constructor(scene) {
         this.scene = scene;
-        this.ambient = new THREE.AmbientLight(0xffe8c8, 0.9);
+
+        // MSUIClient WorldAtmosphere noon, as the default (before Light.dbc
+        // resolves, and the exact rig world-lighting.js restores when toggled
+        // off). The whole world's light level is decided by terrain-splat.js's
+        // worldSunIntensity = sun.intensity/3.5 and worldAmbientIntensity =
+        // (ambient + hemi)/2. Raised from MSUIClient's authored 0.90/0.64 to a
+        // full-bright noon (worldSun 1.0, worldAmbient ~0.95): the authored noon
+        // read too dim on screen (NoToneMapping, exposure 1). Tunable — drop
+        // ambient/hemi back toward 0.64 and sun to 3.15 to match MSUIClient exactly.
+        // Colours are set as sRGB the same way world-lighting.apply() does, so
+        // toggling Light.dbc on/off does not shift the world.
+        this.ambient = new THREE.AmbientLight(0xffffff, 0.95);
+        this.ambient.color.setRGB(0.50, 0.46, 0.38, THREE.SRGBColorSpace);  // warm DayAmbient
         scene.add(this.ambient);
 
-        this.hemi = new THREE.HemisphereLight(0xeebb66, 0x4a5530, 0.8);
+        this.hemi = new THREE.HemisphereLight(0xffffff, 0x3a3320, 0.95);
+        this.hemi.color.setRGB(0.55, 0.62, 0.74, THREE.SRGBColorSpace);
         scene.add(this.hemi);
 
-        this.sun = new THREE.DirectionalLight(0xffbb55, 3.5);
-        this.sun.position.set(-100, 28, 50);
+        this.sun = new THREE.DirectionalLight(0xffffff, 3.5);   // /3.5 = 1.00
+        this.sun.color.setRGB(1.00, 0.90, 0.72, THREE.SRGBColorSpace);   // golden NoonSun
+        this.sun.position.set(-42, 100, 0);   // MSUIClient noon: overhead, slightly -X
         scene.add(this.sun);
 
-        this.fill = new THREE.DirectionalLight(0x99bbdd, 0.4);
+        // MSUIClient has no separate fill light; keep a faint one only so the
+        // few remaining three.js built-in materials are not pitch black on their
+        // shadowed side. It does NOT feed the world lighting model.
+        this.fill = new THREE.DirectionalLight(0x99bbdd, 0.12);
         this.fill.position.set(60, 60, -40);
         scene.add(this.fill);
 
@@ -281,7 +331,7 @@ export class LightingRig {
 
     setLit(v) {
         this._lit = !!v;
-        this.ambient.intensity = this._lit ? 0.9 : 1.4;
+        this.ambient.intensity = this._lit ? 0.95 : 1.4;
         this.hemi.visible = this._lit;
         this.sun.intensity = this._lit ? 3.5 : 1.8;
         this.fill.visible = this._lit;
@@ -711,18 +761,23 @@ export class Viewport {
 
         setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
 
-        // Scene + fog
+        // Scene + fog. Fog distances lean toward MSUIClient's warm-noon feel
+        // (its authored noon is 125..500; the constant fallback is 350..777).
         this.scene = editor.scene;
         this.scene.background = new THREE.Color(FOG_COLOR);
-        this.scene.fog = new THREE.Fog(FOG_COLOR, 180, 550);
+        this.scene.fog = new THREE.Fog(FOG_COLOR, 250, 850);
 
-        // Lighting + sky + ground
+        // Lighting + ground. NO SuperUI sky dome: its blue-to-orange gradient
+        // (a bright orange lower hemisphere) is the "big fat sun". MSUIClient's
+        // sky is either the flat fog-coloured background (the fallback, which the
+        // scene.background above already provides) or the authored five-band sky
+        // that world-lighting.js draws when Light.dbc is on — which is the
+        // default now. So the dome is simply gone.
         this.lighting = new LightingRig(this.scene);
         // Material factories are module-level functions with no viewport
         // reference; hand them the rig once so every lit material can join the
         // world lighting model.
         setWorldLightRig(this.lighting);
-        addSkyDome(this.scene);
         this.ground = addGroundPlane(this.scene);
 
         // Camera + controls

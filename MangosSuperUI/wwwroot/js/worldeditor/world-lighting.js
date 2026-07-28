@@ -320,9 +320,17 @@ export class WorldLighting {
         /** Game-hours per real second. 0 = frozen. Vanilla runs at real time. */
         this.cycleSpeed = 0;
 
-        /** 1.0 means "use the data exactly" — that is the correctness check. */
-        this.sunStrength = 1;
-        this.ambientStrength = 1;
+        /**
+         * 1.0 means "use the data exactly" — the correctness check. The authored
+         * Azeroth noon reads dark on a modern display (NoToneMapping, exposure 1),
+         * so midday looked underlit. These lift it to a bright noon while keeping
+         * the authored HUE. Tunable live via the Light.dbc panel sliders or
+         * `window.we.lighting.sunStrength` / `.ambientStrength` — the ambient
+         * carries more of the lift because the shadowed/ambient-lit areas are what
+         * read as "not bright enough"; the sun is nudged less to avoid blowout.
+         */
+        this.sunStrength = 1.3;
+        this.ambientStrength = 1.55;
 
         this.skyEnabled = true;
         this.stops = Object.assign({}, SKY_STOPS);

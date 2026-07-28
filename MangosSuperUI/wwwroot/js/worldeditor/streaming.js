@@ -87,9 +87,14 @@ export function applyNormalSource(geo) {
     attr.needsUpdate = true;
 }
 
-function makeTextureFromDataURI(dataURI) {
+function makeTextureFromDataURI(dataURI, flipY = true) {
     const tex = new THREE.TextureLoader().load(dataURI);
-    tex.flipY = true;
+    // flipY: WMO (MOTV) UVs render correct at true; M2 DOODAD geometry follows the
+    // glTF/GLB convention (V=0 at TOP) and needs false — the same fix grass got in
+    // foliage.js. With true, every doodad texture is V-flipped: invisible on solid
+    // 3D shapes (bark/canopy tile), but flat/billboard doodads (bushes, saplings)
+    // render literally upside down. So doodads pass false; WMOs keep the default.
+    tex.flipY = flipY;
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
     tex.colorSpace = THREE.SRGBColorSpace;
@@ -118,12 +123,39 @@ export function buildModelParts(data) {
 
         let material;
         if (sub.textureBase64) {
-            material = makeDoodadMaterial({
-                map: makeTextureFromDataURI(sub.textureBase64),
+            // M2 blend mode decides how the submesh composites:
+            //   0 opaque · 1 alpha-key (cutout) · 2 alpha · 3 no-alpha-add ·
+            //   4 add · 5 mod · 6 mod2x
+            // Additive (3/4) is the FIRE/GLOW path (the flame adds light); unlit
+            // (candle flames, lantern glows) renders full-bright. Opaque/alpha-key
+            // keep the cutout that already worked, so ordinary props are unchanged.
+            const blend = sub.blendMode || 0;
+            const additive = (blend === 3 || blend === 4);
+            const softAlpha = (blend === 2 || blend === 5 || blend === 6);
+            const o = {
+                map: makeTextureFromDataURI(sub.textureBase64, false),  // M2 UVs: V=0 at top
                 side: THREE.DoubleSide,
-                alphaTest: 0.5,
-                transparent: true
-            });
+                unlit: !!sub.unlit,
+            };
+            if (additive) {
+                o.transparent = true;
+                o.blending = THREE.AdditiveBlending;   // glow adds to the scene
+                o.depthWrite = false;                  // and never occludes
+                o.alphaTest = 0;
+                if (o.unlit) o.color = 0xffffff;        // full-bright flame
+            } else if (softAlpha) {
+                o.transparent = true;
+                o.depthWrite = !sub.noZWrite;
+                o.alphaTest = 0;
+                if (o.unlit) o.color = 0xffffff;
+            } else {
+                // opaque (0) / alpha-key (1) — the existing cutout, unchanged.
+                o.transparent = true;
+                o.alphaTest = 0.5;
+                o.depthWrite = !sub.noZWrite;
+                if (o.unlit) o.color = 0xffffff;
+            }
+            material = makeDoodadMaterial(o);
         } else {
             material = makeDoodadMaterial({ color: 0x808080, side: THREE.DoubleSide });
         }
@@ -137,6 +169,21 @@ export function buildWmoParts(data, opts) {
     const posAttr = new THREE.Float32BufferAttribute(data.positions, 3);
     const normAttr = new THREE.Float32BufferAttribute(data.normals, 3);
     const uvAttr = new THREE.Float32BufferAttribute(data.uvs, 2);
+
+    // MOCV baked interior light, one normalized RGBA per vertex. Shared across
+    // submeshes like the position buffer. When present, submeshes light through
+    // the vanilla baked model (interior glow); when absent (old cache), the plain
+    // world daylight model — so it degrades gracefully.
+    let mocvAttr = null;
+    if (data.colorsBase64) {
+        const bin = atob(data.colorsBase64);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        if (u8.length === (data.positions.length / 3) * 4) {
+            mocvAttr = new THREE.BufferAttribute(u8, 4, true);   // normalized -> 0..1 in shader
+        }
+    }
+
     const allIndices = data.indices;
     const subs = data.submeshes || [];
 
@@ -150,6 +197,7 @@ export function buildWmoParts(data, opts) {
         geo.setAttribute('position', posAttr);
         geo.setAttribute('normal', normAttr);
         geo.setAttribute('uv', uvAttr);
+        if (mocvAttr) geo.setAttribute('mocv', mocvAttr);
         geo.setIndex(new THREE.BufferAttribute(new Uint32Array(subIndices), 1));
 
         // Instance interiors (AQ, Naxx) are viewed from inside — FrontSide
@@ -158,18 +206,24 @@ export function buildWmoParts(data, opts) {
         const sideMode = forceDoubleSide ? THREE.DoubleSide
             : (sub.doubleSided ? THREE.DoubleSide : THREE.FrontSide);
 
+        // batchType (1/2/3) only when MOCV is present, so the baked interior
+        // model runs; without it makeWmoMaterial keeps the plain daylight model.
+        const batchType = mocvAttr ? sub.batchType : undefined;
+
         let material;
         if (sub.textureBase64) {
             material = makeWmoMaterial({
                 map: makeTextureFromDataURI(sub.textureBase64),
                 side: sideMode,
                 alphaTest: sub.transparent ? 0.5 : 0,
-                transparent: !!sub.transparent
+                transparent: !!sub.transparent,
+                batchType
             });
         } else {
             material = makeWmoMaterial({
                 color: 0xaaaaaa,
-                side: sideMode
+                side: sideMode,
+                batchType
             });
         }
         parts.push({ geometry: geo, material: material });
@@ -514,6 +568,15 @@ export class InstancePool {
 
 const MAX_CONCURRENT_FETCHES = 4;
 
+// ── Residency caps (why Stormwind used to crash the tab) ─────────────────────
+// Object eviction was radius-only and had NO count cap: a dense city returns
+// thousands of placements plus hundreds of UNIQUE models, each decoding its own
+// GPU textures, all instantiated in one frame. That is the OOM / stall. These
+// bound the working set regardless of how much the server hands back.
+const MAX_RESIDENT_PLACEMENTS = 1400;  // hard ceiling; farthest evicted over it
+const ADD_BUDGET_PER_PUMP = 140;       // new instances created per pump (nearest first)
+const MAX_LOAD_RADIUS = 320;           // yd; clamps the working set at the source
+
 export class ObjectStream {
     constructor(editor) {
         this.editor = editor;
@@ -529,6 +592,7 @@ export class ObjectStream {
 
         this.LOAD_RADIUS = 250;
         this.UNLOAD_RADIUS = 350;
+        this._addBudget = 0;   // per-pump instantiation budget (set in pump)
 
         this._diagNextNearby = true;
 
@@ -607,22 +671,14 @@ export class ObjectStream {
         // DUNGEON: skip streaming entirely for dungeon maps
         if (this.editor.tileGrid && this.editor.tileGrid.isDungeon) return;
 
-        if (!this.editor.currentPreset || this._streamingInFlight) return;
+        // Eviction runs FIRST, before the in-flight guard — otherwise a slow
+        // NearbyObjects fetch (exactly what happens under city load) starves the
+        // unload and the resident set only ever grows. Distance eviction + the
+        // hard count cap keep memory bounded even mid-fetch.
+        this._evictDistant(camX, camZ);
+        this._enforceResidentCap(camX, camZ);
 
-        // Unload distant
-        const toRemove = [];
-        for (const id in this.activePlacements) {
-            const p = this.activePlacements[id];
-            const dx = p.x - camX;
-            const dz = p.z - camZ;
-            if (dx * dx + dz * dz > this.UNLOAD_RADIUS * this.UNLOAD_RADIUS) toRemove.push(id);
-        }
-        for (const id of toRemove) {
-            const p = this.activePlacements[id];
-            if (p.instanced) this.pool.removeInstance(p.model, id);
-            delete this.activePlacements[id];
-        }
-        if (toRemove.length > 0) this.pool.flushBounds();
+        if (!this.editor.currentPreset || this._streamingInFlight) return;
 
         // Server fetch
         this._streamingInFlight = true;
@@ -647,16 +703,67 @@ export class ObjectStream {
                 if (gen !== this._generation) return;
                 if (!resp.success) return;
                 const adds = resp.add || {};
+                // Nearest-first, budgeted: never instantiate a whole city in one
+                // frame. Doodads and WMOs share one budget; the leftovers are
+                // picked up on later pumps as nearer ones evict.
+                this._addBudget = ADD_BUDGET_PER_PUMP;
+                this._addWmos((adds.wmos || []), camX, camZ);       // buildings first
                 this._addDoodads(adds.doodads || [], camX, camZ);
-                this._addWmos((adds.wmos || []), camX, camZ);
+                // A large response can still overshoot the cap; trim the farthest.
+                this._enforceResidentCap(camX, camZ);
                 // PERF: recompute bounding spheres after this batch
                 this.pool.flushBounds();
             })
             .catch(() => { this._streamingInFlight = false; });
     }
 
+    /** Remove placements past UNLOAD_RADIUS (was inline in pump). */
+    _evictDistant(camX, camZ) {
+        const toRemove = [];
+        const r2 = this.UNLOAD_RADIUS * this.UNLOAD_RADIUS;
+        for (const id in this.activePlacements) {
+            const p = this.activePlacements[id];
+            const dx = p.x - camX, dz = p.z - camZ;
+            if (dx * dx + dz * dz > r2) toRemove.push(id);
+        }
+        for (const id of toRemove) {
+            const p = this.activePlacements[id];
+            if (p.instanced) this.pool.removeInstance(p.model, id);
+            delete this.activePlacements[id];
+        }
+        if (toRemove.length > 0) this.pool.flushBounds();
+    }
+
+    /**
+     * Hard ceiling on resident placements. Over the cap, evict the FARTHEST —
+     * the single change that stops a dense city from exhausting GPU memory,
+     * because unique-model textures scale with the resident set. Radius alone
+     * never bounded the count.
+     */
+    _enforceResidentCap(camX, camZ) {
+        const ids = Object.keys(this.activePlacements);
+        if (ids.length <= MAX_RESIDENT_PLACEMENTS) return;
+        ids.sort((a, b) => {
+            const pa = this.activePlacements[a], pb = this.activePlacements[b];
+            const da = (pa.x - camX) * (pa.x - camX) + (pa.z - camZ) * (pa.z - camZ);
+            const db = (pb.x - camX) * (pb.x - camX) + (pb.z - camZ) * (pb.z - camZ);
+            return db - da;   // farthest first
+        });
+        const cut = ids.length - MAX_RESIDENT_PLACEMENTS;
+        let flushed = false;
+        for (let i = 0; i < cut; i++) {
+            const id = ids[i];
+            const p = this.activePlacements[id];
+            if (p.instanced) { this.pool.removeInstance(p.model, id); flushed = true; }
+            delete this.activePlacements[id];
+        }
+        if (flushed) this.pool.flushBounds();
+    }
+
     _addDoodads(arr, camX, camZ) {
+        arr = this._nearestFirst(arr, camX, camZ);
         for (const d of arr) {
+            if (this._addBudget <= 0) break;              // budget: rest retry next pump
             if (this.activePlacements[d.id]) continue;
 
             // Two flavors of doodad share this array:
@@ -676,6 +783,7 @@ export class ObjectStream {
                 rec.rotY = d.rotY;
             }
             this.activePlacements[d.id] = rec;
+            this._addBudget--;
 
             if (this.pool.isModelLoaded(d.model)) {
                 this.pool.addInstance(d.model, d.id, this.activePlacements[d.id]);
@@ -687,11 +795,23 @@ export class ObjectStream {
         }
     }
 
+    /** Sort a placement array nearest-first to the camera (budget spends on the near ones). */
+    _nearestFirst(arr, camX, camZ) {
+        if (!arr || arr.length < 2) return arr || [];
+        return arr.slice().sort((a, b) => {
+            const da = (a.x - camX) * (a.x - camX) + (a.z - camZ) * (a.z - camZ);
+            const db = (b.x - camX) * (b.x - camX) + (b.z - camZ) * (b.z - camZ);
+            return da - db;
+        });
+    }
+
     _addWmos(arr, camX, camZ) {
+        arr = this._nearestFirst(arr, camX, camZ);
         const customKeys = this.editor.placementStore
             ? this.editor.placementStore.customPlacementKeys
             : {};
         for (const w of arr) {
+            if (this._addBudget <= 0) break;
             if (this.activePlacements[w.id]) continue;
             // Skip if a custom placement is at this position (avoids
             // double-rendering placed WMOs that also exist in the ADT).
@@ -703,6 +823,7 @@ export class ObjectStream {
                 rotX: w.rotX, rotY: w.rotY, rotZ: w.rotZ,
                 kind: 'w', instanced: false
             };
+            this._addBudget--;
             if (this.pool.isModelLoaded(w.model)) {
                 this.pool.addInstance(w.model, w.id, this.activePlacements[w.id]);
                 this.activePlacements[w.id].instanced = true;
@@ -878,7 +999,10 @@ export class TileGrid {
 
     objectRadiiForCurrent() {
         const base = this.tileWidthMesh || 400;
-        const load = Math.max(150, (this.TILE_RADIUS + 0.5) * base * 0.6);
+        // Clamped to MAX_LOAD_RADIUS: with a real 533-yd tile this used to reach
+        // ~480 yd, so a whole city loaded at once. Capping the request shrinks
+        // the working set at the source; the resident-count cap backs it up.
+        const load = Math.min(MAX_LOAD_RADIUS, Math.max(150, (this.TILE_RADIUS + 0.5) * base * 0.6));
         const unload = load * 1.4;
         return { load, unload };
     }
@@ -1113,7 +1237,10 @@ export class TileGrid {
             this.dungeonInfo = null;
             this.isDungeon = false;
 
-            const FOG_COLOR = 0xc49a50;
+            // MSUIClient DayFog blue (matches render.js FOG_COLOR). world-lighting
+            // re-applies the authored fog each frame when it is on; this is the
+            // fallback for the moment after leaving a dungeon.
+            const FOG_COLOR = 0x8fb5d9;
             scene.background = new THREE.Color(FOG_COLOR);
             if (scene.fog) scene.fog.color = new THREE.Color(FOG_COLOR);
 

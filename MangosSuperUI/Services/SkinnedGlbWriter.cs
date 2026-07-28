@@ -320,16 +320,25 @@ public static class SkinnedGlbWriter
             int parentIdx = bone.ParentBone;
             bool hasValidParent = parentIdx >= 0 && parentIdx < i && nodes[parentIdx] != null;
 
+            // Carry the M2 key-bone id in the node NAME so the browser can find
+            // the strafe twist bones at runtime (SpineLow = 4, Waist = 5) without
+            // needing a glTF `extras` object — SharpGLTF's NodeBuilder.Extras is
+            // version-dependent, the name is not. Only bones that ARE a key bone
+            // get the suffix (KeyBoneId >= 0); the rest stay plain "Bone_{i}" so
+            // the animation-track node names three.js derives never carry a
+            // hyphen. character.js parses /_k(\d+)$/ off THREE.Bone.name.
+            string boneName = bone.KeyBoneId >= 0 ? $"Bone_{i}_k{bone.KeyBoneId}" : $"Bone_{i}";
+
             NodeBuilder node;
             if (hasValidParent)
             {
-                node = nodes[parentIdx].CreateNode($"Bone_{i}");
+                node = nodes[parentIdx].CreateNode(boneName);
                 var parentPivot = m2.Bones[parentIdx].Pivot;
                 node.WithLocalTranslation(bone.Pivot - parentPivot);
             }
             else
             {
-                node = armatureRoot.CreateNode($"Bone_{i}");
+                node = armatureRoot.CreateNode(boneName);
                 node.WithLocalTranslation(bone.Pivot);
             }
 
@@ -670,6 +679,10 @@ public static class SkinnedGlbWriter
         28 => "Ready2HL",
         29 => "ReadyBow",
         30 => "Dodge",
+        37 => "JumpStart",
+        38 => "Jump",
+        39 => "JumpEnd",
+        40 => "Fall",
         _ => $"Anim{animationId}",
     };
 

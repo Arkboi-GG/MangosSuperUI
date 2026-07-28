@@ -366,7 +366,8 @@ export class OptionsModal {
         // that quietly moves off 1.0 destroys it. They live on
         // window.we.lighting for A/B work.
         html += divider('World Lighting');
-        html += row('Light.dbc', 'optWorldLight', 'toggle', { active: false, textOn: 'Off' });
+        // On by default now: this is MSUIClient's own lighting model.
+        html += row('Light.dbc', 'optWorldLight', 'toggle', { active: true, textOn: 'On' });
         html += row('Authored Sky', 'optWorldSky', 'toggle', { active: true, textOn: 'On' });
         html += row('Time of Day', 'optTimeOfDay', 'slider',
             { min: 0, max: 1440, val: 720, display: '12:00' });
@@ -380,7 +381,7 @@ export class OptionsModal {
         });
 
         html += divider('Foliage');
-        html += row('Foliage', 'optFoliage', 'toggle', { active: false, textOn: 'Off' });
+        html += row('Foliage', 'optFoliage', 'toggle', { active: true, textOn: 'On' });
         html += row('Density', 'optFoliageDensity', 'slider',
             { min: 0, max: 20, val: Math.round(FOLIAGE_DEFAULTS.densityScale * 10),
               display: FOLIAGE_DEFAULTS.densityScale.toFixed(1) + 'x' });

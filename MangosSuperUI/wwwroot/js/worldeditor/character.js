@@ -90,9 +90,28 @@ const RATE_MAX = 2.2;
 
 
 // Animation ids we care about here (AnimationData.dbc, vanilla 1.12).
-// SkinnedGlbWriter bakes 0/4/5 today; 13/37/38/39/40 need a bake-list bump
-// plus a CacheVersionRegistry.SkinnedGlbVersion bump to land.
-const ANIM = { STAND: 0, WALK: 4, RUN: 5, WALK_BACK: 13 };
+// SkinnedGlbWriter bakes 0/4/5/13/37/38/39/40 (DefaultAnimationsToBake).
+const ANIM = {
+    STAND: 0, WALK: 4, RUN: 5, WALK_BACK: 13,
+    JUMP_START: 37, JUMP: 38, JUMP_END: 39, FALL: 40,
+};
+
+// ── Strafe torso split (MSUIClient CharacterRenderer.StrafeStyle.Split) ──────
+// The legs take the FULL strafe angle by turning the whole model; the torso is
+// pulled back by the remainder so it only follows part way. TorsoFollow 0.66 is
+// Nico's eyeball match of the real client (legs ~90 deg, torso ~60). The twist
+// applied to the SpineLow bone is therefore (TorsoFollow - 1) * moveYaw.
+const TORSO_FOLLOW = 0.66;
+// Past ~110 deg the character is going backwards: swap to Walkbackwards and take
+// the angle off what is LEFT after the half turn (CharacterRenderer.cs 1589).
+const STRAFE_BACKWARD = 1.92;   // rad
+// _moveYaw easing (CharacterRenderer.Update: blend = 1 - exp(-dt*14)).
+const MOVE_YAW_RATE = 14.0;
+// Motion-direction smoothing for forwardness/sideness (MeasureMotion: dt*12).
+const MOTION_SMOOTH_RATE = 12.0;
+// Key-bone ids carried in the GLB bone names as "_k<id>" (SkinnedGlbWriter).
+const KEY_BONE_SPINE_LOW = 4;   // torso subtree root
+const KEY_BONE_WAIST = 5;       // legs subtree root — fallback if SpineLow absent
 
 // Starter clothes. showDefaultGeosets() gives the NAKED baseline (base body,
 // one hair variant, default underwear) — correct, but not what you want to look
@@ -112,12 +131,16 @@ const CLIP_NAMES = {
     [ANIM.WALK]: 'Walk',
     [ANIM.RUN]: 'Run',
     [ANIM.WALK_BACK]: 'Walkbackwards',
+    [ANIM.JUMP_START]: 'JumpStart',
+    [ANIM.JUMP]: 'Jump',
+    [ANIM.JUMP_END]: 'JumpEnd',
+    [ANIM.FALL]: 'Fall',
 };
 
 // JumpStart and JumpEnd are the ONLY one-shots. M2Sequence's 0x20 flag is
 // not a loop flag — it reads clear on Stand/Walk/Run — so this is hardcoded
-// rather than derived. Unused until the controller grows gravity in M5.
-const ONE_SHOT = new Set([37, 39]);
+// rather than derived. Jump(38) and Fall(40) loop while airborne.
+const ONE_SHOT = new Set([ANIM.JUMP_START, ANIM.JUMP_END]);
 
 // ─────────────────────────────────────────────────────────────────────────
 // Model URL lookup
@@ -174,6 +197,20 @@ export class PlayerCharacter {
         this.heading = 0;        // radians, camera-style yaw (see file header)
         this.groundSpeed = 0;    // smoothed, yd/s
         this.rawSpeed = 0;       // this frame's measured speed, yd/s
+
+        // ── Strafe torso split state ──
+        this._moveYaw = 0;       // eased model turn toward travel direction
+        this._forwardness = 0;   // smoothed dot(travelDir, facing)
+        this._sideness = 0;      // smoothed dot(travelDir, right)
+        this._torsoBone = null;  // SpineLow THREE.Bone, twisted back by the split
+        this._twistQuat = new THREE.Quaternion();
+        this._twistAxis = new THREE.Vector3();
+        this._parentQuat = new THREE.Quaternion();
+
+        // ── Air / jump state (set by the controller each frame) ──
+        this._airborne = false;
+        this._wasAirborne = false;
+        this._airVelY = 0;
 
         this._baseSkin = null;   // decoded body-atlas bitmap; see load()
         this._prevPos = new THREE.Vector3();
@@ -275,6 +312,7 @@ export class PlayerCharacter {
 
             this._normalizeMaterials(character);
             this._bindAnimations(character);
+            this._findStrafeBones();
 
             console.log('[character] loaded', this.race + this.gender,
                 '-', character.geosetList.length, 'geosets,',
@@ -426,7 +464,81 @@ export class PlayerCharacter {
 
     setHeading(yaw) {
         this.heading = yaw;
-        if (this.root) this.root.rotation.y = yaw - Math.PI / 2;
+        this._applyModelYaw();
+    }
+
+    /**
+     * Rotate the whole model to (heading + strafe moveYaw). The model's forward
+     * is +X in the GLB, and rotation.y = h - PI/2 makes +X point along the
+     * facing (see file header); the strafe split adds _moveYaw so the LEGS turn
+     * to face travel while the camera stays behind `heading`. Torso is pulled
+     * back afterwards in _applyTorsoTwist.
+     */
+    _applyModelYaw() {
+        if (this.root) this.root.rotation.y = (this.heading + this._moveYaw) - Math.PI / 2;
+    }
+
+    /**
+     * Told by the controller each frame: is the character off the ground, and
+     * what is its vertical velocity (yd/s, + up). Drives the jump/fall clips.
+     */
+    setAir(airborne, velY) {
+        this._airborne = !!airborne;
+        this._airVelY = velY || 0;
+    }
+
+    /**
+     * Find the SpineLow bone (key bone 4) the torso split twists. SkinnedGlbWriter
+     * encodes the M2 key-bone id in the node name as "_k<id>"; GLTFLoader keeps
+     * the name on the THREE.Bone. Waist (5) would drive the LEGS, but in Split the
+     * legs turn with the whole model, so only the torso bone is needed here.
+     */
+    _findStrafeBones() {
+        this._torsoBone = null;
+        if (!this.root) return;
+        let spineLow = null, waist = null;
+        this.root.traverse((o) => {
+            if (!o.isBone || !o.name) return;
+            const m = /_k(\d+)$/.exec(o.name);
+            if (!m) return;
+            const k = parseInt(m[1], 10);
+            if (k === KEY_BONE_SPINE_LOW && !spineLow) spineLow = o;
+            else if (k === KEY_BONE_WAIST && !waist) waist = o;
+        });
+        // Torso is SpineLow; fall back to Waist only if SpineLow is absent.
+        this._torsoBone = spineLow || waist;
+        if (this._torsoBone) {
+            console.log('[character] strafe torso bone:', this._torsoBone.name);
+        } else {
+            console.warn('[character] no SpineLow/Waist key bone in the GLB — ' +
+                'torso strafe split unavailable (rebuild after the SkinnedGlbWriter ' +
+                'key-bone-name change).');
+        }
+    }
+
+    /**
+     * Pull the torso subtree BACK by (TorsoFollow - 1) * moveYaw about WORLD up,
+     * so the torso ends at TorsoFollow of the model's turn while the legs keep
+     * the full angle — the 90-vs-60 split. Ported from M2Animator: a rotation
+     * appended in model space about the vertical axis. In three.js a bone stores
+     * a LOCAL quaternion, so the world-Y axis is expressed in the bone's parent
+     * frame and pre-multiplied. Must run AFTER mixer.update (which overwrites the
+     * bone each frame) and after the world matrices are current.
+     */
+    _applyTorsoTwist() {
+        const bone = this._torsoBone;
+        if (!bone || !bone.parent) return;
+        const twist = (TORSO_FOLLOW - 1) * this._moveYaw;
+        if (Math.abs(twist) < 1e-4) return;
+        // World matrices must reflect this frame's animation + model rotation
+        // before we read the parent's world orientation.
+        this.root.updateMatrixWorld(true);
+        bone.parent.getWorldQuaternion(this._parentQuat);
+        // World up expressed in the bone's parent frame.
+        this._twistAxis.set(0, 1, 0).applyQuaternion(this._parentQuat.clone().invert());
+        this._twistQuat.setFromAxisAngle(this._twistAxis, twist);
+        bone.quaternion.premultiply(this._twistQuat);
+        bone.updateMatrixWorld(true);
     }
 
     setVisible(v) {
@@ -438,6 +550,10 @@ export class PlayerCharacter {
             this._hasPrev = false;
             this.groundSpeed = 0;
             this.rawSpeed = 0;
+            this._moveYaw = 0;
+            this._forwardness = 0;
+            this._sideness = 0;
+            this._airborne = this._wasAirborne = false;
         }
     }
 
@@ -457,11 +573,11 @@ export class PlayerCharacter {
         if (!this.root || !this.visible) return;
         if (!(dt > 0)) dt = 1 / 60;
 
-        // ── Measured ground speed (XZ only; falling is not walking) ──
-        let raw = 0;
+        // ── Measured ground speed + travel direction (XZ only) ──
+        let raw = 0, dx = 0, dz = 0;
         if (this._hasPrev) {
-            const dx = this.position.x - this._prevPos.x;
-            const dz = this.position.z - this._prevPos.z;
+            dx = this.position.x - this._prevPos.x;
+            dz = this.position.z - this._prevPos.z;
             raw = Math.sqrt(dx * dx + dz * dz) / dt;
         }
         this._prevPos.copy(this.position);
@@ -478,12 +594,60 @@ export class PlayerCharacter {
             this.groundSpeed += (raw - this.groundSpeed) * a;
         }
 
-        // ── State ──
+        // ── Strafe angle (MSUIClient MeasureMotion + ChooseClip) ──
+        // forwardness/sideness are the smoothed dot products of the travel
+        // direction against the character's facing and its right vector. In the
+        // web, forward = (sin h, cos h), right = forward x up = (-cos h, sin h).
+        // moveYaw = atan2(-sideness, forwardness) turns the model to face travel.
+        const blend = 1 - Math.exp(-MOTION_SMOOTH_RATE * dt);
+        const flatLen = Math.hypot(dx, dz);
+        let reverse = this._reverse;
+        if (flatLen > 1e-4 && raw >= MOVE_THRESHOLD) {
+            const ix = dx / flatLen, iz = dz / flatLen;
+            const sh = Math.sin(this.heading), ch = Math.cos(this.heading);
+            const fwd = ix * sh + iz * ch;             // dot(dir, forward)
+            const side = ix * (-ch) + iz * sh;         // dot(dir, right)
+            this._forwardness += (fwd - this._forwardness) * blend;
+            this._sideness += (side - this._sideness) * blend;
+        }
+
+        let phi = Math.atan2(-this._sideness, this._forwardness);
+        // Past ~110 deg the character is backing up: take the angle off what is
+        // left after the half turn, so straight-back is unrotated, and play the
+        // backwards clip. Matches CharacterRenderer.cs rotating-branch.
+        if (Math.abs(phi) > STRAFE_BACKWARD) {
+            phi = phi - Math.sign(phi) * Math.PI;
+            reverse = true;
+        }
+
+        // Target model turn: only while genuinely moving on the ground; ease to
+        // zero on a stop or in the air so the torso unwinds cleanly.
+        const targetYaw = (raw >= MOVE_THRESHOLD && !this._airborne) ? phi : 0;
+        {
+            const a = 1 - Math.exp(-MOVE_YAW_RATE * dt);
+            this._moveYaw += (targetYaw - this._moveYaw) * a;
+            if (Math.abs(this._moveYaw) < 0.002) this._moveYaw = 0;
+        }
+
+        // ── State: air first, then ground locomotion ──
         const speed = this.groundSpeed;
         let want, authored;
-        if (speed < MOVE_THRESHOLD) {
+        if (this._airborne) {
+            // Rising -> Jump, descending -> Fall. JumpStart leads the takeoff so
+            // the launch reads; it clamps and Jump/Fall take over by velocity.
+            if (!this._wasAirborne && this.actions[ANIM.JUMP_START]) {
+                want = ANIM.JUMP_START;
+            } else if (this._airVelY <= 0 && this.actions[ANIM.FALL]) {
+                want = ANIM.FALL;
+            } else if (this.actions[ANIM.JUMP]) {
+                want = ANIM.JUMP;
+            } else {
+                want = ANIM.JUMP_START;   // whatever exists
+            }
+            authored = 0;
+        } else if (speed < MOVE_THRESHOLD) {
             want = ANIM.STAND; authored = 0;
-        } else if (this._reverse && this.actions[ANIM.WALK_BACK]) {
+        } else if (reverse && this.actions[ANIM.WALK_BACK]) {
             // Vanilla's backpedal is its own clip at its own speed.
             want = ANIM.WALK_BACK; authored = 4.5;
         } else if (speed < WALK_RUN_SPLIT) {
@@ -495,10 +659,12 @@ export class PlayerCharacter {
         // Fall back to whatever clip actually exists rather than freezing.
         if (!this.actions[want]) {
             if (this.actions[ANIM.STAND]) { want = ANIM.STAND; authored = 0; }
-            else return;
+            else { this._wasAirborne = this._airborne; return; }
         }
 
-        this._play(want, CROSSFADE);
+        // A shorter crossfade into the air so the jump doesn't lag the launch.
+        this._play(want, this._airborne !== this._wasAirborne ? 0.06 : CROSSFADE);
+        this._wasAirborne = this._airborne;
 
         // ── Match playback to ground speed so the feet don't skate ──
         const action = this.actions[want];
@@ -508,7 +674,15 @@ export class PlayerCharacter {
                 : 1;
         }
 
+        // Apply the model turn for the legs BEFORE stepping the mixer, so the
+        // torso twist reads a current parent world orientation.
+        this._applyModelYaw();
+
         if (this.mixer) this.mixer.update(dt);
+
+        // Pull the torso back by the split remainder (after the mixer wrote the
+        // bone). Skipped in the air, where _moveYaw is eased to zero anyway.
+        this._applyTorsoTwist();
     }
 
     dispose() {

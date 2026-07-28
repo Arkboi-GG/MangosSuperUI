@@ -30,6 +30,8 @@ import { PlayerCharacter } from './character.js';
 import { FoliageField } from './foliage.js';
 import { WorldLighting } from './world-lighting.js';
 import { CharacterController } from './character-control.js';
+import { CollisionWorld } from './collision-world.js';
+import { tickWater } from './water.js';
 import {
     createMovementTicker,
     attachWalkLook,
@@ -135,6 +137,18 @@ const foliage = new FoliageField(editor);
 editor.foliage = foliage;
 viewport.addTicker((vp, dt) => foliage.tick(vp, dt));
 
+// Water animation. The per-liquid shader materials share SHARED.uTime, which
+// tickWater advances every frame (and syncs to the fog + light rig). Without
+// this ticker uTime never moves and the surface freezes — the registration was
+// dropped in the Rev 3 lighting rewrite, which is why "water isn't animated
+// anymore." (The materials themselves, built by streaming.js via water.js, were
+// fine.)
+viewport.addTicker((vp, dt) => tickWater(vp, dt));
+// Grass on by default — this is a game-parity client, and it lets the ground
+// effects be seen without hunting for the toggle. The scatter is tick-driven,
+// so enabling here is safe before any tile has streamed in.
+foliage.setEnabled(true);
+
 // ── Authored exterior lighting (Light.dbc) ──────────────────────────────────
 //
 // Off until switched on in Options, and it OWNS the lighting rig while on:
@@ -143,6 +157,13 @@ viewport.addTicker((vp, dt) => foliage.tick(vp, dt));
 const worldLighting = new WorldLighting(editor);
 editor.worldLighting = worldLighting;
 viewport.addTicker((vp, dt) => worldLighting.tick(vp, dt));
+// Light.dbc exterior lighting ON by default — it is MSUIClient's own lighting
+// model and the base look we want ("outdoor lighting pretty good with light.dbc
+// on from the get-go"). skyEnabled defaults true, so this also brings up the
+// authored sky. The Options toggles were already marked On; the explicit enable
+// had been dropped (same as the water ticker), so the actual state was off. Safe
+// before tiles stream — the first tick resolves once terrain loads.
+worldLighting.setEnabled(true);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tools — 'select' (real picker, Phase 4) + 'place-wmo' + 'sculpt' (Phase 8).
@@ -197,6 +218,9 @@ function loadPresetByKey(presetKey, label) {
     // the outgoing preset.
     editor.signals.presetClearing.dispatch(editor.currentPreset);
 
+    // Drop collision for the outgoing world; the new block loads below.
+    if (editor.collisionWorld) editor.collisionWorld.clear();
+
     // Reset history (commands referring to deleted placements would dangle).
     editor.history.clear();
 
@@ -212,6 +236,12 @@ function loadPresetByKey(presetKey, label) {
 
         // Load saved WMO placements for this preset.
         placementStore.loadSaved();
+
+        // Fetch real vmap collision for this block (fire-and-forget). The
+        // character sweeps render meshes until this resolves.
+        if (editor.collisionWorld) {
+            editor.collisionWorld.loadForPreset(presetKey).catch(() => {});
+        }
 
         // Apply pending teleport if any.
         if (pendingTeleport) {
@@ -283,6 +313,13 @@ editor.playerCharacter = playerCharacter;
 
 const characterController = new CharacterController(editor, playerCharacter);
 editor.characterController = characterController;
+
+// Real building/tree/interior collision (VMaNGOS vmaps). Loaded per preset
+// block; the character raycasts it instead of the render meshes. Until it
+// resolves (or where vmaps are unavailable) the controller falls back to the
+// old render-mesh sweep, so nothing regresses.
+const collisionWorld = new CollisionWorld(editor);
+editor.collisionWorld = collisionWorld;
 
 (function addCharacterButton() {
     const anchor = document.getElementById('weLoadBtn');
@@ -431,6 +468,7 @@ window.we = {
     objectStream: objectStream,
     tileGrid: tileGrid,
     foliage: foliage,
+    collision: collisionWorld,
     lighting: worldLighting,
     selection: editor.selection,
     outlineProxies: outlineProxies,

@@ -79,6 +79,41 @@ const MAX_DELTA_PIXELS = 300;
 const GROUND_RATE = 18.0;
 const PROBE_HZ = 20;
 
+// ── Gravity / jump / collision (MSUIClient MovementConfig, verbatim) ─────────
+const GRAVITY = 19.29110527;     // yd/s^2
+const JUMP_VELOCITY = 7.9558;    // yd/s
+const TERMINAL_VELOCITY = 60.148;
+const BODY_RADIUS = 0.4;         // capsule radius for wall sweep
+const BODY_HEIGHT = 2.1;         // probe from mid-body so low rubble isn't a wall
+const STEP_HEIGHT = 1.0;         // ledges up to this are stepped onto, not blocking
+const GROUND_SNAP = 0.5;         // descending-stairs adhesion (GroundSnapDistance)
+const GROUND_EPS = 0.05;         // GroundContactEpsilon; the jump landing test
+const MAX_SLOPE_DEG = 55;
+// cos(maxSlope): a surface whose up-component exceeds this is a floor, not a wall.
+const MIN_GROUND_Y = Math.cos(MAX_SLOPE_DEG * Math.PI / 180);
+// Feet this far above the probed ground while grounded => walked off a ledge, so
+// start falling. Generous (1 yd) so the 20Hz probe lag on a slope never triggers
+// a false fall — real cliffs are far deeper than any single frame of walking.
+const FALL_THRESHOLD = 1.0;
+// WMO building meshes have no BVH, so refresh the swept set at ~12Hz (not per
+// frame) and cap how many are swept, bounding the brute-force raycast cost.
+const WMO_GATHER_HZ = 12;
+// Sweep nearby building + doodad meshes. The residency cap bounds total
+// instances, and a lazy BVH per swept geometry keeps per-instance rejection
+// cheap. WMO and doodad meshes get SEPARATE budgets: they are per-model
+// InstancedMeshes, and a dense city has enough WMO submeshes (~280) to fill a
+// single shared cap entirely — which starved doodads and silently dropped ALL
+// tree collision. Independent budgets guarantee trees are always swept.
+const WMO_HARD_CAP = 160;
+const DOODAD_HARD_CAP = 140;
+const OBSTACLE_HARD_CAP = WMO_HARD_CAP + DOODAD_HARD_CAP;
+
+// Feet must be this far UNDER terrain before a lower collision floor (a mine, a
+// crypt, a bridge underside) may win over it — vanilla Map::GetHeight's "closer
+// surface" clause, gated so an ordinary uphill step never drops you through the
+// world (CharacterController.UndergroundSlack).
+const UNDERGROUND_SLACK = 1.0;
+
 const TAU = Math.PI * 2;
 
 /** Wrap to (-pi, pi], so easing toward zero always takes the short way. */
@@ -122,6 +157,19 @@ export class CharacterController {
         this._targetGroundY = null;
         this._probeAccum = 0;
 
+        // ── Vertical physics (gravity + jump) ──
+        this.velY = 0;
+        this.grounded = false;
+
+        // ── Collision caches ──
+        this._obstacles = [];         // nearby building + doodad meshes, refreshed at ~12Hz
+        this._wmoGatherAccum = 0;
+        this._rayH = new THREE.Raycaster();   // horizontal wall sweep
+        this._rayD = new THREE.Raycaster();   // downward step/ground probe
+        this._downVec = new THREE.Vector3(0, -1, 0);   // NOT _down: that is the input key-check method
+        this._nrm = new THREE.Vector3();
+        this._nmat = new THREE.Matrix3();
+
         // Instrumentation. Guessing at whether input arrives is what turned
         // three separate control bugs into three separate round trips; a live
         // readout answers it at a glance. See _buildReadout.
@@ -129,6 +177,7 @@ export class CharacterController {
         this.mouseEvents = 0;
         this._dragging = false;
         this._readout = null;
+        this._foliageCtl = null;         // in-world foliage-density chip (character mode)
         this.showReadout = true;
         // True once any keydown carried a usable e.key, after which letter
         // bindings resolve by character rather than physical position.
@@ -185,6 +234,8 @@ export class CharacterController {
     spawnAt(x, groundY, z, facingYaw) {
         this.position.set(x, groundY, z);
         this._targetGroundY = groundY;
+        this.velY = 0;
+        this.grounded = true;
         if (facingYaw !== undefined) this.yaw = norm(facingYaw);
         this.orbitYaw = 0;
         this.pitch = CAM_DEFAULT_PITCH;
@@ -204,6 +255,7 @@ export class CharacterController {
         if (rig.walk.mode) rig.leaveWalkMode();
         this._attachInput();
         this._buildReadout();
+        this._buildFoliageControl();
     }
 
     disable() {
@@ -216,6 +268,7 @@ export class CharacterController {
             this._readout.parentElement.removeChild(this._readout);
         }
         this._readout = null;
+        this._removeFoliageControl();
         const rig = this.editor.viewport.rig;
         rig.controls.enabled = true;
         rig.controls.target.set(
@@ -488,6 +541,13 @@ export class CharacterController {
         // Vanilla has a distinct MOVE_RUN_BACK speed. Scaling run down would
         // make backpedalling a fraction of forward in every direction; the real
         // client picks a different speed and leaves the direction alone.
+        // Push out of any wall we are already inside BEFORE moving. Without this
+        // the sweep is a one-way door: it only ever STOPS motion, so anything
+        // that lands the body inside geometry (a step-up flush to a wall, a snap
+        // under an overhang, a ray slipping past a corner) welds it there and
+        // reads exactly like "collision is offset" (CharacterController.Depenetrate).
+        this._depenetrate();
+
         const speed = walking ? WALK_SPEED
                     : (forward < -0.01 ? BACKWARD_SPEED : RUN_SPEED);
 
@@ -503,20 +563,63 @@ export class CharacterController {
         const wlen = Math.hypot(wx, wz);
         if (wlen > 1e-3) {
             wx /= wlen; wz /= wlen;
-            this.position.x += wx * speed * dt;
-            this.position.z += wz * speed * dt;
+            // Swept horizontal move: slides along walls and buildings instead of
+            // walking through them (CharacterController.MoveHorizontal).
+            this._moveHorizontal(wx * speed * dt, wz * speed * dt);
         }
 
-        // ── Ground ───────────────────────────────────────────────────────────
+        // ── Jump (CharacterController.Update: Jump && Grounded) ───────────────
+        const jumpHeld = this.held.has('Space');
+        let jumped = false;
+        if (jumpHeld && this.grounded) {
+            this.velY = JUMP_VELOCITY;
+            this.grounded = false;
+            jumped = true;
+        }
+
+        // ── Ground probe (throttled BVH raycast into _targetGroundY) ──────────
         this._probeAccum += dt;
-        if (this._targetGroundY === null || this._probeAccum >= 1 / PROBE_HZ) {
+        if (this._targetGroundY === null || this._probeAccum >= 1 / PROBE_HZ || !this.grounded) {
             this._probeAccum = 0;
             const hit = this._probeGround(this.position.x, this.position.z);
             if (hit !== null) this._targetGroundY = hit;
         }
-        if (this._targetGroundY !== null) {
-            const a = 1 - Math.exp(-GROUND_RATE * dt);
-            this.position.y += (this._targetGroundY - this.position.y) * a;
+        const groundY = this._targetGroundY;
+
+        // ── Vertical: gravity + landing (CharacterController.ResolveGround) ───
+        // The Velocity.Z<=0 guard is why jumping works: a rising character is
+        // never snapped back to the ground (that swallowed the jump entirely,
+        // frame-rate dependently, in MSUIClient before the guard).
+        if (this.grounded && !jumped) {
+            if (groundY !== null) {
+                if (this.position.y - groundY > FALL_THRESHOLD) {
+                    // Walked off a ledge -> fall.
+                    this.grounded = false;
+                    this.velY = 0;
+                } else {
+                    // Follow the ground (smoothed; MSUIClient snaps on a real grid).
+                    const a = 1 - Math.exp(-GROUND_RATE * dt);
+                    this.position.y += (groundY - this.position.y) * a;
+                    this.velY = 0;
+                }
+            }
+        }
+        if (!this.grounded) {
+            this.velY -= GRAVITY * dt;
+            if (this.velY < -TERMINAL_VELOCITY) this.velY = -TERMINAL_VELOCITY;
+            this.position.y += this.velY * dt;
+            if (groundY !== null && this.velY <= 0 &&
+                this.position.y <= groundY + GROUND_EPS) {
+                this.position.y = groundY;
+                this.velY = 0;
+                this.grounded = true;
+            } else if (groundY !== null && this.velY <= 0 && !jumped &&
+                       this.position.y - groundY <= GROUND_SNAP) {
+                // Short gaps between narrow supports read as continuous ground.
+                this.position.y = groundY;
+                this.velY = 0;
+                this.grounded = true;
+            }
         }
 
         // ── Re-centre while moving (Program.cs 1358-1363) ────────────────────
@@ -544,6 +647,8 @@ export class CharacterController {
         // Measured displacement cannot tell forward from backward, so the sign
         // of the input has to be handed over explicitly.
         if (this.player.setReverse) this.player.setReverse(forward < -0.01);
+        // Air state drives the jump/fall clips and pauses the strafe torso split.
+        if (this.player.setAir) this.player.setAir(!this.grounded, this.velY);
         this.player.update(dt);
 
         this._resolveCameraCollision(dt);
@@ -599,6 +704,96 @@ export class CharacterController {
             `dist ${this.effectiveDistance.toFixed(1)}/${this.distance.toFixed(1)}`;
     }
 
+    // ── In-world foliage density control (next to the character) ──────────────
+    //
+    // A small options chip in the bottom-right of the canvas, shown only while
+    // the character is active, that scales ground-effect (grass/clutter) density
+    // live without opening the Options modal. It drives the same knob
+    // (foliage.densityScale) the Options → Density slider does, and keeps that
+    // slider in sync if it exists.
+
+    _buildFoliageControl() {
+        if (this._foliageCtl) return;
+        const foliage = this.editor.foliage;
+        if (!foliage) return;
+        const parent = this.editor.viewport.canvas.parentElement;
+        if (!parent) return;
+
+        const fmt = (v) => v.toFixed(1) + '×';   // "1.0×"
+
+        const wrap = document.createElement('div');
+        wrap.id = 'weCharFoliage';
+        wrap.style.cssText =
+            'position:absolute;bottom:16px;right:16px;z-index:12;' +
+            'font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;' +
+            'color:#d8f5d9;background:rgba(0,0,0,0.62);border-radius:6px;padding:6px 8px;';
+
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;';
+        const label = document.createElement('span');
+        label.textContent = '🌿 Foliage';   // 🌿
+        label.style.cssText = 'font-weight:600;';
+        const valEl = document.createElement('span');
+        valEl.textContent = fmt(foliage.densityScale);
+        valEl.style.cssText = 'color:#9fe3a0;min-width:34px;text-align:right;';
+        const caret = document.createElement('span');
+        caret.textContent = '▸';                 // ▸
+        caret.style.opacity = '0.7';
+        row.appendChild(label); row.appendChild(valEl); row.appendChild(caret);
+        wrap.appendChild(row);
+
+        const panel = document.createElement('div');
+        panel.style.cssText = 'display:none;margin-top:6px;align-items:center;gap:8px;';
+        const cap = document.createElement('span');
+        cap.textContent = 'Density'; cap.style.opacity = '0.7';
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.min = '0'; slider.max = '20'; slider.step = '1';
+        slider.value = String(Math.round(foliage.densityScale * 10));
+        slider.style.cssText = 'width:130px;accent-color:#5cb85c;';
+        panel.appendChild(cap); panel.appendChild(slider);
+        wrap.appendChild(panel);
+
+        let open = false;
+        row.addEventListener('click', () => {
+            open = !open;
+            panel.style.display = open ? 'flex' : 'none';
+            caret.textContent = open ? '▾' : '▸';   // ▾ / ▸
+        });
+
+        const apply = () => {
+            const v = parseInt(slider.value, 10) / 10;
+            valEl.textContent = fmt(v);
+            if (foliage.setDensityScale) foliage.setDensityScale(v);
+            else { foliage.densityScale = v; foliage.forceRescatter(); }
+            // Changing density is a clear intent to see it — turn foliage on.
+            if (!foliage.enabled && foliage.setEnabled) foliage.setEnabled(true);
+            // Keep the Options-modal density slider in sync if it is built.
+            const opt = document.getElementById('optFoliageDensity');
+            const optVal = document.getElementById('optFoliageDensityVal');
+            if (opt) opt.value = slider.value;
+            if (optVal) optVal.textContent = fmt(v);
+        };
+        slider.addEventListener('input', apply);
+        // The character owns window input in capture phase, but it gates on
+        // overCanvas(), and this chip is a sibling of the canvas, not a child —
+        // so drags here never reach the look/zoom handlers. stopPropagation is
+        // belt-and-braces for any bubble-phase listeners.
+        for (const t of ['pointerdown', 'mousedown', 'pointermove', 'mousemove', 'wheel', 'click']) {
+            slider.addEventListener(t, (e) => e.stopPropagation(), false);
+        }
+
+        parent.appendChild(wrap);
+        this._foliageCtl = wrap;
+    }
+
+    _removeFoliageControl() {
+        if (this._foliageCtl && this._foliageCtl.parentElement) {
+            this._foliageCtl.parentElement.removeChild(this._foliageCtl);
+        }
+        this._foliageCtl = null;
+    }
+
     _worldMeshes() {
         const tg = this.editor.tileGrid;
         if (!tg) return null;
@@ -608,8 +803,265 @@ export class CharacterController {
 
     _probeGround(x, z) {
         const rig = this.editor.viewport.rig;
-        const hit = rig.probeGroundY(this._worldMeshes(), x, z, this.position.y + 5);
-        return (hit !== null && isFinite(hit)) ? hit : null;
+        const th = rig.probeGroundY(this._worldMeshes(), x, z, this.position.y + 5);
+        const terrainY = (th !== null && isFinite(th)) ? th : null;
+
+        // WMO floors, bridges and tunnel floors come from the vmap collision
+        // world, not the terrain grid — this is what makes interiors walkable.
+        const colY = this._probeCollisionGround(x, z);
+        if (colY === null) return terrainY;
+        if (terrainY === null) return colY;
+
+        // Vanilla Map::GetHeight, in the two clauses it actually is: the
+        // collision surface wins when it is ABOVE terrain, or when the feet are
+        // genuinely UNDER terrain and it is the CLOSER of the two — the second
+        // clause is the entire reason a mine floor beats the mountain above it.
+        // The slack gate stops an ordinary uphill step qualifying and dropping
+        // the character through the world.
+        const feet = this.position.y;
+        if (colY > terrainY) return colY;
+        const underTerrain = terrainY - feet > UNDERGROUND_SLACK;
+        const closer = Math.abs(terrainY - feet) > Math.abs(colY - feet);
+        return (underTerrain && closer) ? colY : terrainY;
+    }
+
+    /**
+     * Downward probe against the vmap CollisionWorld for a floor above terrain
+     * (WMO floors, bridges, interiors). Null when no collision, or the hit is a
+     * wall not a floor. Started at StepHeight above the feet, reaching well below
+     * so a fast fall onto a floor is not missed between frames
+     * (CharacterController.ResolveGround's collision probe).
+     */
+    _probeCollisionGround(x, z) {
+        const cw = this.editor.collisionWorld;
+        if (!cw || !cw.ready) return null;
+        const oy = this.position.y + STEP_HEIGHT;
+        this._rayD.set(new THREE.Vector3(x, oy, z), this._downVec);
+        this._rayD.far = STEP_HEIGHT + 5;
+        this._rayD.firstHitOnly = true;
+        const hits = this._rayD.intersectObjects(cw.meshes, false);
+        const hit = hits.length ? hits[0] : null;
+        if (!hit) return null;
+        // abs(): vmap winding is inconsistent, so a floor's face normal may point
+        // down. Its up-COMPONENT magnitude still tells floor (≈1) from wall (≈0).
+        const nrm = this._worldNormalAt(hit);
+        if (Math.abs(nrm.y) <= MIN_GROUND_Y) return null;
+        return oy - hit.distance;
+    }
+
+    // ── Collision ─────────────────────────────────────────────────────────────
+    //
+    // Ported from CharacterController.MoveHorizontal: a single probe ray from
+    // mid-body along the move; on a wall hit the remaining motion is projected
+    // onto the wall plane so the character slides, and a step-up is attempted so
+    // stairs and curbs are walkable. Two iterations handle inside corners.
+    //
+    // Meshes swept: terrain + dungeon (three-mesh-bvh, cheap) and nearby WMO
+    // buildings (InstancedMesh, no BVH — gathered and distance-filtered at 12Hz).
+    // Walkable slopes (normal.y > cos(maxSlope)) are NOT walls: the gravity/ground
+    // resolver takes those, so a hill never blocks you.
+
+    /** Terrain/dungeon (BVH) plus nearby building AND doodad meshes, for wall sweeps. */
+    _horizontalMeshes(dt) {
+        const base = this._worldMeshes();
+        const out = base ? base.slice() : [];
+
+        // ── Real collision (vmap) takes over from the render-mesh sweep ───────
+        // When the vmap CollisionWorld is loaded, walls/trees/interiors come
+        // from the server's OWN collision geometry (doorways, floors, stairs) —
+        // the whole point of the port. The render-mesh gather below (a crude
+        // outer shell, the "collision is false" bug) is then skipped entirely.
+        const cw = this.editor.collisionWorld;
+        if (cw && cw.ready) {
+            for (const m of cw.meshes) out.push(m);
+            return out;
+        }
+
+        // Buildings (WMO) and doodads (trees/rocks) are InstancedMesh WITHOUT a
+        // BVH, so a brute-force raycast costs their whole triangle count. Two
+        // things keep this bounded: rebuild the swept set at 12Hz and cap it, and
+        // lazily build a BVH on each swept geometry (three-mesh-bvh is
+        // monkey-patched globally by streaming.js) so per-instance rejection is
+        // O(1). The sweep ray is only ~0.5 yd long. Short ground clutter is below
+        // the torso-height ray, so this naturally hits trunks/walls, not pebbles.
+        const tg = this.editor.tileGrid;
+        const os = this.editor.objectStream;
+        if (tg && !tg.isDungeon && os) {
+            this._wmoGatherAccum += dt;
+            if (this._obstacles.length === 0 || this._wmoGatherAccum >= 1 / WMO_GATHER_HZ) {
+                this._wmoGatherAccum = 0;
+                const gathered = [];
+                const ensureBvh = (m) => {
+                    if (m.geometry && !m.geometry.boundsTree && m.geometry.computeBoundsTree) {
+                        try { m.geometry.computeBoundsTree(); } catch (e) { /* fall back to brute force */ }
+                    }
+                };
+                // Separate budgets so a wall of WMO submeshes cannot crowd out
+                // doodads — that shared-cap starvation is what silently deleted
+                // ALL tree collision.
+                let wmoCount = 0, doodadCount = 0;
+                const takeWmo = (m) => {
+                    if (!m || (!m.isInstancedMesh && !m.isMesh)) return;
+                    if (wmoCount >= WMO_HARD_CAP) return;
+                    ensureBvh(m); gathered.push(m); wmoCount++;
+                };
+                const takeDoodad = (m) => {
+                    if (!m || (!m.isInstancedMesh && !m.isMesh)) return;
+                    if (doodadCount >= DOODAD_HARD_CAP) return;
+                    ensureBvh(m); gathered.push(m); doodadCount++;
+                };
+                let wmoN = 0;
+                if (os.wmoMeshList) { const w = os.wmoMeshList(); wmoN = w.length; for (const m of w) takeWmo(m); }
+                const dg = os.pool && os.pool.doodadGroup;
+                if (dg) dg.traverse((c) => takeDoodad(c));
+                this._obstacles = gathered;
+                if (!this._loggedObstacles) {
+                    this._loggedObstacles = true;
+                    console.log('[collision] sweeping', gathered.length, 'obstacle meshes (' +
+                        wmoCount + '/' + wmoN + ' buildings, ' + doodadCount + ' doodads).');
+                }
+            }
+            for (const m of this._obstacles) out.push(m);
+        }
+        return out;
+    }
+
+    /**
+     * World-space surface normal of a raycast hit, for wall-vs-floor.
+     *
+     * Terrain/dungeon are plain Mesh with reliable face normals — use them so a
+     * hill is a floor, not a wall. Buildings/doodads are InstancedMesh whose face
+     * normal does NOT carry the per-instance rotation, so a rotated wall could be
+     * misread as a floor and let you walk through it. For those, return a
+     * HORIZONTAL normal (out of the wall toward the body): an obstacle is always
+     * a wall, which is exactly the behaviour we want for buildings and trees.
+     */
+    _worldNormalAt(hit) {
+        const n = this._nrm;
+        if (!hit.object.isInstancedMesh && hit.face && hit.face.normal) {
+            n.copy(hit.face.normal);
+            this._nmat.getNormalMatrix(hit.object.matrixWorld);
+            n.applyMatrix3(this._nmat).normalize();
+            return n;
+        }
+        // Instanced obstacle (or no face): outward horizontal normal from the
+        // wall back to the body — robust for any instance rotation, and n.y = 0
+        // guarantees it is treated as a wall, not a walkable slope.
+        n.set(this.position.x - hit.point.x, 0, this.position.z - hit.point.z);
+        if (n.lengthSq() < 1e-8) n.set(0, 0, 1);
+        return n.normalize();
+    }
+
+    /**
+     * Push out of any wall we are already inside — 8 rays around the body at
+     * chest height, against the vmap CollisionWorld ONLY (never terrain: shoving
+     * off a slope would make ramps unclimbable). Walkable slopes are skipped. The
+     * push direction is the horizontal from the wall toward the body, and the
+     * total is capped at the radius so a corner hitting several rays at once does
+     * not fling the body across the room. Faithful to CharacterController.Depenetrate,
+     * which the render-mesh build could not have (a render shell has no inside).
+     */
+    _depenetrate() {
+        const cw = this.editor.collisionWorld;
+        if (!cw || !cw.ready) return;
+
+        const ox = this.position.x, oy = this.position.y + BODY_HEIGHT * 0.5, oz = this.position.z;
+        let px = 0, pz = 0;
+        const rays = 8;
+        for (let i = 0; i < rays; i++) {
+            const ang = i * Math.PI * 2 / rays;
+            this._rayH.set(new THREE.Vector3(ox, oy, oz),
+                new THREE.Vector3(Math.cos(ang), 0, Math.sin(ang)));
+            this._rayH.far = BODY_RADIUS;
+            this._rayH.firstHitOnly = true;
+            const hits = this._rayH.intersectObjects(cw.meshes, false);
+            const hit = hits.length ? hits[0] : null;
+            if (!hit) continue;
+            const nrm = this._worldNormalAt(hit);
+            if (Math.abs(nrm.y) > MIN_GROUND_Y) continue;   // a floor, not a wall
+            const depth = BODY_RADIUS - hit.distance;
+            if (depth <= 0) continue;
+            let nx = this.position.x - hit.point.x, nz = this.position.z - hit.point.z;
+            const nl = Math.hypot(nx, nz);
+            if (nl < 1e-4) continue;
+            px += (nx / nl) * depth; pz += (nz / nl) * depth;
+        }
+
+        const mag = Math.hypot(px, pz);
+        if (mag < 1e-4) return;
+        const capped = Math.min(mag, BODY_RADIUS);
+        this.position.x += px / mag * capped;
+        this.position.z += pz / mag * capped;
+    }
+
+    /**
+     * Swept horizontal move with wall slide + step-up. dx/dz are this frame's
+     * intended displacement in world XZ.
+     */
+    _moveHorizontal(dx, dz) {
+        const meshes = this._horizontalMeshes(this.editor.viewport.deltaTime || 1 / 60);
+        if (!meshes || meshes.length === 0) {
+            this.position.x += dx; this.position.z += dz;
+            return;
+        }
+
+        let mx = dx, mz = dz;
+        for (let iter = 0; iter < 2; iter++) {
+            let dist = Math.hypot(mx, mz);
+            if (dist < 1e-5) return;
+            const dirx = mx / dist, dirz = mz / dist;
+
+            const ox = this.position.x, oy = this.position.y + BODY_HEIGHT * 0.5, oz = this.position.z;
+            this._rayH.set(new THREE.Vector3(ox, oy, oz), new THREE.Vector3(dirx, 0, dirz));
+            this._rayH.far = dist + BODY_RADIUS;
+            const hits = this._rayH.intersectObjects(meshes, false);
+            const hit = hits.length ? hits[0] : null;
+
+            if (!hit || hit.distance > dist + BODY_RADIUS) {
+                this.position.x += mx; this.position.z += mz;
+                return;
+            }
+
+            const nrm = this._worldNormalAt(hit);
+            // A walkable slope is a floor, not a wall — let the ground resolver
+            // take it. abs(): vmap winding is inconsistent, so a floor normal may
+            // point down; its up-COMPONENT magnitude still separates floor from wall.
+            if (Math.abs(nrm.y) > MIN_GROUND_Y) {
+                this.position.x += mx; this.position.z += mz;
+                return;
+            }
+
+            // Try to step up onto a low ledge (stairs, curbs) before sliding.
+            if (this.grounded && this._tryStepUp(mx, mz, meshes)) return;
+
+            // Advance up to the wall, then slide along it (strip the into-wall
+            // component of the remaining move; horizontal only).
+            const advance = Math.max(0, hit.distance - BODY_RADIUS);
+            if (advance > 1e-5) { this.position.x += dirx * advance; this.position.z += dirz * advance; }
+
+            const into = mx * nrm.x + mz * nrm.z;   // move . horizontal normal
+            mx -= nrm.x * into; mz -= nrm.z * into;
+            mx *= 0.98; mz *= 0.98;
+        }
+    }
+
+    /** Probe for a ledge within STEP_HEIGHT the move could stand on. */
+    _tryStepUp(mx, mz, meshes) {
+        const px = this.position.x + mx, pz = this.position.z + mz;
+        const top = this.position.y + STEP_HEIGHT + 0.1;
+        this._rayD.set(new THREE.Vector3(px, top, pz), this._downVec);
+        this._rayD.far = STEP_HEIGHT + 0.4;
+        const hits = this._rayD.intersectObjects(meshes, false);
+        const hit = hits.length ? hits[0] : null;
+        if (!hit) return false;
+        const nrm = this._worldNormalAt(hit);
+        if (Math.abs(nrm.y) <= MIN_GROUND_Y) return false;   // not a floor
+        const stepTop = top - hit.distance;
+        const rise = stepTop - this.position.y;
+        if (rise < -0.05 || rise > STEP_HEIGHT) return false;
+        this.position.x = px; this.position.z = pz; this.position.y = stepTop;
+        this.velY = 0; this.grounded = true;
+        return true;
     }
 
     /**

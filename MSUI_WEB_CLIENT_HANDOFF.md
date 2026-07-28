@@ -2,9 +2,18 @@
 
 **For: the next session. Read this first, then start work.**
 
-Rev 2 — 2026-07-26, end of the session that ported foliage, Light.dbc exterior
-lighting and MCNR terrain normals. Everything below is either committed to the
-repo on `nicomain` or explicitly marked as not done.
+Rev 4 — 2026-07-28. **Built the real vmap collision port (§5.6) and an in-world
+foliage-density control.** Committed, structurally verified + harness-tested, NOT
+yet seen in the browser. New files: `Services/VmapCollision.cs`,
+`Controllers/WorldEditorController.Collision.cs` (partial),
+`wwwroot/js/worldeditor/collision-world.js`. Edited: `WorldEditorController.cs`
+(one word: `class` → `partial class`), `character-control.js`, `index.js`,
+`foliage.js`. See §5.6 (now DONE, needs verifying) and the Rev 4 note in §0.5.
+
+Rev 3 — 2026-07-28. This session restored reverted work, fixed the lighting
+no-op and a character-load crash, and — with Nico driving the live browser —
+finally got GROUND TRUTH on the two things that kept "not working": the grass
+squares and building collision. Read §0.5 first; it is the honest state.
 
 ---
 
@@ -26,6 +35,93 @@ reading it.
 purpose.* §6 has the method. It has now caught two historical bugs before they
 shipped, and both times the mutation test is what proved the check was real
 rather than decorative.
+
+**The third instruction, learned the hard way this session:** *do not claim a
+fix works until you have SEEN it in the browser.* Multiple "fixes" for the grass
+squares shipped on a theory and missed. The squares turned out to be nothing the
+theories predicted. Drive the live site, measure the actual object, then fix.
+
+---
+
+## 0.5 Current honest state (Rev 3) — read this
+
+### Deploys ARE landing (the earlier confusion was a stale mount)
+
+The file bridge is unreliable to *read back*: `device_stage_files` and reading
+`/mnt/user-data/uploads/...` returned OLD content for files that had just been
+committed, which looked exactly like an auto-revert. It is not. Verified against
+the RUNNING app (`fetch('/js/worldeditor/world-light.js')`): the server serves
+the committed version. **Trust the browser, not the mount, for what is deployed.**
+Both bridges (files and browser) also dropped connection several times mid-task.
+
+Separately and for real: at the START of this session the working tree DID hold
+pre-fix versions of `character.js`, `foliage.js`, `character-control.js`,
+`render.js`, `world-light.js` (no strafe, old `ShaderMaterial` grass, the
+`output_fragment` lighting no-op, the sky dome still added). Whether an earlier
+revert or a commit that never landed, all five were re-committed this session.
+
+### What is actually working (seen in the browser)
+
+- **Lighting is deployed and real.** `world-light.js` was a SILENT NO-OP: it
+  targeted `#include <output_fragment>`, renamed to `<opaque_fragment>` in r150,
+  so on r162 the whole world-lighting model never applied and everything fell
+  back to three.js defaults. Fixed (targets both names). Northshire at noon now
+  reads as a bright, warm, correctly-coloured scene.
+- **Character loads.** `character.js` referenced `KEY_BONE_WAIST` with no such
+  const — a ReferenceError that crashed character load (and is the likely
+  trigger of the working-tree rollback). Defined it.
+- **Grass blades themselves render correctly** — the green tufts are right.
+
+### What is STILL broken (and now correctly diagnosed)
+
+- **"Squares above the grass" = the grass texture is UPSIDE DOWN.** Measured in
+  the live page: every foliage texture had `flipY = true` (set explicitly in
+  `foliage.js`'s `textureFromDataURI`), but the geometry is M2 doodad geometry
+  served as **GLB**, whose UVs follow the glTF convention and need `flipY = false`.
+  The flipped texture mirrors each card vertically — blades hang downward, and
+  the atlas slice samples the wrong band, leaving a pale block above each tuft
+  that reads as a "square." This was NOT lighting and NOT missing alpha (the
+  textures measured 45–70% transparent, alpha present). **Fix applied but not yet
+  visually confirmed** (browser bridge dropped before the after-shot):
+  `foliage.js` line ~199 now `tex.flipY = false`. Next session: load Northshire,
+  confirm blades point up and the pale blocks are gone. If still wrong, the GLB
+  UV convention from the server's `DoodadModel` is the next suspect.
+- **The pale "stones" are wrong by design.** Nico: they should be *real 3D
+  stones, with shape, scattered* — that is what MSUIClient shows. The web renders
+  ground-effect stones/pebbles as flat billboard cards (the same crossed-quad
+  path as grass), not as their actual rock geometry. The `flipY` fix may make the
+  card show the right texture, but making them *look* like MSUIClient's scattered
+  rocks is a separate, unfinished piece: solid ground-effect doodads must render
+  with their M2 geometry, not billboarded. Read `MSUIClient` foliage/detail-
+  doodad code for how it distinguishes billboard clutter from solid scatter.
+- **Building collision is NOT real and cannot be with the current approach.**
+  The character raycasts the RENDER meshes (WMO/doodad InstancedMeshes). That
+  gives crude outer walls and nothing else — no interiors, doorways, or steps,
+  because the render mesh has no such semantics. This session only fixed a cap
+  bug where ~280 WMO submeshes starved out doodads and silently deleted ALL tree
+  collision (now WMO and doodad meshes get separate budgets). The REAL fix is the
+  MSUIClient port: serve the extracted **vmap** geometry and run the character
+  against a BVH `CollisionWorld`. See §5.6.
+
+  > **Rev 4: BUILT (not yet seen in the browser).** `Services/VmapCollision.cs`
+  > (ports MSUIClient `VmapFormat` + `VmapCollisionLoader`) + `GET
+  > /WorldEditor/Collision` serve the deduped vmap triangles for a 3×3 block in
+  > WoW space; `collision-world.js` converts them to scene space (inverse of the
+  > verified `.gps` transform) and builds three-mesh-bvh proxies the character
+  > raycasts — wall slide, step-up, a downward floor probe with vanilla
+  > `Map::GetHeight` precedence (interiors/bridges), and depenetrate. The old
+  > render-mesh sweep is now only a FALLBACK for when vmaps are unavailable.
+  > Verify per §5.6; check the `[collision]` console line for triangle/spawn counts.
+
+### Tuning knobs Nico can turn without a rebuild
+
+- Midday brightness: raised to worldSun 1.0 / worldAmbient ~0.95 in the
+  `LightingRig` (`render.js`). If it should match MSUIClient exactly instead,
+  those numbers drop back to sun 3.15 / ambient-hemi 0.64.
+- `window.we.lighting.sunStrength` / `.ambientStrength` (live) when Light.dbc is on.
+- **Foliage density, in-world (Rev 4):** while Character mode is on, a 🌿 chip in
+  the bottom-right of the canvas scales ground-effect density live (0–2×) — the
+  same knob as Options → Density (`foliage.densityScale`), kept in sync with it.
 
 ---
 
@@ -74,13 +170,20 @@ what time it is. Foliage and lighting both landed on that line independently.
 - **Terrain splatting** ✅ deployed, working — "terrain looks much better".
   `GET /WorldEditor/TerrainSplat` + `terrain-splat.js`. ~61 texels/yard, up from
   0.26 yd/texel.
-- **One world lighting model** ✅ committed, unverified. `world-light.js`.
+- **One world lighting model** ✅ deployed & working (Rev 3). `world-light.js`.
+  Was a silent no-op until this session — see §0.5. Now targets `opaque_fragment`,
+  carries per-instance normals, and has a `skyNormal` option (grass lights with a
+  world-up normal). Seen correct in the browser.
 - **Animation** ✅ committed. `DefaultAnimationsToBake` `{0,4,5}` → `{0,4,5,13,37,38,39,40}`.
 - **Closed eyes** ✅ committed, unverified. `CharacterSkinCompositor.PaintRegion`
   is now size-aware.
 - **`.mdl` → `.m2`** ✅ deployed.
 
-### Session 2 — all committed, **none verified in a browser**
+### Session 2 — committed; foliage & lighting now partly verified (Rev 3)
+
+> Rev 3 update: lighting is verified working. Foliage is verified RUNNING (grass
+> blades correct) but has the upside-down-texture and stones-as-cards bugs in
+> §0.5 / §5.1. Light.dbc, MCNR, water still unseen.
 
 #### Foliage / ground clutter (was §5.1)
 
@@ -276,6 +379,9 @@ timestamp window, not `Ranges[seqIdx]`. **No strafe clips on land.**
 | **Character faced the camera** | `yaw + PI/2`. MSUIClient's "+90" was read as corroboration; it is a different basis. | A matching number is not a matching derivation. |
 | **Blank face, washed-out limbs** | `baseSkin` passed to `unequipAll` but not `equipMultiple`. | Always pass `baseSkin` to every `equip.js` call outside the items page. |
 | **Strafe dead, 3 rounds** | `e.code` is physical-position on a **US** layout; then matching both code and character let one Dvorak keypress satisfy two bindings. | Letters by character, everything else by code. |
+| **Grass "squares" misdiagnosed 4 rounds** | Chased alpha (twice) then lighting (up-normal), all on theory. Actual cause: foliage textures `flipY=true` on GLB (glTF-convention) UVs → texture mirrored vertically. | Measure the live object before fixing. `flipY` is the first thing to check when a GLB-textured billboard looks wrong. |
+| **"My commits keep reverting"** | `device_stage_files` / reading `/mnt/user-data/uploads` returned pre-commit content for just-written files — looked like an auto-revert. The RUNNING app served the new file. | The mount read-back is stale; verify deploys with `fetch()` in the live page, not the file bridge. |
+| **World lighting did nothing** | `world-light.js` replaced `#include <output_fragment>`, renamed to `<opaque_fragment>` in three r150. On r162 the replace was a no-op; everything used three.js defaults. | A `.replace()` on a shader chunk that silently matches nothing is invisible. Assert the chunk name exists. |
 
 Two historical MSUIClient bugs that this session's harnesses were built to catch,
 and did:
@@ -291,8 +397,13 @@ and did:
 
 ### 5.1 Verify session 2 in a browser — **next**
 
-Nothing from session 2 has been seen running. In rough order of what a first look
-should check:
+> Rev 3: foliage and lighting HAVE now been seen running. Open bugs from that
+> look: (a) grass texture upside down — `flipY` fix applied in `foliage.js`,
+> needs an after-shot to confirm; (b) ground-effect stones render as flat cards,
+> should be scattered 3D rocks like MSUIClient (unfixed — see §0.5). Light.dbc,
+> MCNR and water are still genuinely unseen; the steps below still apply to them.
+
+In rough order of what a first look should check:
 
 1. **Foliage on, walk to the Northshire road.** Grass must not creep onto the
    cobblestone. That single test exercises the 0x40 layer map, the 0x50 mask and
@@ -361,10 +472,14 @@ exactly that reason. Positions are the obvious next thing to pack.
   `ShaderMaterial`s (terrain splat, foliage, sky) do not. Character mode disables
   walk mode so it takes the composer path, but **walk mode will look different**.
   Needs a screenshot comparison, then either drop the bypass or add the encode.
-- **Strafe torso split** — blocked: needs key-bone metadata in the GLB.
-  MangosSuperUI's M2 reader doesn't parse `KeyBoneId`/`KeyBoneLookup` at all.
-  Twist bone is key bone 5 (Waist), fallback 4 (SpineLow); `TorsoFollow 0.66`;
-  `phi = atan2(-sideness, forwardness)`.
+- **Strafe torso split** — code committed, NOT yet verified. `SkinnedGlbWriter.cs`
+  now names bone nodes `Bone_{i}_k{KeyBoneId}` so the GLB carries key-bone ids;
+  `character.js` finds SpineLow (key bone 4, fallback Waist 5) and applies the
+  twist. **Requires a Visual Studio rebuild** — the GLBs regenerate from the C#,
+  and until Nico rebuilds, the bone names aren't in the served GLBs and the split
+  silently no-ops. `TorsoFollow 0.66`; `phi = atan2(-sideness, forwardness)`;
+  backward swap at |phi| > 1.92 rad. Verify after rebuild by strafing and watching
+  the torso lead the legs.
 - **M2 blend modes / two-pass** — server sends no render flags; every doodad gets
   a blanket `DoubleSide + alphaTest 0.5 + transparent`.
 - **`WowSocketBridge.cs`** is on a "dead code" list. It is **not** dead — a web
@@ -379,6 +494,75 @@ exactly that reason. Positions are the obvious next thing to pack.
 - **Lighting: no skybox models, no clouds, no weather.** `LightSkybox`, bands
   9-12 and every params set other than `ParamsClear` are parsed or reachable and
   unused.
+
+### 5.6 Real collision — the vmap port ✅ BUILT (Rev 4) — verify in browser
+
+> **What shipped (Rev 4):**
+> - **Server.** `Services/VmapCollision.cs` ports MSUIClient's `VmapFormat.cs`
+>   (VmtileReader/VmoReader, the LIQU +4 fix, the ZYX Euler rotation, `ToWorld`)
+>   and `VmapCollisionLoader.cs` (cross-tile `_seen` dedup, the `.vmo` candidate
+>   spellings, the degenerate-triangle skip). `GET /WorldEditor/Collision?preset=
+>   &radius=1&includeM2=true` bakes the 3×3 block and returns WoW-world triangles
+>   as base64 Float32 + stats + notes. Vmaps dir = `Vmangos:ServerDataPath`/vmaps
+>   (matches `ServerDataService.GetServerVmapsDir`); a clear error if not found.
+>   `WorldEditorController` is now `partial`; the endpoint lives in
+>   `WorldEditorController.Collision.cs`.
+> - **Client.** `collision-world.js` decodes the buffer, converts WoW→scene with
+>   the INVERSE of the verified `.gps` transform (`sceneX = W(31.5-centerGridY-
+>   wowY/T)`, `sceneZ = W(31.5-centerGridX-wowX/T)`, `sceneY = wowZ`), and builds
+>   invisible double-sided three-mesh-bvh proxies. `character-control.js` now
+>   sweeps THOSE for walls (slide + step-up), depenetrates against them, and adds
+>   a downward collision floor probe with vanilla `Map::GetHeight` precedence
+>   (`UNDERGROUND_SLACK 1.0`) so WMO floors, bridges and tunnels hold you up.
+>   Wall/floor classification uses `abs(normal.y)` because vmap winding is
+>   inconsistent. The render-mesh sweep is kept only as a FALLBACK when the
+>   CollisionWorld is not `ready`.
+> - **Verified:** structure (braces/CRLF/ES-parse) + a Node harness (17 checks:
+>   the WoW→scene round-trip against the independent `.gps` forward, the ground
+>   precedence, wall slide, depenetrate) + a mutation test proving the
+>   `abs(normal.y)` floor check catches a down-wound WMO floor.
+> - **NOT verified:** anything in the live browser. First checks:
+>   1. Enter Character mode at Northshire; console should print
+>      `[collision] N triangles from M tile(s); ... vmaps: <dir>`. If it prints
+>      `0 triangles`, the vmaps dir or the tile filenames are wrong — read the
+>      `[collision]` notes; the endpoint reports exactly what it tried.
+>   2. Walk into a building wall (Northshire Abbey) — you should stop and slide,
+>      not pass through, and be able to walk THROUGH the doorway into the interior.
+>   3. Walk a bridge / into the abbey — the floor should hold you (collision floor
+>      probe), and the abbey steps should step-up without jumping.
+>   4. If collision is offset from what you see, the WoW→scene transform or the
+>      vmtile (col,row)=(gridY,gridX) mapping is the first suspect; `window.we.collision`
+>      exposes the built world.
+> - **Still open:** it loads the 3×3 block on preset load only — walking to a new
+>   ADT does not extend collision yet (refetch on centre-tile change is the next
+>   step, same shape as foliage's tile streaming). Dungeons still use their
+>   render-mesh sweep unless a vmap block is loaded for the instance map.
+
+The character used to raycast the **render** meshes. That is fundamentally
+wrong for buildings: a render mesh has no interior/doorway/step semantics, so you
+get a crude outer shell and nothing to walk into. Trees mostly work because a
+trunk is a trunk from any angle. Rev 3 fixed a real regression (a shared obstacle
+cap where ~280 WMO submeshes starved out doodads and deleted all tree collision;
+now WMO and doodad meshes have separate budgets in `character-control.js`), but
+that is polishing a dead end.
+
+The port, straight from MSUIClient, is the answer:
+
+1. **Server** extracts VMaNGOS vmaps already exist on the box. Add an endpoint
+   that serves, per loaded tile, the collision triangles: read `{map}_{col}_{row}.vmtile`,
+   resolve each spawn to its `.vmo`, apply the spawn transform, emit world-space
+   triangles (packed, not JSON floats). Reference: `MSUIClient/World/Collision/`
+   — `VmapCollisionLoader.cs` (staged, read it), `CollisionWorld.cs`, `VmtileReader`,
+   `VmoReader`, `VmapFormat.ToWorld`. Dedup by `(spawnId, name)` — Stormwind is one
+   `.vmo` covering many tiles; without the `_seen` set you bake it six times.
+2. **Client** builds a `three-mesh-bvh` `CollisionWorld` from those triangles
+   (the BVH monkey-patch is already global via `streaming.js`) and the character
+   raycasts THAT, not the render meshes. Real walls with doorways, floors, stairs.
+3. M2 spawns (`includeM2`) give tree/fence collision from the same path, which can
+   eventually replace the render-mesh doodad sweep entirely.
+
+Movement constants for the controller are already in §3. This is a server + client
+piece of maybe a day; it is not blocked on anything except being built.
 
 ---
 

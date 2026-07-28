@@ -26,7 +26,7 @@ namespace MangosSuperUI.Controllers;
 ///   GET /WorldViewer/Doodads       → doodad placements + WMO bounding boxes for 3×3 grid
 ///   GET /WorldViewer/DoodadModel   → M2 geometry + textures for a single model
 /// </summary>
-public class WorldEditorController : Controller
+public partial class WorldEditorController : Controller
 {
     private readonly ILogger<WorldEditorController> _logger;
     private readonly IConfiguration _config;
@@ -580,9 +580,11 @@ public class WorldEditorController : Controller
             }
 
             var subTexMap = new Dictionary<int, int>();
+            var subMatMap = new Dictionary<int, int>();   // SubmeshIndex -> MaterialIndex (into RenderFlags)
             bool degenerate = model.TextureLookup.Count == 0 || model.TextureLookup.All(x => x == model.TextureLookup[0]);
             foreach (var b in model.Batches)
             {
+                if (!subMatMap.ContainsKey(b.SubmeshIndex)) subMatMap[b.SubmeshIndex] = b.MaterialIndex;
                 if (subTexMap.ContainsKey(b.SubmeshIndex)) continue;
                 subTexMap[b.SubmeshIndex] = degenerate ? b.TextureIndex
                     : (b.TextureIndex < model.TextureLookup.Count ? model.TextureLookup[b.TextureIndex] : b.TextureIndex);
@@ -596,7 +598,24 @@ public class WorldEditorController : Controller
                 int texIdx = subTexMap.ContainsKey(si) ? subTexMap[si] : -1;
                 string? texB64 = texIdx >= 0 && textureMap.ContainsKey(texIdx) ? textureMap[texIdx]
                     : textureMap.Count > 0 ? textureMap[textureMap.Keys.OrderBy(k => Math.Abs(k - si)).First()] : null;
-                submeshes.Add(new { indexStart = idxStart, indexCount = idxCount, textureBase64 = texB64 });
+
+                // M2 render flags for this submesh — the candle-flame / lantern-glow
+                // path. Unlit (0x01) means "authored full bright, ignore lighting"
+                // (a lantern must not go out in a dark room); BlendingMode 4/3 is
+                // additive (the glow adds light); NoZWrite (0x10) stops the flame
+                // quad occluding what is behind it. See SYSTEM_DOODAD_LIGHTING.md §4.
+                var rf = subMatMap.TryGetValue(si, out int mi) && mi < model.RenderFlags.Count
+                    ? model.RenderFlags[mi] : null;
+                submeshes.Add(new
+                {
+                    indexStart = idxStart,
+                    indexCount = idxCount,
+                    textureBase64 = texB64,
+                    unlit = rf?.Unlit ?? false,
+                    blendMode = rf?.BlendingMode ?? 0,
+                    twoSided = rf?.TwoSided ?? false,
+                    noZWrite = rf?.NoZWrite ?? false
+                });
             }
 
             var result = new
@@ -706,6 +725,7 @@ public class WorldEditorController : Controller
             var allPositions = new List<float>();
             var allNormals = new List<float>();
             var allUvs = new List<float>();
+            var allColors = new List<byte>();   // MOCV baked interior light, RGBA per vertex
             var allIndices = new List<int>();
             var submeshes = new List<object>();
             int globalVertexOffset = 0;
@@ -746,6 +766,23 @@ public class WorldEditorController : Controller
                     allPositions.Add(y);     // Three X
                     allPositions.Add(z);     // Three Y (up)
                     allPositions.Add(x);     // Three Z
+                }
+
+                // MOCV baked interior light, index-parallel to the vertices just
+                // appended. Groups with no MOCV (vanilla exterior groups) get
+                // opaque white — the shader's exterior batch branch ignores it,
+                // so those surfaces render exactly as before.
+                for (int vi = 0; vi < group.Vertices.Count; vi++)
+                {
+                    if (vi < group.VertexColors.Count)
+                    {
+                        var c = group.VertexColors[vi];
+                        allColors.Add(c.r); allColors.Add(c.g); allColors.Add(c.b); allColors.Add(c.a);
+                    }
+                    else
+                    {
+                        allColors.Add(255); allColors.Add(255); allColors.Add(255); allColors.Add(255);
+                    }
                 }
 
                 // Add normals (same transform)
@@ -813,6 +850,13 @@ public class WorldEditorController : Controller
                         bool noCull = matId < root.Materials.Count && root.Materials[matId].IsNoCull;
                         bool transparent = matId < root.Materials.Count && root.Materials[matId].IsTransparent;
 
+                        // MOBA runs are ordered transparent | interior | exterior.
+                        // batchType 1/2/3 matches MSUIClient wmo.frag: 1 fades baked
+                        // MOCV toward daylight by portal proximity, 2 is interior
+                        // (baked + a touch of daylight), 3 is pure daylight.
+                        int batchType = bi < group.TransBatchCount ? 1
+                            : (bi < group.TransBatchCount + group.IntBatchCount ? 2 : 3);
+
                         submeshes.Add(new
                         {
                             indexStart = idxStart,
@@ -821,6 +865,7 @@ public class WorldEditorController : Controller
                             materialId = matId,
                             doubleSided = noCull,
                             transparent,
+                            batchType,
                             groupIndex = gi
                         });
                     }
@@ -853,6 +898,7 @@ public class WorldEditorController : Controller
                         materialId = 0,
                         doubleSided = false,
                         transparent = false,
+                        batchType = 3,   // no MOBA info → daylight, unchanged
                         groupIndex = gi
                     });
                 }
@@ -876,6 +922,7 @@ public class WorldEditorController : Controller
                 positions = allPositions.ToArray(),
                 normals = allNormals.ToArray(),
                 uvs = allUvs.ToArray(),
+                colorsBase64 = Convert.ToBase64String(allColors.ToArray()),   // MOCV RGBA/vertex
                 indices = allIndices.ToArray(),
                 submeshes,
                 submeshCount = submeshes.Count,

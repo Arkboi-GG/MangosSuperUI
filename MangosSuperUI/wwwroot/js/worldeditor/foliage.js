@@ -55,6 +55,7 @@ import { getJSON } from './net.js';
 import {
     worldSunIntensity, worldAmbientIntensity, worldSunDirection
 } from './terrain-splat.js';
+import { applyWorldLighting, forgetWorldLighting } from './world-light.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Knobs — MSUIClient FoliageRenderer defaults, verbatim
@@ -119,119 +120,88 @@ function makeRng(seed) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shader — grass.vert / grass.frag
+// Grass material
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// The old CUSTOM ShaderMaterial rendered every grass card as an OPAQUE square —
+// the alpha cutout never took, even though the server's PNG carries a correct
+// alpha channel (BlpDecoder decodes DXT1 punch-through to alpha 0). Rather than
+// keep debugging a bespoke shader, grass now uses the SAME material the tree
+// doodads use and that already works: a MeshStandardMaterial with three.js'
+// built-in `alphaTest` cutout and the world lighting model (applyWorldLighting).
+// The wind sway is appended to that material's onBeforeCompile, so grass keeps
+// its motion AND finally lights like the ground it grows out of.
+//
+// One small regression vs the old shader: the per-blade distance FADE is gone
+// (three.js alphaTest is a hard cut). The scatter radius already bounds where
+// grass appears, so it pops in/out at the radius edge instead of dissolving —
+// acceptable, and re-addable later as an alpha ramp if it reads badly.
 
-const GRASS_VERT = /* glsl */`
-uniform float uTime;
-uniform float uWindStrength;
-uniform float uWindSpeed;
-
-varying vec3  vWNormal;
-varying vec2  vUv;
-varying float vDist;
-
-void main() {
-    mat4 inst = instanceMatrix;
-    vec4 wp = modelMatrix * inst * vec4(position, 1.0);
-
-    // Wind sway. M2 model space is Y-up (M2Reader converts (x,y,z)->(x,z,-y)),
-    // so position.y is the height up the blade and the bend growing with
-    // height^2 keeps the base planted. Phase comes from ABSOLUTE world XZ so
-    // the field does not visibly pulse as the camera moves.
-    float bh = max(position.y, 0.0);
-    float phase = wp.x * 0.15 + wp.z * 0.11 + uTime * uWindSpeed;
-    wp.xz += vec2(sin(phase), cos(phase * 0.83)) * (uWindStrength * bh * bh);
-
-    vWNormal = normalize(mat3(modelMatrix) * mat3(inst) * normal);
-    vUv = uv;
-    vDist = length(wp.xyz - cameraPosition);
-
-    gl_Position = projectionMatrix * viewMatrix * wp;
-}
-`;
-
-const GRASS_FRAG = /* glsl */`
-uniform sampler2D uMap;
-uniform float uAlphaCutoff;
-uniform float uFadeStart;
-uniform float uFadeEnd;
-uniform float uBrightness;
-
-uniform vec3  uSunDirection;
-uniform vec3  uSunColor;
-uniform float uSunIntensity;
-uniform vec3  uAmbientColor;
-uniform float uAmbientIntensity;
-uniform vec3  uFogColor;
-uniform float uFogNear;
-uniform float uFogFar;
-
-varying vec3  vWNormal;
-varying vec2  vUv;
-varying float vDist;
-
-const vec3 UP = vec3(0.0, 1.0, 0.0);
-
-void main() {
-    vec4 albedo = texture2D(uMap, vUv);
-
-    // Distance fade folded into the alpha cutout, so grass dissolves toward the
-    // draw edge instead of popping. Radius ALONE does nothing past this window
-    // — that was a real bug: FadeEnd was fixed at 45 while the Radius slider
-    // went to 120, so raising Radius scattered instances nobody could see.
-    float fade = clamp((uFadeEnd - vDist) / max(uFadeEnd - uFadeStart, 1.0), 0.0, 1.0);
-    float a = albedo.a * fade;
-    if (a < uAlphaCutoff) discard;
-
-    vec3 n = normalize(vWNormal);
-    if (!gl_FrontFacing) n = -n;      // grass is two-sided cards
-
-    float ndl = max(dot(n, normalize(uSunDirection)), 0.0);
-    vec3 sun = uSunColor * ndl * uSunIntensity;
-    vec3 amb = uAmbientColor * uAmbientIntensity
-        * mix(0.62, 1.0, dot(n, UP) * 0.5 + 0.5);
-
-    vec3 lit = albedo.rgb * (sun + amb) * uBrightness;
-
-    float fog = clamp((vDist - uFogNear) / max(uFogFar - uFogNear, 1.0), 0.0, 1.0);
-    gl_FragColor = vec4(mix(lit, uFogColor, fog), 1.0);
-}
-`;
-
-function makeGrassMaterial(map) {
-    return new THREE.ShaderMaterial({
-        vertexShader: GRASS_VERT,
-        fragmentShader: GRASS_FRAG,
-        // Opaque alpha-cutout: depth test + write, no blend, no cull.
-        transparent: false,
-        depthWrite: true,
-        depthTest: true,
-        side: THREE.DoubleSide,
-        uniforms: {
-            uMap: { value: map },
-            uTime: { value: 0 },
-            uWindStrength: { value: FOLIAGE_DEFAULTS.windStrength },
-            uWindSpeed: { value: FOLIAGE_DEFAULTS.windSpeed },
-            uAlphaCutoff: { value: FOLIAGE_DEFAULTS.alphaCutoff },
-            uFadeStart: { value: FOLIAGE_DEFAULTS.fadeStart },
-            uFadeEnd: { value: FOLIAGE_DEFAULTS.fadeEnd },
-            uBrightness: { value: FOLIAGE_DEFAULTS.brightness },
-            uSunDirection: { value: new THREE.Vector3(-100, 28, 50).normalize() },
-            uSunColor: { value: new THREE.Color(0xffbb55) },
-            uSunIntensity: { value: 1.0 },
-            uAmbientColor: { value: new THREE.Color(0xffe8c8) },
-            uAmbientIntensity: { value: 0.85 },
-            uFogColor: { value: new THREE.Color(0xc49a50) },
-            uFogNear: { value: 200 },
-            uFogFar: { value: 900 },
-        },
+function makeGrassMaterial(map, rig) {
+    const mat = new THREE.MeshStandardMaterial({
+        map,
+        alphaTest: 0.5,          // hard cutout, exactly like the tree doodads
+        transparent: true,
+        side: THREE.DoubleSide,  // grass is two-sided cards
+        metalness: 0.0,
+        roughness: 0.9,
+        fog: true,
     });
+
+    // Same sun + hemispheric-ambient model as terrain / doodads / character,
+    // but with skyNormal: grass billboards are vertical, so their true normals
+    // are horizontal and an overhead sun would miss them entirely. skyNormal
+    // lights each blade with a world-up normal so the field reads as sunlit.
+    applyWorldLighting(mat, rig, { skyNormal: true });
+
+    // Wind sway appended to the world-lighting onBeforeCompile. Bend grows with
+    // blade-height^2 so the base stays planted; the phase uses ABSOLUTE world XZ
+    // so the field does not pulse as the camera moves. Applied to `transformed`
+    // (model-local, M2 Y-up) before the instance/model transform.
+    const base = mat.onBeforeCompile;
+    const windU = {
+        uTime: { value: 0 },
+        uWindStrength: { value: FOLIAGE_DEFAULTS.windStrength },
+        uWindSpeed: { value: FOLIAGE_DEFAULTS.windSpeed },
+    };
+    mat.userData._windU = windU;
+    mat.onBeforeCompile = (shader) => {
+        if (base) base(shader);
+        shader.uniforms.uTime = windU.uTime;
+        shader.uniforms.uWindStrength = windU.uWindStrength;
+        shader.uniforms.uWindSpeed = windU.uWindSpeed;
+        shader.vertexShader =
+            'uniform float uTime;\nuniform float uWindStrength;\nuniform float uWindSpeed;\n' +
+            shader.vertexShader.replace(
+                '#include <begin_vertex>',
+                '#include <begin_vertex>\n' +
+                '  {\n' +
+                '    vec4 _gw =\n' +
+                '      #ifdef USE_INSTANCING\n' +
+                '        instanceMatrix *\n' +
+                '      #endif\n' +
+                '        vec4(transformed, 1.0);\n' +
+                '    _gw = modelMatrix * _gw;\n' +
+                '    float _bh = max(transformed.y, 0.0);\n' +
+                '    float _ph = _gw.x * 0.15 + _gw.z * 0.11 + uTime * uWindSpeed;\n' +
+                '    float _amt = uWindStrength * _bh * _bh;\n' +
+                '    transformed.x += sin(_ph) * _amt;\n' +
+                '    transformed.z += cos(_ph * 0.83) * _amt;\n' +
+                '  }');
+    };
+    mat.customProgramCacheKey = () => 'grass-windlit-v1';
+    mat.needsUpdate = true;
+    return mat;
 }
 
 function textureFromDataURI(uri) {
     const tex = new THREE.TextureLoader().load(uri);
-    tex.flipY = true;
+    // flipY MUST be false: the foliage geometry is M2 doodad geometry served as
+    // GLB, so its UVs follow the glTF convention (V=0 at the TOP of the image).
+    // A flipY=true texture renders vertically mirrored on that geometry — which
+    // is exactly the "grass is upside down" bug (blades hang down, and the atlas
+    // slices sample the wrong band, leaving the pale square above each tuft).
+    tex.flipY = false;
     tex.wrapS = THREE.RepeatWrapping;
     tex.wrapT = THREE.RepeatWrapping;
     // r162 decodes sRGB via the texture's internal format (SRGB8_ALPHA8), not a
@@ -322,6 +292,17 @@ export class FoliageField {
     /** Any coverage change takes effect on the next frame, not after 8 yards. */
     forceRescatter() { this._hasScattered = false; this._retryTimer = 0; }
 
+    /**
+     * Live density multiplier — the same knob as Options → Density, clamped to
+     * 0..2×. Used by the in-world foliage control next to the character.
+     */
+    setDensityScale(v) {
+        v = Math.max(0, Math.min(2, v));
+        if (this.densityScale === v) return;
+        this.densityScale = v;
+        this.forceRescatter();
+    }
+
     setKindEnabled(kind, on) {
         if (this.kindEnabled[kind] === !!on) return;
         this.kindEnabled[kind] = !!on;
@@ -348,31 +329,18 @@ export class FoliageField {
     }
 
     _syncUniforms(viewport) {
-        const rig = viewport.lighting;
-        const fog = viewport.scene.fog;
-        const fs = this.effectiveFadeStart, fe = this.effectiveFadeEnd;
+        // Lighting + fog now ride the shared world-lighting model (synced globally
+        // by render.js syncWorldLighting) and the material's own fog. Grass only
+        // needs its wind clock advanced here.
         for (const path in this._models) {
             const m = this._models[path];
             if (!m.parts) continue;
             for (const part of m.parts) {
-                const u = part.material.uniforms;
-                u.uTime.value = this._time;
-                u.uWindStrength.value = this.windStrength;
-                u.uWindSpeed.value = this.windSpeed;
-                u.uAlphaCutoff.value = this.alphaCutoff;
-                u.uFadeStart.value = fs;
-                u.uFadeEnd.value = fe;
-                u.uBrightness.value = this.brightness;
-                worldSunDirection(rig, u.uSunDirection.value);
-                if (rig && rig.sun) u.uSunColor.value.copy(rig.sun.color);
-                if (rig && rig.ambient) u.uAmbientColor.value.copy(rig.ambient.color);
-                u.uSunIntensity.value = worldSunIntensity(rig);
-                u.uAmbientIntensity.value = worldAmbientIntensity(rig);
-                if (fog) {
-                    u.uFogColor.value.copy(fog.color);
-                    u.uFogNear.value = fog.near;
-                    u.uFogFar.value = fog.far;
-                }
+                const wu = part.material.userData && part.material.userData._windU;
+                if (!wu) continue;
+                wu.uTime.value = this._time;
+                wu.uWindStrength.value = this.windStrength;
+                wu.uWindSpeed.value = this.windSpeed;
             }
         }
     }
@@ -719,7 +687,8 @@ export class FoliageField {
             geo.setIndex(new THREE.BufferAttribute(
                 new Uint32Array(allIndices.slice(sub.indexStart, sub.indexStart + sub.indexCount)), 1));
 
-            const material = makeGrassMaterial(textureFromDataURI(sub.textureBase64));
+            const material = makeGrassMaterial(
+                textureFromDataURI(sub.textureBase64), this.editor.viewport.lighting);
             const mesh = new THREE.InstancedMesh(geo, material, 1);
             mesh.count = 0;
             mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -791,7 +760,8 @@ export class FoliageField {
                 this.group.remove(part.mesh);
                 part.mesh.dispose();
                 part.geometry.dispose();
-                if (part.material.uniforms.uMap.value) part.material.uniforms.uMap.value.dispose();
+                if (part.material.map) part.material.map.dispose();
+                forgetWorldLighting(part.material);
                 part.material.dispose();
             }
         }
