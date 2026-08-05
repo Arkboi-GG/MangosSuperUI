@@ -299,6 +299,12 @@
                 <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
             </div>
             <ul class="sidebar-nav sidebar-nav-collapsible">
+                <li class="sidebar-nav-item" data-nav-key="bots-dashboard">
+                    <a asp-controller="Bots" asp-action="Index" class="@(currentController.Equals("Bots", StringComparison.OrdinalIgnoreCase) && !currentAction.Equals("Fleet", StringComparison.OrdinalIgnoreCase) && !currentAction.Equals("Map", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
+                        <i class="fa-solid fa-robot"></i>
+                        IBot Monitor
+                    </a>
+                </li>
                 <li class="sidebar-nav-item" data-nav-key="bots-fleet">
                     <a asp-controller="Bots" asp-action="Fleet" class="@(currentController.Equals("Bots", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("Fleet", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
                         <i class="fa-solid fa-tower-broadcast"></i>
@@ -309,12 +315,6 @@
                     <a asp-controller="Bots" asp-action="Map" class="@(currentController.Equals("Bots", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("Map", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
                         <i class="fa-solid fa-location-crosshairs"></i>
                         Bot Map Viewer
-                    </a>
-                </li>
-                <li class="sidebar-nav-item" data-nav-key="bots-dashboard">
-                    <a asp-controller="Bots" asp-action="Index" class="@(currentController.Equals("Bots", StringComparison.OrdinalIgnoreCase) && !currentAction.Equals("Fleet", StringComparison.OrdinalIgnoreCase) && !currentAction.Equals("Map", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
-                        <i class="fa-solid fa-robot"></i>
-                        IBot Monitor
                     </a>
                 </li>
                 <li class="sidebar-nav-item" data-nav-key="bots-chatfeel">

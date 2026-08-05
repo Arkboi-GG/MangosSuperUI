@@ -52,6 +52,7 @@ $(function () {
             $('#cfgExtractorsPath').val(s.vmangos.extractorsPath);
             $('#cfgServerDataPath').val(s.vmangos.serverDataPath);
             $('#cfgVmangosClientDataPath').val(s.vmangos.clientDataPath);
+            $('#cfgVmapsDataPath').val(s.vmangos.vmapsDataPath || '');
 
             // Kestrel
             $('#cfgKestrelUrl').val(s.kestrel.url);
@@ -463,7 +464,8 @@ $(function () {
                 vmangosSqlPath: $('#cfgSqlPath').val() || '',
                 extractorsPath: $('#cfgExtractorsPath').val() || '',
                 serverDataPath: $('#cfgServerDataPath').val() || '',
-                clientDataPath: $('#cfgVmangosClientDataPath').val() || ''
+                clientDataPath: $('#cfgVmangosClientDataPath').val() || '',
+                vmapsDataPath: $('#cfgVmapsDataPath').val() || ''
             },
             spellCreator: {
                 comfyUI: {

@@ -113,7 +113,7 @@
             content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier', 'professiontuning'],
             spells: ['spells', 'patch', 'visuallab'],
             world: ['worldmap', 'worldeditor'],
-            bots: ['bots-fleet', 'bots-map', 'bots-dashboard', 'bots-chatfeel', 'bots-chatcapacity'],
+            bots: ['bots-dashboard', 'bots-fleet', 'bots-map', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
             devtools: [],
             wiki: ['wiki-code', 'wiki-lua'],

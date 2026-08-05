@@ -193,6 +193,9 @@ public class QuestGraphLoader
             // Step 1: Load all quest nodes
             var quests = await LoadQuestNodesAsync(conn);
 
+            // Enrich cast objectives with their ReqSpellCast (defensive; see method).
+            await LoadCastSpellsAsync(conn, quests);
+
             // Step 2: Load quest givers
             await LoadQuestGiversAsync(conn, quests);
 
@@ -268,6 +271,55 @@ public class QuestGraphLoader
     // cross-faction kill targets (hostile to the taking side) are never flagged. Wrapped in its
     // own try/catch: a schema mismatch degrades to "no flags" (today's behavior), never a failed
     // graph load. Every flagged quest is logged individually so a misfire is visible, not silent.
+    // Enrich cast objectives with their required spell (quest_template ReqSpellCast1-4). An
+    // objective pairing a positive ReqCreatureOrGO with a ReqSpellCast is a CAST objective —
+    // credited by casting that spell ON the target (priest heal-an-NPC and the like), not by
+    // killing it. Loaded DEFENSIVELY in its own try/catch: if this core names the columns
+    // differently, we log a warning and leave objectives un-enriched (today's behaviour) rather
+    // than breaking all quest loading. Verify with: SHOW COLUMNS FROM quest_template LIKE 'ReqSpell%';
+    private async Task LoadCastSpellsAsync(System.Data.IDbConnection conn, Dictionary<int, QuestNode> quests)
+    {
+        try
+        {
+            var rows = await conn.QueryAsync<dynamic>(@"
+                SELECT entry, ReqSpellCast1, ReqSpellCast2, ReqSpellCast3, ReqSpellCast4
+                FROM quest_template
+                WHERE patch = 0");
+
+            int enriched = 0;
+            foreach (var r in rows)
+            {
+                int id = (int)r.entry;
+                if (!quests.TryGetValue(id, out var node) || node.Objectives.Length == 0)
+                    continue;
+
+                int[] spells =
+                {
+                    (int)r.ReqSpellCast1, (int)r.ReqSpellCast2,
+                    (int)r.ReqSpellCast3, (int)r.ReqSpellCast4
+                };
+
+                foreach (var o in node.Objectives)
+                {
+                    if (o.Slot >= 1 && o.Slot <= 4 && spells[o.Slot - 1] != 0)
+                    {
+                        o.RequiredSpellId = spells[o.Slot - 1];
+                        enriched++;
+                    }
+                }
+            }
+
+            _logger.LogInformation("QuestGraphLoader: enriched {Count} cast objectives with ReqSpellCast", enriched);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                "QuestGraphLoader: cast-spell enrichment skipped — quest_template ReqSpellCast1-4 not readable ({Msg}). " +
+                "Cast objectives behave as before; adjust LoadCastSpellsAsync if your schema names them differently.",
+                ex.Message);
+        }
+    }
+
     private async Task FlagFriendlyKillTargetsAsync(System.Data.IDbConnection conn, Dictionary<int, QuestNode> quests)
     {
         const int PlayerBit = 1, AllianceBit = 2, HordeBit = 4;

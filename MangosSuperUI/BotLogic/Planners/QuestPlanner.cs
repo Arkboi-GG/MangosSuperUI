@@ -311,6 +311,51 @@ public sealed class QuestPlanner : IBotPlanner
                     GatherLocals(ctx, q);
                 }
                 break;
+            case "to_cast":
+                // Arrived (or a stale/duplicate travel ack) at a cast objective's target. Gate on ACTUAL
+                // proximity like to_giver/to_turnin: not truly there -> re-travel; there -> start casting the
+                // resolved spell list on the target creature (QUEST_CAST).
+                if (q.Active != null)
+                {
+                    var castObj = ObjectiveAt(q.Active, q.ActiveSlot);
+                    if (castObj != null)
+                    {
+                        var spells = CastSpellsFor(q.Active.Node, castObj, q.Active.QuestId);
+                        var cp = NearestSpawnPoint(castObj.SpawnPositions, ctx.Pos.X, ctx.Pos.Y,
+                            castObj.GrindX, castObj.GrindY, castObj.GrindZ);
+                        var target = CastTarget(castObj.CreatureEntry, cp.X, cp.Y, cp.Z, castObj.GrindMap);
+                        if (!AtNpc(ctx, target)) return MoveTo(target);
+                        if (spells.Length > 0)
+                        {
+                            ctx.SetStep("casting");
+                            return CastSpell(castObj.CreatureEntry, spells[q.CastIndex], castObj.Count);
+                        }
+                    }
+                }
+                break;
+            case "casting":
+                // A QUEST_CAST_ACK cleared this WAIT -> the previous spell FIRED (an expired cast WAIT routes
+                // to Recover with Failure.CommandType=="QUEST_CAST" instead, so we only advance on a real ack).
+                // Fire the next spell in the kit, or -- once every required spell has landed -- wait for the
+                // objective counter to tick on the next STATE (script/column credit), then re-derive (turn-in
+                // when the server flips the quest COMPLETE). Same tail as to_objective.
+                if (q.Active != null)
+                {
+                    var castObj = ObjectiveAt(q.Active, q.ActiveSlot);
+                    var spells = castObj != null
+                        ? CastSpellsFor(q.Active.Node, castObj, q.Active.QuestId)
+                        : Array.Empty<int>();
+                    q.CastIndex++;
+                    if (castObj != null && q.CastIndex < spells.Length)
+                    {
+                        ctx.SetStep("casting");
+                        return CastSpell(castObj.CreatureEntry, spells[q.CastIndex], castObj.Count);
+                    }
+                    ctx.ClearObjective();
+                    ctx.SetStep("obj_sync");
+                    return StepResult.Wait();   // wait for the next STATE (obj_sync re-derives on fresh counts)
+                }
+                break;
         }
 
         RefreshActiveIds(q);
@@ -441,6 +486,31 @@ public sealed class QuestPlanner : IBotPlanner
                 }
             }
 
+            // -- 1c. CAST objective -- a spellcast-credited class quest (priest "Garments of the Light"
+            //      5624/5625, mage "Curing the Sick" 6124/6129, etc.). NEVER a grind: travel to the target
+            //      creature (often a FRIENDLY NPC you heal) and cast the required spell(s) on it via
+            //      QUEST_CAST. Credit lands the standard way -- the objective's MobCounts slot ticks on the
+            //      next STATE (script- or column-credited by the core cast path). Worked BEFORE the grind
+            //      phases so the enriched MOVE_TO / overflow grind can never target a cast objective's
+            //      creature (UnmetLegs / NearestCreatureSlot exclude cast-drivable objectives). Nearest cast
+            //      leg on THIS map; a cross-map cast target rides the log (carry policy) like any cross-map leg.
+            var withCast = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && !b.Deferred
+                                              && HasUnmetCast(ctx, b)).ToList();
+            if (withCast.Count > 0)
+            {
+                (BatchQuest Q, CastLeg Leg)? bestCast = null;
+                float bestCastD = float.MaxValue;
+                foreach (var b in withCast)
+                    foreach (var leg in UnmetCastLegs(ctx, b))
+                    {
+                        if (leg.Map != ctx.MapId) continue;   // cross-map cast target rides the log
+                        float d = Dist2(ctx.Pos.X, ctx.Pos.Y, leg.X, leg.Y);
+                        if (d < bestCastD) { bestCastD = d; bestCast = (b, leg); }
+                    }
+                if (bestCast != null)
+                    return DispatchCastLeg(ctx, q, bestCast.Value.Q, bestCast.Value.Leg);
+            }
+
             // -- 2. NEAR OBJECTIVE -- nearest unmet GRIND LEG, taken ONLY if within the immediate cluster
             //      (BatchRadius). A farther-but-reachable leg is NOT parked here: distance no longer changes
             //      batch membership, only PHASE ORDER. The far leg stays a live candidate and is taken as the
@@ -478,7 +548,8 @@ public sealed class QuestPlanner : IBotPlanner
             var stuck = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed
                                            && b.Node.HasKillObjectives
                                            && !IsComplete(ctx, b)
-                                           && !HasUnmet(ctx, b)).ToList();
+                                           && !HasUnmet(ctx, b)
+                                           && !HasUnmetCast(ctx, b)).ToList();   // a pending cast is NOT a stale-count grind -- the CAST phase owns it (never overflow-grind a heal target)
             if (stuck.Count > 0)
             {
                 var oPick = NearestCreatureSlot(ctx, stuck);
@@ -771,6 +842,29 @@ public sealed class QuestPlanner : IBotPlanner
             return StepResult.Wait();
         }
 
+        // QUEST_CAST timed out (no ACK within the deadline -- e.g. a QUEST_CAST_FAIL target_not_found /
+        // too_far we don't negate yet, or the heal target wandered out of 30yd/LOS this pass). Transient:
+        // re-travel and re-cast from the first spell. Bounded by the shared per-quest fail streak so a
+        // genuinely unreachable cast target still escalates to a normal accepted-quest defer at QuestFailCap
+        // instead of looping. (The happy path acks near-instantly, so this is a rare backstop; a fast
+        // QUEST_CAST_FAIL -> Recover path is a follow-up -- see the handover.)
+        if (f.CommandType == "QUEST_CAST" && active.Accepted)
+        {
+            var cid = ctx.Identity;
+            int castStreak = cid?.QuestFailStreak.GetValueOrDefault(active.QuestId, 0) ?? 0;
+            if (castStreak < QuestFailCap)
+            {
+                if (cid != null) cid.QuestFailStreak[active.QuestId] = castStreak + 1;
+                q.CastIndex = 0;
+                _logger.LogInformation("[QUEST] {Name} cast retry [{Id}] (QUEST_CAST timed out, try {N}/{Cap})",
+                    ctx.Name, active.QuestId, castStreak + 1, QuestFailCap);
+                q.Active = null;
+                ctx.SetStep("plan");   // re-derive -> the cast phase re-picks, re-travels, re-casts
+                return StepResult.Wait();
+            }
+            // retries exhausted -> fall through to the durable accepted-quest defer below
+        }
+
         if (!active.Accepted)
             DeferPick(ctx, active, f.Reason);
         else
@@ -875,7 +969,7 @@ public sealed class QuestPlanner : IBotPlanner
             bool actionableOnTurnIn = kv.Value.Status == QuestStatusComplete || !node.HasObjectives;
             if (!actionableOnTurnIn)
             {
-                if (node.Objectives.Any(o => o.TargetFriendly)) { skipped.Add($"{kv.Key}:unworkable-obj"); continue; }        // Fix 5: kill objective on a FRIENDLY NPC (scripted/spellcast credit) — undrivable
+                if (node.Objectives.Any(o => o.TargetFriendly && !IsCastDrivable(o, node.QuestId))) { skipped.Add($"{kv.Key}:unworkable-obj"); continue; }   // Fix 5: kill objective on a FRIENDLY NPC -- undrivable UNLESS cast-drivable (column ReqSpellCast or a QuestCastKit heal), which the CAST phase completes
                 if (!node.Objectives.All(o => o.IsCreature)) { skipped.Add($"{kv.Key}:noncreature-obj"); continue; }          // GO-interact objectives: phase 2
                 if (!node.ItemObjectives.All(it => it.BestDropSource != null)) { skipped.Add($"{kv.Key}:item-unresolved"); continue; }  // GO-sourced/unresolved items: phase 2
             }
@@ -987,7 +1081,7 @@ public sealed class QuestPlanner : IBotPlanner
     public static bool IsPickable(QuestNode q, BotIdentity id)
          => q.Giver != null
             && q.Objectives.All(o => o.IsCreature)                       // GO-interact objectives: phase 2
-            && q.Objectives.All(o => !o.TargetFriendly)                  // Fix 5: never PICK a kill-a-friendly quest (5624-class) — undrivable until spellcast objectives exist
+            && q.Objectives.All(o => !o.TargetFriendly || IsCastDrivable(o, q.QuestId))   // Fix 5: never PICK a kill-a-friendly quest -- EXCEPT a cast-drivable one (column ReqSpellCast or a QuestCastKit heal, e.g. 5624 Garments), which the CAST phase completes
             && q.ItemObjectives.All(it => it.BestDropSource != null)     // creature-sourced items only; GO-sourced/unresolved: phase 2
             && !id.CompletedQuestIds.Contains(q.QuestId)                 // 2026-06-30 fix: GatherLocals/GoalSelector's only chokepoint that did NOT
                                                                          // re-check completion — GetAvailableQuests was trusted blindly here while
@@ -1144,6 +1238,7 @@ public sealed class QuestPlanner : IBotPlanner
         foreach (var o in b.Node.Objectives)
         {
             if (!o.IsCreature || o.Count <= 0) continue;
+            if (IsCastDrivable(o, b.QuestId)) continue;   // cast objective -- driven by the CAST phase (QUEST_CAST), never a grind leg
             int rem = RawRemaining(ctx, b.QuestId, o);
             if (rem <= 0) continue;
             var p = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
@@ -1305,6 +1400,7 @@ public sealed class QuestPlanner : IBotPlanner
             {
                 var o = b.Node.Objectives[i];
                 if (!o.IsCreature || o.Count <= 0) continue;
+                if (IsCastDrivable(o, b.QuestId)) continue;   // never overflow-GRIND a cast objective's creature (e.g. a heal-target NPC)
                 if (o.GrindMap != ctx.MapId) continue;
                 var p = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
                 float d = Dist2(ctx.Pos.X, ctx.Pos.Y, p.X, p.Y);
@@ -1357,7 +1453,7 @@ public sealed class QuestPlanner : IBotPlanner
             foreach (var o in node.Objectives)
             {
                 if (!o.IsCreature || o.Count <= 0) continue;
-                if (o.TargetFriendly) continue;   // Fix 5: an unkillable friendly target is NOT workable (must not suppress a legitimate exhaust/lock)
+                if (o.TargetFriendly && !IsCastDrivable(o, node.QuestId)) continue;   // Fix 5: an unkillable friendly target is NOT workable -- UNLESS cast-drivable (the CAST phase can complete it), so it counts and the bot doesn't grind-lock while a cast is pending
                 if (o.GrindMap != ctx.MapId) continue;
                 if (!WithinObjectiveRail(node.Giver, o.GrindMap, o.GrindX, o.GrindY)) continue;   // drift rail: a railed leg is NOT workable -- MUST mirror PriorityLeg, or the phase-5 exhaust suppression livelocks (rail blocks the leg, this says workable, Block->reselect->rebuild->repeat)
                 int got = (o.Slot >= 1 && o.Slot <= e.MobCounts.Length) ? e.MobCounts[o.Slot - 1] : 0;
@@ -1555,6 +1651,105 @@ public sealed class QuestPlanner : IBotPlanner
             }),
             "TASK_COMPLETE", TravelDeadline);   // IsObjectiveGrind => KILL-push tightens to 120s no-kill
     }
+
+    // ========================================================================
+    // Cast objectives (spellcast-credited class quests) -- the CAST phase
+    //
+    // A cast objective is a POSITIVE-creature objective completed by CASTING a spell on the target
+    // rather than killing it. Two encodings:
+    //   * COLUMN (quest_template ReqSpellCast != 0 -> QuestObjective.RequiredSpellId): the spell is in
+    //     the DB; cast it on the target creature (mage "Curing the Sick" 19512).
+    //   * SCRIPT-CREDITED (RequiredSpellId == 0, spell only in the Objectives text): the target NPC's
+    //     creature script watches for specific casts and credits itself. The spell can't be read from the
+    //     DB, so it comes from QuestCastKit (priest "Garments of the Light" 5624/5625 -> heal + fortify).
+    //     These objectives are also flagged TargetFriendly by the loader (you HEAL a friendly), so the
+    //     friendly-skip gates exempt exactly the cast-drivable ones.
+    //
+    // Completion is server-authoritative and observed the standard way: the objective's MobCounts slot
+    // ticks on the next STATE after the core cast path credits it. QUEST_CAST_ACK only confirms the cast
+    // FIRED (and sequences a multi-spell kit) -- it never advances the quest by itself.
+    // ========================================================================
+
+    // Cast-drivable = a positive-creature objective we complete by casting, NOT killing. Column casts
+    // (RequiredSpellId != 0) qualify regardless of friendliness; script-credited casts qualify when the
+    // objective is a FRIENDLY-target creature with a QuestCastKit entry for this quest. Shared by the three
+    // friendly-skip gates (BuildBatch / IsPickable / WorkableInLog) and by UnmetLegs / NearestCreatureSlot
+    // (which EXCLUDE these so a cast objective is never grind-targeted).
+    private static bool IsCastDrivable(QuestObjective o, int questId)
+        => o.IsCastObjective                                                          // column-encoded (any friendliness)
+        || (o.CreatureOrGOId > 0 && o.TargetFriendly && QuestCastKit.Has(questId));    // script-credited friendly heal
+
+    // The ordered spell list to cast on this objective's target: the column spell if present, else the
+    // per-quest QuestCastKit (script-credited). Empty = not drivable / no known spells (defensive).
+    private static int[] CastSpellsFor(QuestNode node, QuestObjective o, int questId)
+    {
+        if (o.RequiredSpellId != 0) return new[] { o.RequiredSpellId };
+        return QuestCastKit.For(questId) ?? Array.Empty<int>();
+    }
+
+    // The objective at a given Slot (1-4) within a batched quest, or null.
+    private static QuestObjective? ObjectiveAt(BatchQuest b, int slot)
+    {
+        foreach (var o in b.Node.Objectives) if (o.Slot == slot) return o;
+        return null;
+    }
+
+    // A travel/interact target for a cast objective, from a resolved (x,y,z,map) point.
+    private static QuestNpcLocation CastTarget(int entry, float x, float y, float z, int map)
+        => new QuestNpcLocation { NpcEntry = entry, X = x, Y = y, Z = z, Map = map };
+
+    // A cast leg: the target creature + resolved position + the ordered spells to cast on it. Count is the
+    // objective's total (mostly informational for C++, which casts once per QUEST_CAST); completion is the
+    // counter tick, and a Count>1 objective simply re-derives another cast leg after each tick.
+    private readonly record struct CastLeg(
+        int Slot, int CreatureEntry, float X, float Y, float Z, int Map, int Count, IReadOnlyList<int> Spells);
+
+    // The unmet cast legs of a quest THIS tick: one per cast-drivable objective still short of its count.
+    // Position resolves to the real spawn in the objective's giver-scoped cluster nearest the bot
+    // (NearestSpawnPoint), exactly like UnmetLegs -- the friendly/heal target (e.g. Guard Roberts) is
+    // position-resolved by the loader's ResolveKillTargetsPerQuest before the friendly flag is set.
+    private IEnumerable<CastLeg> UnmetCastLegs(BotContext ctx, BatchQuest b)
+    {
+        foreach (var o in b.Node.Objectives)
+        {
+            if (!IsCastDrivable(o, b.QuestId) || o.Count <= 0) continue;
+            if (RawRemaining(ctx, b.QuestId, o) <= 0) continue;
+            var spells = CastSpellsFor(b.Node, o, b.QuestId);
+            if (spells.Length == 0) continue;   // no known spells -> can't drive (defensive)
+            var p = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
+            yield return new CastLeg(o.Slot, o.CreatureEntry, p.X, p.Y, p.Z, o.GrindMap, o.Count, spells);
+        }
+    }
+
+    private bool HasUnmetCast(BotContext ctx, BatchQuest b) => UnmetCastLegs(ctx, b).Any();
+
+    // Dispatch a cast leg: model on the accept/turn-in ARRIVAL pattern (travel, then act on arrival), NOT
+    // the enriched grind MOVE_TO. Reset the cast index; if already at the target, start casting now, else
+    // travel (to_cast). No Held is stamped -- a cast leg rides its own WAIT + deadline like an accept/turn-in
+    // leg (the reconcile only defends grind objectives).
+    private StepResult DispatchCastLeg(BotContext ctx, QuestScratch q, BatchQuest bq, CastLeg leg)
+    {
+        q.Active = bq;
+        q.ActiveSlot = leg.Slot;
+        q.CastIndex = 0;
+        var target = CastTarget(leg.CreatureEntry, leg.X, leg.Y, leg.Z, leg.Map);
+        if (AtNpc(ctx, target))
+        {
+            ctx.SetStep("casting");
+            return CastSpell(leg.CreatureEntry, leg.Spells[0], leg.Count);
+        }
+        ctx.SetStep("to_cast");
+        return MoveTo(target);
+    }
+
+    // QUEST_CAST for one spell on the target creature entry. C++ resolves the nearest alive creature of this
+    // entry (<=30yd + LOS), faces it, and casts (triggered if the bot doesn't know the spell, so item-/
+    // not-yet-learned quest spells still fire). ACK = cast fired; FAIL/no-ACK rides the deadline into Recover.
+    // Completion is the objective counter, never this ack.
+    private static StepResult CastSpell(int creatureEntry, int spellId, int count)
+        => StepResult.Send(
+            new BridgeCommand("QUEST_CAST", new { spell_id = spellId, entry = creatureEntry, count }),
+            "QUEST_CAST_ACK", InteractDeadline);
 
     // ========================================================================
     // Group execution (the god bot's shared objective)

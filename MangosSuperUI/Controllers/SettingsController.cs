@@ -76,7 +76,8 @@ public class SettingsController : Controller
                 VmangosSqlPath = _config["Vmangos:VmangosSqlPath"] ?? "",
                 ExtractorsPath = _config["Vmangos:ExtractorsPath"] ?? "",
                 ServerDataPath = _config["Vmangos:ServerDataPath"] ?? "",
-                ClientDataPath = _config["Vmangos:ClientDataPath"] ?? ""
+                ClientDataPath = _config["Vmangos:ClientDataPath"] ?? "",
+                VmapsDataPath = _config["Vmangos:VmapsDataPath"] ?? ""
             },
             SpellCreator = BuildSpellCreatorConfig(),
             Wiki = new WikiConfig
@@ -315,6 +316,10 @@ public class VmangosConfig
     public string ExtractorsPath { get; set; } = "";
     public string ServerDataPath { get; set; } = "";
     public string ClientDataPath { get; set; } = "";
+    // Optional explicit vmaps override for the World Editor's collision (VMaNGOS
+    // extracted vmaps). Blank → falls back to ServerDataPath/vmaps. See
+    // WorldEditorController.GetVmapsDirectory.
+    public string VmapsDataPath { get; set; } = "";
 }
 
 public class SpellCreatorConfig

@@ -236,12 +236,9 @@ function loadPresetByKey(presetKey, label) {
 
         // Load saved WMO placements for this preset.
         placementStore.loadSaved();
-
-        // Fetch real vmap collision for this block (fire-and-forget). The
-        // character sweeps render meshes until this resolves.
-        if (editor.collisionWorld) {
-            editor.collisionWorld.loadForPreset(presetKey).catch(() => {});
-        }
+        // NOTE: collision is built LAZILY on entering Character mode (see the
+        // Character button), never on preset load — that synchronous city-sized
+        // BVH build is what froze Stormwind for minutes on load.
 
         // Apply pending teleport if any.
         if (pendingTeleport) {
@@ -395,6 +392,12 @@ editor.collisionWorld = collisionWorld;
                 return;
             }
         }
+
+        // Build vmap collision lazily — only when you actually enter the world,
+        // never on preset load. The city-sized BVH now builds here, in the
+        // background and incrementally (one chunk per turn), so it neither froze
+        // the load nor hard-freezes now. Walls come online a moment after spawn.
+        if (editor.collisionWorld) editor.collisionWorld.loadForPreset(editor.currentPreset).catch(() => {});
 
         playerCharacter.setVisible(true);
         spawnHere();
