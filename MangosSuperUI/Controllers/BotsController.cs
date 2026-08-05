@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Hosting;
 using MangosSuperUI.Services;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Tracking;
@@ -16,8 +17,9 @@ public partial class BotsController : Controller
     private readonly BotFlightRecorder _recorder;
     private readonly BotLogBuffer _log;
     private readonly RaService _ra;
+    private readonly IWebHostEnvironment _env;
 
-    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra)
+    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra, IWebHostEnvironment env)
     {
         _bridge = bridge;
         _brain = brain;
@@ -26,6 +28,7 @@ public partial class BotsController : Controller
         _recorder = recorder;
         _log = log;
         _ra = ra;
+        _env = env;
     }
 
     public IActionResult Index()
@@ -43,40 +46,156 @@ public partial class BotsController : Controller
         "warrior", "paladin", "hunter", "rogue", "priest", "mage", "warlock", "druid"
     };
 
+    // Valid 1.12 race/class combinations. The C++ GetPlayerInfo(race,class) gate is the final
+    // backstop, but we reject bad combos here so nothing illegal is ever sent over RA.
+    // Race tokens MUST match ResolveBotRaceToken() in PlayerBotMgr.cpp.
+    private static readonly Dictionary<string, HashSet<string>> _raceClasses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["human"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "paladin", "rogue", "priest", "mage", "warlock" },
+        ["dwarf"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "paladin", "hunter", "rogue", "priest" },
+        ["nightelf"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "hunter", "rogue", "priest", "druid" },
+        ["gnome"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "rogue", "mage", "warlock" },
+        ["orc"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "hunter", "rogue", "shaman", "warlock" },
+        ["undead"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "rogue", "priest", "mage", "warlock" },
+        ["tauren"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "hunter", "shaman", "druid" },
+        ["troll"] = new(StringComparer.OrdinalIgnoreCase) { "warrior", "hunter", "rogue", "priest", "mage", "shaman" },
+    };
+
+    // Default race per class for the legacy class-only path (mirrors PlayerBotMgr.cpp defaults).
+    private static readonly Dictionary<string, string> _classDefaultRace = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["warrior"] = "human",
+        ["paladin"] = "human",
+        ["hunter"] = "nightelf",
+        ["rogue"] = "human",
+        ["priest"] = "human",
+        ["mage"] = "gnome",
+        ["warlock"] = "human",
+        ["druid"] = "nightelf",
+    };
+
     [HttpPost]
     public async Task<IActionResult> AddBots([FromBody] AddBotsRequest req)
     {
-        var classes = req?.Classes ?? Array.Empty<string>();
-        if (classes.Length == 0)
-            return Json(new { success = false, error = "No classes specified" });
-        if (classes.Length > 50)
-            return Json(new { success = false, error = "Too many at once (max 50)" });
+        // Expand the request into a flat (race, class) spawn list.
+        // Preferred shape: Spawns = [{ race, cls, count }]. Legacy shape: Classes = ["mage", ...]
+        // (class-only, default race per class) is still accepted so old callers don't break.
+        var spawns = new List<(string race, string cls)>();
 
-        // Validate EVERY token against the whitelist before sending anything.
-        var invalid = classes.Where(c => string.IsNullOrWhiteSpace(c) || !_addBotClasses.Contains(c.Trim())).ToList();
-        if (invalid.Count > 0)
-            return Json(new { success = false, error = "Unknown class(es): " + string.Join(", ", invalid) });
-
-        var results = new List<object>();
-        int sent = 0;
-        foreach (var raw in classes)
+        if (req?.Spawns != null && req.Spawns.Length > 0)
         {
-            var cls = raw.Trim().ToLowerInvariant();
-            try
+            foreach (var s in req.Spawns)
             {
-                var resp = await _ra.SendCommandAsync($".bot addai {cls}");
-                sent++;
-                results.Add(new { cls, ok = true, response = resp });
+                var race = (s.Race ?? "").Trim().ToLowerInvariant();
+                var cls = (s.Cls ?? "").Trim().ToLowerInvariant();
+                if (s.Count <= 0) continue;
+                if (!_raceClasses.TryGetValue(race, out var validClasses) || !validClasses.Contains(cls))
+                    return Json(new { success = false, error = $"Invalid race/class combination: {race} {cls}" });
+                for (int i = 0; i < s.Count; i++) spawns.Add((race, cls));
             }
-            catch (Exception ex)
+        }
+        else if (req?.Classes != null && req.Classes.Length > 0)
+        {
+            foreach (var raw in req.Classes)
             {
-                // RA likely dropped — report what got through and stop.
-                results.Add(new { cls, ok = false, error = ex.Message });
-                return Json(new { success = false, error = $"RA send failed after {sent}: {ex.Message}", sent, results });
+                var cls = (raw ?? "").Trim().ToLowerInvariant();
+                if (!_addBotClasses.Contains(cls))
+                    return Json(new { success = false, error = "Unknown class: " + cls });
+                spawns.Add((_classDefaultRace[cls], cls));
             }
         }
 
-        return Json(new { success = true, sent, results });
+        if (spawns.Count == 0)
+            return Json(new { success = false, error = "Nothing to spawn" });
+        if (spawns.Count > 200)
+            return Json(new { success = false, error = "Too many at once (max 200)" });
+
+        // Draw that many unique names from the list (wwwroot/data), minus names already taken.
+        List<string> names;
+        try
+        {
+            names = await BuildNamePoolAsync(spawns.Count);
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, error = ex.Message });
+        }
+
+        // Fire `.bot addai <class> <race> <name>` per bot over RA (serialized inside RaService).
+        // The updated C++ command resolves each race's real starting location and applies the name;
+        // persistence is handled by the existing bot code, exactly as it is today.
+        int sent = 0;
+        for (int i = 0; i < spawns.Count; i++)
+        {
+            var (race, cls) = spawns[i];
+            var name = names[i];
+            try
+            {
+                await _ra.SendCommandAsync($".bot addai {cls} {race} {name}");
+                sent++;
+            }
+            catch (Exception ex)
+            {
+                return Json(new { success = false, error = $"RA send failed after {sent}: {ex.Message}", sent, requested = spawns.Count });
+            }
+        }
+
+        return Json(new { success = true, sent, requested = spawns.Count });
+    }
+
+    // ==================== Load all persisted SuperUI bots (RA console: .bot add_all) ====================
+    // After a server reset the SuperUI bots still live in the perm DB but aren't in the world.
+    // `.bot add_all` re-adds every persisted bot in one shot. This is the same command the server
+    // admin console's "Add All" button fires — exposed here so it can be triggered straight from the
+    // IBot Monitor without opening the console. Fires over RA (serialized inside RaService).
+    [HttpPost]
+    public async Task<IActionResult> AddAll()
+    {
+        try
+        {
+            var response = await _ra.SendCommandAsync(".bot add_all");
+            return Json(new { success = true, response });
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    // Reads the era name list from wwwroot/data, filters to valid 1.12 names (2-12 letters),
+    // drops any already used by an existing character (the name column is unique), shuffles,
+    // and returns `need` of them. Throws if the file is missing or the pool is too small.
+    private async Task<List<string>> BuildNamePoolAsync(int need)
+    {
+        var root = _env.WebRootPath;
+        if (string.IsNullOrEmpty(root))
+            root = System.IO.Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
+        var path = System.IO.Path.Combine(root, "data", "wow_era_5000_names.txt");
+        if (!System.IO.File.Exists(path))
+            throw new Exception("Name list not found at wwwroot/data/wow_era_5000_names.txt");
+
+        var all = (await System.IO.File.ReadAllLinesAsync(path))
+            .Select(l => l.Trim())
+            .Where(l => l.Length >= 2 && l.Length <= 12 && l.All(char.IsLetter))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        using var charConn = _db.Characters();
+        var taken = (await charConn.QueryAsync<string>("SELECT name FROM characters"))
+            .Where(n => !string.IsNullOrEmpty(n))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var avail = all.Where(n => !taken.Contains(n)).ToList();
+        if (avail.Count < need)
+            throw new Exception($"Only {avail.Count} unused names available (need {need}). Add more names to the list.");
+
+        var rng = Random.Shared;
+        for (int i = avail.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (avail[i], avail[j]) = (avail[j], avail[i]);
+        }
+        return avail.Take(need).ToList();
     }
 
     // ==================== REST API ====================
@@ -931,7 +1050,16 @@ public class SetStoryRequest
 
 public class AddBotsRequest
 {
-    // Flat list of class tokens (e.g. ["priest","priest","mage"]); the modal expands its
-    // per-class counts before posting. Validated against the alliance whitelist server-side.
+    // Preferred: per-(race, class) counts. The Add Bots modal posts this shape.
+    public SpawnEntry[]? Spawns { get; set; }
+
+    // Legacy: flat class tokens (class-only, default race per class). Kept for old callers.
     public string[]? Classes { get; set; }
+}
+
+public class SpawnEntry
+{
+    public string? Race { get; set; }
+    public string? Cls { get; set; }
+    public int Count { get; set; }
 }

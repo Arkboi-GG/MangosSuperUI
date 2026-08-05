@@ -28,9 +28,11 @@ import { getJSON } from './net.js';
 
 const TILE_YARDS = 533.33333;
 
-// Cap per-mesh triangles so one geometry never gets unwieldy and each BVH build
-// stays bounded. Most zones fit in one mesh; a dense city splits into a few.
-const TRIS_PER_MESH = 300000;
+// Triangles per BVH mesh. Kept SMALL on purpose: each mesh's computeBoundsTree
+// is a synchronous burst, and the build runs one mesh per event-loop turn (see
+// _buildStep), so small chunks = short hitches instead of one multi-minute freeze
+// on a city. A dense block (Stormwind) becomes many meshes built across frames.
+const TRIS_PER_MESH = 64000;
 
 export class CollisionWorld {
     constructor(editor) {
@@ -40,6 +42,12 @@ export class CollisionWorld {
         this.stats = null;
         this._loadedKey = null;
         this._loading = false;
+
+        // Incremental BVH build state (see _buildStep) — keeps a big city from
+        // freezing the main thread.
+        this._buildTimer = null;
+        this._scene = null;
+        this._builtTris = 0;
 
         // Invisible, DOUBLE-SIDED: vmap winding is not consistent, so a
         // single-sided target would make some walls and floors invisible to the
@@ -59,7 +67,12 @@ export class CollisionWorld {
         opts = opts || {};
         if (!presetKey) return Promise.resolve(false);
 
-        const includeM2 = opts.includeM2 !== false;
+        // includeM2 defaults OFF: buildings/interiors (WMO vmaps) are the point of
+        // the port, and a dense city's thousands of tree/lamp/fence M2s are what
+        // blow the triangle count into the millions. Trees you can walk through is
+        // an acceptable trade for not freezing on Stormwind; pass includeM2:true
+        // for a forest zone where trunk collision matters.
+        const includeM2 = opts.includeM2 === true;
         const radius = (opts.radius != null) ? opts.radius : 1;
         const key = presetKey + '|r' + radius + '|m2' + (includeM2 ? 1 : 0);
 
@@ -127,28 +140,61 @@ export class CollisionWorld {
             scene[i * 3 + 2] = W * (31.5 - cgx - wx / T);
         }
 
-        for (let start = 0; start < this.triangleCount; start += TRIS_PER_MESH) {
-            const count = Math.min(TRIS_PER_MESH, this.triangleCount - start);
-            const geo = new THREE.BufferGeometry();
-            geo.setAttribute('position',
-                new THREE.BufferAttribute(new Float32Array(scene.subarray(start * 9, (start + count) * 9)), 3));
-            // three-mesh-bvh wants an index; the trivial sequential one makes the
-            // soup indexed without changing a single triangle.
-            const idx = new Uint32Array(count * 3);
-            for (let k = 0; k < idx.length; k++) idx[k] = k;
-            geo.setIndex(new THREE.BufferAttribute(idx, 1));
-            try { geo.computeBoundsTree(); } catch (e) { /* falls back to brute force */ }
+        // Build the BVH meshes INCREMENTALLY — one chunk per event-loop turn —
+        // so a huge city (Stormwind's vmap is the whole city in one .vmo, ~900k
+        // triangles) does not freeze the browser. computeBoundsTree is the
+        // expensive synchronous step; yielding between chunks keeps input and
+        // rendering alive. Collision comes online progressively: `ready` flips
+        // true after the first chunk and the character falls back to the
+        // render-mesh sweep until then.
+        this._scene = scene;
+        this._builtTris = 0;
+        this._scheduleBuild();
+    }
 
-            const mesh = new THREE.Mesh(geo, this._material);
-            mesh.name = 'collision-proxy';
-            mesh.visible = false;          // never rendered — a raycast target only
-            mesh.matrixAutoUpdate = false;
-            mesh.updateMatrixWorld(true);  // identity: geometry is already scene-space
-            this.meshes.push(mesh);
+    _scheduleBuild() {
+        if (this._buildTimer != null) return;
+        this._buildTimer = setTimeout(() => this._buildStep(), 0);
+    }
+
+    _buildStep() {
+        this._buildTimer = null;
+        const scene = this._scene;
+        if (!scene) return;
+
+        const start = this._builtTris;
+        const count = Math.min(TRIS_PER_MESH, this.triangleCount - start);
+        if (count <= 0) { this._scene = null; return; }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position',
+            new THREE.BufferAttribute(new Float32Array(scene.subarray(start * 9, (start + count) * 9)), 3));
+        // three-mesh-bvh wants an index; the trivial sequential one makes the
+        // soup indexed without changing a single triangle.
+        const idx = new Uint32Array(count * 3);
+        for (let k = 0; k < idx.length; k++) idx[k] = k;
+        geo.setIndex(new THREE.BufferAttribute(idx, 1));
+        try { geo.computeBoundsTree(); } catch (e) { /* falls back to brute force */ }
+
+        const mesh = new THREE.Mesh(geo, this._material);
+        mesh.name = 'collision-proxy';
+        mesh.visible = false;          // never rendered — a raycast target only
+        mesh.matrixAutoUpdate = false;
+        mesh.updateMatrixWorld(true);  // identity: geometry is already scene-space
+        this.meshes.push(mesh);
+
+        this._builtTris = start + count;
+        if (this._builtTris < this.triangleCount) {
+            this._buildTimer = setTimeout(() => this._buildStep(), 0);   // yield, then next chunk
+        } else {
+            this._scene = null;
         }
     }
 
     clear() {
+        if (this._buildTimer != null) { clearTimeout(this._buildTimer); this._buildTimer = null; }
+        this._scene = null;
+        this._builtTris = 0;
         for (const m of this.meshes) {
             if (m.geometry) {
                 if (m.geometry.boundsTree && m.geometry.disposeBoundsTree) m.geometry.disposeBoundsTree();

@@ -134,6 +134,12 @@ public sealed class QuestScratch
     public BatchQuest? Active { get; set; }
     public int ActiveSlot { get; set; }                  // objective index within Active.Node.Objectives
 
+    // Which spell in the active CAST objective's ordered spell list has been fired so far (0-based).
+    // Reset to 0 when a cast leg is dispatched; advanced only on a real QUEST_CAST_ACK (see
+    // QuestPlanner's "casting" step). Lets a multi-spell script-credited kit (e.g. Garments'
+    // [heal, fortify]) fire one spell per QUEST_CAST across ticks. Irrelevant to non-cast legs.
+    public int CastIndex { get; set; }
+
     // En-route re-gather throttle: re-scan for new local givers once the bot has
     // moved this far from where we last gathered (so a hub passed mid-sweep is caught).
     public Vec3 LastGatherPos { get; set; }

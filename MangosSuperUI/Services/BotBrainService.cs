@@ -587,6 +587,13 @@ public class BotBrainService : BackgroundService
         // Tables the retained surface needs (bot_personality, bot_settings, …).
         await _dbInit.InitializeAsync();
 
+        // Self-heal the core characters.playerbot schema. Stock VMaNGOS ships the
+        // base table (char_guid, chance, ai) but NOT the identity columns the fork's
+        // PlayerBotMgr::Load() and our auto-register below both read/write. On a fresh
+        // clone of the fork these are absent and every bot load fails with a 1054
+        // "unknown column" — so add them here, guarded, once. No-op after the first run.
+        await EnsurePlayerbotColumnsAsync();
+
         // Personality quirk tables (load/roll on connect).
         _quirkLoader.Load();
 
@@ -952,5 +959,72 @@ public class BotBrainService : BackgroundService
         {
             _logger.LogWarning(ex, "BotBrain: failed to persist personality for bot {Guid}", guid);
         }
+    }
+
+    // ==================== Core schema self-heal ====================
+
+    /// <summary>
+    /// Add the fork's identity columns to characters.playerbot if they're missing.
+    /// The base VMaNGOS table has only (char_guid, chance, ai); the fork reads/writes
+    /// name/race/class/level/map/position_x/y/z. Each column is added independently and
+    /// guarded against information_schema, so this is idempotent and survives a partial
+    /// (some-columns-already-present) state. Portable across MySQL 5.6/5.7/8.0 and
+    /// MariaDB — deliberately NOT using "ADD COLUMN IF NOT EXISTS" (MariaDB-only).
+    /// AFTER clauses are omitted on purpose: column position is cosmetic and pinning it
+    /// to a base column ("AFTER ai") would fail on any schema variant that renamed it.
+    /// </summary>
+    private async Task EnsurePlayerbotColumnsAsync()
+    {
+        // (column name, DDL type spec). `class` is a reserved word -> backticked in DDL,
+        // but the information_schema lookup uses the bare name.
+        var columns = new (string Name, string Ddl)[]
+        {
+            ("name",       "`name` VARCHAR(12) NOT NULL DEFAULT ''"),
+            ("race",       "`race` TINYINT UNSIGNED NOT NULL DEFAULT 0"),
+            ("class",      "`class` TINYINT UNSIGNED NOT NULL DEFAULT 0"),
+            ("level",      "`level` TINYINT UNSIGNED NOT NULL DEFAULT 1"),
+            ("map",        "`map` SMALLINT UNSIGNED NOT NULL DEFAULT 0"),
+            ("position_x", "`position_x` FLOAT NOT NULL DEFAULT 0"),
+            ("position_y", "`position_y` FLOAT NOT NULL DEFAULT 0"),
+            ("position_z", "`position_z` FLOAT NOT NULL DEFAULT 0"),
+        };
+
+        try
+        {
+            using var conn = _db.Characters();
+            int added = 0;
+
+            foreach (var (name, ddl) in columns)
+            {
+                if (await ColumnExistsAsync(conn, "playerbot", name))
+                    continue;
+
+                await conn.ExecuteAsync($"ALTER TABLE playerbot ADD COLUMN {ddl}");
+                added++;
+                _logger.LogInformation("BotBrain: added missing playerbot.{Column} column", name);
+            }
+
+            if (added > 0)
+                _logger.LogInformation("BotBrain: playerbot schema self-heal added {Count} column(s)", added);
+        }
+        catch (Exception ex)
+        {
+            // Non-fatal: log loudly. If this fails (e.g. permissions), bot load will fail
+            // later with the same 1054 and the operator gets a second, pointed signal.
+            _logger.LogError(ex, "BotBrain: failed to self-heal characters.playerbot schema — bot load may fail with unknown-column errors until the identity columns exist");
+        }
+    }
+
+    /// <summary>
+    /// Portable column-existence check against information_schema. DATABASE() resolves
+    /// to the connection's current schema (characters), so no DB name needs threading in.
+    /// </summary>
+    private static async Task<bool> ColumnExistsAsync(System.Data.IDbConnection conn, string table, string column)
+    {
+        var count = await conn.ExecuteScalarAsync<int>(
+            @"SELECT COUNT(*) FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table AND COLUMN_NAME = @column",
+            new { table, column });
+        return count > 0;
     }
 }

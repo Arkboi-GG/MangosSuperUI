@@ -63,6 +63,7 @@ public class QuestNode
     public bool HasKillObjectives => Objectives.Length > 0;
     public bool HasItemObjectives => ItemObjectives.Length > 0;
     public bool HasObjectives => HasKillObjectives || HasItemObjectives;
+    public bool HasCastObjectives => Objectives.Any(o => o.IsCastObjective);
     public bool IsAvailableToRace(int raceBit) => RaceMask == 0 || (RaceMask & raceBit) != 0;
     public bool IsAvailableToClass(int classBit) => ClassMask == 0 || (ClassMask & classBit) != 0;
 
@@ -120,6 +121,12 @@ public class QuestObjective
     public int Count { get; set; }
     public string? TargetName { get; set; }
 
+    // Cast objective (quest_template ReqSpellCast). When non-zero, this objective is credited by
+    // CASTING this spell on the target creature (CreatureOrGOId, positive) — the priest heal-an-NPC
+    // class quests and the like — NOT by killing it. Populated by QuestGraphLoader.LoadCastSpellsAsync.
+    // 0 = a normal kill/interact objective.
+    public int RequiredSpellId { get; set; }
+
     // Resolved from creature spawn data (avg position of all spawns)
     public float GrindX { get; set; }
     public float GrindY { get; set; }
@@ -151,6 +158,15 @@ public class QuestObjective
     public bool IsGameObject => CreatureOrGOId < 0;
     public int CreatureEntry => Math.Max(0, CreatureOrGOId);
     public int GameObjectEntry => CreatureOrGOId < 0 ? Math.Abs(CreatureOrGOId) : 0;
+
+    /// <summary>A "cast spell S on creature C" objective (positive creature + a required spell),
+    /// driven by the QUEST_CAST bridge command rather than a grind. Friendliness is irrelevant here
+    /// (you may be HEALING a friendly), so these must never be treated as unkillable-friendly kill
+    /// targets.</summary>
+    public bool IsCastObjective => CreatureOrGOId > 0 && RequiredSpellId != 0;
+
+    /// <summary>A plain kill objective: a creature target with no required spell.</summary>
+    public bool IsKillObjective => CreatureOrGOId > 0 && RequiredSpellId == 0;
 }
 
 /// <summary>

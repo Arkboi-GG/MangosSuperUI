@@ -2324,11 +2324,31 @@ $(function () {
     $('#botReportModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
     $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#botReportModal').removeClass('active'); });
 
-    // ===================== ADD BOTS MODAL (quick .bot addai spawner) =====================
-    // Alliance classes only (no Shaman). Spawns via POST /Bots/AddBots → the server runs
-    // `.bot addai <class>` once per entry over RA. Default preset = 2× each class, for fast reruns.
-    var ADD_BOT_CLASSES = ['warrior', 'paladin', 'hunter', 'rogue', 'priest', 'mage', 'warlock', 'druid'];
-    // Class color + iconography pulled from the subject's own world (vanilla WoW class colors).
+    // ===================== ADD BOTS MODAL (race-aware .bot addai spawner) =====================
+    // Pick counts per race x class. Posts { spawns:[{race,cls,count}] } to /Bots/AddBots, which
+    // draws unique names from wwwroot/data and fires `.bot addai <class> <race> <name>` per bot.
+    // The C++ command spawns each at that race's real starting zone.
+    var AB_RACES = [
+        { key: 'human', name: 'Human', side: 'alliance' },
+        { key: 'dwarf', name: 'Dwarf', side: 'alliance' },
+        { key: 'nightelf', name: 'Night Elf', side: 'alliance' },
+        { key: 'gnome', name: 'Gnome', side: 'alliance' },
+        { key: 'orc', name: 'Orc', side: 'horde' },
+        { key: 'undead', name: 'Undead', side: 'horde' },
+        { key: 'tauren', name: 'Tauren', side: 'horde' },
+        { key: 'troll', name: 'Troll', side: 'horde' }
+    ];
+    var AB_RACE_CLASSES = {
+        human: ['warrior', 'paladin', 'rogue', 'priest', 'mage', 'warlock'],
+        dwarf: ['warrior', 'paladin', 'hunter', 'rogue', 'priest'],
+        nightelf: ['warrior', 'hunter', 'rogue', 'priest', 'druid'],
+        gnome: ['warrior', 'rogue', 'mage', 'warlock'],
+        orc: ['warrior', 'hunter', 'rogue', 'shaman', 'warlock'],
+        undead: ['warrior', 'rogue', 'priest', 'mage', 'warlock'],
+        tauren: ['warrior', 'hunter', 'shaman', 'druid'],
+        troll: ['warrior', 'hunter', 'rogue', 'priest', 'mage', 'shaman']
+    };
+    // Class color + iconography (vanilla WoW class colors; shaman added for Horde).
     var ADD_BOT_META = {
         warrior: { color: '#C79C6E', icon: 'fa-shield-halved' },
         paladin: { color: '#F58CBA', icon: 'fa-hammer' },
@@ -2337,10 +2357,12 @@ $(function () {
         priest: { color: '#FFFFFF', icon: 'fa-hands-praying' },
         mage: { color: '#69CCF0', icon: 'fa-hat-wizard' },
         warlock: { color: '#9482C9', icon: 'fa-skull' },
-        druid: { color: '#FF7D0A', icon: 'fa-paw' }
+        druid: { color: '#FF7D0A', icon: 'fa-paw' },
+        shaman: { color: '#0070DE', icon: 'fa-bolt' }
     };
-    var addBotCounts = {};
-    ADD_BOT_CLASSES.forEach(function (c) { addBotCounts[c] = 2; });
+    // abCounts[race][cls] = n
+    var abCounts = {};
+    AB_RACES.forEach(function (r) { abCounts[r.key] = {}; AB_RACE_CLASSES[r.key].forEach(function (c) { abCounts[r.key][c] = 0; }); });
 
     $('head').append(
         '<style>' +
@@ -2348,7 +2370,7 @@ $(function () {
         '.ab-overlay.active{display:flex;animation:abFade .14s ease;}' +
         '@keyframes abFade{from{opacity:0}to{opacity:1}}' +
         '@keyframes abPop{from{transform:translateY(8px) scale(.985);opacity:.5}to{transform:none;opacity:1}}' +
-        '.ab-modal{background:var(--bg-card,#1a1b26);border:1px solid var(--border-light,#414868);border-radius:14px;width:92vw;max-width:540px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,0.6);overflow:hidden;animation:abPop .16s cubic-bezier(.2,.8,.2,1);}' +
+        '.ab-modal{background:var(--bg-card,#1a1b26);border:1px solid var(--border-light,#414868);border-radius:14px;width:92vw;max-width:600px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,0.6);overflow:hidden;animation:abPop .16s cubic-bezier(.2,.8,.2,1);}' +
         '.ab-header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid var(--border-light,#414868);background:linear-gradient(135deg,rgba(122,162,247,0.14),rgba(187,154,247,0.05));}' +
         '.ab-hleft{display:flex;align-items:center;}' +
         '.ab-hicon{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:rgba(122,162,247,0.16);color:var(--accent,#7aa2f7);font-size:15px;margin-right:11px;}' +
@@ -2358,17 +2380,24 @@ $(function () {
         '.ab-close{background:none;border:none;color:var(--text-muted,#787c99);cursor:pointer;font-size:17px;line-height:1;padding:4px 6px;border-radius:6px;transition:all .12s;}' +
         '.ab-close:hover{color:var(--text-secondary,#c0caf5);background:rgba(255,255,255,0.06);}' +
         '.ab-body{padding:14px 18px;overflow-y:auto;}' +
-        '.ab-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}' +
-        '.ab-card{position:relative;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px 10px 15px;border-radius:10px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);overflow:hidden;transition:opacity .14s,box-shadow .14s,border-color .14s;}' +
+        '.ab-race{margin-bottom:15px;}' +
+        '.ab-race:last-child{margin-bottom:2px;}' +
+        '.ab-rhead{display:flex;align-items:center;gap:8px;margin:0 0 8px 2px;font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--text-secondary,#c0caf5);}' +
+        '.ab-rdot{width:8px;height:8px;border-radius:50%;flex:none;}' +
+        '.ab-rdot.alliance{background:#4a86ff;}' +
+        '.ab-rdot.horde{background:#e0503a;}' +
+        '.ab-rtot{margin-left:auto;font-size:11px;font-weight:600;color:var(--text-muted,#787c99);font-variant-numeric:tabular-nums;}' +
+        '.ab-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px;}' +
+        '.ab-card{position:relative;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px 9px 14px;border-radius:10px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);overflow:hidden;transition:opacity .14s,box-shadow .14s,border-color .14s;}' +
         '.ab-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--cc,#7aa2f7);opacity:.45;transition:opacity .14s;}' +
         '.ab-card.on{box-shadow:0 2px 14px rgba(0,0,0,0.28);}' +
         '.ab-card.on::before{opacity:1;}' +
         '.ab-card.off{opacity:.48;}' +
-        '.ab-cname{display:flex;align-items:center;gap:9px;min-width:0;}' +
-        '.ab-cname i{font-size:14px;width:18px;text-align:center;}' +
-        '.ab-cname b{font-size:13px;font-weight:600;text-transform:capitalize;letter-spacing:.2px;}' +
+        '.ab-cname{display:flex;align-items:center;gap:8px;min-width:0;}' +
+        '.ab-cname i{font-size:13px;width:17px;text-align:center;}' +
+        '.ab-cname b{font-size:12.5px;font-weight:600;text-transform:capitalize;letter-spacing:.2px;}' +
         '.ab-step{display:inline-flex;align-items:center;gap:6px;flex:none;}' +
-        '.ab-step button{width:24px;height:24px;border-radius:6px;border:1px solid var(--border-light,#414868);background:var(--bg-card,#1a1b26);color:var(--text-secondary,#c0caf5);cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .12s;}' +
+        '.ab-step button{width:23px;height:23px;border-radius:6px;border:1px solid var(--border-light,#414868);background:var(--bg-card,#1a1b26);color:var(--text-secondary,#c0caf5);cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .12s;}' +
         '.ab-step button:hover{border-color:var(--cc,#7aa2f7);color:#fff;}' +
         '.ab-step .ab-cnt{min-width:18px;text-align:center;font-weight:700;font-size:13px;font-variant-numeric:tabular-nums;}' +
         '.ab-foot{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-top:1px solid var(--border-light,#414868);gap:10px;background:rgba(0,0,0,0.12);}' +
@@ -2388,66 +2417,102 @@ $(function () {
         '<div class="ab-modal">' +
         '<div class="ab-header">' +
         '<div class="ab-hleft"><div class="ab-hicon"><i class="fa-solid fa-user-plus"></i></div>' +
-        '<div class="ab-htxt"><b>Add Bots</b><span>Quick-spawn alliance bots for a rerun</span></div></div>' +
+        '<div class="ab-htxt"><b>Add Bots</b><span>Pick counts per race - each spawns at its own start with a real name</span></div></div>' +
         '<button class="ab-close" id="abClose"><i class="fa-solid fa-xmark"></i></button></div>' +
-        '<div class="ab-body"><div class="ab-grid" id="abRows"></div></div>' +
+        '<div class="ab-body"><div id="abRows"></div></div>' +
         '<div class="ab-foot">' +
         '<div class="ab-presets">' +
         '<button class="ab-preset" data-ab-preset="0">Clear</button>' +
-        '<button class="ab-preset" data-ab-preset="1">1× each</button>' +
-        '<button class="ab-preset" data-ab-preset="2">2× each</button>' +
+        '<button class="ab-preset" data-ab-preset="1">1x each</button>' +
+        '<button class="ab-preset" data-ab-preset="2">2x each</button>' +
         '</div>' +
         '<button class="ab-spawn" id="abSpawn"><i class="fa-solid fa-bolt"></i> Spawn <span class="ab-tot" id="abTotal">0</span></button>' +
         '</div></div></div>'
     );
 
-    function renderAddBotCards() {
+    function renderAddBots() {
         var html = '', total = 0;
-        for (var i = 0; i < ADD_BOT_CLASSES.length; i++) {
-            var c = ADD_BOT_CLASSES[i], n = addBotCounts[c] || 0, m = ADD_BOT_META[c];
-            total += n;
-            html += '<div class="ab-card ' + (n > 0 ? 'on' : 'off') + '" style="--cc:' + m.color + ';">' +
-                '<span class="ab-cname"><i class="fa-solid ' + m.icon + '" style="color:' + m.color + ';"></i><b>' + c + '</b></span>' +
-                '<span class="ab-step">' +
-                '<button data-ab-dec="' + c + '">−</button>' +
-                '<span class="ab-cnt">' + n + '</span>' +
-                '<button data-ab-inc="' + c + '">+</button>' +
-                '</span></div>';
+        for (var ri = 0; ri < AB_RACES.length; ri++) {
+            var r = AB_RACES[ri], rtot = 0, cards = '';
+            var clss = AB_RACE_CLASSES[r.key];
+            for (var ci = 0; ci < clss.length; ci++) {
+                var c = clss[ci], n = (abCounts[r.key][c] || 0), m = ADD_BOT_META[c];
+                rtot += n; total += n;
+                cards += '<div class="ab-card ' + (n > 0 ? 'on' : 'off') + '" style="--cc:' + m.color + ';">' +
+                    '<span class="ab-cname"><i class="fa-solid ' + m.icon + '" style="color:' + m.color + ';"></i><b>' + c + '</b></span>' +
+                    '<span class="ab-step">' +
+                    '<button data-ab-dec="' + r.key + ':' + c + '">-</button>' +
+                    '<span class="ab-cnt">' + n + '</span>' +
+                    '<button data-ab-inc="' + r.key + ':' + c + '">+</button>' +
+                    '</span></div>';
+            }
+            html += '<div class="ab-race">' +
+                '<div class="ab-rhead"><span class="ab-rdot ' + r.side + '"></span>' + r.name +
+                '<span class="ab-rtot">' + rtot + '</span></div>' +
+                '<div class="ab-grid">' + cards + '</div></div>';
         }
         $('#abRows').html(html);
         $('#abTotal').text(total);
         $('#abSpawn').prop('disabled', total === 0);
     }
 
-    $('#btnAddBots').on('click', function () { renderAddBotCards(); $('#addBotsModal').addClass('active'); });
+    $('#btnAddBots').on('click', function () { renderAddBots(); $('#addBotsModal').addClass('active'); });
+
+    // Load SuperUI Bots — fire `.bot add_all` over RA to re-add every persisted bot to the
+    // world (the standard recovery step after a server reset). Same command as the server
+    // admin console's "Add All", surfaced here so it's one click from the IBot Monitor.
+    $('#btnLoadSuperuiBots').on('click', function () {
+        if (!confirm('Re-add every persisted SuperUI bot to the world via .bot add_all? Run this after a server reset.')) return;
+        var $btn = $(this).prop('disabled', true);
+        $.ajax({ url: '/Bots/AddAll', method: 'POST' })
+            .done(function (res) {
+                if (res && res.success) {
+                    var extra = res.response ? (' — ' + String(res.response).trim().split('\n')[0]) : '';
+                    showToast('Loading SuperUI bots (.bot add_all sent)' + extra);
+                } else {
+                    showToast('Load SuperUI bots failed: ' + ((res && res.error) || 'unknown'), true);
+                }
+            })
+            .fail(function (xhr) { showToast('Load SuperUI bots failed (' + xhr.status + ')', true); })
+            .always(function () { $btn.prop('disabled', false); });
+    });
+
     $('#abClose').on('click', function () { $('#addBotsModal').removeClass('active'); });
     $('#addBotsModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
     $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#addBotsModal').removeClass('active'); });
 
+    function abParseKey(k) { var p = (k || '').split(':'); return { race: p[0], cls: p[1] }; }
     $(document).on('click', '[data-ab-inc]', function () {
-        var c = $(this).attr('data-ab-inc'); addBotCounts[c] = Math.min(20, (addBotCounts[c] || 0) + 1); renderAddBotCards();
+        var kv = abParseKey($(this).attr('data-ab-inc'));
+        abCounts[kv.race][kv.cls] = Math.min(50, (abCounts[kv.race][kv.cls] || 0) + 1); renderAddBots();
     });
     $(document).on('click', '[data-ab-dec]', function () {
-        var c = $(this).attr('data-ab-dec'); addBotCounts[c] = Math.max(0, (addBotCounts[c] || 0) - 1); renderAddBotCards();
+        var kv = abParseKey($(this).attr('data-ab-dec'));
+        abCounts[kv.race][kv.cls] = Math.max(0, (abCounts[kv.race][kv.cls] || 0) - 1); renderAddBots();
     });
     $(document).on('click', '[data-ab-preset]', function () {
         var v = parseInt($(this).attr('data-ab-preset'), 10) || 0;
-        ADD_BOT_CLASSES.forEach(function (c) { addBotCounts[c] = v; });
-        renderAddBotCards();
+        AB_RACES.forEach(function (r) { AB_RACE_CLASSES[r.key].forEach(function (c) { abCounts[r.key][c] = v; }); });
+        renderAddBots();
     });
 
     $('#abSpawn').on('click', function () {
-        var classes = [];
-        ADD_BOT_CLASSES.forEach(function (c) { for (var i = 0; i < (addBotCounts[c] || 0); i++) classes.push(c); });
-        if (!classes.length) { showToast('Pick at least one bot', true); return; }
+        var spawns = [], total = 0;
+        AB_RACES.forEach(function (r) {
+            AB_RACE_CLASSES[r.key].forEach(function (c) {
+                var n = abCounts[r.key][c] || 0;
+                if (n > 0) { spawns.push({ race: r.key, cls: c, count: n }); total += n; }
+            });
+        });
+        if (!total) { showToast('Pick at least one bot', true); return; }
         var $btn = $(this).prop('disabled', true);
-        $.ajax({ url: '/Bots/AddBots', method: 'POST', contentType: 'application/json', data: JSON.stringify({ classes: classes }) })
+        $.ajax({ url: '/Bots/AddBots', method: 'POST', contentType: 'application/json', data: JSON.stringify({ spawns: spawns }) })
             .done(function (res) {
-                if (res && res.success) showToast('Spawning ' + classes.length + ' bot(s) — ' + (res.sent != null ? res.sent : classes.length) + ' command(s) sent');
+                if (res && res.success) showToast('Spawning ' + total + ' bot(s) - ' + (res.sent != null ? res.sent : total) + ' command(s) sent');
                 else showToast('Add bots failed: ' + ((res && res.error) || 'unknown'), true);
                 $('#addBotsModal').removeClass('active');
             })
-            .fail(function (xhr) { showToast('Add Bots endpoint not wired yet (' + xhr.status + ')', true); })
+            .fail(function (xhr) { showToast('Add Bots failed (' + xhr.status + ')', true); })
             .always(function () { $btn.prop('disabled', false); });
     });
 
