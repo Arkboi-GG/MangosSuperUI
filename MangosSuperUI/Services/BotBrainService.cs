@@ -50,6 +50,7 @@ public class BotBrainService : BackgroundService
     private readonly ZoneSafetyMap _safety;       // §5.1 weakest-member travel gate (path creature-level)
     private readonly CreatureSpawnLoader _spawns; // Scatter Build 2: real-spawn anchor sampler -> god-bot shared-objective dispersal
     private readonly ZoneDataLoader _zoneData;    // GAP G (2026-07-02): nearest vendor/repair NPC for the whole-group vendor errand (GroupCoordinator.Update)
+    private readonly BotFallRecorder _fallRecorder; // always-on void/fall black box — Observe(ctx) each tick, flush-only-on-fall
 
     // Roster mirrors. _bots feeds the dashboard + grouping; _contexts is the
     // live-state the spine drives. One entry per connected bot in both.
@@ -77,7 +78,8 @@ public class BotBrainService : BackgroundService
         QuestGraphLoader quests,
         ZoneSafetyMap safety,
         CreatureSpawnLoader spawns,
-        ZoneDataLoader zoneData)
+        ZoneDataLoader zoneData,
+        BotFallRecorder fallRecorder)
     {
         _bridge = bridge;
         _db = db;
@@ -90,6 +92,7 @@ public class BotBrainService : BackgroundService
         _safety = safety;
         _spawns = spawns;
         _zoneData = zoneData;
+        _fallRecorder = fallRecorder;
         _groupManager = new GroupManager(_db, loggerFactory.CreateLogger<GroupManager>());
     }
 
@@ -668,6 +671,7 @@ public class BotBrainService : BackgroundService
                 _initializedGuids.Remove(guid);
                 _disconnectedAt.TryRemove(guid, out _);
                 _tracker.Remove(guid);
+                _fallRecorder.Forget(guid);   // drop the bot's fall-ring so evicted guids don't leak memory
                 _logger.LogInformation("BotBrain: evicted stale bot {Guid} (disconnected {Sec}s+)", guid, (int)EVICT_DISCONNECT_SEC);
             }
         }
@@ -712,6 +716,9 @@ public class BotBrainService : BackgroundService
                 await _driver.TickAsync(kvp.Value, snap);   // runs Sense → hold Idle → Supervise
             else
                 kvp.Value.Sense(snap);                        // disabled: still sense so FleetReport stays live
+
+            // Always-on void/fall black box: ctx.Pos is fresh (post-Sense) either way. Cheap; flushes only on a fall.
+            _fallRecorder.Observe(kvp.Value);
         }
     }
 

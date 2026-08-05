@@ -52,6 +52,7 @@ builder.Services.AddSingleton<SourceIndexerService>();
 builder.Services.AddSingleton<ZoneSafetyMap>();
 builder.Services.AddSingleton<BotFleetDiagnostics>();
 builder.Services.AddSingleton<BotFlightRecorder>();
+builder.Services.AddSingleton<BotFallRecorder>();   // always-on void/fall black box (flush-only-on-fall)
 builder.Services.AddSingleton<SpellCreatorService>();
 builder.Services.AddSingleton<BlpWriterService>();
 builder.Services.AddSingleton<PatchBuilderService>();

@@ -1,0 +1,303 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.Services;
+using Microsoft.Extensions.Logging;
+
+namespace MangosSuperUI.BotLogic.Tracking;
+
+// ════════════════════════════════════════════════════════════════════════════
+// BotFallRecorder — the "black box" for bot MIS-PLACEMENT (wrong-Z and wrong-area)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// PURPOSE
+//   Catch a bot going wrong IN THE ACT, so we stop reasoning about aftermath. For
+//   every bot, always, keep a short in-memory ring of the last ~60s of {goal, step,
+//   where it came from, where it was going, pos, ground-Z, corridor threat}. On a
+//   trigger, persist the ring (the ~50% BEFORE) plus a ~60s tail (the ~50% AFTER)
+//   to ONE JSONL, then stop. Two independent triggers, two output folders:
+//     falls/  — WRONG Z: a sudden one-tick Z drop, or sinking below authoritative
+//               ground (HeightMapService). "It fell through the floor."
+//     strays/ — WRONG AREA: while travelling, the route/destination crosses into
+//               content above the bot's level band (ZoneSafetyMap). "It's heading
+//               somewhere it shouldn't." The capture logs the safety-gate verdict
+//               (destination level, corridor max, the travel cap that allowed it)
+//               so a stray shows WHY the guard was bypassed, not just that it was.
+//   Nothing is written until a trigger fires, so this costs disk only when there
+//   is a bug to look at.
+//
+// GROUND TRUTH, NOT SELF-REPORT
+//   The floor comes from HeightMapService.GetHeight — the server's own GridMap
+//   heightfield (the same data mangosd's Map::GetHeight reads, holes included).
+//   A NULL return means the bot is over a terrain data-hole; that is recorded, not
+//   guessed. This is deliberately independent of anything the bot brain believes.
+//
+// FALSE-POSITIVE GUARD (legit underground: Undercity, mines, caves)
+//   A bot that has ALWAYS been below ground (Undercity sits under Tirisfal terrain)
+//   must not fire. So the sustained-below trigger requires the bot to have been ON
+//   ground recently (LastOnGroundUtc) — i.e. it fires on the TRANSITION surface→void,
+//   never on steady-state underground. The sudden-drop trigger is Z-only and self-
+//   guards (a stationary underground bot never suddenly drops).
+//
+// WIRING
+//   DI singleton (Program.cs). BotBrainService.RunBrainTicksAsync calls Observe(ctx)
+//   once per bot per ~250ms tick, right after Sense refreshes ctx.Pos.
+// ════════════════════════════════════════════════════════════════════════════
+public sealed class BotFallRecorder
+{
+    private readonly HeightMapService _height;
+    private readonly ZoneSafetyMap _safety;
+    private readonly ILogger<BotFallRecorder> _logger;
+
+    // ~60s before + ~60s after at the 250ms tick → a symmetric ~2-minute window.
+    private const int RING_FRAMES = 240;      // BEFORE the trigger (the ring)
+    private const int TAIL_FRAMES = 240;      // AFTER the trigger (recorded post-fire)
+
+    // ── Wrong-Z (fall) trigger ──
+    private const float SUDDEN_DROP_YD = 12f;    // > this much down in ONE ~250ms tick = falling, not walking
+    private const float BELOW_GROUND_YD = 15f;   // Z this far under authoritative ground = under the floor
+    private const int SUSTAIN_TICKS = 3;         // consecutive below-ground ticks before firing (ignore a blip)
+    private const double RECENTLY_ON_GROUND_SEC = 45; // sustained-below only counts as a FALL if on-ground this recently
+    private const double FALL_COOLDOWN_SEC = 300;     // at most one fall capture per bot per 5 min
+
+    // ── Wrong-area (stray) trigger ──
+    private const int STRAY_MARGIN = 5;          // route/destination mob > botLevel + this = straying into danger
+    private const float STRAY_MIN_TRAVEL_YD = 150f;   // must actually be EN ROUTE (a real journey ahead)
+    private const double STRAY_COOLDOWN_SEC = 600;    // travel is long — one stray capture per bot per 10 min
+
+    private const string BASE_DIR = "/opt/mangossuperui/diagnostics";
+    private const string FALL_DIR = BASE_DIR + "/falls";
+    private const string STRAY_DIR = BASE_DIR + "/strays";
+
+    private static readonly JsonSerializerOptions _json = new()
+    {
+        WriteIndented = false,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    public BotFallRecorder(HeightMapService height, ZoneSafetyMap safety, ILogger<BotFallRecorder> logger)
+    {
+        _height = height;
+        _safety = safety;
+        _logger = logger;
+        try { Directory.CreateDirectory(FALL_DIR); Directory.CreateDirectory(STRAY_DIR); }
+        catch (Exception ex) { _logger.LogWarning(ex, "BotFallRecorder: could not create diagnostics dirs under {Dir}", BASE_DIR); }
+    }
+
+    /// <summary>One recorded frame — compact camelCase JSON, one per line.</summary>
+    private sealed class Frame
+    {
+        public string Ts { get; init; } = "";
+        public int Guid { get; init; }
+        public string Name { get; init; } = "";
+        public int Lvl { get; init; }
+        public string Goal { get; init; } = "";
+        public string Step { get; init; } = "";
+        public string? Reason { get; init; }        // ctx.GoalReason — the brain's own "why"
+        public float X { get; init; }
+        public float Y { get; init; }
+        public float Z { get; init; }
+        public int Map { get; init; }
+        public int Zone { get; init; }
+        public float? GroundZ { get; init; }         // authoritative GridMap height; null = terrain data-hole
+        public float? DeltaGround { get; init; }      // Z - GroundZ (negative = under the floor)
+        public bool? Hole { get; init; }              // true when GroundZ is null at this (x,y)
+        public float? DropTick { get; init; }         // Z change since the previous tick (negative = descending)
+        public float? Tx { get; init; }               // target the brain is driving to (where it's GOING)
+        public float? Ty { get; init; }
+        public float? Tz { get; init; }
+        public float Dist2D { get; init; }
+        public float? GrindZ { get; init; }           // grind AreaCenter Z (the surface the brain believes in)
+        public int? CellLvl { get; init; }             // ZoneSafetyMap max creature level at the bot's own cell
+        public int? CorridorMax { get; init; }         // max creature level on the straight route to Target (same-map)
+        public int? TargetLvl { get; init; }           // max creature level at the destination cell
+        public bool Dead { get; init; }
+        public bool InCombat { get; init; }
+        public float Hp { get; init; }
+        public string? Pending { get; init; }         // outstanding bridge command type, if any
+    }
+
+    private sealed class Track
+    {
+        public readonly Queue<Frame> Ring = new();
+        public float LastZ;
+        public bool HaveLast;
+        public int BelowStreak;
+        public DateTime LastOnGroundUtc = DateTime.MinValue;
+        public DateTime LastFallCaptureUtc = DateTime.MinValue;
+        public DateTime LastStrayCaptureUtc = DateTime.MinValue;
+        public List<Frame>? Capture;   // non-null while recording the AFTER window
+        public int TailLeft;
+        public string? Kind;           // "fall" | "stray" — picks the output folder + header
+        public string? Trigger;
+    }
+
+    private readonly ConcurrentDictionary<int, Track> _tracks = new();
+
+    /// <summary>
+    /// Called once per bot per tick from BotBrainService after Sense. Records to the
+    /// bot's ring and, on a detected fall, snapshots the ring + records the tail.
+    /// Single-threaded (the brain tick loop is the only caller) — no locking needed.
+    /// </summary>
+    public void Observe(BotContext ctx)
+    {
+        var t = _tracks.GetOrAdd(ctx.Guid, _ => new Track());
+
+        float z = ctx.Pos.Z;
+        float? ground = _height.GetHeight(ctx.MapId, ctx.Pos.X, ctx.Pos.Y);
+        float? deltaGround = ground is float g ? z - g : null;
+        float? dropTick = t.HaveLast ? z - t.LastZ : null;
+
+        // ── ZoneSafetyMap threat (2D). Cheap O(1) grid reads; null when the grid isn't loaded. ──
+        int? cellLvl = null, corridorMax = null, targetLvl = null;
+        if (_safety.IsLoaded)
+        {
+            cellLvl = _safety.GetMaxCreatureLevel(ctx.MapId, ctx.Pos.X, ctx.Pos.Y);
+            if (ctx.Target is { } tg)
+            {
+                targetLvl = _safety.GetMaxCreatureLevel(tg.Map, tg.X, tg.Y);
+                if (tg.Map == ctx.MapId)   // corridor sampling is single-map
+                    corridorMax = _safety.GetMaxCreatureLevelOnPath(ctx.MapId, ctx.Pos.X, ctx.Pos.Y, tg.X, tg.Y);
+            }
+        }
+
+        var frame = new Frame
+        {
+            Ts = DateTime.UtcNow.ToString("O"),
+            Guid = ctx.Guid, Name = ctx.Name, Lvl = ctx.Level,
+            Goal = ctx.Goal.ToString(), Step = ctx.Step, Reason = ctx.GoalReason,
+            X = ctx.Pos.X, Y = ctx.Pos.Y, Z = z, Map = ctx.MapId, Zone = ctx.ZoneId,
+            GroundZ = ground, DeltaGround = deltaGround, Hole = ground is null ? true : null,
+            DropTick = dropTick,
+            Tx = ctx.Target?.X, Ty = ctx.Target?.Y, Tz = ctx.Target?.Z, Dist2D = ctx.DistToTarget,
+            GrindZ = ctx.Grind?.AreaCenter.Z,
+            CellLvl = cellLvl, CorridorMax = corridorMax, TargetLvl = targetLvl,
+            Dead = ctx.Dead, InCombat = ctx.InCombat, Hp = ctx.HpPct,
+            Pending = ctx.Pending?.CommandType,
+        };
+
+        t.Ring.Enqueue(frame);
+        while (t.Ring.Count > RING_FRAMES) t.Ring.Dequeue();
+
+        // Track "was recently standing on the ground" — the surface→void transition guard.
+        if (deltaGround is float dg && dg > -5f) t.LastOnGroundUtc = DateTime.UtcNow;
+
+        // Already capturing an AFTER window: append and count down to the flush.
+        if (t.Capture is not null)
+        {
+            t.Capture.Add(frame);
+            if (--t.TailLeft <= 0) { Flush(ctx, t); t.Capture = null; t.Trigger = null; t.Kind = null; }
+            t.LastZ = z; t.HaveLast = true;
+            return;
+        }
+
+        // ── Triggers (never on a corpse — death has its own Z games). Fall has priority;
+        //    one capture at a time (the guard above skips detection while capturing). ──
+        if (!ctx.Dead)
+        {
+            // WRONG-Z: fell through the floor.
+            bool sudden = dropTick is float d && d <= -SUDDEN_DROP_YD;
+            bool belowNow = deltaGround is float dgb && dgb <= -BELOW_GROUND_YD;
+            t.BelowStreak = belowNow ? t.BelowStreak + 1 : 0;
+            bool wasRecentlyOnGround = (DateTime.UtcNow - t.LastOnGroundUtc).TotalSeconds <= RECENTLY_ON_GROUND_SEC;
+            bool fell = sudden || (t.BelowStreak >= SUSTAIN_TICKS && wasRecentlyOnGround);
+
+            // WRONG-AREA: EN ROUTE toward content above the band. Threat = worst of the corridor and the destination cell.
+            int threat = Math.Max(corridorMax ?? 0, targetLvl ?? 0);
+            bool traveling = ctx.Target is not null && ctx.DistToTarget > STRAY_MIN_TRAVEL_YD;
+            bool strayed = traveling && threat > ctx.Level + STRAY_MARGIN;
+
+            if (fell && (DateTime.UtcNow - t.LastFallCaptureUtc).TotalSeconds >= FALL_COOLDOWN_SEC)
+            {
+                t.LastFallCaptureUtc = DateTime.UtcNow;
+                t.Kind = "fall";
+                t.Trigger = sudden ? $"sudden_drop {dropTick:F0}yd in one tick"
+                                   : $"sank_through_floor {deltaGround:F0}yd under ground";
+                StartCapture(t);
+                _logger.LogWarning("BotFallRecorder: {Name} (guid {Guid}) FELL — {Trigger} at z={Z:F0} ground={Ground} zone={Zone}",
+                    ctx.Name, ctx.Guid, t.Trigger, z, ground?.ToString("F0") ?? "hole", ctx.ZoneId);
+            }
+            else if (strayed && (DateTime.UtcNow - t.LastStrayCaptureUtc).TotalSeconds >= STRAY_COOLDOWN_SEC)
+            {
+                t.LastStrayCaptureUtc = DateTime.UtcNow;
+                t.Kind = "stray";
+                t.Trigger = $"stray L{ctx.Level} toward mob L{threat} (corridor {corridorMax?.ToString() ?? "?"}, dest {targetLvl?.ToString() ?? "?"})";
+                StartCapture(t);
+                _logger.LogWarning("BotFallRecorder: {Name} (guid {Guid}, L{Lvl}) STRAYING — {Trigger}, {Dist:F0}yd out, zone={Zone}",
+                    ctx.Name, ctx.Guid, ctx.Level, t.Trigger, ctx.DistToTarget, ctx.ZoneId);
+            }
+        }
+
+        t.LastZ = z;
+        t.HaveLast = true;
+    }
+
+    private void StartCapture(Track t)
+    {
+        t.Capture = new List<Frame>(t.Ring);   // the BEFORE (ring already includes the current frame)
+        t.TailLeft = TAIL_FRAMES;               // then record the AFTER
+    }
+
+    private void Flush(BotContext ctx, Track t)
+    {
+        var frames = t.Capture;
+        if (frames is null || frames.Count == 0) return;
+        bool stray = t.Kind == "stray";
+        string dir = stray ? STRAY_DIR : FALL_DIR;
+        string prefix = stray ? "stray" : "fall";
+        try
+        {
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, $"{prefix}_{ctx.Guid}_{Sanitize(ctx.Name)}_{DateTime.UtcNow:yyyyMMdd-HHmmss}.jsonl");
+
+            object header;
+            if (stray)
+            {
+                int firstOver = frames.FindIndex(f => Math.Max(f.CorridorMax ?? 0, f.TargetLvl ?? 0) > ctx.Level + STRAY_MARGIN);
+                header = new
+                {
+                    kind = "stray_header", trigger = t.Trigger,
+                    guid = ctx.Guid, name = ctx.Name, level = ctx.Level, zone = ctx.ZoneId, map = ctx.MapId,
+                    dest = ctx.Target is { } tg ? new { x = tg.X, y = tg.Y, z = tg.Z, map = tg.Map } : null,
+                    distToDest = ctx.DistToTarget,
+                    // The gate that was SUPPOSED to stop this — dest within the cap = the 2D straight-line leak.
+                    travelCapForLevel = ZoneSafetyMap.GetMaxTravelDistance(ctx.Level, ctx.ZoneId),
+                    frames = frames.Count, firstOverBandIndex = firstOver,
+                    window = "ring(before) + tail(after)",
+                };
+            }
+            else
+            {
+                int firstBelow = frames.FindIndex(f => f.DeltaGround is float d && d <= -BELOW_GROUND_YD);
+                header = new
+                {
+                    kind = "fall_header", trigger = t.Trigger,
+                    guid = ctx.Guid, name = ctx.Name, level = ctx.Level, zone = ctx.ZoneId, map = ctx.MapId,
+                    frames = frames.Count, firstBelowIndex = firstBelow,
+                    window = "ring(before) + tail(after)",
+                };
+            }
+
+            using var sw = new StreamWriter(path);
+            sw.WriteLine(JsonSerializer.Serialize(header, _json));
+            foreach (var f in frames) sw.WriteLine(JsonSerializer.Serialize(f, _json));
+
+            _logger.LogWarning("BotFallRecorder: wrote {Path} ({N} frames)", path, frames.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "BotFallRecorder: failed to write {Kind} capture for {Name} (guid {Guid})", prefix, ctx.Name, ctx.Guid);
+        }
+    }
+
+    /// <summary>Drop a bot's ring when it disconnects, so evicted guids don't leak memory.</summary>
+    public void Forget(int guid) => _tracks.TryRemove(guid, out _);
+
+    private static string Sanitize(string s)
+    {
+        var chars = s.Where(c => char.IsLetterOrDigit(c) || c is '-' or '_').ToArray();
+        return chars.Length == 0 ? "bot" : new string(chars);
+    }
+}
