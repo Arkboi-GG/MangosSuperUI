@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Data;
 
 namespace MangosSuperUI.BotLogic.Planners;
 
@@ -32,10 +33,12 @@ public sealed class GrindPlanner : IBotPlanner
     private const double KillRecencySec = 120;   // a bot landing REAL kills is progressing
 
     private readonly ILogger<GrindPlanner> _log;
+    private readonly ZoneSafetyMap _safety;
 
-    public GrindPlanner(ILogger<GrindPlanner> log)
+    public GrindPlanner(ILogger<GrindPlanner> log, ZoneSafetyMap safety)
     {
         _log = log;
+        _safety = safety;
     }
 
     public Goal Handles => Goal.Grinding;
@@ -49,6 +52,23 @@ public sealed class GrindPlanner : IBotPlanner
         // so there is no WAIT that could false-stall a killing bot).
         if (ctx.Grind == null)
         {
+            // GUARD-TOWN BAIL (FINDING_005). Never arm a filler grind while standing in an ENEMY city-guard
+            // cell: city guards social-assist + respawn, so an L18 that strayed into Menethil grinds L47
+            // guards forever (100-attacker chain-pull → 1%-HP grind-lock). The C++ SelectGrindTarget
+            // IsGuard() exclusion stops the bot PICKING a guard; this stops it committing to grind here at
+            // all, so no SET_TASK is sent and the stall path (OnStall→ReselectGoal, then the wedge breaker's
+            // park→relocate/hearth) bails it out of the town instead of pinning it on the garrison. Record
+            // the cell dead so a relocate doesn't drop back onto it. Fail-open: no grid/guard data → no-op.
+            if (_safety.IsLoaded &&
+                _safety.IsEnemyGuardCell(snap.MapId, snap.X, snap.Y, ZoneSafetyMap.TeamFromFaction(ctx.Identity?.Faction)))
+            {
+                ctx.RecordDeadGrindCell(snap.X, snap.Y);
+                _log.LogWarning(
+                    "[GRIND] {Name} refusing filler grind in enemy guard cell @ ({X:F0},{Y:F0}) map {M} — bailing (FINDING_005)",
+                    ctx.Name, snap.X, snap.Y, snap.MapId);
+                return StepResult.Block("grind:guard-town");
+            }
+
             // Fallback grind is the re-evaluated FILLER, not a strategic commitment — so it carries no
             // held objective (the GoalSelector re-picks the moment a quest/group order appears, exactly
             // as today). Clear any stale held objective (e.g. a coordinator order left on a just-ungrouped

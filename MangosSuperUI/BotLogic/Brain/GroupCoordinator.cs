@@ -1188,7 +1188,8 @@ public static class GroupCoordinator
     private static void RouteVirtualUnsafe(BotContext vctx, QuestNpcLocation target, BotContext anchor, ZoneSafetyMap safety)
     {
         int danger = safety.IsLoaded
-            ? safety.GetMaxCreatureLevelOnPath(anchor.MapId, anchor.Pos.X, anchor.Pos.Y, target.X, target.Y)
+            ? safety.GetMaxCreatureLevelOnPath(anchor.MapId, anchor.Pos.X, anchor.Pos.Y, target.X, target.Y,
+                                               ZoneSafetyMap.TeamFromFaction(anchor.Identity?.Faction))
             : 0;
         vctx.Pending = null;   // the leg never really committed -- nothing to ack, just fail it now
         vctx.Failure = new WaitFailure
@@ -1423,7 +1424,9 @@ public static class GroupCoordinator
         if (!safety.IsLoaded) return true;
         int weakest = members.Min(m => m.Level);
         int threshold = weakest + TravelSafetyMargin;
-        var threat = safety.GetPathThreat(anchor.MapId, anchor.Pos.X, anchor.Pos.Y, target.X, target.Y, threshold);
+        // A group is single-faction — the anchor's team is the group's team (FINDING_002).
+        var threat = safety.GetPathThreat(anchor.MapId, anchor.Pos.X, anchor.Pos.Y, target.X, target.Y, threshold,
+                                          ZoneSafetyMap.TeamFromFaction(anchor.Identity?.Faction));
         if (threat.OverCount == 0) return true;
         if (threat.MaxCellOver >= PathClusterCellVeto) return false;
         if (threat.OverCount >= PathClusterTotalVeto) return false;

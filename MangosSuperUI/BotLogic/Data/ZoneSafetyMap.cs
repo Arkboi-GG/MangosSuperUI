@@ -21,6 +21,10 @@ namespace MangosSuperUI.BotLogic.Data;
 // at level 2 because the quest giver is far away and no hard safety gate existed.
 // =============================================================================
 
+/// <summary>Which player team a danger grid is computed FOR. A creature belongs in a team's grid
+/// only if it is hostile to that team (FINDING_002).</summary>
+public enum Team { Alliance = 0, Horde = 1 }
+
 public class ZoneSafetyMap
 {
     private readonly ConnectionFactory _db;
@@ -37,9 +41,35 @@ public class ZoneSafetyMap
     private const float COORD_OFFSET = 17100f;
     private const int GRID_DIM = (int)((COORD_OFFSET * 2) / CELL_SIZE) + 1; // ~343
 
-    // Per-map grid. Each cell stores (avgLevel, maxLevel, spawnCount).
-    // Only maps with spawns get an entry.
-    private readonly Dictionary<int, CellData[,]> _grids = new();
+    // Per-TEAM, per-map grid. Each cell stores (avgLevel, maxLevel, spawnCount) of the spawns that
+    // are HOSTILE to that team. Indexed by (int)Team. (FINDING_002: the old single global grid used a
+    // hardcoded Alliance reactance mask, so Horde-faction city guards — hostile to Alliance, friendly
+    // to Horde — read as danger for Horde bots routing to their own towns. A mixed-faction fleet needs
+    // one grid per team.) Only maps with spawns get an entry within each team's dictionary.
+    private readonly Dictionary<int, CellData[,]>[] _gridsByTeam =
+        { new Dictionary<int, CellData[,]>(), new Dictionary<int, CellData[,]>() };
+
+    private Dictionary<int, CellData[,]> TeamGrid(Team team) => _gridsByTeam[(int)team];
+
+    // Per-TEAM guard cells: the (ix,iy) cells holding a creature flagged CREATURE_FLAG_EXTRA_GUARD that is
+    // HOSTILE to that team (FINDING_005). City guards (Menethil/Stormwind/Orgrimmar/…) mutually social-
+    // assist and respawn infinitely, so an enemy bot that grinds one triggers an unwinnable town-wide
+    // chain-pull (an L18 strayed into Menethil pulls L47 guards → 100-attacker set → 1%-HP grind-lock).
+    // The danger grid already carries their (high) LEVEL; this is the level-INDEPENDENT "never grind here"
+    // signal GrindPlanner consults so a strayed bot bails instead of pinning on the garrison — the C#
+    // complement to the C++ SelectGrindTarget IsGuard() exclusion. Bucketed exactly like the danger grid:
+    // a guard only enters the set of the team it is hostile to (hostile_mask), so it is an "enemy" guard
+    // for that team only. Only maps with guard spawns get an entry within each team's dictionary.
+    private readonly Dictionary<int, HashSet<(int ix, int iy)>>[] _guardCellsByTeam =
+        { new Dictionary<int, HashSet<(int, int)>>(), new Dictionary<int, HashSet<(int, int)>>() };
+
+    private const int CREATURE_FLAG_EXTRA_GUARD = 0x00000400;  // creature_template.flags_extra guard bit (1024)
+
+    /// <summary>Map a bot's faction string ("Horde"/"Alliance"/…) to its danger-grid team.
+    /// Unknown/null defaults to Alliance — the pre-FINDING_002 behaviour, so an unclassified bot is
+    /// no worse off than before the split.</summary>
+    public static Team TeamFromFaction(string? faction) =>
+        string.Equals(faction, "Horde", StringComparison.OrdinalIgnoreCase) ? Team.Horde : Team.Alliance;
 
     // entry → (max level, is-critter). For "real kill" gating: the KILL event carries only the entry,
     // and without this a CHICKEN kill (critter, 0 XP) counts as progress and resets every stall net.
@@ -61,9 +91,9 @@ public class ZoneSafetyMap
     /// Get the max creature level in the cell containing the given world position.
     /// Returns 0 if no creatures are known in that cell.
     /// </summary>
-    public int GetMaxCreatureLevel(int mapId, float x, float y)
+    public int GetMaxCreatureLevel(int mapId, float x, float y, Team team)
     {
-        if (!_grids.TryGetValue(mapId, out var grid)) return 0;
+        if (!TeamGrid(team).TryGetValue(mapId, out var grid)) return 0;
         var (ix, iy) = WorldToGrid(x, y);
         if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) return 0;
         return grid[ix, iy].MaxLevel;
@@ -73,9 +103,9 @@ public class ZoneSafetyMap
     /// Get the average creature level in the cell containing the given world position.
     /// Returns 0 if no creatures are known in that cell.
     /// </summary>
-    public float GetAvgCreatureLevel(int mapId, float x, float y)
+    public float GetAvgCreatureLevel(int mapId, float x, float y, Team team)
     {
-        if (!_grids.TryGetValue(mapId, out var grid)) return 0;
+        if (!TeamGrid(team).TryGetValue(mapId, out var grid)) return 0;
         var (ix, iy) = WorldToGrid(x, y);
         if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) return 0;
         return grid[ix, iy].AvgLevel;
@@ -87,12 +117,25 @@ public class ZoneSafetyMap
     /// This is spawn DENSITY: a high count means a pack/field, even when every mob in it is
     /// trivially low level. A level-only metric is blind to death-by-dogpile; this is not.
     /// </summary>
-    public int GetSpawnCount(int mapId, float x, float y)
+    public int GetSpawnCount(int mapId, float x, float y, Team team)
     {
-        if (!_grids.TryGetValue(mapId, out var grid)) return 0;
+        if (!TeamGrid(team).TryGetValue(mapId, out var grid)) return 0;
         var (ix, iy) = WorldToGrid(x, y);
         if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) return 0;
         return grid[ix, iy].SpawnCount;
+    }
+
+    /// <summary>
+    /// True if the cell containing (x,y) holds a CITY GUARD hostile to <paramref name="team"/> — a place an
+    /// enemy bot must never FILLER-grind (unwinnable town-wide social-assist chain-pull, FINDING_005). This
+    /// is level-INDEPENDENT, unlike GetMaxCreatureLevel: a guard town stays off-limits even to a bot that
+    /// out-levels the guards. Returns false when no grid/guard data exists for the map (fail-open).
+    /// </summary>
+    public bool IsEnemyGuardCell(int mapId, float x, float y, Team team)
+    {
+        if (!_guardCellsByTeam[(int)team].TryGetValue(mapId, out var cells)) return false;
+        var (ix, iy) = WorldToGrid(x, y);
+        return cells.Contains((ix, iy));
     }
 
     /// <summary>
@@ -122,12 +165,12 @@ public class ZoneSafetyMap
     }
 
     public GrindCell? FindGrindCell(
-        int mapId, float botX, float botY, int botLevel, float maxRadiusYards,
+        int mapId, float botX, float botY, int botLevel, float maxRadiusYards, Team team,
         int lowOffset = 5, int highOffset = 2, int dangerCeil = 3,
         int minSpawn = 1, int maxSpawn = 40,
         Func<float, float, bool>? reject = null)
     {
-        if (!_grids.TryGetValue(mapId, out var grid)) return null;
+        if (!TeamGrid(team).TryGetValue(mapId, out var grid)) return null;
 
         int loLvl = Math.Max(1, botLevel - lowOffset);
         int hiLvl = botLevel + highOffset;
@@ -174,15 +217,15 @@ public class ZoneSafetyMap
     ///
     /// Returns the highest creature level encountered on the path, or 0 if safe.
     /// </summary>
-    public int GetMaxCreatureLevelOnPath(int mapId, float x1, float y1, float x2, float y2)
+    public int GetMaxCreatureLevelOnPath(int mapId, float x1, float y1, float x2, float y2, Team team)
     {
-        if (!_grids.TryGetValue(mapId, out var grid)) return 0;
+        if (!TeamGrid(team).TryGetValue(mapId, out var grid)) return 0;
 
         float dx = x2 - x1;
         float dy = y2 - y1;
         float dist = MathF.Sqrt(dx * dx + dy * dy);
 
-        if (dist < 1f) return GetMaxCreatureLevel(mapId, x1, y1);
+        if (dist < 1f) return GetMaxCreatureLevel(mapId, x1, y1, team);
 
         // Sample every half-cell to avoid skipping thin cells
         float step = CELL_SIZE * 0.5f;
@@ -223,9 +266,9 @@ public class ZoneSafetyMap
     /// Cells are deduped via a visited set (half-cell sampling re-hits each cell ~2×; counting
     /// a camp twice would double its apparent size).
     /// </summary>
-    public PathThreat GetPathThreat(int mapId, float x1, float y1, float x2, float y2, int thresholdLevel)
+    public PathThreat GetPathThreat(int mapId, float x1, float y1, float x2, float y2, int thresholdLevel, Team team)
     {
-        if (!_grids.TryGetValue(mapId, out var grid)) return default;
+        if (!TeamGrid(team).TryGetValue(mapId, out var grid)) return default;
 
         float dx = x2 - x1;
         float dy = y2 - y1;
@@ -276,7 +319,8 @@ public class ZoneSafetyMap
         float botX, float botY,
         float? giverX, float? giverY,
         float? objX, float? objY,
-        float? turnInX, float? turnInY)
+        float? turnInX, float? turnInY,
+        Team team)
     {
         int threshold = botLevel + safetyMargin;
         int highestLevel = 0;
@@ -285,14 +329,14 @@ public class ZoneSafetyMap
         // Leg 1: bot → giver
         if (giverX.HasValue && giverY.HasValue)
         {
-            int legMax = GetMaxCreatureLevelOnPath(mapId, botX, botY, giverX.Value, giverY.Value);
+            int legMax = GetMaxCreatureLevelOnPath(mapId, botX, botY, giverX.Value, giverY.Value, team);
             if (legMax > highestLevel) { highestLevel = legMax; dangerLeg = "bot→giver"; }
         }
 
         // Leg 2: giver → objective
         if (giverX.HasValue && giverY.HasValue && objX.HasValue && objY.HasValue)
         {
-            int legMax = GetMaxCreatureLevelOnPath(mapId, giverX.Value, giverY.Value, objX.Value, objY.Value);
+            int legMax = GetMaxCreatureLevelOnPath(mapId, giverX.Value, giverY.Value, objX.Value, objY.Value, team);
             if (legMax > highestLevel) { highestLevel = legMax; dangerLeg = "giver→objective"; }
         }
 
@@ -301,7 +345,7 @@ public class ZoneSafetyMap
         float fromY = objY ?? giverY ?? botY;
         if (turnInX.HasValue && turnInY.HasValue)
         {
-            int legMax = GetMaxCreatureLevelOnPath(mapId, fromX, fromY, turnInX.Value, turnInY.Value);
+            int legMax = GetMaxCreatureLevelOnPath(mapId, fromX, fromY, turnInX.Value, turnInY.Value, team);
             if (legMax > highestLevel) { highestLevel = legMax; dangerLeg = "obj→turnin"; }
         }
 
@@ -444,7 +488,9 @@ public class ZoneSafetyMap
                     c.position_x,
                     c.position_y,
                     ct.level_min AS MinLevel,
-                    ct.level_max AS MaxLevel
+                    ct.level_max AS MaxLevel,
+                    ct.flags_extra AS FlagsExtra,
+                    ft.hostile_mask AS HostileMask
                 FROM creature c
                 JOIN creature_template ct ON ct.entry = c.id AND ct.patch = 0
                 JOIN faction_template ft ON ft.id = ct.faction AND ft.build = 4222
@@ -452,28 +498,69 @@ public class ZoneSafetyMap
                   AND ct.level_min > 0
                   AND ct.level_max > 0
                   AND ct.level_max <= 63
-                  AND (ft.hostile_mask & 3) <> 0");
-            // FACTION REACTANCE FILTER (2026-07-03) — a spawn contributes to the DANGER grid only if its
-            // faction is actually HOSTILE to a player. REPLACES the old npc_flags/flags_extra exclusion, which
-            // LEAKED: friendly Goldshire guards (faction 11) carry NO_AGGRO_ON_SIGHT(1024) but NOT NO_AGGRO(2),
-            // so (flags_extra & 1026) matched 1024 yet a level-55 guard still landed in the grid — and one
-            // friendly guard's cell set MaxLevel=55, vetoing EVERY corridor through town as path_unsafe. That
-            // was the 2026-07-03 whole-pool cascade: an L6 group told it couldn't walk to a LEVEL-5 named
-            // (Garrick, entry 103) because a friendly guard stood between them and it → 20-min grind-lock.
+                  AND (ft.hostile_mask & 7) <> 0");
+            // FACTION REACTANCE FILTER (2026-07-03), now PER-TEAM (FINDING_002, 2026-08-06).
+            // A spawn contributes to a team's DANGER grid only if its faction is actually HOSTILE to that
+            // team. (This replaced an older npc_flags/flags_extra exclusion that LEAKED: friendly Goldshire
+            // guards carry NO_AGGRO_ON_SIGHT but not NO_AGGRO, so a level-55 guard still landed in the grid
+            // and vetoed every corridor through town as path_unsafe — the 2026-07-03 grind-lock cascade.)
             //
-            // Reactance, confirmed against THIS DB at build 4222 (which covers all 204 creature factions on the
-            // fork — full resolve, no fallback): player faction-templates use our_mask bit 1 = "all players",
-            // bit 2 = Alliance, bit 4 = Horde. A creature is hostile to an ALLIANCE player iff hostile_mask & 3
-            // (bits 1|2) is set. Verified: Garrick (ft 17, hm 1) → 1&3=1 KEPT; Goldshire guard (11, hm 12) →
-            // 12&3=0 DROPPED; town NPC (12, hm 4) → DROPPED; spirit healer (35, hm 0) → DROPPED. This fleet is
-            // ALLIANCE; a Horde fleet uses mask 5 (bits 1|4). The faction test SUPERSEDES the old flag filters
-            // (a friendly service NPC has hostile_mask&3=0 and drops out anyway; a hostile mob that also happens
-            // to be a questgiver is now correctly KEPT as danger instead of being wrongly excluded by npc_flags).
+            // Confirmed against THIS DB at build 4222 (all 204 creature factions on the fork resolve, no
+            // fallback): player faction-templates use our_mask bit 1 = "all players", bit 2 = Alliance,
+            // bit 4 = Horde. A creature is hostile to Alliance iff hostile_mask & 3, to Horde iff
+            // hostile_mask & 5. Verified: Garrick (ft 17, hm 1) → in BOTH; Goldshire/Stormwind guard
+            // (hm 12 = Horde-hostile) → Horde grid only; an Orgrimmar guard (Alliance-hostile) → Alliance
+            // grid only; town service NPC (hm 4) / spirit healer (hm 0) → neither.
+            //
+            // The OLD code applied only `& 3` (Alliance) and built ONE global grid. That was correct while
+            // the fleet was Alliance-only, but the fleet is now MIXED: a Horde bot read Orgrimmar's L55-60
+            // guards (Alliance-hostile → they passed `& 3`) as danger and stray-flagged every trip to its
+            // own trainer/vendor. We now bucket each spawn into whichever team grid(s) it threatens, and
+            // callers query with the bot's own team. The `& 7` WHERE pre-filters to any-player-hostile
+            // spawns so purely-friendly NPCs never reach either accumulator.
 
-            // Accumulate per-cell
-            var accum = new Dictionary<int, Dictionary<(int ix, int iy), CellAccum>>();
+            // Accumulate per-cell, PER TEAM. Alliance-danger = hostile_mask & 3, Horde-danger = & 5
+            // (see the reactance comment above). A mob hostile to all players lands in both; a faction
+            // guard lands only in the ENEMY team's grid.
+            var accumByTeam = new[]
+            {
+                new Dictionary<int, Dictionary<(int ix, int iy), CellAccum>>(),  // [Team.Alliance]
+                new Dictionary<int, Dictionary<(int ix, int iy), CellAccum>>(),  // [Team.Horde]
+            };
 
-            int spawnCount = 0;
+            static void AddSpawn(Dictionary<int, Dictionary<(int ix, int iy), CellAccum>> accum,
+                                 int mapId, int ix, int iy, float avgLvl, int maxLvl)
+            {
+                if (!accum.TryGetValue(mapId, out var mapAccum))
+                {
+                    mapAccum = new Dictionary<(int ix, int iy), CellAccum>();
+                    accum[mapId] = mapAccum;
+                }
+                if (!mapAccum.TryGetValue((ix, iy), out var cell))
+                {
+                    cell = new CellAccum();
+                    mapAccum[(ix, iy)] = cell;
+                }
+                cell.TotalLevel += avgLvl;
+                cell.Count++;
+                if (maxLvl > cell.MaxLevel) cell.MaxLevel = maxLvl;
+                cell.Levels[Math.Clamp(maxLvl, 1, 63)]++;   // threat histogram keys the spawn's MAX level (danger is worst-case)
+            }
+
+            // Record a guard spawn's cell into the enemy team's guard set (FINDING_005). Same team
+            // bucketing as the danger grid: a guard is hostile to exactly one player team, so it is an
+            // "enemy guard" for that team only.
+            static void AddGuardCell(Dictionary<int, HashSet<(int ix, int iy)>> set, int mapId, int ix, int iy)
+            {
+                if (!set.TryGetValue(mapId, out var cells))
+                {
+                    cells = new HashSet<(int, int)>();
+                    set[mapId] = cells;
+                }
+                cells.Add((ix, iy));
+            }
+
+            int spawnRows = 0, allianceContribs = 0, hordeContribs = 0;
             foreach (var r in rows)
             {
                 int mapId = (int)r.map;
@@ -481,49 +568,42 @@ public class ZoneSafetyMap
                 float y = (float)r.position_y;
                 int minLvl = (int)r.MinLevel;
                 int maxLvl = (int)r.MaxLevel;
+                int hostileMask = (int)r.HostileMask;
+                long flagsExtra = Convert.ToInt64(r.FlagsExtra);   // may be a wide/unsigned column; widen before masking
+                bool isGuard = (flagsExtra & CREATURE_FLAG_EXTRA_GUARD) != 0;
                 float avgLvl = (minLvl + maxLvl) / 2f;
 
                 var (ix, iy) = WorldToGrid(x, y);
                 if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) continue;
 
-                if (!accum.TryGetValue(mapId, out var mapAccum))
+                if ((hostileMask & 3) != 0) { AddSpawn(accumByTeam[(int)Team.Alliance], mapId, ix, iy, avgLvl, maxLvl); allianceContribs++; }
+                if ((hostileMask & 5) != 0) { AddSpawn(accumByTeam[(int)Team.Horde],    mapId, ix, iy, avgLvl, maxLvl); hordeContribs++; }
+                if (isGuard)   // guard-flagged → mark the ENEMY team's guard set (same bucketing as the grid)
                 {
-                    mapAccum = new Dictionary<(int, int), CellAccum>();
-                    accum[mapId] = mapAccum;
+                    if ((hostileMask & 3) != 0) AddGuardCell(_guardCellsByTeam[(int)Team.Alliance], mapId, ix, iy);
+                    if ((hostileMask & 5) != 0) AddGuardCell(_guardCellsByTeam[(int)Team.Horde],    mapId, ix, iy);
                 }
-
-                var key = (ix, iy);
-                if (!mapAccum.TryGetValue(key, out var cell))
-                {
-                    cell = new CellAccum();
-                    mapAccum[key] = cell;
-                }
-
-                cell.TotalLevel += avgLvl;
-                cell.Count++;
-                if (maxLvl > cell.MaxLevel) cell.MaxLevel = maxLvl;
-                cell.Levels[Math.Clamp(maxLvl, 1, 63)]++;   // threat histogram keys the spawn's MAX level (danger is worst-case)
-
-                spawnCount++;
+                spawnRows++;
             }
 
-            // Build grids
-            foreach (var (mapId, mapAccum) in accum)
+            // Build grids per team
+            for (int t = 0; t < accumByTeam.Length; t++)
             {
-                var grid = new CellData[GRID_DIM, GRID_DIM];
-
-                foreach (var ((ix, iy), cell) in mapAccum)
+                foreach (var (mapId, mapAccum) in accumByTeam[t])
                 {
-                    grid[ix, iy] = new CellData
+                    var grid = new CellData[GRID_DIM, GRID_DIM];
+                    foreach (var ((ix, iy), cell) in mapAccum)
                     {
-                        AvgLevel = cell.TotalLevel / cell.Count,
-                        MaxLevel = cell.MaxLevel,
-                        SpawnCount = cell.Count,
-                        LevelCounts = cell.Levels
-                    };
+                        grid[ix, iy] = new CellData
+                        {
+                            AvgLevel = cell.TotalLevel / cell.Count,
+                            MaxLevel = cell.MaxLevel,
+                            SpawnCount = cell.Count,
+                            LevelCounts = cell.Levels
+                        };
+                    }
+                    _gridsByTeam[t][mapId] = grid;
                 }
-
-                _grids[mapId] = grid;
             }
 
             // Creature classifier — ALL creatures by entry (includes critters/no-aggro, unlike the grid
@@ -542,10 +622,14 @@ public class ZoneSafetyMap
             _loaded = true;
             sw.Stop();
 
-            int cellsPopulated = accum.Values.Sum(m => m.Count);
+            int allianceCells = accumByTeam[(int)Team.Alliance].Values.Sum(m => m.Count);
+            int hordeCells    = accumByTeam[(int)Team.Horde].Values.Sum(m => m.Count);
+            int allianceGuardCells = _guardCellsByTeam[(int)Team.Alliance].Values.Sum(s => s.Count);
+            int hordeGuardCells    = _guardCellsByTeam[(int)Team.Horde].Values.Sum(s => s.Count);
             _logger.LogInformation(
-                "ZoneSafetyMap: loaded {Spawns} creature spawns into {Cells} cells across {Maps} maps in {Ms}ms",
-                spawnCount, cellsPopulated, accum.Count, sw.ElapsedMilliseconds);
+                "ZoneSafetyMap: {Rows} hostile spawns → Alliance grid {AC} contribs/{ACells} cells ({AGuard} guard cells), Horde grid {HC} contribs/{HCells} cells ({HGuard} guard cells), across {Maps} maps in {Ms}ms",
+                spawnRows, allianceContribs, allianceCells, allianceGuardCells, hordeContribs, hordeCells, hordeGuardCells,
+                _gridsByTeam[(int)Team.Alliance].Count, sw.ElapsedMilliseconds);
         }
         catch (Exception ex)
         {
