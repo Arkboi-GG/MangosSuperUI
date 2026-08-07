@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using Microsoft.Extensions.Logging;
 
 namespace MangosSuperUI.BotLogic.Planners;
 
@@ -20,6 +21,14 @@ namespace MangosSuperUI.BotLogic.Planners;
 public sealed class GoalSelector
 {
     private readonly QuestGraphLoader _quests;
+    private readonly ILogger<GoalSelector> _log;
+
+    // [GRIND-LOCK RELEASE] (FINDING_003) A grind-lock that lands no real kills for this long is
+    // unproductive — the bot is committed to grinding a spot with no valid targets (216 bots were
+    // idling at 100% HP in cities). If questing has become viable again (deferrals expired) we release
+    // the lock early rather than idle out the full 20-min window. A genuinely PRODUCTIVE grind-lock
+    // kills well inside this, so its LastKillUtc stays fresh and it is never released.
+    private const double UnproductiveGrindLockSec = 240;   // 4 min with zero real kills = the lock isn't working
 
     // Crater this and the bot breaks for a vendor (mirrors MaintenancePlanner's gate).
     private const int DurabilityVendorThreshold = 30;
@@ -32,9 +41,10 @@ public sealed class GoalSelector
     // far-from-trainer high-level bots start making wasted trips.
     private const long TrainGoldFloor = 0;
 
-    public GoalSelector(QuestGraphLoader quests)
+    public GoalSelector(QuestGraphLoader quests, ILogger<GoalSelector> log)
     {
         _quests = quests;
+        _log = log;
     }
 
     public Goal Select(BotContext ctx, BotStateSnapshot snap)
@@ -218,8 +228,38 @@ public sealed class GoalSelector
         // clock (level-ups do NOT cut it short — the bot earns its hour of XP).
         if (ctx.Identity?.GrindLockUntil is DateTime gl && DateTime.UtcNow < gl)
         {
-            ctx.GoalReason = $"grind-lock {(int)Math.Ceiling((gl - DateTime.UtcNow).TotalMinutes)}m";
-            return Goal.Grinding;
+            // [GRIND-LOCK RELEASE] (FINDING_003) The lock otherwise pins the bot to Grinding for the
+            // WHOLE window. If it's UNPRODUCTIVE (no real kill in UnproductiveGrindLockSec — a spot with
+            // no valid targets, e.g. a city: 216 bots were idling at 100% HP) AND questing is viable
+            // again (a deferral has expired into a pickable, in-reach quest), release the lock and quest
+            // instead of idling out the clock. A productive lock keeps LastKillUtc fresh → never released.
+            var glId = ctx.Identity;
+            bool released = false;
+            if (glId != null && _quests.IsLoaded
+                && (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds > UnproductiveGrindLockSec)
+            {
+                glId.PruneExpiredDeferrals();
+                var glPick = _quests.GetAvailableQuests(
+                        QuestGraphLoader.RaceToBitmask(glId.Race),
+                        QuestGraphLoader.ClassToBitmask(glId.ClassId),
+                        glId.Level, glId.CompletedQuestIds)
+                    .Where(q => QuestPlanner.IsPickable(q, glId)).ToList();
+                int glTier = QuestPlanner.ReachTier(glPick, glId, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.ZoneId);
+                if (glTier >= 0 && glPick.Any(q => QuestPlanner.InReach(q, ctx.Pos.X, ctx.Pos.Y, ctx.MapId,
+                        ZoneSafetyMap.GetMaxTravelDistance(glId.Level, ctx.ZoneId, glTier))))
+                {
+                    glId.GrindLockUntil = null;
+                    _log.LogInformation("[GOAL] {Name} grind-lock released early — unproductive ({S:F0}s no kill) and a quest is workable again (reach t{T})",
+                        ctx.Name, (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds, glTier);
+                    released = true;
+                }
+            }
+            if (!released)
+            {
+                ctx.GoalReason = $"grind-lock {(int)Math.Ceiling((gl - DateTime.UtcNow).TotalMinutes)}m";
+                return Goal.Grinding;
+            }
+            // released → fall through to normal quest/grind selection below
         }
 
         // Stay the course on a live quest.

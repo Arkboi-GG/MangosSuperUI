@@ -212,6 +212,7 @@ public sealed class MaintenanceScratch
     public Vec4 DeathPos { get; set; }                    // where we died (death-spot blacklist target on a loop)
     public bool DeathLoop { get; set; }                   // quick SAME-SPOT re-death → escalate (blacklist + at_graveyard port)
     public bool DeathCluster { get; set; }                // goal-agnostic: ≥N deaths in the rolling window (any spot/goal) → force the graveyard port even when DeathLoop is false
+    public bool HearthEscape { get; set; }                // FINDING_008: persistent loop the graveyard port can't break → port the ghost to the RACIAL START (same-map) instead + hard-reset
     public bool RezSent { get; set; }                     // RESURRECT issued — guards against duplicate sends
     public bool Escalated { get; set; }                   // death-spot blacklisted + at_graveyard sent (once per recovery)
 

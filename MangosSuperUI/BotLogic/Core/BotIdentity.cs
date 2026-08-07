@@ -508,12 +508,49 @@ public class BotIdentity
     }
 
     /// <summary>
+    /// Hearth-escape death window (FINDING_008). Like RecentDeaths, but DELIBERATELY NOT cleared by a
+    /// graveyard port — so it keeps counting across the ports that FAIL to break a loop (SneakyShock:
+    /// 307 deaths, graveyard adjacent to the killer, DeathLoopStreak resets because the camp is wider
+    /// than the 30yd radius). At the cap the bot is hearth-ported to its racial start instead. Cleared
+    /// only on ResetDeathCounter (a real recovery / activity change) or a completed hearth.
+    /// </summary>
+    public List<DateTime> HearthDeaths { get; set; } = new();
+
+    public int RecordHearthDeathAndCount(double windowSec)
+    {
+        var now = DateTime.UtcNow;
+        HearthDeaths.Add(now);
+        var cutoff = now.AddSeconds(-windowSec);
+        HearthDeaths.RemoveAll(t => t < cutoff);
+        return HearthDeaths.Count;
+    }
+
+    /// <summary>
+    /// The bot's racial START location (playercreateinfo) — a guaranteed-safe, faction-appropriate
+    /// spot used as the hearth-escape destination for a persistent death loop (FINDING_008). Returns
+    /// (X, Y, Z, Map). Same values as the DB playercreateinfo rows verified 2026-08-06.
+    /// </summary>
+    public static (float X, float Y, float Z, int Map) RacialStart(int race) => race switch
+    {
+        1 => (-8949.95f, -132.493f, 83.5312f, 0),   // Human      — Northshire (EK)
+        2 => (-618.518f, -4251.67f, 38.718f, 1),    // Orc        — Durotar (Kalimdor)
+        3 => (-6240.32f, 331.033f, 382.758f, 0),    // Dwarf      — Coldridge (EK)
+        4 => (10311.3f, 831.463f, 1326.41f, 1),     // Night Elf  — Shadowglen (Kalimdor)
+        5 => (1676.35f, 1677.45f, 121.67f, 0),      // Undead     — Deathknell/Tirisfal (EK)
+        6 => (-2917.58f, -257.98f, 52.9968f, 1),    // Tauren     — Camp Narache (Kalimdor)
+        7 => (-6240.32f, 331.033f, 382.758f, 0),    // Gnome      — Coldridge (EK)
+        8 => (-618.518f, -4251.67f, 38.718f, 1),    // Troll      — Durotar (Kalimdor)
+        _ => (0f, 0f, 0f, -1),                       // unknown → no valid home (hearth won't fire)
+    };
+
+    /// <summary>
     /// Reset death counter (called when bot picks a new quest or changes activity).
     /// </summary>
     public void ResetDeathCounter()
     {
         DeathsSinceQuestStart = 0;
         DeathLoopStreak = 0;
+        HearthDeaths.Clear();
     }
 
     /// <summary>

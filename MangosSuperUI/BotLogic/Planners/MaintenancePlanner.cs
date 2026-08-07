@@ -193,6 +193,15 @@ public sealed class MaintenancePlanner : IBotPlanner
     private const int RecentDeathClusterCap = 3;
     private const double RecentDeathWindowSec = 600;   // 10 min — must exceed VendorRouteGiveupSec (480)
 
+    // ── Hearth escape (FINDING_008) ── the graveyard port fails to break a loop when the graveyard is
+    // adjacent to the killer (SneakyShock: 307 deaths at the Wetlands Dragonmaw camp, its graveyard 30yd
+    // away). HearthDeaths counts deaths in a window that does NOT clear on port; at the cap the ghost is
+    // ported to the RACIAL START (guaranteed-safe, faction-appropriate) instead of the useless graveyard,
+    // and the bot hard-resets so it re-quests from a clean spot. Same-map only (NearTeleportTo) — the
+    // common case (a stray in an adjacent too-high zone on the bot's own continent).
+    private const int HearthDeathCap = 5;              // deaths in the window before we give up on the graveyard and hearth home
+    private const double HearthWindowSec = 360;        // 6 min — a genuinely persistent loop, not one bad camp
+
     // ── Heal-to-full phase ──
     // Hold the just-rezzed bot IDLE until it has eaten/drunk back to ~full before
     // releasing it to the GoalSelector. RezHealTarget is short of 100% so a single
@@ -291,6 +300,14 @@ public sealed class MaintenancePlanner : IBotPlanner
             int recentDeaths = id?.RecordRecentDeathAndCount(RecentDeathWindowSec) ?? 0;
             bool deathCluster = recentDeaths >= RecentDeathClusterCap;
 
+            // [HEARTH] (FINDING_008) Death window that SURVIVES graveyard ports: at the cap the ports
+            // have demonstrably failed to break the loop → hearth to the racial start instead. Same-map
+            // only (the ghost port is a NearTeleportTo); a cross-continent home would fall back to the
+            // graveyard port (racialHome.Map != ctx.MapId → hearthEscape false, no regression).
+            int hearthDeaths = id?.RecordHearthDeathAndCount(HearthWindowSec) ?? 0;
+            var racialHome = id != null ? BotIdentity.RacialStart(id.Race) : (X: 0f, Y: 0f, Z: 0f, Map: -1);
+            bool hearthEscape = hearthDeaths >= HearthDeathCap && racialHome.Map == ctx.MapId && !ctx.InPlayerParty;
+
             // On a same-spot loop, blacklist the pocket so the QuestPlanner stops ROUTING
             // back here until the bot out-levels it (clears at danger-3). This only steers
             // future quest selection — it does NOT move the bot; the ghost-walk below does.
@@ -342,13 +359,15 @@ public sealed class MaintenancePlanner : IBotPlanner
                 DeathLoop = deathLoop,
                 // Rapid re-death rides the cluster flag — identical escape (graveyard port), zero
                 // new scratch fields. The ARM log line below distinguishes them (RAPID vs CLUSTER).
-                DeathCluster = deathCluster || rapidRedeath
+                DeathCluster = deathCluster || rapidRedeath,
+                HearthEscape = hearthEscape   // FINDING_008: persistent loop → port to racial start, not the graveyard
             };
             ctx.Service = null;   // drop any in-flight vendor trip — recovery owns the bot; re-evaluate after heal
             ctx.SetStep("rez_wait");
-            _log.LogInformation("[REZ] {Name} DEATH @ ({X:F0},{Y:F0})@{Map} loop={Loop} streak={Streak} recent={Recent}{Cluster}{Rapid} (deaths={Deaths})",
+            _log.LogInformation("[REZ] {Name} DEATH @ ({X:F0},{Y:F0})@{Map} loop={Loop} streak={Streak} recent={Recent}{Cluster}{Rapid}{Hearth} (deaths={Deaths} hearthWin={HearthN})",
                 ctx.Name, deathPos.X, deathPos.Y, deathPos.Map, deathLoop, id?.DeathLoopStreak ?? 0,
-                recentDeaths, deathCluster ? " CLUSTER" : "", rapidRedeath ? " RAPID" : "", id?.DeathsSinceQuestStart ?? 0);
+                recentDeaths, deathCluster ? " CLUSTER" : "", rapidRedeath ? " RAPID" : "", hearthEscape ? " HEARTH" : "",
+                id?.DeathsSinceQuestStart ?? 0, hearthDeaths);
             return StepResult.Wait();
         }
 
@@ -378,7 +397,7 @@ public sealed class MaintenancePlanner : IBotPlanner
         // proven seam-cross primitive — NOT the old RepopAtGraveyard race), emits GRAVEYARD_PORT, and
         // stays dead. We then send a plain RESURRECT to rez there. RelocateSent/RelocateDone are reused
         // as the port phase flags. Runs BEFORE the corpse-run delay below: we're leaving the area now.
-        bool useGraveyard = (id?.DeathLoopStreak ?? 0) >= GraveyardAfterStreak || m.DeathCluster;
+        bool useGraveyard = (id?.DeathLoopStreak ?? 0) >= GraveyardAfterStreak || m.DeathCluster || m.HearthEscape;
         // [PLAYERPARTY] Never graveyard-port a companion (2026-07-07): the party is standing at
         // the corpse — an in-place rez rejoins the fight, while a port would teleport the escort
         // across the map away from the human mid-quest (the rapid-redeath trigger would fire on
@@ -408,6 +427,21 @@ public sealed class MaintenancePlanner : IBotPlanner
                 _log.LogInformation("[GRAVE] {Name} port {Why} — rez @ ({X:F0},{Y:F0})@{Map} streak={Streak}",
                     ctx.Name, failure != null ? "FAILED/deadline (rez in place)" : "done",
                     ctx.Pos.X, ctx.Pos.Y, ctx.MapId, id?.DeathLoopStreak ?? 0);
+
+                // [HEARTH] (FINDING_008) The ghost was ported to the racial start (C++ home override) and
+                // is about to rez there — HARD-RESET so the bot re-quests from the clean spot instead of
+                // walking back into the killer: drop the stale grind (armed at the death zone), broadly
+                // blacklist the death zone from quest routing, and clear the death counters/streaks.
+                if (m.HearthEscape && id != null)
+                {
+                    int wasDeaths = id.DeathsSinceQuestStart;
+                    id.AddPathBlacklist(m.DeathPos.X, m.DeathPos.Y, ctx.Level + DeathSpotDangerGate);
+                    id.ResetDeathCounter();          // also clears HearthDeaths
+                    ctx.Grind = null;                // re-arm grind fresh at the racial start, not the death cell
+                    ctx.ClearObjective();
+                    _log.LogWarning("[HEARTH] {Name} hearth-escape — rez at racial start (race {Race}); death zone ({X:F0},{Y:F0})@{Map} blacklisted, counters reset (was {Deaths} deaths)",
+                        ctx.Name, id.Race, m.DeathPos.X, m.DeathPos.Y, m.DeathPos.Map, wasDeaths);
+                }
             }
 
             return SendResurrect(ctx, m);
@@ -829,11 +863,24 @@ public sealed class MaintenancePlanner : IBotPlanner
 
         _log.LogInformation("[GRAVE] {Name} graveyard port ({Why}) from ({X:F0},{Y:F0})@{Map} streak={Streak}",
             ctx.Name,
-            m.DeathCluster ? $"death-cluster ≥{RecentDeathClusterCap}/{RecentDeathWindowSec / 60:F0}min OR rapid re-death <{RapidRedeathPortSec:F0}s"
+            m.HearthEscape ? "HEARTH — racial start"
+                           : m.DeathCluster ? $"death-cluster ≥{RecentDeathClusterCap}/{RecentDeathWindowSec / 60:F0}min OR rapid re-death <{RapidRedeathPortSec:F0}s"
                            : $"streak={ctx.Identity?.DeathLoopStreak ?? 0} >= {GraveyardAfterStreak}",
             ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.Identity?.DeathLoopStreak ?? 0);
 
-        var cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1 });
+        // [HEARTH] (FINDING_008) On a hearth-escape, hand C++ the racial-start coord so it ports the ghost
+        // THERE (safe) instead of the nearest — useless, killer-adjacent — graveyard. Same-map guaranteed
+        // by the arm-time check (racialHome.Map == ctx.MapId). Otherwise the plain graveyard port.
+        BridgeCommand cmd;
+        if (m.HearthEscape && ctx.Identity != null)
+        {
+            var h = BotIdentity.RacialStart(ctx.Identity.Race);
+            cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1, home_x = h.X, home_y = h.Y, home_z = h.Z, home_map = h.Map });
+        }
+        else
+        {
+            cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1 });
+        }
         return StepResult.Send(cmd, "GRAVEYARD_PORT", TimeSpan.FromSeconds(GraveyardPortDeadlineSec));
     }
 
