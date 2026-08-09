@@ -1,0 +1,129 @@
+@{
+    ViewData["Title"] = "Spell Completer";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header d-flex align-items-start justify-content-between">
+            <div>
+                <h1><i class="fa-solid fa-flag-checkered" style="color: var(--accent);"></i> Spell Completer</h1>
+                <p>Upload an MSUIClient design session &mdash; name the spells, pick class &amp; damage, build the patch</p>
+            </div>
+            <div class="d-flex gap-2">
+                <button class="btn-sm btn-outline-subtle" id="btnRebuildPatch" disabled>
+                    <i class="fa-solid fa-hammer"></i> Rebuild patch-3.MPQ
+                </button>
+            </div>
+        </div>
+
+        <div class="content-body">
+
+            <!-- ═══════════ Step 1: upload the session file ═══════════ -->
+            <div class="card mb-3">
+                <div class="card-header">
+                    <strong>1 &middot; Session file</strong>
+                    <span class="text-muted ms-2">spell-session.json from the directory MSUIClient was launched from</span>
+                </div>
+                <div class="card-body">
+                    <div id="scDropZone" class="sc-drop">
+                        <i class="fa-solid fa-file-import"></i>
+                        <span>Drop <code>spell-session.json</code> here, or</span>
+                        <label class="pt-link" for="scFileInput" style="cursor:pointer;">browse&hellip;</label>
+                        <input type="file" id="scFileInput" accept=".json,application/json" style="display:none;" />
+                    </div>
+                    <div id="scSessionSummary" class="text-muted mt-2" style="display:none;"></div>
+                </div>
+            </div>
+
+            <!-- ═══════════ Step 2: the spells in the session ═══════════ -->
+            <div class="card mb-3" id="scSpellsCard" style="display:none;">
+                <div class="card-header"><strong>2 &middot; Complete each spell</strong></div>
+                <div class="card-body">
+                    <div id="scSpellList"></div>
+                </div>
+            </div>
+
+            <!-- ═══════════ Step 3: build ═══════════ -->
+            <div class="card mb-3" id="scBuildCard" style="display:none;">
+                <div class="card-header"><strong>3 &middot; Build</strong></div>
+                <div class="card-body">
+                    <p class="text-muted mb-2">
+                        Every completed spell is stored durably (SQL rows + design bytes), so the
+                        patch can be rebuilt any time. Rebuilding produces <code>patch-3.MPQ</code>
+                        with ALL custom spells &mdash; visuals exactly as designed in MSUIClient.
+                    </p>
+                    <div id="scBuildStatus" class="text-muted"></div>
+                    <div id="scDownloadRow" style="display:none;" class="mt-2">
+                        <a class="btn-sm btn-outline-subtle" id="scDownloadLink" href="#">
+                            <i class="fa-solid fa-download"></i> Download patch-3.MPQ
+                        </a>
+                        <span class="text-muted ms-2">drop into WoW/Data, delete the WDB cache</span>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+@section Styles {
+<style>
+    .sc-drop {
+        border: 2px dashed var(--border-color, #444);
+        border-radius: 8px;
+        padding: 28px;
+        text-align: center;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        justify-content: center;
+        color: var(--text-muted, #999);
+        transition: border-color .15s;
+    }
+    .sc-drop.dragover { border-color: var(--accent, #7aa2f7); color: var(--accent, #7aa2f7); }
+    .sc-spell { border: 1px solid var(--border-color, #333); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+    .sc-spell-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+    .sc-spell-head .sc-temp { font-weight: 600; font-size: 1.05em; }
+    .sc-mods { font-size: .85em; color: var(--text-muted, #999); margin-bottom: 10px; }
+    .sc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px 14px; margin-bottom: 10px; }
+    .sc-grid label { display: block; font-size: .8em; color: var(--text-muted, #999); margin-bottom: 2px; }
+    .sc-grid .form-input, .sc-grid select { width: 100%; }
+    .sc-row-status { margin-top: 6px; font-size: .9em; display: inline-block; margin-left: 10px; }
+    .sc-done { color: var(--status-success, #6c6); }
+    .sc-err { color: var(--status-error, #e66); }
+    .sc-section { font-weight: 600; font-size: .85em; text-transform: uppercase; letter-spacing: .04em;
+        color: var(--text-muted, #999); margin: 14px 0 6px; border-bottom: 1px solid var(--border-color, #333);
+        padding-bottom: 3px; }
+    .sc-wide { grid-column: span 2; }
+    .sc-icon-row { display: flex; align-items: flex-start; gap: 14px; flex-wrap: wrap; }
+    .sc-icon-opt { font-size: .9em; white-space: nowrap; }
+    .sc-icon-grid { display: flex; flex-wrap: wrap; gap: 4px; max-height: 120px; overflow-y: auto;
+        border: 1px solid var(--border-color, #333); border-radius: 6px; padding: 4px; max-width: 480px; }
+    .sc-icon { width: 40px; height: 40px; border-radius: 4px; cursor: pointer; border: 2px solid transparent;
+        image-rendering: auto; }
+    .sc-icon:hover { border-color: var(--text-muted, #888); }
+    .sc-icon.selected { border-color: var(--accent, #7aa2f7); }
+    .sc-effect { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; padding: 8px 10px;
+        border: 1px solid var(--border-color, #2a2a2a); border-radius: 6px; margin-bottom: 8px; }
+    .sc-effect label { display: block; font-size: .8em; color: var(--text-muted, #999); margin-bottom: 2px; }
+    .sc-effect .form-input { width: 130px; }
+    .sc-effect input.form-input { width: 100px; }
+    .sc-effect-n { font-weight: 600; font-size: .9em; padding-bottom: 8px; min-width: 60px; }
+    .sc-effect-hint { font-size: .8em; color: var(--text-muted, #999); padding-bottom: 8px; }
+    .sc-check { font-size: .9em; color: inherit; }
+    .sc-desc textarea { width: 100%; min-height: 72px; resize: vertical; font-size: .95em;
+        line-height: 1.4; }
+    .sc-legend { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--border-color, #2a2a2a);
+        border-radius: 6px; background: color-mix(in srgb, var(--border-color, #2a2a2a) 12%, transparent); }
+    .sc-legend-title { font-size: .85em; color: var(--text-muted, #999); margin-bottom: 6px; }
+    .sc-legend-table { font-size: .85em; border-collapse: collapse; }
+    .sc-legend-table td { padding: 1px 12px 1px 0; vertical-align: top; }
+    .sc-legend-table code { color: var(--accent, #7aa2f7); white-space: nowrap; }
+</style>
+}
+
+@section Scripts {
+<script src="~/js/spellcompleter.js" asp-append-version="true"></script>
+}

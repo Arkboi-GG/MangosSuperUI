@@ -112,6 +112,15 @@ public class PatchBuilderService
     private const int FIELD_EFFECT_BASE_POINTS_0 = 76;   // EffectBasePoints[0] = effectBasePoints1 [VERIFIED: R1=13, R2=30, R3=52]
     private const int FIELD_EFFECT_BASE_POINTS_1 = 77;   // EffectBasePoints[1] = effectBasePoints2 [VERIFIED: R3=1, R4=2, R5=4, R8=9]
 
+    // ── Spell Completer effect-structure indices ──
+    // Anchored by the same verified layout: Effect[0]=61 ... EffectBasePoints[0]=76,
+    // then Mechanic[79] TargetA[82] TargetB[85] Radius[88] ApplyAuraName[91]
+    // Amplitude[94] MultipleValue[97] ChainTarget[100] ItemType[103] MiscValue[106]
+    // EffectTriggerSpell[109] — which lands exactly on the verified 109 below.
+    private const int FIELD_EFFECT_APPLY_AURA_0 = 91;   // EffectApplyAuraName[3]
+    private const int FIELD_EFFECT_AMPLITUDE_0 = 94;    // EffectAmplitude[3] (tick ms)
+    private const int FIELD_EFFECT_MISC_VALUE_0 = 106;  // EffectMiscValue[3]
+
     // ── Trainer wrapper DBC field indices (Session 34) ──
     // Trainer wrappers use SPELL_EFFECT_LEARN_SPELL (36) to teach the real spell.
     // Client needs these in Spell.dbc to render trainer UI.
@@ -230,6 +239,9 @@ public class PatchBuilderService
 
             var mpqBuilder = new MpqBuilderService(_logger as ILogger<MpqBuilderService>);
             int totalM2s = 0;
+            // Two completer spells may carry the same tinted BLP (a shared image) —
+            // one copy in the archive, first writer wins.
+            var extraMpqFilesAdded = new HashSet<string>();
 
             // ── Step 2: Process each custom spell ──
             foreach (var request in spells)
@@ -365,24 +377,60 @@ public class PatchBuilderService
                     if (request.EffectRealPointsPerLevel0.HasValue)
                         spellDbc.PatchRowFloat(request.SpellEntry, FIELD_EFFECT_REAL_PPL_0, request.EffectRealPointsPerLevel0.Value);
 
-                    // ── SkillLineAbility ──
-                    bool slaExists = false;
-                    foreach (var row in skillLineAbilityDbc.GetAllRows())
+                    // ── Spell Completer: mechanics mirrored SQL → DBC ──
+                    // The server runs spell_template; the client reads Spell.dbc for
+                    // tooltips ($s/$o/$d), aura display and duration. Any effect-
+                    // structure change (DoT, slow, heal, duration) must land in both.
+                    if (request.DurationIndex.HasValue)
+                        spellDbc.PatchRow(request.SpellEntry, FIELD_DURATION_INDEX, (uint)request.DurationIndex.Value);
+                    foreach (var ef in request.EffectStructure ?? new List<EffectStructurePatch>())
                     {
-                        if (row.Length > 2 && row[2] == request.SpellEntry) { slaExists = true; break; }
+                        if (ef.Slot is < 0 or > 2) continue;
+                        if (ef.Effect.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_0 + ef.Slot, (uint)ef.Effect.Value);
+                        if (ef.AuraName.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_APPLY_AURA_0 + ef.Slot, (uint)ef.AuraName.Value);
+                        if (ef.BasePoints.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_BASE_POINTS_0 + ef.Slot, unchecked((uint)ef.BasePoints.Value));
+                        if (ef.DieSides.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_DIE_SIDES_0 + ef.Slot, (uint)(ef.DieSides.Value + 1)); // DB→DBC: +1
+                        if (ef.Amplitude.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_AMPLITUDE_0 + ef.Slot, (uint)ef.Amplitude.Value);
+                        if (ef.MiscValue.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_MISC_VALUE_0 + ef.Slot, unchecked((uint)ef.MiscValue.Value));
                     }
-                    if (!slaExists)
+
+                    // ── SkillLineAbility ──
+                    // Only with a REAL skill line: a skill=0 row makes the client
+                    // unable to categorize the spell, silently dropping it from
+                    // trainer lists (the FireFunnel bug).
+                    if (request.SkillId > 0)
                     {
-                        uint newSlaId = skillLineAbilityDbc.GetMaxId() + 1;
-                        int slaFieldCount = skillLineAbilityDbc.RecordSize / 4;
-                        var slaRow = new uint[slaFieldCount];
-                        slaRow[0] = newSlaId;
-                        slaRow[1] = (uint)request.SkillId;
-                        slaRow[2] = request.SpellEntry;
-                        slaRow[3] = 0;
-                        slaRow[4] = (uint)request.ClassMask;
-                        if (slaFieldCount > 5) slaRow[5] = 1;
-                        skillLineAbilityDbc.AddRow(slaRow);
+                        bool slaExists = false;
+                        foreach (var row in skillLineAbilityDbc.GetAllRows())
+                        {
+                            if (row.Length > 2 && row[2] == request.SpellEntry) { slaExists = true; break; }
+                        }
+                        if (!slaExists)
+                        {
+                            uint newSlaId = skillLineAbilityDbc.GetMaxId() + 1;
+                            int slaFieldCount = skillLineAbilityDbc.RecordSize / 4;
+                            var slaRow = new uint[slaFieldCount];
+                            slaRow[0] = newSlaId;
+                            slaRow[1] = (uint)request.SkillId;
+                            slaRow[2] = request.SpellEntry;
+                            slaRow[3] = 0;
+                            slaRow[4] = (uint)request.ClassMask;
+                            if (slaFieldCount > 5) slaRow[5] = 1;
+                            skillLineAbilityDbc.AddRow(slaRow);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogWarning(
+                            "PatchBuilder: [{Name}] no skill line available — SLA row skipped " +
+                            "(check skill_line_ability for #{Entry} or its source)",
+                            request.SpellName, request.SpellEntry);
                     }
 
                     // ── M2 files ──
@@ -492,8 +540,33 @@ public class PatchBuilderService
                                 request.SpellName, phase, patchedM2Bytes.Length);
                         }
 
+                        // ── Apply per-path pre-patched M2 override (Spell Completer) ──
+                        // Keyed by the exact original model, so phases with several
+                        // effect M2s each get their own bytes.
+                        if (request.PerPathPatchedM2s != null &&
+                            request.PerPathPatchedM2s.TryGetValue(
+                                CompleterStore.NormalizeM2Key(effectFile.OriginalM2Path),
+                                out var pathPatchedM2))
+                        {
+                            finalM2 = pathPatchedM2;
+                            _logger.LogInformation(
+                                "PatchBuilder: [{Name}] Using completer M2 for {Path} ({Bytes} bytes)",
+                                request.SpellName, effectFile.OriginalM2Path, pathPatchedM2.Length);
+                        }
+
                         mpqBuilder.AddFile(effectFile.CustomM2Path, finalM2);
                     }
+
+                    // ── Spell Completer verbatim files (tinted BLPs, geometry M2s) ──
+                    if (request.ExtraMpqFiles != null)
+                        foreach (var (extraPath, extraBytes) in request.ExtraMpqFiles)
+                            if (extraMpqFilesAdded.Add(extraPath.ToLowerInvariant()))
+                            {
+                                mpqBuilder.AddFile(extraPath, extraBytes);
+                                _logger.LogInformation(
+                                    "PatchBuilder: [{Name}] Added completer file {Path} ({Bytes} bytes)",
+                                    request.SpellName, extraPath, extraBytes.Length);
+                            }
 
                     // Add custom BLP
                     if (customBlpBytes != null && customBlpMpqPath != null)
@@ -657,6 +730,32 @@ public class PatchBuilderService
                             spellDbc.PatchRowFloat(rank.Entry, FIELD_EFFECT_REAL_PPL_0,
                                 rank.EffectRealPointsPerLevel0.Value);
 
+                        // ── Spell Completer: full mechanics mirrored SQL → DBC per rank ──
+                        // Ranks 2+ clone the SOURCE rank's DBC row, so a spell whose
+                        // mechanics were changed (DoT, slow, duration...) would show
+                        // vanilla tooltips on every rank but 1. The rank's own
+                        // spell_template row is authoritative; mirror it completely.
+                        if (rank.DurationIndex.HasValue)
+                            spellDbc.PatchRow(rank.Entry, FIELD_DURATION_INDEX, (uint)rank.DurationIndex.Value);
+                        if (rank.RangeIndex.HasValue)
+                            spellDbc.PatchRow(rank.Entry, FIELD_RANGE_INDEX, (uint)rank.RangeIndex.Value);
+                        foreach (var ef in rank.EffectStructure ?? new List<EffectStructurePatch>())
+                        {
+                            if (ef.Slot is < 0 or > 2) continue;
+                            if (ef.Effect.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_0 + ef.Slot, (uint)ef.Effect.Value);
+                            if (ef.AuraName.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_APPLY_AURA_0 + ef.Slot, (uint)ef.AuraName.Value);
+                            if (ef.BasePoints.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_BASE_POINTS_0 + ef.Slot, unchecked((uint)ef.BasePoints.Value));
+                            if (ef.DieSides.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_DIE_SIDES_0 + ef.Slot, (uint)(ef.DieSides.Value + 1)); // DB→DBC: +1
+                            if (ef.Amplitude.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_AMPLITUDE_0 + ef.Slot, (uint)ef.Amplitude.Value);
+                            if (ef.MiscValue.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_MISC_VALUE_0 + ef.Slot, unchecked((uint)ef.MiscValue.Value));
+                        }
+
                         // ── SkillLineAbility.dbc — tab placement for this rank ──
                         if (rank.SkillLineAbilityData.HasValue)
                         {
@@ -687,22 +786,37 @@ public class PatchBuilderService
                         }
                         else
                         {
-                            // No skill tab specified — add a generic SLA row so spell shows in spellbook
-                            bool slaExists = false;
-                            foreach (var row in skillLineAbilityDbc.GetAllRows())
+                            // No per-rank SLA data — inherit R1's skill line. A row with
+                            // skill 0 is DEADLY here: the trainer UI cannot categorize
+                            // the entry and silently drops it (spellbook too), which is
+                            // exactly how ranks went missing at trainers. Only write a
+                            // row when we actually have a skill line to put it under.
+                            if (request.SkillId > 0)
                             {
-                                if (row.Length > 2 && row[2] == rank.Entry) { slaExists = true; break; }
+                                bool slaExists = false;
+                                foreach (var row in skillLineAbilityDbc.GetAllRows())
+                                {
+                                    if (row.Length > 2 && row[2] == rank.Entry) { slaExists = true; break; }
+                                }
+                                if (!slaExists)
+                                {
+                                    uint newSlaId = skillLineAbilityDbc.GetMaxId() + 1;
+                                    int slaFieldCount = skillLineAbilityDbc.RecordSize / 4;
+                                    var slaRow = new uint[slaFieldCount];
+                                    slaRow[0] = newSlaId;
+                                    slaRow[1] = (uint)request.SkillId;
+                                    slaRow[2] = rank.Entry;
+                                    slaRow[3] = 0;
+                                    slaRow[4] = (uint)request.ClassMask;
+                                    if (slaFieldCount > 5) slaRow[5] = 1;
+                                    skillLineAbilityDbc.AddRow(slaRow);
+                                }
                             }
-                            if (!slaExists)
+                            else
                             {
-                                uint newSlaId = skillLineAbilityDbc.GetMaxId() + 1;
-                                int slaFieldCount = skillLineAbilityDbc.RecordSize / 4;
-                                var slaRow = new uint[slaFieldCount];
-                                slaRow[0] = newSlaId;
-                                slaRow[1] = 0; // General tab
-                                slaRow[2] = rank.Entry;
-                                if (slaFieldCount > 5) slaRow[5] = 1;
-                                skillLineAbilityDbc.AddRow(slaRow);
+                                _logger.LogWarning(
+                                    "PatchBuilder: [{Name} R{R}] no skill line available — SLA row skipped " +
+                                    "(spell may miss its trainer/spellbook category)", rank.SpellName, rank.Rank);
                             }
                         }
 
@@ -1749,6 +1863,32 @@ public class SpellPatchRequest
     /// </summary>
     public Dictionary<string, byte[]>? PerPhasePatchedM2s { get; set; }
 
+    /// <summary>Spell Completer: DurationIndex mirrored into the DBC row when the
+    /// user changed the spell's duration (SpellDuration.dbc index, not ms).</summary>
+    public int? DurationIndex { get; set; }
+
+    /// <summary>Spell Completer: effect-structure changes (type/aura/points/tick/
+    /// misc per slot) mirrored into the DBC row so tooltips and aura display
+    /// match the server's spell_template.</summary>
+    public List<EffectStructurePatch>? EffectStructure { get; set; }
+
+    /// <summary>
+    /// Spell Completer: pre-patched M2 bytes keyed by CompleterStore.NormalizeM2Key
+    /// of the ORIGINAL model path. Unlike PerPhasePatchedM2s (phase-keyed, so one
+    /// blob covers every effect file in the phase), this targets the EXACT model —
+    /// a phase with several effect M2s gets each one right. Checked after
+    /// PerPhasePatchedM2s, so a per-path match wins.
+    /// </summary>
+    public Dictionary<string, byte[]>? PerPathPatchedM2s { get; set; }
+
+    /// <summary>
+    /// Spell Completer: files added to the MPQ verbatim at their stated paths —
+    /// tinted BLPs at their original paths and patched geometry M2s (per-particle
+    /// models referenced from inside a host M2's bytes). These override art
+    /// globally, matching the creator client's own patch export semantics.
+    /// </summary>
+    public Dictionary<string, byte[]>? ExtraMpqFiles { get; set; }
+
     /// <summary>
     /// Session 33: Additional rank entries that need Spell.dbc + SkillLineAbility.dbc patching.
     /// These are ranks 2+ from GenerateRankChainAsync — they exist in spell_template (server)
@@ -1769,6 +1909,22 @@ public class SpellPatchRequest
     /// 1173 and patched with the custom spell name, subtext, and trigger spell ID.
     /// </summary>
     public List<TrainerWrapperData>? TrainerWrappers { get; set; }
+}
+
+// (RankPatchData gains the same mechanics fields — see below EffectStructurePatch.)
+
+/// <summary>Spell Completer: one effect slot's structure, mirrored SQL → DBC.
+/// Slot is 0-based here (DBC array index); null field = keep the cloned value.
+/// DieSides uses the DB convention (max-min) — the +1 lands at write time.</summary>
+public class EffectStructurePatch
+{
+    public int Slot { get; set; }
+    public int? Effect { get; set; }
+    public int? AuraName { get; set; }
+    public int? BasePoints { get; set; }
+    public int? DieSides { get; set; }
+    public int? Amplitude { get; set; }
+    public int? MiscValue { get; set; }
 }
 
 /// <summary>
@@ -1826,6 +1982,15 @@ public class RankPatchData
     public int? CastingTimeIndex { get; set; }
     /// <summary>effectRealPointsPerLevel1 from spell_template. DBC field [73] (float).</summary>
     public float? EffectRealPointsPerLevel0 { get; set; }
+
+    // ── Spell Completer: full mechanics mirror for this rank ──
+    /// <summary>durationIndex from spell_template. DBC field [30].</summary>
+    public int? DurationIndex { get; set; }
+    /// <summary>rangeIndex from spell_template. DBC field [36].</summary>
+    public int? RangeIndex { get; set; }
+    /// <summary>All three effect slots (type/aura/points/tick/misc) from the
+    /// rank's spell_template row — mirrored so tooltips match the server.</summary>
+    public List<EffectStructurePatch>? EffectStructure { get; set; }
 }
 
 public class PatchResult

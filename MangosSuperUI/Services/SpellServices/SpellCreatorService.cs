@@ -492,12 +492,21 @@ public class SpellCreatorService
     {
         using var conn = _db.Mangos();
 
-        // Get the rank chain
+        // Get the rank chain. Spell Completer: the full effect structure rides
+        // along (durationIndex, effect types, auras, amplitudes, misc) so every
+        // rank's DBC row mirrors exactly what the server runs — tooltips for
+        // ranks 2+ must never show the vanilla source's mechanics.
         var chainRows = await conn.QueryAsync<dynamic>(
             @"SELECT sc.rank, sc.spell_id, st.name, st.nameSubtext, st.school, st.description,
                      st.effectBasePoints1, st.effectDieSides1, st.effectBasePoints2,
                      st.manaCost, st.spellLevel, st.baseLevel, st.castingTimeIndex,
-                     st.effectRealPointsPerLevel1
+                     st.effectRealPointsPerLevel1,
+                     st.durationIndex, st.rangeIndex,
+                     st.effect1, st.effect2, st.effect3,
+                     st.effectApplyAuraName1, st.effectApplyAuraName2, st.effectApplyAuraName3,
+                     st.effectAmplitude1, st.effectAmplitude2, st.effectAmplitude3,
+                     st.effectMiscValue1, st.effectMiscValue2, st.effectMiscValue3,
+                     st.effectBasePoints3, st.effectDieSides2, st.effectDieSides3
               FROM spell_chain sc
               JOIN spell_template st ON st.entry = sc.spell_id
                 AND st.build = (SELECT MAX(build) FROM spell_template WHERE entry = sc.spell_id)
@@ -577,7 +586,27 @@ public class SpellCreatorService
                 BaseLevel = Convert.ToInt32(row.baseLevel ?? 0),
                 CastingTimeIndex = Convert.ToInt32(row.castingTimeIndex ?? 0),
                 EffectRealPointsPerLevel1 = Convert.ToSingle(row.effectRealPointsPerLevel1 ?? 0f),
+                DurationIndex = Convert.ToInt32(row.durationIndex ?? 0),
+                RangeIndex = Convert.ToInt32(row.rangeIndex ?? 0),
             };
+
+            // Full per-slot mechanics so the DBC rank rows mirror the server.
+            var rowDict = (IDictionary<string, object>)row;
+            int Col(string name) => rowDict.TryGetValue(name, out var v) && v != null ? Convert.ToInt32(v) : 0;
+            for (int slot = 0; slot < 3; slot++)
+            {
+                int n = slot + 1;
+                info.Effects.Add(new EffectStructurePatch
+                {
+                    Slot = slot,
+                    Effect = Col($"effect{n}"),
+                    AuraName = Col($"effectApplyAuraName{n}"),
+                    BasePoints = Col($"effectBasePoints{n}"),
+                    DieSides = Col($"effectDieSides{n}"),
+                    Amplitude = Col($"effectAmplitude{n}"),
+                    MiscValue = Col($"effectMiscValue{n}"),
+                });
+            }
 
             if (slaData != null)
             {
@@ -1043,4 +1072,12 @@ public class RankChainPatchInfo
     public int BaseLevel { get; set; }
     public int CastingTimeIndex { get; set; }
     public float EffectRealPointsPerLevel1 { get; set; }
+
+    // Spell Completer: the rank's complete mechanics from spell_template, so
+    // the DBC rank rows (and therefore tooltips) can never diverge from the
+    // server. DurationIndex/RangeIndex are DBC indexes; Effects covers all
+    // three slots (type, aura, points, tick, misc).
+    public int DurationIndex { get; set; }
+    public int RangeIndex { get; set; }
+    public List<EffectStructurePatch> Effects { get; set; } = new();
 }
