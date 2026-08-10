@@ -433,11 +433,11 @@ function buildTierSidePanel(el, onSelect) {
         if (iconName) {
             const icon = document.createElement('img');
             icon.className = 'cv-tier-side-class-icon';
-            icon.src = `/icons/${iconName}.png`;
+            icon.src = `/Icon/Get?name=${iconName}`;
             icon.alt = cls;
             icon.title = cls;
             // Fall back to a text abbreviation if the icon fails to load
-            // (e.g. someone deploys to a box where /icons/ wasn't synced).
+            // (e.g. the MPQ archives are missing on this box).
             // No flash of broken-image — we replace the <img> with a
             // <span> at the first error event.
             icon.addEventListener('error', () => {

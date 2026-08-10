@@ -152,7 +152,7 @@ $(function () {
     }
 
     function renderLootRow(item, icons, isDirect) {
-        var iconPath = icons[item.displayId] || '/icons/inv_misc_questionmark.png';
+        var iconPath = icons[item.displayId] || '/Icon/Get?name=inv_misc_questionmark';
         var qualClass = 'quality-' + item.quality;
         var hasStats = item.totalStats > 0;
         var hasSpells = item.hasSpellEffects;
@@ -608,7 +608,7 @@ $(function () {
                 '</div>';
 
             c.items.forEach(function (it) {
-                var iconPath = icons[it.displayId] || '/icons/inv_misc_questionmark.png';
+                var iconPath = icons[it.displayId] || '/Icon/Get?name=inv_misc_questionmark';
                 var qualClass = 'quality-' + it.quality;
                 totalItems++;
 
@@ -766,7 +766,7 @@ $(function () {
             var analysis = itemGroup.analysis;
             var variants = itemGroup.variants;
 
-            var iconPath = base.iconPath || '/icons/inv_misc_questionmark.png';
+            var iconPath = base.iconPath || '/Icon/Get?name=inv_misc_questionmark';
             var qualClass = 'quality-' + base.quality;
 
             var spellBadge = '';
@@ -871,7 +871,7 @@ $(function () {
             var variants = itemGroup.variants;
             totalVariants += variants.length;
 
-            var iconPath = lootTreeData && lootTreeData.icons ? (lootTreeData.icons[base.displayId] || '/icons/inv_misc_questionmark.png') : '/icons/inv_misc_questionmark.png';
+            var iconPath = lootTreeData && lootTreeData.icons ? (lootTreeData.icons[base.displayId] || '/Icon/Get?name=inv_misc_questionmark') : '/Icon/Get?name=inv_misc_questionmark';
             var qualClass = 'quality-' + base.quality;
 
             // Show spell effects in header if present
@@ -992,7 +992,7 @@ $(function () {
     function renderLegendaryCard(legendary) {
         if (!legendary) return '';
 
-        var iconPath = legendary.iconPath || '/icons/inv_misc_questionmark.png';
+        var iconPath = legendary.iconPath || '/Icon/Get?name=inv_misc_questionmark';
         var h = '<div class="lf-legendary-card">';
         h += '<div class="lf-legendary-card-header">' +
             '<i class="fa-solid fa-crown" style="color:#ff8000;font-size:14px;"></i>' +

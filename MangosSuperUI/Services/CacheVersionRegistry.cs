@@ -296,6 +296,10 @@ public class CacheVersionRegistry
         SweepDirectory("character_models", SkinnedGlbVersion, ".glb");
         SweepDirectory(Path.Combine("character_textures", "skin"), SkinPngVersion, ".png");
         SweepDirectory("item_models", RigidGlbVersion, ".glb");
+        // Gameobject GLBs are generated on demand by GameObjectModelService.
+        // This sweep also clears any legacy unstamped files from the retired
+        // extractor workflow.
+        SweepDirectory("models", RigidGlbVersion, ".glb");
     }
 
     // ────────────────────────────────────────────────────────────────────

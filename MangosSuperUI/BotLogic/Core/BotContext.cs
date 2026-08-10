@@ -418,6 +418,7 @@ public sealed class BotContext
     {
         _deadGrindCells.Clear();
         ConsecutiveFailures = 0;
+        if (Identity != null) Identity.WedgeStreak = 0;   // killing again = not stranded (FINDING_010)
     }
 
     // ---- step / goal timing ----

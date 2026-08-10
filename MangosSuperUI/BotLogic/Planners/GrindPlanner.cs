@@ -29,6 +29,7 @@ namespace MangosSuperUI.BotLogic.Planners;
 public sealed class GrindPlanner : IBotPlanner
 {
     private const float GrindRadius = 60f;       // solo-grind radius (C++ SelectGrindTarget leash)
+    private const int GuardTownParkSec = 120;    // guard-town bail: hold Idle this long instead of re-bailing at tick speed
     private const double ArmGraceSec = 45;       // grace after entry before KILL-recency applies
     private const double KillRecencySec = 120;   // a bot landing REAL kills is progressing
 
@@ -63,9 +64,17 @@ public sealed class GrindPlanner : IBotPlanner
                 _safety.IsEnemyGuardCell(snap.MapId, snap.X, snap.Y, ZoneSafetyMap.TeamFromFaction(ctx.Identity?.Faction)))
             {
                 ctx.RecordDeadGrindCell(snap.X, snap.Y);
+                // PARK, don't just Block: Block → OnStall → ReselectGoal re-enters Grinding next tick
+                // (grind-lock / pick=0 hasn't changed), which re-bails here at tick speed — observed
+                // 2026-08-08, 8 bots at ~1.5Hz for hours. Stamping the wedge backoff makes GoalSelector
+                // hold Idle (its backoff check sits BEFORE the grind-lock), and we deliberately do NOT
+                // future-stamp LastProgressUtc, so the real wedge breaker still accrues no-progress and
+                // runs its park→dead-cell→escalation ladder on schedule.
+                if (ctx.Identity is { } gid)
+                    gid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
                 _log.LogWarning(
-                    "[GRIND] {Name} refusing filler grind in enemy guard cell @ ({X:F0},{Y:F0}) map {M} — bailing (FINDING_005)",
-                    ctx.Name, snap.X, snap.Y, snap.MapId);
+                    "[GRIND] {Name} refusing filler grind in enemy guard cell @ ({X:F0},{Y:F0}) map {M} — parking {P}s (FINDING_005)",
+                    ctx.Name, snap.X, snap.Y, snap.MapId, GuardTownParkSec);
                 return StepResult.Block("grind:guard-town");
             }
 

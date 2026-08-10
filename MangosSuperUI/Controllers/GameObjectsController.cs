@@ -12,6 +12,7 @@ public class GameObjectsController : Controller
     private readonly DbcService _dbc;
     private readonly AuditService _audit;
     private readonly IWebHostEnvironment _env;
+    private readonly GameObjectModelService _goModels;
 
     // Custom objects start at this entry ID
     private const int CUSTOM_RANGE_START = 900000;
@@ -26,12 +27,14 @@ public class GameObjectsController : Controller
         "data16", "data17", "data18", "data19", "data20", "data21", "data22", "data23"
     };
 
-    public GameObjectsController(ConnectionFactory db, DbcService dbc, AuditService audit, IWebHostEnvironment env)
+    public GameObjectsController(ConnectionFactory db, DbcService dbc, AuditService audit,
+        IWebHostEnvironment env, GameObjectModelService goModels)
     {
         _db = db;
         _dbc = dbc;
         _audit = audit;
         _env = env;
+        _goModels = goModels;
     }
 
     public IActionResult Index() => View();
@@ -94,18 +97,18 @@ public class GameObjectsController : Controller
 
         var objects = (await conn.QueryAsync<dynamic>(dataSql, parameters)).ToList();
 
-        // Check which models exist as GLB files
+        // Models are generated on demand from the client MPQs (Detail /
+        // ModelExists trigger generation). Here we only flag which display
+        // ids CAN have a model — cheap DBC lookup, no generation, so the
+        // list page stays fast.
         var modelMap = new Dictionary<uint, string>();
-        var modelsPath = Path.Combine(_env.WebRootPath, "models");
         foreach (var obj in objects)
         {
             uint did = (uint)(obj.displayId ?? 0);
-            if (did > 0 && !modelMap.ContainsKey(did))
-            {
-                var glbPath = Path.Combine(modelsPath, $"{did}.glb");
-                if (System.IO.File.Exists(glbPath))
-                    modelMap[did] = $"/models/{did}.glb";
-            }
+            // Value is the cached GLB path when already generated, or the
+            // marker "ondemand" (frontend only checks truthiness).
+            if (did > 0 && !modelMap.ContainsKey(did) && _goModels.HasModel(did))
+                modelMap[did] = _goModels.TryGetCachedWebPath(did) ?? "ondemand";
         }
 
         return Json(new
@@ -140,12 +143,9 @@ public class GameObjectsController : Controller
         if (obj == null)
             return Json(new { found = false });
 
-        // Check for 3D model
+        // 3D model — generated on demand from the client MPQs if not cached
         uint displayId = (uint)(obj.displayId ?? 0);
-        string? modelPath = null;
-        var glbFile = Path.Combine(_env.WebRootPath, "models", $"{displayId}.glb");
-        if (System.IO.File.Exists(glbFile))
-            modelPath = $"/models/{displayId}.glb";
+        string? modelPath = _goModels.EnsureGlb(displayId);
 
         // Get spawn count
         var spawnCount = await conn.ExecuteScalarAsync<int>(
@@ -176,8 +176,9 @@ public class GameObjectsController : Controller
     [HttpGet]
     public IActionResult ModelExists(uint displayId)
     {
-        var glbFile = Path.Combine(_env.WebRootPath, "models", $"{displayId}.glb");
-        return Json(new { exists = System.IO.File.Exists(glbFile), path = $"/models/{displayId}.glb" });
+        // Generates the GLB from the client MPQs on first request.
+        var webPath = _goModels.EnsureGlb(displayId);
+        return Json(new { exists = webPath != null, path = webPath });
     }
 
     /// <summary>
@@ -312,10 +313,7 @@ public class GameObjectsController : Controller
             return Json(new { found = false });
 
         uint displayId = (uint)(obj.displayId ?? 0);
-        string? modelPath = null;
-        var glbFile = Path.Combine(_env.WebRootPath, "models", $"{displayId}.glb");
-        if (System.IO.File.Exists(glbFile))
-            modelPath = $"/models/{displayId}.glb";
+        string? modelPath = _goModels.EnsureGlb(displayId);
 
         return Json(new { found = true, obj, modelPath });
     }

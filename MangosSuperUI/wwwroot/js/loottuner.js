@@ -218,7 +218,7 @@ $(function () {
             '</tr></thead><tbody>';
 
         data.rows.forEach(function (row) {
-            var iconPath = data.icons[row.displayId] || '/icons/inv_misc_questionmark.png';
+            var iconPath = data.icons[row.displayId] || '/Icon/Get?name=inv_misc_questionmark';
             var qualityClass = 'quality-' + row.itemQuality;
             var abs = Math.abs(row.currentChance);
             var isQuest = row.currentChance < 0;
@@ -558,7 +558,7 @@ $(function () {
             '</tr></thead><tbody>';
 
         data.changes.forEach(function (row) {
-            var iconPath = data.icons[row.displayId] || '/icons/inv_misc_questionmark.png';
+            var iconPath = data.icons[row.displayId] || '/Icon/Get?name=inv_misc_questionmark';
             var qualityClass = 'quality-' + row.itemQuality;
             var origAbs = Math.abs(row.originalChance);
             var curAbs = Math.abs(row.currentChance);

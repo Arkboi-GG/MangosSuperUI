@@ -305,7 +305,7 @@ $(function () {
 
             var html = '';
             data.spells.forEach(function (spell) {
-                var iconPath = currentIcons[spell.spellIconId] || '/icons/inv_misc_questionmark.png';
+                var iconPath = currentIcons[spell.spellIconId] || '/Icon/Get?name=inv_misc_questionmark';
                 var schoolName = SCHOOL_NAMES[spell.school] || '';
                 var rank = spell.nameSubtext || '';
                 var meta = [schoolName, spell.spellLevel > 0 ? 'Level ' + spell.spellLevel : ''].filter(Boolean).join(' · ');
@@ -357,7 +357,7 @@ $(function () {
 
             var html = '';
             data.groups.forEach(function (g) {
-                var iconPath = currentIcons[g.spellIconId] || '/icons/inv_misc_questionmark.png';
+                var iconPath = currentIcons[g.spellIconId] || '/Icon/Get?name=inv_misc_questionmark';
                 var schoolName = SCHOOL_NAMES[g.school] || '';
                 var familyName = SPELL_FAMILY[g.family] || '';
                 var isSingle = g.rankCount === 1;

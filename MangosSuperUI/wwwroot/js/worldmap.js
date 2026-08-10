@@ -124,7 +124,8 @@
                 L.latLng(-t.col * TILE_PX, (t.row + 1) * TILE_PX)
             );
 
-            var url = '/minimap/' + folder + '/map' + zeroPad(t.row) + '_' + zeroPad(t.col) + '.png';
+            // Tiles are decoded from the client MPQs on demand (server disk-caches them)
+            var url = '/WorldMap/Tile?map=' + encodeURIComponent(folder) + '&row=' + t.row + '&col=' + t.col;
 
             var overlay = L.imageOverlay(url, bounds, {
                 opacity: 1,

@@ -45,6 +45,14 @@ public sealed class BotBrain
     private const double WedgeCeilingSec = 150;   // no real progress this long → wedged
     private const int WedgeFailCap = 8;     // …or this many back-to-back negated WAITs (fast fail-loop)
     private const double WedgeBackoffSec = 5;    // park this long, then resume + relocate to a fresh cell
+
+    // [ESCAPE] (FINDING_010) Stranded escalation: this many consecutive wedge trips with zero real
+    // kills in between (WedgeStreak — a kill clears it) means the park→local-relocate ladder is not
+    // working: the bot has no killable/questable content in walking range (Everlook L18, Badlands
+    // L21 — the 23-bot stray census). Escalate to a PORT_HOME (racial start) instead of another
+    // ~50yd shuffle. At the observed wedge cadence (~1 per 2.5 min) the cap ≈ 15 min of proven
+    // stranding, and a refused/failed port re-accrues the same window before retrying.
+    private const int StrandedWedgeCap = 6;
     private const double TrainWedgeCooldownSec = 300;   // a trainer-route wedge defers Training this long (mirrors TrainingPlanner give-up) so the bot quests instead of re-bee-lining
 
     // ── No-path escalation (2026-07-03, the GroupVendor livelock fix) ──
@@ -257,6 +265,51 @@ public sealed class BotBrain
             // Future-stamp the progress clock to the park END so the bot gets a fresh full window on
             // resume (the idle park itself isn't "no progress" to be punished for).
             ctx.LastProgressUtc = id.WedgeBackoffUntil.Value;
+
+            // [ESCAPE] (FINDING_010) Stranded escalation — see StrandedWedgeCap. Alive + solo +
+            // out-of-combat only (the death path already has FINDING_008's hearth; combat ports are
+            // C++-refused anyway). Clears the grind-lock state so the bot quests fresh at home, and
+            // blacklists the stranded cell until it has outleveled it (~7 levels of headroom).
+            id.WedgeStreak++;
+            if (id.WedgeStreak >= StrandedWedgeCap && !ctx.Dead && !ctx.InCombat && !ctx.InPlayerParty)
+            {
+                // Level-banded home (Northshire-pileup fix): over-leveled bots go to a town with
+                // level-appropriate content, not the L1 start where every kill is grey.
+                var home = BotIdentity.HomeFor(id.Race, id.Level);
+
+                // Already-home guard: a bot stranded AT its home town gains nothing from a re-port
+                // — the old no-op port every ~15 min was pure churn (and at scale, the resulting
+                // pileup drove the core's dynamic visibility to its floor). Reset the streak and
+                // let the normal wedge ladder keep working the spot.
+                float hdx = ctx.Pos.X - home.X, hdy = ctx.Pos.Y - home.Y;
+                bool alreadyHome = home.Map == ctx.MapId && (hdx * hdx + hdy * hdy) < 300f * 300f;
+                if (alreadyHome)
+                {
+                    id.WedgeStreak = 0;
+                    _logger.LogInformation(
+                        "[ESCAPE] {Name} stranded at its own home town ({X:F0},{Y:F0})@map{Map} — skipping no-op port",
+                        ctx.Name, home.X, home.Y, home.Map);
+                }
+                else if (home.Map >= 0)
+                {
+                    id.WedgeStreak = 0;
+                    id.GrindLockUntil = null;
+                    id.GrindLockReleaseCooldownUntil = null;
+                    id.AddPathBlacklist(ctx.Pos.X, ctx.Pos.Y, id.Level + 10);
+                    ctx.Grind = null;
+                    _logger.LogWarning(
+                        "[ESCAPE] {Name} STRANDED (wedge streak {N}, goal {G} @ {Pos}) — PORT_HOME to level-band home ({X:F0},{Y:F0})@map{Map}",
+                        ctx.Name, StrandedWedgeCap, ctx.Goal, ctx.Pos, home.X, home.Y, home.Map);
+                    await _executor.IssueNoWaitAsync(ctx, new BridgeCommand("SET_TASK", new
+                    {
+                        task = "PORT_HOME",
+                        home_x = home.X,
+                        home_y = home.Y,
+                        home_z = home.Z,
+                        home_map = home.Map
+                    }));
+                }
+            }
         }
 
         _logger.LogWarning(
