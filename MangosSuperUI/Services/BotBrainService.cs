@@ -845,6 +845,24 @@ public class BotBrainService : BackgroundService
         try
         {
             using var charConn = _db.Characters();
+
+            // [SUI] HARD WALL (2026-08-10, Tesfff): an unattended REAL character
+            // enrolls in the fleet like any bot, but must NEVER be persisted to the
+            // playerbot registry — the next mangosd restart would respawn it as a
+            // fabricated bot on a synthetic account, SaveToDB would stamp that
+            // account over the owner's, and the character vanishes from their
+            // account list. A character whose account exists in realmd is real.
+            var realOwner = await charConn.QueryFirstOrDefaultAsync<int?>(
+                "SELECT c.account FROM characters c WHERE c.guid = @Guid AND c.account IN (SELECT id FROM realmd.account)",
+                new { Guid = guid });
+            if (realOwner != null)
+            {
+                _logger.LogWarning(
+                    "BotBrain: NOT registering {Name} (guid={Guid}) — real character on account {Account}",
+                    bs.Name, guid, realOwner);
+                return;
+            }
+
             var existing = await charConn.QueryFirstOrDefaultAsync<int?>(
                 "SELECT char_guid FROM playerbot WHERE char_guid = @Guid", new { Guid = guid });
 
