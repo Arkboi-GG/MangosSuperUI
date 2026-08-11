@@ -322,70 +322,28 @@ if check_dir "SpellCreator data" "$SC_DATA" "optional" "create"; then
 fi
 
 # ============================================================================
-header "5. WWWRoot Static Assets"
+header "5. On-Demand Game Assets (Client MPQs)"
 # ============================================================================
 
-subhead "Directories"
+# Icons, 3D models, and minimap tiles are decoded on demand from the WoW
+# 1.12.1 client MPQ archives — no extraction, no static wwwroot assets.
+# The only requirement is Vmangos:ClientDataPath pointing at the client
+# Data/ directory. The wwwroot/models, item_models, and minimap dirs are
+# auto-managed caches; being empty is normal on a fresh install.
 
-# These are the directories the Extractor outputs into
-ASSET_DIRS=(
-    "icons:Icon PNGs:required:2600"
-    "models:Game Object GLBs:recommended:900"
-    "item_models:Item Model GLBs:recommended:100"
-    "minimap:Minimap Tile PNGs:recommended:0"
-)
+subhead "Client Data (MPQ archives)"
 
-for entry in "${ASSET_DIRS[@]}"; do
-    IFS=':' read -r dir desc importance expected_min <<< "$entry"
-    
-    full_path="$WWWROOT/$dir"
-    
-    if [ -d "$full_path" ]; then
-        case "$dir" in
-            "icons")
-                count=$(ls "$full_path"/*.png 2>/dev/null | wc -l)
-                ;;
-            "models"|"item_models")
-                count=$(ls "$full_path"/*.glb 2>/dev/null | wc -l)
-                ;;
-            "minimap")
-                count=$(find "$full_path" -name "*.png" 2>/dev/null | wc -l)
-                ;;
-        esac
-        
-        if [ "$count" -gt "$expected_min" ]; then
-            pass "$desc ($dir/): $count files"
-        elif [ "$count" -gt 0 ]; then
-            warning "$desc ($dir/): $count files (expected $expected_min+)"
-        else
-            if [ "$importance" = "required" ]; then
-                failure "$desc ($dir/): empty"
-            else
-                warning "$desc ($dir/): empty"
-            fi
-        fi
+if [ -n "$CLIENT_DATA" ] && [ -d "$CLIENT_DATA" ]; then
+    MPQ_COUNT=$(find "$CLIENT_DATA" -maxdepth 1 -iname "*.mpq" 2>/dev/null | wc -l)
+    if [ "$MPQ_COUNT" -gt 0 ]; then
+        pass "Client Data: $MPQ_COUNT MPQ archives at $CLIENT_DATA"
     else
-        mkdir -p "$full_path" 2>/dev/null
-        if [ "$importance" = "required" ]; then
-            failure "$desc ($dir/): directory created, but no files — run Extractor"
-        else
-            warning "$desc ($dir/): directory created, but no files — run Extractor"
-        fi
+        failure "Client Data directory has no *.MPQ files: $CLIENT_DATA"
+        info "Point Vmangos:ClientDataPath at the Data/ folder itself (the one containing the MPQs)."
     fi
-done
-
-subhead "Icon Case Check"
-if [ -d "$WWWROOT/icons" ]; then
-    UPPER_COUNT=$(ls "$WWWROOT/icons/" 2>/dev/null | grep -c '[A-Z]')
-    if [ "$UPPER_COUNT" -gt 0 ]; then
-        warning "$UPPER_COUNT icon files have uppercase characters — they won't load on Linux"
-        info "Fix: cd $WWWROOT/icons && for f in *; do mv \"\$f\" \"\$(echo \"\$f\" | tr '[:upper:]' '[:lower:]')\" 2>/dev/null; done"
-    else
-        ICON_TOTAL=$(ls "$WWWROOT/icons/"*.png 2>/dev/null | wc -l)
-        if [ "$ICON_TOTAL" -gt 0 ]; then
-            pass "All icon filenames are lowercase"
-        fi
-    fi
+else
+    failure "Vmangos:ClientDataPath not set or missing — icons, 3D models, and minimap tiles will not display"
+    info "Copy a WoW 1.12.1 client Data/ directory to the server and set the path in Settings."
 fi
 
 subhead "Three.js Libraries"
@@ -525,24 +483,11 @@ if [ "$FAIL" -gt 0 ] || [ "$WARN" -gt 0 ]; then
     header "TODO — What To Do Next"
     echo ""
     
-    # Check for empty asset dirs
-    ICONS_COUNT=$(ls "$WWWROOT/icons/"*.png 2>/dev/null | wc -l)
-    MODELS_COUNT=$(ls "$WWWROOT/models/"*.glb 2>/dev/null | wc -l)
-    
-    if [ "$ICONS_COUNT" -eq 0 ] || [ "$MODELS_COUNT" -eq 0 ]; then
-        echo "  ${BOLD}Run the MangosSuperUI Extractor on your Windows PC:${NC}"
-        echo "    1. Point it at your WoW 1.12.1 client Data/ folder"
-        echo "    2. Extract: icons, models, item_models, minimap"
-        echo "    3. SCP the output folders to $WWWROOT/"
-        if [ "$ICONS_COUNT" -eq 0 ]; then
-            echo "    4. Fix icon case: cd $WWWROOT/icons && for f in *; do mv \"\$f\" \"\$(echo \"\$f\" | tr '[:upper:]' '[:lower:]')\" 2>/dev/null; done"
-        fi
-        echo ""
-    fi
-    
     if [ -z "$CLIENT_DATA" ] || [ ! -d "$CLIENT_DATA" ]; then
         echo "  ${BOLD}Copy WoW 1.12.1 client Data/ to the server:${NC}"
-        echo "    This enables the WorldViewer (terrain, WMOs, doodads) and SpellCreator M2 fallback."
+        echo "    Icons, 3D models, and minimap tiles are all decoded from the MPQs on demand —"
+        echo "    this is the ONLY thing needed for game assets (no extraction step)."
+        echo "    Also enables the WorldViewer (terrain, WMOs, doodads) and SpellCreator M2 fallback."
         echo "    scp -r 'C:\\WoW\\Data' YOUR_USER@YOUR_SERVER:/home/YOUR_USER/wowclient/Data"
         echo "    Then set Vmangos:ClientDataPath in Settings."
         echo ""

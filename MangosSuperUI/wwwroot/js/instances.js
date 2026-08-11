@@ -637,7 +637,7 @@ $(function () {
             var icons = data.icons || {};
             var h = '';
             data.items.forEach(function (item) {
-                var iconPath = icons[item.displayId] || '/icons/inv_misc_questionmark.png';
+                var iconPath = icons[item.displayId] || '/Icon/Get?name=inv_misc_questionmark';
                 var qClass = 'quality-' + item.quality;
                 var qName = QUALITY_NAMES[item.quality] || '';
 

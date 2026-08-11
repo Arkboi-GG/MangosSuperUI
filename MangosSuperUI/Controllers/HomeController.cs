@@ -18,6 +18,7 @@ public class HomeController : Controller
     private readonly IConfiguration _config;
     private readonly IOptionsMonitor<VmangosSettings> _vmangosSettings;
     private readonly IOptionsMonitor<RemoteAccessSettings> _raSettings;
+    private readonly MpqReaderService _mpq;
     private readonly ILogger<HomeController> _logger;
 
     public HomeController(
@@ -30,6 +31,7 @@ public class HomeController : Controller
         IConfiguration config,
         IOptionsMonitor<VmangosSettings> vmangosSettings,
         IOptionsMonitor<RemoteAccessSettings> raSettings,
+        MpqReaderService mpq,
         ILogger<HomeController> logger)
     {
         _processManager = processManager;
@@ -41,6 +43,7 @@ public class HomeController : Controller
         _config = config;
         _vmangosSettings = vmangosSettings;
         _raSettings = raSettings;
+        _mpq = mpq;
         _logger = logger;
     }
 
@@ -403,33 +406,63 @@ public class HomeController : Controller
             }
         }
 
-        // ── 6. Static assets ──
-        var wwwroot = Path.Combine(_env.ContentRootPath, "wwwroot");
+        // ── 6. Client game data (MPQ loaders) ──
+        // Icons and 3D models are decoded ON DEMAND from the WoW 1.12.1 client's
+        // MPQ archives — there is no extraction step and no static asset sync.
+        // The only requirement is that Vmangos:ClientDataPath points at a valid
+        // client Data/ directory.
+        var clientDataPath = _config["Vmangos:ClientDataPath"]
+            ?? _config["SpellCreator:ClientDataPath"];
 
-        CheckAssetDir(checks, "Icons", Path.Combine(wwwroot, "icons"), "*.png", 2600,
-            "Item/spell icon images for browsers.");
-        CheckAssetDir(checks, "Game Object Models", Path.Combine(wwwroot, "models"), "*.glb", 900,
-            "3D model previews on the Game Objects page.");
-        CheckAssetDir(checks, "Item Models", Path.Combine(wwwroot, "item_models"), "*.glb", 100,
-            "3D model previews on the Items page.");
-
-        // Check icon case
-        var iconsDir = Path.Combine(wwwroot, "icons");
-        if (Directory.Exists(iconsDir))
+        if (string.IsNullOrWhiteSpace(clientDataPath) || !Directory.Exists(clientDataPath))
         {
-            var upperCount = Directory.GetFiles(iconsDir, "*.png")
-                .Count(f => Path.GetFileName(f).Any(char.IsUpper));
-            if (upperCount > 0)
+            checks.Add(new DiagnosticCheck
             {
-                checks.Add(new DiagnosticCheck
-                {
-                    Category = "assets",
-                    Name = "Icon Filename Case",
-                    Status = "warning",
-                    Detail = $"{upperCount} icon files have uppercase characters. They won't load on Linux (case-sensitive filesystem).",
-                    Fix = $"Run: cd {iconsDir} && for f in *; do mv \"$f\" \"$(echo \"$f\" | tr '[:upper:]' '[:lower:]')\" 2>/dev/null; done"
-                });
+                Category = "assets",
+                Name = "Client Data Path (MPQ)",
+                Status = "error",
+                Detail = string.IsNullOrWhiteSpace(clientDataPath)
+                    ? "Vmangos:ClientDataPath is not configured. Icons and 3D models are served on demand from the client MPQs — without this path, no icons or models will display."
+                    : $"Configured client data path does not exist: {clientDataPath}. Icons and 3D models are served on demand from the client MPQs.",
+                Fix = "In Settings, set 'Client Data Path' to your WoW 1.12.1 client's Data directory (the folder containing *.MPQ files), then restart the app."
+            });
+        }
+        else
+        {
+            var mpqCount = Directory.GetFiles(clientDataPath, "*.MPQ").Length
+                + Directory.GetFiles(clientDataPath, "*.mpq").Length;
+            checks.Add(new DiagnosticCheck
+            {
+                Category = "assets",
+                Name = "Client Data Path (MPQ)",
+                Status = mpqCount > 0 ? "ok" : "error",
+                Detail = mpqCount > 0
+                    ? $"{mpqCount} MPQ archives at {clientDataPath}"
+                    : $"Directory exists but contains no *.MPQ files: {clientDataPath}",
+                Fix = mpqCount > 0 ? null
+                    : "Point 'Client Data Path' in Settings at the client's Data folder itself (e.g. .../wowclient/Data), not the client root."
+            });
+
+            // Live probe: decode the fallback questionmark icon through the real
+            // loader path. If this works, every icon/model request can work.
+            byte[]? probe = null;
+            try { probe = _mpq.ExtractFile("Interface\\Icons\\INV_Misc_QuestionMark.blp"); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Diagnostics: MPQ icon probe threw");
             }
+
+            checks.Add(new DiagnosticCheck
+            {
+                Category = "assets",
+                Name = "Icon Loader (on-demand)",
+                Status = probe is { Length: > 0 } ? "ok" : "error",
+                Detail = probe is { Length: > 0 }
+                    ? $"Icons decode from client MPQs on demand ({_mpq.ArchiveCount} archives mounted)."
+                    : "Could not read Interface\\Icons\\INV_Misc_QuestionMark.blp from the mounted MPQ archives. Icons and models will not display.",
+                Fix = probe is { Length: > 0 } ? null
+                    : "Verify the client Data directory is a complete WoW 1.12.1 install (dbc/model/texture/interface MPQs present) and restart the app."
+            });
         }
 
         // ── Summary ──
@@ -517,34 +550,6 @@ public class HomeController : Controller
                 Detail = $"Found: {path}"
             });
         }
-    }
-
-    private static void CheckAssetDir(List<DiagnosticCheck> checks, string name, string path,
-        string pattern, int expectedMin, string purpose)
-    {
-        if (!Directory.Exists(path))
-        {
-            checks.Add(new DiagnosticCheck
-            {
-                Category = "assets",
-                Name = name,
-                Status = "info",
-                Detail = $"Directory not present. {purpose} Run the MangosSuperUI Extractor to populate.",
-                Fix = $"mkdir -p {path}"
-            });
-            return;
-        }
-
-        var count = Directory.GetFiles(path, pattern).Length;
-        checks.Add(new DiagnosticCheck
-        {
-            Category = "assets",
-            Name = name,
-            Status = count >= expectedMin ? "ok" : (count > 0 ? "warning" : "info"),
-            Detail = count > 0
-                ? $"{count} files ({(count >= expectedMin ? "good" : $"expected {expectedMin}+")})"
-                : $"Directory exists but empty. {purpose}"
-        });
     }
 
     [HttpPost]

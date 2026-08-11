@@ -10,14 +10,17 @@ public class WorldMapController : Controller
     private readonly ConnectionFactory _db;
     private readonly IWebHostEnvironment _env;
     private readonly HeightMapService _heightMap;
+    private readonly MinimapTileService _minimap;
 
     private const int CUSTOM_RANGE_START = 900000;
 
-    public WorldMapController(ConnectionFactory db, IWebHostEnvironment env, HeightMapService heightMap)
+    public WorldMapController(ConnectionFactory db, IWebHostEnvironment env,
+        HeightMapService heightMap, MinimapTileService minimap)
     {
         _db = db;
         _env = env;
         _heightMap = heightMap;
+        _minimap = minimap;
     }
 
     public IActionResult Index()
@@ -35,32 +38,69 @@ public class WorldMapController : Controller
     public IActionResult TileIndex(string map = "Azeroth")
     {
         map = SanitizeMapName(map);
-        var tilesDir = Path.Combine(_env.WebRootPath, "minimap", map);
 
+        // Tile index comes from the client MPQs' md5translate.trs — no
+        // extracted tiles needed. Fall back to scanning the legacy disk
+        // directory only if the MPQs aren't available.
+        if (_minimap.IsAvailable)
+        {
+            var tiles = _minimap.GetTileIndex(map)
+                .Select(t => new[] { t.Row, t.Col })
+                .ToList();
+            return Json(new { map, tiles });
+        }
+
+        var tilesDir = Path.Combine(_env.WebRootPath, "minimap", map);
         if (!Directory.Exists(tilesDir))
             return Json(new { map, tiles = Array.Empty<int[]>() });
 
-        var tiles = new List<int[]>();
+        var diskTiles = new List<int[]>();
         foreach (var file in Directory.GetFiles(tilesDir, "map*.png"))
         {
             var name = Path.GetFileNameWithoutExtension(file); // "map27_30"
             var parts = name.Replace("map", "").Split('_');
             if (parts.Length == 2 && int.TryParse(parts[0], out int row) && int.TryParse(parts[1], out int col))
             {
-                tiles.Add(new[] { row, col });
+                diskTiles.Add(new[] { row, col });
             }
         }
 
-        return Json(new { map, tiles });
+        return Json(new { map, tiles = diskTiles });
+    }
+
+    /// <summary>
+    /// GET /WorldMap/Tile?map=Azeroth&row=27&col=30
+    /// Serves one minimap tile PNG, decoding it from the client MPQs on
+    /// first request (then disk-cached under wwwroot/minimap).
+    /// </summary>
+    [HttpGet]
+    public IActionResult Tile(string map, int row, int col)
+    {
+        map = SanitizeMapName(map);
+        var png = _minimap.GetTilePng(map, row, col);
+        if (png == null) return NotFound();
+
+        Response.Headers["Cache-Control"] = "public, max-age=86400";
+        return File(png, "image/png");
     }
 
     /// <summary>
     /// GET /WorldMap/AvailableMaps
-    /// Returns list of map folders that have minimap tiles.
+    /// Returns list of maps that have minimap tiles.
     /// </summary>
     [HttpGet]
     public IActionResult AvailableMaps()
     {
+        if (_minimap.IsAvailable)
+        {
+            return Json(new
+            {
+                maps = _minimap.GetAvailableMaps()
+                    .Select(m => new { name = m.Name, tileCount = m.TileCount })
+                    .ToList()
+            });
+        }
+
         var minimapRoot = Path.Combine(_env.WebRootPath, "minimap");
         if (!Directory.Exists(minimapRoot))
             return Json(new { maps = Array.Empty<object>() });

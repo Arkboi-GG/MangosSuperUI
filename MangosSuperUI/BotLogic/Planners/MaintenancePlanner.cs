@@ -301,11 +301,14 @@ public sealed class MaintenancePlanner : IBotPlanner
             bool deathCluster = recentDeaths >= RecentDeathClusterCap;
 
             // [HEARTH] (FINDING_008) Death window that SURVIVES graveyard ports: at the cap the ports
-            // have demonstrably failed to break the loop → hearth to the racial start instead. Same-map
-            // only (the ghost port is a NearTeleportTo); a cross-continent home would fall back to the
+            // have demonstrably failed to break the loop → hearth HOME instead. Same-map only (the
+            // ghost port is a NearTeleportTo); a cross-continent home would fall back to the
             // graveyard port (racialHome.Map != ctx.MapId → hearthEscape false, no regression).
+            // 2026-08-09: home is now LEVEL-BANDED (BotIdentity.HomeFor) — hearthing every dying
+            // bot to the L1 racial start piled 97 bots at Northshire, whose update cost floored the
+            // core's dynamic visibility and "despawned" the zone for real players (FINDING_010).
             int hearthDeaths = id?.RecordHearthDeathAndCount(HearthWindowSec) ?? 0;
-            var racialHome = id != null ? BotIdentity.RacialStart(id.Race) : (X: 0f, Y: 0f, Z: 0f, Map: -1);
+            var racialHome = id != null ? BotIdentity.HomeFor(id.Race, id.Level) : (X: 0f, Y: 0f, Z: 0f, Map: -1);
             bool hearthEscape = hearthDeaths >= HearthDeathCap && racialHome.Map == ctx.MapId && !ctx.InPlayerParty;
 
             // On a same-spot loop, blacklist the pocket so the QuestPlanner stops ROUTING
@@ -868,13 +871,14 @@ public sealed class MaintenancePlanner : IBotPlanner
                            : $"streak={ctx.Identity?.DeathLoopStreak ?? 0} >= {GraveyardAfterStreak}",
             ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.Identity?.DeathLoopStreak ?? 0);
 
-        // [HEARTH] (FINDING_008) On a hearth-escape, hand C++ the racial-start coord so it ports the ghost
-        // THERE (safe) instead of the nearest — useless, killer-adjacent — graveyard. Same-map guaranteed
-        // by the arm-time check (racialHome.Map == ctx.MapId). Otherwise the plain graveyard port.
+        // [HEARTH] (FINDING_008) On a hearth-escape, hand C++ the level-band home coord so it ports the
+        // ghost THERE (safe) instead of the nearest — useless, killer-adjacent — graveyard. Same-map
+        // guaranteed by the arm-time check (racialHome.Map == ctx.MapId). Otherwise the plain graveyard
+        // port. (2026-08-09: RacialStart → HomeFor, must match the arm-time site — see the pileup note.)
         BridgeCommand cmd;
         if (m.HearthEscape && ctx.Identity != null)
         {
-            var h = BotIdentity.RacialStart(ctx.Identity.Race);
+            var h = BotIdentity.HomeFor(ctx.Identity.Race, ctx.Identity.Level);
             cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1, home_x = h.X, home_y = h.Y, home_z = h.Z, home_map = h.Map });
         }
         else

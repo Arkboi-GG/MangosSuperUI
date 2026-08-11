@@ -65,6 +65,8 @@ builder.Services.AddSingleton<ComfyUIUpscaler>();
 builder.Services.AddSingleton<VanillaBlpService>();
 builder.Services.AddSingleton<SpellDnaService>();
 builder.Services.AddSingleton<MpqReaderService>();
+builder.Services.AddSingleton<GameObjectModelService>();
+builder.Services.AddSingleton<MinimapTileService>();
 builder.Services.AddSingleton<CharacterModelService>();
 builder.Services.AddSingleton<BodyAtlasTextureService>();
 builder.Services.AddSingleton<CacheVersionRegistry>();

@@ -50,6 +50,12 @@ public partial class DbcService
     public IReadOnlyDictionary<uint, ItemModelDbc> ItemModelInfos { get; private set; }
         = new Dictionary<uint, ItemModelDbc>();
 
+    /// <summary>gameobject displayId → client model path from GameObjectDisplayInfo.dbc
+    /// (e.g. "World\GenericTribal\PassiveDoodads\Banner\TribalBanner01.mdx" or a .wmo).
+    /// Used by GameObjectModelService to generate GLB previews on demand.</summary>
+    public IReadOnlyDictionary<uint, string> GameObjectDisplayModels { get; private set; }
+        = new Dictionary<uint, string>();
+
     /// <summary>All rows of CharSections.dbc (vanilla 1.12 character-creation
     /// texture table). Queried via GetDefaultFaceSection — and future helpers
     /// for skin tones / hair styles. Used by CharacterSkinCompositor to layer
@@ -106,8 +112,8 @@ public partial class DbcService
     public string GetSpellIconPath(uint spellIconId)
     {
         if (SpellIcons.TryGetValue(spellIconId, out var name))
-            return $"/icons/{name}.png";
-        return "/icons/inv_misc_questionmark.png";
+            return $"/Icon/Get?name={name}";
+        return "/Icon/Get?name=inv_misc_questionmark";
     }
 
     /// <summary>Resolve a displayId to its model info (model names + texture names).</summary>
@@ -115,6 +121,14 @@ public partial class DbcService
     {
         if (ItemModelInfos.TryGetValue(displayId, out var info))
             return info;
+        return null;
+    }
+
+    /// <summary>Resolve a gameobject displayId to its client model path, or null.</summary>
+    public string? GetGameObjectModelPath(uint displayId)
+    {
+        if (GameObjectDisplayModels.TryGetValue(displayId, out var path))
+            return path;
         return null;
     }
 
@@ -420,6 +434,7 @@ public partial class DbcService
         {
             ItemDisplayIcons = LoadItemDisplayInfo(Path.Combine(DbcPath, "ItemDisplayInfo.dbc"));
             ItemModelInfos = LoadItemModelInfo(Path.Combine(DbcPath, "ItemDisplayInfo.dbc"));
+            GameObjectDisplayModels = LoadGameObjectDisplayInfo(Path.Combine(DbcPath, "GameObjectDisplayInfo.dbc"));
             SpellIcons = LoadSpellIcon(Path.Combine(DbcPath, "SpellIcon.dbc"));
             SpellDurations = LoadSpellDuration(Path.Combine(DbcPath, "SpellDuration.dbc"));
             SpellCastTimes = LoadSpellCastTimes(Path.Combine(DbcPath, "SpellCastTimes.dbc"));
@@ -529,6 +544,42 @@ public partial class DbcService
 
         LoadedCounts["SpellIcon"] = dict.Count;
         _logger.LogInformation("DbcService: Parsed {Count} SpellIcon entries", dict.Count);
+        return dict;
+    }
+
+    /// <summary>
+    /// GameObjectDisplayInfo.dbc — vanilla 1.12: 12 fields, 48 bytes per record.
+    ///   [0] m_ID        (uint32)  — the gameobject displayId
+    ///   [1] m_modelName (stringref) — client model path, .mdx/.mdl (M2) or .wmo
+    ///   [2..11] m_Sound[10]
+    /// The path is kept verbatim (backslashes, extension included) — the MPQ
+    /// reader and GameObjectModelService handle extension/slash variations.
+    /// </summary>
+    private Dictionary<uint, string> LoadGameObjectDisplayInfo(string filePath)
+    {
+        var dict = new Dictionary<uint, string>();
+        if (!File.Exists(filePath))
+        {
+            _logger.LogWarning("DbcService: File not found: {File}", filePath);
+            LoadedCounts["GameObjectDisplayInfo"] = 0;
+            return dict;
+        }
+
+        var (records, stringBlock, recordSize) = ReadDbcFile(filePath);
+
+        for (int i = 0; i < records.Length / recordSize; i++)
+        {
+            int offset = i * recordSize;
+            uint id = BitConverter.ToUInt32(records, offset);
+            uint nameOffset = BitConverter.ToUInt32(records, offset + 4);
+
+            string modelPath = ReadString(stringBlock, nameOffset);
+            if (!string.IsNullOrEmpty(modelPath))
+                dict[id] = modelPath;
+        }
+
+        LoadedCounts["GameObjectDisplayInfo"] = dict.Count;
+        _logger.LogInformation("DbcService: Parsed {Count} GameObjectDisplayInfo entries", dict.Count);
         return dict;
     }
 

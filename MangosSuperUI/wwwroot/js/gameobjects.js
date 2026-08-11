@@ -715,7 +715,7 @@ $(function () {
             var icons = data.icons || {};
             var h = '';
             data.spells.forEach(function (sp) {
-                var iconPath = icons[sp.spellIconId] || '/icons/inv_misc_questionmark.png';
+                var iconPath = icons[sp.spellIconId] || '/Icon/Get?name=inv_misc_questionmark';
                 var school = SCHOOL_NAMES[sp.school] || '';
                 var rank = sp.nameSubtext || '';
 

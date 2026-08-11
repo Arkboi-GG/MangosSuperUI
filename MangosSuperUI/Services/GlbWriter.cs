@@ -541,7 +541,7 @@ public static class GlbWriter
     /// Convert BLP data to PNG bytes using SkiaSharp (Linux-compatible).
     /// Original extractor used System.Drawing (Windows-only GDI+).
     /// </summary>
-    private static byte[]? ConvertBlpToPngBytes(byte[] blpData)
+    internal static byte[]? ConvertBlpToPngBytes(byte[] blpData)
     {
         try
         {

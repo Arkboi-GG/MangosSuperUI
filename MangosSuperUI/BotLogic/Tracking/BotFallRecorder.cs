@@ -69,6 +69,12 @@ public sealed class BotFallRecorder
     private const int STRAY_MARGIN = 5;          // route/destination mob > botLevel + this = straying into danger
     private const float STRAY_MIN_TRAVEL_YD = 150f;   // must actually be EN ROUTE (a real journey ahead)
     private const double STRAY_COOLDOWN_SEC = 600;    // travel is long — one stray capture per bot per 10 min
+    // Movement gate (FINDING_009): "has a far target" is NOT "is traveling" — stationary bots carry
+    // stale ctx.Targets for minutes (all 5 audited captures were artifacts). Require the same target
+    // held STRAY_SUSTAIN_TICKS consecutive ticks AND the bot to have CLOSED ≥ STRAY_MIN_APPROACH_YD
+    // on it since first seen (ticks are ~0.25–0.5 s; 20 ticks ≈ 5–10 s ≈ 35–70 yd at run speed).
+    private const int STRAY_SUSTAIN_TICKS = 20;
+    private const float STRAY_MIN_APPROACH_YD = 40f;
 
     // Fleet-wide backstop (2026-08-06, FINDING_001): even if a trigger regresses, cap total
     // captures across ALL bots so the recorder can never run away and bury real signal again.
@@ -137,6 +143,13 @@ public sealed class BotFallRecorder
         public DateTime LastOnGroundUtc = DateTime.MinValue;
         public DateTime LastFallCaptureUtc = DateTime.MinValue;
         public DateTime LastStrayCaptureUtc = DateTime.MinValue;
+        // ── Stray movement gate (FINDING_009 method note): all 5 audited stray captures were
+        // artifacts — 3 STATIONARY bots flagged via a stale ctx.Target, 2 transient-target flips.
+        // A stray must be the SAME destination held across ticks AND the bot actually CLOSING
+        // distance on it. Reset whenever the target changes or clears. ──
+        public float StrayTgtX, StrayTgtY;
+        public int StrayTgtTicks;         // consecutive ticks with this same target
+        public float StrayTgtFirstDist;   // DistToTarget when this target was first seen
         public List<Frame>? Capture;   // non-null while recording the AFTER window
         public int TailLeft;
         public string? Kind;           // "fall" | "stray" — picks the output folder + header
@@ -251,8 +264,26 @@ public sealed class BotFallRecorder
             // WRONG-AREA: EN ROUTE toward a DESTINATION cell above the band. The straight-line
             // corridor sampler crosses whole high-level zones on the shared continent (map 0) and
             // is too noisy to trigger on by itself — corridorMax is logged for context only.
+            // Movement gate (FINDING_009): track how long the CURRENT target has been held and how
+            // much distance the bot has closed on it; a stale target on a parked bot never closes.
+            if (ctx.Target is { } stg && stg.Map == ctx.MapId)
+            {
+                float tdx = stg.X - t.StrayTgtX, tdy = stg.Y - t.StrayTgtY;
+                if (t.StrayTgtTicks > 0 && tdx * tdx + tdy * tdy < 4f)   // same dest (±2 yd)
+                    t.StrayTgtTicks++;
+                else
+                {
+                    t.StrayTgtX = stg.X; t.StrayTgtY = stg.Y;
+                    t.StrayTgtTicks = 1;
+                    t.StrayTgtFirstDist = ctx.DistToTarget;
+                }
+            }
+            else t.StrayTgtTicks = 0;
+
             int destLvl = targetLvl ?? 0;
-            bool traveling = ctx.Target is not null && ctx.DistToTarget > STRAY_MIN_TRAVEL_YD;
+            bool traveling = ctx.Target is not null && ctx.DistToTarget > STRAY_MIN_TRAVEL_YD
+                             && t.StrayTgtTicks >= STRAY_SUSTAIN_TICKS
+                             && (t.StrayTgtFirstDist - ctx.DistToTarget) >= STRAY_MIN_APPROACH_YD;
             bool strayed = traveling && destLvl > ctx.Level + STRAY_MARGIN;
 
             if (fell && (DateTime.UtcNow - t.LastFallCaptureUtc).TotalSeconds >= FALL_COOLDOWN_SEC && GlobalRateOk())

@@ -278,6 +278,15 @@ public class BotIdentity
     public DateTime? GrindLockUntil { get; set; }
 
     /// <summary>
+    /// Spacing between grind-lock EARLY-RELEASE attempts (FINDING_003 fix hardening). GoalSelector's
+    /// release check models less than BuildBatch's dispatch gates, so a "workable" quest can insta-fail
+    /// and re-lock — without spacing that loops at tick speed (release⇄re-lock livelock, 2026-08-08).
+    /// Set on each release; the next release attempt waits for this to lapse. Expires by clock.
+    /// Null = no attempt yet / free to release.
+    /// </summary>
+    public DateTime? GrindLockReleaseCooldownUntil { get; set; }
+
+    /// <summary>
     /// Set by the brain's no-progress circuit breaker (BotBrain.TryBreakWedgeAsync) when a bot has made
     /// zero real progress for too long OR is in a fast fail-loop (e.g. relocate MOVE_FAILED no_path at
     /// 1Hz, the off-mesh case). GoalSelector returns Idle while this is in the future so the bot PARKS
@@ -285,6 +294,15 @@ public class BotIdentity
     /// vendor) still preempts. Expires by clock. Null = not parked.
     /// </summary>
     public DateTime? WedgeBackoffUntil { get; set; }
+
+    /// <summary>
+    /// Consecutive wedge-breaker trips with no real kill in between (FINDING_010). The breaker's
+    /// park→local-relocate ladder moves a bot ~50yd; a STRANDED bot (no killable content, no
+    /// dispatchable quest — Everlook L18, Badlands L21) cycles it forever. At the cap the brain
+    /// escalates to a PORT_HOME escape (racial start) instead of another local shuffle. Cleared by
+    /// a real kill (BotContext.OnGrindProgress) and on the escape itself.
+    /// </summary>
+    public int WedgeStreak { get; set; }
 
     /// <summary>
     /// Suppress the Training goal until this UTC time. Set by TrainingPlanner on a give-up
@@ -542,6 +560,39 @@ public class BotIdentity
         8 => (-618.518f, -4251.67f, 38.718f, 1),    // Troll      — Durotar (Kalimdor)
         _ => (0f, 0f, 0f, -1),                       // unknown → no valid home (hearth won't fire)
     };
+
+    /// <summary>
+    /// LEVEL-BANDED home town (FINDING_010 refinement / Northshire-pileup fix, 2026-08-09). Both
+    /// port streams (008 death-hearth + 010 stranded escape) dumped EVERY bot at the L1 racial
+    /// start regardless of level: 97 bots piled at Northshire, whose map-update cost drove the
+    /// core's dynamic visibility to its floor (MapUpdate.MinVisibilityDistance) and "despawned"
+    /// the zone's NPCs for real players. An over-leveled bot at a starter also can't land REAL
+    /// (non-grey) kills, so it re-strands in place. Route by level to a same-map guarded town with
+    /// level-appropriate content in reach: ≤9 racial start, 10–15 first town, 16+ second town.
+    /// All coords are inn/flightpath spots inside guard coverage; Z is approximate (the C++
+    /// PORT_HOME/hearth seam ReGroundZ-snaps same-map ports).
+    /// </summary>
+    public static (float X, float Y, float Z, int Map) HomeFor(int race, int level)
+    {
+        if (level <= 9) return RacialStart(race);
+        bool mid = level <= 15;
+        return race switch
+        {
+            1 => mid ? (-10628.0f, 1036.0f, 33.0f, 0)    // Human   — Sentinel Hill (Westfall)
+                     : (-10559.0f, -1189.0f, 28.0f, 0),  //          Darkshire (Duskwood)
+            3 or 7 => mid ? (-5360.0f, -2953.0f, 323.0f, 0)   // Dwarf/Gnome — Thelsamar (Loch Modan)
+                          : (-3688.0f, -830.0f, 10.0f, 0),    //             Menethil Harbor (Wetlands)
+            4 => mid ? (9821.0f, 959.0f, 1314.0f, 1)     // Night Elf — Dolanaar (Teldrassil)
+                     : (6420.0f, 529.0f, 9.0f, 1),       //            Auberdine (Darkshore)
+            2 or 8 => mid ? (338.0f, -4688.0f, 17.0f, 1)      // Orc/Troll — Razor Hill (Durotar)
+                          : (-472.0f, -2653.0f, 97.0f, 1),    //            The Crossroads (Barrens)
+            5 => mid ? (2247.0f, 252.0f, 34.0f, 0)       // Undead  — Brill (Tirisfal)
+                     : (457.0f, 1548.0f, 132.0f, 0),     //          The Sepulcher (Silverpine)
+            6 => mid ? (-2361.0f, -349.0f, -9.0f, 1)     // Tauren  — Bloodhoof Village (Mulgore)
+                     : (-472.0f, -2653.0f, 97.0f, 1),    //          The Crossroads (Barrens)
+            _ => (0f, 0f, 0f, -1),
+        };
+    }
 
     /// <summary>
     /// Reset death counter (called when bot picks a new quest or changes activity).

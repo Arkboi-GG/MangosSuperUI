@@ -261,7 +261,7 @@
             var h = '';
             rows.forEach(function (r) {
                 h += '<div class="lf-search-item' + (r.lootified ? ' done' : '') + '" data-entry="' + r.entry + '">' +
-                    '<img src="' + esc(r.iconPath || '/icons/inv_misc_questionmark.png') + '" />' +
+                    '<img src="' + esc(r.iconPath || '/Icon/Get?name=inv_misc_questionmark') + '" />' +
                     '<span class="quality-' + r.quality + '">' + esc(r.name) + '</span>' +
                     '<span class="text-muted" style="margin-left:auto;">#' + r.entry + (r.lootified ? ' \u2713' : '') + '</span>' +
                     '</div>';
@@ -455,7 +455,7 @@
             var h = '';
             res.recipes.forEach(function (r) {
                 h += '<div class="lf-recipe-row' + (r.equippable ? '' : ' skip') + '">' +
-                    '<img src="' + esc(r.iconPath || '/icons/inv_misc_questionmark.png') + '" />' +
+                    '<img src="' + esc(r.iconPath || '/Icon/Get?name=inv_misc_questionmark') + '" />' +
                     '<span class="quality-' + r.quality + '">' + esc(r.name) + '</span>' +
                     '<span class="text-muted">#' + r.entry + ' \u00b7 ilvl ' + r.itemLevel + '</span>' +
                     (r.equippable ? '' : '<span class="lf-skip-tag">not equippable</span>') +
@@ -524,7 +524,7 @@
             res.items.forEach(function (it) {
                 h += '<div class="lf-item-block" data-base="' + it.baseEntry + '">' +
                     '<div class="d-flex align-items-center gap-1" style="cursor:pointer;" data-toggle-base="' + it.baseEntry + '">' +
-                    '<img src="' + esc(it.iconPath || '/icons/inv_misc_questionmark.png') + '" style="width:22px;height:22px;border-radius:3px;" />' +
+                    '<img src="' + esc(it.iconPath || '/Icon/Get?name=inv_misc_questionmark') + '" style="width:22px;height:22px;border-radius:3px;" />' +
                     '<span class="quality-' + it.quality + '">' + esc(it.name) + '</span>' +
                     '<span class="text-muted">#' + it.baseEntry + ' · ' + it.variantCount + ' variants</span>' +
                     '<span class="rm" data-rollback-base="' + it.baseEntry + '" style="margin-left:auto;cursor:pointer;color:var(--status-warning);"><i class="fa-solid fa-trash-can"></i></span>' +

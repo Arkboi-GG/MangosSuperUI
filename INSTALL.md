@@ -736,35 +736,22 @@ These paths are only needed if you use the Spell Creator or 3D World Viewer feat
 
 ---
 
-### Step 16: Asset Directories
+### Step 16: Game Assets — Served On Demand from the Client MPQs
 
-MangosSuperUI serves four types of static assets from its `wwwroot/` directory. These are extracted from the WoW 1.12.1 client and are used by the content browser and world map pages.
+MangosSuperUI does **not** require any pre-extracted assets. Icons, 3D models (items, game objects), and minimap tiles are all read directly from the WoW 1.12.1 client's MPQ archives at request time:
 
-| Directory | Contents | Used By | Approximate Count |
-|-----------|----------|---------|-------------------|
-| `wwwroot/icons/` | Item and spell icon PNGs (e.g. `inv_sword_04.png`) | Items, Spells, Lootifier, Instance Loot pages | ~2,684 files |
-| `wwwroot/models/` | Game object 3D models in GLB format | Game Objects page (3D model viewer) | ~1,070 files |
-| `wwwroot/item_models/` | Item 3D models in GLB format (e.g. `23904.glb`) | Items page (3D model viewer) | Varies |
-| `wwwroot/minimap/{MapName}/` | Minimap tile PNGs (e.g. `Azeroth/map29_28.png`) | World Map page (Leaflet tile layer) | Varies by map |
+| Asset | Source | Served Via |
+|-------|--------|-----------|
+| Item & spell icons | `Interface\Icons\*.blp` in the MPQs | `/Icon/Get` (decoded to PNG in memory) |
+| Item 3D models | M2 + BLP from the MPQs | Generated GLB, cached in `wwwroot/item_models/` |
+| Game object 3D models | M2/WMO + BLP from the MPQs | Generated GLB, cached in `wwwroot/models/` |
+| Minimap tiles | `textures\Minimap\` in the MPQs | `/WorldMap/Tile` (decoded PNG, cached in `wwwroot/minimap/`) |
 
-#### Where do these files come from?
+The only requirement is **Vmangos:ClientDataPath** pointing at the client's `Data/` directory (see Part 3). The `wwwroot` caches are created and version-swept automatically — never populate them by hand.
 
-These assets are extracted from the WoW 1.12.1 client's MPQ archives using the **MangosSuperUI Extractor** — a Windows tool included with the project. See Part 3 below for extraction and deployment instructions.
+#### What works without the client data?
 
-https://github.com/Yafrovon/MangosSuperUI_Extractor
-
-#### Filename casing
-
-The MangosSuperUI Extractor handles all filename casing automatically — icon filenames are output in lowercase, and minimap folder names preserve the original WoW map casing (e.g. `Azeroth/`, `Kalimdor/`). No manual renaming is needed after extraction.
-
-#### What works without assets?
-
-MangosSuperUI is fully functional without these asset directories — you just won't see:
-- Icon images on the Items, Spells, and Lootifier pages (items/spells still display, just with placeholder icons)
-- 3D model previews on the Game Objects or Items pages
-- The minimap tile layer on the World Map page (placement and spawn overlay still work with a blank canvas)
-
-All database operations, RA commands, server management, loot editing, and every other feature works regardless of whether assets are present.
+MangosSuperUI is fully functional without a configured client Data directory — you just won't see icons, 3D previews, or minimap imagery. All database operations, RA commands, server management, loot editing, and every other feature works regardless. The Dashboard diagnostics will tell you exactly what's missing.
 
 ---
 
@@ -832,81 +819,30 @@ If all indicators are green, your MangosSuperUI installation is complete.
 
 ---
 
-## Part 3: Asset Extraction
+## Part 3: Client Game Data (No Extraction Needed)
 
-The MangosSuperUI Extractor is a Windows tool that reads the WoW 1.12.1 client's MPQ archives and outputs the icons, 3D models, and minimap tiles that MangosSuperUI uses for its content browser and world map pages.
+MangosSuperUI reads all game assets — icons, 3D models, and minimap tiles — **directly from the WoW 1.12.1 client's MPQ archives, on demand**. There is no extraction step and no asset sync. The standalone MangosSuperUI Extractor tool is retired.
 
----
+### Step 18: Point MangosSuperUI at the Client Data Directory
 
-### Requirements
+1. Place a complete WoW 1.12.1 client on the server (or make its `Data/` directory reachable from the server).
+2. In **Settings → Client Data Path**, set the path to the client's `Data/` directory (the folder containing the `*.MPQ` archives), e.g. `/home/YOU/wowclient/Data`.
+3. Restart MangosSuperUI.
 
-- **Windows PC** with the MangosSuperUI Extractor installed
-- **WoW 1.12.1 client** — the extractor reads from the `Data/` directory containing the MPQ archives
+### Step 19: Verify
 
----
+Open the **Dashboard → Diagnostics** panel:
 
-### Step 18: Run the Extractor
-
-1. Open the MangosSuperUI Extractor on your Windows machine.
-2. Point it at your WoW 1.12.1 client's `Data/` directory.
-3. Run the extraction. It will scan the MPQ archives and output assets into folders on your desktop (or configured output location).
-
-The extractor produces these output folders:
-
-| Output Folder | Contents | MangosSuperUI Location |
-|---------------|----------|----------------------|
-| `icons/` | Item and spell icon PNGs | `wwwroot/icons/` |
-| `models/` | Game object 3D models (GLB) | `wwwroot/models/` |
-| `item_models/` | Item 3D models by displayId (GLB) | `wwwroot/item_models/` |
-| `minimap/` | Minimap tile PNGs organized by map name | `wwwroot/minimap/` |
-
-> The extractor also outputs additional folders (`manifests/`, `worldmaps/`, `dbc/`, `creature_textures/`, `item_textures/`) — these are not needed by MangosSuperUI and can be ignored.
-
----
-
-### Step 19: Copy Assets to the Server
-
-Copy the contents of each extraction folder into the corresponding `wwwroot/` directory on your MangosSuperUI server.
-
-**Create the directories on the server:**
-```bash
-mkdir -p /opt/mangossuperui/wwwroot/icons
-mkdir -p /opt/mangossuperui/wwwroot/models
-mkdir -p /opt/mangossuperui/wwwroot/item_models
-mkdir -p /opt/mangossuperui/wwwroot/minimap
-```
-
-**From Windows PowerShell, SCP each folder:**
-```powershell
-scp -r "C:\path\to\extracted\icons\*" YOUR_USERNAME@YOUR_SERVER_IP:/opt/mangossuperui/wwwroot/icons/
-scp -r "C:\path\to\extracted\models\*" YOUR_USERNAME@YOUR_SERVER_IP:/opt/mangossuperui/wwwroot/models/
-scp -r "C:\path\to\extracted\item_models\*" YOUR_USERNAME@YOUR_SERVER_IP:/opt/mangossuperui/wwwroot/item_models/
-scp -r "C:\path\to\extracted\minimap\*" YOUR_USERNAME@YOUR_SERVER_IP:/opt/mangossuperui/wwwroot/minimap/
-```
-
-> Replace `C:\path\to\extracted\` with the actual path where the extractor saved its output.
-
----
-
-### Step 20: Verify Assets
-
-**Check file counts:**
-```bash
-echo "Icons: $(ls /opt/mangossuperui/wwwroot/icons/*.png 2>/dev/null | wc -l)"
-echo "GO Models: $(ls /opt/mangossuperui/wwwroot/models/*.glb 2>/dev/null | wc -l)"
-echo "Item Models: $(ls /opt/mangossuperui/wwwroot/item_models/*.glb 2>/dev/null | wc -l)"
-echo "Minimap maps: $(ls -d /opt/mangossuperui/wwwroot/minimap/*/ 2>/dev/null | wc -l)"
-```
-
-Expected approximate counts: ~2,684 icons, ~1,070 GO models, item models vary, and several minimap map directories (Azeroth, Kalimdor, plus dungeon/raid maps).
+- **Client Data Path (MPQ)** — should be green and report the number of mounted archives.
+- **Icon Loader (on-demand)** — should be green (the server test-decodes an icon straight from the MPQs).
 
 **Spot-check in the browser:**
 - **Icons:** Open the Items page, search for any item — icons should appear next to item names.
-- **Game Object models:** Open the Game Objects page, click any object — 3D model viewer should load.
-- **Item models:** Open the Items page, click an item with a weapon/armor model — 3D model viewer should load.
-- **Minimap:** Open the World Map page — tile imagery should render on the map.
+- **Game Object models:** Open the Game Objects page, click any object — the 3D model generates on first view.
+- **Item models:** Open the Items page, click an item with a weapon/armor model — same.
+- **Minimap:** Open the World Map page — tiles decode from the MPQs as the map loads.
 
-No restart of MangosSuperUI is needed. Static files are served immediately.
+Generated models and tiles are cached under `wwwroot/` after first request, so repeat views are instant. The caches are versioned and swept automatically — you never need to manage them.
 
 ---
 

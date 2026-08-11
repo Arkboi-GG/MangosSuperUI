@@ -30,6 +30,15 @@ public sealed class GoalSelector
     // kills well inside this, so its LastKillUtc stays fresh and it is never released.
     private const double UnproductiveGrindLockSec = 240;   // 4 min with zero real kills = the lock isn't working
 
+    // [GRIND-LOCK RELEASE] retry spacing. The release check (IsPickable + InReach) models LESS than
+    // what BuildBatch needs to actually dispatch (path-safety, objective rails, giver resolution…), so
+    // a quest can read "workable" forever while the batch instantly exhausts and re-locks. Without
+    // spacing, that closes a release⇄re-lock livelock at tick speed — and each re-entry fires a
+    // SET_TASK whose ack MarkProgress()es, so the wedge breaker never sees it (observed 2026-08-08:
+    // ~68k releases/20min fleet-wide, dozens of bots at ~1.3Hz). One attempt per window; a release
+    // that leads to REAL questing clears the lock and never comes back here.
+    private const double GrindLockReleaseRetrySec = 300;   // one early-release attempt per 5 min per bot
+
     // Crater this and the bot breaks for a vendor (mirrors MaintenancePlanner's gate).
     private const int DurabilityVendorThreshold = 30;
 
@@ -236,6 +245,7 @@ public sealed class GoalSelector
             var glId = ctx.Identity;
             bool released = false;
             if (glId != null && _quests.IsLoaded
+                && !(glId.GrindLockReleaseCooldownUntil is DateTime glrc && DateTime.UtcNow < glrc)
                 && (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds > UnproductiveGrindLockSec)
             {
                 glId.PruneExpiredDeferrals();
@@ -249,6 +259,7 @@ public sealed class GoalSelector
                         ZoneSafetyMap.GetMaxTravelDistance(glId.Level, ctx.ZoneId, glTier))))
                 {
                     glId.GrindLockUntil = null;
+                    glId.GrindLockReleaseCooldownUntil = DateTime.UtcNow.AddSeconds(GrindLockReleaseRetrySec);
                     _log.LogInformation("[GOAL] {Name} grind-lock released early — unproductive ({S:F0}s no kill) and a quest is workable again (reach t{T})",
                         ctx.Name, (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds, glTier);
                     released = true;

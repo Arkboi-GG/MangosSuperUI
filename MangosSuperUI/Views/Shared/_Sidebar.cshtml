@@ -14,7 +14,7 @@
     {
         "home" or "console" or "players" or "accounts" or "realm" => "operations",
         "activity" or "serverlogs" or "livelogs" or "config" or "backup" => "server",
-        "spells" or "patch" => "spells",
+        "spells" or "patch" or "spellcompleter" => "spells",
         "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" or "professiontuning" => "content",
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
@@ -264,6 +264,12 @@
                     <a asp-controller="Patch" asp-action="VisualLab" class="@(currentController.Equals("Patch", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("VisualLab", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
                         <i class="fa-solid fa-cube"></i>
                         Spell Visualizer
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="spellcompleter">
+                    <a asp-controller="SpellCompleter" asp-action="Index" class="@NavClass("SpellCompleter")">
+                        <i class="fa-solid fa-flag-checkered"></i>
+                        Spell Completer
                     </a>
                 </li>
             </ul>

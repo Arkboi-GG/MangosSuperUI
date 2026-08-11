@@ -332,7 +332,11 @@ public partial class PatchController : Controller
             }
             else
             {
-                // Auto from source: copy the source spell's skill_line_ability row
+                // Auto from source: copy the source spell's skill_line_ability row.
+                // MUST allocate `id` — the PK has no default/auto-increment, so an
+                // id-less INSERT IGNORE silently no-ops and the rebuild writes a
+                // dead skill=0 SLA row the client cannot categorize (spell then
+                // vanishes from trainer lists while the server still offers it).
                 try
                 {
                     using var slaConn = _spellCreator.CreateMangosConnection();
@@ -342,12 +346,16 @@ public partial class PatchController : Controller
                         new { E = req.SourceSpellEntry });
                     if (sourceSla != null && (int)(sourceSla.skill_id ?? 0) > 0)
                     {
+                        int nextSlaId = await Dapper.SqlMapper.ExecuteScalarAsync<int>(slaConn,
+                            "SELECT COALESCE(MAX(id), 0) + 1 FROM skill_line_ability");
                         await Dapper.SqlMapper.ExecuteAsync(slaConn,
                             @"INSERT IGNORE INTO skill_line_ability
-                              (spell_id, skill_id, class_mask, superseded_by_spell, learn_on_get_skill, build)
-                              VALUES (@SpellId, @SkillId, @ClassMask, 0, 2, 5875)",
+                              (id, build, skill_id, spell_id, race_mask, class_mask, req_skill_value,
+                               superseded_by_spell, learn_on_get_skill, max_value, min_value, req_train_points)
+                              VALUES (@Id, 5875, @SkillId, @SpellId, 0, @ClassMask, 1, 0, 2, 0, 0, 0)",
                             new
                             {
+                                Id = nextSlaId,
                                 SpellId = newEntry,
                                 SkillId = (int)sourceSla.skill_id,
                                 ClassMask = (int)(sourceSla.class_mask ?? 0)
@@ -1991,13 +1999,26 @@ public partial class PatchController : Controller
                 globalParams = BuildParticleParams(config.ColorPreset, 1.0f);
             }
 
-            // Look up skill_line_ability for R1 to get SkillId and ClassMask for DBC patching
+            // Look up skill_line_ability for R1 to get SkillId and ClassMask for DBC patching.
+            // Fallback: the SOURCE spell's row. A skill=0 SLA row in the client DBC is
+            // worse than useless — the trainer UI cannot categorize the entry and drops
+            // it silently — so the patch must never be built from a missing custom row.
             int slaSkillId = 0, slaClassMask = 0;
             try
             {
                 var slaRow = await conn.QueryFirstOrDefaultAsync<dynamic>(
                     "SELECT skill_id, class_mask FROM skill_line_ability WHERE spell_id = @E AND build = 5875 LIMIT 1",
                     new { E = config.Entry });
+                if (slaRow == null || Convert.ToInt32(slaRow.skill_id ?? 0) == 0)
+                {
+                    slaRow = await conn.QueryFirstOrDefaultAsync<dynamic>(
+                        "SELECT skill_id, class_mask FROM skill_line_ability WHERE spell_id = @E AND build = 5875 LIMIT 1",
+                        new { E = config.SourceEntry });
+                    if (slaRow != null)
+                        _logger.LogInformation(
+                            "Patch: #{Entry} has no usable skill_line_ability row — inheriting source #{Src}'s skill line",
+                            config.Entry, config.SourceEntry);
+                }
                 if (slaRow != null)
                 {
                     slaSkillId = Convert.ToInt32(slaRow.skill_id ?? 0);
@@ -2008,12 +2029,48 @@ public partial class PatchController : Controller
 
             // Session 45: Load R1 gameplay overrides from spell_template for DBC patching.
             // Without this, R1's DBC row clones the source and keeps source mana/damage/level.
+            // Spell Completer: SELECT * so the effect-structure columns (DoT/slow/heal,
+            // duration, amplitude, misc) ride along and get mirrored into the DBC too.
             var r1Fields = await conn.QueryFirstOrDefaultAsync<dynamic>(
-                @"SELECT manaCost, effectBasePoints1, effectDieSides1, effectBasePoints2,
-                         spellLevel, baseLevel, castingTimeIndex, rangeIndex,
-                         effectRealPointsPerLevel1, effectBonusCoefficient1, speed, recoveryTime
-                  FROM spell_template WHERE entry = @E ORDER BY build DESC LIMIT 1",
+                @"SELECT * FROM spell_template WHERE entry = @E ORDER BY build DESC LIMIT 1",
                 new { E = config.Entry });
+
+            // The server's spell_template is authoritative for mechanics; mirror
+            // every effect slot + duration into the client DBC so tooltips and
+            // aura display always match what the server actually runs.
+            int? r1DurationIndex = null;
+            List<EffectStructurePatch>? r1Effects = null;
+            if (r1Fields != null)
+            {
+                var r1Dict = (IDictionary<string, object>)r1Fields;
+                int Col(string name) => r1Dict.TryGetValue(name, out var v) && v != null ? Convert.ToInt32(v) : 0;
+                r1DurationIndex = Col("durationIndex");
+                r1Effects = new List<EffectStructurePatch>();
+                for (int slot = 0; slot < 3; slot++)
+                {
+                    int i = slot + 1;
+                    r1Effects.Add(new EffectStructurePatch
+                    {
+                        Slot = slot,
+                        Effect = Col($"effect{i}"),
+                        AuraName = Col($"effectApplyAuraName{i}"),
+                        BasePoints = Col($"effectBasePoints{i}"),
+                        DieSides = Col($"effectDieSides{i}"),
+                        Amplitude = Col($"effectAmplitude{i}"),
+                        MiscValue = Col($"effectMiscValue{i}"),
+                    });
+                }
+            }
+
+            // Spell Completer: IconSource "source" keeps the inherited spell's
+            // vanilla icon instead of the school fallback.
+            uint? sourceIconId = null;
+            if (string.Equals(config.IconSource, "source", StringComparison.OrdinalIgnoreCase) &&
+                _dbc.SpellEntries.TryGetValue((uint)config.SourceEntry, out var sourceDbcEntry) &&
+                sourceDbcEntry.SpellIconId > 0)
+            {
+                sourceIconId = sourceDbcEntry.SpellIconId;
+            }
 
             requests.Add(new SpellPatchRequest
             {
@@ -2030,11 +2087,13 @@ public partial class PatchController : Controller
                     (int)(await conn.ExecuteScalarAsync<uint?>(
                         "SELECT school FROM spell_template WHERE entry = @E ORDER BY build DESC LIMIT 1",
                         new { E = config.Entry }) ?? 0)),
-                SpellIconId = GetSchoolIconId(
+                SpellIconId = sourceIconId ?? GetSchoolIconId(
                     (int)(await conn.ExecuteScalarAsync<uint?>(
                         "SELECT school FROM spell_template WHERE entry = @E ORDER BY build DESC LIMIT 1",
                         new { E = config.Entry }) ?? 2)),
                 IconPngPath = config.IconPath,
+                DurationIndex = r1DurationIndex,
+                EffectStructure = r1Effects,
                 ParticleParams = globalParams,
                 PerRoleParams = perRoleParams,
                 // Session 14/15: blend mode + emitter type + texture cache
@@ -2043,6 +2102,10 @@ public partial class PatchController : Controller
                 PerPhaseTextures = LoadCachedTextures(config.Entry, config.SpellName),
                 // Session 30: load pre-patched M2s from experiment lab / tuning system
                 PerPhasePatchedM2s = LoadPatchedM2s(config.Entry, config.SpellName),
+                // Spell Completer: per-path patched M2s + verbatim files (tinted
+                // BLPs, geometry M2s) persisted from an MSUIClient design session
+                PerPathPatchedM2s = CompleterStore.LoadPerPathM2s(_env.WebRootPath, config.SpellName),
+                ExtraMpqFiles = CompleterStore.LoadExtraFiles(_env.WebRootPath, config.SpellName),
                 // Session 45: R1 gameplay fields for DBC accuracy
                 ManaCost = r1Fields != null ? (int?)Convert.ToInt32(r1Fields.manaCost ?? 0) : null,
                 EffectBasePoints0 = r1Fields != null ? (int?)Convert.ToInt32(r1Fields.effectBasePoints1 ?? 0) : null,
@@ -2084,6 +2147,12 @@ public partial class PatchController : Controller
                         BaseLevel = r.BaseLevel,
                         CastingTimeIndex = r.CastingTimeIndex,
                         EffectRealPointsPerLevel0 = r.EffectRealPointsPerLevel1,
+                        // Spell Completer: full mechanics mirror per rank — the
+                        // rank's spell_template row is what the server runs, so
+                        // its tooltip data must match it exactly.
+                        DurationIndex = r.DurationIndex,
+                        RangeIndex = r.RangeIndex,
+                        EffectStructure = r.Effects,
                     }).ToList();
 
                     _logger.LogInformation("Patch: Attached {Count} rank entries to spell #{E} ({Name})",

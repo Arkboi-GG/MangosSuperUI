@@ -34,7 +34,7 @@ I'm open-sourcing it because if I wanted this, other people running VMaNGOS — 
 
 This project is not affiliated with or endorsed by Blizzard Entertainment.
 World of Warcraft® is a registered trademark of Blizzard Entertainment, Inc.
-MangosSuperUI does not distribute any Blizzard assets — icons, models, and minimap tiles are extracted from your own WoW 1.12.1 client using the included [Extractor tool](https://github.com/Yafrovon/MangosSuperUI_Extractor).
+MangosSuperUI does not distribute any Blizzard assets — icons, 3D models, and minimap tiles are read on demand from your own WoW 1.12.1 client's MPQ archives (set the Client Data Path in Settings). No extraction step is required.
 MangosSuperUI is a tooling and interoperability framework intended for educational, research, archival, and private emulator development purposes.
 
 ---
@@ -357,7 +357,7 @@ If any single feature hits a wall beyond ~50 hours, I skip it and move on. Stead
 | World Map        | Leaflet.js with custom tile layers                                                                         |
 | AI Inference     | Ollama (LLM chat/prompts), ComfyUI/FLUX (icons/textures)                                                   |
 | MPQ / BLP / DBC  | Managed C# MPQ v1 reader/writer + BLP decoder (replacing native StormLib / War3Net), custom binary parsers |
-| Asset Extraction | [MangosSuperUI Extractor](https://github.com/Yafrovon/MangosSuperUI_Extractor) (WinForms)                  |
+| Game Assets      | Decoded on demand from the client MPQs (icons, M2/WMO → GLB models, minimap tiles) — no extraction step    |
 
 ---
 

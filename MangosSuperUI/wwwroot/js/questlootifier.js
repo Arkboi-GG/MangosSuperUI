@@ -338,7 +338,7 @@
 
         var h = '';
         rewardItems.forEach(function (it) {
-            var icon = iconMap[it.displayId] || '/icons/inv_misc_questionmark.png';
+            var icon = iconMap[it.displayId] || '/Icon/Get?name=inv_misc_questionmark';
             var checked = selectedItems[it.entry] ? 'checked' : '';
             var disabled = it.eligible ? '' : 'disabled';
             h += '<div class="ql-reward-wrap" data-entry="' + it.entry + '">' +
@@ -471,7 +471,7 @@
         }
         var h = '';
         items.forEach(function (it) {
-            var icon = it.baseItem.iconPath || '/icons/inv_misc_questionmark.png';
+            var icon = it.baseItem.iconPath || '/Icon/Get?name=inv_misc_questionmark';
             var baseQ = it.baseItem.quality;
             h += '<div class="ql-variant-block">' +
                 '<div class="ql-variant-head"><img src="' + esc(icon) + '" /> ' +
@@ -911,7 +911,7 @@
 
         var h = '';
         items.forEach(function (it) {
-            var icon = icons[it.displayId] || '/icons/inv_misc_questionmark.png';
+            var icon = icons[it.displayId] || '/Icon/Get?name=inv_misc_questionmark';
             h += '<div class="ql-browse-wrap">' +
                 '<div class="ql-browse-row" data-entry="' + it.baseEntry + '">' +
                 '<img src="' + esc(icon) + '" />' +

@@ -717,7 +717,7 @@ public partial class PatchController
         if (p.key == null) return BadRequest("bad preset");
 
         string mapName = p.mapId switch { 0 => "Azeroth", 1 => "Kalimdor", _ => $"Map{p.mapId}" };
-        string minimapUrl = $"/minimap/{mapName}/map{p.gridY:D2}_{p.gridX:D2}.png";
+        string minimapUrl = $"/WorldMap/Tile?map={mapName}&row={p.gridY}&col={p.gridX}";
 
         var html = new System.Text.StringBuilder();
         html.AppendLine("<!DOCTYPE html><html><head><meta charset='utf-8'><style>");
