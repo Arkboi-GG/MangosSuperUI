@@ -31,6 +31,7 @@ public class SpellCompleterController : Controller
     private readonly SpellCreatorService _spellCreator;
     private readonly SpellConfigService _spellConfig;
     private readonly DbcService _dbc;
+    private readonly AuditService _audit;
     private readonly IWebHostEnvironment _env;
     private readonly IConfiguration _config;
     private readonly ILogger<SpellCompleterController> _logger;
@@ -42,6 +43,7 @@ public class SpellCompleterController : Controller
         SpellCreatorService spellCreator,
         SpellConfigService spellConfig,
         DbcService dbc,
+        AuditService audit,
         IWebHostEnvironment env,
         IConfiguration config,
         RaService ra,
@@ -51,6 +53,7 @@ public class SpellCompleterController : Controller
         _spellCreator = spellCreator;
         _spellConfig = spellConfig;
         _dbc = dbc;
+        _audit = audit;
         _env = env;
         _config = config;
         _ra = ra;
@@ -383,6 +386,20 @@ public class SpellCompleterController : Controller
 
         string ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
 
+        // Every step below that can fail WITHOUT aborting the completion appends here.
+        // A spell that lost its skill_line_ability, spell_chain or trainer rows still
+        // returns success but is invisible in game, so these have to reach the audit
+        // trail rather than dying in the log file.
+        var warnings = new List<string>();
+
+        // One batch for the whole completion. SpellCreatorService writes a spell_clone row
+        // per rank without knowing anything about batching — the ambient scope stamps them
+        // all with the same batch_id, so the Change Graph shows one Completer run instead
+        // of N unrelated spells appearing out of nowhere.
+        using var batch = AuditBatch.Begin(
+            $"Spell Completer — {req.SpellName}" +
+            (string.IsNullOrWhiteSpace(req.TempName) ? "" : $" ({req.TempName})"));
+
         try
         {
             // ── 1: spell_template clone with the user's data-phase values ──
@@ -443,7 +460,11 @@ public class SpellCompleterController : Controller
 
             int newEntry = await _spellCreator.CloneSpellAsync(req.SourceSpellEntry, overrides, ip);
             if (newEntry < 0)
+            {
+                await LogCompletionAsync(req, ip, 0, null, 0, 0, null, warnings,
+                    success: false, error: "spell_template clone produced no row");
                 return Json(new { success = false, error = "Failed to create spell in database." });
+            }
 
             // ── 2: spellbook tab + rank chain root ──
             if (!string.IsNullOrEmpty(req.SkillTabKey))
@@ -455,6 +476,7 @@ public class SpellCompleterController : Controller
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Completer: skill_line_ability insert failed for #{Entry}", newEntry);
+                    warnings.Add($"skill_line_ability insert failed for tab '{req.SkillTabKey}' — the spell will not appear in the spellbook or at trainers ({ex.Message})");
                 }
             }
             else
@@ -486,6 +508,7 @@ public class SpellCompleterController : Controller
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Completer: school-tab match probe failed for #{Entry}", newEntry);
+                    warnings.Add($"school-tab match probe failed — fell back to inheriting the source spell's tab ({ex.Message})");
                 }
 
                 if (schoolTabKey is not null)
@@ -509,6 +532,7 @@ public class SpellCompleterController : Controller
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "Completer: school-tab insert failed for #{Entry}", newEntry);
+                        warnings.Add($"school-tab insert failed for '{schoolTabKey}' — fell through to inheriting the source spell's tab ({ex.Message})");
                         schoolTabKey = null;   // fall through to source inherit
                     }
                 }
@@ -547,18 +571,23 @@ public class SpellCompleterController : Controller
                                 ClassMask = (int)(sourceSla.class_mask ?? 0),
                             });
                         if (affected == 0)
+                        {
                             _logger.LogWarning("Completer: SLA inherit insert ignored for #{Entry} (id {Id})",
                                 newEntry, nextId);
+                            warnings.Add($"skill_line_ability inherit insert was ignored (id {nextId} collided) — the spell may not be categorizable by the client");
+                        }
                     }
                     else
                     {
                         _logger.LogWarning("Completer: source #{Src} has no skill_line_ability row to " +
                             "inherit — #{Entry} will rely on the rebuild's source fallback", req.SourceSpellEntry, newEntry);
+                        warnings.Add($"source #{req.SourceSpellEntry} has no skill_line_ability row to inherit — relying on the rebuild's source fallback");
                     }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Completer: SLA auto-copy failed for #{Entry}", newEntry);
+                    warnings.Add($"skill_line_ability auto-copy failed — the spell will not appear in the spellbook or at trainers ({ex.Message})");
                 }
                 }
             }
@@ -570,6 +599,7 @@ public class SpellCompleterController : Controller
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Completer: spell_chain insert failed for #{Entry}", newEntry);
+                warnings.Add($"spell_chain insert failed — rank progression will not work ({ex.Message})");
             }
 
             // ── 2b: register Rank 1 at trainers ──
@@ -629,11 +659,13 @@ public class SpellCompleterController : Controller
                     {
                         _logger.LogWarning("Completer: source #{Src} has no trainer entries and no " +
                             "skill tab was chosen — R1 #{New} is not at any trainer", req.SourceSpellEntry, newEntry);
+                        warnings.Add($"source #{req.SourceSpellEntry} has no trainer entries and no skill tab was chosen — rank 1 is not available at any trainer");
                     }
                 }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Completer: trainer registration failed for R1 #{Entry}", newEntry);
+                    warnings.Add($"trainer registration failed for rank 1 — players cannot learn the spell ({ex.Message})");
                 }
             }
 
@@ -699,6 +731,7 @@ public class SpellCompleterController : Controller
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Completer: rank chain generation failed for #{Entry}", newEntry);
+                    warnings.Add($"rank chain generation failed — only rank 1 exists ({ex.Message})");
                 }
             }
 
@@ -710,7 +743,15 @@ public class SpellCompleterController : Controller
                 if (string.IsNullOrEmpty(model.M2Base64) || string.IsNullOrEmpty(model.Path)) continue;
                 byte[] bytes;
                 try { bytes = Convert.FromBase64String(model.M2Base64); }
-                catch { return Json(new { success = false, error = $"Bad m2Base64 for {model.Path}" }); }
+                catch
+                {
+                    // The spell rows already exist at this point — bailing here leaves a
+                    // spell in the database with no design bytes behind it, so the audit
+                    // entry has to record the orphan rather than the request just 400-ing.
+                    await LogCompletionAsync(req, ip, newEntry, ranks, 0, 0, null, warnings,
+                        success: false, error: $"Bad m2Base64 for {model.Path} — spell rows were already created and are now orphaned");
+                    return Json(new { success = false, error = $"Bad m2Base64 for {model.Path}" });
+                }
 
                 // Geometry models (per-particle M2s) are referenced from INSIDE the
                 // host model's bytes — their path cannot be re-pointed at a clone,
@@ -725,7 +766,12 @@ public class SpellCompleterController : Controller
                 if (string.IsNullOrEmpty(blp.BlpBase64) || string.IsNullOrEmpty(blp.Path)) continue;
                 byte[] bytes;
                 try { bytes = Convert.FromBase64String(blp.BlpBase64); }
-                catch { return Json(new { success = false, error = $"Bad blpBase64 for {blp.Path}" }); }
+                catch
+                {
+                    await LogCompletionAsync(req, ip, newEntry, ranks, pathM2s.Count, 0, null, warnings,
+                        success: false, error: $"Bad blpBase64 for {blp.Path} — spell rows were already created and are now orphaned");
+                    return Json(new { success = false, error = $"Bad blpBase64 for {blp.Path}" });
+                }
                 extraFiles.Add((blp.Path, bytes));
             }
 
@@ -759,6 +805,7 @@ public class SpellCompleterController : Controller
                 else
                 {
                     _logger.LogWarning("Completer: rejected icon path outside custom dir: {Path}", req.IconPath);
+                    warnings.Add($"custom icon '{req.IconPath}' was rejected (outside the custom icon directory) — fell back to the school icon");
                 }
             }
             else if (req.IconSource == "source")
@@ -781,6 +828,9 @@ public class SpellCompleterController : Controller
                 "Completer: '{Temp}' -> #{Entry} {Name} ({M2s} per-path M2(s), {Extra} extra file(s), {Ranks} rank(s))",
                 req.TempName, newEntry, req.SpellName, pathM2s.Count, extraFiles.Count, ranks?.Count ?? 1);
 
+            await LogCompletionAsync(req, ip, newEntry, ranks, pathM2s.Count, extraFiles.Count,
+                iconSource, warnings, success: true);
+
             return Json(new
             {
                 success = true,
@@ -788,13 +838,88 @@ public class SpellCompleterController : Controller
                 ranksGenerated = ranks?.Count ?? 0,
                 m2Count = pathM2s.Count,
                 extraFileCount = extraFiles.Count,
+                warnings,
             });
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Completer: failed to complete spell '{Name}'", req.SpellName);
+            await LogCompletionAsync(req, ip, 0, null, 0, 0, null, warnings,
+                success: false, error: ex.Message);
             return Json(new { success = false, error = ex.Message });
         }
+    }
+
+    /// <summary>
+    /// One audit row per completion attempt — the batch header that ties together the
+    /// individual spell_clone rows SpellCreatorService writes for rank 1 and every
+    /// generated rank. Those rows say "a spell appeared"; this one says which Completer
+    /// run produced them, from which session, and what it took to get there.
+    ///
+    /// Warnings ride on the entry itself. A completion that lost its skill_line_ability
+    /// or trainer rows still returns success, but the spell is invisible in game — the
+    /// audit trail is where that has to be visible instead of only in the log file.
+    /// </summary>
+    private async Task LogCompletionAsync(
+        CompleteSpellRequest req,
+        string ip,
+        int entry,
+        List<(int rank, int entry)>? ranks,
+        int m2Count,
+        int extraFileCount,
+        string? iconSource,
+        List<string> warnings,
+        bool success,
+        string? error = null)
+    {
+        var summary = new
+        {
+            entry,
+            sourceEntry = req.SourceSpellEntry,
+            name = req.SpellName,
+            subtext = req.NameSubtext ?? "Rank 1",
+            school = req.School,
+            skillTab = req.SkillTabKey,
+            sessionName = req.TempName,
+            generateAllRanks = req.GenerateAllRanks,
+            copySourceTrainers = req.CopySourceTrainers,
+            // The rank entries are exactly what a revert has to remove alongside the root.
+            ranks = ranks?.Select(r => new { rank = r.rank, entry = r.entry }).ToList(),
+            m2Count,
+            extraFileCount,
+            iconSource,
+            warnings,
+            error,
+        };
+
+        var tail = warnings.Count > 0
+            ? $". {warnings.Count} warning(s): {string.Join("; ", warnings)}"
+            : "";
+
+        var notes = success
+            ? $"Completed '{req.SpellName}' as #{entry} from source #{req.SourceSpellEntry} — " +
+              $"{ranks?.Count ?? 1} rank(s), {m2Count} per-path M2(s), {extraFileCount} extra file(s). " +
+              "Patch rebuild required." + tail
+            : $"Completion of '{req.SpellName}' from source #{req.SourceSpellEntry} failed: {error}" + tail;
+
+        await _audit.LogAsync(new AuditEntry
+        {
+            Operator = "admin",
+            OperatorIp = ip,
+            Category = "content",
+            Action = "spell_completer_run",
+            TargetType = "spell_completer",
+            TargetId = entry > 0 ? entry : (int?)null,
+            TargetName = entry > 0 ? $"{req.SpellName} (#{entry})" : req.SpellName,
+            StateAfter = System.Text.Json.JsonSerializer.Serialize(summary),
+            // Undoing means deleting the root spell and its rank chain — the Change Graph
+            // reads the rank entries back out of the summary above to remove the whole
+            // chain rather than orphaning ranks 2+ behind a deleted rank 1.
+            IsReversible = success && entry > 0,
+            RevertKind = success && entry > 0 ? Services.RevertKind.DeleteCustom : Services.RevertKind.None,
+            Success = success,
+            Notes = notes,
+        });
     }
 }
 

@@ -93,6 +93,14 @@
     .sc-row-status { margin-top: 6px; font-size: .9em; display: inline-block; margin-left: 10px; }
     .sc-done { color: var(--status-success, #6c6); }
     .sc-err { color: var(--status-error, #e66); }
+    /* A completion can succeed and still leave the spell unreachable in game
+       (no skill_line_ability, no trainer). Those warnings get their own block
+       so a green check never hides a broken spell. */
+    .sc-warn-list { display: block; margin-top: 8px; padding: 8px 11px; border-radius: 4px;
+                    background: rgba(245,158,11,.1); border-left: 3px solid var(--status-warning, #f59e0b);
+                    color: var(--status-warning, #f59e0b); font-size: .88em; line-height: 1.5; }
+    .sc-warn-list b { display: block; margin-bottom: 3px; }
+    .sc-warn-list ul { margin: 0; padding-left: 18px; }
     .sc-section { font-weight: 600; font-size: .85em; text-transform: uppercase; letter-spacing: .04em;
         color: var(--text-muted, #999); margin: 14px 0 6px; border-bottom: 1px solid var(--border-color, #333);
         padding-bottom: 3px; }

@@ -75,7 +75,7 @@
     // Macro sections shown in the top navbar. Group membership is fixed here
     // and mirrored by data-section="" on each .sidebar-section in _Sidebar.cshtml.
     var SECTIONS = [
-        { key: 'admin', label: 'Server Administration', icon: 'fa-server', groups: ['operations', 'server'] },
+        { key: 'admin', label: 'Server Administration', icon: 'fa-server', groups: ['operations', 'server', 'state'] },
         { key: 'tuning', label: 'Gameplay Tuning', icon: 'fa-sliders', groups: ['content', 'spells', 'world'] },
         { key: 'aibots', label: 'AI Bot Control', icon: 'fa-robot', groups: ['bots'] },
         { key: 'devdata', label: 'Data & Development', icon: 'fa-database', groups: ['data', 'devtools'] },
@@ -87,6 +87,7 @@
     var GROUP_META = {
         operations: { name: 'Operations', icon: 'fa-gauge' },
         server: { name: 'Server', icon: 'fa-server' },
+        state: { name: 'Worlds & History', icon: 'fa-layer-group' },
         content: { name: 'Items & Loot', icon: 'fa-box-open' },
         spells: { name: 'Spells', icon: 'fa-wand-sparkles' },
         world: { name: 'World & Maps', icon: 'fa-map-location-dot' },
@@ -106,10 +107,11 @@
 
     // Default group order + item order within each group
     var DEFAULT_ORDER = {
-        groups: ['operations', 'server', 'content', 'spells', 'world', 'bots', 'data', 'devtools', 'wiki', 'superui'],
+        groups: ['operations', 'server', 'state', 'content', 'spells', 'world', 'bots', 'data', 'devtools', 'wiki', 'superui'],
         items: {
             operations: ['home', 'console', 'players', 'accounts', 'realm'],
-            server: ['activity', 'serverlogs', 'livelogs', 'config', 'backup'],
+            server: ['serverlogs', 'livelogs', 'config'],
+            state: ['worlds', 'changes', 'activity'],
             content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier', 'professiontuning'],
             spells: ['spells', 'patch', 'visuallab', 'spellcompleter'],
             world: ['worldmap', 'worldeditor'],
@@ -458,7 +460,8 @@
             serverlogs: { icon: 'fa-file-lines', label: 'Server Logs' },
             livelogs: { icon: 'fa-satellite-dish', label: 'Live Logs' },
             config: { icon: 'fa-sliders', label: 'Config Editor' },
-            backup: { icon: 'fa-hard-drive', label: 'Backups' },
+            worlds: { icon: 'fa-layer-group', label: 'World State' },
+            changes: { icon: 'fa-diagram-project', label: 'Change Graph' },
             worldmap: { icon: 'fa-map-location-dot', label: 'World Map' },
             items: { icon: 'fa-box-open', label: 'Items' },
             spells: { icon: 'fa-book-open', label: 'Spell Editor' },

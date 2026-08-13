@@ -22,9 +22,17 @@ USE `vmangos_admin`;
 -- Tracks every write operation performed through MangosSuperUI: RA commands,
 -- item/creature edits, loot changes, config saves, etc.
 -- --------------------------------------------------------------------------
+-- batch_id / batch_label group the rows a single tool run produced (one Lootifier
+-- pass, one Spell Completer run) so the Change Graph can drill Domain → Batch →
+-- Entry. revert_kind records HOW a row can be undone — 'baseline' (restore from
+-- og_*), 'state_before' (re-apply the captured rows), 'delete_custom' (remove what
+-- was created), 'registry' (the tool's own rollback), or 'none'. reverted_at marks
+-- rows already undone so they stay in history struck-through instead of vanishing.
 CREATE TABLE IF NOT EXISTS `audit_log` (
   `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
   `timestamp` datetime(3) NOT NULL DEFAULT current_timestamp(3),
+  `batch_id` varchar(32) DEFAULT NULL,
+  `batch_label` varchar(190) DEFAULT NULL,
   `operator` varchar(64) NOT NULL DEFAULT 'system',
   `operator_ip` varchar(45) DEFAULT NULL,
   `category` varchar(32) NOT NULL,
@@ -37,6 +45,9 @@ CREATE TABLE IF NOT EXISTS `audit_log` (
   `state_before` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`state_before`)),
   `state_after` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL CHECK (json_valid(`state_after`)),
   `is_reversible` tinyint(1) NOT NULL DEFAULT 0,
+  `revert_kind` varchar(24) NOT NULL DEFAULT 'none',
+  `reverted_at` datetime(3) DEFAULT NULL,
+  `reverted_by_id` bigint(20) unsigned DEFAULT NULL,
   `reverses_id` bigint(20) unsigned DEFAULT NULL,
   `success` tinyint(1) NOT NULL DEFAULT 1,
   `notes` text DEFAULT NULL,
@@ -46,7 +57,9 @@ CREATE TABLE IF NOT EXISTS `audit_log` (
   KEY `idx_action` (`action`),
   KEY `idx_target` (`target_type`,`target_name`),
   KEY `idx_operator` (`operator`),
-  KEY `idx_reversible` (`is_reversible`)
+  KEY `idx_reversible` (`is_reversible`),
+  KEY `idx_batch` (`batch_id`),
+  KEY `idx_reverted` (`reverted_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- --------------------------------------------------------------------------

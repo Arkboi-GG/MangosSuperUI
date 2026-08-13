@@ -124,6 +124,12 @@ public class DbInitializationService
 
                 TablesCreated = created;
                 TablesExisted = existed;
+
+                // --- column migrations ---
+                // The CREATE statements above are skipped whenever a table already
+                // exists, so columns added after an install shipped can only reach
+                // existing databases through here.
+                await MigrateColumnsAsync(conn, dbName);
             }
 
             AdminDbReady = true;
@@ -199,6 +205,123 @@ public class DbInitializationService
         return count > 0;
     }
 
+    private static async Task<bool> ColumnExistsAsync(MySqlConnection conn, string database, string table, string column)
+    {
+        var count = await conn.ExecuteScalarAsync<int>(
+            @"SELECT COUNT(*) FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA = @database AND TABLE_NAME = @table AND COLUMN_NAME = @column",
+            new { database, table, column });
+        return count > 0;
+    }
+
+    private static async Task<bool> IndexExistsAsync(MySqlConnection conn, string database, string table, string index)
+    {
+        var count = await conn.ExecuteScalarAsync<int>(
+            @"SELECT COUNT(*) FROM information_schema.STATISTICS
+              WHERE TABLE_SCHEMA = @database AND TABLE_NAME = @table AND INDEX_NAME = @index",
+            new { database, table, index });
+        return count > 0;
+    }
+
+    /// <summary>
+    /// Adds columns and indexes introduced after a table's original CREATE. Safe to run on
+    /// every boot: each change is guarded by an information_schema check, so this is a no-op
+    /// once an install is current. A failure here is logged and swallowed — a missing optional
+    /// column degrades the change graph, it does not justify refusing to start the panel.
+    /// </summary>
+    private async Task MigrateColumnsAsync(MySqlConnection conn, string dbName)
+    {
+        // audit_log: change-graph columns. batch_id groups the rows a single tool run
+        // produced; revert_kind tells the graph HOW a row can be undone rather than the
+        // bare is_reversible yes/no; reverted_at marks rows that have already been undone
+        // so they render struck-through instead of disappearing from history.
+        var auditColumns = new (string Column, string Ddl)[]
+        {
+            ("batch_id",       "ADD COLUMN batch_id VARCHAR(32) NULL"),
+            ("batch_label",    "ADD COLUMN batch_label VARCHAR(190) NULL"),
+            ("revert_kind",    "ADD COLUMN revert_kind VARCHAR(24) NOT NULL DEFAULT 'none'"),
+            ("reverted_at",    "ADD COLUMN reverted_at DATETIME(3) NULL"),
+            ("reverted_by_id", "ADD COLUMN reverted_by_id BIGINT UNSIGNED NULL"),
+        };
+
+        var auditIndexes = new (string Index, string Ddl)[]
+        {
+            ("idx_batch",    "CREATE INDEX idx_batch ON audit_log (batch_id)"),
+            ("idx_reverted", "CREATE INDEX idx_reverted ON audit_log (reverted_at)"),
+        };
+
+        try
+        {
+            if (!await TableExistsAsync(conn, dbName, "audit_log")) return;
+
+            var added = 0;
+            foreach (var (column, ddl) in auditColumns)
+            {
+                if (await ColumnExistsAsync(conn, dbName, "audit_log", column)) continue;
+                await conn.ExecuteAsync($"ALTER TABLE audit_log {ddl}");
+                added++;
+                _logger.LogInformation("DbInitializationService: Added audit_log.{Column}", column);
+            }
+
+            foreach (var (index, ddl) in auditIndexes)
+            {
+                if (await IndexExistsAsync(conn, dbName, "audit_log", index)) continue;
+                await conn.ExecuteAsync(ddl);
+                _logger.LogInformation("DbInitializationService: Added audit_log index {Index}", index);
+            }
+
+            // Existing history predates revert_kind and would show up in the graph as
+            // permanently un-undoable. Classify it once, from the action names that were
+            // already being written, so the graph is useful against history from day one.
+            if (added > 0)
+            {
+                var classified = await BackfillRevertKindsAsync(conn);
+                if (classified > 0)
+                    _logger.LogInformation(
+                        "DbInitializationService: Classified revert_kind on {Count} existing audit rows", classified);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "DbInitializationService: audit_log column migration failed — " +
+                                 "the change graph will run with reduced capability");
+        }
+    }
+
+    /// <summary>
+    /// One-time classification of pre-existing audit rows into revert strategies.
+    /// Only touches rows still sitting at the 'none' default, so re-running is harmless
+    /// and never overwrites a kind a controller set deliberately.
+    /// </summary>
+    private static async Task<int> BackfillRevertKindsAsync(MySqlConnection conn)
+    {
+        // action/target_type → revert strategy. Each UPDATE only touches rows still at the
+        // 'none' default, so the FIRST matching rule wins — order runs most specific to
+        // least. Getting this backwards would classify spell_clone as 'baseline', and a
+        // cloned 40000+ spell has no og_spell_template row to go back to.
+        // Anything unmatched stays 'none' rather than promising an undo that would fail.
+        var rules = new (string Kind, string Where)[]
+        {
+            // Tools that own a rollback path through their own registry tables.
+            ("registry", "action LIKE 'lootifier\\_%' OR action LIKE 'quest\\_lootifier\\_%' OR action LIKE 'crafting\\_lootifier\\_%'"),
+            // Creations: undoing means deleting what was made, not restoring a baseline.
+            ("delete_custom", "action IN ('spell_clone','spell_completer_run','patch_generate') OR target_type IN ('item_custom','gameobject_custom')"),
+            // Edits to base-game rows go back via the og_* snapshot tables.
+            ("baseline", "target_type IN ('item_base_game','item_template','spell_template','gameobject_base_game','gameobject_template','creature_loot','loot_row','loot_table','loot_tables')"),
+            // Whatever is left but captured its own before-state can be re-applied directly.
+            ("state_before", "state_before IS NOT NULL AND CHAR_LENGTH(state_before) > 2"),
+        };
+
+        var total = 0;
+        foreach (var (kind, where) in rules)
+        {
+            total += await conn.ExecuteAsync(
+                $"UPDATE audit_log SET revert_kind = @kind WHERE success = 1 AND revert_kind = 'none' AND ({where})",
+                new { kind });
+        }
+        return total;
+    }
+
     // ==================== DDL Statements ====================
     //
     // NOTE: state/changes/action_data columns use LONGTEXT (not the native JSON type)
@@ -213,6 +336,8 @@ public class DbInitializationService
         CREATE TABLE audit_log (
             id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
             timestamp       DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            batch_id        VARCHAR(32)     NULL,
+            batch_label     VARCHAR(190)    NULL,
             operator        VARCHAR(64)     NOT NULL DEFAULT 'system',
             operator_ip     VARCHAR(45)     NULL,
             category        VARCHAR(32)     NOT NULL,
@@ -225,6 +350,9 @@ public class DbInitializationService
             state_before    LONGTEXT        NULL,
             state_after     LONGTEXT        NULL,
             is_reversible   TINYINT(1)      NOT NULL DEFAULT 0,
+            revert_kind     VARCHAR(24)     NOT NULL DEFAULT 'none',
+            reverted_at     DATETIME(3)     NULL,
+            reverted_by_id  BIGINT UNSIGNED NULL,
             reverses_id     BIGINT UNSIGNED NULL,
             success         TINYINT(1)      NOT NULL DEFAULT 1,
             notes           TEXT            NULL
@@ -236,7 +364,9 @@ public class DbInitializationService
         CREATE INDEX idx_action      ON audit_log (action);
         CREATE INDEX idx_target      ON audit_log (target_type, target_name);
         CREATE INDEX idx_operator    ON audit_log (operator);
-        CREATE INDEX idx_reversible  ON audit_log (is_reversible);";
+        CREATE INDEX idx_reversible  ON audit_log (is_reversible);
+        CREATE INDEX idx_batch       ON audit_log (batch_id);
+        CREATE INDEX idx_reverted    ON audit_log (reverted_at);";
 
     private const string Sql_ConfigHistory = @"
         CREATE TABLE config_history (

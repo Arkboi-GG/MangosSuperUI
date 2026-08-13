@@ -402,23 +402,24 @@
                 </div>
             </div>
 
-            <!-- Backup & Restore -->
+            <!-- World Storage -->
             <div class="card mb-4">
                 <div class="card-header d-flex align-items-center gap-2">
-                    <i class="fa-solid fa-hard-drive" style="color: var(--accent);"></i>
-                    Backup & Restore
+                    <i class="fa-solid fa-layer-group" style="color: var(--accent);"></i>
+                    World Storage
                 </div>
                 <div class="card-body">
                     <p style="font-size: 12.5px; color: var(--text-secondary); margin: 0 0 16px;">
-                        Paths used by the <a href="/Backup" style="color: var(--accent);">Backups</a> page.
-                        Database backups use <code>mysqldump</code> and are stored as gzipped SQL.
-                        Core Source backups tar the source tree for version snapshots while developing.
+                        Paths used by the <a href="/Worlds" style="color: var(--accent);">World State</a> page.
+                        Suspending a world dumps its databases with <code>mysqldump</code> as gzipped SQL and tars the
+                        core source tree. The world registry (<code>worlds.json</code>) lives in this directory too —
+                        it is deliberately kept out of <code>vmangos_admin</code>, which is itself swapped on every resume.
                     </p>
                     <div class="row g-3">
                         <div class="col-md-8">
                             <label class="cmd-label">
-                                Backup Storage Directory
-                                <i class="fa-solid fa-circle-question cfg-hint" title="Where backup folders are stored. Each backup creates a timestamped subfolder containing dump files and a manifest.json."></i>
+                                World Storage Directory
+                                <i class="fa-solid fa-circle-question cfg-hint" title="Where suspended worlds are stored. Each suspend creates a timestamped subfolder containing dump files and a manifest.json, alongside the worlds.json registry."></i>
                             </label>
                             <input type="text" class="form-input cfg-input" id="cfgBackupDir" placeholder="/home/wowvmangos/backups" />
                         </div>

@@ -476,12 +476,22 @@
             data: JSON.stringify(body)
         }).done(function (res) {
             if (res.success) {
+                var warnings = res.warnings || [];
+
                 status.innerHTML = '<i class="fa-solid fa-check"></i> Created as #' + res.spellEntry +
                     (res.ranksGenerated ? ' with ' + res.ranksGenerated + ' rank(s)' : '') +
                     ' — ' + res.m2Count + ' patched model(s), ' + res.extraFileCount + ' extra file(s), ' +
                     body.effects.length + ' mechanic override(s) stored. ' +
                     '<b>Restart the world server</b> (spell/trainer tables load at startup) and delete ' +
-                    'the client’s WDB cache after installing the rebuilt patch.';
+                    'the client’s WDB cache after installing the rebuilt patch.' +
+                    // The spell exists either way, but these decide whether players can
+                    // ever reach it — never let a green check bury them.
+                    (warnings.length
+                        ? '<span class="sc-warn-list"><b><i class="fa-solid fa-triangle-exclamation"></i> ' +
+                          'Completed with ' + warnings.length + ' warning' + (warnings.length !== 1 ? 's' : '') + ':</b><ul>' +
+                          warnings.map(function (w) { return '<li>' + escapeHtml(w) + '</li>'; }).join('') +
+                          '</ul></span>'
+                        : '');
                 status.className = 'sc-row-status sc-done';
                 document.getElementById('btnRebuildPatch').disabled = false;
             } else {

@@ -807,6 +807,15 @@ public class LootifierController : Controller
     [HttpPost]
     public async Task<IActionResult> BatchCommit([FromBody] BatchCommitRequest request)
     {
+        // Gives the run a stable identity and title in the Change Graph. Note this commit
+        // writes ONE summary audit row, not one per generated item — the per-item detail
+        // lives in lootifier_generated_items / lootifier_loot_entries, which is also what
+        // Rollback reads. So the batch is a labelled container, not a grouping of many
+        // rows; it becomes the latter for free if per-item logging is ever added.
+        using var batch = AuditBatch.Begin(
+            $"ARPG Lootifier — batch of {request.creatures.Length} creature(s)" +
+            (request.regenerate ? " (regenerate)" : ""));
+
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
 
@@ -1075,6 +1084,7 @@ public class LootifierController : Controller
             StateBefore = "{}",
             StateAfter = JsonSerializer.Serialize(new { totalItemsCreated, totalLootRowsCreated, creaturesProcessed, pairsSkipped, regenReused, regenRemoved, regenRemapped }),
             IsReversible = true,
+            RevertKind = Services.RevertKind.Registry,
             Success = true,
             Notes = $"Lootifier batch: {totalItemsCreated} variants + {totalLootRowsCreated} loot rows across {creaturesProcessed} creatures ({pairsSkipped} already-expanded pairs skipped)"
                 + (request.regenerate ? $"; regenerate: {regenReused} refreshed in place, {regenRemoved} removed, {regenRemapped} owned copies rerolled" : "")
@@ -1175,6 +1185,10 @@ public class LootifierController : Controller
     {
         if (request.creatureEntry <= 0)
             return Json(new { success = false, error = "Invalid creature entry" });
+
+        using var batch = AuditBatch.Begin(
+            $"ARPG Lootifier — creature {request.creatureEntry}" +
+            (request.regenerate ? " (regenerate)" : ""));
 
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
@@ -1343,6 +1357,7 @@ public class LootifierController : Controller
             StateBefore = "{}",
             StateAfter = JsonSerializer.Serialize(new { totalItemsCreated, totalLootRowsCreated, regenReused, regenRemoved, regenRemapped, commitLog }),
             IsReversible = true,
+            RevertKind = Services.RevertKind.Registry,
             Success = true,
             Notes = $"Lootifier: {totalItemsCreated} variants + {totalLootRowsCreated} loot rows for creature {request.creatureEntry}"
                 + (request.regenerate ? $" (regenerate: {regenReused} refreshed in place, {regenRemoved} removed, {regenRemapped} owned copies rerolled)" : "")
@@ -1356,6 +1371,10 @@ public class LootifierController : Controller
     [HttpPost]
     public async Task<IActionResult> Rollback([FromBody] RollbackRequest request)
     {
+        using var batch = AuditBatch.Begin(
+            "ARPG Lootifier rollback — " +
+            (request.creatureEntry > 0 ? $"creature {request.creatureEntry}" : "all creatures"));
+
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
 

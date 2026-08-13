@@ -13,7 +13,8 @@
     string activeGroup = currentController.ToLower() switch
     {
         "home" or "console" or "players" or "accounts" or "realm" => "operations",
-        "activity" or "serverlogs" or "livelogs" or "config" or "backup" => "server",
+        "serverlogs" or "livelogs" or "config" => "server",
+        "worlds" or "changes" or "activity" => "state",
         "spells" or "patch" or "spellcompleter" => "spells",
         "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" or "professiontuning" => "content",
         "worldeditor" or "worldmap" => "world",
@@ -27,7 +28,7 @@
     // Which macro section contains that group?
     string activeSection = activeGroup switch
     {
-        "operations" or "server" => "admin",
+        "operations" or "server" or "state" => "admin",
         "content" or "spells" or "world" => "tuning",
         "bots" => "aibots",
         "data" or "devtools" => "devdata",
@@ -143,12 +144,6 @@
                 <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
             </div>
             <ul class="sidebar-nav sidebar-nav-collapsible">
-                <li class="sidebar-nav-item" data-nav-key="activity">
-                    <a asp-controller="Activity" asp-action="Index" class="@NavClass("Activity")">
-                        <i class="fa-solid fa-clipboard-list"></i>
-                        Activity Log
-                    </a>
-                </li>
                 <li class="sidebar-nav-item" data-nav-key="serverlogs">
                     <a asp-controller="ServerLogs" asp-action="Index" class="@NavClass("ServerLogs")">
                         <i class="fa-solid fa-file-lines"></i>
@@ -167,10 +162,32 @@
                         Config Editor
                     </a>
                 </li>
-                <li class="sidebar-nav-item" data-nav-key="backup">
-                    <a asp-controller="Backup" asp-action="Index" class="@NavClass("Backup")">
-                        <i class="fa-solid fa-hard-drive"></i>
-                        Backups
+            </ul>
+        </div>
+
+        <!-- Worlds & History -->
+        <div class="sidebar-section" data-group="state" data-section="admin">
+            <div class="sidebar-section-title" data-toggle-group="state">
+                <span>Worlds &amp; History</span>
+                <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
+            </div>
+            <ul class="sidebar-nav sidebar-nav-collapsible">
+                <li class="sidebar-nav-item" data-nav-key="worlds">
+                    <a asp-controller="Worlds" asp-action="Index" class="@NavClass("Worlds")">
+                        <i class="fa-solid fa-layer-group"></i>
+                        World State
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="changes">
+                    <a asp-controller="Changes" asp-action="Index" class="@NavClass("Changes")">
+                        <i class="fa-solid fa-diagram-project"></i>
+                        Change Graph
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="activity">
+                    <a asp-controller="Activity" asp-action="Index" class="@NavClass("Activity")">
+                        <i class="fa-solid fa-clipboard-list"></i>
+                        Activity Log
                     </a>
                 </li>
             </ul>

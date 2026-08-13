@@ -97,14 +97,19 @@ public class AuditService
     {
         try
         {
+            // A caller inside a batch scope doesn't have to thread the id through every
+            // call site — the ambient scope fills it in.
+            entry.BatchId ??= AuditBatch.CurrentId;
+            entry.BatchLabel ??= AuditBatch.CurrentLabel;
+
             using var conn = _db.Admin();
             var id = await conn.ExecuteScalarAsync<long>(
-                @"INSERT INTO audit_log 
-                    (operator, operator_ip, category, action, target_type, target_name, target_id,
-                     ra_command, ra_response, state_before, state_after, is_reversible, reverses_id, success, notes)
-                  VALUES 
-                    (@Operator, @OperatorIp, @Category, @Action, @TargetType, @TargetName, @TargetId,
-                     @RaCommand, @RaResponse, @StateBefore, @StateAfter, @IsReversible, @ReversesId, @Success, @Notes);
+                @"INSERT INTO audit_log
+                    (batch_id, batch_label, operator, operator_ip, category, action, target_type, target_name, target_id,
+                     ra_command, ra_response, state_before, state_after, is_reversible, revert_kind, reverses_id, success, notes)
+                  VALUES
+                    (@BatchId, @BatchLabel, @Operator, @OperatorIp, @Category, @Action, @TargetType, @TargetName, @TargetId,
+                     @RaCommand, @RaResponse, @StateBefore, @StateAfter, @IsReversible, @RevertKind, @ReversesId, @Success, @Notes);
                   SELECT LAST_INSERT_ID();",
                 entry);
 
@@ -200,7 +205,9 @@ public class AuditService
                                category, action, target_type AS targetType, target_name AS targetName, 
                                target_id AS targetId, ra_command AS raCommand, ra_response AS raResponse,
                                state_before AS stateBefore, state_after AS stateAfter,
-                               is_reversible AS isReversible, reverses_id AS reversesId, success, notes
+                               is_reversible AS isReversible, reverses_id AS reversesId, success, notes,
+                         batch_id AS batchId, batch_label AS batchLabel, revert_kind AS revertKind,
+                         reverted_at AS revertedAt, reverted_by_id AS revertedById
                         FROM audit_log";
 
             if (!string.IsNullOrEmpty(category))
@@ -230,7 +237,9 @@ public class AuditService
                          category, action, target_type AS targetType, target_name AS targetName,
                          target_id AS targetId, ra_command AS raCommand, ra_response AS raResponse,
                          state_before AS stateBefore, state_after AS stateAfter,
-                         is_reversible AS isReversible, reverses_id AS reversesId, success, notes
+                         is_reversible AS isReversible, reverses_id AS reversesId, success, notes,
+                         batch_id AS batchId, batch_label AS batchLabel, revert_kind AS revertKind,
+                         reverted_at AS revertedAt, reverted_by_id AS revertedById
                   FROM audit_log
                   WHERE target_type = @targetType AND target_name = @targetName
                   ORDER BY id DESC LIMIT @count",
@@ -272,6 +281,70 @@ public class AuditService
 
 // ==================== DTOs ====================
 
+/// <summary>
+/// Ambient batch scope. Wrap a tool run in <c>using (AuditBatch.Begin("ARPG Lootifier — Deadmines"))</c>
+/// and every AuditEntry written inside it — including ones written deep inside services
+/// that know nothing about batching — is stamped with the same batch_id. That is what lets
+/// the Change Graph draw "one Lootifier pass" instead of 400 unrelated rows.
+///
+/// AsyncLocal, so the scope follows the request across awaits and does not leak between
+/// concurrent requests.
+/// </summary>
+public sealed class AuditBatch : IDisposable
+{
+    private static readonly AsyncLocal<AuditBatch?> _current = new();
+
+    public string Id { get; }
+    public string Label { get; }
+
+    private readonly AuditBatch? _parent;
+    private bool _disposed;
+
+    private AuditBatch(string label)
+    {
+        Id = Guid.NewGuid().ToString("N")[..16];
+        Label = label;
+        _parent = _current.Value;
+        _current.Value = this;
+    }
+
+    public static string? CurrentId => _current.Value?.Id;
+    public static string? CurrentLabel => _current.Value?.Label;
+
+    /// <summary>Opens a batch scope. Nested scopes keep the innermost label.</summary>
+    public static AuditBatch Begin(string label) => new(label);
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _current.Value = _parent;
+    }
+}
+
+/// <summary>
+/// How a logged change can be undone. The Change Graph dispatches on this instead of
+/// guessing from the action name, and <see cref="None"/> means the graph shows the row
+/// as history only rather than offering an undo that would fail.
+/// </summary>
+public static class RevertKind
+{
+    /// <summary>No supported undo path.</summary>
+    public const string None = "none";
+
+    /// <summary>Restore the target rows from the matching og_* baseline table.</summary>
+    public const string Baseline = "baseline";
+
+    /// <summary>Re-apply the rows captured in state_before.</summary>
+    public const string StateBefore = "state_before";
+
+    /// <summary>The change created something; undoing means deleting it again.</summary>
+    public const string DeleteCustom = "delete_custom";
+
+    /// <summary>The originating tool owns a rollback path through its own registry tables.</summary>
+    public const string Registry = "registry";
+}
+
 public class AuditEntry
 {
     public string Operator { get; set; } = "admin";
@@ -289,6 +362,15 @@ public class AuditEntry
     public long? ReversesId { get; set; }
     public bool Success { get; set; } = true;
     public string? Notes { get; set; }
+
+    /// <summary>Groups every row a single tool run produced. Null for one-off actions.</summary>
+    public string? BatchId { get; set; }
+
+    /// <summary>Human title for the batch, e.g. "ARPG Lootifier — Deadmines".</summary>
+    public string? BatchLabel { get; set; }
+
+    /// <summary>One of <see cref="RevertKind"/>.</summary>
+    public string RevertKind { get; set; } = Services.RevertKind.None;
 }
 
 public class AuditLogRow
@@ -310,4 +392,9 @@ public class AuditLogRow
     public long? ReversesId { get; set; }
     public bool Success { get; set; }
     public string? Notes { get; set; }
+    public string? BatchId { get; set; }
+    public string? BatchLabel { get; set; }
+    public string RevertKind { get; set; } = Services.RevertKind.None;
+    public DateTime? RevertedAt { get; set; }
+    public long? RevertedById { get; set; }
 }

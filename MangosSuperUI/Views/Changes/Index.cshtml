@@ -1,0 +1,269 @@
+@{
+    ViewData["Title"] = "Change Graph";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header">
+            <div class="d-flex align-items-center justify-content-between">
+                <div>
+                    <h1>Change Graph</h1>
+                    <p>Everything modified through the panel — drill down, then undo exactly what you meant to</p>
+                </div>
+                <div class="cg-totals" id="cgTotals"></div>
+            </div>
+        </div>
+
+        <div class="content-body">
+
+            <!-- ── Filters ── -->
+            <div class="card mb-3">
+                <div class="card-body">
+                    <div class="d-flex align-items-center gap-3 flex-wrap">
+                        <div class="cg-search-wrap">
+                            <i class="fa-solid fa-magnifying-glass cg-search-icon"></i>
+                            <input type="text" class="form-input cg-search" id="cgSearch"
+                                   placeholder="Search targets, actions, batches, notes..." autocomplete="off" />
+                        </div>
+
+                        <div class="cg-chips" id="cgShowChips">
+                            <button class="cg-chip active" data-show="all">All</button>
+                            <button class="cg-chip" data-show="revertable">Revertable</button>
+                            <button class="cg-chip" data-show="reverted">Reverted</button>
+                            <button class="cg-chip" data-show="failed">Failed</button>
+                        </div>
+
+                        <div class="cg-chips" id="cgDaysChips">
+                            <button class="cg-chip" data-days="1">24h</button>
+                            <button class="cg-chip" data-days="7">7d</button>
+                            <button class="cg-chip" data-days="30">30d</button>
+                            <button class="cg-chip active" data-days="">All time</button>
+                        </div>
+
+                        <select class="form-input cg-op-select" id="cgOperator" style="width: auto;">
+                            <option value="">All operators</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── Breadcrumb spine ── -->
+            <div class="cg-breadcrumb" id="cgBreadcrumb"></div>
+
+            <!-- ── Drill levels ── -->
+            <div id="cgLevel"></div>
+
+        </div>
+    </div>
+</div>
+
+<!-- ══════════ Entry detail drawer ══════════ -->
+<div class="cg-drawer" id="cgDrawer">
+    <div class="cg-drawer-panel">
+        <div class="cg-drawer-head">
+            <div>
+                <div class="cg-drawer-title" id="cgDrawerTitle">Change</div>
+                <div class="cg-drawer-sub" id="cgDrawerSub"></div>
+            </div>
+            <button class="cg-btn cg-btn-ghost" id="cgDrawerClose"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="cg-drawer-body" id="cgDrawerBody"></div>
+        <div class="cg-drawer-foot" id="cgDrawerFoot"></div>
+    </div>
+</div>
+
+<!-- ══════════ Revert confirmation ══════════ -->
+<div class="modal fade" id="cgRevertModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content cg-modal">
+            <div class="modal-header cg-modal-head">
+                <h5 class="modal-title"><i class="fa-solid fa-rotate-left"></i> <span id="cgRevertTitle">Undo Change</span></h5>
+            </div>
+            <div class="modal-body">
+                <p class="cg-modal-lead" id="cgRevertBody"></p>
+                <div class="cg-revert-plan" id="cgRevertPlan"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="cg-btn cg-btn-warn" id="cgConfirmRevert"><i class="fa-solid fa-rotate-left"></i> Undo</button>
+                <button class="cg-btn cg-btn-ghost" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Styles {
+    <style>
+        /* ══════════ Header totals ══════════ */
+        .cg-totals { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .cg-total { font-size: 11.5px; font-weight: 600; padding: 4px 10px; border-radius: 12px;
+                    background: var(--accent-subtle); color: var(--accent); white-space: nowrap; }
+        .cg-total.warn { background: rgba(245,158,11,.12); color: var(--status-warning); }
+        .cg-total.err { background: rgba(239,68,68,.1); color: var(--status-error); }
+        .cg-total.muted { background: var(--bg-card-alt); color: var(--text-muted); }
+
+        /* ══════════ Filters ══════════ */
+        .cg-search-wrap { position: relative; min-width: 260px; flex: 1; max-width: 380px; }
+        .cg-search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+                          color: var(--text-muted); font-size: 13px; pointer-events: none; }
+        .cg-search { padding-left: 34px !important; font-size: 13px; }
+        .cg-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+        .cg-chip { padding: 4px 12px; font-size: 11.5px; font-weight: 500; border-radius: 20px;
+                   border: 1px solid var(--border-light); background: var(--bg-card);
+                   color: var(--text-secondary); cursor: pointer; transition: all var(--transition-fast); white-space: nowrap; }
+        .cg-chip:hover { border-color: var(--accent); color: var(--accent); }
+        .cg-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+        .cg-op-select { font-size: 12.5px; padding: 6px 10px; }
+
+        /* ══════════ Breadcrumb spine ══════════ */
+        .cg-breadcrumb { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+                         margin-bottom: 14px; font-size: 12.5px; }
+        .cg-crumb { display: inline-flex; align-items: center; gap: 7px; padding: 5px 13px;
+                    border-radius: 16px; background: var(--bg-card); border: 1px solid var(--border-light);
+                    color: var(--text-secondary); cursor: pointer; transition: all var(--transition-fast); }
+        .cg-crumb:hover { border-color: var(--accent); color: var(--accent); }
+        .cg-crumb.current { background: var(--accent); border-color: var(--accent); color: #fff; cursor: default; font-weight: 600; }
+        .cg-crumb.current:hover { color: #fff; }
+        .cg-crumb-sep { color: var(--border-medium); font-size: 10px; }
+
+        /* ══════════ Level 1 — domain nodes ══════════ */
+        .cg-domains { display: grid; grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); gap: 12px; }
+        .cg-node { position: relative; padding: 16px 18px; border-radius: var(--radius-lg);
+                   background: var(--bg-card); border: 1px solid var(--border-light);
+                   border-top: 3px solid var(--cg-color, var(--accent)); cursor: pointer;
+                   transition: all var(--transition-fast); box-shadow: var(--shadow-sm); }
+        .cg-node:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--cg-color, var(--accent)); }
+        .cg-node.empty { opacity: .5; cursor: default; }
+        .cg-node.empty:hover { transform: none; box-shadow: var(--shadow-sm); }
+        .cg-node-head { display: flex; align-items: center; gap: 10px; }
+        .cg-node-icon { width: 34px; height: 34px; border-radius: var(--radius-md); flex-shrink: 0;
+                        display: flex; align-items: center; justify-content: center; font-size: 15px;
+                        background: color-mix(in srgb, var(--cg-color, var(--accent)) 13%, transparent);
+                        color: var(--cg-color, var(--accent)); }
+        .cg-node-label { font-size: 14px; font-weight: 700; color: var(--text-primary); }
+        .cg-node-count { font-size: 26px; font-weight: 700; color: var(--text-primary); line-height: 1.1; margin-top: 12px; }
+        .cg-node-unit { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; }
+        .cg-node-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 10px; }
+        .cg-tag { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; text-transform: uppercase; letter-spacing: .04em; }
+        .cg-tag-revertable { background: rgba(34,197,94,.12); color: var(--status-online); }
+        .cg-tag-reverted { background: rgba(141,150,160,.16); color: var(--text-muted); }
+        .cg-tag-failed { background: rgba(239,68,68,.1); color: var(--status-error); }
+        .cg-node-when { font-size: 11px; color: var(--text-muted); margin-top: 8px; }
+
+        /* ══════════ Levels 2 & 3 — hierarchy rail ══════════ */
+        .cg-list { background: var(--bg-card); border: 1px solid var(--border-light);
+                   border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow-sm); }
+        .cg-row { display: flex; align-items: center; gap: 12px; padding: 13px 18px;
+                  border-bottom: 1px solid var(--border-light); cursor: pointer;
+                  transition: background var(--transition-fast); position: relative; }
+        .cg-row:last-child { border-bottom: none; }
+        .cg-row:hover { background: var(--bg-card-alt); }
+        .cg-row.reverted { opacity: .62; }
+        .cg-row.reverted .cg-row-title { text-decoration: line-through; }
+        .cg-row.failed { border-left: 3px solid var(--status-error); }
+
+        /* The spine: a connector so nested levels read as a tree, not a flat table */
+        .cg-row-spine { width: 16px; flex-shrink: 0; color: var(--border-medium); font-size: 11px; text-align: center; }
+        .cg-row-main { flex: 1; min-width: 0; }
+        .cg-row-title { font-size: 13.5px; font-weight: 600; color: var(--text-primary);
+                        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .cg-row-meta { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-muted); margin-top: 3px; }
+        .cg-row-meta span { display: inline-flex; align-items: center; gap: 4px; }
+        .cg-row-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .cg-row-count { font-size: 17px; font-weight: 700; color: var(--text-primary); line-height: 1; }
+        .cg-row-count-unit { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+
+        .cg-kind { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+                   padding: 2px 6px; border-radius: 3px; white-space: nowrap; }
+        .cg-kind-baseline { background: rgba(59,130,196,.12); color: #3b82c4; }
+        .cg-kind-state_before { background: rgba(168,85,247,.12); color: #a855f7; }
+        .cg-kind-delete_custom { background: rgba(245,158,11,.12); color: var(--status-warning); }
+        .cg-kind-registry { background: rgba(94,170,168,.14); color: #5eaaa8; }
+        .cg-kind-none { background: var(--bg-card-alt); color: var(--text-muted); }
+
+        /* ══════════ Buttons ══════════ */
+        .cg-btn { display: inline-flex; align-items: center; gap: 6px; border-radius: var(--radius-sm);
+                  padding: 5px 12px; font-size: 12.5px; font-weight: 500; cursor: pointer;
+                  transition: all var(--transition-fast); border: 1px solid transparent; white-space: nowrap; }
+        .cg-btn:disabled { opacity: .5; cursor: not-allowed; }
+        .cg-btn-warn { background: none; border-color: var(--status-warning); color: var(--status-warning); }
+        .cg-btn-warn:hover:not(:disabled) { background: rgba(245,158,11,.1); }
+        .cg-btn-ghost { background: none; border-color: var(--border-light); color: var(--text-secondary); }
+        .cg-btn-ghost:hover:not(:disabled) { border-color: var(--border-medium); background: var(--bg-card-alt); color: var(--text-primary); }
+
+        /* ══════════ Entry drawer ══════════ */
+        .cg-drawer { position: fixed; inset: 0; z-index: 1050; background: rgba(0,0,0,.32);
+                     display: none; justify-content: flex-end; }
+        .cg-drawer.open { display: flex; }
+        .cg-drawer-panel { width: min(620px, 100%); background: var(--bg-card); height: 100%;
+                           display: flex; flex-direction: column; box-shadow: var(--shadow-lg);
+                           animation: cgSlide .22s ease-out; }
+        @@keyframes cgSlide { from { transform: translateX(24px); opacity: .6; } to { transform: none; opacity: 1; } }
+        .cg-drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+                          padding: 16px 20px; border-bottom: 1px solid var(--border-light); }
+        .cg-drawer-title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
+        .cg-drawer-sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+        .cg-drawer-body { flex: 1; overflow-y: auto; padding: 18px 20px; }
+        .cg-drawer-foot { padding: 13px 20px; border-top: 1px solid var(--border-light);
+                          display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+        .cg-detail-row { display: flex; gap: 10px; margin-bottom: 7px; font-size: 12.5px; }
+        .cg-detail-label { color: var(--text-muted); min-width: 104px; font-weight: 500; flex-shrink: 0; }
+        .cg-detail-value { color: var(--text-secondary); word-break: break-word; }
+
+        .cg-section-title { font-size: 11px; font-weight: 700; text-transform: uppercase;
+                            letter-spacing: .07em; color: var(--text-muted); margin: 18px 0 8px; }
+
+        /* Field diff */
+        .cg-diff { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        .cg-diff th { font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em;
+                      color: var(--text-muted); text-align: left; padding: 6px 9px;
+                      border-bottom: 1px solid var(--border-light); font-weight: 600; }
+        .cg-diff td { padding: 7px 9px; border-bottom: 1px solid var(--border-light); vertical-align: top; }
+        .cg-diff-field { font-family: 'Consolas','Courier New',monospace; color: var(--text-primary); font-weight: 600; }
+        .cg-diff-old { font-family: 'Consolas','Courier New',monospace; color: var(--status-error);
+                       background: rgba(239,68,68,.06); border-radius: 3px; }
+        .cg-diff-new { font-family: 'Consolas','Courier New',monospace; color: var(--status-online);
+                       background: rgba(34,197,94,.07); border-radius: 3px; }
+
+        .cg-json { font-family: 'Consolas','Courier New',monospace; font-size: 11px; line-height: 1.5;
+                   background: #0f1319; color: #c8d0da; padding: 10px 12px; border-radius: var(--radius-sm);
+                   max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
+
+        .cg-note { padding: 9px 12px; border-radius: var(--radius-sm); font-size: 12.5px; }
+        .cg-note-info { background: var(--accent-light); color: var(--accent); }
+        .cg-note-warn { background: rgba(245,158,11,.1); color: var(--status-warning); }
+        .cg-note-muted { background: var(--bg-card-alt); color: var(--text-muted); }
+
+        /* ══════════ Modal ══════════ */
+        .cg-modal { background: var(--bg-card); border: 1px solid var(--border-light); border-radius: var(--radius-lg); }
+        .cg-modal .modal-header { border-bottom: 1px solid var(--border-light); padding: 14px 20px;
+                                  background: rgba(245,158,11,.08); }
+        .cg-modal .modal-title { font-size: 15px; font-weight: 700; color: var(--status-warning); }
+        .cg-modal .modal-body { padding: 18px 20px; }
+        .cg-modal .modal-footer { border-top: 1px solid var(--border-light); gap: 8px; padding: 12px 20px; }
+        .cg-modal-lead { font-size: 13.5px; color: var(--text-secondary); line-height: 1.55; }
+        .cg-modal-lead strong { color: var(--text-primary); }
+        .cg-revert-plan { margin-top: 12px; padding: 11px 13px; border-radius: var(--radius-md);
+                          background: var(--bg-card-alt); border: 1px solid var(--border-light);
+                          font-size: 12.5px; color: var(--text-secondary); line-height: 1.55; }
+
+        /* ══════════ Empty / loading ══════════ */
+        .cg-empty { text-align: center; padding: 42px 20px; color: var(--text-muted);
+                    background: var(--bg-card); border: 1px solid var(--border-light); border-radius: var(--radius-lg); }
+        .cg-empty i { font-size: 30px; margin-bottom: 11px; display: block; opacity: .4; }
+
+        .cg-toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; padding: 12px 20px;
+                    border-radius: var(--radius-md); font-size: 13px; font-weight: 500; color: #fff;
+                    box-shadow: var(--shadow-lg); max-width: 440px; animation: cgToastIn .3s ease-out; }
+        .cg-toast.success { background: var(--status-online); }
+        .cg-toast.error { background: var(--status-error); }
+        .cg-toast.info { background: var(--accent); }
+        @@keyframes cgToastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+    </style>
+}
+
+@section Scripts {
+    <script src="~/js/changes.js" asp-append-version="true"></script>
+}

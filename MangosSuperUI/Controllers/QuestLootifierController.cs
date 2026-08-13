@@ -367,6 +367,11 @@ public class QuestLootifierController : Controller
     [HttpPost]
     public async Task<IActionResult> Commit([FromBody] QuestCommitRequest request)
     {
+        using var batch = AuditBatch.Begin(
+            "Quest Lootifier — " +
+            (request.allQuests ? "all quest rewards" : $"{request.itemEntries?.Length ?? 0} reward item(s)") +
+            (request.regenerate ? " (regenerate)" : ""));
+
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
 
@@ -519,6 +524,7 @@ public class QuestLootifierController : Controller
             StateBefore = "{}",
             StateAfter = JsonSerializer.Serialize(new { itemsCreated, basesProcessed, basesSkipped, itemsRemapped }),
             IsReversible = true,
+            RevertKind = Services.RevertKind.Registry,
             Success = true,
             Notes = $"Quest Lootifier: {itemsCreated} variants across {basesProcessed} reward items ({basesSkipped} already done, {itemsRemapped} player-owned items rerolled)"
         });
@@ -577,6 +583,10 @@ public class QuestLootifierController : Controller
     [HttpPost]
     public async Task<IActionResult> Rollback([FromBody] QuestRollbackRequest request)
     {
+        using var batch = AuditBatch.Begin(
+            "Quest Lootifier rollback — " +
+            (request.baseEntry > 0 ? $"base item {request.baseEntry}" : "all quest variants"));
+
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
 

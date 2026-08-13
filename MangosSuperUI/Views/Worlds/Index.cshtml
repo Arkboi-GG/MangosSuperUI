@@ -1,0 +1,357 @@
+@{
+    ViewData["Title"] = "World State";
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+        <div class="content-header">
+            <div class="d-flex align-items-center justify-content-between">
+                <div>
+                    <h1>World State</h1>
+                    <p>Suspend the running world, park it, and resume another in its place</p>
+                </div>
+                <div class="ws-proc-strip" id="wsProcStrip"></div>
+            </div>
+        </div>
+
+        <div class="content-body">
+
+            <!-- ── The mount point: what is loaded right now ── -->
+            <div class="ws-stage" id="wsStage">
+                <div class="ws-stage-loading">
+                    <i class="fa-solid fa-spinner fa-spin"></i> Reading world state...
+                </div>
+            </div>
+
+            <!-- ── Job theatre: narrates a suspend/resume while it runs ── -->
+            <div class="ws-theatre" id="wsTheatre" style="display: none;"></div>
+
+            <!-- ── Lineage: worlds and their forks over time ── -->
+            <div class="card mb-4" id="wsLineageCard" style="display: none;">
+                <div class="card-header d-flex align-items-center justify-content-between">
+                    <span><i class="fa-solid fa-code-branch" style="color: var(--accent);"></i> Lineage</span>
+                    <span class="text-muted" style="font-size: 11.5px;">Forks share their origin snapshot on disk</span>
+                </div>
+                <div class="card-body">
+                    <div class="ws-lineage" id="wsLineage"></div>
+                </div>
+            </div>
+
+            <!-- ── The shelf: parked worlds ── -->
+            <div class="card">
+                <div class="card-header d-flex align-items-center justify-content-between">
+                    <span><i class="fa-solid fa-layer-group" style="color: var(--accent);"></i> Parked Worlds</span>
+                    <span class="text-muted" style="font-size: 12px;" id="wsShelfCount"></span>
+                </div>
+                <div class="card-body p-0" id="wsShelf">
+                    <div class="text-center p-4 text-muted">
+                        <i class="fa-solid fa-spinner fa-spin"></i> Loading worlds...
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<!-- ══════════ Suspend Modal ══════════ -->
+<div class="modal fade" id="wsSuspendModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content ws-modal">
+            <div class="modal-header ws-modal-head-warn">
+                <h5 class="modal-title"><i class="fa-solid fa-circle-pause"></i> Suspend World</h5>
+            </div>
+            <div class="modal-body">
+                <p class="ws-modal-lead">
+                    <strong id="wsSuspendName"></strong> will be unloaded. The server stops, every group is
+                    frozen to disk, and <strong>nothing will be mounted</strong> until you resume a world.
+                </p>
+                <div class="ws-step-preview">
+                    <div class="ws-step-preview-item"><i class="fa-solid fa-power-off"></i> Stop mangosd &amp; realmd</div>
+                    <div class="ws-step-preview-item"><i class="fa-solid fa-snowflake"></i> Freeze world, characters &amp; core</div>
+                    <div class="ws-step-preview-item"><i class="fa-solid fa-box-archive"></i> Park the world on the shelf</div>
+                </div>
+                <label class="form-label" style="margin-top: 14px;">Note for this suspend point</label>
+                <input type="text" class="form-input" id="wsSuspendLabel"
+                       placeholder="e.g. End of the ARPG loot pass — everything balanced" />
+            </div>
+            <div class="modal-footer">
+                <button class="ws-btn ws-btn-warn" id="wsConfirmSuspend">
+                    <i class="fa-solid fa-circle-pause"></i> Suspend &amp; Unload
+                </button>
+                <button class="ws-btn ws-btn-ghost" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════ Resume / Swap Ceremony Modal ══════════ -->
+<div class="modal fade" id="wsResumeModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content ws-modal">
+            <div class="modal-header ws-modal-head-accent">
+                <h5 class="modal-title"><i class="fa-solid fa-right-left"></i> <span id="wsResumeTitle">Resume World</span></h5>
+            </div>
+            <div class="modal-body">
+                <!-- The exchange: what leaves, what arrives -->
+                <div class="ws-exchange" id="wsExchange"></div>
+
+                <div class="ws-step-preview" id="wsResumeSteps"></div>
+
+                <div class="ws-snapshot-pick" id="wsSnapshotPick" style="display: none;">
+                    <label class="form-label">Resume from</label>
+                    <select class="form-input" id="wsSnapshotSelect"></select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="ws-btn ws-btn-accent" id="wsConfirmResume">
+                    <i class="fa-solid fa-play"></i> <span id="wsConfirmResumeLabel">Resume</span>
+                </button>
+                <button class="ws-btn ws-btn-ghost" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════ World Editor Modal (create fork / edit) ══════════ -->
+<div class="modal fade" id="wsEditModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content ws-modal">
+            <div class="modal-header ws-modal-head-accent">
+                <h5 class="modal-title"><i class="fa-solid fa-pen" id="wsEditIcon"></i> <span id="wsEditTitle">Edit World</span></h5>
+            </div>
+            <div class="modal-body">
+                <p class="ws-modal-lead" id="wsEditLead" style="display: none;"></p>
+
+                <label class="form-label">World name</label>
+                <input type="text" class="form-input" id="wsEditName" placeholder="e.g. RTS Prototype" />
+
+                <label class="form-label" style="margin-top: 14px;">Kind</label>
+                <div class="ws-flavor-row" id="wsFlavorRow">
+                    <label class="ws-flavor" data-flavor="mmo">
+                        <i class="fa-solid fa-earth-americas"></i><span>MMO</span>
+                    </label>
+                    <label class="ws-flavor" data-flavor="rts">
+                        <i class="fa-solid fa-chess-rook"></i><span>RTS</span>
+                    </label>
+                    <label class="ws-flavor" data-flavor="sandbox">
+                        <i class="fa-solid fa-flask"></i><span>Sandbox</span>
+                    </label>
+                    <label class="ws-flavor" data-flavor="custom">
+                        <i class="fa-solid fa-star"></i><span>Custom</span>
+                    </label>
+                </div>
+
+                <label class="form-label" style="margin-top: 14px;">Notes</label>
+                <textarea class="form-input" id="wsEditNotes" rows="2"
+                          placeholder="What is this world for?"></textarea>
+            </div>
+            <div class="modal-footer">
+                <button class="ws-btn ws-btn-accent" id="wsConfirmEdit"><i class="fa-solid fa-check"></i> Save</button>
+                <button class="ws-btn ws-btn-ghost" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════ Delete Modal ══════════ -->
+<div class="modal fade" id="wsDeleteModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content ws-modal">
+            <div class="modal-header ws-modal-head-danger">
+                <h5 class="modal-title"><i class="fa-solid fa-trash"></i> <span id="wsDeleteTitle">Delete</span></h5>
+            </div>
+            <div class="modal-body">
+                <p class="ws-modal-lead" id="wsDeleteBody"></p>
+                <p class="text-muted" style="font-size: 12px; margin-bottom: 0;">This cannot be undone.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="ws-btn ws-btn-danger" id="wsConfirmDelete"><i class="fa-solid fa-trash"></i> Delete</button>
+                <button class="ws-btn ws-btn-ghost" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Styles {
+    <style>
+        /* ══════════ Process strip (header right) ══════════ */
+        .ws-proc-strip { display: flex; gap: 8px; align-items: center; }
+        .ws-proc { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; padding: 4px 10px; border-radius: 12px; background: var(--bg-card); border: 1px solid var(--border-light); color: var(--text-secondary); }
+        .ws-proc .status-dot { width: 7px; height: 7px; }
+
+        /* ══════════ The stage — what is mounted right now ══════════ */
+        .ws-stage { border-radius: var(--radius-lg); margin-bottom: 16px; overflow: hidden; }
+        .ws-stage-loading { padding: 40px; text-align: center; color: var(--text-muted); background: var(--bg-card); border: 1px solid var(--border-light); border-radius: var(--radius-lg); }
+
+        .ws-mounted { display: flex; align-items: center; gap: 22px; padding: 22px 26px; background: var(--bg-card); border: 1px solid var(--border-light); border-left: 4px solid var(--ws-flavor, var(--accent)); border-radius: var(--radius-lg); box-shadow: var(--shadow-sm); }
+
+        /* Orb — the mount indicator. Pulses while a world is actually serving. */
+        .ws-orb { position: relative; width: 74px; height: 74px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 27px; flex-shrink: 0; background: color-mix(in srgb, var(--ws-flavor, var(--accent)) 12%, transparent); color: var(--ws-flavor, var(--accent)); }
+        .ws-orb::after { content: ''; position: absolute; inset: -6px; border-radius: 50%; border: 2px solid var(--ws-flavor, var(--accent)); opacity: 0; }
+        .ws-orb.live::after { animation: wsPulse 2.4s ease-out infinite; }
+        @@keyframes wsPulse { 0% { opacity: 0.55; transform: scale(0.94); } 70% { opacity: 0; transform: scale(1.14); } 100% { opacity: 0; } }
+
+        .ws-stage-main { flex: 1; min-width: 0; }
+        .ws-stage-eyebrow { display: flex; align-items: center; gap: 8px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 4px; }
+        .ws-live-pip { display: inline-flex; align-items: center; gap: 5px; color: var(--status-online); }
+        .ws-live-pip .status-dot { width: 7px; height: 7px; background: var(--status-online); box-shadow: 0 0 6px rgba(34,197,94,0.5); }
+        .ws-stage-name { font-size: 24px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.02em; line-height: 1.15; }
+        .ws-stage-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+        .ws-stage-meta span { display: inline-flex; align-items: center; gap: 5px; }
+        .ws-stage-actions { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+
+        /* Live counts under the stage */
+        .ws-vitals { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+        .ws-vital { flex: 1; min-width: 108px; padding: 9px 13px; border-radius: var(--radius-md); background: var(--bg-card-alt); border: 1px solid var(--border-light); }
+        .ws-vital-value { font-size: 18px; font-weight: 700; color: var(--text-primary); line-height: 1.2; }
+        .ws-vital-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 1px; }
+
+        /* Empty stage — nothing loaded */
+        .ws-empty-stage { padding: 34px 26px; text-align: center; border: 2px dashed var(--border-medium); border-radius: var(--radius-lg); background: repeating-linear-gradient(45deg, var(--bg-card), var(--bg-card) 10px, var(--bg-card-alt) 10px, var(--bg-card-alt) 20px); }
+        .ws-empty-stage i.ws-empty-icon { font-size: 30px; color: var(--text-muted); opacity: 0.5; display: block; margin-bottom: 10px; }
+        .ws-empty-title { font-size: 16px; font-weight: 700; color: var(--text-secondary); }
+        .ws-empty-sub { font-size: 12.5px; color: var(--text-muted); margin-top: 4px; }
+
+        /* Mounted but the process is down */
+        .ws-stalled-banner { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 8px 12px; border-radius: var(--radius-sm); background: rgba(245,158,11,0.1); color: var(--status-warning); font-size: 12.5px; font-weight: 500; }
+
+        /* ══════════ Job theatre ══════════ */
+        .ws-theatre { background: var(--bg-card); border: 1px solid var(--accent); border-radius: var(--radius-lg); padding: 18px 22px; margin-bottom: 16px; box-shadow: var(--shadow-md); }
+        .ws-theatre.done { border-color: var(--status-online); }
+        .ws-theatre.failed { border-color: var(--status-error); }
+        .ws-theatre-title { font-size: 15px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 9px; }
+        .ws-theatre-sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; margin-bottom: 14px; }
+
+        .ws-steps { display: flex; flex-direction: column; gap: 2px; }
+        .ws-step { display: flex; align-items: center; gap: 11px; padding: 7px 0; font-size: 13px; color: var(--text-muted); position: relative; padding-left: 4px; }
+        .ws-step-icon { width: 20px; text-align: center; font-size: 12px; flex-shrink: 0; }
+        .ws-step.running { color: var(--text-primary); font-weight: 600; }
+        .ws-step.running .ws-step-icon { color: var(--accent); }
+        .ws-step.done { color: var(--text-secondary); }
+        .ws-step.done .ws-step-icon { color: var(--status-online); }
+        .ws-step.failed { color: var(--status-error); font-weight: 600; }
+        .ws-step.skipped { color: var(--text-muted); opacity: 0.65; }
+        .ws-step-detail { margin-left: auto; font-size: 11.5px; color: var(--text-muted); font-family: 'Consolas','Courier New',monospace; }
+        .ws-theatre-error { margin-top: 12px; padding: 9px 12px; border-radius: var(--radius-sm); background: rgba(239,68,68,0.08); color: var(--status-error); font-size: 12.5px; }
+
+        /* ══════════ Lineage rail ══════════ */
+        .ws-lineage { display: flex; flex-direction: column; gap: 4px; }
+        .ws-lineage-row { display: flex; align-items: center; gap: 9px; padding: 6px 0; font-size: 13px; }
+        .ws-lineage-indent { flex-shrink: 0; color: var(--border-medium); font-family: 'Consolas','Courier New',monospace; font-size: 12px; white-space: pre; }
+        .ws-lineage-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; background: var(--ws-flavor, var(--accent)); }
+        .ws-lineage-dot.suspended { background: transparent; border: 2px solid var(--ws-flavor, var(--accent)); }
+        .ws-lineage-name { font-weight: 600; color: var(--text-primary); cursor: pointer; }
+        .ws-lineage-name:hover { color: var(--accent); }
+        .ws-lineage-meta { font-size: 11.5px; color: var(--text-muted); }
+
+        /* ══════════ World shelf ══════════ */
+        .ws-card { padding: 16px 20px; border-bottom: 1px solid var(--border-light); border-left: 3px solid var(--ws-flavor, var(--accent)); transition: background var(--transition-fast); }
+        .ws-card:last-child { border-bottom: none; }
+        .ws-card:hover { background: var(--bg-card-alt); }
+        .ws-card-top { display: flex; align-items: flex-start; gap: 14px; }
+        .ws-card-icon { width: 40px; height: 40px; border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; font-size: 17px; flex-shrink: 0; background: color-mix(in srgb, var(--ws-flavor, var(--accent)) 12%, transparent); color: var(--ws-flavor, var(--accent)); }
+        .ws-card-body { flex: 1; min-width: 0; }
+        .ws-card-name { font-size: 15px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .ws-chip { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 7px; border-radius: 4px; }
+        .ws-chip-flavor { background: color-mix(in srgb, var(--ws-flavor, var(--accent)) 14%, transparent); color: var(--ws-flavor, var(--accent)); }
+        .ws-chip-state-suspended { background: rgba(245,158,11,0.12); color: var(--status-warning); }
+        .ws-chip-state-archived { background: rgba(141,150,160,0.14); color: var(--text-muted); }
+        .ws-chip-materialized { background: rgba(34,197,94,0.12); color: var(--status-online); }
+        .ws-card-notes { font-size: 12.5px; color: var(--text-secondary); margin-top: 3px; }
+        .ws-card-meta { display: flex; gap: 15px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-muted); margin-top: 7px; }
+        .ws-card-meta span { display: inline-flex; align-items: center; gap: 5px; }
+        .ws-card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 11px; }
+
+        /* Snapshot drawer inside a world card */
+        .ws-snaps { margin-top: 12px; border-top: 1px dashed var(--border-light); padding-top: 10px; display: none; }
+        .ws-card.open .ws-snaps { display: block; }
+        .ws-snap { display: flex; align-items: center; gap: 10px; padding: 7px 0; font-size: 12.5px; border-bottom: 1px solid var(--border-light); }
+        .ws-snap:last-child { border-bottom: none; }
+        .ws-snap-kind { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 6px; border-radius: 3px; flex-shrink: 0; }
+        .ws-snap-kind-suspend { background: rgba(59,130,196,0.12); color: #3b82c4; }
+        .ws-snap-kind-safety { background: rgba(245,158,11,0.12); color: var(--status-warning); }
+        .ws-snap-kind-legacy { background: rgba(141,150,160,0.14); color: var(--text-muted); }
+        .ws-snap-kind-fork-origin { background: rgba(168,85,247,0.12); color: #a855f7; }
+        .ws-snap-when { font-family: 'Consolas','Courier New',monospace; color: var(--text-secondary); flex-shrink: 0; }
+        .ws-snap-label { color: var(--accent); font-style: italic; cursor: pointer; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ws-snap-label:hover { text-decoration: underline; }
+        .ws-snap-right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+        .ws-snap-size { font-size: 11px; color: var(--text-muted); }
+
+        /* ══════════ Buttons ══════════ */
+        .ws-btn { display: inline-flex; align-items: center; gap: 6px; border-radius: var(--radius-sm); padding: 5px 12px; font-size: 12.5px; font-weight: 500; cursor: pointer; transition: all var(--transition-fast); border: 1px solid transparent; white-space: nowrap; }
+        .ws-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .ws-btn-accent { background: var(--accent); color: var(--text-on-accent); border-color: var(--accent); }
+        .ws-btn-accent:hover:not(:disabled) { background: var(--accent-hover); }
+        .ws-btn-warn { background: none; border-color: var(--status-warning); color: var(--status-warning); }
+        .ws-btn-warn:hover:not(:disabled) { background: rgba(245,158,11,0.1); }
+        .ws-btn-danger { background: var(--status-error); border-color: var(--status-error); color: #fff; }
+        .ws-btn-danger:hover:not(:disabled) { filter: brightness(0.92); }
+        .ws-btn-ghost { background: none; border-color: var(--border-light); color: var(--text-secondary); }
+        .ws-btn-ghost:hover:not(:disabled) { border-color: var(--border-medium); background: var(--bg-card-alt); color: var(--text-primary); }
+        .ws-btn-lg { padding: 8px 16px; font-size: 13px; font-weight: 600; }
+
+        /* ══════════ Modals ══════════ */
+        .ws-modal { background: var(--bg-card); border: 1px solid var(--border-light); border-radius: var(--radius-lg); }
+        .ws-modal .modal-header { border-bottom: 1px solid var(--border-light); padding: 14px 20px; }
+        .ws-modal .modal-title { font-size: 15px; font-weight: 700; }
+        .ws-modal-head-accent .modal-title { color: var(--accent); }
+        .ws-modal-head-accent { background: var(--accent-light); }
+        .ws-modal-head-warn .modal-title { color: var(--status-warning); }
+        .ws-modal-head-warn { background: rgba(245,158,11,0.08); }
+        .ws-modal-head-danger .modal-title { color: var(--status-error); }
+        .ws-modal-head-danger { background: rgba(239,68,68,0.07); }
+        .ws-modal .modal-body { padding: 18px 20px; }
+        .ws-modal .modal-footer { border-top: 1px solid var(--border-light); gap: 8px; padding: 12px 20px; }
+        .ws-modal-lead { font-size: 13.5px; color: var(--text-secondary); line-height: 1.55; }
+        .ws-modal-lead strong { color: var(--text-primary); }
+
+        /* The exchange visual: outgoing world → incoming world */
+        .ws-exchange { display: flex; align-items: stretch; gap: 12px; margin-bottom: 16px; }
+        .ws-exchange-side { flex: 1; padding: 14px; border-radius: var(--radius-md); border: 1px solid var(--border-light); background: var(--bg-card-alt); border-top: 3px solid var(--ws-flavor, var(--accent)); min-width: 0; }
+        .ws-exchange-role { font-size: 9.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); }
+        .ws-exchange-name { font-size: 15px; font-weight: 700; color: var(--text-primary); margin-top: 3px; word-break: break-word; }
+        .ws-exchange-fate { font-size: 11.5px; margin-top: 5px; font-weight: 600; }
+        .ws-exchange-fate.out { color: var(--status-warning); }
+        .ws-exchange-fate.in { color: var(--status-online); }
+        .ws-exchange-note { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+        .ws-exchange-arrow { display: flex; align-items: center; color: var(--text-muted); font-size: 17px; flex-shrink: 0; }
+
+        .ws-step-preview { display: flex; flex-direction: column; gap: 5px; padding: 12px 14px; border-radius: var(--radius-md); background: var(--bg-card-alt); border: 1px solid var(--border-light); }
+        .ws-step-preview-item { font-size: 12.5px; color: var(--text-secondary); display: flex; align-items: center; gap: 9px; }
+        .ws-step-preview-item i { width: 16px; text-align: center; color: var(--text-muted); font-size: 11px; }
+
+        /* Flavor picker */
+        .ws-flavor-row { display: flex; gap: 8px; flex-wrap: wrap; }
+        .ws-flavor { flex: 1; min-width: 78px; display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 10px 6px; border: 2px solid var(--border-light); border-radius: var(--radius-md); cursor: pointer; transition: all var(--transition-fast); font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
+        .ws-flavor i { font-size: 16px; }
+        .ws-flavor:hover { border-color: var(--accent); }
+        .ws-flavor.active { border-color: var(--accent); background: var(--accent-light); color: var(--accent); }
+
+        .ws-snapshot-pick { margin-top: 14px; }
+
+        /* ══════════ Empty + toast ══════════ */
+        .ws-shelf-empty { text-align: center; padding: 38px 20px; color: var(--text-muted); }
+        .ws-shelf-empty i { font-size: 30px; margin-bottom: 11px; display: block; opacity: 0.4; }
+
+        .ws-toast { position: fixed; bottom: 24px; right: 24px; z-index: 9999; padding: 12px 20px; border-radius: var(--radius-md); font-size: 13px; font-weight: 500; color: #fff; animation: wsToastIn 0.3s ease-out; box-shadow: var(--shadow-lg); max-width: 420px; }
+        .ws-toast.success { background: var(--status-online); }
+        .ws-toast.error { background: var(--status-error); }
+        .ws-toast.info { background: var(--accent); }
+        @@keyframes wsToastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        @@media (max-width: 900px) {
+            .ws-mounted { flex-wrap: wrap; }
+            .ws-stage-actions { flex-direction: row; width: 100%; }
+            .ws-exchange { flex-direction: column; }
+            .ws-exchange-arrow { justify-content: center; transform: rotate(90deg); }
+        }
+    </style>
+}
+
+@section Scripts {
+    <script src="~/js/worlds.js" asp-append-version="true"></script>
+}

@@ -305,6 +305,9 @@ public class CraftingLootifierController : Controller
         if (request == null || request.skillLineId <= 0)
             return Json(new { success = false, error = "No profession selected" });
 
+        using var batch = AuditBatch.Begin(
+            $"Crafting Lootifier — {_dbc.GetProfessionName((uint)request.skillLineId)} profession batch");
+
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
         await EnsureTrackingTables(adminConn);
@@ -335,6 +338,7 @@ public class CraftingLootifierController : Controller
             StateBefore = "{}",
             StateAfter = JsonSerializer.Serialize(new { itemsCreated, basesProcessed, itemsRemapped }),
             IsReversible = true,
+            RevertKind = Services.RevertKind.Registry,
             Success = true,
             Notes = $"Crafting Lootifier profession batch ({_dbc.GetProfessionName((uint)request.skillLineId)}): {itemsCreated} variants across {basesProcessed} items ({itemsRemapped} player-owned items rerolled)"
         });
@@ -398,6 +402,8 @@ public class CraftingLootifierController : Controller
         if (baseItems.Count == 0)
             return Json(new { success = false, error = "No items selected" });
 
+        using var batch = AuditBatch.Begin($"Crafting Lootifier — {baseItems.Count} base item(s)");
+
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
         await EnsureTrackingTables(adminConn);
@@ -417,6 +423,7 @@ public class CraftingLootifierController : Controller
             StateBefore = "{}",
             StateAfter = JsonSerializer.Serialize(new { itemsCreated, basesProcessed, itemsRemapped }),
             IsReversible = true,
+            RevertKind = Services.RevertKind.Registry,
             Success = true,
             Notes = $"Crafting Lootifier: {itemsCreated} variants across {basesProcessed} items ({itemsRemapped} player-owned items rerolled)"
         });
@@ -509,6 +516,10 @@ public class CraftingLootifierController : Controller
     [HttpPost]
     public async Task<IActionResult> Rollback([FromBody] CraftingRollbackRequest request)
     {
+        using var batch = AuditBatch.Begin(
+            "Crafting Lootifier rollback — " +
+            (request is { baseEntry: > 0 } ? $"base item {request.baseEntry}" : "all crafting variants"));
+
         using var mangosConn = _db.Mangos();
         using var adminConn = _db.Admin();
 

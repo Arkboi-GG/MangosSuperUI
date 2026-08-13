@@ -72,7 +72,9 @@ public class ActivityController : Controller
                                 category, action, target_type AS targetType, target_name AS targetName,
                                 target_id AS targetId, ra_command AS raCommand, ra_response AS raResponse,
                                 state_before AS stateBefore, state_after AS stateAfter,
-                                is_reversible AS isReversible, reverses_id AS reversesId, success, notes
+                                is_reversible AS isReversible, reverses_id AS reversesId, success, notes,
+                         batch_id AS batchId, batch_label AS batchLabel, revert_kind AS revertKind,
+                         reverted_at AS revertedAt, reverted_by_id AS revertedById
                          FROM audit_log {where}
                          ORDER BY id DESC
                          LIMIT @limit OFFSET @offset";
@@ -139,7 +141,9 @@ public class ActivityController : Controller
                          category, action, target_type AS targetType, target_name AS targetName,
                          target_id AS targetId, ra_command AS raCommand, ra_response AS raResponse,
                          state_before AS stateBefore, state_after AS stateAfter,
-                         is_reversible AS isReversible, reverses_id AS reversesId, success, notes
+                         is_reversible AS isReversible, reverses_id AS reversesId, success, notes,
+                         batch_id AS batchId, batch_label AS batchLabel, revert_kind AS revertKind,
+                         reverted_at AS revertedAt, reverted_by_id AS revertedById
                   FROM audit_log WHERE id = @id", new { id });
 
             return Json(new { found = entry != null, entry });
