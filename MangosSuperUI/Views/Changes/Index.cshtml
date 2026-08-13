@@ -10,7 +10,7 @@
             <div class="d-flex align-items-center justify-content-between">
                 <div>
                     <h1>Change Graph</h1>
-                    <p>Everything modified through the panel — drill down, then undo exactly what you meant to</p>
+                    <p id="cgSubtitle">What your server has that stock VMaNGOS does not</p>
                 </div>
                 <div class="cg-totals" id="cgTotals"></div>
             </div>
@@ -18,8 +18,46 @@
 
         <div class="content-body">
 
-            <!-- ── Filters ── -->
-            <div class="card mb-3">
+            <!-- ── View switch: what IS different vs what HAPPENED ── -->
+            <div class="cg-viewswitch">
+                <button class="cg-view active" data-view="drift">
+                    <i class="fa-solid fa-code-compare"></i>
+                    <span>Current Drift</span>
+                    <small>What differs from stock right now</small>
+                </button>
+                <button class="cg-view" data-view="history">
+                    <i class="fa-solid fa-clock-rotate-left"></i>
+                    <span>History</span>
+                    <small>Every action ever taken</small>
+                </button>
+            </div>
+
+            <!-- ── Drift controls ── -->
+            <div class="card mb-3" id="cgDriftControls">
+                <div class="card-body">
+                    <div class="d-flex align-items-center gap-3 flex-wrap">
+                        <div class="cg-search-wrap">
+                            <i class="fa-solid fa-magnifying-glass cg-search-icon"></i>
+                            <input type="text" class="form-input cg-search" id="cgDriftSearch"
+                                   placeholder="Search by name or entry id..." autocomplete="off" />
+                        </div>
+
+                        <div class="cg-chips" id="cgModeChips">
+                            <button class="cg-chip active" data-mode="tracked">Tracked</button>
+                            <button class="cg-chip" data-mode="deep">Deep scan</button>
+                        </div>
+
+                        <button class="cg-btn cg-btn-ghost" id="cgRescan" title="Discard cached deep-scan results and measure again">
+                            <i class="fa-solid fa-rotate"></i> Rescan
+                        </button>
+
+                        <div class="cg-mode-note" id="cgModeNote"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ── History filters ── -->
+            <div class="card mb-3" id="cgHistoryControls" style="display: none;">
                 <div class="card-body">
                     <div class="d-flex align-items-center gap-3 flex-wrap">
                         <div class="cg-search-wrap">
@@ -95,6 +133,52 @@
 
 @section Styles {
     <style>
+        /* ══════════ View switch ══════════ */
+        .cg-viewswitch { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+        .cg-view { flex: 1; min-width: 210px; text-align: left; padding: 11px 16px; border-radius: var(--radius-md);
+                   border: 2px solid var(--border-light); background: var(--bg-card); cursor: pointer;
+                   transition: all var(--transition-fast); display: grid;
+                   grid-template-columns: auto 1fr; grid-template-rows: auto auto;
+                   column-gap: 10px; align-items: center; }
+        .cg-view i { grid-row: 1 / span 2; font-size: 17px; color: var(--text-muted); }
+        .cg-view span { font-size: 13.5px; font-weight: 700; color: var(--text-primary); }
+        .cg-view small { font-size: 11px; color: var(--text-muted); }
+        .cg-view:hover { border-color: var(--accent); }
+        .cg-view.active { border-color: var(--accent); background: var(--accent-light); }
+        .cg-view.active i, .cg-view.active span { color: var(--accent); }
+
+        .cg-mode-note { font-size: 11.5px; color: var(--text-muted); margin-left: auto; max-width: 420px; }
+
+        /* ══════════ Drift nodes ══════════ */
+        .cg-status { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+                     padding: 2px 7px; border-radius: 3px; white-space: nowrap; }
+        .cg-status-modified { background: rgba(245,158,11,.13); color: var(--status-warning); }
+        .cg-status-added { background: rgba(34,197,94,.13); color: var(--status-online); }
+        .cg-status-removed { background: rgba(239,68,68,.1); color: var(--status-error); }
+        .cg-status-untracked { background: rgba(168,85,247,.12); color: #a855f7; }
+
+        /* ── Grouped variants: ranks of a spell, Lootifier variants of an item ── */
+        .cg-group { border-bottom: 1px solid var(--border-light); }
+        .cg-group:last-child { border-bottom: none; }
+        .cg-group .cg-row { border-bottom: none; }
+        .cg-group-count { display: inline-block; font-size: 10.5px; font-weight: 700; min-width: 20px;
+                          text-align: center; padding: 1px 6px; border-radius: 9px;
+                          background: var(--accent-subtle); color: var(--accent); }
+        .cg-group-chevron { transition: transform var(--transition-fast); font-size: 10px; }
+        .cg-group.open .cg-group-chevron { transform: rotate(90deg); }
+
+        .cg-children { display: none; background: var(--bg-card-alt);
+                       border-top: 1px dashed var(--border-light); }
+        .cg-group.open .cg-children { display: block; }
+        .cg-child { padding-left: 40px !important; border-bottom: 1px solid var(--border-light) !important; }
+        .cg-child:last-child { border-bottom: none !important; }
+
+        .cg-clean { text-align: center; padding: 44px 20px; background: var(--bg-card);
+                    border: 1px solid var(--border-light); border-radius: var(--radius-lg); }
+        .cg-clean i { font-size: 34px; color: var(--status-online); display: block; margin-bottom: 12px; }
+        .cg-clean-title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
+        .cg-clean-sub { font-size: 12.5px; color: var(--text-muted); margin-top: 5px; }
+
         /* ══════════ Header totals ══════════ */
         .cg-totals { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
         .cg-total { font-size: 11.5px; font-weight: 600; padding: 4px 10px; border-radius: 12px;

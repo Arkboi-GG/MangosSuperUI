@@ -50,6 +50,11 @@ public sealed class BotFallRecorder
     private readonly ZoneSafetyMap _safety;
     private readonly ILogger<BotFallRecorder> _logger;
 
+    // Kill switch (2026-08-13): the recorder writes ~190KB per capture and runs at its
+    // GLOBAL_MAX_PER_MIN cap on a live fleet (~GBs/day). That is a diagnostics tool, not a
+    // default — OFF unless appsettings opts in with "BotDiagnostics:FallRecorder": true.
+    private readonly bool _enabled;
+
     // ~60s before + ~60s after at the 250ms tick → a symmetric ~2-minute window.
     private const int RING_FRAMES = 240;      // BEFORE the trigger (the ring)
     private const int TAIL_FRAMES = 240;      // AFTER the trigger (recorded post-fire)
@@ -91,11 +96,18 @@ public sealed class BotFallRecorder
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
 
-    public BotFallRecorder(HeightMapService height, ZoneSafetyMap safety, ILogger<BotFallRecorder> logger)
+    public BotFallRecorder(HeightMapService height, ZoneSafetyMap safety, ILogger<BotFallRecorder> logger,
+        IConfiguration config)
     {
         _height = height;
         _safety = safety;
         _logger = logger;
+        _enabled = config.GetValue("BotDiagnostics:FallRecorder", false);
+        if (!_enabled)
+        {
+            _logger.LogInformation("BotFallRecorder: disabled (default) — set BotDiagnostics:FallRecorder=true to capture fall/stray black boxes");
+            return;
+        }
         try { Directory.CreateDirectory(FALL_DIR); Directory.CreateDirectory(STRAY_DIR); }
         catch (Exception ex) { _logger.LogWarning(ex, "BotFallRecorder: could not create diagnostics dirs under {Dir}", BASE_DIR); }
     }
@@ -181,6 +193,8 @@ public sealed class BotFallRecorder
     /// </summary>
     public void Observe(BotContext ctx)
     {
+        if (!_enabled) return;
+
         var t = _tracks.GetOrAdd(ctx.Guid, _ => new Track());
 
         float z = ctx.Pos.Z;

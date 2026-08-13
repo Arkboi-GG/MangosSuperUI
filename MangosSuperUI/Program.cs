@@ -45,6 +45,7 @@ builder.Services.AddSingleton<StateCaptureService>();
 builder.Services.AddSingleton<AuditService>();
 builder.Services.AddSingleton<WorldStateService>();   // world suspend/resume — registry lives on disk, not in a swappable DB
 builder.Services.AddSingleton<ChangeGraphService>();  // audit_log as a drillable graph, with entry/batch undo
+builder.Services.AddSingleton<DivergenceService>();   // live drift vs og_* baselines — the state view behind the graph
 builder.Services.AddSingleton<DbcService>();
 builder.Services.AddSingleton<HeightMapService>();
 builder.Services.AddSingleton<BotBridgeService>();

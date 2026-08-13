@@ -367,43 +367,106 @@ public class ChangeGraphService
             entry,
             diff,
             diffNote,
-            revert = DescribeRevert(entry),
+            revert = await DescribeRevertAsync(entry),
         };
     }
 
     /// <summary>
     /// What the undo button will actually do, in plain terms, so the confirm dialog can be
     /// specific instead of saying "revert this?".
+    ///
+    /// Every answer is checked against the live tables, not against the audit row alone. The
+    /// log records that something happened, never whether the result still stands — an entry
+    /// cloned and later deleted still carries a 'delete_custom' row, and offering to delete
+    /// it again produces a button that cannot possibly succeed.
     /// </summary>
-    private static object DescribeRevert(AuditLogRow e)
+    private async Task<object> DescribeRevertAsync(AuditLogRow e)
     {
         if (e.RevertedAt != null)
             return new { available = false, reason = "Already reverted." };
         if (!e.Success)
             return new { available = false, reason = "This action failed, so there is nothing to undo." };
 
-        return e.RevertKind switch
+        var table = ResolveTable(e.TargetType);
+
+        switch (e.RevertKind)
         {
-            RevertKind.Baseline => ResolveTable(e.TargetType) is { } t
-                ? new { available = true, summary = $"Restore {t} #{e.TargetId} from the og_{t} baseline." }
-                : new { available = false, reason = $"No baseline table is mapped for target type '{e.TargetType}'." },
-
-            RevertKind.StateBefore => string.IsNullOrWhiteSpace(e.StateBefore)
-                ? new { available = false, reason = "No before-state was captured for this change." }
-                : ResolveTable(e.TargetType) is { } t2
-                    ? new { available = true, summary = $"Re-apply the captured {t2} rows for #{e.TargetId}." }
-                    : new { available = false, reason = $"No table is mapped for target type '{e.TargetType}'." },
-
-            RevertKind.DeleteCustom => new { available = true, summary = "Delete what this change created." },
-
-            RevertKind.Registry => new
+            case RevertKind.Baseline:
             {
-                available = false,
-                reason = "This tool owns its own rollback — use the Rollback action on its page so its registry tables stay consistent.",
-            },
+                if (table == null)
+                    return new { available = false, reason = $"No baseline table is mapped for target type '{e.TargetType}'." };
+                if (e.TargetId is not > 0)
+                    return new { available = false, reason = "This entry has no target id to restore." };
 
-            _ => new { available = false, reason = "No undo path is defined for this kind of change." },
-        };
+                using var admin = _db.Admin();
+                var ogTable = "og_" + table;
+                if (!await TableExistsAsync(admin, ogTable))
+                    return new { available = false, reason = $"Baseline table {ogTable} does not exist yet." };
+
+                var hasBaseline = await admin.ExecuteScalarAsync<int>(
+                    $"SELECT COUNT(*) FROM `{ogTable}` WHERE entry = @e", new { e = e.TargetId }) > 0;
+
+                return hasBaseline
+                    ? new { available = true, summary = $"Restore {table} #{e.TargetId} from the {ogTable} baseline." }
+                    : new
+                    {
+                        available = false,
+                        reason = $"{table} #{e.TargetId} has no baseline row — it was created after the snapshot, so there is nothing to restore it to.",
+                    };
+            }
+
+            case RevertKind.StateBefore:
+            {
+                if (string.IsNullOrWhiteSpace(e.StateBefore))
+                    return new { available = false, reason = "No before-state was captured for this change." };
+                if (table == null)
+                    return new { available = false, reason = $"No table is mapped for target type '{e.TargetType}'." };
+                return new { available = true, summary = $"Re-apply the captured {table} rows for #{e.TargetId}." };
+            }
+
+            case RevertKind.DeleteCustom:
+            {
+                var (exists, what) = await CreatedThingStillExistsAsync(e);
+                return exists
+                    ? new { available = true, summary = $"Delete {what}." }
+                    : new { available = false, reason = $"{what} no longer exists — this change has already been undone." };
+            }
+
+            case RevertKind.Registry:
+                return new
+                {
+                    available = false,
+                    reason = "This tool owns its own rollback — use the Rollback action on its page so its registry tables stay consistent.",
+                };
+
+            default:
+                return new { available = false, reason = "No undo path is defined for this kind of change." };
+        }
+    }
+
+    /// <summary>
+    /// Does the thing a creation-type change made still exist? Returns a description either
+    /// way so the UI can name it rather than saying "the target".
+    /// </summary>
+    private async Task<(bool exists, string what)> CreatedThingStillExistsAsync(AuditLogRow e)
+    {
+        var entry = e.Action == "spell_completer_run"
+            ? ParseCompleterSummary(e.StateAfter).entry
+            : e.TargetId ?? 0;
+
+        if (entry <= 0) return (false, "the created row");
+
+        var table = e.Action is "spell_completer_run" or "spell_clone"
+            ? "spell_template"
+            : ResolveTable(e.TargetType);
+
+        if (table == null) return (false, $"#{entry}");
+
+        using var mangos = _db.Mangos();
+        var count = await mangos.ExecuteScalarAsync<int>(
+            $"SELECT COUNT(*) FROM `{table}` WHERE entry = @e", new { e = entry });
+
+        return (count > 0, $"{table} #{entry}");
     }
 
     private static readonly Dictionary<string, string> TargetTables = new(StringComparer.OrdinalIgnoreCase)

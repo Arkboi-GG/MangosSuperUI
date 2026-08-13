@@ -12,38 +12,9 @@ public class InstancesController : Controller
     private readonly DbcService _dbc;
     private readonly AuditService _audit;
 
-    // Instance metadata: map ID → (name, category, level range)
-    private static readonly List<InstanceInfo> INSTANCES = new()
-    {
-        // Dungeons
-        new(389, "Ragefire Chasm", "dungeon", "13-18"),
-        new(36,  "Deadmines", "dungeon", "17-21"),
-        new(43,  "Wailing Caverns", "dungeon", "17-24"),
-        new(34,  "The Stockade", "dungeon", "22-30"),
-        new(33,  "Shadowfang Keep", "dungeon", "22-30"),
-        new(48,  "Blackfathom Deeps", "dungeon", "24-32"),
-        new(47,  "Razorfen Kraul", "dungeon", "29-38"),
-        new(90,  "Gnomeregan", "dungeon", "29-38"),
-        new(189, "Scarlet Monastery", "dungeon", "28-45"),
-        new(129, "Razorfen Downs", "dungeon", "37-46"),
-        new(70,  "Uldaman", "dungeon", "41-51"),
-        new(209, "Zul'Farrak", "dungeon", "44-54"),
-        new(349, "Maraudon", "dungeon", "46-55"),
-        new(109, "Sunken Temple", "dungeon", "50-56"),
-        new(230, "Blackrock Depths", "dungeon", "52-60"),
-        new(229, "Blackrock Spire", "dungeon", "55-60"),
-        new(429, "Dire Maul", "dungeon", "55-60"),
-        new(329, "Stratholme", "dungeon", "58-60"),
-        new(289, "Scholomance", "dungeon", "58-60"),
-        // Raids
-        new(249, "Onyxia's Lair", "raid", "60"),
-        new(409, "Molten Core", "raid", "60"),
-        new(469, "Blackwing Lair", "raid", "60"),
-        new(309, "Zul'Gurub", "raid", "60"),
-        new(509, "Ruins of Ahn'Qiraj", "raid", "60"),
-        new(531, "Temple of Ahn'Qiraj", "raid", "60"),
-        new(533, "Naxxramas", "raid", "60")
-    };
+    // Instance metadata lives in Services/InstanceCatalog so non-controller code can
+    // name a map too. Single source of truth — this is just the local alias.
+    private static List<InstanceInfo> INSTANCES => MangosSuperUI.Services.InstanceCatalog.All;
 
     public InstancesController(ConnectionFactory db, DbcService dbc, AuditService audit)
     {
@@ -76,47 +47,11 @@ public class InstancesController : Controller
         return Json(result);
     }
 
-    // ── Curated boss list (loaded from JSON) ────────────────────────────
-    private static Dictionary<int, List<BossEntry>>? _bossMap;
-    private static readonly object _bossLock = new();
-
+    // ── Curated boss list ───────────────────────────────────────────────
+    // Loaded and cached by Services/InstanceCatalog so the Change Graph names the same
+    // bosses, in the same order, from the same file.
     private Dictionary<int, List<BossEntry>> GetBossMap(IWebHostEnvironment? env = null)
-    {
-        if (_bossMap != null) return _bossMap;
-        lock (_bossLock)
-        {
-            if (_bossMap != null) return _bossMap;
-            _bossMap = new Dictionary<int, List<BossEntry>>();
-
-            // Load from wwwroot/data/instance-bosses.json
-            var path = Path.Combine(
-                env?.WebRootPath ?? "wwwroot",
-                "data", "instance-bosses.json");
-
-            if (System.IO.File.Exists(path))
-            {
-                var json = System.IO.File.ReadAllText(path);
-                var doc = JsonDocument.Parse(json);
-                foreach (var inst in doc.RootElement.GetProperty("instances").EnumerateArray())
-                {
-                    var mapId = inst.GetProperty("mapId").GetInt32();
-                    var bosses = new List<BossEntry>();
-                    foreach (var b in inst.GetProperty("bosses").EnumerateArray())
-                    {
-                        bosses.Add(new BossEntry
-                        {
-                            Entry = b.GetProperty("entry").GetInt32(),
-                            Name = b.GetProperty("name").GetString() ?? "",
-                            Order = b.GetProperty("order").GetInt32(),
-                            Optional = b.TryGetProperty("optional", out var opt) && opt.GetBoolean()
-                        });
-                    }
-                    _bossMap[mapId] = bosses;
-                }
-            }
-            return _bossMap;
-        }
-    }
+        => MangosSuperUI.Services.InstanceCatalog.BossMap(env?.WebRootPath);
 
     // ===================== INSTANCE CREATURES =====================
 

@@ -271,14 +271,30 @@ public class DbInitializationService
             }
 
             // Existing history predates revert_kind and would show up in the graph as
-            // permanently un-undoable. Classify it once, from the action names that were
-            // already being written, so the graph is useful against history from day one.
-            if (added > 0)
+            // permanently un-undoable. Classify it from the action names that were already
+            // being written, so the graph is useful against history from day one.
+            //
+            // Version-gated rather than run-once: the classifier gets corrected as its
+            // blind spots surface, and a fix is worthless if it never reaches the rows that
+            // were misclassified by the previous version. Re-running is safe because the
+            // classifier is deterministic and agrees with every revert_kind the controllers
+            // set explicitly at insert time.
+            await conn.ExecuteAsync(Sql_SchemaMeta);
+
+            var storedVersion = await conn.ExecuteScalarAsync<int?>(
+                "SELECT CAST(meta_value AS SIGNED) FROM schema_meta WHERE meta_key = 'revert_classifier'");
+
+            if (storedVersion is null || storedVersion < RevertClassifierVersion)
             {
                 var classified = await BackfillRevertKindsAsync(conn);
-                if (classified > 0)
-                    _logger.LogInformation(
-                        "DbInitializationService: Classified revert_kind on {Count} existing audit rows", classified);
+                await conn.ExecuteAsync(
+                    @"INSERT INTO schema_meta (meta_key, meta_value) VALUES ('revert_classifier', @v)
+                      ON DUPLICATE KEY UPDATE meta_value = @v, updated_at = CURRENT_TIMESTAMP(3)",
+                    new { v = RevertClassifierVersion.ToString() });
+
+                _logger.LogInformation(
+                    "DbInitializationService: Classified revert_kind on {Count} audit rows (classifier v{From} → v{To})",
+                    classified, storedVersion?.ToString() ?? "none", RevertClassifierVersion);
             }
         }
         catch (Exception ex)
@@ -289,37 +305,71 @@ public class DbInitializationService
     }
 
     /// <summary>
-    /// One-time classification of pre-existing audit rows into revert strategies.
-    /// Only touches rows still sitting at the 'none' default, so re-running is harmless
-    /// and never overwrites a kind a controller set deliberately.
+    /// Bump when the CASE below changes so corrected rules reach rows the previous
+    /// version misclassified.
+    /// v1 → v2: deletions are never revertable, and custom-range entries (spells 40000-49999,
+    ///          items/objects 900000+) are 'delete_custom' rather than 'baseline' — they have
+    ///          no og_* row, so the baseline restore they advertised could never succeed.
+    /// </summary>
+    private const int RevertClassifierVersion = 2;
+
+    /// <summary>
+    /// Classifies audit rows into revert strategies. Deterministic and idempotent: it runs
+    /// over every successful row, not just unclassified ones, so a corrected classifier can
+    /// repair earlier mistakes. Every value a controller sets explicitly at insert time
+    /// matches what this produces, so re-running never fights the write path.
     /// </summary>
     private static async Task<int> BackfillRevertKindsAsync(MySqlConnection conn)
     {
-        // action/target_type → revert strategy. Each UPDATE only touches rows still at the
-        // 'none' default, so the FIRST matching rule wins — order runs most specific to
-        // least. Getting this backwards would classify spell_clone as 'baseline', and a
-        // cloned 40000+ spell has no og_spell_template row to go back to.
-        // Anything unmatched stays 'none' rather than promising an undo that would fail.
-        var rules = new (string Kind, string Where)[]
-        {
-            // Tools that own a rollback path through their own registry tables.
-            ("registry", "action LIKE 'lootifier\\_%' OR action LIKE 'quest\\_lootifier\\_%' OR action LIKE 'crafting\\_lootifier\\_%'"),
-            // Creations: undoing means deleting what was made, not restoring a baseline.
-            ("delete_custom", "action IN ('spell_clone','spell_completer_run','patch_generate') OR target_type IN ('item_custom','gameobject_custom')"),
-            // Edits to base-game rows go back via the og_* snapshot tables.
-            ("baseline", "target_type IN ('item_base_game','item_template','spell_template','gameobject_base_game','gameobject_template','creature_loot','loot_row','loot_table','loot_tables')"),
-            // Whatever is left but captured its own before-state can be re-applied directly.
-            ("state_before", "state_before IS NOT NULL AND CHAR_LENGTH(state_before) > 2"),
-        };
+        // One UPDATE with an ordered CASE rather than a sequence of UPDATEs. Sequential
+        // rules relied on matched rows leaving the revert_kind='none' pool, which makes it
+        // impossible to express "deletions are NEVER revertable" — assigning 'none' does
+        // not remove a row, so a later rule would still claim it. CASE makes precedence
+        // explicit and evaluates each row exactly once.
+        //
+        // Custom-content entry ranges matter here. A cloned spell lives at 40000-49999 and
+        // custom items/objects at 900000+; none of them have an og_* row, so classifying
+        // them 'baseline' would offer a restore that cannot possibly work.
+        const string customSpell = "(target_id BETWEEN 40000 AND 49999)";
+        const string customItem = "(target_id >= 900000)";
 
-        var total = 0;
-        foreach (var (kind, where) in rules)
-        {
-            total += await conn.ExecuteAsync(
-                $"UPDATE audit_log SET revert_kind = @kind WHERE success = 1 AND revert_kind = 'none' AND ({where})",
-                new { kind });
-        }
-        return total;
+        var sql = $@"
+            UPDATE audit_log SET revert_kind = CASE
+
+                -- Deletions removed something and captured no before-state. There is
+                -- nothing to put back, so they are never revertable.
+                WHEN action LIKE '%\_delete' AND (state_before IS NULL OR CHAR_LENGTH(state_before) <= 2)
+                    THEN 'none'
+
+                -- Tools that own a rollback path through their own registry tables.
+                WHEN action LIKE 'lootifier\_%' OR action LIKE 'quest\_lootifier\_%'
+                     OR action LIKE 'crafting\_lootifier\_%'
+                    THEN 'registry'
+
+                -- Creations: undoing means deleting what was made.
+                WHEN action IN ('spell_clone','spell_completer_run','patch_generate')
+                     OR target_type IN ('item_custom','gameobject_custom')
+                     OR (target_type = 'spell_template' AND {customSpell})
+                     OR (target_type IN ('item_template','item_base_game') AND {customItem})
+                     OR (target_type IN ('gameobject_template','gameobject_base_game') AND {customItem})
+                    THEN 'delete_custom'
+
+                -- Edits to base-game rows go back via the og_* snapshot tables. Custom
+                -- ranges are already handled above, so anything reaching here has a baseline.
+                WHEN target_type IN ('item_base_game','item_template','spell_template',
+                                     'gameobject_base_game','gameobject_template',
+                                     'creature_loot','loot_row','loot_table','loot_tables')
+                    THEN 'baseline'
+
+                -- Whatever is left but captured its own before-state can be re-applied.
+                WHEN state_before IS NOT NULL AND CHAR_LENGTH(state_before) > 2
+                    THEN 'state_before'
+
+                ELSE 'none'
+            END
+            WHERE success = 1";
+
+        return await conn.ExecuteAsync(sql);
     }
 
     // ==================== DDL Statements ====================
@@ -398,6 +448,15 @@ public class DbInitializationService
     private const string Sql_ScheduledActionsIndexes = @"
         CREATE INDEX idx_execute_at ON scheduled_actions (execute_at);
         CREATE INDEX idx_status     ON scheduled_actions (status);";
+
+    // Tiny key/value table for migration bookkeeping — lets data migrations be versioned
+    // and re-run when their logic is corrected, instead of firing once and never again.
+    private const string Sql_SchemaMeta = @"
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            meta_key        VARCHAR(64)     NOT NULL PRIMARY KEY,
+            meta_value      VARCHAR(255)    NOT NULL,
+            updated_at      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+        ) ENGINE=InnoDB;";
 
     private const string Sql_OgBaselineMeta = @"
         CREATE TABLE IF NOT EXISTS og_baseline_meta (
