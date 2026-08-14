@@ -10,9 +10,14 @@
             <div class="d-flex align-items-center justify-content-between">
                 <div>
                     <h1>World State</h1>
-                    <p>Suspend the running world, park it, and resume another in its place</p>
+                    <p>Suspend the current world, park it, and resume another through a validated restore</p>
                 </div>
-                <div class="ws-proc-strip" id="wsProcStrip"></div>
+                <div class="d-flex align-items-center gap-2">
+                    <button class="ws-btn ws-btn-accent ws-btn-lg" id="wsBtnCreateRts">
+                        <i class="fa-solid fa-plus"></i> New RTS World
+                    </button>
+                    <div class="ws-proc-strip" id="wsProcStrip"></div>
+                </div>
             </div>
         </div>
 
@@ -43,7 +48,12 @@
             <div class="card">
                 <div class="card-header d-flex align-items-center justify-content-between">
                     <span><i class="fa-solid fa-layer-group" style="color: var(--accent);"></i> Parked Worlds</span>
-                    <span class="text-muted" style="font-size: 12px;" id="wsShelfCount"></span>
+                    <div class="d-flex align-items-center gap-2">
+                        <button class="ws-btn ws-btn-ghost ws-new-rts-inline" type="button">
+                            <i class="fa-solid fa-plus"></i> New RTS World
+                        </button>
+                        <span class="text-muted" style="font-size: 12px;" id="wsShelfCount"></span>
+                    </div>
                 </div>
                 <div class="card-body p-0" id="wsShelf">
                     <div class="text-center p-4 text-muted">
@@ -65,13 +75,13 @@
             </div>
             <div class="modal-body">
                 <p class="ws-modal-lead">
-                    <strong id="wsSuspendName"></strong> will be unloaded. The server stops, every group is
-                    frozen to disk, and <strong>nothing will be mounted</strong> until you resume a world.
+                    <strong id="wsSuspendName"></strong> will be unloaded. This owner-initiated action stops
+                    mangosd and realmd, captures every group, and leaves no world serving until one is resumed.
                 </p>
                 <div class="ws-step-preview">
                     <div class="ws-step-preview-item"><i class="fa-solid fa-power-off"></i> Stop mangosd &amp; realmd</div>
-                    <div class="ws-step-preview-item"><i class="fa-solid fa-snowflake"></i> Freeze world, characters &amp; core</div>
-                    <div class="ws-step-preview-item"><i class="fa-solid fa-box-archive"></i> Park the world on the shelf</div>
+                    <div class="ws-step-preview-item"><i class="fa-solid fa-snowflake"></i> Capture and validate world, players &amp; core artifacts</div>
+                    <div class="ws-step-preview-item"><i class="fa-solid fa-box-archive"></i> Park the world; leave no world serving players</div>
                 </div>
                 <label class="form-label" style="margin-top: 14px;">Note for this suspend point</label>
                 <input type="text" class="form-input" id="wsSuspendLabel"
@@ -98,11 +108,30 @@
                 <!-- The exchange: what leaves, what arrives -->
                 <div class="ws-exchange" id="wsExchange"></div>
 
-                <div class="ws-step-preview" id="wsResumeSteps"></div>
-
                 <div class="ws-snapshot-pick" id="wsSnapshotPick" style="display: none;">
-                    <label class="form-label">Resume from</label>
+                    <label class="form-label">Resume from snapshot</label>
                     <select class="form-input" id="wsSnapshotSelect"></select>
+                </div>
+
+                <label class="ws-check-row" for="wsForceFullRestore">
+                    <input type="checkbox" id="wsForceFullRestore" />
+                    <span>
+                        <strong>Force full restore</strong>
+                        <small>Validate and restore the selected snapshot even when this world's data is already materialized.</small>
+                    </span>
+                </label>
+
+                <div class="ws-preflight" id="wsResumePreflight">
+                    <div class="ws-preflight-loading"><i class="fa-solid fa-spinner fa-spin"></i> Running read-only preflight...</div>
+                </div>
+
+                <div class="ws-resume-config" id="wsResumeConfiguration">
+                    <div class="ws-preflight-loading"><i class="fa-solid fa-spinner fa-spin"></i> Reading captured launch configuration...</div>
+                </div>
+
+                <div class="ws-owner-note">
+                    <i class="fa-solid fa-key"></i>
+                    <span>This owner-initiated action validates the selection, restores when needed, and starts realmd and mangosd.</span>
                 </div>
             </div>
             <div class="modal-footer">
@@ -115,7 +144,95 @@
     </div>
 </div>
 
-<!-- ══════════ World Editor Modal (create fork / edit) ══════════ -->
+<!-- Create a parked, zero-roster RTS campaign -->
+<div class="modal fade" id="wsCreateRtsModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-xl modal-dialog-scrollable">
+        <div class="modal-content ws-modal">
+            <div class="modal-header ws-modal-head-accent">
+                <h5 class="modal-title"><i class="fa-solid fa-chess-rook"></i> New RTS World</h5>
+            </div>
+            <div class="modal-body">
+                <div class="ws-owner-note mb-3">
+                    <i class="fa-solid fa-box-archive"></i>
+                    <span>Creation builds and validates a parked world only. It does not restore databases or start services.</span>
+                </div>
+
+                <div class="ws-create-grid">
+                    <section class="ws-create-section">
+                        <h6>Campaign</h6>
+                        <label class="form-label" for="wsCreateName">World name</label>
+                        <input type="text" class="form-input" id="wsCreateName" value="RTS Campaign" />
+
+                        <label class="form-label mt-3" for="wsCreateSource">Clean-template source</label>
+                        <select class="form-input" id="wsCreateSource"></select>
+                        <div class="ws-source-status" id="wsCreateSourceStatus"></div>
+
+                        <label class="form-label mt-3" for="wsCreateNotes">Notes</label>
+                        <textarea class="form-input" id="wsCreateNotes" rows="2" placeholder="Purpose, ruleset, or milestone"></textarea>
+                    </section>
+
+                    <section class="ws-create-section">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <h6>Capacity</h6>
+                            <span class="ws-chip ws-chip-flavor" id="wsCreateProfile">rts-r1-v1</span>
+                        </div>
+                        <div class="ws-field-grid">
+                            <label class="ws-fixed-field"><span>Realm ID</span><strong id="wsCfgRealmIdText">Select a source</strong><small>Inherited from the snapshot; not editable.</small></label>
+                            <label><span>PlayerLimit</span><input class="form-input" type="number" id="wsCfgPlayerLimit" min="1" max="100000" step="1" value="2600" /></label>
+                            <label><span>PlayerHardLimit</span><input class="form-input" type="number" id="wsCfgPlayerHardLimit" min="0" max="100000" step="1" value="2600" /></label>
+                            <label><span>LoginPerTick</span><input class="form-input" type="number" id="wsCfgLoginPerTick" min="0" max="100" step="1" value="0" /></label>
+                            <label><span>RTS state flush (ms)</span><input class="form-input" type="number" id="wsCfgStateFlushMs" min="1000" max="600000" step="1000" value="30000" /></label>
+                            <label><span>Alliance bot cap</span><input class="form-input" type="number" id="wsCfgAllianceBotCap" min="0" max="50000" step="1" value="1250" /></label>
+                            <label><span>Horde bot cap</span><input class="form-input" type="number" id="wsCfgHordeBotCap" min="0" max="50000" step="1" value="1250" /></label>
+                        </div>
+                        <div class="ws-field-help">PlayerHardLimit must be 0 or at least PlayerLimit. LoginPerTick 0 preserves the current unrestricted-login behavior.</div>
+                        <div class="ws-field-help" id="wsCreateCapacitySummary">Combined bot caps consume session capacity; the remainder is human/login headroom.</div>
+                    </section>
+                </div>
+
+                <section class="ws-create-section mt-3">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <h6>RTS tuning</h6>
+                        <span class="text-muted" style="font-size: 11.5px;">Fields are supplied by the server profile</span>
+                    </div>
+                    <div class="ws-rate-sections" id="wsRateFields">
+                        <div class="text-muted" style="font-size: 12px;"><i class="fa-solid fa-spinner fa-spin"></i> Loading profile fields...</div>
+                    </div>
+                </section>
+
+                <div class="ws-create-grid mt-3">
+                    <section class="ws-create-section">
+                        <h6><i class="fa-solid fa-shield-halved"></i> Preserved from source</h6>
+                        <ul class="ws-summary-list ws-summary-keep" id="wsCreatePreserve">
+                            <li>Game-world content, core source, SQL baseline and server profile</li>
+                            <li>Human accounts and authentication settings</li>
+                            <li>Global admin configuration and bot name pool</li>
+                        </ul>
+                    </section>
+                    <section class="ws-create-section">
+                        <h6><i class="fa-solid fa-broom"></i> Reset for this campaign</h6>
+                        <ul class="ws-summary-list ws-summary-reset" id="wsCreateReset">
+                            <li>0 characters and 0 persisted bots</li>
+                            <li>Realm character counts and bot-bound admin state</li>
+                            <li>R1 module rule/runtime tables, faction state and rotation assignments start empty</li>
+                        </ul>
+                    </section>
+                </div>
+
+                <div class="ws-create-validation" id="wsCreateValidation"></div>
+            </div>
+            <div class="modal-footer">
+                <span class="text-muted me-auto" style="font-size: 11.5px;">The new world appears on the Parked Worlds shelf when validation completes.</span>
+                <button class="ws-btn ws-btn-accent" id="wsConfirmCreateRts">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i> Create Parked RTS World
+                </button>
+                <button class="ws-btn ws-btn-ghost" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- World Editor Modal (fork / edit) -->
 <div class="modal fade" id="wsEditModal" tabindex="-1">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content ws-modal">
@@ -333,6 +450,55 @@
 
         .ws-snapshot-pick { margin-top: 14px; }
 
+        /* Restore preflight and configuration-driven RTS creation */
+        .ws-check-row { display: flex; align-items: flex-start; gap: 10px; margin-top: 14px; padding: 11px 13px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--bg-card-alt); cursor: pointer; }
+        .ws-check-row input { margin-top: 3px; }
+        .ws-check-row span { display: flex; flex-direction: column; gap: 2px; color: var(--text-primary); font-size: 12.5px; }
+        .ws-check-row small { color: var(--text-muted); line-height: 1.35; }
+        .ws-preflight { margin-top: 14px; border: 1px solid var(--border-light); border-radius: var(--radius-md); overflow: hidden; }
+        .ws-preflight-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--bg-card-alt); border-bottom: 1px solid var(--border-light); }
+        .ws-preflight-title { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 700; color: var(--text-primary); }
+        .ws-preflight-loading { padding: 16px; text-align: center; font-size: 12.5px; color: var(--text-muted); }
+        .ws-preflight-body { padding: 11px 12px; display: flex; flex-direction: column; gap: 8px; }
+        .ws-preflight-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+        .ws-status-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 4px; font-size: 10.5px; font-weight: 700; background: var(--bg-card-alt); color: var(--text-secondary); border: 1px solid var(--border-light); }
+        .ws-status-badge.good { color: var(--status-online); border-color: color-mix(in srgb, var(--status-online) 35%, var(--border-light)); }
+        .ws-status-badge.warn { color: var(--status-warning); border-color: color-mix(in srgb, var(--status-warning) 35%, var(--border-light)); }
+        .ws-status-badge.bad { color: var(--status-error); border-color: color-mix(in srgb, var(--status-error) 35%, var(--border-light)); }
+        .ws-message-list { margin: 0; padding-left: 19px; font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+        .ws-message-list.blockers { color: var(--status-error); }
+        .ws-message-list.warnings { color: var(--status-warning); }
+        .ws-artifact-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 10px; padding-top: 3px; }
+        .ws-artifact { min-width: 0; font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ws-artifact.good i { color: var(--status-online); }
+        .ws-artifact.bad i { color: var(--status-error); }
+        .ws-owner-note { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; padding: 10px 12px; border-radius: var(--radius-md); background: var(--accent-light); color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+        .ws-owner-note i { color: var(--accent); margin-top: 2px; }
+        .ws-resume-config { margin-top: 14px; padding: 13px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--bg-card-alt); }
+        .ws-resume-config h6 { margin: 0 0 4px; font-size: 12px; font-weight: 800; color: var(--text-primary); text-transform: uppercase; letter-spacing: 0.05em; }
+        .ws-resume-config-intro { margin-bottom: 11px; font-size: 11.5px; color: var(--text-muted); }
+        .ws-config-summary { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+        .ws-create-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+        .ws-create-section { padding: 14px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--bg-card-alt); }
+        .ws-create-section h6 { margin: 0 0 11px; font-size: 12px; font-weight: 800; color: var(--text-primary); text-transform: uppercase; letter-spacing: 0.05em; }
+        .ws-field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 11px; }
+        .ws-field-grid label, .ws-rate-field { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; font-weight: 600; color: var(--text-secondary); min-width: 0; }
+        .ws-fixed-field { justify-content: center; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); background: var(--bg-card); }
+        .ws-fixed-field strong { color: var(--text-primary); font-size: 14px; }
+        .ws-fixed-field small { color: var(--text-muted); font-weight: 400; line-height: 1.25; }
+        .ws-field-help { margin-top: 9px; color: var(--text-muted); font-size: 10.5px; line-height: 1.4; }
+        .ws-rate-section + .ws-rate-section { margin-top: 13px; }
+        .ws-rate-heading { margin-bottom: 7px; font-size: 11px; font-weight: 700; color: var(--text-secondary); }
+        .ws-rate-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+        .ws-rate-field small { color: var(--text-muted); font-weight: 400; line-height: 1.3; }
+        .ws-source-status { margin-top: 8px; min-height: 22px; font-size: 11.5px; color: var(--text-muted); }
+        .ws-summary-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: var(--text-secondary); }
+        .ws-summary-list li { display: flex; gap: 7px; line-height: 1.4; }
+        .ws-summary-list li::before { font-family: "Font Awesome 6 Free"; font-weight: 900; flex-shrink: 0; }
+        .ws-summary-keep li::before { content: "\f00c"; color: var(--status-online); }
+        .ws-summary-reset li::before { content: "\f1f8"; color: var(--status-warning); }
+        .ws-create-validation { margin-top: 13px; }
+
         /* ══════════ Empty + toast ══════════ */
         .ws-shelf-empty { text-align: center; padding: 38px 20px; color: var(--text-muted); }
         .ws-shelf-empty i { font-size: 30px; margin-bottom: 11px; display: block; opacity: 0.4; }
@@ -348,6 +514,9 @@
             .ws-stage-actions { flex-direction: row; width: 100%; }
             .ws-exchange { flex-direction: column; }
             .ws-exchange-arrow { justify-content: center; transform: rotate(90deg); }
+            .ws-create-grid { grid-template-columns: 1fr; }
+            .ws-rate-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .ws-field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         }
     </style>
 }

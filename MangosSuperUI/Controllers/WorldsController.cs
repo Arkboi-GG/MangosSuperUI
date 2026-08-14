@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
+using MangosSuperUI.Models;
 using MangosSuperUI.Services;
 
 namespace MangosSuperUI.Controllers;
@@ -46,6 +47,128 @@ public class WorldsController : Controller
     [HttpGet]
     public IActionResult Job() => Json(new { job = _worlds.CurrentJob });
 
+    /// <summary>
+    /// GET /Worlds/Preflight — validate the selected snapshot before a resume job is accepted.
+    /// This is read-only; Resume performs the same validation again inside the job.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> Preflight(
+        string? worldId,
+        string? snapshot = null,
+        bool forceFullRestore = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(worldId))
+            return Json(new { success = false, error = "Missing worldId" });
+
+        try
+        {
+            var preflight = await _worlds.PreflightResumeAsync(
+                worldId, snapshot, forceFullRestore, cancellationToken);
+            return Json(new { success = true, preflight });
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// GET /Worlds/CreateOptions — profile metadata and snapshots which can seed a clean RTS world.
+    /// Eligibility here is a cheap manifest check; CreateRts performs full hash validation.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> CreateOptions(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var registry = await _worlds.GetRegistryAsync();
+            var requiredFiles = WorldArtifactService.V2Artifacts
+                .Where(x => x.Required)
+                .Select(x => x.File)
+                .ToArray();
+            var namePool = await _worlds.GetBotNamePoolStatsAsync(cancellationToken);
+            var sources = new List<CreateRtsSourceOption>();
+
+            foreach (var world in registry.Worlds)
+            {
+                foreach (var snapshot in world.Snapshots)
+                {
+                    var capturedFiles = snapshot.Artifacts
+                        .Select(artifact => artifact.FileName)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    var missing = requiredFiles
+                        .Where(file => !capturedFiles.Contains(file))
+                        .ToArray();
+                    var legacy = snapshot.SchemaVersion < 2 || snapshot.Artifacts.Count == 0;
+                    var blockers = new List<string>();
+                    if (legacy)
+                        blockers.Add("Requires a v2 snapshot. Restore this world and suspend it once with the updated World State system.");
+                    else if (missing.Length != 0)
+                        blockers.Add("Missing required artifacts: " + string.Join(", ", missing));
+
+                    int? realmId = null;
+                    if (blockers.Count == 0)
+                    {
+                        try
+                        {
+                            realmId = await _worlds.GetSnapshotRealmIdAsync(
+                                snapshot.Folder, cancellationToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            blockers.Add("Captured RealmID is invalid: " + ex.Message);
+                        }
+                    }
+
+                    var eligible = blockers.Count == 0;
+                    sources.Add(new CreateRtsSourceOption
+                    {
+                        WorldId = world.Id,
+                        WorldName = world.Name,
+                        Snapshot = snapshot.Folder,
+                        DisplayName = $"{world.Name} — {snapshot.TakenUtc:u}",
+                        TakenUtc = snapshot.TakenUtc,
+                        Label = snapshot.Label,
+                        SchemaVersion = snapshot.SchemaVersion,
+                        Legacy = legacy,
+                        RealmId = realmId,
+                        Integrity = legacy
+                            ? "legacy-structural-only"
+                            : missing.Length == 0 ? "checksummed-manifest" : "incomplete",
+                        ConfigStatus = capturedFiles.Contains(WorldArtifactService.CoreConfig)
+                            ? "captured"
+                            : legacy ? "legacy-embedded" : "missing",
+                        RtsSourceEligible = eligible,
+                        Eligible = eligible,
+                        Reason = blockers.FirstOrDefault(),
+                        Blockers = blockers.ToArray(),
+                        Warnings = legacy
+                            ? new[] { "Legacy snapshots do not contain historical SHA-256 metadata." }
+                            : Array.Empty<string>()
+                    });
+                }
+            }
+            var orderedSources = sources.OrderByDescending(source => source.TakenUtc).ToArray();
+
+            return Json(new
+            {
+                success = true,
+                profileId = WorldConfigurationCatalog.RtsR1ProfileId,
+                defaults = WorldConfigurationCatalog.NormalizeAndValidate(new WorldLaunchConfiguration()),
+                rateFields = WorldConfigurationCatalog.RateFields,
+                fields = WorldConfigurationCatalog.RateFields,
+                namePoolEligible = namePool.ValidUniqueNames,
+                namePoolSha256 = namePool.Sha256,
+                sources = orderedSources
+            });
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
     // ===================== LIFECYCLE =====================
 
     /// <summary>POST /Worlds/Suspend — stop the server and freeze the live world.</summary>
@@ -86,7 +209,12 @@ public class WorldsController : Controller
 
         try
         {
-            var job = await _worlds.ResumeAsync(request.WorldId, request.Snapshot, Ip);
+            var job = await _worlds.ResumeAsync(
+                request.WorldId,
+                request.Snapshot,
+                Ip,
+                request.ForceFullRestore,
+                request.Configuration);
 
             await _audit.LogAsync(new AuditEntry
             {
@@ -99,6 +227,47 @@ public class WorldsController : Controller
                 IsReversible = true,
                 Success = true,
                 Notes = $"{job.Title} started"
+            });
+
+            return Json(new { success = true, job });
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// POST /Worlds/CreateRts — build and register a parked zero-roster RTS world from
+    /// an eligible v2 snapshot. The service does not mount it or start either daemon.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> CreateRts([FromBody] CreateRtsWorldRequestModel? request)
+    {
+        if (request == null)
+            return Json(new { success = false, error = "Missing request" });
+
+        try
+        {
+            var job = await _worlds.CreateRtsWorldAsync(request);
+
+            await _audit.LogAsync(new AuditEntry
+            {
+                Operator = "admin",
+                OperatorIp = Ip,
+                Category = "system",
+                Action = "world_create_rts",
+                TargetType = "world",
+                TargetName = request.Name,
+                StateAfter = JsonSerializer.Serialize(new
+                {
+                    request.SourceWorldId,
+                    request.SourceSnapshot,
+                    request.Configuration
+                }),
+                IsReversible = true,
+                Success = true,
+                Notes = $"RTS world creation started from snapshot {request.SourceSnapshot}"
             });
 
             return Json(new { success = true, job });
@@ -288,6 +457,26 @@ public class WorldsController : Controller
 
     // ===================== REQUEST DTOs =====================
 
+    private sealed class CreateRtsSourceOption
+    {
+        public string WorldId { get; set; } = "";
+        public string WorldName { get; set; } = "";
+        public string Snapshot { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+        public DateTime TakenUtc { get; set; }
+        public string Label { get; set; } = "";
+        public int SchemaVersion { get; set; }
+        public bool Legacy { get; set; }
+        public int? RealmId { get; set; }
+        public string Integrity { get; set; } = "unknown";
+        public string ConfigStatus { get; set; } = "unknown";
+        public bool RtsSourceEligible { get; set; }
+        public bool Eligible { get; set; }
+        public string? Reason { get; set; }
+        public string[] Blockers { get; set; } = Array.Empty<string>();
+        public string[] Warnings { get; set; } = Array.Empty<string>();
+    }
+
     public class SuspendRequest
     {
         public string? Label { get; set; }
@@ -297,6 +486,8 @@ public class WorldsController : Controller
     {
         public string? WorldId { get; set; }
         public string? Snapshot { get; set; }
+        public bool ForceFullRestore { get; set; }
+        public WorldLaunchConfiguration? Configuration { get; set; }
     }
 
     public class RestoreGroupRequest

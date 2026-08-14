@@ -32,8 +32,8 @@ public class RotationService
     private readonly string _assignmentsPath;
     private readonly object _gate = new();
 
-    // bot name (lowercased) -> profile name. Persisted; pushed on HELLO.
-    private Dictionary<string, string> _assignments = new();
+    // bot name (case-insensitive) -> profile name. Persisted; pushed on HELLO.
+    private Dictionary<string, string> _assignments = new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -127,7 +127,14 @@ public class RotationService
 
     public IReadOnlyDictionary<string, string> Assignments
     {
-        get { lock (_gate) return new Dictionary<string, string>(_assignments); }
+        get
+        {
+            lock (_gate)
+            {
+                LoadAssignments();
+                return new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase);
+            }
+        }
     }
 
     /// <summary>
@@ -143,8 +150,18 @@ public class RotationService
 
         lock (_gate)
         {
-            _assignments[botName.ToLowerInvariant()] = profile.Name;
-            SaveAssignments();
+            LoadAssignments(throwOnError: true);
+            var before = new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase);
+            _assignments[botName.Trim()] = profile.Name;
+            try
+            {
+                SaveAssignments();
+            }
+            catch
+            {
+                _assignments = before;
+                throw;
+            }
         }
 
         var bot = FindOnlineBot(botName);
@@ -164,8 +181,21 @@ public class RotationService
         bool had;
         lock (_gate)
         {
-            had = _assignments.Remove(botName.ToLowerInvariant());
-            if (had) SaveAssignments();
+            LoadAssignments(throwOnError: true);
+            var before = new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase);
+            had = _assignments.Remove(botName.Trim());
+            if (had)
+            {
+                try
+                {
+                    SaveAssignments();
+                }
+                catch
+                {
+                    _assignments = before;
+                    throw;
+                }
+            }
         }
 
         var bot = FindOnlineBot(botName);
@@ -184,7 +214,10 @@ public class RotationService
     {
         string? profileName;
         lock (_gate)
-            _assignments.TryGetValue(name.ToLowerInvariant(), out profileName);
+        {
+            LoadAssignments();
+            _assignments.TryGetValue(name.Trim(), out profileName);
+        }
         if (profileName == null)
             return;
 
@@ -209,36 +242,69 @@ public class RotationService
 
     private (int guid, string name)? FindOnlineBot(string botName)
     {
-        foreach (var kvp in _bridge.BotStates)
-            if (string.Equals(kvp.Value.Name, botName, StringComparison.OrdinalIgnoreCase))
-                return (kvp.Key, kvp.Value.Name);
+        foreach (var kvp in _bridge.Connections)
+            if (string.Equals(kvp.Value.State.Name, botName, StringComparison.OrdinalIgnoreCase))
+                return (kvp.Key, kvp.Value.State.Name);
         return null;
     }
 
-    private void LoadAssignments()
+    private void LoadAssignments(bool throwOnError = false)
     {
         try
         {
-            if (File.Exists(_assignmentsPath))
-                _assignments = JsonSerializer.Deserialize<Dictionary<string, string>>(
-                    File.ReadAllText(_assignmentsPath), JsonOpts) ?? new();
+            var loaded = File.Exists(_assignmentsPath)
+                ? JsonSerializer.Deserialize<Dictionary<string, string>>(
+                    File.ReadAllText(_assignmentsPath), JsonOpts)
+                : null;
+
+            _assignments = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var assignment in loaded ?? new Dictionary<string, string>())
+            {
+                var botName = assignment.Key.Trim();
+                var profileName = assignment.Value?.Trim();
+                if (botName.Length > 0 && !string.IsNullOrWhiteSpace(profileName))
+                    _assignments[botName] = profileName;
+            }
         }
         catch (Exception ex)
         {
             _logger.LogWarning("[ROTATION] assignments.json failed to parse ({Err}) — starting empty", ex.Message);
-            _assignments = new();
+            _assignments = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (throwOnError)
+                throw new IOException($"Could not load rotation assignments from '{_assignmentsPath}'.", ex);
         }
     }
 
     private void SaveAssignments()
     {
+        var tempPath = Path.Combine(
+            Path.GetDirectoryName(_assignmentsPath) ?? _dir,
+            $".{Path.GetFileName(_assignmentsPath)}.{Guid.NewGuid():N}.tmp");
+
         try
         {
-            File.WriteAllText(_assignmentsPath, JsonSerializer.Serialize(_assignments, JsonOpts));
+            var ordered = _assignments
+                .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+            File.WriteAllText(tempPath, JsonSerializer.Serialize(ordered, JsonOpts));
+            File.Move(tempPath, _assignmentsPath, overwrite: true);
         }
         catch (Exception ex)
         {
             _logger.LogWarning("[ROTATION] failed to save assignments.json: {Err}", ex.Message);
+            throw new IOException($"Could not save rotation assignments to '{_assignmentsPath}'.", ex);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "[ROTATION] could not remove temporary assignment file '{Path}'", tempPath);
+            }
         }
     }
 }
