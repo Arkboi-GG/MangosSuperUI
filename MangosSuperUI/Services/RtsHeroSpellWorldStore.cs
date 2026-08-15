@@ -17,18 +17,15 @@ public static class RtsHeroSpellWorldStore
     public const string OriginalStateTable = "superui_rts_spell_original_state";
 
     /// <summary>
-    /// R2 captures any pre-existing 51001..51005 rows once, then installs exactly
-    /// those five native aura definitions. R1 restores the captured rows when its
-    /// source previously ran R2; against an MMO source it is a true no-op.
+    /// Used only while creating an RTS World State. It adds the two preservation
+    /// tables to the copied stock world schema, captures any pre-existing reserved
+    /// rows once, and installs the five RTS hero auras.
     /// </summary>
-    public static string BuildArtifactPostlude(WorldLaunchConfiguration input)
+    public static string BuildCreationArtifactPostlude(WorldLaunchConfiguration input)
     {
         var configuration = WorldConfigurationCatalog.NormalizeAndValidate(input);
-        if (!WorldConfigurationCatalog.IsR2(configuration))
-            return BuildConditionalOriginalRestoreSql();
-
         var sql = new StringBuilder();
-        sql.AppendLine("-- World State: preserve and install only the five RTS R2 hero aura rows.");
+        sql.AppendLine("-- World State RTS creation: add preservation tables and install the five hero aura rows.");
         sql.Append("CREATE TABLE IF NOT EXISTS `").Append(OriginalTable)
             .AppendLine("` LIKE `spell_template`;");
         sql.Append("CREATE TABLE IF NOT EXISTS `").Append(OriginalStateTable)
@@ -39,6 +36,25 @@ public static class RtsHeroSpellWorldStore
             .Append(OriginalStateTable).AppendLine("` WHERE `id`=1);");
         sql.Append("INSERT IGNORE INTO `").Append(OriginalStateTable)
             .AppendLine("` (`id`) VALUES (1);");
+        sql.Append(BuildHeroAuraRefreshSql(configuration));
+        return sql.ToString();
+    }
+
+    /// <summary>
+    /// Used while resuming an RTS World State. The snapshot already contains the
+    /// complete RTS overlay, so this postlude may update managed aura rows but must
+    /// never create or alter schema.
+    /// </summary>
+    public static string BuildResumeArtifactPostlude(WorldLaunchConfiguration input)
+    {
+        var configuration = WorldConfigurationCatalog.NormalizeAndValidate(input);
+        return "-- World State RTS resume: refresh managed hero aura rows; schema already exists.\n" +
+            BuildHeroAuraRefreshSql(configuration);
+    }
+
+    private static string BuildHeroAuraRefreshSql(WorldLaunchConfiguration configuration)
+    {
+        var sql = new StringBuilder();
         sql.Append("DELETE FROM `spell_template` WHERE `entry` IN (")
             .Append(ReservedIdList).AppendLine(");");
         sql.Append(BuildInsertRowsSql(configuration));
@@ -58,26 +74,6 @@ public static class RtsHeroSpellWorldStore
                 .Append(",1,1,0,0,61,79,0,127,0,0,0,0,0,'RTS Hero Level ")
                 .Append(rule.HeroLevel).AppendLine("');");
         }
-        return sql.ToString();
-    }
-
-    private static string BuildConditionalOriginalRestoreSql()
-    {
-        var sql = new StringBuilder();
-        sql.AppendLine("-- World State: R1 restores pre-RTS rows when this source previously ran R2.");
-        sql.Append("SET @ws_rts_has_original = IF((SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN ('")
-            .Append(OriginalTable).Append("','").Append(OriginalStateTable)
-            .AppendLine("'))=2,1,0);");
-        sql.Append("SET @ws_sql = IF(@ws_rts_has_original=1, 'SELECT COUNT(*) INTO @ws_rts_original_ready FROM `")
-            .Append(OriginalStateTable).AppendLine("` WHERE `id`=1', 'SET @ws_rts_original_ready=0');");
-        sql.AppendLine("PREPARE ws_stmt FROM @ws_sql; EXECUTE ws_stmt; DEALLOCATE PREPARE ws_stmt;");
-        sql.Append("SET @ws_sql = IF(@ws_rts_original_ready=1, 'DELETE FROM `spell_template` WHERE `entry` IN (")
-            .Append(ReservedIdList).AppendLine(")', 'SELECT 1');");
-        sql.AppendLine("PREPARE ws_stmt FROM @ws_sql; EXECUTE ws_stmt; DEALLOCATE PREPARE ws_stmt;");
-        sql.Append("SET @ws_sql = IF(@ws_rts_original_ready=1, 'INSERT INTO `spell_template` SELECT * FROM `")
-            .Append(OriginalTable).Append("` WHERE `entry` IN (").Append(ReservedIdList)
-            .AppendLine(")', 'SELECT 1');");
-        sql.AppendLine("PREPARE ws_stmt FROM @ws_sql; EXECUTE ws_stmt; DEALLOCATE PREPARE ws_stmt;");
         return sql.ToString();
     }
 

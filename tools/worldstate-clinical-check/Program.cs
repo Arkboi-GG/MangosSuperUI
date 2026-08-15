@@ -218,25 +218,41 @@ static async Task RunAsync(string root)
     Require(seed.Contains("('mode','rts')", StringComparison.Ordinal), "standalone seed is not RTS mode");
     Require(seed.Contains("INSERT INTO `superui_faction`", StringComparison.Ordinal),
         "faction genesis seed is absent");
+    string[] rtsTables =
+    {
+        "superui_worldstate", "superui_rules_zone", "superui_rules_hub",
+        "superui_rules_hero", "superui_rules_dungeon", "superui_faction",
+        "superui_heroes", "superui_zone_control", "superui_dungeon_control"
+    };
+    foreach (var table in rtsTables)
+        Require(seed.Contains($"CREATE TABLE IF NOT EXISTS `{table}`", StringComparison.Ordinal),
+            $"RTS creation seed does not create {table}");
+    Require(!seed.Contains("ALTER TABLE", StringComparison.OrdinalIgnoreCase),
+        "clean R2 creation still contains legacy schema-upgrade DDL");
+    Require(seed.Contains("VALUES ('honor.enabled','1')", StringComparison.Ordinal) &&
+            seed.Contains("VALUES ('hero.enabled','1')", StringComparison.Ordinal) &&
+            seed.Contains("VALUES ('control.faction_bots','1')", StringComparison.Ordinal) &&
+            seed.Contains("VALUES (1,20,10,51001,120,120);", StringComparison.Ordinal),
+        "the sole RTS profile does not enable its Honor/Hero contract");
+    Require(WorldConfigurationCatalog.Profiles.Count == 1 &&
+            WorldConfigurationCatalog.Profiles[0].Id == WorldConfigurationCatalog.RtsR2ProfileId,
+        "more than one RTS profile remains exposed");
+    var rejectedR1 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR2ProfileId);
+    rejectedR1.ProfileId = "rts-r1-v1";
+    ExpectThrows<InvalidOperationException>(
+        () => WorldConfigurationCatalog.NormalizeAndValidate(rejectedR1),
+        "the removed R1 profile was accepted");
 
-    var r1 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR1ProfileId);
-    r1.RealmId = 1;
-    r1.PlayerLimit = 4;
-    r1.PlayerHardLimit = 4;
-    r1.AllianceBotCap = 2;
-    r1.HordeBotCap = 2;
-    var r1Seed = RtsWorldCreationService.BuildCharactersSeedSql(r1);
-    Require(!r1Seed.Contains("('honor.weight.player'", StringComparison.Ordinal) &&
-            !r1Seed.Contains("VALUES ('honor.enabled','1')", StringComparison.Ordinal) &&
-            !r1Seed.Contains("VALUES ('hero.enabled','1')", StringComparison.Ordinal) &&
-            !r1Seed.Contains("VALUES ('control.faction_bots','1')", StringComparison.Ordinal) &&
-            !r1Seed.Contains("VALUES (1,20,10,51001,120,120);", StringComparison.Ordinal),
-        "R1 profile unexpectedly enables Honor/Hero rules");
-    var r1WorldPostlude = RtsHeroSpellWorldStore.BuildArtifactPostlude(r1);
-    Require(r1WorldPostlude.Contains("pre-RTS rows", StringComparison.Ordinal) &&
-            r1WorldPostlude.Contains($"SELECT * FROM `{RtsHeroSpellWorldStore.OriginalTable}`", StringComparison.Ordinal) &&
-            !r1WorldPostlude.Contains("0x80000040", StringComparison.Ordinal),
-        "R1 does not conditionally restore preserved world spell rows cleanly");
+    var creationPostlude = RtsHeroSpellWorldStore.BuildCreationArtifactPostlude(request.Configuration);
+    Require(creationPostlude.Contains($"CREATE TABLE IF NOT EXISTS `{RtsHeroSpellWorldStore.OriginalTable}`", StringComparison.Ordinal) &&
+            creationPostlude.Contains($"CREATE TABLE IF NOT EXISTS `{RtsHeroSpellWorldStore.OriginalStateTable}`", StringComparison.Ordinal) &&
+            creationPostlude.Contains("0x80000040", StringComparison.Ordinal),
+        "RTS creation does not create preservation tables and install hero aura rows");
+    var resumePostlude = RtsHeroSpellWorldStore.BuildResumeArtifactPostlude(request.Configuration);
+    Require(!resumePostlude.Contains("CREATE TABLE", StringComparison.OrdinalIgnoreCase) &&
+            !resumePostlude.Contains("ALTER TABLE", StringComparison.OrdinalIgnoreCase) &&
+            resumePostlude.Contains("0x80000040", StringComparison.Ordinal),
+        "RTS resume performs schema DDL or fails to refresh managed hero aura rows");
 
     var invalidR2 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR2ProfileId);
     invalidR2.HeroRules.RemoveAt(4);

@@ -175,8 +175,7 @@
                         <div class="d-flex justify-content-between align-items-center">
                             <h6>Capacity</h6>
                             <select class="form-input ws-profile-select" id="wsCreateProfile" aria-label="RTS rules profile">
-                                <option value="rts-r2-v1">RTS R2 - Honor + Heroes</option>
-                                <option value="rts-r1-v1">RTS R1 - Foundation only</option>
+                                <option value="rts-r2-v1">RTS - Honor + Heroes</option>
                             </select>
                         </div>
                         <div class="ws-field-grid">
@@ -211,7 +210,7 @@
                             <li>Game-world content, core source, SQL baseline and server profile; R2 reserves only spell rows 51001-51005 inside the generated RTS artifact</li>
                             <li>Human accounts and authentication settings</li>
                             <li>Global admin configuration and bot name pool</li>
-                            <li>The source snapshot and any pre-existing 51001-51005 rows remain preserved for exact R1 rollback</li>
+                            <li>The source snapshot stays unchanged; any pre-existing 51001-51005 rows are copied into preservation tables inside the new RTS artifact</li>
                         </ul>
                     </section>
                     <section class="ws-create-section">

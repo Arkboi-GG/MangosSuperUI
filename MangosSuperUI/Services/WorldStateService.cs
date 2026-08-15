@@ -1102,7 +1102,7 @@ public class WorldStateService
             await _artifacts.TransformGzipAsync(
                 Path.Combine(snapshotDirectory, WorldArtifactService.WorldMangos),
                 Path.Combine(stagingDirectory, WorldArtifactService.WorldMangos),
-                RtsHeroSpellWorldStore.BuildArtifactPostlude(configuration));
+                RtsHeroSpellWorldStore.BuildResumeArtifactPostlude(configuration));
             await _artifacts.CopyAtomicAsync(
                 Path.Combine(snapshotDirectory, WorldArtifactService.WorldAdmin),
                 Path.Combine(stagingDirectory, WorldArtifactService.WorldAdmin));
@@ -1146,10 +1146,9 @@ public class WorldStateService
 
         using var characters = _db.Characters();
         await characters.OpenAsync();
-        // Schema ownership lives here, in the stopped-world load ceremony. The core
-        // only reads these tables at boot and therefore never runs RTS DDL/DML while
-        // an MMO world is loading.
-        await EnsureRtsSchemaAsync(characters);
+        // RTS schema is created once by RtsWorldCreationService. A resume restores
+        // that complete snapshot and updates managed rows only; it never self-heals
+        // or upgrades schema here.
         using var transaction = await characters.BeginTransactionAsync();
         try
         {
@@ -1164,9 +1163,9 @@ public class WorldStateService
                     new { key = row.Key, value = row.Value }, transaction);
             }
 
-            // These are rules, not runtime match state. Switching R1/R2 replaces the
-            // five configured target levels but deliberately preserves faction Honor
-            // and the persistent hero roster in superui_faction/superui_heroes.
+            // These are rules, not runtime match state. Resume replaces the five
+            // configured target levels but deliberately preserves faction Honor and
+            // the persistent hero roster in superui_faction/superui_heroes.
             await characters.ExecuteAsync("DELETE FROM `superui_rules_hero`", transaction: transaction);
             foreach (var rule in expectedHeroRules)
             {
@@ -1223,12 +1222,6 @@ public class WorldStateService
     {
         using var world = _db.Mangos();
         await world.OpenAsync();
-        if (!WorldConfigurationCatalog.IsR2(configuration))
-        {
-            await ValidateR1OriginalSpellRowsAsync(world);
-            return;
-        }
-
         var rows = (await world.QueryAsync<RtsHeroSpellValidationRow>(
             @"SELECT `entry` AS `SpellId`,`build` AS `Build`,`attributes` AS `Attributes`,
                      `durationIndex` AS `DurationIndex`,`stackAmount` AS `StackAmount`,
@@ -1279,89 +1272,6 @@ public class WorldStateService
                 throw new InvalidDataException(
                     $"RTS R2 world spell {rule.SpellId} does not match its configured passive scale/damage aura contract.");
         }
-    }
-
-    private static async Task ValidateR1OriginalSpellRowsAsync(MySqlConnector.MySqlConnection world)
-    {
-        var tableCount = await world.ExecuteScalarAsync<int>(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() " +
-            "AND table_name IN (@Original,@State)",
-            new
-            {
-                Original = RtsHeroSpellWorldStore.OriginalTable,
-                State = RtsHeroSpellWorldStore.OriginalStateTable
-            });
-        if (tableCount == 0) return;
-        if (tableCount != 2)
-            throw new InvalidDataException("The RTS original-spell preservation tables are incomplete.");
-        var captured = await world.ExecuteScalarAsync<int>(
-            $"SELECT COUNT(*) FROM `{RtsHeroSpellWorldStore.OriginalStateTable}` WHERE `id`=1");
-        if (captured != 1)
-            throw new InvalidDataException("The RTS original-spell preservation marker is missing.");
-
-        var liveColumns = (await world.QueryAsync<string>(
-            "SELECT `column_name` FROM information_schema.columns WHERE table_schema=DATABASE() " +
-            "AND table_name='spell_template' ORDER BY `ordinal_position`")).ToArray();
-        var originalColumns = (await world.QueryAsync<string>(
-            "SELECT `column_name` FROM information_schema.columns WHERE table_schema=DATABASE() " +
-            "AND table_name=@Table ORDER BY `ordinal_position`",
-            new { Table = RtsHeroSpellWorldStore.OriginalTable })).ToArray();
-        if (liveColumns.Length == 0 || !liveColumns.SequenceEqual(originalColumns, StringComparer.OrdinalIgnoreCase))
-            throw new InvalidDataException("The preserved RTS spell rows no longer match the spell_template schema.");
-
-        var ids = string.Join(',', RtsHeroSpellWorldStore.ReservedSpellIds);
-        var missing = await world.ExecuteScalarAsync<int>(
-            $"SELECT COUNT(*) FROM `{RtsHeroSpellWorldStore.OriginalTable}` o " +
-            "LEFT JOIN `spell_template` s ON s.`entry`=o.`entry` AND s.`build`=o.`build` " +
-            $"WHERE o.`entry` IN ({ids}) AND s.`entry` IS NULL");
-        var extra = await world.ExecuteScalarAsync<int>(
-            "SELECT COUNT(*) FROM `spell_template` s " +
-            $"LEFT JOIN `{RtsHeroSpellWorldStore.OriginalTable}` o ON o.`entry`=s.`entry` AND o.`build`=s.`build` " +
-            $"WHERE s.`entry` IN ({ids}) AND o.`entry` IS NULL");
-        var differs = string.Join(" OR ", liveColumns.Select(column =>
-        {
-            var quoted = column.Replace("`", "``", StringComparison.Ordinal);
-            return $"NOT (s.`{quoted}` <=> o.`{quoted}`)";
-        }));
-        var changed = await world.ExecuteScalarAsync<int>(
-            "SELECT COUNT(*) FROM `spell_template` s " +
-            $"JOIN `{RtsHeroSpellWorldStore.OriginalTable}` o ON o.`entry`=s.`entry` AND o.`build`=s.`build` " +
-            $"WHERE s.`entry` IN ({ids}) AND ({differs})");
-        if (missing != 0 || extra != 0 || changed != 0)
-            throw new InvalidDataException("RTS R1 did not restore the preserved 51001-51005 spell rows exactly.");
-    }
-
-    private static async Task EnsureRtsSchemaAsync(MySqlConnector.MySqlConnection characters)
-    {
-        string[] statements =
-        {
-            "CREATE TABLE IF NOT EXISTS `superui_worldstate` (`key` VARCHAR(32) NOT NULL PRIMARY KEY, `value` VARCHAR(64) NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS `superui_rules_zone` (`zone_id` INT UNSIGNED NOT NULL PRIMARY KEY, `ore` TINYINT UNSIGNED NOT NULL DEFAULT 0, `skins` TINYINT UNSIGNED NOT NULL DEFAULT 0, `herbs` TINYINT UNSIGNED NOT NULL DEFAULT 0)",
-            "CREATE TABLE IF NOT EXISTS `superui_rules_hub` (`hub_id` SMALLINT UNSIGNED NOT NULL PRIMARY KEY, `zone_id` INT UNSIGNED NOT NULL, `name` VARCHAR(64) NOT NULL, `banner_go_guid` INT UNSIGNED NOT NULL, `event_alliance` SMALLINT UNSIGNED NOT NULL, `event_horde` SMALLINT UNSIGNED NOT NULL, `capture_ms` INT UNSIGNED NOT NULL DEFAULT 60000, `initial_controller` TINYINT UNSIGNED NOT NULL DEFAULT 0)",
-            "CREATE TABLE IF NOT EXISTS `superui_rules_hero` (`hero_level` TINYINT UNSIGNED NOT NULL PRIMARY KEY, `declare_cost` INT UNSIGNED NOT NULL, `revive_fee` INT UNSIGNED NOT NULL, `spell_id` INT UNSIGNED NOT NULL, `scale_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100, `damage_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100)",
-            "CREATE TABLE IF NOT EXISTS `superui_rules_dungeon` (`map_id` INT UNSIGNED NOT NULL PRIMARY KEY, `final_boss_entry` INT UNSIGNED NOT NULL, `buff_spell_id` INT UNSIGNED NOT NULL, `loot_items` TINYINT UNSIGNED NOT NULL DEFAULT 10)",
-            "CREATE TABLE IF NOT EXISTS `superui_faction` (`team` TINYINT UNSIGNED NOT NULL PRIMARY KEY, `honor_pool` BIGINT NOT NULL DEFAULT 0)",
-            "CREATE TABLE IF NOT EXISTS `superui_heroes` (`guid` INT UNSIGNED NOT NULL PRIMARY KEY, `team` TINYINT UNSIGNED NOT NULL, `hero_level` TINYINT UNSIGNED NOT NULL DEFAULT 1, `dead` TINYINT UNSIGNED NOT NULL DEFAULT 0, `declared_at` BIGINT UNSIGNED NOT NULL DEFAULT 0)",
-            "CREATE TABLE IF NOT EXISTS `superui_zone_control` (`zone_id` INT UNSIGNED NOT NULL PRIMARY KEY, `controller` TINYINT UNSIGNED NOT NULL DEFAULT 0)",
-            "CREATE TABLE IF NOT EXISTS `superui_dungeon_control` (`map_id` INT UNSIGNED NOT NULL PRIMARY KEY, `controller` TINYINT UNSIGNED NOT NULL DEFAULT 0)"
-        };
-        foreach (var statement in statements)
-            await characters.ExecuteAsync(statement);
-        await EnsureHeroRuleSchemaAsync(characters);
-    }
-
-    private static async Task EnsureHeroRuleSchemaAsync(MySqlConnector.MySqlConnection characters)
-    {
-        var columns = (await characters.QueryAsync<string>(
-                "SELECT `column_name` FROM information_schema.columns " +
-                "WHERE table_schema=DATABASE() AND table_name='superui_rules_hero'"))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (!columns.Contains("scale_percent"))
-            await characters.ExecuteAsync(
-                "ALTER TABLE `superui_rules_hero` ADD COLUMN `scale_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
-        if (!columns.Contains("damage_percent"))
-            await characters.ExecuteAsync(
-                "ALTER TABLE `superui_rules_hero` ADD COLUMN `damage_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
     }
 
     /// <summary>

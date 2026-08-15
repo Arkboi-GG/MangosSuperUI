@@ -512,6 +512,12 @@ public sealed class BotContext
     public GroupOrder GroupOrder { get; set; } = GroupOrder.None;
     public GroupOrder LastGroupOrder { get; set; } = GroupOrder.None;
 
+    // A group leg that repeatedly has no Detour route is quarantined until the
+    // coordinator changes the structural order. This prevents both a hot
+    // MOVE_TO retry loop and the former uncapped teleport-to-destination escape.
+    public GroupOrder? NoPathQuarantinedOrder { get; set; }
+    public Vec4? NoPathQuarantinedDest { get; set; }
+
     /// <summary>Round 5 (2026-07-04): last time the GroupCoordinator saw a LIVING groupmate within
     /// guard range of this bot's corpse (stamped by TrackDeaths every tick while dead+guarded).
     /// MaintenancePlanner's in-place rez gate waits for a fresh stamp — capped — so a grouped bot

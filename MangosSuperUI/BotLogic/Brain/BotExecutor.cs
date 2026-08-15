@@ -162,6 +162,21 @@ public sealed class BotExecutor
                     ctx.LastKillUtc = DateTime.UtcNow;
                     ctx.MarkProgress();
                     ctx.OnGrindProgress();   // a real kill: clear the fail streak + dead-cell history
+                    // A no-WAIT coordinator objective has no MOVE_TO arrival ack. A real kill is its
+                    // positive proof that this route/field works, so reset the destination streak;
+                    // otherwise old failures are not actually consecutive and can quarantine later.
+                    var directive = ctx.GroupOrder.Objective;
+                    bool creditsDirective = directive.IsActive
+                        && (evt.CreatureEntry == directive.CreatureEntry
+                            || (directive.Alt1 != 0 && evt.CreatureEntry == directive.Alt1)
+                            || (directive.Alt2 != 0 && evt.CreatureEntry == directive.Alt2)
+                            || (directive.Alt3 != 0 && evt.CreatureEntry == directive.Alt3));
+                    if (creditsDirective
+                        && ctx.Held is { Source: ObjectiveSource.Coordinator } groupObjective
+                        && groupObjective.QuestId == directive.QuestId)
+                    {
+                        ctx.Identity?.ClearNoPathStreak(directive.Map, directive.X, directive.Y);
+                    }
                     // Refresh the objective-grind deadline on progress so a slow-but-killing bot is
                     // never false-failed mid-grind (enriched MOVE_TO or SET_TASK {kill_count=N}).
                     if (ctx.Pending is { } objWait && (objWait.CommandType == "SET_TASK" || objWait.IsObjectiveGrind))
@@ -259,8 +274,8 @@ public sealed class BotExecutor
         // Fix 3 (2026-07-04): the durable no_path streak must count EVERY MOVE_FAILED reason=no_path,
         // WAIT or no WAIT. Group objective legs and every reconcile re-issue are fire-and-forget
         // (Dispatch) — no Pending, so TryNegate below never sees their failures, no Failure is
-        // stamped, the streak never grows, and TryEscalateUnreachableAsync (the 5-fail hard-teleport
-        // rescue) is structurally blind to the exact loop that needs it most (Oyic, 2026-07-04:
+        // stamped, the streak never grows, and the 5-fail group quarantine is structurally blind
+        // to the exact loop that needs it most (Oyic, 2026-07-04:
         // 10,033 uncounted no_paths against one coordinate at ~1/s for 10 hours while the waited
         // path's identical rescue saved Xoz in 5 fails). Recorded HERE, unconditionally; the old
         // duplicate recorder inside TryNegate is removed so a waited fail doesn't double-count.
@@ -269,7 +284,7 @@ public sealed class BotExecutor
             var mfk = ParsePipe(evt.Data);
             if (mfk.TryGetValue("reason", out var mfr) && mfr == "no_path"
                 && mfk.TryGetValue("dest_x", out var mfx) && mfk.TryGetValue("dest_y", out var mfy))
-                idNoPath.RecordNoPath(ParseF(mfx), ParseF(mfy));
+                idNoPath.RecordNoPath(ctx.MapId, ParseF(mfx), ParseF(mfy));
         }
 
         var pending = ctx.Pending;
@@ -329,6 +344,9 @@ public sealed class BotExecutor
             _logger.LogInformation("[EXEC] {Name} quest {Id} rewarded — CompletedQuestIds stamped (ack-driven)",
                 ctx.Name, rewardedId);
         }
+
+        if (pending.CommandType == "MOVE_TO" && ctx.Target is { } reached && ctx.Identity is { } moveId)
+            moveId.ClearNoPathStreak(reached.Map, reached.X, reached.Y);
 
         ctx.Pending = null;
         ctx.MarkProgress();

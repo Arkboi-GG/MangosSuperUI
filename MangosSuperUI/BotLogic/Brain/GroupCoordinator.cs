@@ -65,8 +65,8 @@ public static class GroupCoordinator
     // the 2026-07-03 session notes) used to hold the WHOLE group in GroupVendor forever: the gate
     // re-derived every tick for as long as anyNeedsVendor stayed true, which it does by construction
     // for a member that can never arrive. GroupVendorWindowCapSec bounds how long the group waits
-    // before force-releasing to questing regardless (the member's own BotBrain.TryEscalateUnreachableAsync
-    // — a hard TELEPORT_TO on a durable no_path streak — and/or its solo MaintenancePlanner backstop
+    // before force-releasing to questing regardless (the member's own BotBrain no-path quarantine
+    // and/or its solo MaintenancePlanner backstop
     // still own actually resolving ITS OWN wedge; this cap only stops that from ALSO freezing the
     // team). GroupVendorCooldownSec then holds the window closed so a member whose need hasn't
     // actually cleared doesn't immediately re-open a fresh window the very next tick.
@@ -971,32 +971,63 @@ public static class GroupCoordinator
                                                    .Select(it => it.Slot).ToList();
             if (killSlots.Count == 0 && itemSlots.Count == 0) { vctx.Pending = null; return true; }   // can't identify the leg -- don't wedge
 
-            bool anyoneStillOwes = members.Any(m =>
+            bool reachableStillOwes = false;
+            bool quarantinedStillOwes = false;
+            Vec4? quarantinedDest = null;
+            foreach (var m in members)
             {
                 // COMPLETION IS A HARD UNION (2026-07-03): a slow-but-alive member still OWES and MUST gate --
                 // NO TimeSinceProgressSec liveness bypass here (that bypass was the second leak that let the
-                // group advance while a member was still killing/collecting, stranding it). Only a dead member
-                // is skipped, and it already peeled to death-recovery via AnyRecovering upstream; a genuinely-
-                // stuck (not merely slow) objective is moved off for the WHOLE group by Derive's path_unsafe-
-                // defer / overflow-bound / grey-drop, never by leaving one member behind.
-                if (m.Dead) return false;
-                if (!m.QuestLog.TryGetValue(active.QuestId, out var e)) return false;   // not a holder
-                if (e.Status == QuestStatusComplete) return false;
+                // group advance while a member was still killing/collecting, stranding it). A quarantined
+                // member still owes the work; it is a proven route FAILURE, not successful completion. Let
+                // reachable holders finish, then surface no_path into the virtual planner so Recover shelves
+                // this objective for the whole group instead of false-advancing to obj_sync.
+                if (m.Dead) continue;
+                if (!m.QuestLog.TryGetValue(active.QuestId, out var e)) continue;   // not a holder
+                if (e.Status == QuestStatusComplete) continue;
+                bool owes = false;
                 foreach (var slot in killSlots)
                 {
                     if (slot < 1 || slot > e.MobCounts.Length) continue;
                     var obj = active.Node.Objectives.First(o => o.Slot == slot);
-                    if (obj.Count > e.MobCounts[slot - 1]) return true;
+                    if (obj.Count > e.MobCounts[slot - 1]) { owes = true; break; }
                 }
-                foreach (var slot in itemSlots)
+                if (!owes)
                 {
-                    if (slot < 1 || slot > e.ItemCounts.Length) continue;
-                    var it = active.Node.ItemObjectives.First(x => x.Slot == slot);
-                    if (it.Count > e.ItemCounts[slot - 1]) return true;
+                    foreach (var slot in itemSlots)
+                    {
+                        if (slot < 1 || slot > e.ItemCounts.Length) continue;
+                        var it = active.Node.ItemObjectives.First(x => x.Slot == slot);
+                        if (it.Count > e.ItemCounts[slot - 1]) { owes = true; break; }
+                    }
                 }
-                return false;
-            });
-            if (anyoneStillOwes) return false;
+
+                if (!owes) continue;
+                if (m.NoPathQuarantinedOrder is { } quarantined && quarantined == m.GroupOrder)
+                {
+                    quarantinedStillOwes = true;
+                    quarantinedDest ??= m.NoPathQuarantinedDest;
+                }
+                else
+                {
+                    reachableStillOwes = true;
+                }
+            }
+
+            if (reachableStillOwes) return false;
+            if (quarantinedStillOwes)
+            {
+                vctx.Pending = null;
+                vctx.Failure = new WaitFailure
+                {
+                    CommandType = "MOVE_TO",
+                    Reason = "no_path",
+                    Dest = quarantinedDest,
+                    Utc = DateTime.UtcNow
+                };
+                return true;   // caller runs QuestPlanner.Recover this tick; this is NOT progress
+            }
+
             vctx.Pending = null;
             vctx.MarkProgress();
             plan.ExhaustCycles = 0; plan.LastExhaustSet = "";   // Fix 4: real progress resets the ladder
@@ -1393,7 +1424,10 @@ public static class GroupCoordinator
     // A member that is dead or hasn't made progress within the liveness window stops gating the
     // group's phases (§6): one frozen member must never freeze the team. Its own progress clock
     // (kill / quest / level / ack) resets this, so it is stateless.
-    private static bool IsStuck(BotContext m) => m.Dead || m.TimeSinceProgressSec > GateLivenessSec;
+    private static bool IsStuck(BotContext m)
+        => m.Dead
+           || (m.NoPathQuarantinedOrder is { } order && order == m.GroupOrder)
+           || m.TimeSinceProgressSec > GateLivenessSec;
 
     // Every present, LIVE member is within reach of the NPC on the same map (a stuck/away member is
     // waited-for only up to the liveness escape, then ignored so the group can advance).

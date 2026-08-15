@@ -8,9 +8,7 @@ namespace MangosSuperUI.Models;
 /// </summary>
 public sealed class WorldLaunchConfiguration
 {
-    // Keep the model-level fallback on R1 so manifests written before profiles were
-    // selectable never acquire R2 modules merely because a property was absent.
-    public string ProfileId { get; set; } = WorldConfigurationCatalog.RtsR1ProfileId;
+    public string ProfileId { get; set; } = WorldConfigurationCatalog.RtsR2ProfileId;
     public int RealmId { get; set; } = 1;
     public int PlayerLimit { get; set; } = 2600;
     public int PlayerHardLimit { get; set; } = 2600;
@@ -97,7 +95,6 @@ public sealed class WorldConfigurationField
 
 public static class WorldConfigurationCatalog
 {
-    public const string RtsR1ProfileId = "rts-r1-v1";
     public const string RtsR2ProfileId = "rts-r2-v1";
     public const string DefaultProfileId = RtsR2ProfileId;
 
@@ -105,14 +102,8 @@ public static class WorldConfigurationCatalog
     {
         new WorldConfigurationProfile
         {
-            Id = RtsR1ProfileId,
-            Label = "RTS R1 - Foundation only",
-            Description = "Accelerated progression and faction bot caps; Honor and Heroes remain inert."
-        },
-        new WorldConfigurationProfile
-        {
             Id = RtsR2ProfileId,
-            Label = "RTS R2 - Honor + Heroes",
+            Label = "RTS - Honor + Heroes",
             Description = "Fight for faction Honor, then declare, promote, and revive persistent Heroes.",
             HonorAndHeroes = true
         }
@@ -163,9 +154,6 @@ public static class WorldConfigurationCatalog
         return NormalizeAndValidate(value);
     }
 
-    public static bool IsR2(WorldLaunchConfiguration value) =>
-        string.Equals(value.ProfileId, RtsR2ProfileId, StringComparison.Ordinal);
-
     public static WorldLaunchConfiguration NormalizeAndValidate(WorldLaunchConfiguration? input)
     {
         var value = input?.Clone() ?? new WorldLaunchConfiguration();
@@ -204,37 +192,34 @@ public static class WorldConfigurationCatalog
         }
         value.Rates = normalized;
 
-        if (IsR2(value))
-        {
-            ValidateWholeNumber(value.HonorWeightPlayer, 0, 1000000, "Player Honor weight");
-            ValidateWholeNumber(value.HonorWeightBot, 0, 1000000, "Bot Honor weight");
-            ValidateWholeNumber(value.HonorWeightFactionNpc, 0, 1000000, "Faction NPC Honor weight");
-            ValidateWholeNumber(value.HonorWeightFactionElite, 0, 1000000, "Faction elite Honor weight");
-            ValidateWholeNumber(value.HeroSlotsFixed, 1, 127, "Fixed hero slots");
+        ValidateWholeNumber(value.HonorWeightPlayer, 0, 1000000, "Player Honor weight");
+        ValidateWholeNumber(value.HonorWeightBot, 0, 1000000, "Bot Honor weight");
+        ValidateWholeNumber(value.HonorWeightFactionNpc, 0, 1000000, "Faction NPC Honor weight");
+        ValidateWholeNumber(value.HonorWeightFactionElite, 0, 1000000, "Faction elite Honor weight");
+        ValidateWholeNumber(value.HeroSlotsFixed, 1, 127, "Fixed hero slots");
 
-            var rules = (value.HeroRules ?? new()).Select(rule => rule.Clone()).ToList();
-            if (rules.Count != 5 || rules.Select(rule => rule.HeroLevel).Distinct().Count() != 5 ||
-                rules.Any(rule => rule.HeroLevel is < 1 or > 5))
-                throw new InvalidOperationException("RTS R2 requires exactly one hero rule for each target level 1 through 5.");
-            foreach (var rule in rules)
-            {
-                ValidateWholeNumber(rule.HonorCost, 0, int.MaxValue, $"Hero level {rule.HeroLevel} Honor cost");
-                ValidateWholeNumber(rule.ReviveFee, 0, int.MaxValue, $"Hero level {rule.HeroLevel} revive fee");
-                ValidateWholeNumber(rule.SpellId, 1, int.MaxValue, $"Hero level {rule.HeroLevel} spell ID");
-                ValidateWholeNumber(rule.ScalePercent, 100, 200, $"Hero level {rule.HeroLevel} scale percent");
-                ValidateWholeNumber(rule.DamagePercent, 100, 200, $"Hero level {rule.HeroLevel} damage percent");
-            }
-            if (rules.Select(rule => rule.SpellId).Distinct().Count() != rules.Count)
-                throw new InvalidOperationException("Each RTS R2 hero level must use a distinct spell ID.");
-            foreach (var rule in rules)
-            {
-                var reservedSpellId = 51000 + rule.HeroLevel;
-                if (rule.SpellId != reservedSpellId)
-                    throw new InvalidOperationException(
-                        $"Hero level {rule.HeroLevel} must use reserved RTS aura spell ID {reservedSpellId}.");
-            }
-            value.HeroRules = rules.OrderBy(rule => rule.HeroLevel).ToList();
+        var rules = (value.HeroRules ?? new()).Select(rule => rule.Clone()).ToList();
+        if (rules.Count != 5 || rules.Select(rule => rule.HeroLevel).Distinct().Count() != 5 ||
+            rules.Any(rule => rule.HeroLevel is < 1 or > 5))
+            throw new InvalidOperationException("RTS requires exactly one hero rule for each target level 1 through 5.");
+        foreach (var rule in rules)
+        {
+            ValidateWholeNumber(rule.HonorCost, 0, int.MaxValue, $"Hero level {rule.HeroLevel} Honor cost");
+            ValidateWholeNumber(rule.ReviveFee, 0, int.MaxValue, $"Hero level {rule.HeroLevel} revive fee");
+            ValidateWholeNumber(rule.SpellId, 1, int.MaxValue, $"Hero level {rule.HeroLevel} spell ID");
+            ValidateWholeNumber(rule.ScalePercent, 100, 200, $"Hero level {rule.HeroLevel} scale percent");
+            ValidateWholeNumber(rule.DamagePercent, 100, 200, $"Hero level {rule.HeroLevel} damage percent");
         }
+        if (rules.Select(rule => rule.SpellId).Distinct().Count() != rules.Count)
+            throw new InvalidOperationException("Each RTS hero level must use a distinct spell ID.");
+        foreach (var rule in rules)
+        {
+            var reservedSpellId = 51000 + rule.HeroLevel;
+            if (rule.SpellId != reservedSpellId)
+                throw new InvalidOperationException(
+                    $"Hero level {rule.HeroLevel} must use reserved RTS aura spell ID {reservedSpellId}.");
+        }
+        value.HeroRules = rules.OrderBy(rule => rule.HeroLevel).ToList();
         return value;
     }
 
@@ -262,25 +247,22 @@ public static class WorldConfigurationCatalog
         };
         foreach (var field in RateFields)
             rows[field.Key] = value.Rates[field.Key].ToString("R", CultureInfo.InvariantCulture);
-        if (IsR2(value))
-        {
-            rows["honor.enabled"] = "1";
-            rows["hero.enabled"] = "1";
-            rows["honor.weight.player"] = value.HonorWeightPlayer.ToString(CultureInfo.InvariantCulture);
-            rows["honor.weight.bot"] = value.HonorWeightBot.ToString(CultureInfo.InvariantCulture);
-            rows["honor.weight.npc"] = value.HonorWeightFactionNpc.ToString(CultureInfo.InvariantCulture);
-            rows["honor.weight.npc_elite"] = value.HonorWeightFactionElite.ToString(CultureInfo.InvariantCulture);
-            rows["honor.suppress_bot_hk"] = value.SuppressBotHonorHistory ? "1" : "0";
-            rows["control.faction_bots"] = value.FactionWideBotControl ? "1" : "0";
-            rows["hero.slots_fixed"] = value.HeroSlotsFixed.ToString(CultureInfo.InvariantCulture);
-        }
+        rows["honor.enabled"] = "1";
+        rows["hero.enabled"] = "1";
+        rows["honor.weight.player"] = value.HonorWeightPlayer.ToString(CultureInfo.InvariantCulture);
+        rows["honor.weight.bot"] = value.HonorWeightBot.ToString(CultureInfo.InvariantCulture);
+        rows["honor.weight.npc"] = value.HonorWeightFactionNpc.ToString(CultureInfo.InvariantCulture);
+        rows["honor.weight.npc_elite"] = value.HonorWeightFactionElite.ToString(CultureInfo.InvariantCulture);
+        rows["honor.suppress_bot_hk"] = value.SuppressBotHonorHistory ? "1" : "0";
+        rows["control.faction_bots"] = value.FactionWideBotControl ? "1" : "0";
+        rows["hero.slots_fixed"] = value.HeroSlotsFixed.ToString(CultureInfo.InvariantCulture);
         return rows;
     }
 
     public static IReadOnlyList<RtsHeroRuleConfiguration> ToHeroRuleRows(WorldLaunchConfiguration input)
     {
         var value = NormalizeAndValidate(input);
-        return IsR2(value) ? value.HeroRules.Select(rule => rule.Clone()).ToArray() : Array.Empty<RtsHeroRuleConfiguration>();
+        return value.HeroRules.Select(rule => rule.Clone()).ToArray();
     }
 
     private static void ValidateWholeNumber(int value, int min, int max, string label)

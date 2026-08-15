@@ -1949,7 +1949,7 @@ public sealed class QuestPlanner : IBotPlanner
     // stamped clump point (grind-lock windows, no-shared-quest holds, alive-errand peel waits, and
     // the Axiom-2 corpse defense — TargetPos is the corpse/rez position there). Far from the point
     // ON A NEW ORDER -> converge first (a MOVE_TO with its normal WAIT, so MOVE_FAILED feeds the
-    // Fix-3 streak and a marooned member escalates to the hard teleport instead of thrashing);
+    // no-path streak and a marooned member is quarantined instead of thrashing);
     // near -> the solo-proven indefinite SET_TASK GRIND {entry=0, kill_count=0} — C++
     // SelectGrindTarget scans nearest valid XP mobs (skips grey/critters), DoGrindPatrol keeps it
     // moving, the combat directive focus-fires the anchor's pull. Hysteresis: distance is only
@@ -2000,7 +2000,7 @@ public sealed class QuestPlanner : IBotPlanner
     // turned every death into a camp dive: converge + active pulls at a corpse inside a dense
     // L8-10 camp was the round-5 wipe engine (291 deaths, flat ~80/hr, 33-45% re-deaths <90s).
     // The converge leg is a normal WAITed MoveTo, so a blocked approach feeds the Fix-3 streak
-    // and escalates to the hard teleport instead of thrashing. Same order-change hysteresis as
+    // and enters group-leg quarantine instead of thrashing. Same order-change hysteresis as
     // GroupGrindTogether: distance is only re-checked when the point moves (e.g. a GY-rez jump).
     private StepResult GroupDefendPoint(BotContext ctx, GroupOrder o)
     {

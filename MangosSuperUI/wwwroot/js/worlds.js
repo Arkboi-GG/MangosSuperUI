@@ -598,8 +598,8 @@ $(function () {
     function renderProfileOptions(selector, selectedProfileId) {
         var profiles = availableProfiles();
         if (!profiles.length) {
-            $(selector).html('<option value="rts-r2-v1">RTS R2 - Honor + Heroes</option>' +
-                '<option value="rts-r1-v1">RTS R1 - Foundation only</option>').val(selectedProfileId || 'rts-r2-v1');
+            $(selector).html('<option value="rts-r2-v1">RTS - Honor + Heroes</option>')
+                .val(selectedProfileId || 'rts-r2-v1');
             return;
         }
         $(selector).html(profiles.map(function (profile) {
@@ -633,13 +633,6 @@ $(function () {
         var profileId = objectValue(configuration, 'profileId') || selectedProfileId(scope);
         var profile = profileDefinition(profileId);
         var description = profile && objectValue(profile, 'description');
-        if (profileId !== 'rts-r2-v1') {
-            $(selector).html('<div class="ws-r2-disabled"><strong>Honor + Heroes are disabled.</strong> ' +
-                'This load removes their boot gates and rules, restores the five preserved pre-R2 world spell rows, ' +
-                'and leaves existing faction Honor and hero roster state parked without deleting it.</div>');
-            return;
-        }
-
         var defaults = profileDefaults(profileId);
         var rules = objectValue(configuration, 'heroRules') || objectValue(defaults, 'heroRules') || [];
         function setting(name, fallback) {
@@ -777,28 +770,26 @@ $(function () {
             if (!Number.isFinite(value) || value < min || value > max)
                 errors.push($(this).closest('label').find('span').first().text() + ' must be between ' + min + ' and ' + max + '.');
         });
-        if (configuration.profileId === 'rts-r2-v1') {
-            ['honorWeightPlayer', 'honorWeightBot', 'honorWeightFactionNpc', 'honorWeightFactionElite'].forEach(function (key) {
-                var value = Number(configuration[key]);
-                if (!Number.isInteger(value) || value < 0 || value > 1000000)
-                    errors.push('R2 Honor weights must be whole numbers between 0 and 1,000,000.');
-            });
-            if (!Number.isInteger(Number(configuration.heroSlotsFixed)) || configuration.heroSlotsFixed < 1 || configuration.heroSlotsFixed > 127)
-                errors.push('Fixed hero slots must be between 1 and 127.');
-            if (!configuration.heroRules || configuration.heroRules.length !== 5)
-                errors.push('RTS R2 requires five hero target-level rows.');
-            (configuration.heroRules || []).forEach(function (rule) {
-                if (!Number.isInteger(rule.heroLevel) || rule.heroLevel < 1 || rule.heroLevel > 5 ||
-                    !Number.isInteger(rule.honorCost) || rule.honorCost < 0 ||
-                    !Number.isInteger(rule.reviveFee) || rule.reviveFee < 0 ||
-                    !Number.isInteger(rule.spellId) || rule.spellId < 1 ||
-                    !Number.isInteger(rule.scalePercent) || rule.scalePercent < 100 || rule.scalePercent > 200 ||
-                    !Number.isInteger(rule.damagePercent) || rule.damagePercent < 100 || rule.damagePercent > 200)
-                    errors.push('Every hero row needs valid whole-number costs, spell ID, scale, and damage values.');
-                if (Number.isInteger(rule.heroLevel) && rule.spellId !== 51000 + rule.heroLevel)
-                    errors.push('Hero level ' + rule.heroLevel + ' must use reserved spell ID ' + (51000 + rule.heroLevel) + '.');
-            });
-        }
+        ['honorWeightPlayer', 'honorWeightBot', 'honorWeightFactionNpc', 'honorWeightFactionElite'].forEach(function (key) {
+            var value = Number(configuration[key]);
+            if (!Number.isInteger(value) || value < 0 || value > 1000000)
+                errors.push('RTS Honor weights must be whole numbers between 0 and 1,000,000.');
+        });
+        if (!Number.isInteger(Number(configuration.heroSlotsFixed)) || configuration.heroSlotsFixed < 1 || configuration.heroSlotsFixed > 127)
+            errors.push('Fixed hero slots must be between 1 and 127.');
+        if (!configuration.heroRules || configuration.heroRules.length !== 5)
+            errors.push('RTS requires five hero target-level rows.');
+        (configuration.heroRules || []).forEach(function (rule) {
+            if (!Number.isInteger(rule.heroLevel) || rule.heroLevel < 1 || rule.heroLevel > 5 ||
+                !Number.isInteger(rule.honorCost) || rule.honorCost < 0 ||
+                !Number.isInteger(rule.reviveFee) || rule.reviveFee < 0 ||
+                !Number.isInteger(rule.spellId) || rule.spellId < 1 ||
+                !Number.isInteger(rule.scalePercent) || rule.scalePercent < 100 || rule.scalePercent > 200 ||
+                !Number.isInteger(rule.damagePercent) || rule.damagePercent < 100 || rule.damagePercent > 200)
+                errors.push('Every hero row needs valid whole-number costs, spell ID, scale, and damage values.');
+            if (Number.isInteger(rule.heroLevel) && rule.spellId !== 51000 + rule.heroLevel)
+                errors.push('Hero level ' + rule.heroLevel + ' must use reserved spell ID ' + (51000 + rule.heroLevel) + '.');
+        });
         return errors;
     }
 
@@ -826,23 +817,18 @@ $(function () {
             statusBadge('good', 'fa-layer-group', label) +
             statusBadge('', 'fa-users', 'limit ' + formatNumber(configuration.playerLimit)) +
             statusBadge('', 'fa-robot', formatNumber(configuration.allianceBotCap) + 'A / ' + formatNumber(configuration.hordeBotCap) + 'H');
-        if (configuration.profileId === 'rts-r2-v1') {
-            html += statusBadge(configuration.factionWideBotControl ? 'good' : 'warn', 'fa-chess-knight',
-                configuration.factionWideBotControl ? 'faction bot control on' : 'faction bot control off');
-            html += statusBadge('good', 'fa-shield-halved', 'heroes: bots only, ' + formatNumber(configuration.heroSlotsFixed) + ' slots');
-            html += statusBadge(configuration.suppressBotHonorHistory ? 'good' : 'warn', 'fa-scroll',
-                configuration.suppressBotHonorHistory ? 'bot HK history suppressed' : 'bot HK history retained');
-            html += '</div><div class="ws-field-help"><strong>Honor weights:</strong> player ' + esc(configuration.honorWeightPlayer) +
-                ', bot ' + esc(configuration.honorWeightBot) + ', faction NPC ' + esc(configuration.honorWeightFactionNpc) +
-                ', elite ' + esc(configuration.honorWeightFactionElite) + '. <strong>Hero ladder:</strong> ' +
-                (configuration.heroRules || []).map(function (rule) {
-                    return 'L' + rule.heroLevel + ' ' + rule.honorCost + '/' + rule.reviveFee +
-                        ' Honor, ' + rule.scalePercent + '% scale, ' + rule.damagePercent + '% damage, #' + rule.spellId;
-                }).join(' -> ') + '.</div>';
-            return html;
-        }
-        html += statusBadge('warn', 'fa-power-off', 'Honor + Heroes inert') +
-            '</div><div class="ws-field-help">R1 removes the Honor/Hero boot gates and restores any preserved pre-R2 spell rows; parked runtime Honor and hero records remain untouched.</div>';
+        html += statusBadge(configuration.factionWideBotControl ? 'good' : 'warn', 'fa-chess-knight',
+            configuration.factionWideBotControl ? 'faction bot control on' : 'faction bot control off');
+        html += statusBadge('good', 'fa-shield-halved', 'heroes: bots only, ' + formatNumber(configuration.heroSlotsFixed) + ' slots');
+        html += statusBadge(configuration.suppressBotHonorHistory ? 'good' : 'warn', 'fa-scroll',
+            configuration.suppressBotHonorHistory ? 'bot HK history suppressed' : 'bot HK history retained');
+        html += '</div><div class="ws-field-help"><strong>Honor weights:</strong> player ' + esc(configuration.honorWeightPlayer) +
+            ', bot ' + esc(configuration.honorWeightBot) + ', faction NPC ' + esc(configuration.honorWeightFactionNpc) +
+            ', elite ' + esc(configuration.honorWeightFactionElite) + '. <strong>Hero ladder:</strong> ' +
+            (configuration.heroRules || []).map(function (rule) {
+                return 'L' + rule.heroLevel + ' ' + rule.honorCost + '/' + rule.reviveFee +
+                    ' Honor, ' + rule.scalePercent + '% scale, ' + rule.damagePercent + '% damage, #' + rule.spellId;
+            }).join(' -> ') + '.</div>';
         return html;
     }
 
@@ -1128,7 +1114,7 @@ $(function () {
 
         if (!createOptions) return;
         var saved = p.savedConfiguration || selectedResumeSnapshotConfiguration() || target.launchConfiguration || {};
-        var savedProfileId = objectValue(saved, 'profileId') || 'rts-r1-v1';
+        var savedProfileId = objectValue(saved, 'profileId') || 'rts-r2-v1';
         var seed = mergeConfiguration(profileDefaults(savedProfileId), saved);
         seed.profileId = savedProfileId;
         seed.realmId = Number(objectValue(p.configValues, 'realmId'));

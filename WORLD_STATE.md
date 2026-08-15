@@ -46,14 +46,25 @@ The new roster starts at zero. Later bot creation reuses `wwwroot/data/wow_era_5
 
 ## RTS launch configuration
 
-The `rts-r1-v1` profile is editable each time an RTS world is resumed. It currently includes:
+`rts-r2-v1` is the sole RTS profile. It is configured when an RTS world is
+created and reviewed when that world is resumed. R1 and pre-R2 snapshots are
+not supported. The profile includes:
 
 - `PlayerLimit`, `PlayerHardLimit`, and `LoginPerTick` in `mangosd.conf`;
 - Alliance and Horde bot admission caps;
 - the RTS state flush interval;
-- every R1 XP and loot rate consumed by the core.
+- every managed XP and loot rate consumed by the core;
+- Honor weights and bot-HK suppression;
+- faction-control enablement, the hero-slot cap, and all five hero-level rules.
 
 `RealmID` is not editable campaign tuning. Create inherits it from the selected snapshot's captured `mangosd.conf`; Resume verifies the same captured value again after restore and never rewrites it. Combined Alliance and Horde caps may not exceed `PlayerLimit` or the current eligible unique-name count. `PlayerLimit - combined bot caps` is the explicit session headroom left for humans and other logins; zero is valid but leaves no headroom. The default profile reserves 2,500 bot slots (1,250 per faction) inside a 2,600-session soft/hard ceiling, leaving 100 session slots. Bots and human players share the VMaNGOS session limit. The exact lowercase `characters.superui_worldstate.mode=rts` row activates the C++ RTS gate at boot; a UI flavor badge alone does not.
+
+Create New RTS World automatically composes the complete database overlay into
+the parked artifacts: all nine `characters.superui_*` RTS tables and both
+`mangos.superui_rts_spell_original*` preservation tables. The Core does not
+create or alter them at startup, and the owner does not run a separate SQL
+migration. Resume restores the schema already captured in the selected World
+State and updates managed rows only.
 
 ## Owner validation sequence
 
@@ -61,7 +72,7 @@ The `rts-r1-v1` profile is editable each time an RTS world is resumed. It curren
 2. On the parked legacy MMO world, select **Force full restore** and review the preflight. The owner confirms Resume.
 3. Verify the MMO is healthy, then the owner suspends it. That creates the first checksummed v2 clean-template snapshot.
 4. Choose **New RTS World**, select that v2 source, review/edit the launch profile, and create the parked zero-roster world.
-5. Resume the RTS world, verify the preflight/profile, and perform the R1 gameplay checks.
+5. Resume the RTS world, verify the preflight/profile, and perform the R2 gameplay checks.
 
 Codex may edit and build this project, but does not deploy it, invoke these lifecycle actions, mutate the live databases, or control either server process.
 

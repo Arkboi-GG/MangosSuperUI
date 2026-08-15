@@ -125,16 +125,17 @@ public class BotIdentity
 
     /// <summary>
     /// Durable per-destination consecutive no_path count (2026-07-03, the GroupVendor livelock fix).
-    /// Key = destination rounded to the nearest yard (same granularity as PathBlacklist). Distinct from
+    /// Key = map plus destination rounded to the nearest yard (same granularity as PathBlacklist). Distinct from
     /// BotContext.ConsecutiveFailures (resets to 0 on every BotBrain.TryBreakWedgeAsync trip) and from
     /// PathBlacklist (a level-gated danger veto, not a reachability fact) — this is durable memory that
     /// "MOVE_TO to THIS coordinate has failed with reason=no_path N times in a row," surviving the wedge
     /// park so a genuinely unreachable leg (a real navmesh graph disconnection C++ cannot self-heal —
     /// confirmed live 2026-07-03) is eventually recognized instead of retried at ~1Hz forever. Bumped by
-    /// BotExecutor.TryNegate on each no_path MOVE_FAILED; consulted + cleared by
-    /// BotBrain.TryEscalateUnreachableAsync.
+    /// BotExecutor.OnEvent on each no_path MOVE_FAILED; consulted by the group-leg
+    /// quarantine and cleared after a real arrival or an order change.
     /// </summary>
-    public Dictionary<(int X, int Y), int> NoPathStreak { get; set; } = new();
+    public Dictionary<(int Map, int X, int Y), int> NoPathStreak { get; set; } = new();
+    private readonly object _noPathStreakLock = new();
 
     // --- Death tracking (for reactive quest shelving) ---
     /// <summary>Number of deaths since the bot last changed quests or activities.</summary>
@@ -468,28 +469,33 @@ public class BotIdentity
     }
 
     /// <summary>Bump (or seed) the no_path streak for a destination. Returns the new count.</summary>
-    public int RecordNoPath(float destX, float destY)
+    public int RecordNoPath(int map, float destX, float destY)
     {
-        var key = ((int)MathF.Round(destX), (int)MathF.Round(destY));
-        NoPathStreak.TryGetValue(key, out int count);
-        count++;
-        NoPathStreak[key] = count;
-        return count;
+        var key = (map, (int)MathF.Round(destX), (int)MathF.Round(destY));
+        lock (_noPathStreakLock)
+        {
+            NoPathStreak.TryGetValue(key, out int count);
+            count++;
+            NoPathStreak[key] = count;
+            return count;
+        }
     }
 
     /// <summary>Current no_path streak for a destination (0 = never failed / cleared).</summary>
-    public int GetNoPathStreak(float destX, float destY)
+    public int GetNoPathStreak(int map, float destX, float destY)
     {
-        var key = ((int)MathF.Round(destX), (int)MathF.Round(destY));
-        return NoPathStreak.TryGetValue(key, out int count) ? count : 0;
+        var key = (map, (int)MathF.Round(destX), (int)MathF.Round(destY));
+        lock (_noPathStreakLock)
+            return NoPathStreak.TryGetValue(key, out int count) ? count : 0;
     }
 
-    /// <summary>Clear the no_path streak for a destination — a successful arrival, or an escalated
-    /// teleport past the blocked leg, means we're no longer trying to reach it, so stop counting it.</summary>
-    public void ClearNoPathStreak(float destX, float destY)
+    /// <summary>Clear the no_path streak for a destination after a successful arrival or when the
+    /// quarantined group order changes and the blocked leg is no longer current.</summary>
+    public void ClearNoPathStreak(int map, float destX, float destY)
     {
-        var key = ((int)MathF.Round(destX), (int)MathF.Round(destY));
-        NoPathStreak.Remove(key);
+        var key = (map, (int)MathF.Round(destX), (int)MathF.Round(destY));
+        lock (_noPathStreakLock)
+            NoPathStreak.Remove(key);
     }
 
     /// <summary>
