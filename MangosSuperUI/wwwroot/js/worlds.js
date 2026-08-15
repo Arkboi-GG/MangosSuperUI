@@ -468,7 +468,6 @@ $(function () {
             }
             applyCreateDefaults();
             renderCreateSources();
-            renderProfileRateFields('#wsRateFields', 'create', createOptions.defaults || {});
             renderCreateValidation();
         });
     });
@@ -491,14 +490,9 @@ $(function () {
     }
 
     function applyCreateDefaults() {
-        var d = createOptions.defaults || {};
-        $('#wsCreateProfile').text(createOptions.profileId || d.profileId || 'rts-r1-v1');
-        setNumber('#wsCfgPlayerLimit', d.playerLimit, 2600);
-        setNumber('#wsCfgPlayerHardLimit', d.playerHardLimit, 2600);
-        setNumber('#wsCfgLoginPerTick', d.loginPerTick, 0);
-        setNumber('#wsCfgStateFlushMs', d.stateFlushMs, 30000);
-        setNumber('#wsCfgAllianceBotCap', d.allianceBotCap, 1250);
-        setNumber('#wsCfgHordeBotCap', d.hordeBotCap, 1250);
+        var profileId = (createOptions && (createOptions.defaultProfileId || createOptions.profileId)) || 'rts-r2-v1';
+        renderProfileOptions('#wsCreateProfile', profileId);
+        applyConfigurationFields('create', profileDefaults(profileId));
     }
 
     function renderCreateSources() {
@@ -582,13 +576,143 @@ $(function () {
         $(selector).html(html);
     }
 
+    function availableProfiles() {
+        return (createOptions && createOptions.profiles) || [];
+    }
+
+    function profileDefinition(profileId) {
+        return availableProfiles().filter(function (profile) {
+            return String(objectValue(profile, 'id') || '') === String(profileId || '');
+        })[0] || null;
+    }
+
+    function profileDefaults(profileId) {
+        var profile = profileDefinition(profileId);
+        var defaults = profile && objectValue(profile, 'defaults');
+        if (defaults) return mergeConfiguration({}, defaults);
+        var fallback = mergeConfiguration({}, (createOptions && createOptions.defaults) || {});
+        fallback.profileId = profileId || objectValue(fallback, 'profileId') || 'rts-r2-v1';
+        return fallback;
+    }
+
+    function renderProfileOptions(selector, selectedProfileId) {
+        var profiles = availableProfiles();
+        if (!profiles.length) {
+            $(selector).html('<option value="rts-r2-v1">RTS R2 - Honor + Heroes</option>' +
+                '<option value="rts-r1-v1">RTS R1 - Foundation only</option>').val(selectedProfileId || 'rts-r2-v1');
+            return;
+        }
+        $(selector).html(profiles.map(function (profile) {
+            var id = objectValue(profile, 'id');
+            return '<option value="' + esc(id) + '">' + esc(objectValue(profile, 'label') || id) + '</option>';
+        }).join('')).val(selectedProfileId);
+        if (!$(selector).val()) $(selector).val(objectValue(profiles[0], 'id'));
+    }
+
+    function selectedProfileId(scope) {
+        var selector = scope === 'resume' ? '#wsResumeProfile' : '#wsCreateProfile';
+        return $(selector).val() || (createOptions && (createOptions.defaultProfileId || createOptions.profileId)) || 'rts-r2-v1';
+    }
+
+    function applyConfigurationFields(scope, configuration) {
+        var prefix = scope === 'resume' ? '#wsResumeCfg' : '#wsCfg';
+        var profileSelector = scope === 'resume' ? '#wsResumeProfile' : '#wsCreateProfile';
+        var profileId = objectValue(configuration, 'profileId') || 'rts-r2-v1';
+        $(profileSelector).val(profileId);
+        setNumber(prefix + 'PlayerLimit', objectValue(configuration, 'playerLimit'), 2600);
+        setNumber(prefix + 'PlayerHardLimit', objectValue(configuration, 'playerHardLimit'), 2600);
+        setNumber(prefix + 'LoginPerTick', objectValue(configuration, 'loginPerTick'), 0);
+        setNumber(prefix + 'StateFlushMs', objectValue(configuration, 'stateFlushMs'), 30000);
+        setNumber(prefix + 'AllianceBotCap', objectValue(configuration, 'allianceBotCap'), 1250);
+        setNumber(prefix + 'HordeBotCap', objectValue(configuration, 'hordeBotCap'), 1250);
+        renderProfileRateFields(scope === 'resume' ? '#wsResumeRateFields' : '#wsRateFields', scope, configuration);
+        renderR2Fields(scope === 'resume' ? '#wsResumeR2Fields' : '#wsCreateR2Fields', scope, configuration);
+    }
+
+    function renderR2Fields(selector, scope, configuration) {
+        var profileId = objectValue(configuration, 'profileId') || selectedProfileId(scope);
+        var profile = profileDefinition(profileId);
+        var description = profile && objectValue(profile, 'description');
+        if (profileId !== 'rts-r2-v1') {
+            $(selector).html('<div class="ws-r2-disabled"><strong>Honor + Heroes are disabled.</strong> ' +
+                'This load removes their boot gates and rules, restores the five preserved pre-R2 world spell rows, ' +
+                'and leaves existing faction Honor and hero roster state parked without deleting it.</div>');
+            return;
+        }
+
+        var defaults = profileDefaults(profileId);
+        var rules = objectValue(configuration, 'heroRules') || objectValue(defaults, 'heroRules') || [];
+        function setting(name, fallback) {
+            var value = objectValue(configuration, name);
+            if (value === undefined || value === null) value = objectValue(defaults, name);
+            return value === undefined || value === null ? fallback : value;
+        }
+        function numberField(label, suffix, value, min, max) {
+            return '<label><span>' + esc(label) + '</span><input class="form-input" type="number" id="' +
+                (scope === 'resume' ? 'wsResumeCfg' : 'wsCfg') + suffix + '" min="' + min + '" max="' + max +
+                '" step="1" value="' + esc(value) + '" /></label>';
+        }
+
+        var html = '<div class="ws-r2-heading"><div><strong>Honor + Heroes</strong><small>' +
+            esc(description || 'Faction combat funds persistent hero declaration, promotion, and revival.') +
+            '</small></div>' + statusBadge('good', 'fa-bolt', 'active at next boot') + '</div>';
+        html += '<div class="ws-r2-grid">' +
+            numberField('Player kill Honor', 'HonorWeightPlayer', setting('honorWeightPlayer', 10), 0, 1000000) +
+            numberField('Bot kill Honor', 'HonorWeightBot', setting('honorWeightBot', 5), 0, 1000000) +
+            numberField('Faction NPC Honor', 'HonorWeightFactionNpc', setting('honorWeightFactionNpc', 1), 0, 1000000) +
+            numberField('Faction elite Honor', 'HonorWeightFactionElite', setting('honorWeightFactionElite', 3), 0, 1000000) +
+            numberField('Fixed hero slots', 'HeroSlotsFixed', setting('heroSlotsFixed', 4), 1, 127) +
+            '<label class="ws-r2-check"><input type="checkbox" id="' + (scope === 'resume' ? 'wsResumeCfg' : 'wsCfg') +
+            'SuppressBotHonorHistory"' + (setting('suppressBotHonorHistory', true) ? ' checked' : '') +
+            ' /><span>Suppress bot-vs-bot vanilla HK history</span></label>' +
+            '<label class="ws-r2-check"><input type="checkbox" id="' + (scope === 'resume' ? 'wsResumeCfg' : 'wsCfg') +
+            'FactionWideBotControl"' + (setting('factionWideBotControl', true) ? ' checked' : '') +
+            ' /><span>Enable same-faction bot control</span></label></div>';
+        html += '<div class="ws-field-help"><strong>Hero eligibility is bot-only server law.</strong> Human characters can earn and spend faction Honor, but cannot occupy a hero slot.</div>';
+        html += '<table class="ws-hero-rules"><thead><tr><th>Level</th><th>Enter cost</th><th>Revive</th><th>Spell ID</th><th>Scale %</th><th>Damage %</th></tr></thead><tbody>';
+        rules.forEach(function (rule, index) {
+            var level = objectValue(rule, 'heroLevel') || index + 1;
+            function cell(field, value, min, max, readOnly) {
+                return '<td><input class="form-input" type="number" data-' + scope + '-hero="' + field +
+                    '" min="' + min + '" max="' + max + '" step="1" value="' + esc(value) + '"' +
+                    (readOnly ? ' readonly aria-readonly="true"' : '') + ' /></td>';
+            }
+            html += '<tr data-' + scope + '-hero-level="' + esc(level) + '"><td><strong>' + esc(level) + '</strong></td>' +
+                cell('honorCost', objectValue(rule, 'honorCost'), 0, 2147483647) +
+                cell('reviveFee', objectValue(rule, 'reviveFee'), 0, 2147483647) +
+                cell('spellId', objectValue(rule, 'spellId'), 51001, 51005, true) +
+                cell('scalePercent', objectValue(rule, 'scalePercent'), 100, 200) +
+                cell('damagePercent', objectValue(rule, 'damagePercent'), 100, 200) + '</tr>';
+        });
+        html += '</tbody></table><div class="ws-field-help">Enter cost is the declaration cost at level 1 and promotion cost for levels 2-5. ' +
+            'Reserved spell IDs 51001-51005 are native passive auras in this RTS world only. World State writes their configured scale/damage bonuses into the staged restore artifact and validates the matching save-bound rule rows at boot.</div>';
+        $(selector).html(html);
+    }
+
+    function switchProfile(scope, profileId) {
+        var current = collectConfiguration(scope);
+        var next = profileDefaults(profileId);
+        next.profileId = profileId;
+        next.realmId = current.realmId;
+        next.playerLimit = current.playerLimit;
+        next.playerHardLimit = current.playerHardLimit;
+        next.loginPerTick = current.loginPerTick;
+        next.stateFlushMs = current.stateFlushMs;
+        next.allianceBotCap = current.allianceBotCap;
+        next.hordeBotCap = current.hordeBotCap;
+        next.rates = current.rates;
+        applyConfigurationFields(scope, next);
+    }
+
     function collectConfiguration(scope) {
         var prefix = scope === 'resume' ? '#wsResumeCfg' : '#wsCfg';
+        var profileId = selectedProfileId(scope);
+        var defaults = profileDefaults(profileId);
         var realmId = scope === 'resume'
             ? objectValue(pendingResume && pendingResume.preflight && pendingResume.preflight.configValues, 'realmId')
             : objectValue(selectedCreateSource(), 'realmId');
         var configuration = {
-            profileId: (createOptions && createOptions.profileId) || 'rts-r1-v1',
+            profileId: profileId,
             realmId: Number(realmId),
             playerLimit: numberValue(prefix + 'PlayerLimit'),
             playerHardLimit: numberValue(prefix + 'PlayerHardLimit'),
@@ -596,11 +720,37 @@ $(function () {
             stateFlushMs: numberValue(prefix + 'StateFlushMs'),
             allianceBotCap: numberValue(prefix + 'AllianceBotCap'),
             hordeBotCap: numberValue(prefix + 'HordeBotCap'),
-            rates: {}
+            rates: {},
+            honorWeightPlayer: numberValueOr(prefix + 'HonorWeightPlayer', objectValue(defaults, 'honorWeightPlayer') || 10),
+            honorWeightBot: numberValueOr(prefix + 'HonorWeightBot', objectValue(defaults, 'honorWeightBot') || 5),
+            honorWeightFactionNpc: numberValueOr(prefix + 'HonorWeightFactionNpc', objectValue(defaults, 'honorWeightFactionNpc') || 1),
+            honorWeightFactionElite: numberValueOr(prefix + 'HonorWeightFactionElite', objectValue(defaults, 'honorWeightFactionElite') || 3),
+            suppressBotHonorHistory: $(prefix + 'SuppressBotHonorHistory').length
+                ? $(prefix + 'SuppressBotHonorHistory').prop('checked')
+                : objectValue(defaults, 'suppressBotHonorHistory') !== false,
+            factionWideBotControl: $(prefix + 'FactionWideBotControl').length
+                ? $(prefix + 'FactionWideBotControl').prop('checked')
+                : objectValue(defaults, 'factionWideBotControl') !== false,
+            heroSlotsFixed: numberValueOr(prefix + 'HeroSlotsFixed', objectValue(defaults, 'heroSlotsFixed') || 4),
+            heroRules: []
         };
         $('[data-' + scope + '-rate]').each(function () {
             configuration.rates[$(this).attr('data-' + scope + '-rate')] = Number($(this).val());
         });
+        $('tr[data-' + scope + '-hero-level]').each(function () {
+            var row = $(this);
+            function heroValue(field) { return Number(row.find('[data-' + scope + '-hero="' + field + '"]').val()); }
+            configuration.heroRules.push({
+                heroLevel: Number(row.attr('data-' + scope + '-hero-level')),
+                honorCost: heroValue('honorCost'),
+                reviveFee: heroValue('reviveFee'),
+                spellId: heroValue('spellId'),
+                scalePercent: heroValue('scalePercent'),
+                damagePercent: heroValue('damagePercent')
+            });
+        });
+        if (!configuration.heroRules.length)
+            configuration.heroRules = $.extend(true, [], objectValue(defaults, 'heroRules') || []);
         return configuration;
     }
 
@@ -627,6 +777,28 @@ $(function () {
             if (!Number.isFinite(value) || value < min || value > max)
                 errors.push($(this).closest('label').find('span').first().text() + ' must be between ' + min + ' and ' + max + '.');
         });
+        if (configuration.profileId === 'rts-r2-v1') {
+            ['honorWeightPlayer', 'honorWeightBot', 'honorWeightFactionNpc', 'honorWeightFactionElite'].forEach(function (key) {
+                var value = Number(configuration[key]);
+                if (!Number.isInteger(value) || value < 0 || value > 1000000)
+                    errors.push('R2 Honor weights must be whole numbers between 0 and 1,000,000.');
+            });
+            if (!Number.isInteger(Number(configuration.heroSlotsFixed)) || configuration.heroSlotsFixed < 1 || configuration.heroSlotsFixed > 127)
+                errors.push('Fixed hero slots must be between 1 and 127.');
+            if (!configuration.heroRules || configuration.heroRules.length !== 5)
+                errors.push('RTS R2 requires five hero target-level rows.');
+            (configuration.heroRules || []).forEach(function (rule) {
+                if (!Number.isInteger(rule.heroLevel) || rule.heroLevel < 1 || rule.heroLevel > 5 ||
+                    !Number.isInteger(rule.honorCost) || rule.honorCost < 0 ||
+                    !Number.isInteger(rule.reviveFee) || rule.reviveFee < 0 ||
+                    !Number.isInteger(rule.spellId) || rule.spellId < 1 ||
+                    !Number.isInteger(rule.scalePercent) || rule.scalePercent < 100 || rule.scalePercent > 200 ||
+                    !Number.isInteger(rule.damagePercent) || rule.damagePercent < 100 || rule.damagePercent > 200)
+                    errors.push('Every hero row needs valid whole-number costs, spell ID, scale, and damage values.');
+                if (Number.isInteger(rule.heroLevel) && rule.spellId !== 51000 + rule.heroLevel)
+                    errors.push('Hero level ' + rule.heroLevel + ' must use reserved spell ID ' + (51000 + rule.heroLevel) + '.');
+            });
+        }
         return errors;
     }
 
@@ -644,6 +816,34 @@ $(function () {
         if (eligibleNameCount !== undefined && eligibleNameCount !== null)
             text += ' Current eligible-name pool: ' + formatNumber(eligibleNameCount) + '.';
         $(selector).css('color', headroom < 0 ? 'var(--status-error)' : headroom === 0 ? 'var(--status-warning)' : '').text(text);
+    }
+
+    function configurationReviewHtml(configuration) {
+        if (!configuration) return '';
+        var profile = profileDefinition(configuration.profileId);
+        var label = profile && objectValue(profile, 'label') || configuration.profileId;
+        var html = '<div class="ws-config-summary">' +
+            statusBadge('good', 'fa-layer-group', label) +
+            statusBadge('', 'fa-users', 'limit ' + formatNumber(configuration.playerLimit)) +
+            statusBadge('', 'fa-robot', formatNumber(configuration.allianceBotCap) + 'A / ' + formatNumber(configuration.hordeBotCap) + 'H');
+        if (configuration.profileId === 'rts-r2-v1') {
+            html += statusBadge(configuration.factionWideBotControl ? 'good' : 'warn', 'fa-chess-knight',
+                configuration.factionWideBotControl ? 'faction bot control on' : 'faction bot control off');
+            html += statusBadge('good', 'fa-shield-halved', 'heroes: bots only, ' + formatNumber(configuration.heroSlotsFixed) + ' slots');
+            html += statusBadge(configuration.suppressBotHonorHistory ? 'good' : 'warn', 'fa-scroll',
+                configuration.suppressBotHonorHistory ? 'bot HK history suppressed' : 'bot HK history retained');
+            html += '</div><div class="ws-field-help"><strong>Honor weights:</strong> player ' + esc(configuration.honorWeightPlayer) +
+                ', bot ' + esc(configuration.honorWeightBot) + ', faction NPC ' + esc(configuration.honorWeightFactionNpc) +
+                ', elite ' + esc(configuration.honorWeightFactionElite) + '. <strong>Hero ladder:</strong> ' +
+                (configuration.heroRules || []).map(function (rule) {
+                    return 'L' + rule.heroLevel + ' ' + rule.honorCost + '/' + rule.reviveFee +
+                        ' Honor, ' + rule.scalePercent + '% scale, ' + rule.damagePercent + '% damage, #' + rule.spellId;
+                }).join(' -> ') + '.</div>';
+            return html;
+        }
+        html += statusBadge('warn', 'fa-power-off', 'Honor + Heroes inert') +
+            '</div><div class="ws-field-help">R1 removes the Honor/Hero boot gates and restores any preserved pre-R2 spell rows; parked runtime Honor and hero records remain untouched.</div>';
+        return html;
     }
 
     function renderCreateValidation() {
@@ -665,13 +865,18 @@ $(function () {
 
         var h = blockers.length
             ? '<div class="ws-preflight"><div class="ws-preflight-head"><div class="ws-preflight-title"><i class="fa-solid fa-circle-xmark" style="color: var(--status-error);"></i> Creation blocked</div></div><div class="ws-preflight-body">' + messageList(unique(blockers), 'blockers') + '</div></div>'
-            : '<div class="ws-preflight"><div class="ws-preflight-head"><div class="ws-preflight-title"><i class="fa-solid fa-circle-check" style="color: var(--status-online);"></i> Ready to build a parked zero-roster world</div><span class="ws-status-badge good">0 characters · 0 persisted bots</span></div></div>';
+            : '<div class="ws-preflight"><div class="ws-preflight-head"><div class="ws-preflight-title"><i class="fa-solid fa-circle-check" style="color: var(--status-online);"></i> Ready to build a parked zero-roster world</div><span class="ws-status-badge good">' + esc(configuration.profileId) + ' · 0 characters · 0 persisted bots</span></div></div>';
+        h += configurationReviewHtml(configuration);
         $('#wsCreateValidation').html(h);
         $('#wsConfirmCreateRts').prop('disabled', blockers.length > 0);
     }
 
     $('#wsCreateSource').on('change', function () { renderCreateSourceStatus(); renderCreateValidation(); });
-    $(document).on('input change', '#wsCreateName, #wsCreateRtsModal input[data-create-rate], #wsCreateRtsModal input[type=number]', renderCreateValidation);
+    $(document).on('change', '#wsCreateProfile', function () {
+        switchProfile('create', $(this).val());
+        renderCreateValidation();
+    });
+    $(document).on('input change', '#wsCreateName, #wsCreateRtsModal input, #wsCreateRtsModal select', renderCreateValidation);
 
     $('#wsConfirmCreateRts').on('click', function () {
         renderCreateValidation();
@@ -724,7 +929,11 @@ $(function () {
         var isSwap = !!outgoing;
         $('#wsResumeTitle').text(isSwap ? 'Swap Worlds' : 'Resume World');
         $('#wsConfirmResumeLabel').text(isSwap ? 'Swap Worlds' : 'Resume');
-        $('#wsForceFullRestore').prop('checked', false);
+        var isRtsTarget = String(target.flavor || '').toLowerCase() === 'rts';
+        $('#wsForceFullRestore').prop('checked', isRtsTarget).prop('disabled', isRtsTarget);
+        $('#wsForceFullRestoreHelp').text(isRtsTarget
+            ? 'Required for RTS profiles: restore the selected snapshot, apply immutable boot rules to an ephemeral world artifact, and preserve captured runtime state.'
+            : 'Validate and restore the selected snapshot even when this world\'s data is already materialized.');
         renderResumeExchange(outgoing, target);
 
         if (snapshots.length > 1 && !requestedSnapshot) {
@@ -918,12 +1127,14 @@ $(function () {
         }
 
         if (!createOptions) return;
-        var seed = mergeConfiguration(
-            createOptions.defaults || {},
-            p.savedConfiguration || selectedResumeSnapshotConfiguration() || target.launchConfiguration || {});
+        var saved = p.savedConfiguration || selectedResumeSnapshotConfiguration() || target.launchConfiguration || {};
+        var savedProfileId = objectValue(saved, 'profileId') || 'rts-r1-v1';
+        var seed = mergeConfiguration(profileDefaults(savedProfileId), saved);
+        seed.profileId = savedProfileId;
         seed.realmId = Number(objectValue(p.configValues, 'realmId'));
         var html = '<h6>RTS launch configuration</h6>' +
-            '<div class="ws-resume-config-intro">Review or change the selected campaign’s capacity, faction caps, and rates before it starts.</div>' +
+            '<div class="ws-resume-config-intro">Review or change this load-time profile. World State performs a full stopped-world restore, preserves the selected snapshot’s runtime Honor/hero state, and makes the configuration immutable for the next boot.</div>' +
+            '<label class="form-label" for="wsResumeProfile">Rules profile</label><select class="form-input ws-profile-select" id="wsResumeProfile"></select>' +
             '<div class="ws-config-summary">' +
             statusBadge(seed.realmId > 0 ? 'good' : 'bad', 'fa-earth-americas', seed.realmId > 0 ? 'RealmID ' + seed.realmId + ' · inherited, not editable' : 'Captured RealmID unavailable') +
             statusBadge(p.namePoolEligible !== undefined && p.namePoolEligible !== null ? 'good' : 'bad', 'fa-signature', p.namePoolEligible !== undefined && p.namePoolEligible !== null ? formatNumber(p.namePoolEligible) + ' eligible bot names now' : 'Name pool unavailable') +
@@ -936,12 +1147,16 @@ $(function () {
             resumeNumberField('Alliance bot cap', 'AllianceBotCap', seed.allianceBotCap, 0, 50000) +
             resumeNumberField('Horde bot cap', 'HordeBotCap', seed.hordeBotCap, 0, 50000) +
             '</div><div class="ws-field-help" id="wsResumeCapacitySummary"></div>' +
-            '<div id="wsResumeRateFields" style="margin-top: 13px;"></div>';
+            '<div id="wsResumeRateFields" style="margin-top: 13px;"></div>' +
+            '<div class="ws-r2-settings" id="wsResumeR2Fields"></div>' +
+            '<div id="wsResumeRulesReview"></div>';
         $('#wsResumeConfiguration').html(html);
-        renderProfileRateFields('#wsResumeRateFields', 'resume', seed);
+        renderProfileOptions('#wsResumeProfile', seed.profileId);
+        applyConfigurationFields('resume', seed);
         pendingResume.configInitialized = true;
         pendingResume.configScope = 'resume';
         renderCapacitySummary('#wsResumeCapacitySummary', seed, p.namePoolEligible);
+        $('#wsResumeRulesReview').html(configurationReviewHtml(seed));
     }
 
     function selectedResumeSnapshotConfiguration() {
@@ -968,6 +1183,7 @@ $(function () {
             else {
                 var configuration = collectConfiguration('resume');
                 renderCapacitySummary('#wsResumeCapacitySummary', configuration, pendingResume.preflight.namePoolEligible);
+                $('#wsResumeRulesReview').html(configurationReviewHtml(configuration));
                 blocked = blocked || configurationErrors(
                     configuration, 'resume', pendingResume.preflight.namePoolEligible).length > 0;
             }
@@ -975,7 +1191,11 @@ $(function () {
         $('#wsConfirmResume').prop('disabled', blocked);
     }
 
-    $(document).on('input change', '#wsResumeConfiguration input', refreshResumeConfirm);
+    $(document).on('change', '#wsResumeProfile', function () {
+        switchProfile('resume', $(this).val());
+        refreshResumeConfirm();
+    });
+    $(document).on('input change', '#wsResumeConfiguration input, #wsResumeConfiguration select', refreshResumeConfirm);
 
     $('#wsConfirmResume').on('click', function () {
         if (!pendingResume || !pendingResume.preflight || !pendingResume.preflight.allowed) return;
@@ -1180,6 +1400,12 @@ $(function () {
         return Number.isFinite(value) ? value : NaN;
     }
 
+    function numberValueOr(selector, fallback) {
+        if (!$(selector).length) return Number(fallback);
+        var value = Number($(selector).val());
+        return Number.isFinite(value) ? value : Number(fallback);
+    }
+
     function statusBadge(tone, icon, label) {
         return '<span class="ws-status-badge ' + esc(tone || '') + '"><i class="fa-solid ' + esc(icon) + '"></i> ' + esc(label) + '</span>';
     }
@@ -1205,6 +1431,10 @@ $(function () {
     function mergeConfiguration(base, override) {
         var merged = $.extend(true, {}, base || {}, override || {});
         merged.rates = $.extend({}, (base && base.rates) || {}, (override && override.rates) || {});
+        if (override && objectValue(override, 'heroRules') !== undefined)
+            merged.heroRules = $.extend(true, [], objectValue(override, 'heroRules') || []);
+        else
+            merged.heroRules = $.extend(true, [], objectValue(base, 'heroRules') || []);
         return merged;
     }
 

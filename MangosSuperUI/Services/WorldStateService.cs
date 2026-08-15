@@ -27,6 +27,11 @@ namespace MangosSuperUI.Services;
 /// </summary>
 public class WorldStateService
 {
+    private const string ManagedRtsSettingPredicate =
+        "`key`='mode' OR `key`='state.flush_ms' OR `key` LIKE 'rate.%' OR " +
+        "`key` LIKE 'bots.cap.%' OR `key` LIKE 'honor.weight.%' OR " +
+        "`key` IN ('honor.enabled','honor.suppress_bot_hk','control.faction_bots','hero.enabled','hero.slots_fixed')";
+
     private readonly ConnectionFactory _db;
     private readonly ProcessManagerService _proc;
     private readonly IOptionsMonitor<VmangosSettings> _settings;
@@ -875,17 +880,25 @@ public class WorldStateService
             throw new InvalidOperationException("RTS launch configuration can only be applied to an RTS world.");
         }
 
+        // RTS boot configuration is immutable once the core starts. Preparing the
+        // selected profile therefore always uses a fresh, ephemeral restore input;
+        // the parked snapshot itself is never edited and its runtime state is kept.
+        var effectiveForceFullRestore = forceFullRestore || launchConfiguration != null;
+        if (launchConfiguration != null && snapshot == null)
+            throw new InvalidOperationException(
+                "An RTS profile can only be loaded from a captured snapshot; suspend this world once to create one.");
+
         var outgoing = registry.Worlds.FirstOrDefault(w => w.Id == registry.LiveWorldId);
 
         // A world with no snapshot can only be resumed if its data is still sitting in the
         // databases — otherwise there is genuinely nothing to mount.
-        var alreadyMaterialized = !forceFullRestore && registry.MaterializedWorldId == target.Id
+        var alreadyMaterialized = !effectiveForceFullRestore && registry.MaterializedWorldId == target.Id
             && (snapshot == null || registry.MaterializedSnapshot == snapshot.Folder);
 
         if (snapshot == null && !alreadyMaterialized)
             throw new InvalidOperationException($"“{target.Name}” has no snapshot to resume from.");
 
-        var initialPreflight = await PreflightResumeAsync(target.Id, snapshot?.Folder, forceFullRestore);
+        var initialPreflight = await PreflightResumeAsync(target.Id, snapshot?.Folder, effectiveForceFullRestore);
         if (!initialPreflight.Allowed)
             throw new InvalidOperationException("Snapshot preflight failed: " + string.Join("; ", initialPreflight.Blockers));
         if (launchConfiguration != null)
@@ -913,13 +926,13 @@ public class WorldStateService
         var title = outgoing != null ? $"Swapping {outgoing.Name} → {target.Name}" : $"Resuming {target.Name}";
 
         if (launchConfiguration != null)
-            steps.Insert(steps.Count - 1, Step("configure", "Apply RTS launch configuration"));
+            steps.Insert(steps.Count - 1, Step("configure", "Apply RTS rules and launch configuration"));
 
         return await StartJobAsync(outgoing != null ? "swap" : "resume", title, steps, async job =>
         {
             await RunStep(job, "preflight", async () =>
             {
-                var current = await PreflightResumeAsync(target.Id, snapshot?.Folder, forceFullRestore);
+                var current = await PreflightResumeAsync(target.Id, snapshot?.Folder, effectiveForceFullRestore);
                 if (!current.Allowed)
                     throw new InvalidOperationException(string.Join("; ", current.Blockers));
                 if (launchConfiguration != null)
@@ -996,7 +1009,22 @@ public class WorldStateService
                 if (!Directory.Exists(dir))
                     throw new InvalidOperationException($"Snapshot folder '{snapshot.Folder}' is missing from disk.");
 
-                await RestoreRequired(job, "restore-world", "world", dir);
+                string? preparedWorldDirectory = null;
+                try
+                {
+                    if (launchConfiguration != null)
+                    {
+                        preparedWorldDirectory = await PrepareRtsWorldRestoreDirectoryAsync(
+                            dir, launchConfiguration, job.Id);
+                    }
+                    await RestoreRequired(
+                        job, "restore-world", "world", preparedWorldDirectory ?? dir);
+                }
+                finally
+                {
+                    if (preparedWorldDirectory != null)
+                        CleanupStagingDirectory(preparedWorldDirectory);
+                }
                 await RestoreRequired(job, "restore-players", "players", dir);
                 await RestoreRequired(job, "restore-core", "core", dir);
 
@@ -1013,7 +1041,7 @@ public class WorldStateService
                         world.LaunchConfiguration = launchConfiguration.Clone();
                         return true;
                     });
-                    return $"PlayerLimit {launchConfiguration.PlayerLimit:N0}; bots {launchConfiguration.AllianceBotCap:N0}A/{launchConfiguration.HordeBotCap:N0}H";
+                    return $"{launchConfiguration.ProfileId}; PlayerLimit {launchConfiguration.PlayerLimit:N0}; bots {launchConfiguration.AllianceBotCap:N0}A/{launchConfiguration.HordeBotCap:N0}H";
                 });
             }
 
@@ -1063,9 +1091,39 @@ public class WorldStateService
         await RunStep(job, stepKey, async () => await RestoreGroupAsync(group, dir));
     }
 
+    private async Task<string> PrepareRtsWorldRestoreDirectoryAsync(
+        string snapshotDirectory,
+        WorldLaunchConfiguration configuration,
+        string jobId)
+    {
+        var stagingDirectory = CreateStagingDirectory(jobId, "rts-world-profile");
+        try
+        {
+            await _artifacts.TransformGzipAsync(
+                Path.Combine(snapshotDirectory, WorldArtifactService.WorldMangos),
+                Path.Combine(stagingDirectory, WorldArtifactService.WorldMangos),
+                RtsHeroSpellWorldStore.BuildArtifactPostlude(configuration));
+            await _artifacts.CopyAtomicAsync(
+                Path.Combine(snapshotDirectory, WorldArtifactService.WorldAdmin),
+                Path.Combine(stagingDirectory, WorldArtifactService.WorldAdmin));
+            await _artifacts.ValidateGzipAsync(
+                Path.Combine(stagingDirectory, WorldArtifactService.WorldMangos));
+            await _artifacts.ValidateGzipAsync(
+                Path.Combine(stagingDirectory, WorldArtifactService.WorldAdmin));
+            return stagingDirectory;
+        }
+        catch
+        {
+            CleanupStagingDirectory(stagingDirectory);
+            throw;
+        }
+    }
+
     private async Task ApplyWorldLaunchConfigurationAsync(WorldLaunchConfiguration input)
     {
         var configuration = WorldConfigurationCatalog.NormalizeAndValidate(input);
+        var expectedRows = WorldConfigurationCatalog.ToWorldStateRows(configuration);
+        var expectedHeroRules = WorldConfigurationCatalog.ToHeroRuleRows(configuration);
         var namePool = await _rtsWorlds.GetNamePoolStatsAsync();
         WorldConfigurationCatalog.ValidateNamePoolCapacity(configuration, namePool.ValidUniqueNames);
         if (!File.Exists(MangosdConfPath))
@@ -1088,33 +1146,70 @@ public class WorldStateService
 
         using var characters = _db.Characters();
         await characters.OpenAsync();
-        await characters.ExecuteAsync(
-            "CREATE TABLE IF NOT EXISTS `superui_worldstate` (`key` VARCHAR(32) NOT NULL PRIMARY KEY, `value` VARCHAR(64) NOT NULL)");
+        // Schema ownership lives here, in the stopped-world load ceremony. The core
+        // only reads these tables at boot and therefore never runs RTS DDL/DML while
+        // an MMO world is loading.
+        await EnsureRtsSchemaAsync(characters);
         using var transaction = await characters.BeginTransactionAsync();
         try
         {
             await characters.ExecuteAsync(
-                "DELETE FROM `superui_worldstate` WHERE `key`='mode' OR `key`='state.flush_ms' OR `key` LIKE 'rate.%' OR `key` LIKE 'bots.cap.%'",
+                "DELETE FROM `superui_worldstate` WHERE " + ManagedRtsSettingPredicate,
                 transaction: transaction);
-            foreach (var row in WorldConfigurationCatalog.ToWorldStateRows(configuration))
+            foreach (var row in expectedRows)
             {
                 await characters.ExecuteAsync(
                     "INSERT INTO `superui_worldstate` (`key`,`value`) VALUES (@key,@value) " +
                     "ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)",
                     new { key = row.Key, value = row.Value }, transaction);
             }
-            var expectedRows = WorldConfigurationCatalog.ToWorldStateRows(configuration);
+
+            // These are rules, not runtime match state. Switching R1/R2 replaces the
+            // five configured target levels but deliberately preserves faction Honor
+            // and the persistent hero roster in superui_faction/superui_heroes.
+            await characters.ExecuteAsync("DELETE FROM `superui_rules_hero`", transaction: transaction);
+            foreach (var rule in expectedHeroRules)
+            {
+                await characters.ExecuteAsync(
+                    "INSERT INTO `superui_rules_hero` (`hero_level`,`declare_cost`,`revive_fee`,`spell_id`,`scale_percent`,`damage_percent`) " +
+                    "VALUES (@HeroLevel,@HonorCost,@ReviveFee,@SpellId,@ScalePercent,@DamagePercent)",
+                    rule, transaction);
+            }
+            await characters.ExecuteAsync(
+                "INSERT IGNORE INTO `superui_faction` (`team`,`honor_pool`) VALUES (0,0),(1,0)",
+                transaction: transaction);
+
             var actualRows = (await characters.QueryAsync<WorldStateSettingRow>(
                 "SELECT `key` AS `Key`, `value` AS `Value` FROM `superui_worldstate` " +
-                "WHERE `key`='mode' OR `key`='state.flush_ms' OR `key` LIKE 'rate.%' OR `key` LIKE 'bots.cap.%'",
+                "WHERE " + ManagedRtsSettingPredicate,
                 transaction: transaction))
                 .ToDictionary(row => row.Key, row => row.Value, StringComparer.OrdinalIgnoreCase);
+            if (actualRows.Count != expectedRows.Count)
+                throw new InvalidDataException("RTS worldstate verification found unexpected managed settings.");
             foreach (var expected in expectedRows)
             {
                 if (!actualRows.TryGetValue(expected.Key, out var actual) ||
                     !string.Equals(actual, expected.Value, StringComparison.Ordinal))
                     throw new InvalidDataException($"RTS worldstate verification failed for '{expected.Key}'.");
             }
+
+            var actualHeroRules = (await characters.QueryAsync<HeroRuleSettingRow>(
+                "SELECT `hero_level` AS `HeroLevel`, `declare_cost` AS `HonorCost`, `revive_fee` AS `ReviveFee`, " +
+                "`spell_id` AS `SpellId`, `scale_percent` AS `ScalePercent`, `damage_percent` AS `DamagePercent` " +
+                "FROM `superui_rules_hero` ORDER BY `hero_level`",
+                transaction: transaction)).ToArray();
+            if (actualHeroRules.Length != expectedHeroRules.Count)
+                throw new InvalidDataException("RTS hero-rule verification found an unexpected row count.");
+            for (var index = 0; index < expectedHeroRules.Count; index++)
+            {
+                var expected = expectedHeroRules[index];
+                var actual = actualHeroRules[index];
+                if (actual.HeroLevel != expected.HeroLevel || actual.HonorCost != expected.HonorCost ||
+                    actual.ReviveFee != expected.ReviveFee || actual.SpellId != expected.SpellId ||
+                    actual.ScalePercent != expected.ScalePercent || actual.DamagePercent != expected.DamagePercent)
+                    throw new InvalidDataException($"RTS hero-rule verification failed for level {expected.HeroLevel}.");
+            }
+            await ValidateRtsHeroSpellRowsAsync(configuration);
             await transaction.CommitAsync();
         }
         catch
@@ -1122,6 +1217,151 @@ public class WorldStateService
             await transaction.RollbackAsync();
             throw;
         }
+    }
+
+    private async Task ValidateRtsHeroSpellRowsAsync(WorldLaunchConfiguration configuration)
+    {
+        using var world = _db.Mangos();
+        await world.OpenAsync();
+        if (!WorldConfigurationCatalog.IsR2(configuration))
+        {
+            await ValidateR1OriginalSpellRowsAsync(world);
+            return;
+        }
+
+        var rows = (await world.QueryAsync<RtsHeroSpellValidationRow>(
+            @"SELECT `entry` AS `SpellId`,`build` AS `Build`,`attributes` AS `Attributes`,
+                     `durationIndex` AS `DurationIndex`,`stackAmount` AS `StackAmount`,
+                     `equippedItemClass` AS `EquippedItemClass`,
+                     `equippedItemSubClassMask` AS `EquippedItemSubClassMask`,
+                     `equippedItemInventoryTypeMask` AS `EquippedItemInventoryTypeMask`,
+                     `effect1` AS `Effect1`,`effect2` AS `Effect2`,`effect3` AS `Effect3`,
+                     `effectBaseDice1` AS `EffectBaseDice1`,`effectBaseDice2` AS `EffectBaseDice2`,
+                     `effectDieSides1` AS `EffectDieSides1`,`effectDieSides2` AS `EffectDieSides2`,
+                     `effectBasePoints1` AS `EffectBasePoints1`,`effectBasePoints2` AS `EffectBasePoints2`,
+                     `effectImplicitTargetA1` AS `EffectImplicitTargetA1`,
+                     `effectImplicitTargetA2` AS `EffectImplicitTargetA2`,
+                     `effectImplicitTargetB1` AS `EffectImplicitTargetB1`,
+                     `effectImplicitTargetB2` AS `EffectImplicitTargetB2`,
+                     `effectApplyAuraName1` AS `EffectApplyAuraName1`,
+                     `effectApplyAuraName2` AS `EffectApplyAuraName2`,
+                     `effectMiscValue1` AS `EffectMiscValue1`,`effectMiscValue2` AS `EffectMiscValue2`,
+                     `targets` AS `Targets`,`procFlags` AS `ProcFlags`,`procChance` AS `ProcChance`,
+                     `procCharges` AS `ProcCharges`,`effectAmplitude1` AS `EffectAmplitude1`,
+                     `effectAmplitude2` AS `EffectAmplitude2`,`effectTriggerSpell1` AS `EffectTriggerSpell1`,
+                     `effectTriggerSpell2` AS `EffectTriggerSpell2`,`customFlags` AS `CustomFlags`
+              FROM `spell_template` WHERE `entry` IN @Ids ORDER BY `entry`,`build`",
+            new { Ids = RtsHeroSpellWorldStore.ReservedSpellIds })).ToArray();
+        if (rows.Length != 5)
+            throw new InvalidDataException(
+                "RTS R2 requires exactly one build-5875 world spell row for each reserved ID 51001-51005.");
+
+        var rules = configuration.HeroRules.OrderBy(rule => rule.SpellId).ToArray();
+        for (var index = 0; index < rules.Length; index++)
+        {
+            var rule = rules[index];
+            var row = rows[index];
+            if (row.SpellId != rule.SpellId || row.Build != 5875 || row.Attributes != 0x80000040UL ||
+                row.DurationIndex != 21 || row.StackAmount != 1 || row.EquippedItemClass != -1 ||
+                row.EquippedItemSubClassMask != 0 || row.EquippedItemInventoryTypeMask != 0 ||
+                row.Effect1 != 6 || row.Effect2 != 6 || row.Effect3 != 0 ||
+                row.EffectBaseDice1 != 1 || row.EffectBaseDice2 != 1 ||
+                row.EffectDieSides1 != 1 || row.EffectDieSides2 != 1 ||
+                row.EffectBasePoints1 != rule.ScalePercent - 101 ||
+                row.EffectBasePoints2 != rule.DamagePercent - 101 ||
+                row.EffectImplicitTargetA1 != 1 || row.EffectImplicitTargetA2 != 1 ||
+                row.EffectImplicitTargetB1 != 0 || row.EffectImplicitTargetB2 != 0 ||
+                row.EffectApplyAuraName1 != 61 || row.EffectApplyAuraName2 != 79 ||
+                row.EffectMiscValue1 != 0 || row.EffectMiscValue2 != 127 || row.Targets != 0 ||
+                row.ProcFlags != 0 || row.ProcChance != 0 || row.ProcCharges != 0 ||
+                row.EffectAmplitude1 != 0 || row.EffectAmplitude2 != 0 ||
+                row.EffectTriggerSpell1 != 0 || row.EffectTriggerSpell2 != 0 || row.CustomFlags != 0)
+                throw new InvalidDataException(
+                    $"RTS R2 world spell {rule.SpellId} does not match its configured passive scale/damage aura contract.");
+        }
+    }
+
+    private static async Task ValidateR1OriginalSpellRowsAsync(MySqlConnector.MySqlConnection world)
+    {
+        var tableCount = await world.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() " +
+            "AND table_name IN (@Original,@State)",
+            new
+            {
+                Original = RtsHeroSpellWorldStore.OriginalTable,
+                State = RtsHeroSpellWorldStore.OriginalStateTable
+            });
+        if (tableCount == 0) return;
+        if (tableCount != 2)
+            throw new InvalidDataException("The RTS original-spell preservation tables are incomplete.");
+        var captured = await world.ExecuteScalarAsync<int>(
+            $"SELECT COUNT(*) FROM `{RtsHeroSpellWorldStore.OriginalStateTable}` WHERE `id`=1");
+        if (captured != 1)
+            throw new InvalidDataException("The RTS original-spell preservation marker is missing.");
+
+        var liveColumns = (await world.QueryAsync<string>(
+            "SELECT `column_name` FROM information_schema.columns WHERE table_schema=DATABASE() " +
+            "AND table_name='spell_template' ORDER BY `ordinal_position`")).ToArray();
+        var originalColumns = (await world.QueryAsync<string>(
+            "SELECT `column_name` FROM information_schema.columns WHERE table_schema=DATABASE() " +
+            "AND table_name=@Table ORDER BY `ordinal_position`",
+            new { Table = RtsHeroSpellWorldStore.OriginalTable })).ToArray();
+        if (liveColumns.Length == 0 || !liveColumns.SequenceEqual(originalColumns, StringComparer.OrdinalIgnoreCase))
+            throw new InvalidDataException("The preserved RTS spell rows no longer match the spell_template schema.");
+
+        var ids = string.Join(',', RtsHeroSpellWorldStore.ReservedSpellIds);
+        var missing = await world.ExecuteScalarAsync<int>(
+            $"SELECT COUNT(*) FROM `{RtsHeroSpellWorldStore.OriginalTable}` o " +
+            "LEFT JOIN `spell_template` s ON s.`entry`=o.`entry` AND s.`build`=o.`build` " +
+            $"WHERE o.`entry` IN ({ids}) AND s.`entry` IS NULL");
+        var extra = await world.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM `spell_template` s " +
+            $"LEFT JOIN `{RtsHeroSpellWorldStore.OriginalTable}` o ON o.`entry`=s.`entry` AND o.`build`=s.`build` " +
+            $"WHERE s.`entry` IN ({ids}) AND o.`entry` IS NULL");
+        var differs = string.Join(" OR ", liveColumns.Select(column =>
+        {
+            var quoted = column.Replace("`", "``", StringComparison.Ordinal);
+            return $"NOT (s.`{quoted}` <=> o.`{quoted}`)";
+        }));
+        var changed = await world.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM `spell_template` s " +
+            $"JOIN `{RtsHeroSpellWorldStore.OriginalTable}` o ON o.`entry`=s.`entry` AND o.`build`=s.`build` " +
+            $"WHERE s.`entry` IN ({ids}) AND ({differs})");
+        if (missing != 0 || extra != 0 || changed != 0)
+            throw new InvalidDataException("RTS R1 did not restore the preserved 51001-51005 spell rows exactly.");
+    }
+
+    private static async Task EnsureRtsSchemaAsync(MySqlConnector.MySqlConnection characters)
+    {
+        string[] statements =
+        {
+            "CREATE TABLE IF NOT EXISTS `superui_worldstate` (`key` VARCHAR(32) NOT NULL PRIMARY KEY, `value` VARCHAR(64) NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS `superui_rules_zone` (`zone_id` INT UNSIGNED NOT NULL PRIMARY KEY, `ore` TINYINT UNSIGNED NOT NULL DEFAULT 0, `skins` TINYINT UNSIGNED NOT NULL DEFAULT 0, `herbs` TINYINT UNSIGNED NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS `superui_rules_hub` (`hub_id` SMALLINT UNSIGNED NOT NULL PRIMARY KEY, `zone_id` INT UNSIGNED NOT NULL, `name` VARCHAR(64) NOT NULL, `banner_go_guid` INT UNSIGNED NOT NULL, `event_alliance` SMALLINT UNSIGNED NOT NULL, `event_horde` SMALLINT UNSIGNED NOT NULL, `capture_ms` INT UNSIGNED NOT NULL DEFAULT 60000, `initial_controller` TINYINT UNSIGNED NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS `superui_rules_hero` (`hero_level` TINYINT UNSIGNED NOT NULL PRIMARY KEY, `declare_cost` INT UNSIGNED NOT NULL, `revive_fee` INT UNSIGNED NOT NULL, `spell_id` INT UNSIGNED NOT NULL, `scale_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100, `damage_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100)",
+            "CREATE TABLE IF NOT EXISTS `superui_rules_dungeon` (`map_id` INT UNSIGNED NOT NULL PRIMARY KEY, `final_boss_entry` INT UNSIGNED NOT NULL, `buff_spell_id` INT UNSIGNED NOT NULL, `loot_items` TINYINT UNSIGNED NOT NULL DEFAULT 10)",
+            "CREATE TABLE IF NOT EXISTS `superui_faction` (`team` TINYINT UNSIGNED NOT NULL PRIMARY KEY, `honor_pool` BIGINT NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS `superui_heroes` (`guid` INT UNSIGNED NOT NULL PRIMARY KEY, `team` TINYINT UNSIGNED NOT NULL, `hero_level` TINYINT UNSIGNED NOT NULL DEFAULT 1, `dead` TINYINT UNSIGNED NOT NULL DEFAULT 0, `declared_at` BIGINT UNSIGNED NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS `superui_zone_control` (`zone_id` INT UNSIGNED NOT NULL PRIMARY KEY, `controller` TINYINT UNSIGNED NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS `superui_dungeon_control` (`map_id` INT UNSIGNED NOT NULL PRIMARY KEY, `controller` TINYINT UNSIGNED NOT NULL DEFAULT 0)"
+        };
+        foreach (var statement in statements)
+            await characters.ExecuteAsync(statement);
+        await EnsureHeroRuleSchemaAsync(characters);
+    }
+
+    private static async Task EnsureHeroRuleSchemaAsync(MySqlConnector.MySqlConnection characters)
+    {
+        var columns = (await characters.QueryAsync<string>(
+                "SELECT `column_name` FROM information_schema.columns " +
+                "WHERE table_schema=DATABASE() AND table_name='superui_rules_hero'"))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!columns.Contains("scale_percent"))
+            await characters.ExecuteAsync(
+                "ALTER TABLE `superui_rules_hero` ADD COLUMN `scale_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
+        if (!columns.Contains("damage_percent"))
+            await characters.ExecuteAsync(
+                "ALTER TABLE `superui_rules_hero` ADD COLUMN `damage_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100");
     }
 
     /// <summary>
@@ -1372,7 +1612,7 @@ public class WorldStateService
                     return $"0 characters, 0 bots; {build.NamePoolEligible:N0} eligible names";
                 });
                 await RunStep(job, "configure", () => Task.FromResult<string?>(
-                    $"RTS R1 · PlayerLimit {configuration.PlayerLimit:N0} · bot caps {configuration.AllianceBotCap:N0}/{configuration.HordeBotCap:N0}"));
+                    $"{configuration.ProfileId} · PlayerLimit {configuration.PlayerLimit:N0} · bot caps {configuration.AllianceBotCap:N0}/{configuration.HordeBotCap:N0}"));
 
                 var finalFolder = NewSnapshotFolder("rts-seed") + "_" + job.Id[..6];
                 WorldSnapshot? snapshot = null;
@@ -1389,7 +1629,7 @@ public class WorldStateService
                         stagingDirectory, finalFolder, SnapshotKind.RtsSeed,
                         $"Clean RTS genesis from {source.Name}", AllGroups, stats,
                         configuration, source.Id, sourceSnapshot.Folder,
-                        WorldConfigurationCatalog.RtsR1ProfileId,
+                        configuration.ProfileId,
                         build.NamePoolSha256, build.NamePoolEligible);
                     foreach (var artifact in snapshot.Artifacts)
                     {
@@ -2111,6 +2351,54 @@ public class WorldStateService
     {
         public string Key { get; set; } = "";
         public string Value { get; set; } = "";
+    }
+
+    private sealed class HeroRuleSettingRow
+    {
+        public int HeroLevel { get; set; }
+        public int HonorCost { get; set; }
+        public int ReviveFee { get; set; }
+        public int SpellId { get; set; }
+        public int ScalePercent { get; set; }
+        public int DamagePercent { get; set; }
+    }
+
+    private sealed class RtsHeroSpellValidationRow
+    {
+        public int SpellId { get; set; }
+        public int Build { get; set; }
+        public ulong Attributes { get; set; }
+        public int DurationIndex { get; set; }
+        public int StackAmount { get; set; }
+        public int EquippedItemClass { get; set; }
+        public long EquippedItemSubClassMask { get; set; }
+        public long EquippedItemInventoryTypeMask { get; set; }
+        public int Effect1 { get; set; }
+        public int Effect2 { get; set; }
+        public int Effect3 { get; set; }
+        public int EffectBaseDice1 { get; set; }
+        public int EffectBaseDice2 { get; set; }
+        public int EffectDieSides1 { get; set; }
+        public int EffectDieSides2 { get; set; }
+        public int EffectBasePoints1 { get; set; }
+        public int EffectBasePoints2 { get; set; }
+        public int EffectImplicitTargetA1 { get; set; }
+        public int EffectImplicitTargetA2 { get; set; }
+        public int EffectImplicitTargetB1 { get; set; }
+        public int EffectImplicitTargetB2 { get; set; }
+        public int EffectApplyAuraName1 { get; set; }
+        public int EffectApplyAuraName2 { get; set; }
+        public int EffectMiscValue1 { get; set; }
+        public int EffectMiscValue2 { get; set; }
+        public ulong Targets { get; set; }
+        public ulong ProcFlags { get; set; }
+        public int ProcChance { get; set; }
+        public int ProcCharges { get; set; }
+        public int EffectAmplitude1 { get; set; }
+        public int EffectAmplitude2 { get; set; }
+        public int EffectTriggerSpell1 { get; set; }
+        public int EffectTriggerSpell2 { get; set; }
+        public ulong CustomFlags { get; set; }
     }
 
     private string ResolveSnapshotDirectory(string folder)

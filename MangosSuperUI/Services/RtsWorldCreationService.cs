@@ -52,7 +52,10 @@ public sealed class RtsWorldCreationService
 
         Directory.CreateDirectory(stagingDirectory);
 
-        await CopyAsync(sourceDirectory, stagingDirectory, WorldArtifactService.WorldMangos, cancellationToken);
+        await _artifacts.TransformGzipAsync(
+            Path.Combine(sourceDirectory, WorldArtifactService.WorldMangos),
+            Path.Combine(stagingDirectory, WorldArtifactService.WorldMangos),
+            RtsHeroSpellWorldStore.BuildArtifactPostlude(configuration), cancellationToken);
         await _artifacts.TransformGzipAsync(
             Path.Combine(sourceDirectory, WorldArtifactService.WorldAdmin),
             Path.Combine(stagingDirectory, WorldArtifactService.WorldAdmin),
@@ -185,26 +188,46 @@ public sealed class RtsWorldCreationService
     {
         var configuration = WorldConfigurationCatalog.NormalizeAndValidate(input);
         var rows = WorldConfigurationCatalog.ToWorldStateRows(configuration);
+        var heroRules = WorldConfigurationCatalog.ToHeroRuleRows(configuration);
         var sql = new StringBuilder();
-        sql.AppendLine("-- World State: clean RTS R1 genesis.");
+        sql.Append("-- World State: clean ").Append(configuration.ProfileId).AppendLine(" genesis.");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_worldstate` (`key` VARCHAR(32) NOT NULL PRIMARY KEY, `value` VARCHAR(64) NOT NULL);");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_rules_zone` (`zone_id` INT UNSIGNED NOT NULL PRIMARY KEY, `ore` TINYINT UNSIGNED NOT NULL DEFAULT 0, `skins` TINYINT UNSIGNED NOT NULL DEFAULT 0, `herbs` TINYINT UNSIGNED NOT NULL DEFAULT 0);");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_rules_hub` (`hub_id` SMALLINT UNSIGNED NOT NULL PRIMARY KEY, `zone_id` INT UNSIGNED NOT NULL, `name` VARCHAR(64) NOT NULL, `banner_go_guid` INT UNSIGNED NOT NULL, `event_alliance` SMALLINT UNSIGNED NOT NULL, `event_horde` SMALLINT UNSIGNED NOT NULL, `capture_ms` INT UNSIGNED NOT NULL DEFAULT 60000, `initial_controller` TINYINT UNSIGNED NOT NULL DEFAULT 0);");
-        sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_rules_hero` (`hero_level` TINYINT UNSIGNED NOT NULL PRIMARY KEY, `declare_cost` INT UNSIGNED NOT NULL, `revive_fee` INT UNSIGNED NOT NULL, `spell_id` INT UNSIGNED NOT NULL);");
+        sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_rules_hero` (`hero_level` TINYINT UNSIGNED NOT NULL PRIMARY KEY, `declare_cost` INT UNSIGNED NOT NULL, `revive_fee` INT UNSIGNED NOT NULL, `spell_id` INT UNSIGNED NOT NULL, `scale_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100, `damage_percent` SMALLINT UNSIGNED NOT NULL DEFAULT 100);");
+        AppendEnsureHeroRuleColumn(sql, "scale_percent", "SMALLINT UNSIGNED NOT NULL DEFAULT 100");
+        AppendEnsureHeroRuleColumn(sql, "damage_percent", "SMALLINT UNSIGNED NOT NULL DEFAULT 100");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_rules_dungeon` (`map_id` INT UNSIGNED NOT NULL PRIMARY KEY, `final_boss_entry` INT UNSIGNED NOT NULL, `buff_spell_id` INT UNSIGNED NOT NULL, `loot_items` TINYINT UNSIGNED NOT NULL DEFAULT 10);");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_faction` (`team` TINYINT UNSIGNED NOT NULL PRIMARY KEY, `honor_pool` BIGINT NOT NULL DEFAULT 0);");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_heroes` (`guid` INT UNSIGNED NOT NULL PRIMARY KEY, `team` TINYINT UNSIGNED NOT NULL, `hero_level` TINYINT UNSIGNED NOT NULL DEFAULT 1, `dead` TINYINT UNSIGNED NOT NULL DEFAULT 0, `declared_at` BIGINT UNSIGNED NOT NULL DEFAULT 0);");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_zone_control` (`zone_id` INT UNSIGNED NOT NULL PRIMARY KEY, `controller` TINYINT UNSIGNED NOT NULL DEFAULT 0);");
         sql.AppendLine("CREATE TABLE IF NOT EXISTS `superui_dungeon_control` (`map_id` INT UNSIGNED NOT NULL PRIMARY KEY, `controller` TINYINT UNSIGNED NOT NULL DEFAULT 0);");
-        sql.AppendLine("DELETE FROM `superui_worldstate` WHERE `key`='mode' OR `key`='state.flush_ms' OR `key` LIKE 'rate.%' OR `key` LIKE 'bots.cap.%' OR `key` LIKE 'honor.weight.%';");
+        sql.AppendLine("DELETE FROM `superui_worldstate` WHERE `key`='mode' OR `key`='state.flush_ms' OR `key` LIKE 'rate.%' OR `key` LIKE 'bots.cap.%' OR `key` LIKE 'honor.weight.%' OR `key` IN ('honor.enabled','honor.suppress_bot_hk','control.faction_bots','hero.enabled','hero.slots_fixed');");
         foreach (var row in rows)
             sql.Append("INSERT INTO `superui_worldstate` (`key`,`value`) VALUES ('")
                 .Append(SqlLiteral(row.Key)).Append("','").Append(SqlLiteral(row.Value))
                 .AppendLine("') ON DUPLICATE KEY UPDATE `value`=VALUES(`value`);");
         sql.AppendLine("DELETE FROM `superui_rules_zone`; DELETE FROM `superui_rules_hub`; DELETE FROM `superui_rules_hero`; DELETE FROM `superui_rules_dungeon`;");
+        foreach (var rule in heroRules)
+        {
+            sql.Append("INSERT INTO `superui_rules_hero` (`hero_level`,`declare_cost`,`revive_fee`,`spell_id`,`scale_percent`,`damage_percent`) VALUES (")
+                .Append(rule.HeroLevel).Append(',').Append(rule.HonorCost).Append(',')
+                .Append(rule.ReviveFee).Append(',').Append(rule.SpellId).Append(',')
+                .Append(rule.ScalePercent).Append(',').Append(rule.DamagePercent)
+                .AppendLine(");");
+        }
         sql.AppendLine("DELETE FROM `superui_heroes`; DELETE FROM `superui_zone_control`; DELETE FROM `superui_dungeon_control`; DELETE FROM `superui_faction`;");
         sql.AppendLine("INSERT INTO `superui_faction` (`team`,`honor_pool`) VALUES (0,0),(1,0);");
         return sql.ToString();
+    }
+
+    private static void AppendEnsureHeroRuleColumn(StringBuilder sql, string column, string definition)
+    {
+        sql.Append("SET @ws_sql = IF(EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='superui_rules_hero' AND column_name='")
+            .Append(column)
+            .Append("'), 'SELECT 1', 'ALTER TABLE `superui_rules_hero` ADD COLUMN `")
+            .Append(column).Append("` ").Append(definition)
+            .AppendLine("'); PREPARE ws_stmt FROM @ws_sql; EXECUTE ws_stmt; DEALLOCATE PREPARE ws_stmt;");
     }
 
     private static string SqlLiteral(string value) => value.Replace("'", "''", StringComparison.Ordinal);

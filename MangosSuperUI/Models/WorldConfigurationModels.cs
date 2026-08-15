@@ -8,6 +8,8 @@ namespace MangosSuperUI.Models;
 /// </summary>
 public sealed class WorldLaunchConfiguration
 {
+    // Keep the model-level fallback on R1 so manifests written before profiles were
+    // selectable never acquire R2 modules merely because a property was absent.
     public string ProfileId { get; set; } = WorldConfigurationCatalog.RtsR1ProfileId;
     public int RealmId { get; set; } = 1;
     public int PlayerLimit { get; set; } = 2600;
@@ -17,6 +19,15 @@ public sealed class WorldLaunchConfiguration
     public int HordeBotCap { get; set; } = 1250;
     public int StateFlushMs { get; set; } = 30000;
     public Dictionary<string, double> Rates { get; set; } = WorldConfigurationCatalog.CreateDefaultRates();
+    public int HonorWeightPlayer { get; set; } = 10;
+    public int HonorWeightBot { get; set; } = 5;
+    public int HonorWeightFactionNpc { get; set; } = 1;
+    public int HonorWeightFactionElite { get; set; } = 3;
+    public bool SuppressBotHonorHistory { get; set; } = true;
+    public bool FactionWideBotControl { get; set; } = true;
+    public int HeroSlotsFixed { get; set; } = 4;
+    public List<RtsHeroRuleConfiguration> HeroRules { get; set; } =
+        WorldConfigurationCatalog.CreateDefaultHeroRules();
 
     public WorldLaunchConfiguration Clone() => new()
     {
@@ -28,8 +39,48 @@ public sealed class WorldLaunchConfiguration
         AllianceBotCap = AllianceBotCap,
         HordeBotCap = HordeBotCap,
         StateFlushMs = StateFlushMs,
-        Rates = new Dictionary<string, double>(Rates ?? new(), StringComparer.OrdinalIgnoreCase)
+        Rates = new Dictionary<string, double>(Rates ?? new(), StringComparer.OrdinalIgnoreCase),
+        HonorWeightPlayer = HonorWeightPlayer,
+        HonorWeightBot = HonorWeightBot,
+        HonorWeightFactionNpc = HonorWeightFactionNpc,
+        HonorWeightFactionElite = HonorWeightFactionElite,
+        SuppressBotHonorHistory = SuppressBotHonorHistory,
+        FactionWideBotControl = FactionWideBotControl,
+        HeroSlotsFixed = HeroSlotsFixed,
+        HeroRules = (HeroRules ?? new()).Select(rule => rule.Clone()).ToList()
     };
+}
+
+/// <summary>
+/// One target hero level. HonorCost is the cost to enter this level: declaration
+/// for level 1, promotion for levels 2-5. Scale and damage are percentages.
+/// </summary>
+public sealed class RtsHeroRuleConfiguration
+{
+    public int HeroLevel { get; set; }
+    public int HonorCost { get; set; }
+    public int ReviveFee { get; set; }
+    public int SpellId { get; set; }
+    public int ScalePercent { get; set; }
+    public int DamagePercent { get; set; }
+
+    public RtsHeroRuleConfiguration Clone() => new()
+    {
+        HeroLevel = HeroLevel,
+        HonorCost = HonorCost,
+        ReviveFee = ReviveFee,
+        SpellId = SpellId,
+        ScalePercent = ScalePercent,
+        DamagePercent = DamagePercent
+    };
+}
+
+public sealed class WorldConfigurationProfile
+{
+    public string Id { get; init; } = "";
+    public string Label { get; init; } = "";
+    public string Description { get; init; } = "";
+    public bool HonorAndHeroes { get; init; }
 }
 
 public sealed class WorldConfigurationField
@@ -47,6 +98,25 @@ public sealed class WorldConfigurationField
 public static class WorldConfigurationCatalog
 {
     public const string RtsR1ProfileId = "rts-r1-v1";
+    public const string RtsR2ProfileId = "rts-r2-v1";
+    public const string DefaultProfileId = RtsR2ProfileId;
+
+    public static readonly IReadOnlyList<WorldConfigurationProfile> Profiles = new[]
+    {
+        new WorldConfigurationProfile
+        {
+            Id = RtsR1ProfileId,
+            Label = "RTS R1 - Foundation only",
+            Description = "Accelerated progression and faction bot caps; Honor and Heroes remain inert."
+        },
+        new WorldConfigurationProfile
+        {
+            Id = RtsR2ProfileId,
+            Label = "RTS R2 - Honor + Heroes",
+            Description = "Fight for faction Honor, then declare, promote, and revive persistent Heroes.",
+            HonorAndHeroes = true
+        }
+    };
 
     public static readonly IReadOnlyList<WorldConfigurationField> RateFields = new[]
     {
@@ -71,10 +141,35 @@ public static class WorldConfigurationCatalog
     public static Dictionary<string, double> CreateDefaultRates() =>
         RateFields.ToDictionary(x => x.Key, x => x.DefaultValue, StringComparer.OrdinalIgnoreCase);
 
+    public static List<RtsHeroRuleConfiguration> CreateDefaultHeroRules()
+    {
+        int[] costs = { 20, 40, 80, 160, 320 };
+        int[] revives = { 10, 20, 40, 80, 160 };
+        int[] percents = { 120, 140, 160, 180, 200 };
+        return Enumerable.Range(0, 5).Select(index => new RtsHeroRuleConfiguration
+        {
+            HeroLevel = index + 1,
+            HonorCost = costs[index],
+            ReviveFee = revives[index],
+            SpellId = 51001 + index,
+            ScalePercent = percents[index],
+            DamagePercent = percents[index]
+        }).ToList();
+    }
+
+    public static WorldLaunchConfiguration CreateDefaults(string profileId)
+    {
+        var value = new WorldLaunchConfiguration { ProfileId = profileId };
+        return NormalizeAndValidate(value);
+    }
+
+    public static bool IsR2(WorldLaunchConfiguration value) =>
+        string.Equals(value.ProfileId, RtsR2ProfileId, StringComparison.Ordinal);
+
     public static WorldLaunchConfiguration NormalizeAndValidate(WorldLaunchConfiguration? input)
     {
         var value = input?.Clone() ?? new WorldLaunchConfiguration();
-        if (!string.Equals(value.ProfileId, RtsR1ProfileId, StringComparison.Ordinal))
+        if (!Profiles.Any(profile => string.Equals(profile.Id, value.ProfileId, StringComparison.Ordinal)))
             throw new InvalidOperationException($"Unsupported world profile '{value.ProfileId}'.");
         if (value.RealmId <= 0)
             throw new InvalidOperationException("Realm ID must be positive.");
@@ -108,6 +203,38 @@ public static class WorldConfigurationCatalog
             normalized[field.Key] = pair.Value;
         }
         value.Rates = normalized;
+
+        if (IsR2(value))
+        {
+            ValidateWholeNumber(value.HonorWeightPlayer, 0, 1000000, "Player Honor weight");
+            ValidateWholeNumber(value.HonorWeightBot, 0, 1000000, "Bot Honor weight");
+            ValidateWholeNumber(value.HonorWeightFactionNpc, 0, 1000000, "Faction NPC Honor weight");
+            ValidateWholeNumber(value.HonorWeightFactionElite, 0, 1000000, "Faction elite Honor weight");
+            ValidateWholeNumber(value.HeroSlotsFixed, 1, 127, "Fixed hero slots");
+
+            var rules = (value.HeroRules ?? new()).Select(rule => rule.Clone()).ToList();
+            if (rules.Count != 5 || rules.Select(rule => rule.HeroLevel).Distinct().Count() != 5 ||
+                rules.Any(rule => rule.HeroLevel is < 1 or > 5))
+                throw new InvalidOperationException("RTS R2 requires exactly one hero rule for each target level 1 through 5.");
+            foreach (var rule in rules)
+            {
+                ValidateWholeNumber(rule.HonorCost, 0, int.MaxValue, $"Hero level {rule.HeroLevel} Honor cost");
+                ValidateWholeNumber(rule.ReviveFee, 0, int.MaxValue, $"Hero level {rule.HeroLevel} revive fee");
+                ValidateWholeNumber(rule.SpellId, 1, int.MaxValue, $"Hero level {rule.HeroLevel} spell ID");
+                ValidateWholeNumber(rule.ScalePercent, 100, 200, $"Hero level {rule.HeroLevel} scale percent");
+                ValidateWholeNumber(rule.DamagePercent, 100, 200, $"Hero level {rule.HeroLevel} damage percent");
+            }
+            if (rules.Select(rule => rule.SpellId).Distinct().Count() != rules.Count)
+                throw new InvalidOperationException("Each RTS R2 hero level must use a distinct spell ID.");
+            foreach (var rule in rules)
+            {
+                var reservedSpellId = 51000 + rule.HeroLevel;
+                if (rule.SpellId != reservedSpellId)
+                    throw new InvalidOperationException(
+                        $"Hero level {rule.HeroLevel} must use reserved RTS aura spell ID {reservedSpellId}.");
+            }
+            value.HeroRules = rules.OrderBy(rule => rule.HeroLevel).ToList();
+        }
         return value;
     }
 
@@ -135,7 +262,31 @@ public static class WorldConfigurationCatalog
         };
         foreach (var field in RateFields)
             rows[field.Key] = value.Rates[field.Key].ToString("R", CultureInfo.InvariantCulture);
+        if (IsR2(value))
+        {
+            rows["honor.enabled"] = "1";
+            rows["hero.enabled"] = "1";
+            rows["honor.weight.player"] = value.HonorWeightPlayer.ToString(CultureInfo.InvariantCulture);
+            rows["honor.weight.bot"] = value.HonorWeightBot.ToString(CultureInfo.InvariantCulture);
+            rows["honor.weight.npc"] = value.HonorWeightFactionNpc.ToString(CultureInfo.InvariantCulture);
+            rows["honor.weight.npc_elite"] = value.HonorWeightFactionElite.ToString(CultureInfo.InvariantCulture);
+            rows["honor.suppress_bot_hk"] = value.SuppressBotHonorHistory ? "1" : "0";
+            rows["control.faction_bots"] = value.FactionWideBotControl ? "1" : "0";
+            rows["hero.slots_fixed"] = value.HeroSlotsFixed.ToString(CultureInfo.InvariantCulture);
+        }
         return rows;
+    }
+
+    public static IReadOnlyList<RtsHeroRuleConfiguration> ToHeroRuleRows(WorldLaunchConfiguration input)
+    {
+        var value = NormalizeAndValidate(input);
+        return IsR2(value) ? value.HeroRules.Select(rule => rule.Clone()).ToArray() : Array.Empty<RtsHeroRuleConfiguration>();
+    }
+
+    private static void ValidateWholeNumber(int value, int min, int max, string label)
+    {
+        if (value < min || value > max)
+            throw new InvalidOperationException($"{label} must be between {min} and {max}.");
     }
 
     private static WorldConfigurationField Rate(
@@ -158,7 +309,8 @@ public sealed class CreateRtsWorldRequestModel
     public string SourceWorldId { get; set; } = "";
     public string SourceSnapshot { get; set; } = "";
     public string? Notes { get; set; }
-    public WorldLaunchConfiguration Configuration { get; set; } = new();
+    public WorldLaunchConfiguration Configuration { get; set; } =
+        WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.DefaultProfileId);
 }
 
 public sealed class SnapshotArtifact

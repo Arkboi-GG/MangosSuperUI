@@ -55,6 +55,7 @@ static async Task RunAsync(string root)
         Name = "Clinical RTS",
         Configuration = new WorldLaunchConfiguration
         {
+            ProfileId = WorldConfigurationCatalog.RtsR2ProfileId,
             RealmId = 1,
             PlayerLimit = 2500,
             PlayerHardLimit = 2600,
@@ -68,6 +69,8 @@ static async Task RunAsync(string root)
     var result = await builder.BuildAsync(source, staging, request);
     Require(result.NamePoolEligible == 5, "name-list filtering/deduplication changed");
     Require(result.NamePoolSha256.Length == 64, "name-list SHA-256 was not recorded");
+    Require(result.Configuration.ProfileId == WorldConfigurationCatalog.RtsR2ProfileId,
+        "R2 profile identity was not preserved");
 
     var config = await MangosdConfigDocument.LoadAsync(
         Path.Combine(staging, WorldArtifactService.CoreConfig));
@@ -89,10 +92,44 @@ static async Task RunAsync(string root)
         "alliance cap seed is absent");
     Require(characters.Contains("('state.flush_ms','45000')", StringComparison.Ordinal),
         "state flush seed is absent");
+    Require(characters.Contains("('honor.weight.player','10')", StringComparison.Ordinal) &&
+            characters.Contains("('honor.weight.bot','5')", StringComparison.Ordinal) &&
+            characters.Contains("('honor.weight.npc','1')", StringComparison.Ordinal) &&
+            characters.Contains("('honor.weight.npc_elite','3')", StringComparison.Ordinal),
+        "R2 Honor defaults are absent");
+    Require(characters.Contains("('honor.suppress_bot_hk','1')", StringComparison.Ordinal) &&
+            characters.Contains("('control.faction_bots','1')", StringComparison.Ordinal) &&
+            characters.Contains("('honor.enabled','1')", StringComparison.Ordinal) &&
+            characters.Contains("('hero.enabled','1')", StringComparison.Ordinal) &&
+            characters.Contains("('hero.slots_fixed','4')", StringComparison.Ordinal),
+        "R2 boot gates, faction control, suppression, or slot defaults are absent");
+    Require(characters.Contains("VALUES (1,20,10,51001,120,120);", StringComparison.Ordinal) &&
+            characters.Contains("VALUES (5,320,160,51005,200,200);", StringComparison.Ordinal),
+        "R2 hero target-level rows are absent");
     Require(characters.Contains("DELETE FROM `superui_heroes`", StringComparison.Ordinal),
         "campaign state reset is absent");
     Require(!characters.Contains("INSERT INTO `characters`", StringComparison.Ordinal),
         "generated character artifact unexpectedly seeds a player/bot roster");
+
+    var sourceWorld = await ReadGzipAsync(Path.Combine(source, WorldArtifactService.WorldMangos));
+    var stagedWorld = await ReadGzipAsync(Path.Combine(staging, WorldArtifactService.WorldMangos));
+    Require(!sourceWorld.Contains(RtsHeroSpellWorldStore.OriginalTable, StringComparison.Ordinal),
+        "RTS build changed the source world artifact");
+    Require(stagedWorld.Contains("0x80000040", StringComparison.Ordinal) &&
+            stagedWorld.Contains("`effectApplyAuraName1`,`effectApplyAuraName2`", StringComparison.Ordinal) &&
+            stagedWorld.Contains("61,79,0,127", StringComparison.Ordinal),
+        "R2 native passive scale/damage aura mechanics are absent from the staged world artifact");
+    Require(stagedWorld.Contains("(51001,5875", StringComparison.Ordinal) &&
+            stagedWorld.Contains(",19,19,1,1,0,0,61,79", StringComparison.Ordinal) &&
+            stagedWorld.Contains("(51005,5875", StringComparison.Ordinal) &&
+            stagedWorld.Contains(",99,99,1,1,0,0,61,79", StringComparison.Ordinal),
+        "R2 level-one or level-five aura totals are incorrect");
+    Require(stagedWorld.Split("INSERT INTO `spell_template`", StringSplitOptions.None).Length - 1 == 5 &&
+            !stagedWorld.Contains("(51006,5875", StringComparison.Ordinal),
+        "R2 world artifact updates more than the five reserved spell rows");
+    Require(stagedWorld.Contains($"CREATE TABLE IF NOT EXISTS `{RtsHeroSpellWorldStore.OriginalTable}` LIKE `spell_template`", StringComparison.Ordinal) &&
+            stagedWorld.Contains("NOT EXISTS", StringComparison.Ordinal),
+        "pre-R2 spell rows are not preserved once for profile rollback");
 
     var admin = await ReadGzipAsync(Path.Combine(staging, WorldArtifactService.WorldAdmin));
     Require(admin.Contains("DELETE FROM `bot_registry`", StringComparison.Ordinal),
@@ -180,7 +217,51 @@ static async Task RunAsync(string root)
     var seed = RtsWorldCreationService.BuildCharactersSeedSql(request.Configuration);
     Require(seed.Contains("('mode','rts')", StringComparison.Ordinal), "standalone seed is not RTS mode");
     Require(seed.Contains("INSERT INTO `superui_faction`", StringComparison.Ordinal),
-        "R1 faction genesis seed is absent");
+        "faction genesis seed is absent");
+
+    var r1 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR1ProfileId);
+    r1.RealmId = 1;
+    r1.PlayerLimit = 4;
+    r1.PlayerHardLimit = 4;
+    r1.AllianceBotCap = 2;
+    r1.HordeBotCap = 2;
+    var r1Seed = RtsWorldCreationService.BuildCharactersSeedSql(r1);
+    Require(!r1Seed.Contains("('honor.weight.player'", StringComparison.Ordinal) &&
+            !r1Seed.Contains("VALUES ('honor.enabled','1')", StringComparison.Ordinal) &&
+            !r1Seed.Contains("VALUES ('hero.enabled','1')", StringComparison.Ordinal) &&
+            !r1Seed.Contains("VALUES ('control.faction_bots','1')", StringComparison.Ordinal) &&
+            !r1Seed.Contains("VALUES (1,20,10,51001,120,120);", StringComparison.Ordinal),
+        "R1 profile unexpectedly enables Honor/Hero rules");
+    var r1WorldPostlude = RtsHeroSpellWorldStore.BuildArtifactPostlude(r1);
+    Require(r1WorldPostlude.Contains("pre-RTS rows", StringComparison.Ordinal) &&
+            r1WorldPostlude.Contains($"SELECT * FROM `{RtsHeroSpellWorldStore.OriginalTable}`", StringComparison.Ordinal) &&
+            !r1WorldPostlude.Contains("0x80000040", StringComparison.Ordinal),
+        "R1 does not conditionally restore preserved world spell rows cleanly");
+
+    var invalidR2 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR2ProfileId);
+    invalidR2.HeroRules.RemoveAt(4);
+    ExpectThrows<InvalidOperationException>(
+        () => WorldConfigurationCatalog.NormalizeAndValidate(invalidR2),
+        "incomplete R2 hero rules were accepted");
+    var remappedR2 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR2ProfileId);
+    remappedR2.HeroRules[0].SpellId = 51009;
+    ExpectThrows<InvalidOperationException>(
+        () => WorldConfigurationCatalog.NormalizeAndValidate(remappedR2),
+        "an R2 hero rule escaped the reserved 51001-51005 spell range");
+    var oversizedR2 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR2ProfileId);
+    oversizedR2.HeroRules[0].ScalePercent = 201;
+    ExpectThrows<InvalidOperationException>(
+        () => WorldConfigurationCatalog.NormalizeAndValidate(oversizedR2),
+        "an R2 hero scale above the server's 200 percent ceiling was accepted");
+    var maximumHeroSlotsR2 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR2ProfileId);
+    maximumHeroSlotsR2.HeroSlotsFixed = 127;
+    Require(WorldConfigurationCatalog.NormalizeAndValidate(maximumHeroSlotsR2).HeroSlotsFixed == 127,
+        "the maximum wire-safe R2 hero-slot count was rejected");
+    var oversizedHeroSlotsR2 = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.RtsR2ProfileId);
+    oversizedHeroSlotsR2.HeroSlotsFixed = 128;
+    ExpectThrows<InvalidOperationException>(
+        () => WorldConfigurationCatalog.NormalizeAndValidate(oversizedHeroSlotsR2),
+        "an R2 hero-slot count above the u8 state-packet envelope was accepted");
 }
 
 static async Task RunCoreRestoreChecksAsync(string root, WorldArtifactService artifacts)

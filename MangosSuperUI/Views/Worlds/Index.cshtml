@@ -117,7 +117,7 @@
                     <input type="checkbox" id="wsForceFullRestore" />
                     <span>
                         <strong>Force full restore</strong>
-                        <small>Validate and restore the selected snapshot even when this world's data is already materialized.</small>
+                        <small id="wsForceFullRestoreHelp">Validate and restore the selected snapshot even when this world's data is already materialized.</small>
                     </span>
                 </label>
 
@@ -174,7 +174,10 @@
                     <section class="ws-create-section">
                         <div class="d-flex justify-content-between align-items-center">
                             <h6>Capacity</h6>
-                            <span class="ws-chip ws-chip-flavor" id="wsCreateProfile">rts-r1-v1</span>
+                            <select class="form-input ws-profile-select" id="wsCreateProfile" aria-label="RTS rules profile">
+                                <option value="rts-r2-v1">RTS R2 - Honor + Heroes</option>
+                                <option value="rts-r1-v1">RTS R1 - Foundation only</option>
+                            </select>
                         </div>
                         <div class="ws-field-grid">
                             <label class="ws-fixed-field"><span>Realm ID</span><strong id="wsCfgRealmIdText">Select a source</strong><small>Inherited from the snapshot; not editable.</small></label>
@@ -198,15 +201,17 @@
                     <div class="ws-rate-sections" id="wsRateFields">
                         <div class="text-muted" style="font-size: 12px;"><i class="fa-solid fa-spinner fa-spin"></i> Loading profile fields...</div>
                     </div>
+                    <div class="ws-r2-settings" id="wsCreateR2Fields"></div>
                 </section>
 
                 <div class="ws-create-grid mt-3">
                     <section class="ws-create-section">
                         <h6><i class="fa-solid fa-shield-halved"></i> Preserved from source</h6>
                         <ul class="ws-summary-list ws-summary-keep" id="wsCreatePreserve">
-                            <li>Game-world content, core source, SQL baseline and server profile</li>
+                            <li>Game-world content, core source, SQL baseline and server profile; R2 reserves only spell rows 51001-51005 inside the generated RTS artifact</li>
                             <li>Human accounts and authentication settings</li>
                             <li>Global admin configuration and bot name pool</li>
+                            <li>The source snapshot and any pre-existing 51001-51005 rows remain preserved for exact R1 rollback</li>
                         </ul>
                     </section>
                     <section class="ws-create-section">
@@ -214,7 +219,8 @@
                         <ul class="ws-summary-list ws-summary-reset" id="wsCreateReset">
                             <li>0 characters and 0 persisted bots</li>
                             <li>Realm character counts and bot-bound admin state</li>
-                            <li>R1 module rule/runtime tables, faction state and rotation assignments start empty</li>
+                            <li>Faction Honor and hero runtime state start empty; selected profile rules are seeded</li>
+                            <li>Rotation assignments start empty</li>
                         </ul>
                     </section>
                 </div>
@@ -478,6 +484,7 @@
         .ws-resume-config h6 { margin: 0 0 4px; font-size: 12px; font-weight: 800; color: var(--text-primary); text-transform: uppercase; letter-spacing: 0.05em; }
         .ws-resume-config-intro { margin-bottom: 11px; font-size: 11.5px; color: var(--text-muted); }
         .ws-config-summary { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+        .ws-profile-select { width: auto; min-width: 230px; padding: 5px 30px 5px 9px; font-size: 11.5px; }
         .ws-create-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
         .ws-create-section { padding: 14px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--bg-card-alt); }
         .ws-create-section h6 { margin: 0 0 11px; font-size: 12px; font-weight: 800; color: var(--text-primary); text-transform: uppercase; letter-spacing: 0.05em; }
@@ -491,6 +498,20 @@
         .ws-rate-heading { margin-bottom: 7px; font-size: 11px; font-weight: 700; color: var(--text-secondary); }
         .ws-rate-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
         .ws-rate-field small { color: var(--text-muted); font-weight: 400; line-height: 1.3; }
+        .ws-r2-settings { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--border-light); }
+        .ws-r2-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+        .ws-r2-heading strong { display: block; color: var(--text-primary); font-size: 12px; }
+        .ws-r2-heading small { display: block; margin-top: 2px; color: var(--text-muted); font-size: 10.5px; line-height: 1.35; }
+        .ws-r2-disabled { padding: 10px 12px; border: 1px dashed var(--border-light); border-radius: var(--radius-sm); color: var(--text-muted); font-size: 11.5px; line-height: 1.45; }
+        .ws-r2-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+        .ws-r2-grid label { display: flex; flex-direction: column; gap: 4px; min-width: 0; color: var(--text-secondary); font-size: 11px; font-weight: 600; }
+        .ws-r2-check { display: flex !important; flex-direction: row !important; align-items: center; gap: 7px !important; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); background: var(--bg-card); }
+        .ws-r2-check input { margin: 0; }
+        .ws-hero-rules { width: 100%; margin-top: 12px; border-collapse: collapse; table-layout: fixed; font-size: 10.5px; }
+        .ws-hero-rules th { padding: 5px 4px; color: var(--text-muted); font-weight: 700; text-align: left; border-bottom: 1px solid var(--border-light); }
+        .ws-hero-rules td { padding: 5px 4px; vertical-align: middle; }
+        .ws-hero-rules th:first-child, .ws-hero-rules td:first-child { width: 52px; text-align: center; }
+        .ws-hero-rules .form-input { width: 100%; min-width: 0; padding: 5px 6px; font-size: 10.5px; }
         .ws-source-status { margin-top: 8px; min-height: 22px; font-size: 11.5px; color: var(--text-muted); }
         .ws-summary-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: var(--text-secondary); }
         .ws-summary-list li { display: flex; gap: 7px; line-height: 1.4; }

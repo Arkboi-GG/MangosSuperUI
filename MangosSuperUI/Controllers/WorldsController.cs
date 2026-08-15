@@ -154,8 +154,17 @@ public class WorldsController : Controller
             return Json(new
             {
                 success = true,
-                profileId = WorldConfigurationCatalog.RtsR1ProfileId,
-                defaults = WorldConfigurationCatalog.NormalizeAndValidate(new WorldLaunchConfiguration()),
+                profileId = WorldConfigurationCatalog.DefaultProfileId,
+                defaultProfileId = WorldConfigurationCatalog.DefaultProfileId,
+                profiles = WorldConfigurationCatalog.Profiles.Select(profile => new
+                {
+                    profile.Id,
+                    profile.Label,
+                    profile.Description,
+                    profile.HonorAndHeroes,
+                    defaults = WorldConfigurationCatalog.CreateDefaults(profile.Id)
+                }),
+                defaults = WorldConfigurationCatalog.CreateDefaults(WorldConfigurationCatalog.DefaultProfileId),
                 rateFields = WorldConfigurationCatalog.RateFields,
                 fields = WorldConfigurationCatalog.RateFields,
                 namePoolEligible = namePool.ValidUniqueNames,
