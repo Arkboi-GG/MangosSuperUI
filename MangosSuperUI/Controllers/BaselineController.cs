@@ -24,7 +24,12 @@ public class BaselineController : Controller
         ("og_pickpocketing_loot_template",  "pickpocketing_loot_template"),
         ("og_disenchant_loot_template",     "disenchant_loot_template"),
         ("og_spell_template",               "spell_template"),
-        ("og_gameobject_template",          "gameobject_template")
+        ("og_gameobject_template",          "gameobject_template"),
+        // NPC dev window (spawn / pathing / aggro) — the true VMaNGOS baseline the
+        // dev tool diffs against and resets to (see NpcDevBaselineService).
+        ("og_creature",                     "creature"),
+        ("og_creature_movement",            "creature_movement"),
+        ("og_creature_template",            "creature_template")
     };
 
     public BaselineController(ConnectionFactory db, AuditService audit, ILogger<BaselineController> logger)

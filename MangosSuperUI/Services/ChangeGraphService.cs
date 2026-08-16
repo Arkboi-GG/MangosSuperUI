@@ -63,6 +63,10 @@ public class ChangeGraphService
             @"action IN ('item_delete','baseline_reset_item','icon_generate')
               OR target_type IN ('item_template','item_base_game','item_custom','icon')"),
 
+        new("npc", "NPCs & Spawns", "fa-dragon", "#e11d48",
+            @"category = 'npc' OR action LIKE 'npc\_%'
+              OR target_type IN ('creature','creature_movement','creature_movement_template','creature_template')"),
+
         new("world", "World & Objects", "fa-map-location-dot", "#22c55e",
             @"action LIKE 'gameobject\_%' OR action = 'baseline_reset_gameobject'
               OR target_type IN ('gameobject_template','gameobject_base_game','gameobject_custom')"),

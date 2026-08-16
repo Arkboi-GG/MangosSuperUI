@@ -324,6 +324,11 @@ public class BotIdentity
     public float GrindRelocateY { get; set; }
     public float GrindRelocateZ { get; set; }
 
+    /// <summary>One relocate ATTEMPT per window (FINDING_003 residual fix). Deliberately NOT
+    /// cleared by ClearGrindRelocate — a failed/aborted relocate must not re-arm at tick speed
+    /// (the FINDING_009 lesson); the bot grinds in place until the cooldown lapses.</summary>
+    public DateTime? GrindRelocateCooldownUntil { get; set; }
+
     /// <summary>Clear all grind-relocation phase flags (relocate finished or aborted).</summary>
     public void ClearGrindRelocate()
     {

@@ -89,6 +89,10 @@ builder.Services.AddScoped<RetextureSupport>();
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();
 
+// NPC dev window (spawn / pathing / aggro) commit + audit path.
+builder.Services.AddScoped<NpcDevApplyService>();
+builder.Services.AddScoped<NpcDevBaselineService>();
+
 // ---------- BotLogic: Behavioral Engine ----------
 
 // Tracking (in-memory, singleton)

@@ -1,17 +1,21 @@
 using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Models;
+using MangosSuperUI.Services;
 using Dapper;
 
 namespace MangosSuperUI.Controllers;
 
 /// <summary>
-/// Read-only data feed for the MSUI client's NPC dev window (spawns, patrol paths,
-/// aggro-relevant template fields). One round trip returns everything the overlay
-/// needs for an area, JSON-shaped, instead of four CSV table dumps.
+/// Data + apply endpoints for the MSUI client's NPC dev window. <c>Snapshot</c> is the
+/// read-only feed (spawns, patrol paths, aggro-relevant template fields) — one round
+/// trip for an area instead of four CSV dumps. <c>Apply</c> is the write path: the
+/// window's change-set is verified, applied to the mangos world DB, and audited
+/// (<see cref="NpcDevApplyService"/> → AuditService, category "npc"), so the client
+/// commits directly instead of hand-uploading a file.
 ///
-/// STRICTLY READ-ONLY by design: the dev window's edits never come back through
-/// here — they arrive as uploaded change-set files (NpcDev upload/verify/apply,
-/// phase 4) so every write goes through AuditService with a full audit trail.
+/// Making a committed change LIVE on the running server is the client's separate
+/// owner-clicked reload (.reload creature_template / .npc reloadspawn); this controller
+/// never issues runtime-control commands.
 ///
 /// Contract documented in MSUIClient repo: NPC_DEV_WINDOW.md § HTTP contracts.
 /// </summary>
@@ -23,11 +27,16 @@ public class NpcDevController : Controller
     private const float MaxRange = 600f;    // yards; spatial half-box cap
 
     private readonly ConnectionFactory _db;
+    private readonly NpcDevApplyService _apply;
+    private readonly NpcDevBaselineService _baseline;
     private readonly ILogger<NpcDevController> _logger;
 
-    public NpcDevController(ConnectionFactory db, ILogger<NpcDevController> logger)
+    public NpcDevController(ConnectionFactory db, NpcDevApplyService apply,
+        NpcDevBaselineService baseline, ILogger<NpcDevController> logger)
     {
         _db = db;
+        _apply = apply;
+        _baseline = baseline;
         _logger = logger;
     }
 
@@ -143,6 +152,71 @@ public class NpcDevController : Controller
         catch (Exception ex)
         {
             _logger.LogError(ex, "NpcDev snapshot failed (map {Map})", map);
+            return StatusCode(500, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// POST /NpcDev/Apply — the dev window's change-set (schemaVersion + session + packets,
+    /// the same document shape as dev-changes/*.json). Each packet is verified against the
+    /// current DB (drift from its `before` blocks it as stale), applied to the mangos world
+    /// DB, and audited under one batch (category "npc"). Returns per-packet verdicts. Does
+    /// NOT make the change live — that is the client's separate reload.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> Apply([FromBody] NpcApplyRequest? req)
+    {
+        if (req?.Packets is not { Count: > 0 })
+            return BadRequest("no packets");
+        try
+        {
+            NpcApplyResult result = await _apply.ApplyAsync(req, HttpContext.Connection.RemoteIpAddress?.ToString());
+            return Json(result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "NpcDev apply failed");
+            return StatusCode(500, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// GET /NpcDev/Diff?guid=G&amp;entry=E — is this spawn (its row + path) and/or its entry's
+    /// template changed from the captured og_creature* baseline? `hasBaseline=false` when the
+    /// owner hasn't run Baseline/Initialize with the creature tables yet.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> Diff(uint guid, uint entry = 0)
+    {
+        if (guid == 0) return BadRequest("guid required");
+        try
+        {
+            return Json(await _baseline.DiffAsync(guid, entry));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "NpcDev diff failed (guid {Guid})", guid);
+            return StatusCode(500, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// POST /NpcDev/Reset — restore each guid's spawn row + path, and each entry's template
+    /// (detection_range), from the og_creature* baseline. Audited (category "npc"). Does NOT
+    /// make it live — the client reloads afterwards. Returns per-target verdicts.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> Reset([FromBody] NpcResetRequest? req)
+    {
+        if (req is null || (req.Guids.Count == 0 && req.Entries.Count == 0))
+            return BadRequest("nothing to reset");
+        try
+        {
+            return Json(await _baseline.ResetAsync(req, HttpContext.Connection.RemoteIpAddress?.ToString()));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "NpcDev reset failed");
             return StatusCode(500, ex.Message);
         }
     }

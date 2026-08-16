@@ -210,6 +210,43 @@ public class ZoneSafetyMap
         return best;
     }
 
+    // ── Fleet-wide no-path destination memory (FINDING_017 follow-up) ──────────
+    // When ONE bot proves a destination unpathable (an honest MOVE_FAILED
+    // no_path/empty_path from the core), every other bot can skip that pocket
+    // for a while instead of re-proving it. TTL'd (terrain doesn't change, but
+    // fixes/mmap reloads do) and 50yd-cell keyed. In-memory only — a restart
+    // forgets, which is fine: re-proving costs seconds post-FINDING_017.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(int Map, int Cx, int Cy), DateTime> _noPathDests = new();
+    private const float NOPATH_CELL_YARDS = 50f;
+    private const int NOPATH_TTL_MINUTES = 90;
+    private const int NOPATH_CAP = 4096;
+
+    public void RecordNoPathDest(int mapId, float x, float y)
+    {
+        if (_noPathDests.Count >= NOPATH_CAP)
+        {
+            var now = DateTime.UtcNow;
+            foreach (var kv in _noPathDests)
+                if (kv.Value < now)
+                    _noPathDests.TryRemove(kv.Key, out _);
+            if (_noPathDests.Count >= NOPATH_CAP) return;   // full of live entries — drop the record
+        }
+        var key = (mapId, (int)MathF.Round(x / NOPATH_CELL_YARDS), (int)MathF.Round(y / NOPATH_CELL_YARDS));
+        _noPathDests[key] = DateTime.UtcNow.AddMinutes(NOPATH_TTL_MINUTES);
+    }
+
+    public bool IsNoPathDest(int mapId, float x, float y)
+    {
+        var key = (mapId, (int)MathF.Round(x / NOPATH_CELL_YARDS), (int)MathF.Round(y / NOPATH_CELL_YARDS));
+        if (!_noPathDests.TryGetValue(key, out var until)) return false;
+        if (DateTime.UtcNow >= until)
+        {
+            _noPathDests.TryRemove(key, out _);
+            return false;
+        }
+        return true;
+    }
+
     /// <summary>
     /// Check if a straight-line path from (x1,y1) to (x2,y2) on the given map
     /// crosses any cells with max creature level above the given threshold.

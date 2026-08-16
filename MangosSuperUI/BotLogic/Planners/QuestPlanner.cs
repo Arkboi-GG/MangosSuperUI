@@ -146,12 +146,16 @@ public sealed class QuestPlanner : IBotPlanner
     // a COMPLETE quest must hand in wherever its ender is (one bounded trip, reward kept).
     private const float ObjectiveGiverRailYards = 2500f;   // BotTuning candidate
 
-    public QuestPlanner(QuestGraphLoader quests, CreatureSpawnLoader spawns, ILogger<QuestPlanner> logger)
+    public QuestPlanner(QuestGraphLoader quests, CreatureSpawnLoader spawns, ILogger<QuestPlanner> logger,
+        ZoneSafetyMap safety)
     {
         _quests = quests;
         _spawns = spawns;
         _logger = logger;
+        _safety = safety;
     }
+
+    private readonly ZoneSafetyMap _safety;
 
     public Goal Handles => Goal.Questing;
 
@@ -725,6 +729,12 @@ public sealed class QuestPlanner : IBotPlanner
         if (q == null || active == null) return StepResult.Wait();   // unknown leg -> re-derive next tick
 
         bool lastLeg = ctx.DistToTarget >= 0 && ctx.DistToTarget < ForceRadius;
+
+        // [FINDING_017 follow-up] fleet-wide no-path memory: one bot's honest no_path
+        // teaches every other bot to skip the same pocket for a while (TTL'd; consumed
+        // by the grind relocate + DispatchObjectiveLeg). Per-bot defers below unchanged.
+        if (f.Reason is "no_path" or "empty_path" && f.Dest is { } npDest)
+            _safety.RecordNoPathDest(npDest.Map, npDest.X, npDest.Y);
 
         // no_path on the LAST LEG to a giver/turn-in = a WMO-interior NPC the navmesh
         // can't reach. force_* bypasses proximity (300 yd, all eligibility gates intact).
@@ -1605,6 +1615,21 @@ public sealed class QuestPlanner : IBotPlanner
     // cycle if C++ drops the task.
     private StepResult DispatchObjectiveLeg(BotContext ctx, QuestScratch q, (BatchQuest Quest, GrindLeg Leg) pick)
     {
+        // [FINDING_017 follow-up] Another bot already proved this leg's dest cell unpathable
+        // (fleet no-path memory, TTL'd). Skip the walk THIS sweep — transient batch removal
+        // only, no durable defer: the next BuildBatch retries after the TTL has had a chance
+        // to lapse. Exactly the outcome of walking there and failing, minus the walk.
+        if (_safety.IsNoPathDest(pick.Leg.Map, pick.Leg.X, pick.Leg.Y))
+        {
+            _logger.LogInformation(
+                "[QUEST] {Name} skipping leg [{Id}] @ ({X:F0},{Y:F0}) — fleet-known no_path dest",
+                ctx.Name, pick.Quest.QuestId, pick.Leg.X, pick.Leg.Y);
+            q.Batch.Remove(pick.Quest);
+            q.Active = null;
+            ctx.SetStep("plan");
+            return StepResult.Wait();
+        }
+
         q.Active = pick.Quest;
         q.ActiveSlot = 0;                               // legs aren't slot-routed (item legs live in ItemObjectives)
         ctx.SetStep("to_objective");

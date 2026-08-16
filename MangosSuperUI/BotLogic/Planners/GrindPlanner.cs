@@ -33,6 +33,13 @@ public sealed class GrindPlanner : IBotPlanner
     private const double ArmGraceSec = 45;       // grace after entry before KILL-recency applies
     private const double KillRecencySec = 120;   // a bot landing REAL kills is progressing
 
+    // [GRIND-RELOCATE] (FINDING_003 residual) — see the relocate block in PlanNext.
+    private const float RelocateSearchRadius = 350f; // a modest walk, never a cross-zone trek
+    private const float RelocateMinDist = 80f;       // beyond the 60yd grind leash — nearer is the same spot
+    private const int RelocatePathDangerCeil = 5;    // corridor mobs over botLevel+this → reject the route
+    private const int RelocateCooldownMin = 15;      // one relocate ATTEMPT per ~lock window (009 lesson: never at tick speed)
+    private static readonly TimeSpan RelocateDeadline = TimeSpan.FromMinutes(3); // 350yd at ~7yd/s + recovery slack
+
     private readonly ILogger<GrindPlanner> _log;
     private readonly ZoneSafetyMap _safety;
 
@@ -78,6 +85,76 @@ public sealed class GrindPlanner : IBotPlanner
                 return StepResult.Block("grind:guard-town");
             }
 
+            // [GRIND-RELOCATE] (FINDING_003 residual) A grind-LOCKED bot parked where nothing is
+            // killable used to idle out the whole window (417 bots observed 2026-08-16). Walk it to
+            // the nearest LEVEL-SAFE cell instead. This is NOT the removed density-chaser: the old
+            // relocate scored raw density and dragged bots into red zones; FindGrindCell's level
+            // ceiling/band plus the rejects below (dead cells, per-bot blacklist, enemy-guard cells,
+            // fleet-known no-path dests, corridor danger) are the rails it lacked. One ATTEMPT per
+            // cooldown window, and every failure path falls through to today's arm-here behavior —
+            // worst case is exactly the status quo.
+            if (ctx.Identity is { } rid)
+            {
+                if (rid.GrindRelocating && ctx.Failure is { CommandType: "MOVE_TO" } rf)
+                {
+                    // relocate leg failed — grind here as before; this window's attempt is spent
+                    if (rf.Reason is "no_path" or "empty_path")
+                    {
+                        _safety.RecordNoPathDest(snap.MapId, rid.GrindRelocateX, rid.GrindRelocateY);
+                        ctx.RecordDeadGrindCell(rid.GrindRelocateX, rid.GrindRelocateY);
+                    }
+                    rid.ClearGrindRelocate();
+                    ctx.Failure = null;
+                    _log.LogInformation("[GRIND] {Name} relocate leg failed ({Reason}) — arming grind in place",
+                        ctx.Name, rf.Reason);
+                }
+                else if (rid.GrindRelocating)
+                {
+                    float rdx = snap.X - rid.GrindRelocateX, rdy = snap.Y - rid.GrindRelocateY;
+                    if (rdx * rdx + rdy * rdy <= 20f * 20f)
+                    {
+                        rid.ClearGrindRelocate();   // arrived — fall through, arm at the NEW spot
+                        _log.LogInformation("[GRIND] {Name} relocate arrived @ ({X:F0},{Y:F0}) — arming grind",
+                            ctx.Name, snap.X, snap.Y);
+                    }
+                    else
+                        return StepResult.Wait();   // C++ is still walking the relocate leg
+                }
+                else if (rid.GrindLockUntil is DateTime rgl && DateTime.UtcNow < rgl
+                    && (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds > KillRecencySec
+                    && !(rid.GrindRelocateCooldownUntil is DateTime rcd && DateTime.UtcNow < rcd)
+                    && _safety.IsLoaded)
+                {
+                    rid.GrindRelocateCooldownUntil = DateTime.UtcNow.AddMinutes(RelocateCooldownMin);
+                    var rteam = ZoneSafetyMap.TeamFromFaction(rid.Faction);
+                    var cell = _safety.FindGrindCell(
+                        snap.MapId, snap.X, snap.Y, ctx.Level, RelocateSearchRadius, rteam,
+                        reject: (wx, wy) =>
+                            ctx.IsDeadGrindCell(wx, wy)
+                            || rid.IsPathBlacklisted(wx, wy)
+                            || _safety.IsEnemyGuardCell(snap.MapId, wx, wy, rteam)
+                            || _safety.IsNoPathDest(snap.MapId, wx, wy)
+                            || _safety.GetMaxCreatureLevelOnPath(snap.MapId, snap.X, snap.Y, wx, wy, rteam)
+                                > ctx.Level + RelocatePathDangerCeil);
+                    if (cell is { } c && c.DistYards >= RelocateMinDist)
+                    {
+                        rid.GrindRelocating = true;
+                        rid.GrindRelocateMoveIssued = true;
+                        rid.GrindRelocateX = c.X;
+                        rid.GrindRelocateY = c.Y;
+                        rid.GrindRelocateZ = snap.Z;
+                        ctx.SetStep("grind-relocate");
+                        _log.LogInformation(
+                            "[GRIND] {Name} barren grind-lock — relocating {D:F0}yd to cell ({X:F0},{Y:F0}) avg L{Avg:F0} max L{Max} spawns {N}",
+                            ctx.Name, c.DistYards, c.X, c.Y, c.AvgLevel, c.MaxLevel, c.SpawnCount);
+                        return StepResult.Send(
+                            new BridgeCommand("MOVE_TO", new { mapId = snap.MapId, x = c.X, y = c.Y, z = snap.Z }),
+                            "TASK_COMPLETE", RelocateDeadline);
+                    }
+                    // no viable safe cell in range — grind here exactly as before (attempt spent)
+                }
+            }
+
             // Fallback grind is the re-evaluated FILLER, not a strategic commitment — so it carries no
             // held objective (the GoalSelector re-picks the moment a quest/group order appears, exactly
             // as today). Clear any stale held objective (e.g. a coordinator order left on a just-ungrouped
@@ -116,6 +193,9 @@ public sealed class GrindPlanner : IBotPlanner
 
     public bool IsProgressing(BotContext ctx, BotStateSnapshot snap)
     {
+        // A relocate walk IS progress (per the BotIdentity design note): the Send deadline
+        // bounds it, and the goal-change / wedge clears abort it — no unbounded pass.
+        if (ctx.Identity is { GrindRelocating: true }) return true;
         if (ctx.TimeInGoalSec < ArmGraceSec) return true;        // arm grace: let the patrol get going
         return (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds < KillRecencySec;  // REAL kills only (gated in BotExecutor)
     }
