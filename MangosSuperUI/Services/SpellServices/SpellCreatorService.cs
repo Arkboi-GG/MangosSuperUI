@@ -383,6 +383,30 @@ public class SpellCreatorService
     /// <summary>Get the full skill tab mapping for the frontend.</summary>
     public static Dictionary<string, (int skillId, int classMask, int spellFamilyName)> GetSkillTabMap() => SkillTabMap;
 
+    /// <summary>
+    /// Decide the learn_on_get_skill flag for a rank-1 spell.
+    /// 2 = ABILITY_LEARNED_ON_GET_RACE_OR_CLASS_SKILL — the class auto-knows the spell the moment it
+    /// has the skill line, so trainers never offer it (you already have it). Only correct for genuine
+    /// level-1 base spells. 0 = trainer-learned — the normal path for anything with a real level gate.
+    /// A mid-level clone (e.g. Cone of Cold R1 @ lv26) MUST be 0 or R1 is auto-granted and goes missing
+    /// at the trainer while R2+ (which are always 0) show up.
+    /// </summary>
+    /// <param name="explicitLevel">The user-supplied R1 spell level, or null to read the persisted value
+    /// (which inherits the source spell's level when the user didn't override it).</param>
+    public async Task<int> ResolveRank1LearnFlagAsync(int spellEntry, int? explicitLevel)
+    {
+        int level = explicitLevel ?? 0;
+        if (level <= 0)
+        {
+            using var conn = _db.Mangos();
+            level = await conn.ExecuteScalarAsync<int?>(
+                "SELECT spellLevel FROM spell_template WHERE entry = @E AND build = 5875",
+                new { E = spellEntry }) ?? 0;
+        }
+        // Auto-learn only genuine level-1 base spells; everything with a real level requirement is trained.
+        return level <= 1 ? 2 : 0;
+    }
+
     /// <summary>Insert a skill_line_ability row so the spell appears in the correct spellbook tab.</summary>
     /// <param name="learnOnGetSkill">2 = auto-learned at character creation (R1 starting spells), 0 = trainer-learned (R2+).</param>
     public async Task<bool> InsertSkillLineAbilityAsync(int spellEntry, string skillTabKey, int supersededBySpell = 0, int learnOnGetSkill = 0)

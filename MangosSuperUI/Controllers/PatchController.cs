@@ -323,7 +323,10 @@ public partial class PatchController : Controller
             {
                 try
                 {
-                    await _spellCreator.InsertSkillLineAbilityAsync(newEntry, req.SkillTabKey, learnOnGetSkill: 2);
+                    // Auto-learn (2) only for genuine level-1 base spells; a mid-level clone must be
+                    // trainer-learned (0) or the class auto-knows R1 and it vanishes from trainers.
+                    int r1LearnFlag = await _spellCreator.ResolveRank1LearnFlagAsync(newEntry, req.SpellLevel);
+                    await _spellCreator.InsertSkillLineAbilityAsync(newEntry, req.SkillTabKey, learnOnGetSkill: r1LearnFlag);
                 }
                 catch (Exception ex)
                 {
