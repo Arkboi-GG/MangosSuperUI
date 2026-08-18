@@ -1,0 +1,1163 @@
+@{
+    ViewData["Title"] = "Item Assets";
+}
+
+@section Styles {
+    <style>
+        .wf-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .wf-header { padding: 20px 28px 14px; border-bottom: 1px solid var(--border-light); }
+        .wf-header h1 { font-size: 20px; font-weight: 700; color: var(--text-primary); margin: 0 0 4px; }
+        .wf-header-sub { font-size: 13px; color: var(--text-muted); }
+        .wf-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+        .wf-pill { font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+            border: 1px solid var(--border-light); color: var(--text-muted); background: var(--bg-card); }
+        .wf-pill.ok { color: #14804a; border-color: #14804a55; background: #14804a14; }
+        .wf-pill.bad { color: #b42318; border-color: #b4231855; background: #b4231814; }
+        .wf-pill.warn { color: #b54708; border-color: #b5470855; background: #b5470814; }
+
+        .wf-body { flex: 1; display: grid; grid-template-columns: 1fr minmax(400px, 44%);
+            gap: 20px; padding: 20px 28px; overflow: hidden; }
+        @@media (max-width: 1100px) { .wf-body { grid-template-columns: 1fr; overflow-y: auto; } }
+
+        .wf-controls { overflow-y: auto; padding-right: 6px; display: flex; flex-direction: column; gap: 16px; }
+        .wf-card { background: var(--bg-card); border: 1px solid var(--border-light); border-radius: 10px; padding: 16px 18px; }
+        .wf-card h3 { font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0 0 3px; display: flex; align-items: center; gap: 8px; }
+        .wf-card .phase { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px;
+            color: var(--text-muted); border: 1px solid var(--border-light); border-radius: 4px; padding: 1px 6px; }
+        .wf-card p { font-size: 12px; color: var(--text-muted); margin: 0 0 12px; line-height: 1.5; }
+        .wf-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+        .wf-field { display: flex; flex-direction: column; gap: 4px; }
+        .wf-field label { font-size: 11px; color: var(--text-muted); font-weight: 600; }
+        .wf-field input[type=number], .wf-field input[type=text] {
+            width: 92px; padding: 6px 8px; font-size: 13px; border-radius: 6px;
+            border: 1px solid var(--border-light); background: var(--bg-input, var(--bg-card)); color: var(--text-primary); }
+        .wf-btn { padding: 8px 14px; font-size: 13px; font-weight: 600; border-radius: 7px; cursor: pointer;
+            border: 1px solid var(--accent, #2563eb); background: var(--accent, #2563eb); color: #fff; }
+        .wf-btn:hover { filter: brightness(1.08); }
+        .wf-btn.secondary { background: transparent; color: var(--text-primary); border-color: var(--border-light); }
+        .wf-btn:disabled { opacity: .55; cursor: default; }
+        .wf-file { font-size: 12px; color: var(--text-muted); }
+
+        .wf-preview { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+        .wf-viewer { flex: 1; min-height: 420px; border: 1px solid var(--border-light); border-radius: 10px;
+            overflow: hidden; background: linear-gradient(180deg, #1a1d24, #0f1115); position: relative; }
+        .wf-viewer.expanded { position: fixed; inset: 20px; z-index: 60; min-height: 0; border-radius: 12px;
+            box-shadow: 0 20px 60px #000a; }
+        .wf-viewer canvas { display: block; width: 100%; height: 100%; }
+        .wf-viewer .hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+            color: #8a93a6; font-size: 13px; pointer-events: none; }
+        .wf-cameras { position:absolute; z-index:2; top:8px; right:8px; display:flex; gap:5px; }
+        .wf-cameras button { border:1px solid #ffffff33; background:#111722cc; color:#dce2ee; border-radius:5px;
+            padding:4px 7px; font-size:10px; cursor:pointer; }
+        .wf-result { max-height: 34%; overflow-y: auto; border: 1px solid var(--border-light); border-radius: 10px;
+            padding: 12px 14px; background: var(--bg-card); font-size: 12px; }
+        .wf-result .title { font-weight: 700; color: var(--text-primary); margin-bottom: 6px; }
+        .wf-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; color: var(--text-muted); }
+        .wf-kv b { color: var(--text-primary); font-weight: 600; }
+        .wf-diag { margin-top: 8px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--text-muted); }
+        .wf-diag .err { color: #d9534f; }
+        .wf-diag .warn { color: #d98800; }
+        .wf-note { font-size: 11px; color: var(--text-muted); margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border-light); }
+        .wf-dl { display: inline-block; margin-top: 8px; margin-right: 14px; font-size: 13px; font-weight: 600; color: var(--accent, #2563eb); }
+        .wf-pipeline { border-color: color-mix(in srgb, var(--accent, #2563eb) 45%, var(--border-light)); }
+        .wf-stagebar { display:flex; gap:6px; flex-wrap:wrap; margin:10px 0 12px; }
+        .wf-stagebar span { font-size:10px; font-weight:700; color:var(--text-muted); padding:4px 8px;
+            border:1px solid var(--border-light); border-radius:999px; }
+        .wf-view-grid { display:grid; grid-template-columns:repeat(4,minmax(110px,1fr)); gap:8px; margin:10px 0; }
+        @@media (max-width: 900px) { .wf-view-grid { grid-template-columns:repeat(2,1fr); } }
+        .wf-ref { border:1px solid var(--border-light); border-radius:8px; padding:7px; background:var(--bg-input,var(--bg-card)); }
+        .wf-ref .head { display:flex; justify-content:space-between; align-items:center; font-size:10px; font-weight:700;
+            color:var(--text-muted); margin-bottom:5px; }
+        .wf-ref canvas { width:100%; aspect-ratio:1; border-radius:5px; cursor:crosshair;
+            background-color:#fff; background-image:linear-gradient(45deg,#eef0f4 25%,transparent 25%),
+            linear-gradient(-45deg,#eef0f4 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#eef0f4 75%),
+            linear-gradient(-45deg,transparent 75%,#eef0f4 75%); background-size:16px 16px; background-position:0 0,0 8px,8px -8px,-8px 0; }
+        .wf-ref input[type=file] { width:100%; font-size:9px; margin-top:4px; }
+        .wf-editor-tools { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:11px; color:var(--text-muted); }
+
+        /* Forged Weapons registry list */
+        .wf-weapons table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .wf-weapons th { text-align: left; color: var(--text-muted); font-weight: 600; font-size: 11px;
+            padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border-light); }
+        .wf-weapons td { padding: 5px 8px 5px 0; color: var(--text-primary); border-bottom: 1px dashed var(--border-light); }
+        .wf-weapons td.muted { color: var(--text-muted); }
+        .wf-weapons .wf-del { padding: 3px 9px; font-size: 11.5px; font-weight: 600; border-radius: 6px; cursor: pointer;
+            border: 1px solid #b4231855; background: #b4231814; color: #b42318; }
+        .wf-weapons .wf-del:hover { background: #b4231828; }
+        .wf-weapons .empty { color: var(--text-muted); font-size: 12px; }
+
+        /* Setup modal (sketch → 3D install instructions) */
+        .wf-modal-overlay { position: fixed; inset: 0; background: rgba(8, 10, 14, .6); display: none;
+            align-items: center; justify-content: center; z-index: 10000; }
+        .wf-modal-overlay.open { display: flex; }
+        .wf-modal { width: min(780px, 94vw); max-height: 88vh; overflow-y: auto;
+            background: var(--bg-card, #fff); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border-light); border-radius: 12px; padding: 18px 22px; }
+        .wf-modal h2 { font-size: 16px; font-weight: 700; color: var(--text-primary); margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
+        .wf-modal p { font-size: 12.5px; color: var(--text-muted); line-height: 1.55; margin: 0 0 10px; }
+        .wf-steps { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 14px; }
+        .wf-step { display: flex; gap: 10px; align-items: flex-start; }
+        .wf-step .n { flex: 0 0 22px; height: 22px; border-radius: 50%; background: var(--accent, #2563eb); color: #fff;
+            font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; margin-top: 1px; }
+        .wf-step b { display: block; font-size: 13px; color: var(--text-primary); margin-bottom: 1px; }
+        .wf-step .d { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+        .wf-modal .nodes { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--text-primary); }
+        .wf-prompt { width: 100%; height: 260px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px;
+            line-height: 1.45; background: var(--bg-input, var(--bg-card)); color: var(--text-primary);
+            border: 1px solid var(--border-light); border-radius: 8px; padding: 10px; white-space: pre; resize: vertical; }
+        .wf-modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
+    </style>
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+
+    <div class="main-content">
+<div class="wf-wrap">
+    <div class="wf-header">
+        <h1><i class="fa-solid fa-hammer"></i> Item Assets — Weapon Forge</h1>
+        <div class="wf-header-sub">
+            Generate, import, or draw a weapon and forge it into the game. Forging inserts the item into the world
+            database, reloads <code>item_template</code>, and deploys <code>patch-5.MPQ</code> to the client Data folder
+            (alongside the Retexture Engine's <code>patch-4</code>). Restart the client, then <code>.additem</code> the
+            new entry. All build files are also kept in the artifact folder.
+        </div>
+        <div class="wf-pills" id="wfPills">
+            <span class="wf-pill" id="pillFixture">fixture …</span>
+            <span class="wf-pill" id="pillDonor">donor …</span>
+            <span class="wf-pill" id="pillContract">contract …</span>
+        </div>
+    </div>
+
+    <div class="wf-body">
+        <div class="wf-controls">
+
+            <div class="wf-card">
+                <h3><span class="phase">Model</span> Generate Sword</h3>
+                <p><strong>Low-poly by design.</strong> Real vanilla weapons are ~100–230 triangles — a plain blade is
+                   barely 30–50, and the detail is <em>painted, not modelled</em>. Keep the blade thin and let the
+                   texture carry the intricacy. <strong>Preview mesh</strong> renders it here; <strong>Forge item</strong>
+                   builds the real item (world DB, patch, deploy) — then restart the client and <code>.additem</code>.</p>
+                <div class="wf-row">
+                    <div class="wf-field"><label>Blade length</label><input type="number" id="gsLen" value="0.75" step="0.05" min="0.2" max="1.5"></div>
+                    <div class="wf-field"><label>Blade width</label><input type="number" id="gsWid" value="0.09" step="0.01" min="0.02" max="0.3"></div>
+                    <div class="wf-field"><label>Segments <span style="color:var(--text-muted);">(vanilla ≈ 3–4)</span></label><input type="number" id="gsSeg" value="4" step="1" min="3" max="40"></div>
+                    <div class="wf-field"><label>Name (optional)</label><input type="text" id="gsName" placeholder="Generated Sword" style="width:150px;"></div>
+                    <button class="wf-btn secondary" data-action="generate">Preview mesh</button>
+                    <button class="wf-btn" data-action="forgeSword">Forge item</button>
+                </div>
+                <label style="display:flex; align-items:center; gap:6px; margin-top:8px; font-size:11px; color:var(--text-muted);">
+                    <input type="checkbox" id="gsKeepName"> Keep donor's internal model name (debug — isolates the rename)
+                </label>
+            </div>
+
+            <div class="wf-card wf-pipeline">
+                <h3><span class="phase">Production</span> Sketch → Game-ready Weapon
+                    <span class="wf-pill" id="pillPipeline" style="margin-left:auto;">pipeline …</span></h3>
+                <p>A staged workbench: clean the paper drawing, inspect or paint the missing views, reconstruct a
+                   textured low-poly master, correct sword form, preview it from diagnostic angles, then forge. Every
+                   provider and quality setting is installation-local and configured from this page.</p>
+                <div class="wf-stagebar"><span>1 · references</span><span>2 · depth</span><span>3 · reconstruction</span>
+                    <span>4 · texture</span><span>5 · game mesh</span><span>6 · forge</span></div>
+                <div class="wf-row">
+                    <div class="wf-field" style="flex:1;"><label>Broadside source (PNG/JPEG)</label>
+                        <input type="file" id="prodSource" accept="image/png,image/jpeg" class="wf-file"></div>
+                    <button class="wf-btn secondary" data-action="prepareProductionViews">Prepare editable views</button>
+                    <button class="wf-btn secondary" data-action="loadCrescentExample">Load supplied example</button>
+                    <button class="wf-btn secondary" data-action="openSetup"><i class="fa-solid fa-sliders"></i> Pipeline setup</button>
+                </div>
+                <div id="prodViews" style="display:none;">
+                    <div class="wf-view-grid">
+                        <div class="wf-ref" data-role="front"><div class="head"><span>FRONT · cleaned source</span><label><input type="checkbox" checked disabled> use</label></div><canvas width="512" height="512"></canvas><input type="file" accept="image/*"></div>
+                        <div class="wf-ref" data-role="back"><div class="head"><span>BACK · starter</span><label><input type="checkbox"> use</label></div><canvas width="512" height="512"></canvas><input type="file" accept="image/*"></div>
+                        <div class="wf-ref" data-role="left"><div class="head"><span>EDGE · starter</span><label><input type="checkbox"> use</label></div><canvas width="512" height="512"></canvas><input type="file" accept="image/*"></div>
+                        <div class="wf-ref" data-role="right"><div class="head"><span>3/4 · starter</span><label><input type="checkbox"> use</label></div><canvas width="512" height="512"></canvas><input type="file" accept="image/*"></div>
+                    </div>
+                    <div class="wf-editor-tools">
+                        <strong>Reference pencil:</strong>
+                        <label><input type="radio" name="refTool" value="ink" checked> ink</label>
+                        <label><input type="radio" name="refTool" value="erase"> erase</label>
+                        <label>size <input type="range" id="refBrush" min="1" max="24" value="4"></label>
+                        <span>Generated views are guides. Paint corrections, replace them, or leave weak views unchecked.</span>
+                    </div>
+                    <div class="wf-row" style="margin-top:10px;">
+                        <div class="wf-field"><label>Depth scale</label><input type="number" id="prodDepth" value="1.25" min="0.25" max="4" step="0.05"></div>
+                        <div class="wf-field"><label>Extra roll °</label><input type="number" id="prodRoll" value="0" min="-180" max="180" step="1"></div>
+                        <label style="font-size:11px;color:var(--text-muted);padding-bottom:7px;"><input type="checkbox" id="prodStraighten" checked> straighten blade centerline</label>
+                        <label style="font-size:11px;color:var(--text-muted);padding-bottom:7px;"><input type="checkbox" id="prodFlipGrip"> flip grip/tip</label>
+                        <div class="wf-field"><label>Name (optional)</label><input type="text" id="prodName" placeholder="Reconstructed Blade" style="width:155px;"></div>
+                        <button class="wf-btn secondary" data-action="previewProduction">Reconstruct &amp; preview</button>
+                        <button class="wf-btn" data-action="forgeProduction">Forge inspected result</button>
+                    </div>
+                </div>
+                <div class="wf-note" id="prodNote">Prepare references first. The front view is never silently combined with invented sides.</div>
+            </div>
+
+            <div class="wf-card">
+                <h3><span class="phase">Route B</span> Import GLB / Hand-drawn Sketch
+                    <span class="wf-pill" id="pillSketch3d" style="margin-left:auto;">sketch → 3D …</span></h3>
+                <p><strong>Import GLB</strong> accepts any single-mesh 3D file (a Blender export, an AI reconstruction) —
+                   Preview inspects and normalizes it, Forge builds it into a real item, embedded texture included.
+                   <strong>Forge sketch</strong> turns a drawing straight into an item: the image is reconstructed into a
+                   3D model on the ComfyUI pool, then forged automatically. Requires a one-time server setup — see
+                   <em>Set up sketch → 3D</em>.</p>
+                <div class="wf-row">
+                    <div class="wf-field" style="flex:1;">
+                        <label>GLB model (.glb)</label>
+                        <input type="file" id="glbFile" accept=".glb" class="wf-file">
+                    </div>
+                    <div class="wf-field"><label>Name (optional)</label><input type="text" id="glbName" placeholder="Imported Blade" style="width:140px;"></div>
+                    <button class="wf-btn secondary" data-action="uploadGlb">Preview mesh</button>
+                    <button class="wf-btn" data-action="forgeGlb">Forge item</button>
+                </div>
+                <div class="wf-row" style="margin-top:10px;">
+                    <div class="wf-field" style="flex:1;">
+                        <label>Hand-drawn sketch (PNG/JPEG)</label>
+                        <input type="file" id="sketchFile" accept="image/png,image/jpeg" class="wf-file">
+                    </div>
+                    <div class="wf-field"><label>Name (optional)</label><input type="text" id="skName" placeholder="Sketched Blade" style="width:140px;"></div>
+                    <button class="wf-btn" data-action="forgeSketch">Forge sketch</button>
+                    <button class="wf-btn secondary" data-action="openSetup"><i class="fa-solid fa-wrench"></i> Set up sketch → 3D</button>
+                </div>
+                <div class="wf-note" id="sketchNote">
+                    GLB import has no server requirements. Sketch reconstruction requires an image→3D pipeline on the
+                    ComfyUI server (one-time install) — <strong>Set up sketch → 3D</strong> has the instructions.
+                </div>
+            </div>
+
+            <div class="wf-card">
+                <h3><span class="phase">Texture</span> Texture an existing model
+                    <span class="wf-pill" style="margin-left:auto;">local · img2img</span></h3>
+                <p><strong>Add intricacy to a model that already has a texture.</strong> Its baked texture is refined by
+                   local ComfyUI/Flux with your prompt — and because the image is already mapped to the model's UVs, the
+                   detail lands in the right places (no unwrap or "which-way-is-up" problem). Best for GLBs from
+                   Tripo/Meshy that ship a texture. No texture on the model? Use the <strong>Texture zones</strong> panel.</p>
+                <div class="wf-row">
+                    <div class="wf-field" style="flex:1;"><label>Textured GLB (.glb)</label>
+                        <input type="file" id="txGlb" accept=".glb" class="wf-file"></div>
+                    <div class="wf-field"><label>Denoise <span style="color:var(--text-muted);">(0.3 subtle · 0.6 bold)</span></label>
+                        <input type="range" id="txDenoise" min="0.2" max="0.8" step="0.05" value="0.45"></div>
+                </div>
+                <div class="wf-row" style="margin-top:8px;">
+                    <div class="wf-field" style="flex:1;"><label>Prompt</label>
+                        <input type="text" id="txPrompt" placeholder="ornate runes, gold filigree, weathered steel" style="width:100%;"></div>
+                    <div class="wf-field"><label>Name (optional)</label>
+                        <input type="text" id="txName" placeholder="Refined Blade" style="width:140px;"></div>
+                </div>
+                <div class="wf-row" style="margin-top:8px;align-items:center;">
+                    <button class="wf-btn secondary" data-action="refineGlb">Refine texture (local)</button>
+                    <button class="wf-btn" data-action="forgeRefined">Forge refined</button>
+                    <img id="txAtlasImg" width="72" height="72" alt="refined texture"
+                         style="image-rendering:pixelated;border:1px solid var(--border-color);background:#222;margin-left:auto;display:none;">
+                </div>
+                <div class="wf-note">Needs a local ComfyUI/Flux node online (same engine as the Retexture Engine).
+                    Flux img2img is slow — expect ~30–60s. Over-budget imports (&gt;1000 tris) preview fine but won't forge until decimated.</div>
+            </div>
+
+            <div class="wf-card">
+                <h3><span class="phase">Registry</span> Forged Weapons</h3>
+                <p>The weapons currently in the registry — the exact contents of <code>patch-5.MPQ</code>.
+                   <strong>Delete</strong> removes a weapon from the game: world-database row, packaged patch, and
+                   registry entry; its IDs return to the pool. All forge and delete actions are recorded in the
+                   Activity Log.</p>
+                <div id="wfWeapons" class="wf-weapons"><span style="color:var(--text-muted);font-size:12px;">Loading…</span></div>
+                <div class="wf-row" style="margin-top:10px;">
+                    <button class="wf-btn secondary" data-action="rebuildPatch">Rebuild patch</button>
+                    <a class="wf-btn secondary" href="/WeaponForge/DownloadPatch" style="text-decoration:none;">
+                        <i class="fa-solid fa-download"></i> Download current patch-5.MPQ</a>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="wf-preview">
+            <div class="wf-viewer" id="wfViewer"><div class="hint" id="wfHint">Run an action to preview a model</div>
+                <div class="wf-cameras"><button data-camera="three">3/4</button><button data-camera="front">front</button><button data-camera="edge">edge</button><button id="wfExpand" title="Expand viewer">⤢ expand</button></div></div>
+            <div class="wf-result" id="wfResult">
+                <div class="title">Ready</div>
+                <div style="color:var(--text-muted);">Results, IDs, downloads, and diagnostics appear here.</div>
+            </div>
+
+            <div class="wf-card" id="zonePanel" style="display:none;margin-top:10px;">
+                <h3 style="display:flex;align-items:center;gap:8px;">
+                    <i class="fa-solid fa-layer-group"></i> Texture zones
+                    <button class="wf-btn secondary" id="zoneAuto" style="margin-left:auto;padding:2px 9px;font-size:11px;">Auto-segment</button>
+                </h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:2px 0 8px;">
+                    Split the blade axis into four zones; each maps to one quadrant of a 2×2 atlas. Drag the boundaries,
+                    then fill each quadrant with a colour, an uploaded 128×64, or a locally generated texture.
+                </p>
+                <div id="zoneSliders" style="display:flex;flex-direction:column;gap:5px;font-size:11px;">
+                    <label style="display:flex;align-items:center;gap:8px;"><span style="width:92px;">blade ↔ guard</span>
+                        <input type="range" id="zbBladeGuard" min="0.02" max="0.98" step="0.005" value="0.34" style="flex:1;"></label>
+                    <label style="display:flex;align-items:center;gap:8px;"><span style="width:92px;">guard ↔ grip</span>
+                        <input type="range" id="zbGuardGrip" min="0.02" max="0.98" step="0.005" value="0.24" style="flex:1;"></label>
+                    <label style="display:flex;align-items:center;gap:8px;"><span style="width:92px;">grip ↔ pommel</span>
+                        <input type="range" id="zbGripPommel" min="0.02" max="0.98" step="0.005" value="0.08" style="flex:1;"></label>
+                </div>
+                <div id="zoneCells" style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px;"></div>
+                <div style="display:flex;align-items:center;gap:10px;margin-top:10px;">
+                    <div style="text-align:center;">
+                        <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px;">atlas (128×64)</div>
+                        <img id="zoneAtlasImg" alt="atlas" width="128" height="64"
+                             style="image-rendering:pixelated;border:1px solid var(--border-color);background:#222;display:block;">
+                    </div>
+                    <div style="flex:1;display:flex;flex-direction:column;gap:6px;">
+                        <input type="text" id="zoneName" placeholder="Zoned Weapon" style="width:100%;">
+                        <div style="display:flex;gap:6px;">
+                            <button class="wf-btn secondary" data-action="previewZoned" style="flex:1;">Preview textured</button>
+                            <button class="wf-btn" data-action="forgeZoned" style="flex:1;">Forge with zones</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="wf-card" id="reworkPanel" style="display:none;margin-top:10px;">
+                <h3 style="display:flex;align-items:center;gap:8px;">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i> Rework texture
+                    <span class="wf-pill" id="reworkLabel" style="margin-left:auto;">display …</span>
+                </h3>
+                <p style="font-size:11px;color:var(--text-muted);margin:2px 0 8px;">
+                    Refine this forged weapon's <em>existing</em> texture with local Flux img2img — the mesh is untouched.
+                    <strong>Apply</strong> writes the new texture back and redeploys patch-5 (restart the client to see it).
+                </p>
+                <div class="wf-row">
+                    <div class="wf-field" style="flex:1;"><label>Prompt</label>
+                        <input type="text" id="reworkPrompt" placeholder="ornate runes, gold filigree, weathered steel" style="width:100%;"></div>
+                    <div class="wf-field"><label>Denoise <span style="color:var(--text-muted);">(0.3 subtle · 0.6 bold)</span></label>
+                        <input type="range" id="reworkDenoise" min="0.2" max="0.8" step="0.05" value="0.4"></div>
+                </div>
+                <div class="wf-row" style="margin-top:8px;align-items:center;">
+                    <button class="wf-btn secondary" data-action="reworkForged">Refine (preview)</button>
+                    <button class="wf-btn" data-action="applyForged">Apply to server</button>
+                    <img id="reworkAtlasImg" width="72" height="72" alt="reworked"
+                         style="image-rendering:pixelated;border:1px solid var(--border-color);background:#222;margin-left:auto;display:none;">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="wf-modal-overlay" id="setupModal">
+        <div class="wf-modal">
+            <h2><i class="fa-solid fa-wrench"></i> Set up automatic sketch → 3D</h2>
+            <p>Choose a provider here. Tripo is the self-contained route: enter your own API key and the Forge page
+               handles upload, multiview reconstruction, low-poly texture generation, and download. ComfyUI keeps
+               everything local and uses the portable workflow below.</p>
+            <h2><i class="fa-solid fa-diagram-project"></i> Production pipeline profile</h2>
+            <div class="wf-row">
+                <div class="wf-field"><label>Provider</label><select id="pipeProvider"><option value="tripo">Tripo API</option><option value="comfyui">Local ComfyUI</option></select></div>
+                <div class="wf-field"><label>Target triangles</label><input type="number" id="pipeTarget" value="800" min="200" max="1000" step="25"></div>
+                <div class="wf-field"><label>Texture</label><select id="pipeTexture"><option value="detailed">Detailed</option><option value="standard">Standard</option></select></div>
+                <div class="wf-field"><label>Tripo model</label><input type="text" id="pipeModel" value="tripo-p1" style="width:145px;"></div>
+            </div>
+            <div class="wf-row" style="margin-top:8px;">
+                <div class="wf-field" style="flex:1;"><label>Tripo API base URL</label><input type="text" id="pipeBase" value="https://openapi.tripo3d.ai/v3" style="width:100%;"></div>
+                <div class="wf-field" style="flex:1;"><label>Tripo API key (write-only; blank preserves it)</label><input type="password" id="pipeKey" autocomplete="off" placeholder="Enter this installation's key" style="width:100%;"></div>
+            </div>
+            <div class="wf-row" style="margin-top:8px;">
+                <div class="wf-field"><label>Local node name</label><input type="text" id="pipeComfyName" value="weapon-forge" style="width:130px;"></div>
+                <div class="wf-field" style="flex:1;"><label>Local ComfyUI URL (joins live pool immediately)</label><input type="text" id="pipeComfyUrl" value="http://localhost:8188" style="width:100%;"></div>
+            </div>
+            <div class="wf-row" style="margin-top:8px;">
+                <label style="font-size:11px;color:var(--text-muted);"><input type="checkbox" id="pipeAutofix" checked> input autofix</label>
+                <label style="font-size:11px;color:var(--text-muted);"><input type="checkbox" id="pipeSmart" checked> smart low-poly when supported</label>
+                <button class="wf-btn" data-action="savePipelineProfile"><i class="fa-solid fa-floppy-disk"></i> Save profile</button>
+                <a class="wf-btn secondary" href="/WeaponForge/ExportPipelineProfile" style="text-decoration:none;">Export portable profile</a>
+                <input type="file" id="pipeImportFile" accept=".json,application/json" class="wf-file">
+                <button class="wf-btn secondary" data-action="importPipelineProfile">Import profile</button>
+            </div>
+            <p id="pipeStatus" class="nodes">Loading pipeline profile…</p>
+            <hr style="border:0;border-top:1px solid var(--border-light);margin:16px 0;">
+            <p>Local ComfyUI setup (used only when that provider is selected):</p>
+            <div class="wf-steps">
+                <div class="wf-step"><span class="n">1</span><div>
+                    <b>Copy the prompt below</b>
+                    <span class="d">It's a complete instruction sheet for an AI assistant — you don't need to understand
+                    or edit it.</span></div></div>
+                <div class="wf-step"><span class="n">2</span><div>
+                    <b>Run it on your AI machine</b>
+                    <span class="d">Open an AI agent in a terminal on the computer with your graphics card (e.g. Claude
+                    Code) and paste the prompt. It checks what's already on the machine, installs or reuses what's
+                    needed, and test-runs everything.</span></div></div>
+                <div class="wf-step"><span class="n">3</span><div>
+                    <b>The agent hands you back one thing: a workflow JSON</b>
+                    <span class="d">A block of text — ComfyUI's “Save (API format)” export. That file is the recipe this
+                    app will run for every sketch from now on. It comes from the agent at the end of its run.</span></div></div>
+                <div class="wf-step"><span class="n">4</span><div>
+                    <b>Paste or upload that JSON below, press Save workflow</b>
+                    <span class="d">Sketch → 3D switches on the moment it saves — no restart, no code changes.</span></div></div>
+                <div class="wf-step"><span class="n">5</span><div>
+                    <b>Draw</b>
+                    <span class="d">Upload a sketch on this page and press <em>Forge sketch</em>. The app clears the
+                    graphics card, runs the workflow, downloads the 3D model it produces, and forges it into the game
+                    like any other model.</span></div></div>
+            </div>
+
+            <h2><i class="fa-solid fa-copy"></i> Step 1 — the prompt</h2>
+            <p id="setupStatus" class="nodes">Loading your ComfyUI node list…</p>
+            <textarea class="wf-prompt" id="setupPrompt" readonly spellcheck="false"></textarea>
+            <div class="wf-modal-actions">
+                <button class="wf-btn" data-action="copySetup"><i class="fa-solid fa-copy"></i> Copy prompt</button>
+            </div>
+
+            <h2 style="margin-top:16px;"><i class="fa-solid fa-upload"></i> Step 4 — upload the workflow JSON</h2>
+            <p id="wfStatus" class="nodes">Checking stored workflow…</p>
+            <textarea class="wf-prompt" id="wfJson" spellcheck="false" style="height:120px;"
+                placeholder='Paste the API-format workflow JSON here (ComfyUI → “Save (API format)”)…'></textarea>
+            <div class="wf-row" style="margin-top:8px;">
+                <input type="file" id="wfJsonFile" accept=".json,application/json" class="wf-file" style="flex:1;">
+            </div>
+            <div class="wf-modal-actions">
+                <button class="wf-btn secondary" data-action="closeSetup">Close</button>
+                <button class="wf-btn secondary" id="btnClearWf" data-action="clearWorkflow" style="display:none;">Remove workflow</button>
+                <button class="wf-btn" data-action="saveWorkflow"><i class="fa-solid fa-floppy-disk"></i> Save workflow</button>
+            </div>
+        </div>
+    </div>
+</div>
+    </div>
+</div>
+
+@section Scripts {
+    <script type="importmap">
+        {
+          "imports": {
+            "three": "/lib/three/build/three.module.js",
+            "three/addons/": "/lib/three/examples/jsm/"
+          }
+        }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ---------- 3D viewer ----------
+        const host = document.getElementById('wfViewer');
+        const hint = document.getElementById('wfHint');
+        let renderer, scene, camera, controls, current = null;
+
+        function initViewer() {
+            const w = host.clientWidth, h = host.clientHeight;
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio || 1);
+            renderer.setSize(w, h);
+            host.appendChild(renderer.domElement);
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(45, w / h, 0.01, 100);
+            camera.position.set(1.4, 0.9, 1.4);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+
+            scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.1));
+            const dir = new THREE.DirectionalLight(0xffffff, 1.4);
+            dir.position.set(2, 3, 2); scene.add(dir);
+            const grid = new THREE.GridHelper(2, 20, 0x3a4150, 0x262b33);
+            grid.position.y = -0.001; scene.add(grid);
+
+            window.addEventListener('resize', onResize);
+            animate();
+        }
+        function onResize() {
+            if (!renderer) return;
+            const w = host.clientWidth, h = host.clientHeight;
+            renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+        }
+        function animate() { requestAnimationFrame(animate); controls && controls.update(); renderer && renderer.render(scene, camera); }
+
+        const loader = new GLTFLoader();
+        function loadGlb(url) {
+            if (!url) return;
+            hint.style.display = 'none';
+            loader.load(url + '?t=' + Date.now(), (gltf) => {
+                if (current) { scene.remove(current); }
+                const model = gltf.scene;
+                // Re-material for readable, lit previews (in-game weapons are unlit; this reveals form).
+                model.traverse((o) => {
+                    if (o.isMesh) {
+                        const map = o.material && o.material.map ? o.material.map : null;
+                        o.material = new THREE.MeshStandardMaterial({
+                            map: map, color: map ? 0xffffff : 0xb8bec9, metalness: 0.15, roughness: 0.65,
+                            flatShading: true, side: THREE.DoubleSide });
+                    }
+                });
+                current = model; scene.add(model);
+                frameObject(model);
+                if (pendingTextured) { pendingTextured = false; }
+                else { lastPreviewPath = url.split('?')[0]; onFreshPreview(); }
+            }, undefined, (err) => setResult({ title: 'Preview failed', error: String(err) }));
+        }
+        function frameObject(obj) {
+            const box = new THREE.Box3().setFromObject(obj);
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z) || 1;
+            controls.target.copy(center);
+            camera.position.copy(center).add(new THREE.Vector3(maxDim * 1.6, maxDim * 1.1, maxDim * 1.6));
+            camera.near = maxDim / 100; camera.far = maxDim * 100; camera.updateProjectionMatrix();
+            controls.update();
+        }
+        function setDiagnosticCamera(kind) {
+            if (!current) return; const box = new THREE.Box3().setFromObject(current), size=box.getSize(new THREE.Vector3()), center=box.getCenter(new THREE.Vector3());
+            const d=Math.max(size.x,size.y,size.z)*1.7; controls.target.copy(center);
+            const offset = kind==='front' ? new THREE.Vector3(0,0,d) : (kind==='edge' ? new THREE.Vector3(0,d,0) : new THREE.Vector3(d*.8,d*.55,d*.8));
+            camera.position.copy(center).add(offset); camera.up.set(0,1,0); camera.lookAt(center); controls.update();
+        }
+        document.querySelectorAll('[data-camera]').forEach(b => b.addEventListener('click', () => setDiagnosticCamera(b.dataset.camera)));
+
+        // ---------- helpers ----------
+        function esc(s) { return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+        function setResult({ title, kv, diagnostics, downloads, note, error }) {
+            const r = document.getElementById('wfResult');
+            let html = `<div class="title">${esc(title || 'Result')}</div>`;
+            if (error) html += `<div class="wf-diag err">${esc(error)}</div>`;
+            if (kv) {
+                html += '<div class="wf-kv">';
+                for (const [k, v] of Object.entries(kv)) html += `<span>${esc(k)}</span><b>${esc(v)}</b>`;
+                html += '</div>';
+            }
+            if (downloads && downloads.length) {
+                html += '<div>';
+                for (const d of downloads)
+                    html += `<a class="wf-dl" href="${d.url}"><i class="fa-solid fa-download"></i> ${esc(d.label)}</a>`;
+                html += '</div>';
+            }
+            if (diagnostics && diagnostics.length) {
+                html += '<div class="wf-diag">';
+                for (const d of diagnostics) {
+                    const cls = d.includes('[Error]') ? 'err' : (d.includes('[Warning]') ? 'warn' : '');
+                    html += `<div class="${cls}">${esc(d)}</div>`;
+                }
+                html += '</div>';
+            }
+            if (note) html += `<div class="wf-note">${esc(note)}</div>`;
+            r.innerHTML = html;
+        }
+        function busy(btn, on) { btn.disabled = on; btn.dataset._t = btn.dataset._t || btn.textContent; btn.textContent = on ? 'Working…' : btn.dataset._t; }
+        function previewUrl(data) { return (data.preview && data.preview.glbWebPath) || data.previewGlbWebPath || null; }
+
+        // ---------- editable multiview reference workbench ----------
+        const refCards = () => [...document.querySelectorAll('#prodViews .wf-ref')];
+        function drawReference(canvas, url) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => { const c = canvas.getContext('2d'); c.clearRect(0, 0, canvas.width, canvas.height); c.drawImage(img, 0, 0, canvas.width, canvas.height); resolve(); };
+                img.onerror = reject; img.src = url;
+            });
+        }
+        refCards().forEach(card => {
+            const canvas = card.querySelector('canvas'), input = card.querySelector('input[type=file]');
+            input.addEventListener('change', () => { const f = input.files[0]; if (f) drawReference(canvas, URL.createObjectURL(f)); });
+            let drawing = false, last = null;
+            const point = e => { const r = canvas.getBoundingClientRect(); return { x:(e.clientX-r.left)*canvas.width/r.width, y:(e.clientY-r.top)*canvas.height/r.height }; };
+            canvas.addEventListener('pointerdown', e => { drawing = true; last = point(e); canvas.setPointerCapture(e.pointerId); });
+            canvas.addEventListener('pointermove', e => {
+                if (!drawing) return; const p = point(e), c = canvas.getContext('2d');
+                c.save(); c.lineCap = 'round'; c.lineJoin = 'round'; c.lineWidth = +document.getElementById('refBrush').value;
+                const erase = document.querySelector('input[name=refTool]:checked').value === 'erase';
+                c.globalCompositeOperation = erase ? 'destination-out' : 'source-over'; c.strokeStyle = '#111';
+                c.beginPath(); c.moveTo(last.x,last.y); c.lineTo(p.x,p.y); c.stroke(); c.restore(); last = p;
+            });
+            const stop = () => { drawing = false; last = null; };
+            canvas.addEventListener('pointerup', stop); canvas.addEventListener('pointercancel', stop);
+        });
+        function canvasPng(canvas) { return new Promise(resolve => canvas.toBlob(resolve, 'image/png')); }
+        async function productionForm(includeName) {
+            const fd = new FormData();
+            for (const card of refCards()) {
+                const role = card.dataset.role, use = role === 'front' || card.querySelector('input[type=checkbox]').checked;
+                if (use) fd.append(role, await canvasPng(card.querySelector('canvas')), role + '.png');
+            }
+            fd.append('straightenBlade', document.getElementById('prodStraighten').checked);
+            fd.append('depthScale', document.getElementById('prodDepth').value);
+            fd.append('rollDegrees', document.getElementById('prodRoll').value);
+            fd.append('flipGripEnd', document.getElementById('prodFlipGrip').checked);
+            if (includeName) fd.append('name', document.getElementById('prodName').value.trim());
+            return fd;
+        }
+
+        function applyLine(ok, label, msg) { return `${ok ? '✓' : '✗'} ${label}: ${msg}`; }
+        function forgeResult(d, titleOk) {
+            if (!d.ok) return setResult({ title: 'Forge failed', error: d.error || d.message, diagnostics: d.diagnostics });
+            const a = d.apply || {};
+            const allApplied = a.sqlApplied && a.reloaded && a.patchDeployed;
+            setResult({
+                title: titleOk + (allApplied ? ' & applied to server' : ' — some apply steps need attention'),
+                kv: {
+                    'Item entry': d.itemEntry, 'Display id': d.displayId, 'Model': d.modelMember,
+                    'Weapons in patch': d.packagedWeaponCount + (d.skippedWeaponCount ? ` (${d.skippedWeaponCount} skipped)` : ''),
+                    'Verified': d.allMembersVerified ? 'yes' : 'NO', 'Triangles': d.triangleCount,
+                },
+                downloads: [
+                    { label: 'patch-5.MPQ', url: d.mpqDownloadUrl },
+                    { label: 'item_template.sql', url: d.sqlDownloadUrl },
+                ],
+                diagnostics: [
+                    applyLine(a.sqlApplied, 'World DB', a.sqlMessage || ''),
+                    applyLine(a.reloaded, 'Reload', a.reloadMessage || ''),
+                    applyLine(a.patchDeployed, 'Patch deploy', a.patchDeployMessage || ''),
+                    ...(d.diagnostics || []),
+                ],
+                note: allApplied
+                    ? `Live on the server. Restart the client(s), then .additem ${d.itemEntry}.`
+                    : 'One or more steps require manual action — see the lines above; the downloads contain the files. Then restart the client and .additem.'
+            });
+            loadGlb(previewUrl(d));
+            loadWeapons();
+        }
+
+        // ---------- forged weapons registry ----------
+        async function loadWeapons() {
+            const host = document.getElementById('wfWeapons');
+            try {
+                const d = await (await fetch('/WeaponForge/ListWeapons')).json();
+                if (!d.ok) { host.innerHTML = `<span class="empty">Could not load: ${esc(d.error || 'unknown')}</span>`; return; }
+                if (!d.weapons.length) { host.innerHTML = '<span class="empty">Nothing forged yet.</span>'; return; }
+                let html = '<table><tr><th>Name</th><th>Entry</th><th>Display</th><th>Source</th><th>Created</th><th></th></tr>';
+                for (const w of d.weapons) {
+                    html += `<tr><td>${esc(w.name)}</td><td class="muted">${w.itemEntry || '—'}</td>` +
+                            `<td class="muted">${w.displayId}</td><td class="muted">${esc(w.sourceKind)}</td>` +
+                            `<td class="muted">${esc(w.createdAt)}</td>` +
+                            `<td style="white-space:nowrap;"><button class="wf-del" data-view="${w.displayId}" data-name="${esc(w.name)}" style="background:var(--bg-input,#1c2029);color:var(--text-primary);border-color:var(--border-color);margin-right:5px;">View / rework</button>` +
+                            `<button class="wf-del" data-del="${w.displayId}" data-name="${esc(w.name)}">Delete</button></td></tr>`;
+                }
+                host.innerHTML = html + '</table>';
+                host.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', () => deleteWeapon(btn)));
+                host.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => viewForged(btn)));
+            } catch (e) { host.innerHTML = `<span class="empty">Could not load: ${esc(e)}</span>`; }
+        }
+        async function deleteWeapon(btn) {
+            const id = btn.dataset.del, name = btn.dataset.name;
+            if (!confirm(`Delete "${name}" (display ${id})?\n\nRemoves the item from the world database and the packaged patch. Its IDs return to the pool.`)) return;
+            btn.disabled = true;
+            try {
+                const d = await (await fetch(`/WeaponForge/DeleteWeapon?displayId=${encodeURIComponent(id)}`, { method: 'POST' })).json();
+                if (!d.ok) return setResult({ title: 'Delete failed', error: d.error });
+                setResult({
+                    title: `Deleted "${d.deleted.name}" everywhere`,
+                    kv: { 'Weapons remaining': d.weaponsRemaining, 'Patch': d.patchRemoved ? 'removed' : 'repackaged & redeployed' },
+                    diagnostics: [
+                        applyLine(d.itemRowDeleted, 'World DB', d.itemRowMessage || ''),
+                        applyLine(d.reloaded, 'Reload', d.reloadMessage || ''),
+                        applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
+                    ],
+                    downloads: d.patchDownloadUrl ? [{ label: 'patch-5.MPQ', url: d.patchDownloadUrl }] : [],
+                    note: 'IDs returned to the pool. Restart the client to clear its model caches.'
+                });
+            } finally { btn.disabled = false; loadWeapons(); }
+        }
+
+        async function loadStatus() {
+            try {
+                const s = await (await fetch('/WeaponForge/Status')).json();
+                pill('pillFixture', s.fixtureVerified, 'fixture verified', 'fixture FAILED');
+                pill('pillDonor', s.donorM2Found, `donor ${(s.donorM2Bytes || 0).toLocaleString()} B`, 'donor not mounted', true);
+                document.getElementById('pillContract').textContent = 'contract v' + s.coordinateContractVersion;
+            } catch { pill('pillFixture', false, '', 'status unavailable'); }
+        }
+        function pill(id, ok, okText, badText, warnIfBad) {
+            const el = document.getElementById(id);
+            el.textContent = ok ? okText : badText;
+            el.className = 'wf-pill ' + (ok ? 'ok' : (warnIfBad ? 'warn' : 'bad'));
+        }
+
+        // ---------- setup modal ----------
+        const setupModal = document.getElementById('setupModal');
+        async function loadSetupInfo() {
+            const pillEl = document.getElementById('pillSketch3d');
+            try {
+                const d = await (await fetch('/WeaponForge/Image3DSetup')).json();
+                document.getElementById('setupStatus').textContent = d.nodes.length
+                    ? 'ComfyUI node(s): ' + d.nodes.map(n => `${n.name} (${n.url})`).join(', ')
+                    : 'No ComfyUI configured — the prompt below covers a full from-scratch install (hardware check included). Enter the server URL in this Pipeline setup modal, then upload the workflow here.';
+                document.getElementById('setupPrompt').value = d.prompt || '';
+                const wf = d.workflow || {};
+                document.getElementById('wfStatus').textContent = wf.present
+                    ? `Workflow installed ✓ (${wf.nodeCount} nodes${wf.hasLoadImage ? ', LoadImage found' : ''}) — sketch → 3D is ACTIVE.`
+                    : 'No workflow stored yet — sketch → 3D is inactive until one is uploaded.';
+                document.getElementById('btnClearWf').style.display = wf.present ? '' : 'none';
+                pillEl.textContent = wf.present ? 'sketch → 3D ready' : 'sketch → 3D needs setup';
+                pillEl.className = 'wf-pill ' + (wf.present ? 'ok' : 'warn');
+            } catch (e) {
+                document.getElementById('setupStatus').textContent = 'Could not load setup info: ' + e;
+                pillEl.textContent = 'sketch → 3D status unknown';
+                pillEl.className = 'wf-pill';
+            }
+            await loadPipelineProfile();
+        }
+        async function loadPipelineProfile() {
+            const pillEl = document.getElementById('pillPipeline');
+            try {
+                const d = await (await fetch('/WeaponForge/PipelineProfile')).json(), p = d.profile || {};
+                document.getElementById('pipeProvider').value = p.provider || 'comfyui';
+                document.getElementById('pipeTarget').value = p.targetTriangles || 800;
+                document.getElementById('pipeTexture').value = p.textureQuality || 'detailed';
+                document.getElementById('pipeModel').value = p.tripoModel || 'tripo-p1';
+                document.getElementById('pipeComfyName').value = p.comfyNodeName || 'weapon-forge';
+                document.getElementById('pipeComfyUrl').value = p.comfyBaseUrl || 'http://localhost:8188';
+                document.getElementById('pipeBase').value = p.tripoBaseUrl || 'https://openapi.tripo3d.ai/v3';
+                document.getElementById('pipeAutofix').checked = p.enableImageAutofix !== false;
+                document.getElementById('pipeSmart').checked = p.smartLowPoly !== false;
+                document.getElementById('pipeStatus').textContent = p.provider === 'tripo'
+                    ? `Tripo selected · ${p.tripoModel} · ${p.targetTriangles} tris · key ${p.hasTripoApiKey ? 'stored ✓' : 'missing'}`
+                    : `Local ComfyUI selected · ${p.targetTriangles} triangle target (workflow controls actual export)`;
+                const ready = p.provider !== 'tripo' || p.hasTripoApiKey;
+                pillEl.textContent = ready ? `${p.provider} ready` : 'Tripo key needed';
+                pillEl.className = 'wf-pill ' + (ready ? 'ok' : 'warn');
+            } catch (e) { pillEl.textContent = 'pipeline unavailable'; pillEl.className = 'wf-pill bad'; }
+        }
+        async function openSetup() {
+            setupModal.classList.add('open');
+            await loadSetupInfo();
+        }
+        async function copySetup(btn) {
+            const ta = document.getElementById('setupPrompt');
+            try { await navigator.clipboard.writeText(ta.value); }
+            catch { ta.select(); document.execCommand('copy'); }
+            btn.textContent = 'Copied!';
+            setTimeout(() => { btn.innerHTML = '<i class="fa-solid fa-copy"></i> Copy prompt'; }, 1400);
+        }
+        setupModal.addEventListener('click', (e) => { if (e.target === setupModal) setupModal.classList.remove('open'); });
+
+        // ---------- actions ----------
+        const actions = {
+            async loadCrescentExample(btn) {
+                const cards = Object.fromEntries(refCards().map(c => [c.dataset.role, c]));
+                const sourceBlob = await (await fetch('/weapon-forge/samples/crescent-sword-source.png')).blob();
+                const prepFd = new FormData(); prepFd.append('file', sourceBlob, 'crescent-sword-source.png');
+                const prepared = await (await fetch('/WeaponForge/PrepareSketchViews', { method:'POST', body:prepFd })).json();
+                if (!prepared.ok) return setResult({ title:'Example preparation failed', error:prepared.error });
+                await drawReference(cards.front.querySelector('canvas'), prepared.front);
+                await drawReference(cards.back.querySelector('canvas'), prepared.back);
+                await drawReference(cards.left.querySelector('canvas'), '/weapon-forge/samples/crescent-sword-side-reference.png');
+                await drawReference(cards.right.querySelector('canvas'), '/weapon-forge/samples/crescent-sword-three-quarter-reference.png');
+                cards.left.querySelector('input[type=checkbox]').checked = true;
+                cards.right.querySelector('input[type=checkbox]').checked = true;
+                document.getElementById('prodViews').style.display = '';
+                document.getElementById('prodNote').textContent = 'Loaded the supplied crescent-sword source plus generated side/three-quarter references. Inspect and paint over them before reconstruction.';
+                setResult({ title:'Supplied crescent-sword references loaded', note:'Side references are generated proposals, not ground truth. The workbench keeps them editable and opt-in.' });
+            },
+            async prepareProductionViews(btn) {
+                const f = document.getElementById('prodSource').files[0];
+                if (!f) return setResult({ title:'No source', error:'Choose a PNG/JPEG broadside drawing first.' });
+                const fd = new FormData(); fd.append('file', f);
+                const d = await (await fetch('/WeaponForge/PrepareSketchViews', { method:'POST', body:fd })).json();
+                if (!d.ok) return setResult({ title:'Reference preparation failed', error:d.error });
+                const urls = { front:d.front, back:d.back, left:d.left, right:d.threeQuarter || d.right };
+                for (const card of refCards()) await drawReference(card.querySelector('canvas'), urls[card.dataset.role]);
+                document.getElementById('prodViews').style.display = '';
+                document.getElementById('prodNote').textContent = d.note;
+                setResult({ title:'Editable references prepared', kv:{ 'Detected source axis':(+d.sourceAxisDegrees).toFixed(1)+'°' }, note:d.note });
+            },
+            async previewProduction(btn) {
+                const fd = await productionForm(false);
+                const d = await (await fetch('/WeaponForge/PreviewSketchPipeline', { method:'POST', body:fd })).json();
+                if (!d.ok) return setResult({ title:`Pipeline stopped at ${d.stage || 'unknown stage'}`, error:d.error, diagnostics:d.diagnostics });
+                const q = d.quality || {};
+                setResult({ title:'Production mesh ready for inspection', kv:{ 'Vertices':d.vertexCount, 'Triangles':d.triangleCount,
+                    'Texture':d.hasTexture?'yes':'no', 'Depth/length':q.depthRatio == null?'—':(q.depthRatio*100).toFixed(1)+'%',
+                    'Blade deviation':q.bladeCenterlineDeviation == null?'—':(q.bladeCenterlineDeviation*100).toFixed(1)+'%' },
+                    diagnostics:d.diagnostics, note:d.providerMessage + ' ' + d.note });
+                loadGlb(previewUrl(d));
+            },
+            async forgeProduction(btn) {
+                const fd = await productionForm(true);
+                const d = await (await fetch('/WeaponForge/ForgeSketchPipeline', { method:'POST', body:fd })).json();
+                forgeResult(d, 'Production sketch forged');
+            },
+            async generate(btn) {
+                const q = `?bladeLength=${+document.getElementById('gsLen').value}&bladeWidth=${+document.getElementById('gsWid').value}&bladeSegments=${+document.getElementById('gsSeg').value}`;
+                const d = await (await fetch('/WeaponForge/GenerateSword' + q)).json();
+                const regions = d.regionCounts ? Object.entries(d.regionCounts).map(([k, v]) => `${k}:${v}`).join('  ') : '';
+                setResult({ title: d.ok ? 'Sword generated (preview only)' : 'Generation failed',
+                    kv: { 'Vertices': d.vertexCount, 'Triangles': d.triangleCount, 'M2 written': d.m2Written ? 'yes' : 'no',
+                          'M2 bytes': (d.m2Bytes || 0).toLocaleString(), 'Regions': regions },
+                    diagnostics: d.diagnostics, note: 'Preview only — Forge builds it into the game.' });
+                loadGlb(previewUrl(d));
+            },
+            async forgeSword(btn) {
+                const name = document.getElementById('gsName').value.trim();
+                const q = `?bladeLength=${+document.getElementById('gsLen').value}&bladeWidth=${+document.getElementById('gsWid').value}` +
+                          `&bladeSegments=${+document.getElementById('gsSeg').value}` + (name ? `&name=${encodeURIComponent(name)}` : '') +
+                          (document.getElementById('gsKeepName').checked ? '&keepDonorName=true' : '');
+                const d = await (await fetch('/WeaponForge/ForgeSword' + q, { method: 'POST' })).json();
+                forgeResult(d, 'Sword forged');
+            },
+            async uploadGlb(btn) {
+                const f = document.getElementById('glbFile').files[0];
+                if (!f) return setResult({ title: 'No file', error: 'Choose a .glb first.' });
+                const fd = new FormData(); fd.append('file', f);
+                const d = await (await fetch('/WeaponForge/UploadGlb', { method: 'POST', body: fd })).json();
+                setResult({ title: d.ok ? 'GLB imported (preview only)' : 'Import finished with issues',
+                    kv: { 'Vertices': d.vertexCount, 'Triangles': d.triangleCount, 'Texture': d.hasTexture ? 'yes' : 'no',
+                          'Source': (d.sourceSha256 || '').slice(0, 12) },
+                    diagnostics: d.diagnostics, note: d.note, error: d.error });
+                loadGlb(previewUrl(d));
+            },
+            async forgeGlb(btn) {
+                const f = document.getElementById('glbFile').files[0];
+                if (!f) return setResult({ title: 'No file', error: 'Choose a .glb first.' });
+                const fd = new FormData(); fd.append('file', f);
+                const name = document.getElementById('glbName').value.trim();
+                if (name) fd.append('name', name);
+                const d = await (await fetch('/WeaponForge/ForgeGlb', { method: 'POST', body: fd })).json();
+                forgeResult(d, 'GLB forged');
+            },
+            async forgeSketch(btn) {
+                const f = document.getElementById('sketchFile').files[0];
+                if (!f) return setResult({ title: 'No image', error: 'Choose a PNG/JPEG sketch first.' });
+                const fd = new FormData(); fd.append('file', f);
+                const name = document.getElementById('skName').value.trim();
+                if (name) fd.append('name', name);
+                const d = await (await fetch('/WeaponForge/ForgeSketch', { method: 'POST', body: fd })).json();
+                if (d.message && !d.ok) return setResult({
+                    title: d.configured ? 'Sketch → 3D failed' : 'One-time setup needed',
+                    note: d.message
+                });
+                forgeResult(d, 'Sketch forged');
+            },
+            async rebuildPatch(btn) {
+                const d = await (await fetch('/WeaponForge/RebuildPatch', { method: 'POST' })).json();
+                if (!d.ok) return setResult({ title: 'Rebuild failed', error: d.error });
+                setResult({
+                    title: 'Patch repackaged',
+                    kv: { 'Weapons': d.weaponCount, 'Patch': d.patchRemoved ? 'removed (no weapons in registry)' : 'rebuilt' },
+                    downloads: d.patchDownloadUrl ? [{ label: 'patch-5.MPQ', url: d.patchDownloadUrl }] : [],
+                    diagnostics: [applyLine(d.patchDeployed || d.patchRemoved, 'Deploy', d.patchDeployMessage || ''), ...(d.diagnostics || [])]
+                });
+                loadWeapons();
+            },
+            async openSetup() { await openSetup(); },
+            async closeSetup() { setupModal.classList.remove('open'); },
+            async copySetup(btn) { await copySetup(btn); },
+            async saveWorkflow(btn) {
+                const fd = new FormData();
+                const text = document.getElementById('wfJson').value.trim();
+                const f = document.getElementById('wfJsonFile').files[0];
+                if (text) fd.append('workflowJson', text);
+                if (f) fd.append('file', f);
+                if (!text && !f) { document.getElementById('wfStatus').textContent = 'Paste the JSON or choose a .json file first.'; return; }
+                const d = await (await fetch('/WeaponForge/SaveImage3DWorkflow', { method: 'POST', body: fd })).json();
+                document.getElementById('wfStatus').textContent = d.message || d.error || 'done';
+                if (d.ok) { document.getElementById('wfJson').value = ''; document.getElementById('wfJsonFile').value = ''; }
+                await loadSetupInfo();
+            },
+            async savePipelineProfile(btn) {
+                const fd = new FormData();
+                fd.append('provider', document.getElementById('pipeProvider').value);
+                fd.append('targetTriangles', document.getElementById('pipeTarget').value);
+                fd.append('textureQuality', document.getElementById('pipeTexture').value);
+                fd.append('tripoModel', document.getElementById('pipeModel').value.trim());
+                fd.append('tripoBaseUrl', document.getElementById('pipeBase').value.trim());
+                fd.append('comfyNodeName', document.getElementById('pipeComfyName').value.trim());
+                fd.append('comfyBaseUrl', document.getElementById('pipeComfyUrl').value.trim());
+                const key = document.getElementById('pipeKey').value.trim(); if (key) fd.append('tripoApiKey', key);
+                fd.append('enableImageAutofix', document.getElementById('pipeAutofix').checked);
+                fd.append('smartLowPoly', document.getElementById('pipeSmart').checked);
+                const d = await (await fetch('/WeaponForge/SavePipelineProfile', { method:'POST', body:fd })).json();
+                document.getElementById('pipeStatus').textContent = d.message || d.error || 'done';
+                if (d.ok) document.getElementById('pipeKey').value = '';
+                await loadPipelineProfile();
+            },
+            async importPipelineProfile(btn) {
+                const f = document.getElementById('pipeImportFile').files[0];
+                if (!f) { document.getElementById('pipeStatus').textContent = 'Choose an exported profile JSON first.'; return; }
+                const fd = new FormData(); fd.append('file', f);
+                const d = await (await fetch('/WeaponForge/ImportPipelineProfile', { method:'POST', body:fd })).json();
+                document.getElementById('pipeStatus').textContent = d.message || d.error || 'done';
+                if (d.ok) document.getElementById('pipeImportFile').value = '';
+                await loadPipelineProfile();
+            },
+            async clearWorkflow(btn) {
+                if (!confirm('Remove the stored image→3D workflow? Forge sketch deactivates until a new one is uploaded.')) return;
+                const d = await (await fetch('/WeaponForge/ClearImage3DWorkflow', { method: 'POST' })).json();
+                document.getElementById('wfStatus').textContent = d.message || 'removed';
+                await loadSetupInfo();
+            },
+            async previewZoned(btn) {
+                if (!lastPreviewPath) return setResult({ title: 'Nothing to texture', error: 'Preview a GLB or sketch first.' });
+                const d = await (await fetch('/WeaponForge/PreviewZonedTexture', { method: 'POST', body: zoneForm() })).json();
+                if (!d.ok) return setResult({ title: 'Zoned preview failed', error: d.error });
+                pendingTextured = true; loadGlb(previewUrl(d));
+                if (d.atlasDataUrl) document.getElementById('zoneAtlasImg').src = d.atlasDataUrl;
+                const z = d.zoneTriangleCounts || {};
+                setResult({ title: 'Zoned texture preview', kv: { 'Blade': z.blade || 0, 'Guard': z.guard || 0, 'Grip': z.grip || 0, 'Pommel': z.pommel || 0 },
+                    note: 'Preview only. Drag a boundary to return to the zone map; Forge to package.' });
+            },
+            async forgeZoned(btn) {
+                if (!lastPreviewPath) return setResult({ title: 'Nothing to texture', error: 'Preview a GLB or sketch first.' });
+                const fd = zoneForm();
+                const name = document.getElementById('zoneName').value.trim(); if (name) fd.append('name', name);
+                const d = await (await fetch('/WeaponForge/ForgeZonedTexture', { method: 'POST', body: fd })).json();
+                forgeResult(d, 'Zoned weapon forged');
+            },
+            async refineGlb(btn) {
+                const f = document.getElementById('txGlb').files[0];
+                if (!f) return setResult({ title: 'No file', error: 'Choose a textured .glb first.' });
+                const prompt = document.getElementById('txPrompt').value.trim();
+                if (!prompt) return setResult({ title: 'No prompt', error: 'Describe the intricacy to add.' });
+                const fd = new FormData(); fd.append('file', f); fd.append('prompt', prompt);
+                fd.append('denoise', document.getElementById('txDenoise').value);
+                const d = await (await fetch('/WeaponForge/RefineGlbTexture', { method: 'POST', body: fd })).json();
+                if (!d.ok) return setResult({ title: 'Refine failed', error: d.error, diagnostics: d.diagnostics });
+                lastRefined = d.refinedDataUrl;
+                const img = document.getElementById('txAtlasImg'); img.src = d.refinedDataUrl; img.style.display = 'block';
+                pendingTextured = true; loadGlb(previewUrl(d));
+                setResult({ title: 'Texture refined (preview)', kv: { 'Triangles': d.triangleCount, 'Vertices': d.vertexCount }, note: d.note });
+            },
+            async forgeRefined(btn) {
+                const f = document.getElementById('txGlb').files[0];
+                if (!f) return setResult({ title: 'No file', error: 'Choose a textured .glb first.' });
+                if (!lastRefined) return setResult({ title: 'Nothing refined', error: 'Run Refine texture first.' });
+                const fd = new FormData(); fd.append('file', f); fd.append('refinedDataUrl', lastRefined);
+                const name = document.getElementById('txName').value.trim(); if (name) fd.append('name', name);
+                const d = await (await fetch('/WeaponForge/ForgeRefinedGlb', { method: 'POST', body: fd })).json();
+                forgeResult(d, 'Refined weapon forged');
+            },
+            async reworkForged(btn) {
+                if (!reworkDisplayId) return setResult({ title: 'No weapon', error: 'Open a forged weapon with View / rework first.' });
+                const prompt = document.getElementById('reworkPrompt').value.trim();
+                if (!prompt) return setResult({ title: 'No prompt', error: 'Describe the rework.' });
+                const fd = new FormData();
+                fd.append('displayId', reworkDisplayId); fd.append('prompt', prompt);
+                fd.append('denoise', document.getElementById('reworkDenoise').value);
+                const d = await (await fetch('/WeaponForge/ReworkForgedTexture', { method: 'POST', body: fd })).json();
+                if (!d.ok) return setResult({ title: 'Rework failed', error: d.error });
+                reworkRefined = d.refinedDataUrl;
+                const img = document.getElementById('reworkAtlasImg'); img.src = d.refinedDataUrl; img.style.display = 'block';
+                pendingTextured = true; loadGlb(previewUrl(d));
+                setResult({ title: 'Texture reworked (preview)', note: d.note });
+            },
+            async applyForged(btn) {
+                if (!reworkDisplayId) return setResult({ title: 'No weapon', error: 'Open a forged weapon first.' });
+                if (!reworkRefined) return setResult({ title: 'Nothing to apply', error: 'Run Refine (preview) first.' });
+                const fd = new FormData();
+                fd.append('displayId', reworkDisplayId); fd.append('refinedDataUrl', reworkRefined);
+                const d = await (await fetch('/WeaponForge/ApplyForgedTexture', { method: 'POST', body: fd })).json();
+                if (!d.ok) return setResult({ title: 'Apply failed', error: d.error });
+                setResult({ title: 'Texture applied to server', kv: { 'Display': d.displayId, 'Deploy': d.patchDeployed ? 'yes' : 'no' },
+                    diagnostics: [applyLine(d.patchDeployed, 'Deploy', d.patchDeployMessage || '')], note: d.message });
+                loadWeapons();
+            }
+        };
+
+        const noBusy = new Set(['openSetup', 'closeSetup', 'copySetup', 'saveWorkflow', 'savePipelineProfile', 'importPipelineProfile']);
+        document.querySelectorAll('[data-action]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const skipBusy = noBusy.has(btn.dataset.action);
+                if (!skipBusy) busy(btn, true);
+                try { await actions[btn.dataset.action](btn); }
+                catch (e) { setResult({ title: 'Request failed', error: String(e) }); }
+                finally { if (!skipBusy) busy(btn, false); }
+            });
+        });
+
+        // ── Material-zone atlas (WEAPON_FORGE.md quadrant atlas) ──────────────────────────────
+        let lastPreviewPath = null;   // /weapon_forge_cache/xxx.glb — the geometry source for zoning
+        let pendingTextured = false;  // next loadGlb is a textured re-preview, don't overwrite the map
+        let lastRefined = null;       // data URL of the last img2img-refined atlas, for Forge refined
+        let reworkDisplayId = null;   // forged weapon currently opened for rework
+        let reworkRefined = null;     // data URL of its reworked atlas, for Apply
+
+        async function viewForged(btn) {
+            const id = btn.dataset.view, name = btn.dataset.name || ('display ' + id);
+            btn.disabled = true;
+            try {
+                const d = await (await fetch(`/WeaponForge/PreviewForged?displayId=${encodeURIComponent(id)}`)).json();
+                if (!d.ok) return setResult({ title: 'Could not load weapon', error: d.error });
+                reworkDisplayId = id; reworkRefined = null;
+                document.getElementById('reworkLabel').textContent = `${name} · display ${id}`;
+                document.getElementById('reworkAtlasImg').style.display = 'none';
+                document.getElementById('reworkPanel').style.display = 'block';
+                pendingTextured = true; loadGlb(previewUrl(d));
+                setResult({ title: `Viewing ${name}`, kv: { 'Display': id, 'Texture': d.hasTexture ? 'yes' : 'no' },
+                    note: 'Loaded from the registry. Rework its texture below.' });
+            } catch (e) { setResult({ title: 'Load failed', error: String(e) }); }
+            finally { btn.disabled = false; }
+        }
+        let zoneCellsBuilt = false;
+        const ZONE_COLORS = [0x4aa3ff, 0xffcf4a, 0x6ee07a, 0xff6b6b]; // blade guard grip pommel
+        const ZONE_LABELS = ['blade', 'guard', 'grip', 'pommel'];
+        // Default per-zone material colours: steel / gold / leather / dark iron.
+        const cellFills = [
+            { kind: 'solid', color: '#c9ced6', imageDataUrl: null },
+            { kind: 'solid', color: '#d8b24a', imageDataUrl: null },
+            { kind: 'solid', color: '#6f4a2f', imageDataUrl: null },
+            { kind: 'solid', color: '#4a4e57', imageDataUrl: null },
+        ];
+        const zonePanel = document.getElementById('zonePanel');
+
+        function readBoundaries() {
+            let bg = +document.getElementById('zbBladeGuard').value;
+            let gg = +document.getElementById('zbGuardGrip').value;
+            let gp = +document.getElementById('zbGripPommel').value;
+            // Keep strictly descending so zones never cross (server clamps identically).
+            if (gg > bg - 0.01) gg = bg - 0.01;
+            if (gp > gg - 0.01) gp = gg - 0.01;
+            return { bg, gg, gp };
+        }
+        function meshXRange() {
+            let min = Infinity, max = -Infinity;
+            if (current) current.traverse(o => {
+                if (!o.isMesh) return;
+                const p = o.geometry.attributes.position;
+                for (let i = 0; i < p.count; i++) { const x = p.getX(i); if (x < min) min = x; if (x > max) max = x; }
+            });
+            if (!isFinite(min)) { min = 0; max = 1; }
+            return { min, max, range: Math.max(max - min, 1e-6) };
+        }
+        function applyZoneColors() {
+            if (!current) return;
+            const b = readBoundaries(), r = meshXRange();
+            current.traverse(o => {
+                if (!o.isMesh) return;
+                const geo = o.geometry, pos = geo.attributes.position;
+                const colors = new Float32Array(pos.count * 3);
+                for (let i = 0; i < pos.count; i++) {
+                    const t = (pos.getX(i) - r.min) / r.range;
+                    const z = t >= b.bg ? 0 : t >= b.gg ? 1 : t >= b.gp ? 2 : 3;
+                    const c = new THREE.Color(ZONE_COLORS[z]);
+                    colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
+                }
+                geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                o.material.vertexColors = true; o.material.map = null;
+                o.material.color = new THREE.Color(0xffffff); o.material.needsUpdate = true;
+            });
+        }
+        function autoSegment() {
+            const r = meshXRange();
+            const tOrigin = Math.min(0.9, Math.max(0.05, (0 - r.min) / r.range));
+            const bg = Math.min(0.97, tOrigin + 0.10);
+            const gg = Math.max(0.05, tOrigin - 0.04);
+            const gp = Math.max(0.02, gg - 0.14);
+            document.getElementById('zbBladeGuard').value = bg.toFixed(3);
+            document.getElementById('zbGuardGrip').value = Math.min(gg, bg - 0.01).toFixed(3);
+            document.getElementById('zbGripPommel').value = Math.min(gp, gg - 0.01).toFixed(3);
+        }
+        function updateAtlasThumb() {
+            const cv = document.createElement('canvas'); cv.width = 128; cv.height = 64;
+            const ctx = cv.getContext('2d');
+            const rects = [[0, 0], [64, 0], [0, 32], [64, 32]];
+            let pending = 0;
+            const finish = () => { document.getElementById('zoneAtlasImg').src = cv.toDataURL('image/png'); };
+            ctx.fillStyle = '#8a8f99'; ctx.fillRect(0, 0, 128, 64);
+            cellFills.forEach((f, i) => {
+                const [x, y] = rects[i];
+                if (f.kind === 'image' && f.imageDataUrl) {
+                    pending++;
+                    const im = new Image();
+                    im.onload = () => { ctx.drawImage(im, x, y, 64, 32); if (--pending === 0) finish(); };
+                    im.onerror = () => { if (--pending === 0) finish(); };
+                    im.src = f.imageDataUrl;
+                } else {
+                    ctx.fillStyle = f.color || '#9a9fa8'; ctx.fillRect(x, y, 64, 32);
+                }
+            });
+            if (pending === 0) finish();
+        }
+        function buildZoneCells() {
+            if (zoneCellsBuilt) return; zoneCellsBuilt = true;
+            const host = document.getElementById('zoneCells');
+            host.innerHTML = '';
+            const modeBtn = (i, k, label) =>
+                `<button type="button" class="zmode" data-z="${i}" data-k="${k}"
+                    style="flex:1;padding:4px 2px;font-size:10.5px;cursor:pointer;border:1px solid var(--border-color);
+                           background:var(--bg-input,#1c2029);color:var(--text-primary);border-radius:5px;">${label}</button>`;
+            cellFills.forEach((f, i) => {
+                const box = document.createElement('div');
+                box.style.cssText = 'border:1px solid var(--border-color);border-radius:6px;padding:7px;font-size:11px;';
+                box.innerHTML =
+                    `<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+                        <span style="width:11px;height:11px;border-radius:2px;background:#${ZONE_COLORS[i].toString(16).padStart(6,'0')};"></span>
+                        <strong>Q${i+1} · ${ZONE_LABELS[i]}</strong></div>
+                     <div style="display:flex;gap:4px;margin-bottom:6px;">
+                        ${modeBtn(i,'solid','🎨 Colour')}${modeBtn(i,'upload','⬆ Upload')}${modeBtn(i,'generate','✦ Generate')}</div>
+                     <div class="zk-solid" data-z="${i}"><input type="color" value="${f.color}" data-z="${i}" class="zc" style="width:100%;height:28px;padding:0;border:none;background:none;cursor:pointer;"></div>
+                     <div class="zk-upload" data-z="${i}" style="display:none;">
+                        <input type="file" accept="image/png,image/jpeg" data-z="${i}" class="zf" style="width:100%;font-size:10.5px;">
+                        <div style="color:var(--text-muted);font-size:10px;margin-top:3px;">128×64 PNG/JPEG — fills this quadrant (front + back share it).</div></div>
+                     <div class="zk-generate" data-z="${i}" style="display:none;">
+                        <input type="text" placeholder="e.g. polished steel, seamless" data-z="${i}" class="zp" style="width:100%;margin-bottom:4px;font-size:11px;">
+                        <button type="button" class="wf-btn secondary zg" data-z="${i}" style="width:100%;padding:4px;font-size:10.5px;">✦ Text → image (ComfyUI · Flux)</button>
+                        <div class="zgs" data-z="${i}" style="color:var(--text-muted);font-size:10px;margin-top:3px;min-height:12px;"></div></div>`;
+                host.appendChild(box);
+            });
+            const setMode = (i, kind) => {
+                for (const k of ['solid', 'upload', 'generate'])
+                    host.querySelector(`.zk-${k}[data-z="${i}"]`).style.display = k === kind ? 'block' : 'none';
+                host.querySelectorAll(`button.zmode[data-z="${i}"]`).forEach(b => {
+                    const on = b.dataset.k === kind;
+                    b.style.background = on ? 'var(--accent,#2563eb)' : 'var(--bg-input,#1c2029)';
+                    b.style.color = on ? '#fff' : 'var(--text-primary)';
+                    b.style.borderColor = on ? 'var(--accent,#2563eb)' : 'var(--border-color)';
+                });
+                cellFills[i].kind = (kind !== 'solid' && cellFills[i].imageDataUrl) ? 'image' : 'solid';
+                cellFills[i].mode = kind;
+                updateAtlasThumb();
+            };
+            host.querySelectorAll('button.zmode').forEach(b => b.addEventListener('click', () => setMode(+b.dataset.z, b.dataset.k)));
+            host.querySelectorAll('input.zc').forEach(inp => inp.addEventListener('input', () => {
+                const i = +inp.dataset.z; cellFills[i].color = inp.value;
+                if ((cellFills[i].mode || 'solid') === 'solid') cellFills[i].kind = 'solid';
+                updateAtlasThumb();
+            }));
+            host.querySelectorAll('input.zf').forEach(inp => inp.addEventListener('change', () => {
+                const i = +inp.dataset.z, file = inp.files[0]; if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => { cellFills[i].imageDataUrl = reader.result; cellFills[i].kind = 'image'; cellFills[i].mode = 'upload'; updateAtlasThumb(); };
+                reader.readAsDataURL(file);
+            }));
+            host.querySelectorAll('button.zg').forEach(btn => btn.addEventListener('click', async () => {
+                const i = +btn.dataset.z;
+                const status = host.querySelector(`.zgs[data-z="${i}"]`);
+                const prompt = host.querySelector(`input.zp[data-z="${i}"]`).value.trim();
+                if (!prompt) { status.textContent = 'Enter a prompt first.'; return; }
+                busy(btn, true); status.textContent = 'Generating on the local pool… (Flux is slow, ~30–60s)';
+                try {
+                    const fd = new FormData(); fd.append('prompt', prompt);
+                    const d = await (await fetch('/WeaponForge/GenerateCellTexture', { method: 'POST', body: fd })).json();
+                    if (!d.ok) { status.textContent = d.error || 'Generation failed.'; }
+                    else { cellFills[i].imageDataUrl = d.imageDataUrl; cellFills[i].kind = 'image'; cellFills[i].mode = 'generate'; updateAtlasThumb(); status.textContent = 'Generated ✓ — mapped into Q' + (i + 1) + '.'; }
+                } catch (e) { status.textContent = 'Generation failed: ' + String(e); }
+                finally { busy(btn, false); }
+            }));
+            cellFills.forEach((_, i) => setMode(i, cellFills[i].mode || 'solid'));
+        }
+        function onFreshPreview() {
+            buildZoneCells();
+            zonePanel.style.display = 'block';
+            autoSegment();
+            applyZoneColors();
+            updateAtlasThumb();
+        }
+        function zoneForm() {
+            const b = readBoundaries(), fd = new FormData();
+            fd.append('previewPath', lastPreviewPath);
+            fd.append('bladeGuard', b.bg); fd.append('guardGrip', b.gg); fd.append('gripPommel', b.gp);
+            fd.append('fillsJson', JSON.stringify(cellFills.map(f => ({ kind: f.kind, color: f.color, image: f.imageDataUrl || null }))));
+            return fd;
+        }
+        ['zbBladeGuard', 'zbGuardGrip', 'zbGripPommel'].forEach(id =>
+            document.getElementById(id).addEventListener('input', applyZoneColors));
+        document.getElementById('zoneAuto').addEventListener('click', () => { autoSegment(); applyZoneColors(); });
+        document.getElementById('wfExpand').addEventListener('click', () => {
+            const v = document.getElementById('wfViewer');
+            const on = v.classList.toggle('expanded');
+            document.getElementById('wfExpand').textContent = on ? '⤢ close' : '⤢ expand';
+            requestAnimationFrame(() => { onResize(); if (current) frameObject(current); });
+        });
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const v = document.getElementById('wfViewer');
+                if (v.classList.contains('expanded')) { v.classList.remove('expanded'); document.getElementById('wfExpand').textContent = '⤢ expand'; requestAnimationFrame(() => { onResize(); if (current) frameObject(current); }); }
+            }
+        });
+
+        initViewer();
+        loadStatus();
+        loadWeapons();
+        loadSetupInfo();
+    </script>
+}

@@ -117,11 +117,15 @@ public class DbcWriterService
         return max;
     }
 
-    /// <summary>Read a string from the original string block at the given offset.</summary>
+    /// <summary>Read a string at the given offset — from the original string block, or from a string
+    /// queued by <see cref="AddString"/> that will be appended at Write() time. This mirrors what the
+    /// written file will contain, so validators can check rows built against pending offsets.</summary>
     public string ReadString(uint offset)
     {
-        if (offset == 0 || offset >= _originalStringBlock.Length)
+        if (offset == 0)
             return "";
+        if (offset >= _originalStringBlock.Length)
+            return _strings.TryGetValue(offset, out var pending) ? pending : "";
         int end = (int)offset;
         while (end < _originalStringBlock.Length && _originalStringBlock[end] != 0)
             end++;

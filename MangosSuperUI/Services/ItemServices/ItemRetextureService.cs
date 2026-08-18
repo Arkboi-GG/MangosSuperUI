@@ -36,6 +36,7 @@ public class ItemRetextureService
     private readonly IConfiguration _config;
     private readonly ILogger<ItemRetextureService> _logger;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService _weaponForge;
     private readonly HttpClient _http;
 
     private readonly string _dbcPath;
@@ -57,7 +58,8 @@ public class ItemRetextureService
         IWebHostEnvironment env,
         IConfiguration config,
         ILogger<ItemRetextureService> logger,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService weaponForge)
     {
         _comfy = comfy;
         _mpq = mpq;
@@ -69,6 +71,7 @@ public class ItemRetextureService
         _config = config;
         _logger = logger;
         _loggerFactory = loggerFactory;
+        _weaponForge = weaponForge;
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(180) };
 
         _dbcPath = config["Vmangos:DbcPath"]
@@ -537,6 +540,85 @@ public class ItemRetextureService
                 request.DisplayId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Stateless txt2img: run a bare Flux prompt through the SAME ComfyUI text-to-image workflow the
+    /// retexture engine uses and return the raw generated PNG bytes. No DB, no display id, no BLP —
+    /// the caller decides what to do with the pixels. Used by the Weapon Forge to generate one atlas
+    /// quadrant's fill. Returns null when no ComfyUI node is online or generation fails.
+    /// </summary>
+    public async Task<byte[]?> GenerateTexturePngAsync(string prompt, int genWidth = 512, int genHeight = 256,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(prompt)) return null;
+        if (!await _comfy.IsAnyNodeOnlineAsync(ct)) return null;
+
+        int w = Math.Max(64, (genWidth / 64) * 64);
+        int h = Math.Max(64, (genHeight / 64) * 64);
+
+        var workflow = BuildTextureWorkflow(prompt, 0, w, h);
+        var outputDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "retexture_output");
+        Directory.CreateDirectory(outputDir);
+
+        string? generatedPng = await _comfy.GenerateAsync(workflow, "weapon_zone", outputDir, ct);
+        if (generatedPng == null || !File.Exists(generatedPng)) return null;
+
+        try { return await File.ReadAllBytesAsync(generatedPng, ct); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "GenerateTexturePngAsync: could not read generated PNG {Path}", generatedPng);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Stateless img2img: refine an EXISTING texture with a prompt through the same ComfyUI/Flux
+    /// img2img workflow the retexture engine uses. Because the source image is already registered to
+    /// the model's UVs, the added intricacy lands in the right places (the "which way is up" problem
+    /// is already solved by the incoming layout). Used by the Weapon Forge to add detail to a GLB's
+    /// baked texture. Denoise governs how far it strays (low = subtle, high = reinvents). Returns null
+    /// when no ComfyUI node is online or generation fails.
+    /// </summary>
+    public async Task<byte[]?> RefineTexturePngAsync(byte[] sourcePng, string prompt,
+        int genSize = 512, float denoise = 0.45f, CancellationToken ct = default)
+    {
+        if (sourcePng is not { Length: > 0 } || string.IsNullOrWhiteSpace(prompt)) return null;
+        if (!await _comfy.IsAnyNodeOnlineAsync(ct)) return null;
+
+        int size = Math.Max(64, (genSize / 64) * 64);
+        string tmp = Path.Combine(Path.GetTempPath(), $"weapon_refine_{Guid.NewGuid():N}.png");
+        try
+        {
+            // Normalize whatever the GLB carried (PNG/WebP/odd dims) to a clean square PNG to upload.
+            using (var src = SKBitmap.Decode(sourcePng))
+            {
+                if (src is null) return null;
+                using var resized = src.Resize(new SKImageInfo(size, size, SKColorType.Rgba8888, SKAlphaType.Unpremul),
+                    new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
+                if (resized is null) return null;
+                using var outStream = File.Create(tmp);
+                resized.Encode(outStream, SKEncodedImageFormat.Png, 100);
+            }
+
+            string? uploadedName = await _comfy.UploadImageFileAsync(tmp, ct);
+            if (uploadedName is null) return null;
+
+            float d = Math.Clamp(denoise, 0.1f, 1.0f);
+            var workflow = BuildImg2ImgWorkflow(prompt, uploadedName, 0, size, size, d);
+            var outputDir = Path.Combine(_env.WebRootPath, "item_textures_cache", "retexture_output");
+            Directory.CreateDirectory(outputDir);
+
+            string? generatedPng = await _comfy.GenerateAsync(workflow, "weapon_refine", outputDir, ct);
+            if (generatedPng == null || !File.Exists(generatedPng)) return null;
+            return await File.ReadAllBytesAsync(generatedPng, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "RefineTexturePngAsync failed");
+            return null;
+        }
+        finally { try { File.Delete(tmp); } catch { } }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1246,6 +1328,20 @@ public class ItemRetextureService
                 "Retexture: patch-4.MPQ rebuilt — {Count} retextures, {Files} files, {Size}KB",
                 result.TotalEntries, mpqBuilder.FileCount,
                 new FileInfo(patchPath).Length / 1024);
+
+            // Weapon Forge patch-5 sits ABOVE patch-4 and carries its own copy of ItemDisplayInfo.dbc,
+            // so a fresh patch-4 row would be shadowed by a stale patch-5 until the Forge repackages.
+            // Trigger that repackage now (best-effort; a Forge hiccup must never fail a retexture).
+            try
+            {
+                var forge = await _weaponForge.RebuildPatchAsync("retexture patch-4 rebuilt");
+                if (forge.WeaponCount > 0)
+                    _logger.LogInformation("Retexture: Weapon Forge patch-5 re-unioned ({Count} weapon(s))", forge.WeaponCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Retexture: Weapon Forge patch-5 re-union failed — rebuild it from the Item Assets page");
+            }
 
             return result;
         }

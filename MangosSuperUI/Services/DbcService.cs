@@ -460,17 +460,19 @@ public partial class DbcService
 
     /// <summary>
     /// ItemDisplayInfo.dbc — 23 fields, 92 bytes per record.
-    /// Field layout (all uint32):
+    /// Field layout (all uint32), corrected against the raw installed-DBC evidence in
+    /// WEAPON_GEN.md §2.2 (field 9 is nonzero in only 11 armor/cape/tabard rows with values 1/2 =
+    /// flags; field 10 is nonzero in 1,008 rows carrying ranged SpellVisual values = SpellVisualID):
     ///   [0] m_ID
-    ///   [1-2] m_modelName[2]         (stringref)
-    ///   [3-4] m_modelTexture[2]      (stringref)
+    ///   [1-2] m_modelName[2]         (stringref) — logical name, includes .mdx
+    ///   [3-4] m_modelTexture[2]      (stringref) — bare texture stems
     ///   [5] m_inventoryIcon           (stringref) ← THIS IS WHAT WE WANT
-    ///   [6] m_groundModel             (stringref)
-    ///   [7-9] m_geosetGroup[3]
-    ///   [10] m_spellVisualID
+    ///   [6-8] m_geosetGroup[3]
+    ///   [9] m_flags                    (sparse; 1/2 on a few armor rows)
+    ///   [10] m_spellVisualID           (bows 5, firearms 224, thrown 98, wands 225/226)
     ///   [11] m_groupSoundIndex
     ///   [12-13] m_helmetGeosetVisID[2]
-    ///   [14-21] m_texture[8]         (stringref)
+    ///   [14-21] m_texture[8]         (stringref) — body-atlas armor components
     ///   [22] m_itemVisual
     /// </summary>
     private Dictionary<uint, string> LoadItemDisplayInfo(string filePath)
@@ -754,8 +756,10 @@ public partial class DbcService
     ///   [3-4]    m_modelTexture[0..1]              stringref each
     ///   [5]      m_inventoryIcon                   stringref (single in vanilla)
     ///   [6-8]    m_geosetGroup[0..2]               uint32 each
-    ///   [9]      m_spellVisualID                   uint32 (sparse, ~0.04%)
-    ///   [10]     m_groundModel?                    uint32 (sparse, ~2%)
+    ///   [9]      m_flags                           uint32 (sparse; 1/2 on 11 armor rows)
+    ///   [10]     m_spellVisualID                   uint32 (bows 5, firearms 224,
+    ///                                                       thrown 98, wands 225/226 —
+    ///                                                       ranged values confirm SpellVisual)
     ///   [11]     m_groupSoundIndex                 uint32 (~69%, values 7-16
     ///                                                       are armor sound groups)
     ///   [12-13]  m_helmetGeosetVis[0..1]           uint32 each (~4%, helms only)
@@ -820,7 +824,7 @@ public partial class DbcService
             int geosetGroup1 = BitConverter.ToInt32(records, offset + 7 * 4);
             int geosetGroup2 = BitConverter.ToInt32(records, offset + 8 * 4);
 
-            // Skip fields 9-11: m_spellVisualID, m_groundModel(?), m_groupSoundIndex.
+            // Skip fields 9-11: m_flags, m_spellVisualID, m_groupSoundIndex.
 
             // Fields 12-13: m_helmetGeosetVis[0..1]. Drives hair / facial-hair
             // hiding when a helm is equipped. Encoding is reverse-engineered

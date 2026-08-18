@@ -1,0 +1,951 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Dapper;
+using MangosSuperUI.Models;
+
+namespace MangosSuperUI.Services.WeaponForge;
+
+/// <summary>
+/// The one packaging path for EVERY custom weapon source — donor clone (Phase 1), parametric
+/// sword (Route A), imported GLB / reconstructed sketch (Route B). Compiles the input to M2+BLP,
+/// persists the compiled bytes as the durable source of truth in the custom_weapon_* tables, and
+/// then rebuilds the single unified <c>patch-5.MPQ</c> containing ALL custom weapons recorded in
+/// the database — mirroring how the spell pipeline rebuilds one patch-3.MPQ from DB state. A new
+/// build therefore never orphans previously forged weapons: their members and DBC rows are
+/// re-packaged from the stored bytes every time.
+///
+/// patch-5 (not 4): the Retexture Engine owns <c>patch-4.MPQ</c>. The Forge's patch sits ABOVE it,
+/// and its DBC is built on the effective state read BENEATH patch-5 (see ResolveBaseDbc) — so it
+/// always unions the retexture rows in patch-4 without ever feeding its own output back as input.
+/// The retexture pipeline triggers <see cref="RebuildPatchAsync"/> after each of its own rebuilds
+/// so patch-5's DBC never goes stale above a newer patch-4.
+///
+/// Forging APPLIES, like the app's other tools (NPC dev commits SQL, the Retexture Engine deploys
+/// its patch): the item row is inserted into the world DB (fail-closed INSERT), the core is told
+/// <c>.reload item_template</c> over RA, and patch-5.MPQ is deployed into the client Data folder.
+/// Deleting a weapon reverses all of it. Every apply step is best-effort and individually reported —
+/// a down DB/RA/client never fails the build, it just leaves that step for the owner (the files are
+/// always also written to the artifact root). The one step that stays manual is restarting the
+/// client, which nothing can automate away.
+/// </summary>
+public sealed class CustomWeaponBuildService
+{
+    public const string PatchFileName = "patch-5.MPQ";
+    private const string LegacyPatchFileName = "patch-4.MPQ"; // pre-rename Forge output; cleaned up on write
+
+    private const string DonorBlpPath = @"ITEM\ObjectComponents\WEAPON\Sword_1H_Short_A_01Blue.blp";
+    private const uint DonorDisplayRow = 679;
+
+    private readonly MpqReaderService _mpq;
+    private readonly WeaponIdReservationService _ids;
+    private readonly WeaponPatchBuilder _patch;
+    private readonly WeaponAssetCompiler _compiler;
+    private readonly WeaponPreviewService _preview;
+    private readonly AuditService _audit;
+    private readonly RaService _ra;
+    private readonly ConnectionFactory _db;
+    private readonly IWebHostEnvironment _env;
+    private readonly IConfiguration _config;
+    private readonly ILogger<CustomWeaponBuildService> _logger;
+
+    public CustomWeaponBuildService(MpqReaderService mpq, WeaponIdReservationService ids,
+        WeaponPatchBuilder patch, WeaponAssetCompiler compiler, WeaponPreviewService preview,
+        AuditService audit, RaService ra, ConnectionFactory db, IWebHostEnvironment env,
+        IConfiguration config, ILogger<CustomWeaponBuildService> logger)
+    {
+        _mpq = mpq; _ids = ids; _patch = patch; _compiler = compiler; _preview = preview;
+        _audit = audit; _ra = ra; _db = db; _env = env; _config = config; _logger = logger;
+    }
+
+    /// <summary>The client Data directory the app deploys patches into — same config the Retexture
+    /// Engine uses for patch-4. Null when not configured/present (deploy steps report and skip).</summary>
+    private string? ClientDataPath
+    {
+        get
+        {
+            var p = _config["Vmangos:ClientDataPath"] ?? _config["SpellCreator:ClientDataPath"];
+            return !string.IsNullOrEmpty(p) && Directory.Exists(p) ? p : null;
+        }
+    }
+
+    public string ArtifactRoot =>
+        _config["WeaponForge:ArtifactRoot"] is { Length: > 0 } cfg
+            ? cfg
+            : Path.Combine(_env.WebRootPath, "weapon_forge_builds");
+
+    // ═══════════════════════════════════════════════════════════════════
+    // BUILD (one new weapon → persist → unified patch)
+    // ═══════════════════════════════════════════════════════════════════
+
+    public async Task<CustomWeaponBuildResult> BuildAsync(CustomWeaponBuildRequest request)
+    {
+        bool hasMesh = request.Mesh is not null;
+        bool hasPrecompiled = request.PrecompiledM2 is { Length: > 0 };
+        if (hasMesh == hasPrecompiled)
+            throw new ArgumentException("Provide exactly one of Mesh or PrecompiledM2.", nameof(request));
+
+        if (!DonorItemTemplateFixture.Verify())
+            throw new InvalidOperationException("Donor item_template fixture failed hash verification.");
+
+        // 1) Base DBC (beneath patch-5) — donor sound + id floor.
+        byte[] baseDbc = ResolveBaseDbc();
+        var baseReader = DbcWriterService.ReadDbc(baseDbc, WeaponNaming.ItemDisplayInfoMember);
+        uint donorGroupSound = ReadGroupSound(baseReader);
+        uint dbcMax = baseReader.GetMaxId();
+
+        // 2) Reserve ids atomically. buildId is the stable reservation slot key so a retry is idempotent.
+        string buildId = (request.SourceKind == "donor_patch" ? "gold-" : "wpn-") + Guid.NewGuid().ToString("N")[..12];
+        long entryFloor = await _ids.ComputeItemEntryFloorAsync();
+        long displayFloor = await _ids.ComputeDisplayIdFloorAsync(dbcMax);
+        var entryRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemEntry, entryFloor, buildId, "item");
+        var dispRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemDisplay, displayFloor, buildId, "display");
+
+        int modelIndex = checked((int)dispRes.Id); // 1 model ↔ 1 display; ties SUI_W names to the display id
+        string weaponName = string.IsNullOrWhiteSpace(request.Name) ? $"Forged Sword {dispRes.Id}" : request.Name.Trim();
+
+        // 3) Compile (or accept precompiled donor bytes). BLP falls back to the donor texture so a
+        //    textureless mesh still ships something valid to sample.
+        var diag = new ForgeDiagnostics("build");
+        byte[] m2;
+        byte[] blp;
+        if (hasMesh)
+        {
+            var texture = request.TexturePng is { Length: > 0 }
+                ? new WeaponTexture { SourcePng = request.TexturePng, Width = 256, Height = 256, UseDxt1 = true }
+                : null;
+            var compiled = _compiler.Compile(request.Mesh!, texture, new WeaponCompileOptions
+            {
+                ModelIndex = modelIndex,
+                CanonicalInternalName = !request.KeepDonorInternalName,
+                MeshValidation = new MeshValidationOptions { Topology = request.Topology },
+            });
+            diag.AddRange(compiled.Diagnostics);
+            if (compiled.M2 is null || compiled.Diagnostics.HasErrors)
+                throw new InvalidOperationException("Mesh compilation failed: " + string.Join("; ",
+                    compiled.Diagnostics.Items.Where(i => i.Severity == ForgeSeverity.Error).Select(i => i.Message)));
+            m2 = compiled.M2;
+            blp = compiled.Blp ?? ExtractDonorBlp();
+        }
+        else
+        {
+            m2 = request.PrecompiledM2!;
+            blp = request.PrecompiledBlp ?? ExtractDonorBlp();
+        }
+
+        // 4) Persist FIRST — the stored compiled bytes are what every future unified rebuild
+        //    re-packages, so a weapon that isn't durably recorded must not be handed out.
+        var sql = WeaponItemTemplateSql.Build(entryRes.Id, weaponName, dispRes.Id, buildId);
+        string iconStem = ReadDonorIconStem(baseReader);
+        await PersistRecordsAsync(request, buildId, modelIndex, entryRes.Id, dispRes.Id, weaponName, m2, blp, sql, donorGroupSound, iconStem);
+        await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
+        await _ids.MarkStateAsync(WeaponIdReservationService.KindItemDisplay, dispRes.Id, "committed");
+
+        // 5) Unified rebuild: every custom weapon with stored bytes, this one included.
+        var assembly = await AssembleUnifiedPatchAsync(diag, buildId);
+        if (assembly.Patch is null)
+            throw new InvalidOperationException("Unified patch assembly produced no weapons — the just-persisted weapon should have been included.");
+
+        // 6) Preview the freshly packaged bytes.
+        var preview = _preview.RenderFromBytes(m2, blp);
+
+        // 7) Write the build directory: straight patch-5.MPQ + item_template.sql (+ reports). No ZIP.
+        var manifest = BuildManifest(request, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
+            donorGroupSound, sql, assembly.Patch, assembly.PackagedCount, assembly.SkippedCount, assembly.ReplacedInBase);
+        string buildDir = WriteOutputs(buildId, entryRes.Id, dispRes.Id, modelIndex, assembly.Patch, sql, manifest, diag);
+
+        // 8) Apply — like the app's other tools: world DB row, core reload, client patch deploy.
+        //    Each step is best-effort and individually reported; failures leave that step manual.
+        var sqlApply = await ApplyItemSqlAsync(sql, entryRes.Id);
+        var reload = sqlApply.Ok ? await ReloadItemTemplateAsync() : (Ok: false, Message: "skipped — SQL was not applied");
+        var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
+        var apply = new ServerApplyStatus
+        {
+            SqlApplied = sqlApply.Ok, SqlMessage = sqlApply.Message,
+            Reloaded = reload.Ok, ReloadMessage = reload.Message,
+            PatchDeployed = deploy.Ok, PatchDeployMessage = deploy.Message,
+        };
+
+        _logger.LogInformation(
+            "WeaponForge: build {Build} ({Kind}) → entry {Entry}, display {Display}; {Patch} packages {Count} weapon(s); " +
+            "sql={Sql} reload={Reload} deploy={Deploy}",
+            buildId, request.SourceKind, entryRes.Id, dispRes.Id, PatchFileName, assembly.PackagedCount,
+            sqlApply.Ok, reload.Ok, deploy.Ok);
+
+        // Audit trail (Activity Log / Change Graph) — records the build AND what was applied live.
+        await _audit.LogAsync(new AuditEntry
+        {
+            Category = "weaponforge",
+            Action = "forge_" + request.SourceKind,
+            TargetType = "item",
+            TargetName = weaponName,
+            TargetId = checked((int)entryRes.Id),
+            RaCommand = sqlApply.Ok ? ".reload item_template" : null,
+            RaResponse = sqlApply.Ok ? reload.Message : null,
+            StateAfter = JsonSerializer.Serialize(new
+            {
+                buildId,
+                itemEntry = entryRes.Id,
+                displayId = dispRes.Id,
+                model = WeaponNaming.ModelMpqPath(modelIndex),
+                mpqSha256 = assembly.Patch.MpqSha256,
+                weaponsInPatch = assembly.PackagedCount,
+                applied = apply,
+            }),
+            IsReversible = true,
+            RevertKind = RevertKind.Registry,
+            Success = true,
+            Notes = $"{PatchFileName} rebuilt with {assembly.PackagedCount} weapon(s). " +
+                    $"SQL: {sqlApply.Message}. Reload: {reload.Message}. Deploy: {deploy.Message}. " +
+                    "Undo via the Forged Weapons list on the Item Assets page.",
+        });
+
+        return new CustomWeaponBuildResult
+        {
+            BuildId = buildId,
+            ItemEntry = entryRes.Id,
+            DisplayId = dispRes.Id,
+            ModelIndex = modelIndex,
+            Name = weaponName,
+            SourceKind = request.SourceKind,
+            ModelMember = WeaponNaming.ModelMpqPath(modelIndex),
+            TextureMember = WeaponNaming.TextureMpqPath(modelIndex),
+            MpqSha256 = assembly.Patch.MpqSha256,
+            DbcSha256 = assembly.Patch.DbcSha256,
+            SqlSha256 = sql.Sha256,
+            AllMembersVerified = assembly.Patch.AllVerified,
+            PackagedWeaponCount = assembly.PackagedCount,
+            SkippedWeaponCount = assembly.SkippedCount,
+            PreviewGlbWebPath = preview.Ok ? preview.GlbWebPath : null,
+            TriangleCount = preview.TriangleCount,
+            VertexCount = preview.VertexCount,
+            BuildDirectory = buildDir,
+            BuildDirName = Path.GetFileName(buildDir),
+            Apply = apply,
+            Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // REBUILD ONLY (no new weapon — repackage current DB state)
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Rebuild the canonical patch-5.MPQ from the weapons currently in the database, without
+    /// reserving ids or adding anything. Called after a weapon is deleted, on demand from the UI,
+    /// and by the Retexture Engine after its own patch-4 rebuild (so patch-5's DBC re-unions the
+    /// fresh retexture rows instead of shadowing them). With zero weapons the canonical patch is
+    /// removed — an empty overlay would serve no purpose and still shadow patch-4's DBC.
+    /// </summary>
+    public async Task<WeaponPatchRebuildSummary> RebuildPatchAsync(string reason)
+    {
+        var diag = new ForgeDiagnostics("rebuild");
+        var assembly = await AssembleUnifiedPatchAsync(diag, "rebuild-" + Guid.NewGuid().ToString("N")[..8]);
+
+        if (assembly.Patch is null)
+        {
+            RemoveCanonicalPatches();
+            var removal = RemoveDeployedPatch();
+            _logger.LogInformation("WeaponForge: rebuild ({Reason}) — no weapons in DB; {Patch} removed ({Client})",
+                reason, PatchFileName, removal.Message);
+            return new WeaponPatchRebuildSummary
+            {
+                WeaponCount = 0,
+                PatchRemoved = true,
+                MpqSha256 = null,
+                PatchDeployed = false,
+                PatchDeployMessage = removal.Message,
+                Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
+            };
+        }
+
+        WriteCanonicalPatch(assembly.Patch.MpqBytes);
+        var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
+        _logger.LogInformation("WeaponForge: rebuild ({Reason}) — {Patch} repackaged with {Count} weapon(s); deploy={Deploy}",
+            reason, PatchFileName, assembly.PackagedCount, deploy.Ok);
+
+        return new WeaponPatchRebuildSummary
+        {
+            WeaponCount = assembly.PackagedCount,
+            PatchRemoved = false,
+            MpqSha256 = assembly.Patch.MpqSha256,
+            PatchDeployed = deploy.Ok,
+            PatchDeployMessage = deploy.Message,
+            Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // LIST / DELETE (the Forge's inventory + undo)
+    // ═══════════════════════════════════════════════════════════════════
+
+    public async Task<List<ForgedWeaponInfo>> ListWeaponsAsync()
+    {
+        await using var conn = _db.Admin();
+        await conn.OpenAsync();
+        var rows = await conn.QueryAsync(
+            @"SELECT d.display_id      AS DisplayId,
+                     d.created_at      AS CreatedAt,
+                     mo.source_kind    AS SourceKind,
+                     mo.model_mpq_path AS ModelMpqPath,
+                     ma.item_entry     AS ItemEntry,
+                     ma.build_id       AS BuildId,
+                     ma.gameplay_json  AS GameplayJson
+              FROM custom_weapon_display d
+              JOIN custom_weapon_model mo ON mo.model_id = d.model_id
+              LEFT JOIN custom_weapon_item_manifest ma ON ma.display_id = d.display_id
+              ORDER BY d.display_id");
+
+        var list = new List<ForgedWeaponInfo>();
+        foreach (var r in rows)
+        {
+            long entry = r.ItemEntry is null ? 0L : (long)Convert.ToInt64(r.ItemEntry);
+            list.Add(new ForgedWeaponInfo
+            {
+                DisplayId = Convert.ToInt64(r.DisplayId),
+                ItemEntry = entry,
+                Name = ReadNameFromGameplayJson((string?)r.GameplayJson) ?? (entry > 0 ? $"Weapon {entry}" : "Unnamed weapon"),
+                SourceKind = (string)r.SourceKind,
+                ModelMpqPath = (string)r.ModelMpqPath,
+                BuildId = (string?)r.BuildId,
+                CreatedAt = (DateTime)r.CreatedAt,
+            });
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// Remove one forged weapon EVERYWHERE the Forge put it: registry rows, its world-DB
+    /// item_template row (with a core reload), and the packaged patch (repackaged and redeployed
+    /// without it). Its entry/display ids are RELEASED for reuse — the audit log is the history.
+    /// </summary>
+    public async Task<WeaponDeleteResult> DeleteWeaponAsync(long displayId)
+    {
+        ForgedWeaponInfo? victim = (await ListWeaponsAsync()).FirstOrDefault(w => w.DisplayId == displayId);
+        if (victim is null)
+            throw new KeyNotFoundException($"No forged weapon with display id {displayId}.");
+
+        await using (var conn = _db.Admin())
+        {
+            await conn.OpenAsync();
+            await conn.ExecuteAsync("DELETE FROM custom_weapon_item_manifest WHERE display_id = @displayId", new { displayId });
+            await conn.ExecuteAsync("DELETE FROM custom_weapon_display WHERE display_id = @displayId", new { displayId });
+            await conn.ExecuteAsync("DELETE FROM custom_weapon_model WHERE model_id = @displayId", new { displayId });
+        }
+
+        // Free the ids for reuse (best-effort — a hiccup here only wastes an id, never blocks the delete).
+        try
+        {
+            if (victim.ItemEntry > 0)
+                await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, victim.ItemEntry);
+            await _ids.ReleaseAsync(WeaponIdReservationService.KindItemDisplay, displayId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: releasing ids for display {Display} failed (delete continues)", displayId);
+        }
+
+        var itemRow = victim.ItemEntry > 0
+            ? await DeleteItemRowAsync(victim.ItemEntry)
+            : (Ok: true, Message: "no item entry recorded");
+        var reload = itemRow.Ok ? await ReloadItemTemplateAsync() : (Ok: false, Message: "skipped — world row not deleted");
+
+        var rebuild = await RebuildPatchAsync($"deleted weapon display {displayId}");
+
+        await _audit.LogAsync(new AuditEntry
+        {
+            Category = "weaponforge",
+            Action = "forge_delete",
+            TargetType = "item",
+            TargetName = victim.Name,
+            TargetId = victim.ItemEntry is > 0 and <= int.MaxValue ? (int)victim.ItemEntry : null,
+            RaCommand = itemRow.Ok ? ".reload item_template" : null,
+            RaResponse = itemRow.Ok ? reload.Message : null,
+            StateBefore = JsonSerializer.Serialize(victim),
+            IsReversible = false,
+            RevertKind = RevertKind.None,
+            Success = true,
+            Notes = $"Deleted everywhere. World row: {itemRow.Message}. Reload: {reload.Message}. " +
+                    $"Patch: {(rebuild.PatchRemoved ? "removed (no weapons left)" : $"repackaged with {rebuild.WeaponCount} weapon(s)")}, " +
+                    $"{rebuild.PatchDeployMessage}. Ids released for reuse.",
+        });
+
+        _logger.LogInformation("WeaponForge: deleted weapon display {Display} (entry {Entry}, '{Name}') everywhere",
+            victim.DisplayId, victim.ItemEntry, victim.Name);
+
+        return new WeaponDeleteResult
+        {
+            Deleted = victim,
+            Rebuild = rebuild,
+            ItemRowDeleted = itemRow.Ok,
+            ItemRowMessage = itemRow.Message,
+            Reloaded = reload.Ok,
+            ReloadMessage = reload.Message,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SERVER APPLY (world DB + RA reload + client patch deploy)
+    // ═══════════════════════════════════════════════════════════════════
+
+    private async Task<(bool Ok, string Message)> ApplyItemSqlAsync(GeneratedSql sql, long entry)
+    {
+        try
+        {
+            await using var conn = _db.Mangos();
+            await conn.OpenAsync();
+            await conn.ExecuteAsync(sql.Text);
+            return (true, $"item_template row {entry} inserted");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: item_template insert for entry {Entry} failed", entry);
+            return (false, $"world DB insert failed: {ex.Message} — item_template.sql is in the build folder for manual apply");
+        }
+    }
+
+    private async Task<(bool Ok, string Message)> DeleteItemRowAsync(long entry)
+    {
+        try
+        {
+            await using var conn = _db.Mangos();
+            await conn.OpenAsync();
+            int rows = await conn.ExecuteAsync("DELETE FROM item_template WHERE entry = @entry", new { entry });
+            return (true, rows > 0 ? $"item_template row {entry} deleted" : $"no item_template row {entry} existed");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: item_template delete for entry {Entry} failed", entry);
+            return (false, $"world DB delete failed: {ex.Message} — run manually: DELETE FROM item_template WHERE entry = {entry};");
+        }
+    }
+
+    private async Task<(bool Ok, string Message)> ReloadItemTemplateAsync()
+    {
+        try
+        {
+            var response = await _ra.SendCommandAsync(".reload item_template");
+            var trimmed = (response ?? "").Trim();
+            return (true, trimmed.Length > 0 ? trimmed : "reload issued");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: .reload item_template failed");
+            return (false, $"RA reload failed: {ex.Message} — run .reload item_template yourself");
+        }
+    }
+
+    private (bool Ok, string Message) DeployPatchToClient(byte[] mpqBytes)
+    {
+        var dataPath = ClientDataPath;
+        if (dataPath is null)
+            return (false, "no client Data path configured — copy the downloaded patch yourself");
+        try
+        {
+            string target = Path.Combine(dataPath, PatchFileName);
+            File.WriteAllBytes(target, mpqBytes);
+            return (true, $"deployed to {target}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"deploy failed ({ex.Message}) — the client is probably running; close it and click Rebuild patch");
+        }
+    }
+
+    private (bool Ok, string Message) RemoveDeployedPatch()
+    {
+        var dataPath = ClientDataPath;
+        if (dataPath is null) return (true, "no client Data path configured");
+        try
+        {
+            string target = Path.Combine(dataPath, PatchFileName);
+            if (File.Exists(target)) { File.Delete(target); return (true, $"removed {target}"); }
+            return (true, "no deployed patch to remove");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"could not remove deployed patch ({ex.Message}) — the client is probably running; delete it after closing");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SHARED ASSEMBLY
+    // ═══════════════════════════════════════════════════════════════════
+
+    private sealed class UnifiedAssembly
+    {
+        public WeaponPatchResult? Patch;     // null ⇔ zero packageable weapons
+        public int PackagedCount;
+        public int SkippedCount;
+        public int ReplacedInBase;
+    }
+
+    private async Task<UnifiedAssembly> AssembleUnifiedPatchAsync(ForgeDiagnostics diag, string tempKey)
+    {
+        byte[] baseDbc = ResolveBaseDbc();
+        var baseReader = DbcWriterService.ReadDbc(baseDbc, WeaponNaming.ItemDisplayInfoMember);
+        uint donorGroupSound = ReadGroupSound(baseReader);
+
+        string donorIcon = ReadDonorIconStem(baseReader);
+
+        var installed = await LoadPackagedWeaponsAsync();
+        var skipped = installed.Where(w => w.M2 is null || w.Blp is null).ToList();
+        var packaged = installed.Where(w => w.M2 is not null && w.Blp is not null).ToList();
+        foreach (var s in skipped)
+            diag.Warn("package.skipped",
+                $"display {s.DisplayId} has no stored compiled bytes (built before unified packaging) — rebuild it to re-include it");
+
+        if (packaged.Count == 0)
+            return new UnifiedAssembly { Patch = null, PackagedCount = 0, SkippedCount = skipped.Count, ReplacedInBase = 0 };
+
+        // If a previously built Forge patch was mounted anyway (or a custom row leaked into a lower
+        // archive), strip our ids so the DB-driven rebuild is the single authority.
+        var customIds = packaged.Select(w => (uint)w.DisplayId).ToHashSet();
+        int replaced = baseReader.RemoveRowsWhere(id => customIds.Contains(id));
+        byte[] cleanedBase = replaced > 0 ? baseReader.Write() : baseDbc;
+
+        var input = new WeaponPatchInput
+        {
+            CleanItemDisplayInfoDbc = cleanedBase,
+            Displays = packaged.Select(w => new WeaponDisplayInfoParams
+            {
+                DisplayId = (uint)w.DisplayId,
+                ModelIndex = (int)w.ModelId,
+                GroupSoundIndex = w.GroupSoundIndex ?? donorGroupSound,
+                // Package-time fallback heals rows persisted before the icon fix (empty stem = red "?").
+                IconStem = string.IsNullOrEmpty(w.IconStem) ? donorIcon : w.IconStem,
+                ItemVisual = (uint)w.ItemVisual,
+            }).ToArray(),
+            Models = packaged.GroupBy(w => w.ModelMpqPath, StringComparer.OrdinalIgnoreCase)
+                .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().M2! }).ToArray(),
+            Textures = packaged.GroupBy(w => w.TextureMpqPath, StringComparer.OrdinalIgnoreCase)
+                .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().Blp! }).ToArray(),
+        };
+        string tempDir = Path.Combine(Path.GetTempPath(), "weaponforge", tempKey);
+        var patch = _patch.Build(input, tempDir);
+
+        return new UnifiedAssembly
+        {
+            Patch = patch,
+            PackagedCount = packaged.Count,
+            SkippedCount = skipped.Count,
+            ReplacedInBase = replaced,
+        };
+    }
+
+    /// <summary>The base ItemDisplayInfo.dbc to union onto: the effective mounted copy EXCLUDING
+    /// patch-5 itself — the Forge must never read its own installed output back as input, or rows
+    /// added to lower patches (the Retexture Engine's patch-4) after the last forge build would be
+    /// frozen out forever. An explicit clean copy can be pointed at via WeaponForge:CleanDbcPath.</summary>
+    private byte[] ResolveBaseDbc()
+    {
+        var cfgPath = _config["WeaponForge:CleanDbcPath"];
+        if (!string.IsNullOrWhiteSpace(cfgPath) && File.Exists(cfgPath))
+            return File.ReadAllBytes(cfgPath);
+
+        return _mpq.ExtractFile(WeaponNaming.ItemDisplayInfoMember,
+                skipArchive: name => name.StartsWith("patch-5", StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException("Could not extract a base ItemDisplayInfo.dbc from the mounted archives.");
+    }
+
+    private byte[] ExtractDonorBlp() =>
+        _mpq.ExtractFile(DonorBlpPath)
+            ?? throw new InvalidOperationException($"Donor BLP not found in mounted archives: {DonorBlpPath}");
+
+    private static uint ReadGroupSound(DbcWriterService dbc)
+    {
+        var row = dbc.GetRow(DonorDisplayRow);
+        return row is not null && row.Length > WeaponDisplayInfoRow.F_GroupSoundIndex
+            ? row[WeaponDisplayInfoRow.F_GroupSoundIndex]
+            : 0u;
+    }
+
+    /// <summary>The donor's inventory icon stem (field 5 of display row 679, e.g. INV_Sword_04).
+    /// An empty InventoryIcon renders as the red "?" in bags — proven in the first real-client run —
+    /// so every weapon without its own icon inherits the donor's until icon generation exists.</summary>
+    private static string ReadDonorIconStem(DbcWriterService dbc)
+    {
+        var row = dbc.GetRow(DonorDisplayRow);
+        if (row is not null && row.Length > WeaponDisplayInfoRow.F_InventoryIcon)
+        {
+            var stem = dbc.ReadString(row[WeaponDisplayInfoRow.F_InventoryIcon]);
+            if (!string.IsNullOrEmpty(stem)) return stem;
+        }
+        return "INV_Sword_04"; // donor 2131 Shortsword's stock icon — always present in base MPQs
+    }
+
+    private static string? ReadNameFromGameplayJson(string? json)
+    {
+        if (string.IsNullOrEmpty(json)) return null;
+        try
+        {
+            var doc = JsonSerializer.Deserialize<JsonElement>(json);
+            return doc.TryGetProperty("name", out var n) ? n.GetString() : null;
+        }
+        catch { return null; }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PERSISTENCE
+    // ═══════════════════════════════════════════════════════════════════
+
+    private async Task PersistRecordsAsync(CustomWeaponBuildRequest request, string buildId, int modelIndex,
+        long entry, long display, string weaponName, byte[] m2, byte[] blp, GeneratedSql sql, uint groupSound,
+        string iconStem)
+    {
+        string? sourceSha = request.SourceBlob is { Length: > 0 } src ? Sha256(src) : null;
+        string dbcFieldsJson = JsonSerializer.Serialize(new { groupSoundIndex = groupSound });
+        string gameplayJson = JsonSerializer.Serialize(new { name = weaponName, sourceKind = request.SourceKind });
+
+        await using var conn = _db.Admin();
+        await conn.OpenAsync();
+
+        await conn.ExecuteAsync(
+            @"INSERT INTO custom_weapon_model
+                (model_id, model_mpq_path, compiled_m2, m2_sha256, source_kind, source_blob, source_sha256,
+                 generator_params_json, writer_version, coordinate_contract_version, validation_state)
+              VALUES (@model_id, @path, @m2, @m2sha, @kind, @src, @srcsha, @params, @writer, @ccv, 'built')
+              ON DUPLICATE KEY UPDATE
+                compiled_m2 = VALUES(compiled_m2), m2_sha256 = VALUES(m2_sha256),
+                source_blob = VALUES(source_blob), source_sha256 = VALUES(source_sha256),
+                generator_params_json = VALUES(generator_params_json), validation_state = VALUES(validation_state)",
+            new
+            {
+                model_id = display,
+                path = WeaponNaming.ModelMpqPath(modelIndex),
+                m2,
+                m2sha = Sha256(m2),
+                kind = request.SourceKind,
+                src = request.SourceBlob,
+                srcsha = sourceSha,
+                @params = request.GeneratorParamsJson,
+                writer = request.WriterVersion,
+                ccv = CoordinateContract.Version,
+            });
+
+        await conn.ExecuteAsync(
+            @"INSERT INTO custom_weapon_display
+                (display_id, model_id, texture_mpq_path, compiled_blp, blp_sha256, source_texture,
+                 icon_stem, item_visual, donor_display_id, dbc_fields_json, validation_state)
+              VALUES (@display, @model_id, @tex, @blp, @blpsha, @srctex, @icon, 0, @donor, @fields, 'built')
+              ON DUPLICATE KEY UPDATE
+                compiled_blp = VALUES(compiled_blp), blp_sha256 = VALUES(blp_sha256),
+                source_texture = VALUES(source_texture), icon_stem = VALUES(icon_stem),
+                dbc_fields_json = VALUES(dbc_fields_json), validation_state = VALUES(validation_state)",
+            new
+            {
+                display,
+                model_id = display,
+                tex = WeaponNaming.TextureMpqPath(modelIndex),
+                blp,
+                blpsha = Sha256(blp),
+                srctex = request.TexturePng,
+                icon = iconStem,
+                donor = DonorDisplayRow,
+                fields = dbcFieldsJson,
+            });
+
+        await conn.ExecuteAsync(
+            @"INSERT INTO custom_weapon_item_manifest
+                (build_id, item_entry, display_id, gameplay_json, sql_text, sql_sha256)
+              VALUES (@build, @entry, @display, @gameplay, @sql, @sqlsha)
+              ON DUPLICATE KEY UPDATE sql_sha256 = VALUES(sql_sha256), gameplay_json = VALUES(gameplay_json)",
+            new { build = buildId, entry, display, gameplay = gameplayJson, sql = sql.Text, sqlsha = sql.Sha256 });
+    }
+
+    private sealed class PackagedWeaponRow
+    {
+        public ulong DisplayId { get; set; }
+        public ulong ModelId { get; set; }
+        public string TextureMpqPath { get; set; } = "";
+        public byte[]? Blp { get; set; }
+        public string? IconStem { get; set; }
+        public int ItemVisual { get; set; }
+        public string? DbcFieldsJson { get; set; }
+        public string ModelMpqPath { get; set; } = "";
+        public byte[]? M2 { get; set; }
+
+        public uint? GroupSoundIndex
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(DbcFieldsJson)) return null;
+                try
+                {
+                    var doc = JsonSerializer.Deserialize<JsonElement>(DbcFieldsJson);
+                    return doc.TryGetProperty("groupSoundIndex", out var gs) ? gs.GetUInt32() : null;
+                }
+                catch { return null; }
+            }
+        }
+    }
+
+    private async Task<List<PackagedWeaponRow>> LoadPackagedWeaponsAsync()
+    {
+        await using var conn = _db.Admin();
+        await conn.OpenAsync();
+        var rows = await conn.QueryAsync<PackagedWeaponRow>(
+            @"SELECT d.display_id      AS DisplayId,
+                     d.model_id        AS ModelId,
+                     d.texture_mpq_path AS TextureMpqPath,
+                     d.compiled_blp    AS Blp,
+                     d.icon_stem       AS IconStem,
+                     d.item_visual     AS ItemVisual,
+                     d.dbc_fields_json AS DbcFieldsJson,
+                     m.model_mpq_path  AS ModelMpqPath,
+                     m.compiled_m2     AS M2
+              FROM custom_weapon_display d
+              JOIN custom_weapon_model m ON m.model_id = d.model_id
+              ORDER BY d.display_id");
+        return rows.ToList();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // OUTPUTS
+    // ═══════════════════════════════════════════════════════════════════
+
+    private object BuildManifest(CustomWeaponBuildRequest request, string buildId, long entry, long display,
+        int modelIndex, string weaponName, uint donorGroupSound, GeneratedSql sql, WeaponPatchResult patch,
+        int packagedCount, int skippedCount, int replacedInBase) => new
+    {
+        buildId,
+        createdAtUtc = DateTime.UtcNow.ToString("O"),
+        sourceKind = request.SourceKind,
+        itemEntry = entry,
+        displayId = display,
+        modelIndex,
+        name = weaponName,
+        names = new
+        {
+            model = WeaponNaming.DbcModelName(modelIndex),
+            modelMember = WeaponNaming.ModelMpqPath(modelIndex),
+            texture = WeaponNaming.DbcTextureName(modelIndex),
+            textureMember = WeaponNaming.TextureMpqPath(modelIndex),
+            dbcMember = WeaponNaming.ItemDisplayInfoMember,
+        },
+        versions = new
+        {
+            coordinateContract = CoordinateContract.Version,
+            writer = request.WriterVersion,
+            generator = request.SourceKind,
+        },
+        donor = new { displayRow = DonorDisplayRow, groupSoundIndex = donorGroupSound },
+        packaging = new
+        {
+            patchFileName = PatchFileName,
+            weaponsPackaged = packagedCount,
+            weaponsSkipped = skippedCount,
+            baseRowsReplaced = replacedInBase,
+            note = $"{PatchFileName} is the single unified weapon patch: it contains EVERY custom weapon recorded in the " +
+                   "database, and its DBC also carries the Retexture Engine's patch-4 rows (it is built on the state beneath patch-5). " +
+                   "Install it ALONGSIDE patch-4, never instead of it.",
+        },
+        sql = new { sha256 = sql.Sha256 },
+        dbc = new { sha256 = patch.DbcSha256, sizeBytes = patch.DbcBytes.Length },
+        mpq = new { sha256 = patch.MpqSha256, sizeBytes = patch.MpqBytes.Length },
+        members = patch.Members,
+    };
+
+    private string WriteOutputs(string buildId, long entry, long display, int modelIndex,
+        WeaponPatchResult patch, GeneratedSql sql, object manifest, ForgeDiagnostics diag)
+    {
+        string buildDir = Path.Combine(ArtifactRoot, $"weapon-build-{buildId}");
+        Directory.CreateDirectory(buildDir);
+
+        File.WriteAllBytes(Path.Combine(buildDir, PatchFileName), patch.MpqBytes);
+        File.WriteAllText(Path.Combine(buildDir, "item_template.sql"), sql.Text, new UTF8Encoding(false));
+
+        var jsonOpts = new JsonSerializerOptions { WriteIndented = true };
+        File.WriteAllText(Path.Combine(buildDir, "manifest.json"),
+            JsonSerializer.Serialize(manifest, jsonOpts), new UTF8Encoding(false));
+
+        File.WriteAllText(Path.Combine(buildDir, "validation-report.md"),
+            RenderValidationMarkdown(buildId, entry, display, modelIndex, patch, diag), new UTF8Encoding(false));
+        File.WriteAllText(Path.Combine(buildDir, "OWNER_CHECKLIST.md"),
+            RenderOwnerChecklist(buildId, entry, display, patch, sql), new UTF8Encoding(false));
+
+        WriteCanonicalPatch(patch.MpqBytes);
+        return buildDir;
+    }
+
+    /// <summary>The newest unified patch is also the canonical one — a stable copy at the artifact
+    /// root. Any pre-rename patch-4 artifact left by the Forge is removed so only one Forge patch
+    /// file can ever be picked up from here.</summary>
+    private void WriteCanonicalPatch(byte[] mpqBytes)
+    {
+        Directory.CreateDirectory(ArtifactRoot);
+        File.WriteAllBytes(Path.Combine(ArtifactRoot, PatchFileName), mpqBytes);
+        try
+        {
+            string legacy = Path.Combine(ArtifactRoot, LegacyPatchFileName);
+            if (File.Exists(legacy)) File.Delete(legacy);
+        }
+        catch { /* best-effort cleanup */ }
+    }
+
+    private void RemoveCanonicalPatches()
+    {
+        foreach (var f in new[] { PatchFileName, LegacyPatchFileName })
+        {
+            try
+            {
+                string path = Path.Combine(ArtifactRoot, f);
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch { /* best-effort cleanup */ }
+        }
+    }
+
+    private static string RenderValidationMarkdown(string buildId, long entry, long display, int modelIndex,
+        WeaponPatchResult patch, ForgeDiagnostics diag)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"# Validation report — build {buildId}");
+        sb.AppendLine();
+        sb.AppendLine($"- Item entry: **{entry}**");
+        sb.AppendLine($"- Display id: **{display}**");
+        sb.AppendLine($"- Model: `{WeaponNaming.DbcModelName(modelIndex)}` → `{WeaponNaming.ModelMpqPath(modelIndex)}`");
+        sb.AppendLine($"- Texture: `{WeaponNaming.DbcTextureName(modelIndex)}` → `{WeaponNaming.TextureMpqPath(modelIndex)}`");
+        sb.AppendLine($"- MPQ SHA-256: `{patch.MpqSha256}`");
+        sb.AppendLine($"- DBC SHA-256: `{patch.DbcSha256}`");
+        sb.AppendLine($"- All members byte-verified after repack: **{(patch.AllVerified ? "yes" : "NO")}**");
+        sb.AppendLine();
+        sb.AppendLine("## Packaged members (ALL custom weapons)");
+        sb.AppendLine();
+        sb.AppendLine("| path | size | sha256 | verified |");
+        sb.AppendLine("|---|---:|---|:--:|");
+        foreach (var m in patch.Members)
+            sb.AppendLine($"| `{m.MpqPath}` | {m.Size} | `{m.Sha256[..12]}…` | {(m.Verified ? "✓" : "✗")} |");
+        if (diag.Items.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Diagnostics");
+            sb.AppendLine();
+            foreach (var line in diag.Items) sb.AppendLine($"- {line}");
+        }
+        return sb.ToString();
+    }
+
+    private static string RenderOwnerChecklist(string buildId, long entry, long display,
+        WeaponPatchResult patch, GeneratedSql sql)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"# VERIFY — weapon build {buildId}");
+        sb.AppendLine();
+        sb.AppendLine("The Forge already applied this build: item_template row inserted (fail-closed), `.reload");
+        sb.AppendLine($"item_template` issued, and `{PatchFileName}` deployed to the client Data folder — per-step");
+        sb.AppendLine("results are in the build result and the Activity Log. If a step failed, this folder has the");
+        sb.AppendLine("files to do it by hand (`item_template.sql`, the patch).");
+        sb.AppendLine();
+        sb.AppendLine($"- Item entry: **{entry}**   Display id: **{display}**");
+        sb.AppendLine($"- MPQ SHA-256: `{patch.MpqSha256}`   SQL SHA-256: `{sql.Sha256}`");
+        sb.AppendLine($"- `{PatchFileName}` contains EVERY forged weapon and sits ABOVE the Retexture Engine's");
+        sb.AppendLine("  patch-4.MPQ — the two install side by side; never overwrite patch-4 with this file.");
+        sb.AppendLine();
+        sb.AppendLine("1. Fully RESTART the Blizzard client and MSUIClient (a warm client caches DBC/model lookups).");
+        sb.AppendLine($"2. On a GM: `.additem {entry}` and verify query/name/icon.");
+        sb.AppendLine("3. Check main hand, offhand (where allowed), held and sheathed states, and dressing view.");
+        sb.AppendLine("4. Assign the same display via an NPC virtual weapon and verify that path.");
+        sb.AppendLine("5. Record screenshots/logs, client build, pass/fail, and any pivot/culling/texture discrepancy.");
+        return sb.ToString();
+    }
+
+    private static string Sha256(byte[] data) => Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
+}
+
+/// <summary>One custom weapon to build and package. Exactly one of <see cref="Mesh"/> (compiled
+/// through the Forge writer) or <see cref="PrecompiledM2"/> (donor-clone bytes) must be set.</summary>
+public sealed class CustomWeaponBuildRequest
+{
+    public string? Name { get; init; }
+
+    /// <summary>'donor_patch' | 'parametric' | 'glb_import' | 'sketch3d' — recorded as provenance.</summary>
+    public required string SourceKind { get; init; }
+
+    public RigidWeaponMesh? Mesh { get; init; }
+    public WeaponTopologyMode Topology { get; init; } = WeaponTopologyMode.Variable;
+
+    /// <summary>Optional PNG master (e.g. the GLB's embedded texture). Encoded to a 256×256 DXT1 BLP;
+    /// when absent the donor texture is packaged so the model still samples something valid.</summary>
+    public byte[]? TexturePng { get; init; }
+
+    public byte[]? PrecompiledM2 { get; init; }
+    public byte[]? PrecompiledBlp { get; init; }
+
+    /// <summary>Source material for later edit/recompile (original GLB, sketch PNG, …).</summary>
+    public byte[]? SourceBlob { get; init; }
+    public string? GeneratorParamsJson { get; init; }
+    public string? WriterVersion { get; init; }
+
+    /// <summary>Debug lever: keep the donor's internal M2 name instead of the canonical
+    /// SUI_W_#### rename, to isolate the EOF name-append in the reference client.</summary>
+    public bool KeepDonorInternalName { get; init; }
+}
+
+public sealed class CustomWeaponBuildResult
+{
+    public required string BuildId { get; init; }
+    public required long ItemEntry { get; init; }
+    public required long DisplayId { get; init; }
+    public required int ModelIndex { get; init; }
+    public required string Name { get; init; }
+    public required string SourceKind { get; init; }
+    public required string ModelMember { get; init; }
+    public required string TextureMember { get; init; }
+    public required string MpqSha256 { get; init; }
+    public required string DbcSha256 { get; init; }
+    public required string SqlSha256 { get; init; }
+    public required bool AllMembersVerified { get; init; }
+    public required int PackagedWeaponCount { get; init; }
+    public required int SkippedWeaponCount { get; init; }
+    public string? PreviewGlbWebPath { get; init; }
+    public int TriangleCount { get; init; }
+    public int VertexCount { get; init; }
+    public required string BuildDirectory { get; init; }
+    public required string BuildDirName { get; init; }
+    public required ServerApplyStatus Apply { get; init; }
+    public required IReadOnlyList<string> Diagnostics { get; init; }
+}
+
+/// <summary>What the Forge applied live, step by step. A false is not an error — the message says
+/// what to do manually (the files always also exist in the build folder).</summary>
+public sealed class ServerApplyStatus
+{
+    public required bool SqlApplied { get; init; }
+    public required string SqlMessage { get; init; }
+    public required bool Reloaded { get; init; }
+    public required string ReloadMessage { get; init; }
+    public required bool PatchDeployed { get; init; }
+    public required string PatchDeployMessage { get; init; }
+}
+
+public sealed class WeaponPatchRebuildSummary
+{
+    public required int WeaponCount { get; init; }
+    public required bool PatchRemoved { get; init; }
+    public required string? MpqSha256 { get; init; }
+    public required bool PatchDeployed { get; init; }
+    public required string PatchDeployMessage { get; init; }
+    public required IReadOnlyList<string> Diagnostics { get; init; }
+}
+
+public sealed class ForgedWeaponInfo
+{
+    public required long DisplayId { get; init; }
+    public required long ItemEntry { get; init; }
+    public required string Name { get; init; }
+    public required string SourceKind { get; init; }
+    public required string ModelMpqPath { get; init; }
+    public string? BuildId { get; init; }
+    public required DateTime CreatedAt { get; init; }
+}
+
+public sealed class WeaponDeleteResult
+{
+    public required ForgedWeaponInfo Deleted { get; init; }
+    public required WeaponPatchRebuildSummary Rebuild { get; init; }
+    public required bool ItemRowDeleted { get; init; }
+    public required string ItemRowMessage { get; init; }
+    public required bool Reloaded { get; init; }
+    public required string ReloadMessage { get; init; }
+}

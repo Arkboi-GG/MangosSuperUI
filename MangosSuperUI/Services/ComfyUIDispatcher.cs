@@ -45,6 +45,7 @@ public class ComfyUIDispatcher : IDisposable
     private readonly ILogger<ComfyUIDispatcher> _logger;
     private readonly HttpClient _http;
     private readonly List<ComfyNode> _nodes = new();
+    private readonly object _nodesLock = new();
 
     /// <summary>
     /// The token pool. Each token is a node reference. Reading a token = "I have
@@ -128,7 +129,7 @@ public class ComfyUIDispatcher : IDisposable
         {
             if (_poolSeeded) return;
 
-            foreach (var node in _nodes)
+            foreach (var node in SnapshotNodes())
             {
                 int currentDepth = 0;
                 try
@@ -226,11 +227,192 @@ public class ComfyUIDispatcher : IDisposable
     }
 
     /// <summary>
+    /// Submit a workflow and return the raw BYTES of the first output file whose name ends in one of
+    /// <paramref name="extensions"/> (e.g. ".glb"). Same token/submit/poll flow as GenerateAsync, but
+    /// it scans every array in the node outputs for a file — so it works for GLB/mesh outputs, not just
+    /// images. Used by the Weapon Forge image→3D path (a TRELLIS ComfyUI node produces a .glb).
+    ///
+    /// <paramref name="freeVramFirst"/> evicts whatever model is currently resident on the node
+    /// (FLUX, SD, …) via ComfyUI's /free endpoint before submitting, so a heavyweight image→3D
+    /// pipeline can boot on a card another workload was occupying. ComfyUI reloads evicted models
+    /// on demand the next time a workflow needs them, so this is safe for the other features.
+    /// </summary>
+    public async Task<byte[]?> GenerateFileBytesAsync(object workflow, string label,
+        string[] extensions, CancellationToken ct = default, bool freeVramFirst = false)
+        => (await GenerateFileBytesDetailedAsync(workflow, label, extensions, ct, freeVramFirst)).Bytes;
+
+    /// <summary>Same as <see cref="GenerateFileBytesAsync"/> but failures carry the REASON — most
+    /// importantly ComfyUI's validation response when a submit is rejected (e.g. a node input outside
+    /// its declared min/max), which otherwise never appears in /history and is invisible to callers.</summary>
+    public async Task<(byte[]? Bytes, string? Error)> GenerateFileBytesDetailedAsync(object workflow, string label,
+        string[] extensions, CancellationToken ct = default, bool freeVramFirst = false)
+    {
+        await EnsurePoolSeededAsync(ct);
+
+        ComfyNode node;
+        using (var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        {
+            timeoutCts.CancelAfter(MaxWaitForSlot);
+            try { node = await _tokenPool.Reader.ReadAsync(timeoutCts.Token); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogError("ComfyUI Dispatch: Timeout waiting for slot token for '{Label}'", label);
+                return (null, "timed out waiting for a free ComfyUI slot");
+            }
+        }
+
+        try
+        {
+            if (freeVramFirst)
+                await FreeVramAsync(node, ct);
+
+            var (promptId, submitError) = await SubmitToNodeDetailedAsync(node, workflow, label, ct);
+            if (promptId == null)
+                return (null, submitError ?? "ComfyUI rejected the job submission");
+
+            var bytes = await PollForFileBytesAsync(node, promptId, label, extensions, ct);
+            return bytes is not null
+                ? (bytes, null)
+                : (null, $"job {promptId} on {node.Name} produced no {string.Join('/', extensions)} within {MaxGenerationTime.TotalMinutes:0} minutes — check that node's ComfyUI log");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ComfyUI Dispatch: file generation failed on {Node} for '{Label}'", node.Name, label);
+            return (null, ex.Message);
+        }
+        finally
+        {
+            _tokenPool.Writer.TryWrite(node); // never lose a token
+        }
+    }
+
+    /// <summary>The configured pool nodes (name + base URL), for diagnostics and setup guidance.</summary>
+    public IReadOnlyList<(string Name, string BaseUrl)> ConfiguredNodes =>
+        SnapshotNodes().Select(n => (n.Name, n.BaseUrl)).ToList();
+
+    /// <summary>Add a validated runtime node from an in-feature setup page. This makes tools such
+    /// as Weapon Forge self-contained without rewriting server-config.json or requiring a restart.
+    /// The node joins the same token pool immediately and duplicates are ignored.</summary>
+    public bool AddRuntimeNode(string name, string baseUrl)
+    {
+        if (!Uri.TryCreate(baseUrl?.Trim().TrimEnd('/'), UriKind.Absolute, out var uri) ||
+            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            throw new ArgumentException("ComfyUI URL must be an absolute HTTP or HTTPS URL.", nameof(baseUrl));
+        string normalized = uri.ToString().TrimEnd('/');
+        ComfyNode node;
+        lock (_nodesLock)
+        {
+            if (_nodes.Any(n => string.Equals(n.BaseUrl, normalized, StringComparison.OrdinalIgnoreCase))) return false;
+            node = new ComfyNode(string.IsNullOrWhiteSpace(name) ? uri.Host : name.Trim(), normalized);
+            _nodes.Add(node);
+            if (_poolSeeded)
+                for (int i = 0; i < MaxQueueDepthPerNode; i++) _tokenPool.Writer.TryWrite(node);
+        }
+        _logger.LogInformation("ComfyUI Dispatcher: runtime node '{Name}' added at {Url}", node.Name, node.BaseUrl);
+        return true;
+    }
+
+    private List<ComfyNode> SnapshotNodes()
+    {
+        lock (_nodesLock) return _nodes.ToList();
+    }
+
+    /// <summary>
+    /// Ask a ComfyUI node to unload all resident models and release cached VRAM
+    /// (POST /free with unload_models + free_memory). Best-effort: an unreachable node or an older
+    /// ComfyUI without /free logs a warning and returns false — callers proceed either way, since
+    /// the subsequent job simply loads its models on top of whatever is resident.
+    /// </summary>
+    public async Task<bool> FreeVramAsync(ComfyNode node, CancellationToken ct = default)
+    {
+        try
+        {
+            var content = new StringContent(
+                "{\"unload_models\":true,\"free_memory\":true}", Encoding.UTF8, "application/json");
+            var resp = await _http.PostAsync($"{node.BaseUrl}/free", content, ct);
+            if (resp.IsSuccessStatusCode)
+            {
+                _logger.LogInformation("ComfyUI Dispatch: freed VRAM on {Node} (models unloaded)", node.Name);
+                return true;
+            }
+            _logger.LogWarning("ComfyUI Dispatch: /free on {Node} returned {Status} — continuing without eviction",
+                node.Name, resp.StatusCode);
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning("ComfyUI Dispatch: /free failed on {Node} — {Err}", node.Name, ex.Message);
+            return false;
+        }
+    }
+
+    private async Task<byte[]?> PollForFileBytesAsync(ComfyNode node, string promptId,
+        string label, string[] extensions, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + MaxGenerationTime;
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
+        {
+            await Task.Delay(HistoryPollInterval, ct);
+            try
+            {
+                var histResp = await _http.GetAsync($"{node.BaseUrl}/history/{promptId}", ct);
+                if (!histResp.IsSuccessStatusCode) continue;
+
+                var hist = JsonSerializer.Deserialize<JsonElement>(await histResp.Content.ReadAsStringAsync(ct));
+                if (!hist.TryGetProperty(promptId, out var run)) continue;
+                if (!run.TryGetProperty("outputs", out var outputs)) continue;
+
+                foreach (var nodeOut in outputs.EnumerateObject())
+                {
+                    // Scan every array property (images, gltf, meshes, 3d, result, …) for a file object.
+                    foreach (var prop in nodeOut.Value.EnumerateObject())
+                    {
+                        if (prop.Value.ValueKind != JsonValueKind.Array) continue;
+                        foreach (var item in prop.Value.EnumerateArray())
+                        {
+                            if (item.ValueKind != JsonValueKind.Object) continue;
+                            if (!item.TryGetProperty("filename", out var fnEl)) continue;
+                            var fname = fnEl.GetString() ?? "";
+                            if (!extensions.Any(e => fname.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
+
+                            var subfolder = item.TryGetProperty("subfolder", out var sf) ? sf.GetString() ?? "" : "";
+                            var type = item.TryGetProperty("type", out var ty) ? ty.GetString() ?? "output" : "output";
+                            var viewUrl = $"{node.BaseUrl}/view?filename={Uri.EscapeDataString(fname)}" +
+                                          $"&subfolder={Uri.EscapeDataString(subfolder)}&type={Uri.EscapeDataString(type)}";
+
+                            var fileResp = await _http.GetAsync(viewUrl, ct);
+                            if (!fileResp.IsSuccessStatusCode) continue;
+
+                            node.IncrementCompleted();
+                            _logger.LogInformation("ComfyUI Dispatch: '{Label}' produced {File} on {Node}", label, fname, node.Name);
+                            return await fileResp.Content.ReadAsByteArrayAsync(ct);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "ComfyUI Dispatch: file poll error for {PromptId}", promptId);
+            }
+        }
+
+        _logger.LogWarning("ComfyUI Dispatch: Timeout waiting for a file output for '{Label}' on {Node}", label, node.Name);
+        return null;
+    }
+
+    /// <summary>
     /// Submit a workflow to a specific node. No locking — each caller has its own
     /// token so there's no contention.
     /// </summary>
     private async Task<string?> SubmitToNodeAsync(ComfyNode node,
-        Dictionary<string, object> workflow, string label, CancellationToken ct)
+        object workflow, string label, CancellationToken ct)
+        => (await SubmitToNodeDetailedAsync(node, workflow, label, ct)).PromptId;
+
+    /// <summary>Submit with the rejection reason preserved: a validation 400 (bad node input, node
+    /// type missing on this node, …) never reaches /history, so the response body is the ONLY
+    /// evidence of why a job never ran.</summary>
+    private async Task<(string? PromptId, string? Error)> SubmitToNodeDetailedAsync(ComfyNode node,
+        object workflow, string label, CancellationToken ct)
     {
         var payload = JsonSerializer.Serialize(new { prompt = workflow });
         var content = new StringContent(payload, Encoding.UTF8, "application/json");
@@ -248,7 +430,7 @@ public class ComfyUIDispatcher : IDisposable
                 "ComfyUI Dispatch: Queued '{Label}' on {Node} → {PromptId}",
                 label, node.Name, promptId);
 
-            return promptId;
+            return (promptId, null);
         }
         else
         {
@@ -256,7 +438,8 @@ public class ComfyUIDispatcher : IDisposable
             _logger.LogWarning(
                 "ComfyUI Dispatch: POST failed on {Node}: {Status} — {Body}",
                 node.Name, resp.StatusCode, body);
-            return null;
+            var snippet = body.Length > 600 ? body[..600] + "…" : body;
+            return (null, $"{node.Name} rejected the job ({(int)resp.StatusCode}): {snippet}");
         }
     }
 
@@ -342,7 +525,7 @@ public class ComfyUIDispatcher : IDisposable
         await EnsurePoolSeededAsync(ct);
 
         // Upload to all nodes so any can pick up the workflow
-        foreach (var node in _nodes)
+        foreach (var node in SnapshotNodes())
         {
             try
             {
@@ -403,7 +586,7 @@ public class ComfyUIDispatcher : IDisposable
     /// <summary>Check if any node in the pool is reachable.</summary>
     public async Task<bool> IsAnyNodeOnlineAsync(CancellationToken ct = default)
     {
-        foreach (var node in _nodes)
+        foreach (var node in SnapshotNodes())
         {
             try
             {
@@ -421,7 +604,7 @@ public class ComfyUIDispatcher : IDisposable
     public async Task<List<ComfyNodeStatus>> GetPoolStatusAsync(CancellationToken ct = default)
     {
         var statuses = new List<ComfyNodeStatus>();
-        foreach (var node in _nodes)
+        foreach (var node in SnapshotNodes())
         {
             var status = new ComfyNodeStatus { Name = node.Name, BaseUrl = node.BaseUrl };
             try

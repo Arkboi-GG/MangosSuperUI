@@ -7,8 +7,9 @@ namespace MangosSuperUI.Services;
 /// Singleton service that opens the WoW 1.12.1 client MPQ archives and provides
 /// on-demand file extraction for any game asset.
 ///
-/// MPQ search order: reverse alphabetical (patch-5 &gt; patch-4 &gt; patch-2 &gt;
-/// patch &gt; model &gt; base) so patch overrides take priority.
+/// MPQ search order: numeric patch precedence via MpqPatchOrder (patch-10 &gt; patch-5 &gt;
+/// patch-4 &gt; patch-2 &gt; patch &gt; model &gt; base) so patch overrides take priority. Held
+/// archives are stored ascending and iterated in reverse; live patches are stored descending.
 ///
 /// Config: Vmangos:ClientDataPath → "/home/wowvmangos/wowclient/Data"
 ///
@@ -133,10 +134,14 @@ public class MpqReaderService : IDisposable
 
         _logger.LogInformation("MpqReader: Opening MPQ archives from {Path}", dataPath);
 
+        // Ascending numeric patch precedence: base archives first, then patches by number. Held
+        // archives are appended in this order and iterated in REVERSE in ExtractFile, so the
+        // highest-priority archive (patch-N) is checked first. MpqPatchOrder is behavior-preserving
+        // for base archives (same rank → name tie-break), and only corrects two-digit patch order.
         var mpqFiles = Directory.GetFiles(dataPath, "*.MPQ", SearchOption.TopDirectoryOnly)
             .Concat(Directory.GetFiles(dataPath, "*.mpq", SearchOption.TopDirectoryOnly))
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+            .OrderBy(f => Path.GetFileName(f), Comparer<string>.Create(MpqPatchOrder.CompareAscending))
             .ToList();
 
         foreach (var mpqPath in mpqFiles)
@@ -177,8 +182,8 @@ public class MpqReaderService : IDisposable
             }
         }
 
-        // Highest priority first (reverse alphabetical: patch-5 before patch-4).
-        _livePatches.Sort((a, b) => string.Compare(b.Name, a.Name, StringComparison.OrdinalIgnoreCase));
+        // Highest priority first (numeric: patch-10 before patch-5 before patch-4 before patch).
+        _livePatches.Sort((a, b) => MpqPatchOrder.CompareDescending(a.Name, b.Name));
 
         _logger.LogInformation("MpqReader: {Held} held, {Live} live archive(s)", _archives.Count, _livePatches.Count);
         _initialized = true;
@@ -287,10 +292,17 @@ public class MpqReaderService : IDisposable
     /// currently be resolved.</summary>
     private IEnumerable<MpqArchive> LiveArchives()
     {
+        foreach (var (_, archive) in LiveArchivesNamed())
+            yield return archive;
+    }
+
+    /// <summary>Live patch archives with their names, highest priority first.</summary>
+    private IEnumerable<(string Name, MpqArchive Archive)> LiveArchivesNamed()
+    {
         for (int i = 0; i < _livePatches.Count; i++)
         {
             var a = ResolveLivePatch(_livePatches[i]);
-            if (a != null) yield return a;
+            if (a != null) yield return (_livePatches[i].Name, a);
         }
     }
 
@@ -350,7 +362,7 @@ public class MpqReaderService : IDisposable
             if (fresh != null)
             {
                 _archives.Add((name, fresh));
-                _archives.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+                _archives.Sort((a, b) => MpqPatchOrder.CompareAscending(a.Name, b.Name));
             }
             _allPaths = null;
             try { old?.Dispose(); } catch { }
@@ -367,13 +379,23 @@ public class MpqReaderService : IDisposable
     /// Extract a file by its MPQ-internal path. Live patches (highest priority)
     /// are checked first, then held archives in reverse order. Null if not found.
     /// </summary>
-    public byte[]? ExtractFile(string mpqPath)
+    public byte[]? ExtractFile(string mpqPath) => ExtractFile(mpqPath, null);
+
+    /// <summary>
+    /// Extract with an archive filter: any archive whose file name matches
+    /// <paramref name="skipArchive"/> is ignored. Lets a rebuilder read the effective state
+    /// BENEATH its own output — e.g. the Weapon Forge resolves the base ItemDisplayInfo.dbc
+    /// excluding patch-5, so an installed copy of its own patch never feeds back as input
+    /// (which would freeze out rows added to lower patches after the last forge build).
+    /// </summary>
+    public byte[]? ExtractFile(string mpqPath, Func<string, bool>? skipArchive)
     {
         EnsureInitialized();
 
         // Live patches override everything held.
-        foreach (var archive in LiveArchives())
+        foreach (var (liveName, archive) in LiveArchivesNamed())
         {
+            if (skipArchive != null && skipArchive(liveName)) continue;
             try
             {
                 var data = archive.ReadFile(mpqPath);
@@ -392,6 +414,7 @@ public class MpqReaderService : IDisposable
             for (int i = _archives.Count - 1; i >= 0; i--)
             {
                 var (name, archive) = _archives[i];
+                if (skipArchive != null && skipArchive(name)) continue;
                 try
                 {
                     var data = archive.ReadFile(mpqPath);

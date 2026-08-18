@@ -95,6 +95,12 @@ public sealed class NpcDevApplyService
             case "waypoint-path-replace":
                 await ApplyWaypointAsync(conn, packet, @operator, ip, v);
                 break;
+            case "group-set":
+                await ApplyGroupSetAsync(conn, packet, @operator, ip, v);
+                break;
+            case "group-delete":
+                await ApplyGroupDeleteAsync(conn, packet, @operator, ip, v);
+                break;
             default:
                 v.Verdict = "unsupported";
                 v.Message = $"packet type '{packet.Type}' is not handled yet";
@@ -245,6 +251,60 @@ public sealed class NpcDevApplyService
         v.Verdict = "applied";
         v.Message = $"{point - 1} node(s)";
         v.AuditId = await AuditAsync("npc_waypoint", source, keyVal, $"{source} {keyVal}", packet, @operator, ip);
+    }
+
+    // ── creature_groups (formations): full replace / delete ──────────────────
+
+    private async Task ApplyGroupSetAsync(MySqlConnection conn, NpcApplyPacket packet,
+        string op, string? ip, NpcPacketVerdict v)
+    {
+        if (U(packet.Target, "leaderGuid") is not { } leader)
+        {
+            v.Verdict = "failed"; v.Message = "target.leaderGuid missing"; return;
+        }
+        if (!packet.After.TryGetValue("members", out JsonElement membersEl) || membersEl.ValueKind != JsonValueKind.Array)
+        {
+            v.Verdict = "failed"; v.Message = "after.members missing or not an array"; return;
+        }
+        uint flags = U(packet.After, "flags") ?? 1;   // default OPTION_FORMATION_MOVE
+
+        var members = new List<(uint Guid, double Dist, double Angle)>();
+        foreach (JsonElement m in membersEl.EnumerateArray())
+        {
+            uint g = (uint)Math.Max(0, ElNum(m, "guid"));
+            if (g != 0) members.Add((g, ElNum(m, "dist"), ElNum(m, "angle")));
+        }
+        if (members.Count == 0) { v.Verdict = "failed"; v.Message = "no members"; return; }
+
+        var memberIds = members.Select(m => m.Guid).ToList();
+        await using var tx = await conn.BeginTransactionAsync();
+        // Clear the leader's old group AND any prior membership of the new members
+        // (PK is member_guid — a creature can only be in one group).
+        await conn.ExecuteAsync("DELETE FROM `creature_groups` WHERE `leader_guid` = @l", new { l = leader }, tx);
+        await conn.ExecuteAsync("DELETE FROM `creature_groups` WHERE `member_guid` IN @ids", new { ids = memberIds }, tx);
+        foreach ((uint g, double dist, double angle) in members)
+            await conn.ExecuteAsync(
+                "INSERT INTO `creature_groups` (`leader_guid`, `member_guid`, `dist`, `angle`, `flags`) " +
+                "VALUES (@l, @m, @d, @a, @f)",
+                new { l = leader, m = g, d = dist, a = angle, f = flags }, tx);
+        await tx.CommitAsync();
+
+        v.Verdict = "applied";
+        v.Message = $"{members.Count} row(s), flags {flags}";
+        v.AuditId = await AuditAsync("npc_group", "creature_groups", leader, $"leader {leader}", packet, op, ip);
+    }
+
+    private async Task ApplyGroupDeleteAsync(MySqlConnection conn, NpcApplyPacket packet,
+        string op, string? ip, NpcPacketVerdict v)
+    {
+        if (U(packet.Target, "leaderGuid") is not { } leader)
+        {
+            v.Verdict = "failed"; v.Message = "target.leaderGuid missing"; return;
+        }
+        int n = await conn.ExecuteAsync("DELETE FROM `creature_groups` WHERE `leader_guid` = @l", new { l = leader });
+        v.Verdict = "applied";
+        v.Message = $"{n} row(s) removed";
+        v.AuditId = await AuditAsync("npc_group_delete", "creature_groups", leader, $"leader {leader}", packet, op, ip);
     }
 
     // ── audit ─────────────────────────────────────────────────────────────────

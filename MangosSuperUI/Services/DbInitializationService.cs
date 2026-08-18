@@ -122,6 +122,25 @@ public class DbInitializationService
                     _logger.LogInformation("DbInitializationService: Created og_baseline_meta table");
                 }
 
+                // --- Weapon Forge registry (WEAPON_GEN.md §4.2, §13.4) ---
+                // Atomic id reservation + weapon model/display/manifest records. These are the
+                // Forge's own source-of-truth tables; they never touch the live mangos DB. Each is
+                // guarded independently so a partial upgrade fills in only what is missing.
+                foreach (var (table, ddl) in WeaponForgeTables)
+                {
+                    if (await TableExistsAsync(conn, dbName, table))
+                    {
+                        existed++;
+                        _logger.LogDebug("DbInitializationService: {Table} already exists", table);
+                    }
+                    else
+                    {
+                        await conn.ExecuteAsync(ddl);
+                        created++;
+                        _logger.LogInformation("DbInitializationService: Created {Table} table", table);
+                    }
+                }
+
                 TablesCreated = created;
                 TablesExisted = existed;
 
@@ -467,6 +486,114 @@ public class DbInitializationService
             row_count       INT UNSIGNED    NOT NULL DEFAULT 0,
             created_at      DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
             UNIQUE KEY idx_table (table_name)
+        ) ENGINE=InnoDB;";
+
+    // ==================== Weapon Forge DDL ====================
+    //
+    // All InnoDB so the reservation flow can use a real transaction + SELECT ... FOR UPDATE on
+    // the allocator row (the live item_template is MyISAM and cannot; these Forge tables can and
+    // must). ids are BIGINT UNSIGNED so a floor computation can never silently truncate, and are
+    // range-checked against the MEDIUMINT UNSIGNED ceiling (16,777,215) in code before use.
+
+    private static readonly (string Table, string Ddl)[] WeaponForgeTables =
+    {
+        ("custom_id_allocator", Sql_CustomIdAllocator),
+        ("custom_id_reservation", Sql_CustomIdReservation),
+        ("custom_weapon_model", Sql_CustomWeaponModel),
+        ("custom_weapon_display", Sql_CustomWeaponDisplay),
+        ("custom_weapon_item_manifest", Sql_CustomWeaponItemManifest),
+        ("weapon_forge_config", Sql_WeaponForgeConfig),
+    };
+
+    // Durable key/value config for the Forge (e.g. the image→3D ComfyUI workflow JSON). DB-backed
+    // because wwwroot and the app directory are wiped on publish.
+    private const string Sql_WeaponForgeConfig = @"
+        CREATE TABLE weapon_forge_config (
+            k          VARCHAR(64)  NOT NULL PRIMARY KEY,
+            v           LONGTEXT     NULL,
+            updated_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+        ) ENGINE=InnoDB;";
+
+    // One row per namespace ('item_entry', 'item_display'). next_id is the next value to hand out.
+    private const string Sql_CustomIdAllocator = @"
+        CREATE TABLE custom_id_allocator (
+            kind        VARCHAR(24)      NOT NULL PRIMARY KEY,
+            next_id     BIGINT UNSIGNED  NOT NULL,
+            updated_at  DATETIME(3)      NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+        ) ENGINE=InnoDB;";
+
+    // Reservation ledger: an id is exclusively owned while its weapon exists; deleting a weapon
+    // releases the row and the allocator falls back (WeaponIdReservationService.ReleaseAsync) so
+    // ids are reused — the audit_log carries the history. A retry with the same
+    // (build_id, kind, slot) gets the same id back via the unique key.
+    private const string Sql_CustomIdReservation = @"
+        CREATE TABLE custom_id_reservation (
+            kind         VARCHAR(24)      NOT NULL,
+            id           BIGINT UNSIGNED  NOT NULL,
+            build_id     VARCHAR(64)      NOT NULL,
+            slot         VARCHAR(64)      NOT NULL,
+            state        VARCHAR(16)      NOT NULL DEFAULT 'reserved',
+            reserved_at  DATETIME(3)      NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            committed_at DATETIME(3)      NULL,
+            PRIMARY KEY (kind, id),
+            UNIQUE KEY uq_build_slot (build_id, kind, slot)
+        ) ENGINE=InnoDB;";
+
+    // One shared M2 mesh; many displays reference it. Stores compiled bytes for deterministic
+    // rebuilds AND enough source material to edit/recompile later (params+seed for parametric,
+    // source GLB/master for glb_trellis).
+    private const string Sql_CustomWeaponModel = @"
+        CREATE TABLE custom_weapon_model (
+            model_id                     BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+            model_mpq_path               VARCHAR(255)    NOT NULL,
+            compiled_m2                  LONGBLOB        NULL,
+            m2_sha256                    CHAR(64)        NULL,
+            source_kind                  VARCHAR(24)     NOT NULL,
+            source_blob                  LONGBLOB        NULL,
+            source_sha256                CHAR(64)        NULL,
+            artifact_store_key           VARCHAR(255)    NULL,
+            generator_params_json        LONGTEXT        NULL,
+            seed                         BIGINT          NULL,
+            generator_version            VARCHAR(32)     NULL,
+            writer_version               VARCHAR(32)     NULL,
+            coordinate_contract_version  INT             NOT NULL DEFAULT 0,
+            validation_state             VARCHAR(16)     NOT NULL DEFAULT 'draft',
+            validation_report            LONGTEXT        NULL,
+            created_at                   DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            INDEX idx_model_kind (source_kind)
+        ) ENGINE=InnoDB;";
+
+    // One display = one texture bound to a model, plus the explicit 23-field ItemDisplayInfo state.
+    private const string Sql_CustomWeaponDisplay = @"
+        CREATE TABLE custom_weapon_display (
+            display_id        BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+            model_id          BIGINT UNSIGNED NOT NULL,
+            texture_mpq_path  VARCHAR(255)    NOT NULL,
+            compiled_blp      LONGBLOB        NULL,
+            blp_sha256        CHAR(64)        NULL,
+            source_texture    LONGBLOB        NULL,
+            texture_params_json LONGTEXT      NULL,
+            texture_version   VARCHAR(32)     NULL,
+            icon_stem         VARCHAR(128)    NULL,
+            item_visual       INT             NOT NULL DEFAULT 0,
+            donor_display_id  INT UNSIGNED    NULL,
+            dbc_fields_json   LONGTEXT        NULL,
+            validation_state  VARCHAR(16)     NOT NULL DEFAULT 'draft',
+            created_at        DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            INDEX idx_display_model (model_id)
+        ) ENGINE=InnoDB;";
+
+    // The publishable owner-handoff record: the item entry + its idempotent SQL, tied to a build.
+    private const string Sql_CustomWeaponItemManifest = @"
+        CREATE TABLE custom_weapon_item_manifest (
+            build_id       VARCHAR(64)      NOT NULL PRIMARY KEY,
+            item_entry     BIGINT UNSIGNED  NOT NULL,
+            display_id     BIGINT UNSIGNED  NOT NULL,
+            gameplay_json  LONGTEXT         NULL,
+            sql_text       LONGTEXT         NULL,
+            sql_sha256     CHAR(64)         NULL,
+            created_at     DATETIME(3)      NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            INDEX idx_manifest_entry (item_entry)
         ) ENGINE=InnoDB;";
 }
 
