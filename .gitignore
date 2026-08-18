@@ -53,3 +53,8 @@ Desktop.ini
 
 # ----- Logs -----
 *.log
+
+# ----- Owner-Local Diagnostics / Worldstate -----
+# These contain environment-specific operational research and must not be published.
+/tools/
+/WORLD_STATE.md
