@@ -463,7 +463,20 @@ public class BotBridgeService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _listener = new TcpListener(IPAddress.Loopback, 3444);
-        _listener.Start();
+        try
+        {
+            _listener.Start();
+        }
+        catch (SocketException ex)
+        {
+            // Another instance (e.g. the WSL-hosted server stack) already owns 3444. Losing the
+            // bridge only means bots can't connect to THIS instance — that must not take down the
+            // whole host (BackgroundServiceExceptionBehavior is StopHost).
+            _logger.LogError(
+                "BotBridge: cannot listen on 127.0.0.1:3444 ({Message}) — another instance is likely running; bridge disabled for this instance",
+                ex.Message);
+            return;
+        }
         _logger.LogInformation("BotBridge TCP listener started on 127.0.0.1:3444");
 
         try

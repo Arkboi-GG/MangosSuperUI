@@ -33,6 +33,12 @@ public sealed class MeshValidationOptions
 
     /// <summary>Allowed slack outside [0,1] for UV0 before it is an error (texels, as a fraction).</summary>
     public float UvEpsilon { get; init; } = 1e-3f;
+
+    /// <summary>IMPORT-stage mode: capacity ceilings (UInt16 vertex count, triangle hard ceiling)
+    /// are reported as warnings instead of errors, because the caller decimates to budget BEFORE
+    /// forging — the ceilings are writer-time constraints, not import-time ones. Forge-time
+    /// validation keeps the default (false) and still hard-rejects.</summary>
+    public bool CapacityAsWarnings { get; init; }
 }
 
 /// <summary>Constants of the golden donor fixture (Sword_1H_Short_A_01.m2, DBC display 679),
@@ -77,7 +83,12 @@ public static class RigidWeaponMeshValidator
 
         // ── UInt16-safe global counts (M2 view lookups are uint16) ───────────────────────────
         if (vc > ushort.MaxValue)
-            d.Error("mesh.count.u16", $"Vertex count {vc} exceeds the UInt16 ceiling {ushort.MaxValue}.");
+        {
+            if (options.CapacityAsWarnings)
+                d.Warn("mesh.count.u16", $"Vertex count {vc} exceeds the UInt16 ceiling {ushort.MaxValue} — decimation required before forging.");
+            else
+                d.Error("mesh.count.u16", $"Vertex count {vc} exceeds the UInt16 ceiling {ushort.MaxValue}.");
+        }
 
         // ── Finite positions / normals / UV0; non-zero normals ───────────────────────────────
         for (int i = 0; i < vc; i++)
@@ -195,7 +206,12 @@ public static class RigidWeaponMeshValidator
         if (tc > options.VariableHeroWarn)
             d.Warn("mesh.budget.hero", $"Triangle count {tc} exceeds the hero warning threshold {options.VariableHeroWarn}.");
         if (tc > options.VariableHardCeiling)
-            d.Error("mesh.budget.ceiling", $"Triangle count {tc} exceeds the hard ceiling {options.VariableHardCeiling}.");
+        {
+            if (options.CapacityAsWarnings)
+                d.Warn("mesh.budget.ceiling", $"Triangle count {tc} exceeds the hard ceiling {options.VariableHardCeiling} — decimation required before forging.");
+            else
+                d.Error("mesh.budget.ceiling", $"Triangle count {tc} exceeds the hard ceiling {options.VariableHardCeiling}.");
+        }
     }
 
     private static bool IsFinite(Vector3 v) => float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z);

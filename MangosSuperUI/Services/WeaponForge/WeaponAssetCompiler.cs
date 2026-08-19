@@ -48,6 +48,7 @@ public sealed class WeaponAssetCompiler
                 ModelIndex = options.ModelIndex,
                 Variant = options.Variant,
                 CanonicalInternalName = options.CanonicalInternalName,
+                DonorM2Path = options.DonorM2Path,
             };
             m2 = _writer.WriteM2(mesh, ctx, diag);
         }
@@ -110,6 +111,10 @@ public sealed class WeaponWriteContext
     /// <summary>False keeps the donor's proven internal M2 name instead of rewriting it to
     /// SUI_W_####.mdx — a debug lever for isolating the EOF name-append in the reference client.</summary>
     public bool CanonicalInternalName { get; init; } = true;
+
+    /// <summary>MPQ member path of the donor scaffold M2 to build on (bones, attachments,
+    /// sequences follow the donor). Null → the writer's golden 1H sword.</summary>
+    public string? DonorM2Path { get; init; }
 }
 
 /// <summary>Phase-1 placeholder: the donor-scaffold M2 writer does not exist yet. Records a
@@ -140,6 +145,10 @@ public sealed class WeaponCompileOptions
     public required int ModelIndex { get; init; }
     public int Variant { get; init; } = 1;
     public bool CanonicalInternalName { get; init; } = true;
+
+    /// <summary>Donor scaffold M2 member for the writer (per weapon family). Null → golden sword.</summary>
+    public string? DonorM2Path { get; init; }
+
     public MeshValidationOptions MeshValidation { get; init; } = new();
 }
 

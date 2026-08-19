@@ -3,17 +3,20 @@ using System.Numerics;
 namespace MangosSuperUI.Services.WeaponForge;
 
 /// <summary>
-/// Heuristic orientation + scale of an imported mesh into the sword authoring envelope: the blade
-/// runs +X with the grip at the origin, scaled to the donor's blade extent (WEAPON_GEN.md §2.3, §5).
-/// It finds the long axis by PCA (power iteration), aligns it to +X, decides which end is the grip by
-/// comparing cross-section spread (the tip is the narrow end), and scales to fit. Every decision is
-/// reported; genuinely ambiguous inputs (no dominant axis, symmetric ends) raise warnings rather than
-/// being silently forced — the caller can then fall back to an explicit owner-set grip axis.
+/// Heuristic orientation + scale of an imported mesh into the weapon authoring envelope: the long
+/// axis runs +X with the palm at the origin, scaled to the resolved donor's extent (WEAPON_GEN.md
+/// §2.3, §5). It finds the long axis by PCA (power iteration), aligns it to +X, decides which end
+/// is the grip by comparing cross-section spread (the tip is the narrow end), and scales to fit.
+/// The palm-back fraction — how far the weapon reaches behind the origin — comes from the weapon
+/// family's stock donor (0.188 for the golden sword, ~mid-shaft for a staff), so each type lands
+/// in the hand where its vanilla counterparts do. Every decision is reported; genuinely ambiguous
+/// inputs (no dominant axis, symmetric ends) raise warnings rather than being silently forced —
+/// the caller can then fall back to an explicit owner-set grip axis.
 /// </summary>
-public static class SwordNormalizer
+public static class WeaponNormalizer
 {
     public static (Vector3[] Positions, Vector3[] Normals, MeshNormalizationRecord Record) Normalize(
-        Vector3[] pos, Vector3[] nrm, float donorExtent, ForgeDiagnostics diag)
+        Vector3[] pos, Vector3[] nrm, float donorExtent, float palmBackFraction, ForgeDiagnostics diag)
     {
         int n = pos.Length;
         if (n == 0) return (pos, nrm, MeshNormalizationRecord.Identity);
@@ -94,9 +97,9 @@ public static class SwordNormalizer
         float scale = donorExtent / range;
 
         // Palm-at-origin convention (donor-measured): the client puts the model origin in the palm,
-        // and the donor's pommel tip reaches 18.8% of its total length behind that (−0.206 of
-        // 1.095). Place the scaled back end there so the hand lands on the grip, not the pommel.
-        const float palmBackFraction = 0.188f;
+        // and the donor's back end reaches palmBackFraction of its length behind that (golden sword:
+        // −0.206 of 1.095 ≈ 18.8%; a staff ~mid-shaft). Place the scaled back end there so the hand
+        // lands where it does on the family's stock weapons.
         float backX = -palmBackFraction * donorExtent;
 
         var outPos = new Vector3[n];
@@ -113,7 +116,7 @@ public static class SwordNormalizer
             Scale = scale,
             Translation = new Vector3(-minX * scale + backX, 0, 0), // post-scale X mapping: x' = (x − minX)·scale + backX
             WindingReversed = false, // the 180° reorient is det +1; source-mirror winding is handled at bake
-            Method = "PCA long-axis → +X; grip = wider-cross-section end; roll → wide cross-axis on +Y; scaled to donor extent; palm at origin (back end at −18.8%)",
+            Method = $"PCA long-axis → +X; grip = wider-cross-section end; roll → wide cross-axis on +Y; scaled to donor extent {donorExtent:0.###}; palm at origin (back end at −{palmBackFraction:P1})",
         };
         return (outPos, outNrm, record);
     }
