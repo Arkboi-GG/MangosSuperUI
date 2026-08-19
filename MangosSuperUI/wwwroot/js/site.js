@@ -78,7 +78,7 @@
         { key: 'admin', label: 'Server Administration', icon: 'fa-server', groups: ['operations', 'server', 'state'] },
         { key: 'tuning', label: 'Gameplay Tuning', icon: 'fa-sliders', groups: ['content', 'spells', 'world'] },
         { key: 'aibots', label: 'AI Bot Control', icon: 'fa-robot', groups: ['bots'] },
-        { key: 'devdata', label: 'Data & Development', icon: 'fa-database', groups: ['data', 'devtools'] },
+        { key: 'devdata', label: 'Data & Development', icon: 'fa-database', groups: ['data', 'devtools', 'gamedev'] },
         { key: 'wiki', label: 'Wiki', icon: 'fa-book', groups: ['wiki'] },
         { key: 'superui', label: 'SuperUI', icon: 'fa-toolbox', groups: ['superui'] }
     ];
@@ -94,6 +94,7 @@
         bots: { name: 'Bots', icon: 'fa-robot' },
         data: { name: 'Data', icon: 'fa-database' },
         devtools: { name: 'Development', icon: 'fa-code' },
+        gamedev: { name: 'Game Development', icon: 'fa-hammer' },
         wiki: { name: 'Documentation', icon: 'fa-book' },
         superui: { name: 'App', icon: 'fa-toolbox' }
     };
@@ -107,7 +108,7 @@
 
     // Default group order + item order within each group
     var DEFAULT_ORDER = {
-        groups: ['operations', 'server', 'state', 'content', 'spells', 'world', 'bots', 'data', 'devtools', 'wiki', 'superui'],
+        groups: ['operations', 'server', 'state', 'content', 'spells', 'world', 'bots', 'data', 'devtools', 'gamedev', 'wiki', 'superui'],
         items: {
             operations: ['home', 'console', 'players', 'accounts', 'realm'],
             server: ['serverlogs', 'livelogs', 'config'],
@@ -118,6 +119,7 @@
             bots: ['bots-dashboard', 'bots-fleet', 'bots-map', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
             devtools: [],
+            gamedev: ['weaponforge'],
             wiki: ['wiki-code', 'wiki-lua'],
             superui: ['downloads-page', 'settings']
         }
@@ -476,6 +478,7 @@
             craftinglootifier: { icon: 'fa-hammer', label: 'Crafting Lootifier' },
             professiontuning: { icon: 'fa-scale-balanced', label: 'Profession Tuning' },
             retextureengine: { icon: 'fa-palette', label: 'Retexture Engine' },
+            weaponforge: { icon: 'fa-hammer', label: 'Item Assets' },
             worldeditor: { icon: 'fa-mountain-sun', label: '3D World Editor' },
             'downloads-page': { icon: 'fa-download', label: 'Downloads' },
             settings: { icon: 'fa-gear', label: 'Settings' },

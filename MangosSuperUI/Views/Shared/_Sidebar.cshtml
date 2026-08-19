@@ -19,6 +19,7 @@
         "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" or "professiontuning" => "content",
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
+        "weaponforge" => "gamedev",
         "bots" or "chatsettings" => "bots",
         "wiki" => "wiki",
         "downloads" or "settings" => "superui",
@@ -31,7 +32,7 @@
         "operations" or "server" or "state" => "admin",
         "content" or "spells" or "world" => "tuning",
         "bots" => "aibots",
-        "data" or "devtools" => "devdata",
+        "data" or "devtools" or "gamedev" => "devdata",
         "wiki" => "wiki",
         "superui" => "superui",
         _ => "admin"
@@ -385,6 +386,22 @@
                 <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
             </div>
             <ul class="sidebar-nav sidebar-nav-collapsible">
+            </ul>
+        </div>
+
+        <!-- Game Development -->
+        <div class="sidebar-section" data-group="gamedev" data-section="devdata">
+            <div class="sidebar-section-title" data-toggle-group="gamedev">
+                <span>Game Development</span>
+                <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
+            </div>
+            <ul class="sidebar-nav sidebar-nav-collapsible">
+                <li class="sidebar-nav-item" data-nav-key="weaponforge">
+                    <a asp-controller="WeaponForge" asp-action="Index" class="@NavClass("WeaponForge")">
+                        <i class="fa-solid fa-hammer"></i>
+                        Item Assets
+                    </a>
+                </li>
             </ul>
         </div>
 

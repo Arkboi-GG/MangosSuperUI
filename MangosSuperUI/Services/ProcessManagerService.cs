@@ -34,7 +34,7 @@ public class ProcessManagerService
     public async Task<string> RestartRealmdAsync() => await RunSystemctlAsync("restart", "realmd");
 
     /// <summary>
-    /// Returns diagnostics about process detection — what name was configured,
+    /// Returns diagnostics about process detection â€” what name was configured,
     /// what was actually found, and how it was resolved.
     /// </summary>
     public ProcessDiagnostics GetDiagnostics()
@@ -128,9 +128,9 @@ public class ProcessManagerService
         try
         {
             var processes = Process.GetProcessesByName(configuredName);
-            if (processes.Length > 0)
+            var proc = processes.FirstOrDefault(p => IsProcessFromConfiguredBinDirectory(p.Id));
+            if (proc != null)
             {
-                var proc = processes[0];
                 UpdateResolvedName(keyword, configuredName);
                 return new ProcessStatus
                 {
@@ -154,9 +154,9 @@ public class ProcessManagerService
             try
             {
                 var processes = Process.GetProcessesByName(cached);
-                if (processes.Length > 0)
+                var proc = processes.FirstOrDefault(p => IsProcessFromConfiguredBinDirectory(p.Id));
+                if (proc != null)
                 {
-                    var proc = processes[0];
                     return new ProcessStatus
                     {
                         IsRunning = true,
@@ -170,7 +170,7 @@ public class ProcessManagerService
             catch { }
         }
 
-        // Strategy 3: Scan /proc (expensive — throttled to once per ResolveCacheDuration)
+        // Strategy 3: Scan /proc (expensive â€” throttled to once per ResolveCacheDuration)
         if (DateTime.UtcNow - _lastResolveScan > ResolveCacheDuration)
         {
             var found = ScanProcForProcess(keyword);
@@ -218,7 +218,8 @@ public class ProcessManagerService
                     try
                     {
                         var comm = File.ReadAllText(commPath).Trim();
-                        if (comm.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                        if (comm.Contains(keyword, StringComparison.OrdinalIgnoreCase)
+                            && IsProcessFromConfiguredBinDirectory(pid))
                         {
                             _logger.LogInformation(
                                 "Process auto-detect: found {Keyword} via /proc/{Pid}/comm = '{Comm}'",
@@ -239,7 +240,8 @@ public class ProcessManagerService
                         // Only match on the executable name, not arguments
                         var exe = cmdline.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
                         var exeName = Path.GetFileName(exe);
-                        if (exeName.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                        if (exeName.Contains(keyword, StringComparison.OrdinalIgnoreCase)
+                            && IsProcessFromConfiguredBinDirectory(pid))
                         {
                             // Read the actual comm name for this PID
                             var actualComm = File.Exists(commPath)
@@ -262,6 +264,40 @@ public class ProcessManagerService
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Restricts process discovery to this SuperUI instance's configured server directory.
+    /// Multiple emulator installations can legitimately use the same mangosd/realmd process
+    /// names on one host, so matching on /proc/comm alone is not enough to establish ownership.
+    /// </summary>
+    private bool IsProcessFromConfiguredBinDirectory(int pid)
+    {
+        if (string.IsNullOrWhiteSpace(Settings.BinDirectory))
+            return true;
+
+        try
+        {
+            var cmdlinePath = $"/proc/{pid}/cmdline";
+            if (!File.Exists(cmdlinePath))
+                return false;
+
+            var cmdline = File.ReadAllText(cmdlinePath);
+            var executable = cmdline.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(executable) || !Path.IsPathRooted(executable))
+                return false;
+
+            var executableDirectory = Path.GetDirectoryName(Path.GetFullPath(executable));
+            var configuredDirectory = Path.GetFullPath(Settings.BinDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+            return string.Equals(executableDirectory, configuredDirectory, StringComparison.Ordinal);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Unable to verify configured bin directory for PID {Pid}", pid);
+            return false;
+        }
     }
 
     private void UpdateResolvedName(string keyword, string name)

@@ -54,7 +54,15 @@ Desktop.ini
 # ----- Logs -----
 *.log
 
-# ----- Owner-Local Diagnostics / Worldstate -----
-# These contain environment-specific operational research and must not be published.
+# ----- Owner-local tooling + planning docs (NOT for the public repo) -----
+# The root tools/ tree (port research, worldstate-clinical-check, etc.) plus the internal planning
+# docs are owner-local — they contain homeserver IPs, SSH key names, DB details, and internal paths,
+# so they are transferred privately, never published. Root-anchored so they only match the repo root.
 /tools/
+/CMANGOS_PORT.md
+/WEAPON_GEN.md
 /WORLD_STATE.md
+
+# ----- Weapon Forge: docs + sample art only (code IS committed) -----
+/WEAPON_FORGE.md
+/MangosSuperUI/wwwroot/weapon-forge/

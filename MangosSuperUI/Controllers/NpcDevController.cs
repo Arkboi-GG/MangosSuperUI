@@ -139,6 +139,15 @@ public class NpcDevController : Controller
                     """, new { entries = templateEntries }))
                     templates[(uint)row.entry] = row;
 
+            // ── formations (creature_groups) touching any selected/found guid ──
+            var groups = movementGuids.Count == 0 ? [] : (await conn.QueryAsync(
+                """
+                SELECT leader_guid AS leaderGuid, member_guid AS memberGuid,
+                       dist, angle, flags
+                FROM creature_groups
+                WHERE member_guid IN @guids OR leader_guid IN @guids
+                """, new { guids = movementGuids })).ToList();
+
             return Json(new
             {
                 fetchedUtc = DateTime.UtcNow,
@@ -147,6 +156,7 @@ public class NpcDevController : Controller
                 movement,
                 movementTemplates,
                 templates = templates.Values,
+                groups,
             });
         }
         catch (Exception ex)

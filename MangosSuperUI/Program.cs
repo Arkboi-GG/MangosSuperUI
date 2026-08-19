@@ -89,6 +89,34 @@ builder.Services.AddScoped<RetextureSupport>();
 builder.Services.AddScoped<ItemTextureService>();
 builder.Services.AddScoped<ItemRetextureService>();
 
+// ---------- Weapon Forge (WEAPON_GEN.md) — custom weapon model/texture generation ----------
+// Pure, offline artifact compiler + atomic id reservation. No live DB/RA/client-path side effects.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponIdReservationService>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponPatchBuilder>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponPreviewService>();
+// Phase-3 donor-scaffold writer: emits real custom geometry on the donor scaffold (fixed topology).
+// Swap back to NullWeaponMeshWriter only to isolate the compiler from the writer during debugging.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.IWeaponMeshWriter,
+    MangosSuperUI.Services.WeaponForge.DonorScaffoldWriter>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponAssetCompiler>();
+// The one packaging path for every weapon source: compile → persist compiled bytes → rebuild the
+// single unified patch-4.MPQ (ALL custom weapons) → straight .mpq + .sql outputs, no ZIP.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService>();
+// Route B (hand-drawn sketch / FLUX concept → GLB import). The image→3D worker is owner-operated,
+// so IWeapon3DGenerator defaults to a not-configured seam; the GLB importer is real.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.GlbWeaponImporter>();
+// Image→3D runs on the SAME ComfyUI pool the app already uses (Settings → AI Services) — no new
+// service. A sketch upload runs the installed image→3D (TRELLIS) workflow and returns a GLB. The
+// concrete type is registered too so the controller can manage the uploaded workflow file.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.ComfyUIWeapon3DGenerator>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.IWeapon3DGenerator>(
+    sp => sp.GetRequiredService<MangosSuperUI.Services.WeaponForge.ComfyUIWeapon3DGenerator>());
+// Staged, provider-neutral production workbench. Profile/credentials live in the Forge DB config;
+// deterministic reference cleanup works offline, while Tripo and ComfyUI remain swappable providers.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponPipelineProfileService>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.TripoWeapon3DProvider>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponSketchViewService>();
+
 // NPC dev window (spawn / pathing / aggro) commit + audit path.
 builder.Services.AddScoped<NpcDevApplyService>();
 builder.Services.AddScoped<NpcDevBaselineService>();
