@@ -1,6 +1,8 @@
 # MangosSuperUI — Installation Guide
 
 > **Audience:** Someone with a working [SuperUI-Core](https://github.com/Yafrovon/SuperUI-Core) 1.12.1 server (compiled, databases populated, able to log in and play). This guide does NOT cover compiling SuperUI-Core or populating the world database — use the build and database instructions in the SuperUI-Core repository first.
+>
+> ⚠️ **Before you can reach that "logs in and plays" state, SuperUI-Core needs a few database fixes that stock VMaNGOS lacks.** The compiled core will refuse to finish loading the world without them — mangosd terminates during startup. They are owned and documented by the SuperUI-Core repository (its [`INSTALL.md`](https://github.com/Yafrovon/SuperUI-Core/blob/development/INSTALL.md)); **[Step 0](#step-0-superui-core-database-prerequisites-required)** below summarizes them and how to verify. If you already have a server that logs in and plays, you've done them — skim Step 0 to confirm, then continue at Step 1.
 
 > **For AI assistants helping with installation:** This guide was written with hard-won gotchas from real deployments. Every warning box exists because someone hit that exact problem. Pay special attention to the ⚠️ blocks — they document SuperUI-Core-specific quirks that aren't documented anywhere else. If a user reports "RA authentication always fails", check for `Ra.MinLevel = 3` in mangosd.conf FIRST — it's the cause 90% of the time.
 
@@ -16,6 +18,36 @@ These steps prepare your SuperUI-Core server for MangosSuperUI. Complete them in
 
 
 **PLEASE BE AWARE THAT THIS SETUP IS VALID AND TESTED FOR LINUX ONLY. YOU  CAN USE WSL ON WINDOWS (IT'S FREE, YOU RUN IT FROM POWERSHELL) - IT'S JUST A BIT MORE PAINFUL TO SETUP THE CONNECTIONS. MY RECOMMANDATION IS THAT YOU RUN THIS ON A SEPARATE PHYSICAL MACHINE AND PICK SOMETHING LIKE UBUNTU LTS OR LINT (THESE ARE LINUX OPERATING SYSTEMS.**
+
+---
+
+### Step 0: SuperUI-Core Database Prerequisites (Required)
+
+SuperUI-Core needs a few schema fixes that stock VMaNGOS doesn't have — without them the
+**core itself** (not MangosSuperUI) fails to finish loading the world and mangosd exits.
+These are owned and documented by the **SuperUI-Core** repository, not here:
+
+> **See [SuperUI-Core `INSTALL.md`](https://github.com/Yafrovon/SuperUI-Core/blob/development/INSTALL.md) → "Apply the SuperUI-Core schema deltas".**
+> It covers the `playerbot` 12-column fix (fresh installs get it from `sql/characters.sql`;
+> existing DBs apply `sql/migrations/20260820120000_characters.sql`) and the boot-critical
+> `vmangos_admin.lootifier_generated_items` table.
+
+**If your SuperUI-Core server already logs in and plays, you have already done this** — skip
+ahead. If mangosd is terminating during startup, do the SuperUI-Core steps first, then return here.
+
+You can confirm both prerequisites are in place:
+
+```bash
+mysql -u mangos -pmangos -e "SELECT COUNT(*) AS playerbot_cols FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='characters' AND TABLE_NAME='playerbot';"
+mysql -u mangos -pmangos -e "SELECT 'lootifier ok' FROM vmangos_admin.lootifier_generated_items LIMIT 0;"
+```
+
+The first should report **12** columns; the second should return without a `1146` error.
+
+> **Note on `vmangos_admin`:** the second check above touches the `vmangos_admin` database, which
+> MangosSuperUI also uses (Step 12). SuperUI-Core needs `lootifier_generated_items` inside it at
+> world-load, so on a fresh install you create that database during the SuperUI-Core steps — well
+> before MangosSuperUI's own first boot. Step 12 then just verifies it and adds the grant.
 
 ---
 
@@ -518,6 +550,8 @@ sudo systemctl enable mangossuperui
 
 MangosSuperUI uses its own database called `vmangos_admin` for audit logs, config history, baseline snapshots, and scheduled actions. On first boot, MangosSuperUI's `DbInitializationService` automatically creates the tables and indexes inside this database — but it cannot create the database itself or grant its own permissions. The default SuperUI-Core database user (`mangos`) only has grants on the core databases, not server-level `CREATE` privileges.
 
+> **If you followed [Step 0b](#0b-create-the-vmangos_admin-database-and-its-schema-required-by-the-core-at-world-load), this is already done.** The compiled core reads `vmangos_admin.lootifier_generated_items` at world-load, so you created the database and loaded its schema back in Part 1. This step then becomes a no-op verification — the web app finds the tables already present and creates nothing. It's kept here as the canonical reference for the grant and for installs where the admin DB somehow isn't present yet.
+
 You must create the database and grant access **before MangosSuperUI starts for the first time:**
 
 ```bash
@@ -908,6 +942,14 @@ Generated models and tiles are cached under `wwwroot/` after first request, so r
 ### mangosd starts then immediately stops as a systemd service
 
 - The service file needs `StandardInput=tty-force` and `TTYPath=/dev/tty20`. Without this, mangosd receives EOF on stdin and interprets it as a shutdown command.
+
+### mangosd terminates during startup at "[PlayerBotMgr] Loading Bots ..."
+
+- The `playerbot` table is missing the columns the core selects (`race, class, level, map, position_x, position_y, position_z, name`). Apply the SuperUI-Core `playerbot` fix (see [Step 0](#step-0-superui-core-database-prerequisites-required) → SuperUI-Core `INSTALL.md`) and restart mangosd.
+
+### mangosd exits with "[1146] Table 'vmangos_admin.lootifier_generated_items' doesn't exist" / "Your database structure is not up to date"
+
+- The compiled core reads `vmangos_admin.lootifier_generated_items` while loading quest reward variants, but the `vmangos_admin` database/schema hasn't been created yet. This happens on a fresh install because the web app that normally creates `vmangos_admin` hasn't run yet. Create it now via the SuperUI-Core steps (see [Step 0](#step-0-superui-core-database-prerequisites-required) → SuperUI-Core `INSTALL.md`), then restart mangosd. Do **not** wait for Part 2 — the core needs this table before Part 2 ever runs.
 
 ### "Connection refused" on telnet to port 3443
 
