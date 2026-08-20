@@ -249,41 +249,71 @@ public class ComfyUIDispatcher : IDisposable
     {
         await EnsurePoolSeededAsync(ct);
 
-        ComfyNode node;
-        using (var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        // A dead pool entry (a stale localhost default, a powered-off box) must not eat the job
+        // while a healthy node exists: rotate through the token pool and skip any node that fails
+        // to ACCEPT the submission (unreachable, or its ComfyUI rejects the graph — a node missing
+        // the required custom nodes rejects at validation, and another node may still have them).
+        // Failures AFTER acceptance still surface directly.
+        var failed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? lastError = null;
+        int maxAttempts = Math.Max(2, SnapshotNodes().Count * MaxQueueDepthPerNode);
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            timeoutCts.CancelAfter(MaxWaitForSlot);
-            try { node = await _tokenPool.Reader.ReadAsync(timeoutCts.Token); }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            ComfyNode node;
+            using (var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                _logger.LogError("ComfyUI Dispatch: Timeout waiting for slot token for '{Label}'", label);
-                return (null, "timed out waiting for a free ComfyUI slot");
+                timeoutCts.CancelAfter(MaxWaitForSlot);
+                try { node = await _tokenPool.Reader.ReadAsync(timeoutCts.Token); }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    _logger.LogError("ComfyUI Dispatch: Timeout waiting for slot token for '{Label}'", label);
+                    return (null, lastError ?? "timed out waiting for a free ComfyUI slot");
+                }
+            }
+
+            try
+            {
+                if (failed.Contains(node.BaseUrl)) continue; // token bounces back in finally; take the next one
+
+                if (freeVramFirst)
+                    await FreeVramAsync(node, ct);
+
+                string? promptId, submitError;
+                try
+                {
+                    (promptId, submitError) = await SubmitToNodeDetailedAsync(node, workflow, label, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    failed.Add(node.BaseUrl);
+                    lastError = $"{node.Name} unreachable: {ex.Message}";
+                    _logger.LogWarning("ComfyUI Dispatch: {Node} unreachable for '{Label}' — trying another node ({Err})",
+                        node.Name, label, ex.Message);
+                    continue;
+                }
+                if (promptId == null)
+                {
+                    failed.Add(node.BaseUrl);
+                    lastError = submitError ?? "ComfyUI rejected the job submission";
+                    continue;
+                }
+
+                var bytes = await PollForFileBytesAsync(node, promptId, label, extensions, ct);
+                return bytes is not null
+                    ? (bytes, null)
+                    : (null, $"job {promptId} on {node.Name} produced no {string.Join('/', extensions)} within {MaxGenerationTime.TotalMinutes:0} minutes — check that node's ComfyUI log");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "ComfyUI Dispatch: file generation failed on {Node} for '{Label}'", node.Name, label);
+                return (null, ex.Message);
+            }
+            finally
+            {
+                _tokenPool.Writer.TryWrite(node); // never lose a token
             }
         }
-
-        try
-        {
-            if (freeVramFirst)
-                await FreeVramAsync(node, ct);
-
-            var (promptId, submitError) = await SubmitToNodeDetailedAsync(node, workflow, label, ct);
-            if (promptId == null)
-                return (null, submitError ?? "ComfyUI rejected the job submission");
-
-            var bytes = await PollForFileBytesAsync(node, promptId, label, extensions, ct);
-            return bytes is not null
-                ? (bytes, null)
-                : (null, $"job {promptId} on {node.Name} produced no {string.Join('/', extensions)} within {MaxGenerationTime.TotalMinutes:0} minutes — check that node's ComfyUI log");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "ComfyUI Dispatch: file generation failed on {Node} for '{Label}'", node.Name, label);
-            return (null, ex.Message);
-        }
-        finally
-        {
-            _tokenPool.Writer.TryWrite(node); // never lose a token
-        }
+        return (null, lastError ?? "no ComfyUI node accepted the job");
     }
 
     /// <summary>The configured pool nodes (name + base URL), for diagnostics and setup guidance.</summary>
@@ -524,7 +554,11 @@ public class ComfyUIDispatcher : IDisposable
     {
         await EnsurePoolSeededAsync(ct);
 
-        // Upload to all nodes so any can pick up the workflow
+        // Upload to EVERY node so whichever node the dispatcher later hands the job to can
+        // LoadImage it (with overwrite + caller-unique filenames the stored name is identical on
+        // each node). Unreachable nodes just log — the dispatcher skips them at submit time too.
+        string? storedName = null;
+        ComfyNode? firstNode = null;
         foreach (var node in SnapshotNodes())
         {
             try
@@ -541,13 +575,13 @@ public class ComfyUIDispatcher : IDisposable
                 {
                     var json = JsonSerializer.Deserialize<JsonElement>(
                         await resp.Content.ReadAsStringAsync(ct));
-                    var storedName = json.GetProperty("name").GetString() ?? filename;
+                    var name = json.GetProperty("name").GetString() ?? filename;
 
                     _logger.LogInformation(
                         "ComfyUI Dispatch: Uploaded '{File}' to {Node} → '{Stored}'",
-                        filename, node.Name, storedName);
+                        filename, node.Name, name);
 
-                    return (storedName, node);
+                    if (storedName is null) { storedName = name; firstNode = node; }
                 }
                 else
                 {
@@ -563,7 +597,7 @@ public class ComfyUIDispatcher : IDisposable
             }
         }
 
-        return (null, null);
+        return (storedName, firstNode);
     }
 
     /// <summary>

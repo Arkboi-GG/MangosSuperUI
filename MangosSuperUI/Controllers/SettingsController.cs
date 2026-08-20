@@ -80,6 +80,10 @@ public class SettingsController : Controller
                 VmapsDataPath = _config["Vmangos:VmapsDataPath"] ?? ""
             },
             SpellCreator = BuildSpellCreatorConfig(),
+            WeaponForge = new WeaponForgeConfig
+            {
+                TbcDataPath = _config["WeaponForge:TbcDataPath"] ?? ""
+            },
             Wiki = new WikiConfig
             {
                 Root = _config["Wiki:Root"] ?? ""
@@ -203,6 +207,7 @@ public class SettingsController : Controller
             Set("remoteAccess", settings.RemoteAccess);
             Set("vmangos", settings.Vmangos);
             Set("spellCreator", settings.SpellCreator);
+            Set("weaponForge", settings.WeaponForge);
             Set("wiki", settings.Wiki);
             Set("kestrel", settings.Kestrel);
 
@@ -276,8 +281,16 @@ public class ServerConfig
     public RemoteAccessConfig? RemoteAccess { get; set; }
     public VmangosConfig? Vmangos { get; set; }
     public SpellCreatorConfig? SpellCreator { get; set; }
+    public WeaponForgeConfig? WeaponForge { get; set; }
     public WikiConfig? Wiki { get; set; }
     public KestrelConfig? Kestrel { get; set; }
+}
+
+public class WeaponForgeConfig
+{
+    /// <summary>TBC (2.4.3) client Data folder — enables the Forge's TBC-import section.
+    /// (WeaponForge:ArtifactRoot stays a config-file-only advanced override.)</summary>
+    public string TbcDataPath { get; set; } = "";
 }
 
 public class ConnectionStringsConfig

@@ -42,6 +42,8 @@ public sealed class CustomWeaponBuildService
     private readonly WeaponPatchBuilder _patch;
     private readonly WeaponAssetCompiler _compiler;
     private readonly WeaponPreviewService _preview;
+    private readonly WeaponDonorResolver _donors;
+    private readonly DbcService _dbc;
     private readonly AuditService _audit;
     private readonly RaService _ra;
     private readonly ConnectionFactory _db;
@@ -51,11 +53,13 @@ public sealed class CustomWeaponBuildService
 
     public CustomWeaponBuildService(MpqReaderService mpq, WeaponIdReservationService ids,
         WeaponPatchBuilder patch, WeaponAssetCompiler compiler, WeaponPreviewService preview,
-        AuditService audit, RaService ra, ConnectionFactory db, IWebHostEnvironment env,
+        WeaponDonorResolver donors, DbcService dbc, AuditService audit, RaService ra,
+        ConnectionFactory db, IWebHostEnvironment env,
         IConfiguration config, ILogger<CustomWeaponBuildService> logger)
     {
         _mpq = mpq; _ids = ids; _patch = patch; _compiler = compiler; _preview = preview;
-        _audit = audit; _ra = ra; _db = db; _env = env; _config = config; _logger = logger;
+        _donors = donors; _dbc = dbc; _audit = audit; _ra = ra; _db = db; _env = env;
+        _config = config; _logger = logger;
     }
 
     /// <summary>The client Data directory the app deploys patches into — same config the Retexture
@@ -88,10 +92,16 @@ public sealed class CustomWeaponBuildService
         if (!DonorItemTemplateFixture.Verify())
             throw new InvalidOperationException("Donor item_template fixture failed hash verification.");
 
-        // 1) Base DBC (beneath patch-5) — donor sound + id floor.
+        // Weapon family: gameplay contract from the catalog, visual donor (scaffold, sound, icon,
+        // grip envelope) resolved from the installed stock assets. Fails closed when the family has
+        // no usable stock donor.
+        var profile = WeaponTypeCatalog.Get(request.WeaponTypeKey);
+        var donor = _donors.Resolve(profile);
+        uint donorGroupSound = donor.GroupSoundIndex;
+
+        // 1) Base DBC (beneath patch-5) — id floor.
         byte[] baseDbc = ResolveBaseDbc();
         var baseReader = DbcWriterService.ReadDbc(baseDbc, WeaponNaming.ItemDisplayInfoMember);
-        uint donorGroupSound = ReadGroupSound(baseReader);
         uint dbcMax = baseReader.GetMaxId();
 
         // 2) Reserve ids atomically. buildId is the stable reservation slot key so a retry is idempotent.
@@ -102,7 +112,9 @@ public sealed class CustomWeaponBuildService
         var dispRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemDisplay, displayFloor, buildId, "display");
 
         int modelIndex = checked((int)dispRes.Id); // 1 model ↔ 1 display; ties SUI_W names to the display id
-        string weaponName = string.IsNullOrWhiteSpace(request.Name) ? $"Forged Sword {dispRes.Id}" : request.Name.Trim();
+        string weaponName = string.IsNullOrWhiteSpace(request.Name)
+            ? $"Forged {profile.DefaultNoun} {dispRes.Id}"
+            : request.Name.Trim();
 
         // 3) Compile (or accept precompiled donor bytes). BLP falls back to the donor texture so a
         //    textureless mesh still ships something valid to sample.
@@ -111,13 +123,20 @@ public sealed class CustomWeaponBuildService
         byte[] blp;
         if (hasMesh)
         {
-            var texture = request.TexturePng is { Length: > 0 }
-                ? new WeaponTexture { SourcePng = request.TexturePng, Width = 256, Height = 256, UseDxt1 = true }
-                : null;
+            // Envelope follows the source aspect (snapped to powers of two, ≤256) rather than a
+            // forced square: a 2:1 zone atlas encodes as 256×128, a square reconstruction texture
+            // stays 256×256. Forcing 256×256 previously stretched every zone atlas vertically 2×.
+            WeaponTexture? texture = null;
+            if (request.TexturePng is { Length: > 0 })
+            {
+                var (tw, th) = TargetBlpSize(request.TexturePng);
+                texture = new WeaponTexture { SourcePng = request.TexturePng, Width = tw, Height = th, UseDxt1 = true };
+            }
             var compiled = _compiler.Compile(request.Mesh!, texture, new WeaponCompileOptions
             {
                 ModelIndex = modelIndex,
                 CanonicalInternalName = !request.KeepDonorInternalName,
+                DonorM2Path = donor.M2Path,
                 MeshValidation = new MeshValidationOptions { Topology = request.Topology },
             });
             diag.AddRange(compiled.Diagnostics);
@@ -125,21 +144,32 @@ public sealed class CustomWeaponBuildService
                 throw new InvalidOperationException("Mesh compilation failed: " + string.Join("; ",
                     compiled.Diagnostics.Items.Where(i => i.Severity == ForgeSeverity.Error).Select(i => i.Message)));
             m2 = compiled.M2;
-            blp = compiled.Blp ?? ExtractDonorBlp();
+            blp = compiled.Blp ?? ExtractDonorBlp(donor);
         }
         else
         {
             m2 = request.PrecompiledM2!;
-            blp = request.PrecompiledBlp ?? ExtractDonorBlp();
+            blp = request.PrecompiledBlp ?? ExtractDonorBlp(donor);
         }
 
         // 4) Persist FIRST — the stored compiled bytes are what every future unified rebuild
         //    re-packages, so a weapon that isn't durably recorded must not be handed out.
-        var sql = WeaponItemTemplateSql.Build(entryRes.Id, weaponName, dispRes.Id, buildId);
-        string iconStem = ReadDonorIconStem(baseReader);
-        await PersistRecordsAsync(request, buildId, modelIndex, entryRes.Id, dispRes.Id, weaponName, m2, blp, sql, donorGroupSound, iconStem);
+        //    The gameplay row clones donor 2131 with the family's subclass/inventory/sheath/
+        //    material/delay overrides, so a forged axe IS an axe to the core.
+        var sql = WeaponItemTemplateSql.Build(entryRes.Id, weaponName, dispRes.Id, buildId,
+            profile.ItemTemplateOverrides());
+        string iconStem = donor.IconStem.Length > 0 ? donor.IconStem : ReadDonorIconStem(baseReader);
+        await PersistRecordsAsync(request, profile, donor, buildId, modelIndex, entryRes.Id, dispRes.Id,
+            weaponName, m2, blp, sql, donorGroupSound, iconStem);
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemDisplay, dispRes.Id, "committed");
+
+        // Inject the new display into DbcService's in-memory caches so the web UI (Items page icon
+        // lookup, model/texture panel, GLB preview) resolves it immediately — the same registration
+        // the Retexture Engine does for its custom displays. Without this the forged weapon's display
+        // id is absent from the statically-loaded server DBC and renders as the red "?" with no
+        // texture. Cloned from the family's donor row, then overridden with the weapon's own SUI_W names.
+        RegisterDisplayWithDbc(dispRes.Id, modelIndex, donor.DisplayRow);
 
         // 5) Unified rebuild: every custom weapon with stored bytes, this one included.
         var assembly = await AssembleUnifiedPatchAsync(diag, buildId);
@@ -150,7 +180,7 @@ public sealed class CustomWeaponBuildService
         var preview = _preview.RenderFromBytes(m2, blp);
 
         // 7) Write the build directory: straight patch-5.MPQ + item_template.sql (+ reports). No ZIP.
-        var manifest = BuildManifest(request, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
+        var manifest = BuildManifest(request, profile, donor, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
             donorGroupSound, sql, assembly.Patch, assembly.PackagedCount, assembly.SkippedCount, assembly.ReplacedInBase);
         string buildDir = WriteOutputs(buildId, entryRes.Id, dispRes.Id, modelIndex, assembly.Patch, sql, manifest, diag);
 
@@ -167,9 +197,9 @@ public sealed class CustomWeaponBuildService
         };
 
         _logger.LogInformation(
-            "WeaponForge: build {Build} ({Kind}) → entry {Entry}, display {Display}; {Patch} packages {Count} weapon(s); " +
+            "WeaponForge: build {Build} ({Kind}, {Type}) → entry {Entry}, display {Display}; {Patch} packages {Count} weapon(s); " +
             "sql={Sql} reload={Reload} deploy={Deploy}",
-            buildId, request.SourceKind, entryRes.Id, dispRes.Id, PatchFileName, assembly.PackagedCount,
+            buildId, request.SourceKind, profile.Key, entryRes.Id, dispRes.Id, PatchFileName, assembly.PackagedCount,
             sqlApply.Ok, reload.Ok, deploy.Ok);
 
         // Audit trail (Activity Log / Change Graph) — records the build AND what was applied live.
@@ -207,6 +237,8 @@ public sealed class CustomWeaponBuildService
             DisplayId = dispRes.Id,
             ModelIndex = modelIndex,
             Name = weaponName,
+            WeaponType = profile.Key,
+            WeaponTypeLabel = profile.Label,
             SourceKind = request.SourceKind,
             ModelMember = WeaponNaming.ModelMpqPath(modelIndex),
             TextureMember = WeaponNaming.TextureMpqPath(modelIndex),
@@ -284,13 +316,14 @@ public sealed class CustomWeaponBuildService
         await using var conn = _db.Admin();
         await conn.OpenAsync();
         var rows = await conn.QueryAsync(
-            @"SELECT d.display_id      AS DisplayId,
-                     d.created_at      AS CreatedAt,
-                     mo.source_kind    AS SourceKind,
-                     mo.model_mpq_path AS ModelMpqPath,
-                     ma.item_entry     AS ItemEntry,
-                     ma.build_id       AS BuildId,
-                     ma.gameplay_json  AS GameplayJson
+            @"SELECT d.display_id       AS DisplayId,
+                     d.created_at       AS CreatedAt,
+                     d.donor_display_id AS DonorDisplayRow,
+                     mo.source_kind     AS SourceKind,
+                     mo.model_mpq_path  AS ModelMpqPath,
+                     ma.item_entry      AS ItemEntry,
+                     ma.build_id        AS BuildId,
+                     ma.gameplay_json   AS GameplayJson
               FROM custom_weapon_display d
               JOIN custom_weapon_model mo ON mo.model_id = d.model_id
               LEFT JOIN custom_weapon_item_manifest ma ON ma.display_id = d.display_id
@@ -300,18 +333,61 @@ public sealed class CustomWeaponBuildService
         foreach (var r in rows)
         {
             long entry = r.ItemEntry is null ? 0L : (long)Convert.ToInt64(r.ItemEntry);
+            string? gameplayJson = (string?)r.GameplayJson;
             list.Add(new ForgedWeaponInfo
             {
                 DisplayId = Convert.ToInt64(r.DisplayId),
                 ItemEntry = entry,
-                Name = ReadNameFromGameplayJson((string?)r.GameplayJson) ?? (entry > 0 ? $"Weapon {entry}" : "Unnamed weapon"),
+                Name = ReadGameplayJsonField(gameplayJson, "name") ?? (entry > 0 ? $"Weapon {entry}" : "Unnamed weapon"),
+                WeaponType = ReadGameplayJsonField(gameplayJson, "weaponType"),
                 SourceKind = (string)r.SourceKind,
                 ModelMpqPath = (string)r.ModelMpqPath,
+                DonorDisplayRow = r.DonorDisplayRow is null ? 0L : (long)Convert.ToInt64(r.DonorDisplayRow),
                 BuildId = (string?)r.BuildId,
                 CreatedAt = (DateTime)r.CreatedAt,
             });
         }
         return list;
+    }
+
+    /// <summary>
+    /// Register all forged weapon displays into DbcService's in-memory caches at startup, so the web
+    /// UI resolves their icon/model/texture immediately after an app restart — the in-memory
+    /// registration is not durable across restarts, exactly like the Retexture Engine's
+    /// <c>LoadExistingRetexturesAsync</c> (which this mirrors, and which Program.cs calls alongside).
+    /// </summary>
+    public async Task LoadExistingWeaponsAsync()
+    {
+        try
+        {
+            var weapons = await ListWeaponsAsync();
+            foreach (var w in weapons)
+                RegisterDisplayWithDbc(w.DisplayId, checked((int)w.DisplayId), // modelIndex == displayId
+                    w.DonorDisplayRow > 0 ? (uint)w.DonorDisplayRow : DonorDisplayRow);
+            if (weapons.Count > 0)
+                _logger.LogInformation("WeaponForge: registered {Count} forged weapon display(s) into the DBC cache", weapons.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: LoadExistingWeaponsAsync failed (forged weapons may render as red '?' until a rebuild)");
+        }
+    }
+
+    /// <summary>Clone the family donor's ItemDisplayInfo row into the in-memory DBC under the forged
+    /// display id, overriding the model/texture with the weapon's own SUI_W names. Best-effort: a
+    /// failure here only costs the web preview, never the build.</summary>
+    private void RegisterDisplayWithDbc(long displayId, int modelIndex, uint donorDisplayRow)
+    {
+        try
+        {
+            _dbc.RegisterCustomDisplayEntry((uint)displayId, donorDisplayRow,
+                WeaponNaming.DbcModelName(modelIndex),
+                WeaponNaming.DbcTextureName(modelIndex));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: DBC display registration for display {Display} failed", displayId);
+        }
     }
 
     /// <summary>
@@ -548,9 +624,18 @@ public sealed class CustomWeaponBuildService
             ?? throw new InvalidOperationException("Could not extract a base ItemDisplayInfo.dbc from the mounted archives.");
     }
 
-    private byte[] ExtractDonorBlp() =>
-        _mpq.ExtractFile(DonorBlpPath)
+    /// <summary>Fallback texture for a textureless mesh: the family donor's own BLP where the donor
+    /// row names one, else the golden sword's — so the model always samples something valid.</summary>
+    private byte[] ExtractDonorBlp(WeaponDonorInfo donor)
+    {
+        if (donor.BlpPath is { Length: > 0 } path)
+        {
+            var blp = _mpq.ExtractFile(path);
+            if (blp is { Length: > 0 }) return blp;
+        }
+        return _mpq.ExtractFile(DonorBlpPath)
             ?? throw new InvalidOperationException($"Donor BLP not found in mounted archives: {DonorBlpPath}");
+    }
 
     private static uint ReadGroupSound(DbcWriterService dbc)
     {
@@ -574,13 +659,13 @@ public sealed class CustomWeaponBuildService
         return "INV_Sword_04"; // donor 2131 Shortsword's stock icon — always present in base MPQs
     }
 
-    private static string? ReadNameFromGameplayJson(string? json)
+    private static string? ReadGameplayJsonField(string? json, string field)
     {
         if (string.IsNullOrEmpty(json)) return null;
         try
         {
             var doc = JsonSerializer.Deserialize<JsonElement>(json);
-            return doc.TryGetProperty("name", out var n) ? n.GetString() : null;
+            return doc.TryGetProperty(field, out var n) ? n.GetString() : null;
         }
         catch { return null; }
     }
@@ -589,13 +674,21 @@ public sealed class CustomWeaponBuildService
     // PERSISTENCE
     // ═══════════════════════════════════════════════════════════════════
 
-    private async Task PersistRecordsAsync(CustomWeaponBuildRequest request, string buildId, int modelIndex,
+    private async Task PersistRecordsAsync(CustomWeaponBuildRequest request, WeaponTypeProfile profile,
+        WeaponDonorInfo donor, string buildId, int modelIndex,
         long entry, long display, string weaponName, byte[] m2, byte[] blp, GeneratedSql sql, uint groupSound,
         string iconStem)
     {
         string? sourceSha = request.SourceBlob is { Length: > 0 } src ? Sha256(src) : null;
         string dbcFieldsJson = JsonSerializer.Serialize(new { groupSoundIndex = groupSound });
-        string gameplayJson = JsonSerializer.Serialize(new { name = weaponName, sourceKind = request.SourceKind });
+        string gameplayJson = JsonSerializer.Serialize(new
+        {
+            name = weaponName,
+            sourceKind = request.SourceKind,
+            weaponType = profile.Key,
+            weaponTypeLabel = profile.Label,
+            donorModel = donor.ModelName,
+        });
 
         await using var conn = _db.Admin();
         await conn.OpenAsync();
@@ -641,7 +734,7 @@ public sealed class CustomWeaponBuildService
                 blpsha = Sha256(blp),
                 srctex = request.TexturePng,
                 icon = iconStem,
-                donor = DonorDisplayRow,
+                donor = donor.DisplayRow,
                 fields = dbcFieldsJson,
             });
 
@@ -704,13 +797,24 @@ public sealed class CustomWeaponBuildService
     // OUTPUTS
     // ═══════════════════════════════════════════════════════════════════
 
-    private object BuildManifest(CustomWeaponBuildRequest request, string buildId, long entry, long display,
+    private object BuildManifest(CustomWeaponBuildRequest request, WeaponTypeProfile profile,
+        WeaponDonorInfo donorInfo, string buildId, long entry, long display,
         int modelIndex, string weaponName, uint donorGroupSound, GeneratedSql sql, WeaponPatchResult patch,
         int packagedCount, int skippedCount, int replacedInBase) => new
     {
         buildId,
         createdAtUtc = DateTime.UtcNow.ToString("O"),
         sourceKind = request.SourceKind,
+        weaponType = new
+        {
+            key = profile.Key,
+            label = profile.Label,
+            subclass = profile.Subclass,
+            inventoryType = profile.InventoryType,
+            sheath = profile.Sheath,
+            material = profile.Material,
+            delayMs = profile.DelayMs,
+        },
         itemEntry = entry,
         displayId = display,
         modelIndex,
@@ -729,7 +833,15 @@ public sealed class CustomWeaponBuildService
             writer = request.WriterVersion,
             generator = request.SourceKind,
         },
-        donor = new { displayRow = DonorDisplayRow, groupSoundIndex = donorGroupSound },
+        donor = new
+        {
+            displayRow = donorInfo.DisplayRow,
+            model = donorInfo.ModelName,
+            m2Path = donorInfo.M2Path,
+            groupSoundIndex = donorGroupSound,
+            extentX = donorInfo.ExtentX,
+            palmBackFraction = donorInfo.PalmBackFraction,
+        },
         packaging = new
         {
             patchFileName = PatchFileName,
@@ -851,6 +963,29 @@ public sealed class CustomWeaponBuildService
     }
 
     private static string Sha256(byte[] data) => Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
+
+    /// <summary>Target BLP dimensions for a source PNG: each axis snapped to the largest power of two
+    /// ≤ the source and ≤ 256, preserving aspect. A 256×128 zone atlas stays 256×128; a 512×512
+    /// reconstruction texture becomes 256×256. Falls back to 256×256 if the PNG can't be read.</summary>
+    private static (int W, int H) TargetBlpSize(byte[] png)
+    {
+        try
+        {
+            using var codec = SkiaSharp.SKCodec.Create(new MemoryStream(png));
+            if (codec is not null)
+                return (SnapPow2(codec.Info.Width), SnapPow2(codec.Info.Height));
+        }
+        catch { /* fall through */ }
+        return (256, 256);
+    }
+
+    private static int SnapPow2(int v)
+    {
+        v = Math.Clamp(v, 8, 256);
+        int p = 8;
+        while (p * 2 <= v) p *= 2;
+        return p;
+    }
 }
 
 /// <summary>One custom weapon to build and package. Exactly one of <see cref="Mesh"/> (compiled
@@ -861,6 +996,11 @@ public sealed class CustomWeaponBuildRequest
 
     /// <summary>'donor_patch' | 'parametric' | 'glb_import' | 'sketch3d' — recorded as provenance.</summary>
     public required string SourceKind { get; init; }
+
+    /// <summary>Weapon family key from <see cref="WeaponTypeCatalog"/> — drives the gameplay row
+    /// (subclass/inventory/sheath/material/delay), the donor scaffold the M2 writer builds on, and
+    /// the display donor row (sound/icon). Unknown/empty falls back to the proven 1H sword.</summary>
+    public string? WeaponTypeKey { get; init; }
 
     public RigidWeaponMesh? Mesh { get; init; }
     public WeaponTopologyMode Topology { get; init; } = WeaponTopologyMode.Variable;
@@ -889,6 +1029,8 @@ public sealed class CustomWeaponBuildResult
     public required long DisplayId { get; init; }
     public required int ModelIndex { get; init; }
     public required string Name { get; init; }
+    public required string WeaponType { get; init; }
+    public required string WeaponTypeLabel { get; init; }
     public required string SourceKind { get; init; }
     public required string ModelMember { get; init; }
     public required string TextureMember { get; init; }
@@ -934,8 +1076,12 @@ public sealed class ForgedWeaponInfo
     public required long DisplayId { get; init; }
     public required long ItemEntry { get; init; }
     public required string Name { get; init; }
+    /// <summary>Family key recorded at forge time; null for weapons forged before types existed.</summary>
+    public string? WeaponType { get; init; }
     public required string SourceKind { get; init; }
     public required string ModelMpqPath { get; init; }
+    /// <summary>Stock ItemDisplayInfo row the display was cloned from (0 when unrecorded).</summary>
+    public long DonorDisplayRow { get; init; }
     public string? BuildId { get; init; }
     public required DateTime CreatedAt { get; init; }
 }

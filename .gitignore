@@ -66,4 +66,7 @@ Desktop.ini
 # ----- Weapon Forge: docs + sample art only (code IS committed) -----
 /WEAPON_FORGE.md
 /MangosSuperUI/wwwroot/weapon-forge/
+/.claude
 /SUPERUI_CORE_CONTENT_REORGANIZATION.md
+/CMANGOS_PORT.md
+/WEAPON_GEN.md

@@ -16,7 +16,8 @@ namespace MangosSuperUI.Services.WeaponForge;
 /// </summary>
 public sealed class DonorScaffoldWriter : IWeaponMeshWriter
 {
-    private const string DonorM2Path = @"ITEM\ObjectComponents\WEAPON\Sword_1H_Short_A_01.m2";
+    /// <summary>Fallback scaffold when the write context names no per-family donor.</summary>
+    private const string GoldenDonorM2Path = @"ITEM\ObjectComponents\WEAPON\Sword_1H_Short_A_01.m2";
 
     private readonly MpqReaderService _mpq;
     private readonly ILogger<DonorScaffoldWriter> _logger;
@@ -34,12 +35,14 @@ public sealed class DonorScaffoldWriter : IWeaponMeshWriter
 
     public byte[]? WriteM2(RigidWeaponMesh mesh, WeaponWriteContext ctx, ForgeDiagnostics diag)
     {
-        var donor = _mpq.ExtractFile(DonorM2Path);
+        string donorPath = ctx.DonorM2Path ?? GoldenDonorM2Path;
+        var donor = _mpq.ExtractFile(donorPath);
         if (donor is null)
         {
-            diag.Error("writer.donor.missing", $"Golden donor M2 not found in mounted archives: {DonorM2Path}");
+            diag.Error("writer.donor.missing", $"Donor scaffold M2 not found in mounted archives: {donorPath}");
             return null;
         }
+        diag.Info("writer.donor", $"Scaffold donor: {donorPath}");
 
         var doc = RawM2Document.Parse(donor, out var perr);
         if (doc is null) { diag.Error("writer.donor.parse", perr ?? "donor parse failed"); return null; }

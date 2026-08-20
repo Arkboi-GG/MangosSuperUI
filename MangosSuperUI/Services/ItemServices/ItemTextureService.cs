@@ -6,6 +6,18 @@ using System.Text;
 namespace MangosSuperUI.Services;
 
 /// <summary>
+/// Temporary GLB assets produced for an uncommitted model retexture preview.
+/// Ordinary model items use <see cref="GlbUrl"/>. Shoulder items also expose
+/// the two authored side models through <see cref="Attachments"/>; GlbUrl keeps
+/// the existing preview-response gate compatible.
+/// </summary>
+public sealed class PreviewGlbAssets
+{
+    public string? GlbUrl { get; init; }
+    public Dictionary<string, string> Attachments { get; init; } = new();
+}
+
+/// <summary>
 /// Extracts, decodes, and serves item model textures on demand.
 ///
 /// Pipeline:
@@ -296,20 +308,102 @@ public class ItemTextureService
         return result;
     }
 
-    public string? BuildPreviewGlb(uint displayId, string recoloredPngPath)
+    /// <summary>
+    /// Build every temporary GLB needed to preview a staged model retexture.
+    ///
+    /// Shoulder displays are a special case: ItemDisplayInfo carries two
+    /// independently-authored M2s (ModelName1 = left, ModelName2 = right).
+    /// Returning both avoids cloning/mirroring one spaulder in the browser,
+    /// which is not geometrically equivalent and can point the clone inward.
+    /// Other model items keep the historical single-GLB contract.
+    /// </summary>
+    public PreviewGlbAssets? BuildPreviewGlbs(uint displayId, string recoloredPngPath)
     {
         if (displayId == 0 || string.IsNullOrEmpty(recoloredPngPath) || !File.Exists(recoloredPngPath))
             return null;
 
+        var modelInfo = _dbc.GetItemModelInfo(displayId);
+        if (modelInfo == null) return null;
+
+        var info = modelInfo.Value;
+        bool isShoulder = IsShoulderModelName(info.ModelName1) ||
+                          IsShoulderModelName(info.ModelName2);
+
+        if (isShoulder)
+        {
+            var leftUrl = BuildPreviewGlbCore(
+                displayId, recoloredPngPath,
+                info.ModelName1, info.TextureName1,
+                "lshoulder", doubleSided: true);
+
+            string rightTexture = !string.IsNullOrEmpty(info.TextureName2)
+                ? info.TextureName2
+                : info.TextureName1;
+            var rightUrl = BuildPreviewGlbCore(
+                displayId, recoloredPngPath,
+                info.ModelName2, rightTexture,
+                "rshoulder", doubleSided: true);
+
+            // A partial pair would leave the other side's previously-mounted
+            // model in place, producing a mixed old/new preview. Fail the pair
+            // atomically and remove whichever temporary half did build.
+            if (leftUrl == null || rightUrl == null)
+            {
+                DeletePreviewGlb(leftUrl);
+                DeletePreviewGlb(rightUrl);
+                _logger.LogWarning(
+                    "ItemTexture: incomplete shoulder preview pair for displayId {Id} (left={Left}, right={Right})",
+                    displayId, leftUrl != null, rightUrl != null);
+                return null;
+            }
+
+            return new PreviewGlbAssets
+            {
+                GlbUrl = leftUrl,
+                Attachments = new Dictionary<string, string>
+                {
+                    ["shoulderLeft"] = leftUrl,
+                    ["shoulderRight"] = rightUrl
+                }
+            };
+        }
+
+        string? modelName = !string.IsNullOrEmpty(info.ModelName1)
+            ? info.ModelName1
+            : info.ModelName2;
+        string? textureName = !string.IsNullOrEmpty(info.ModelName1)
+            ? info.TextureName1
+            : (!string.IsNullOrEmpty(info.TextureName2) ? info.TextureName2 : info.TextureName1);
+
+        var glbUrl = BuildPreviewGlbCore(
+            displayId, recoloredPngPath, modelName, textureName,
+            "model", doubleSided: false);
+        return glbUrl == null ? null : new PreviewGlbAssets { GlbUrl = glbUrl };
+    }
+
+    private static bool IsShoulderModelName(string? modelName)
+    {
+        if (string.IsNullOrWhiteSpace(modelName)) return false;
+        string stem = Path.GetFileNameWithoutExtension(modelName.Replace('\\', '/'));
+        return stem.Contains("shoulder", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Side-aware implementation shared by ordinary model previews and each
+    /// authored half of a shoulder pair.
+    /// </summary>
+    private string? BuildPreviewGlbCore(
+        uint displayId,
+        string recoloredPngPath,
+        string? modelName,
+        string? textureName,
+        string assetLabel,
+        bool doubleSided)
+    {
+        if (string.IsNullOrEmpty(modelName)) return null;
+
         try
         {
-            var modelInfo = _dbc.GetItemModelInfo(displayId);
-            if (modelInfo == null) return null;
-
-            string? modelName = !string.IsNullOrEmpty(modelInfo.Value.ModelName1)
-                ? modelInfo.Value.ModelName1
-                : modelInfo.Value.ModelName2;
-            if (string.IsNullOrEmpty(modelName)) return null;
 
             var m2Data = FindAndExtractItemM2(modelName);
             if (m2Data == null) return null;
@@ -327,9 +421,9 @@ public class ItemTextureService
                             ?? _mpq.ExtractFile(texRef.Filename.ToLowerInvariant());
                 if (blpData != null) textures[i] = blpData;
             }
-            if (!string.IsNullOrEmpty(modelInfo.Value.TextureName1))
+            if (!string.IsNullOrEmpty(textureName))
             {
-                var blpData = FindItemBlp(modelInfo.Value.TextureName1, modelName);
+                var blpData = FindItemBlp(textureName, modelName);
                 if (blpData != null)
                 {
                     int slot = FindSkinTextureSlot(m2Model, textures);
@@ -348,11 +442,12 @@ public class ItemTextureService
             // The skin can be rendered at MULTIPLE sampled slots — as a baked Type-0
             // texture AND as a Type-2 slot the DBC fills with the SAME skin (Corrupted
             // Ashbringer: baked SWORD_2H_ASHBRINGERCORRUPT at one slot + a Type-2 slot
-            // TextureName1 fills with the same skin for its other piece). Inject into
+            // the selected DBC texture fills with the same skin for its other piece).
+            // Inject into
             // every such slot. A Type-2 slot has an EMPTY M2 filename, so it can't be
-            // matched by filename — match it by TextureName1 == the primary skin.
-            string t1Stem = Path.GetFileNameWithoutExtension(
-                (modelInfo.Value.TextureName1 ?? "").Replace('\\', '/'));
+            // matched by filename — match it by the side's DBC texture == the primary skin.
+            string dbcTextureStem = Path.GetFileNameWithoutExtension(
+                (textureName ?? "").Replace('\\', '/'));
             var skinSlots = new List<int>();
             bool havePrimary = false;
             string primaryStem = "";
@@ -368,7 +463,7 @@ public class ItemTextureService
                 if (!havePrimary) { havePrimary = true; primaryStem = stem; }
                 bool sameBaked = stem.Equals(primaryStem, StringComparison.OrdinalIgnoreCase);
                 bool dbcSameSkin = stem.Length == 0 &&
-                    (primaryStem.Length == 0 || t1Stem.Equals(primaryStem, StringComparison.OrdinalIgnoreCase));
+                    (primaryStem.Length == 0 || dbcTextureStem.Equals(primaryStem, StringComparison.OrdinalIgnoreCase));
                 if (sameBaked || dbcSameSkin)
                     skinSlots.Add(ti);
             }
@@ -383,14 +478,14 @@ public class ItemTextureService
                 _logger.LogInformation("ItemTexture/DBG {Id} tex[{I}] Type={T} File='{F}'",
                     displayId, di, m2Model.Textures[di].Type, m2Model.Textures[di].Filename);
             _logger.LogInformation(
-                "ItemTexture/DBG {Id} Lookup=[{L}] Batches=[{B}] Sampled=[{S}] primaryStem='{P}' t1Stem='{T1}' skinSlots=[{K}]",
-                displayId, string.Join(",", m2Model.TextureLookup),
+                "ItemTexture/DBG {Id} {Asset} Lookup=[{L}] Batches=[{B}] Sampled=[{S}] primaryStem='{P}' dbcTextureStem='{T}' skinSlots=[{K}]",
+                displayId, assetLabel, string.Join(",", m2Model.TextureLookup),
                 string.Join(" ", m2Model.Batches.Select(b => $"{b.SubmeshIndex}:{b.TextureIndex}")),
                 string.Join(",", GlbWriter.SampledTextureIndices(m2Model)),
-                primaryStem, t1Stem, string.Join(",", skinSlots));
+                primaryStem, dbcTextureStem, string.Join(",", skinSlots));
 
             // Native dims/format of the slot we inject into: the sampled slot's own
-            // texture; for a Type-2 slot (empty filename) the DBC fills, use TextureName1;
+            // texture; for a Type-2 slot (empty filename) use the selected DBC texture;
             // else the first texture.
             int targetW = 0, targetH = 0;
             bool useDxt1 = false;
@@ -400,12 +495,12 @@ public class ItemTextureService
                 dimTex = texMeta?.Textures.FirstOrDefault(t =>
                     Path.GetFileNameWithoutExtension((t.Filename ?? "").Replace('\\', '/'))
                         .Equals(primaryStem, StringComparison.OrdinalIgnoreCase));
-            if (dimTex == null && !string.IsNullOrEmpty(modelInfo.Value.TextureName1))
+            if (dimTex == null && !string.IsNullOrEmpty(textureName))
             {
-                string t1 = Path.GetFileNameWithoutExtension(modelInfo.Value.TextureName1.Replace('\\', '/'));
+                string dbcTexture = Path.GetFileNameWithoutExtension(textureName.Replace('\\', '/'));
                 dimTex = texMeta?.Textures.FirstOrDefault(t =>
                     Path.GetFileNameWithoutExtension((t.Filename ?? "").Replace('\\', '/'))
-                        .Equals(t1, StringComparison.OrdinalIgnoreCase));
+                        .Equals(dbcTexture, StringComparison.OrdinalIgnoreCase));
             }
             dimTex ??= texMeta?.Textures.FirstOrDefault();
             if (dimTex != null)
@@ -434,23 +529,28 @@ public class ItemTextureService
             // Write to a throwaway preview path (NOT the versioned cache).
             var previewDir = Path.Combine(_env.WebRootPath, "item_models", "_preview");
             Directory.CreateDirectory(previewDir);
-            string fileName = $"preview_{displayId}_{Guid.NewGuid():N}.glb";
+            string fileName = $"preview_{displayId}_{assetLabel}_{Guid.NewGuid():N}.glb";
             string glbPath = Path.Combine(previewDir, fileName);
 
-            bool ok = GlbWriter.SaveGlb(m2Model, textures, glbPath);
+            bool ok = GlbWriter.SaveGlb(m2Model, textures, glbPath, doubleSided);
             if (!ok)
             {
-                _logger.LogWarning("ItemTexture: preview GLB write failed for displayId {Id}", displayId);
+                _logger.LogWarning(
+                    "ItemTexture: preview GLB write failed for displayId {Id} {Asset}",
+                    displayId, assetLabel);
                 return null;
             }
 
-            _logger.LogInformation("ItemTexture: built preview GLB {File} for displayId {Id} (recolor → slot(s) {Slots})",
-                fileName, displayId, string.Join(",", skinSlots));
+            _logger.LogInformation(
+                "ItemTexture: built preview GLB {File} for displayId {Id} {Asset} (recolor → slot(s) {Slots})",
+                fileName, displayId, assetLabel, string.Join(",", skinSlots));
             return $"/item_models/_preview/{fileName}";
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "ItemTexture: BuildPreviewGlb failed for displayId {Id}", displayId);
+            _logger.LogWarning(ex,
+                "ItemTexture: BuildPreviewGlb failed for displayId {Id} {Asset} model {Model}",
+                displayId, assetLabel, modelName);
             return null;
         }
     }
@@ -482,7 +582,7 @@ public class ItemTextureService
     }
 
     /// <summary>
-    /// Delete a temp preview GLB previously produced by BuildPreviewGlb. Safe to
+    /// Delete a temp preview GLB previously produced by BuildPreviewGlbs. Safe to
     /// call with a web path ("/item_models/_preview/xxx.glb") or null. Best-effort.
     /// Also opportunistically sweeps preview GLBs older than 1 hour so abandoned
     /// previews don't accumulate.
@@ -562,8 +662,8 @@ public class ItemTextureService
     // attachment system:
     //
     //   attachment ID 11 → Helm        (parented to Bone_54 = Head)
-    //   attachment ID  5 → ShoulderL   (parented to Bone_56 on HumanMale)
-    //   attachment ID  6 → ShoulderR   (parented to Bone_55 on HumanMale)
+    //   attachment ID  5 → ShoulderRight (parented to Bone_56 on HumanMale)
+    //   attachment ID  6 → ShoulderLeft  (parented to Bone_55 on HumanMale)
     //
     // Both render through the existing rigid GlbWriter pipeline, same as
     // weapons (Session D). The data difference vs weapons:

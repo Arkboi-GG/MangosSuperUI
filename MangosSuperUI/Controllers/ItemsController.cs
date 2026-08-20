@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
+using MangosSuperUI.Services.SpellServices;
 using Dapper;
 using System.Text.Json;
 
@@ -334,7 +335,120 @@ public class ItemsController : Controller
         // Generate GLB on demand from MPQ (falls back to pre-extracted GLB if it exists)
         string? modelPath = _itemTextures.EnsureGlb(displayId);
 
-        return Json(new { found = true, item, iconPath, modelPath });
+        // Resolve the item's proc/use spells to human-readable text. The tooltip
+        // description (e.g. "Chance on Hit: Increases Strength by $s1 for $d")
+        // lives only in Spell.dbc, not in the SQL spell_template, so we pull name
+        // + description from DbcService and fall back to spell_template.name for
+        // hidden spells that Spell.dbc omits.
+        var spells = await ResolveItemSpellsAsync(conn, (IDictionary<string, object>)item);
+
+        return Json(new { found = true, item, iconPath, modelPath, spells });
+    }
+
+    /// <summary>
+    /// Builds the display list for an item's up-to-5 spell slots: for each
+    /// non-empty spellid_N it returns { id, trigger, name, description,
+    /// descriptionRaw }. Names/descriptions come from Spell.dbc (DbcService),
+    /// with a spell_template.name fallback for spells Spell.dbc hides; the
+    /// description's $-tokens ($s1, $d, ...) are resolved to real numbers from
+    /// the spell's spell_template effect fields via <see cref="SpellTooltipFormatter"/>.
+    /// </summary>
+    private async Task<List<object>> ResolveItemSpellsAsync(
+        System.Data.IDbConnection conn, IDictionary<string, object> item)
+    {
+        var refs = new List<(int Id, int Trigger)>();
+        for (int i = 1; i <= 5; i++)
+        {
+            if (!item.TryGetValue($"spellid_{i}", out var sidObj)) continue;
+            int sid = Convert.ToInt32(sidObj ?? 0);
+            if (sid <= 0) continue;
+            item.TryGetValue($"spelltrigger_{i}", out var trigObj);
+            refs.Add((sid, Convert.ToInt32(trigObj ?? 0)));
+        }
+
+        var spells = new List<object>();
+        if (refs.Count == 0) return spells;
+
+        // Full spell_template rows: names for DBC-hidden spells, plus the effect
+        // fields needed to resolve tooltip tokens.
+        var sqlRows = new Dictionary<int, IDictionary<string, object>>();
+        try
+        {
+            var ids = refs.Select(r => r.Id).Distinct().ToArray();
+            var rows = await conn.QueryAsync<dynamic>(
+                @"SELECT * FROM spell_template
+                  WHERE entry IN @Ids AND build = (
+                      SELECT MAX(build) FROM spell_template st2 WHERE st2.entry = spell_template.entry)",
+                new { Ids = ids });
+            foreach (var row in rows)
+            {
+                var dict = (IDictionary<string, object>)row;
+                int e = Convert.ToInt32(dict.TryGetValue("entry", out var ev) ? ev : 0);
+                if (e > 0) sqlRows[e] = dict;
+            }
+        }
+        catch { /* spell_template may lack rows for these ids — DBC still covers most */ }
+
+        foreach (var (id, trigger) in refs)
+        {
+            string? name = null, rawDescription = null;
+            if (_dbc.SpellEntries.TryGetValue((uint)id, out var dbcEntry))
+            {
+                name = dbcEntry.Name;
+                rawDescription = dbcEntry.Description;
+            }
+
+            sqlRows.TryGetValue(id, out var row);
+            if (string.IsNullOrEmpty(name) && row != null &&
+                row.TryGetValue("name", out var nm) && nm is string sqlName && sqlName.Length > 0)
+                name = sqlName;
+
+            // Resolve $-tokens when we have both a description and the effect row.
+            string? description = rawDescription;
+            if (!string.IsNullOrEmpty(rawDescription) && row != null)
+                description = SpellTooltipFormatter.Format(rawDescription, BuildSpellNumbers((uint)id, row));
+
+            spells.Add(new { id, trigger, name, description, descriptionRaw = rawDescription });
+        }
+
+        return spells;
+    }
+
+    /// <summary>Extracts the effect fields the tooltip formatter needs from a spell_template row.</summary>
+    private SpellTooltipFormatter.SpellNumbers BuildSpellNumbers(uint entry, IDictionary<string, object> row)
+    {
+        int GetInt(string col)
+        {
+            if (row.TryGetValue(col, out var v) && v != null)
+            {
+                try { return Convert.ToInt32(v); } catch { return 0; }
+            }
+            return 0;
+        }
+
+        var n = new SpellTooltipFormatter.SpellNumbers
+        {
+            Entry = entry,
+            ProcChance = GetInt("procChance"),
+            ProcCharges = GetInt("procCharges"),
+            StackAmount = GetInt("stackAmount"),
+            MaxAffectedTargets = GetInt("maxAffectedTargets"),
+        };
+        for (int i = 0; i < 3; i++)
+        {
+            int s = i + 1;
+            n.BasePoints[i] = GetInt($"effectBasePoints{s}");
+            n.DieSides[i] = GetInt($"effectDieSides{s}");
+            n.BaseDice[i] = GetInt($"effectBaseDice{s}");
+            n.Amplitude[i] = GetInt($"effectAmplitude{s}");
+            n.ChainTargets[i] = GetInt($"effectChainTarget{s}");
+        }
+
+        uint durationIdx = (uint)GetInt("durationIndex");
+        if (_dbc.SpellDurations.TryGetValue(durationIdx, out var dur))
+            n.DurationMs = dur.DurationMs;
+
+        return n;
     }
 
     // ===================== NEW — EDIT ENDPOINTS =====================
@@ -1364,8 +1478,9 @@ public class ItemsController : Controller
 
     /// <summary>
     /// Wrap a rendered PNG (already on disk under wwwroot/item_textures_cache/)
-    /// into a throwaway preview GLB and return the response shape the panel
-    /// expects. Centralizes the "build GLB + return urls + pngPath" tail.
+    /// into throwaway preview GLB assets and return the response shape the panel
+    /// expects. Shoulder displays produce their separate authored L/R models;
+    /// single-model items continue to produce one primary GLB.
     ///
     /// (May 2026) **Optional upscaler cleanup pass.** Before wrapping, the PNG
     /// can go through ComfyUIUpscaler — 4x upscale via a game-texture-trained
@@ -1399,8 +1514,8 @@ public class ItemsController : Controller
             : await _upscaler.CleanupAsync(
                 pngPath, $"preview_{displayId}_{mode}", HttpContext.RequestAborted);
 
-        var glbUrl = _itemTextures.BuildPreviewGlb(displayId, cleanedPngPath);
-        if (glbUrl == null)
+        var previewGlbs = _itemTextures.BuildPreviewGlbs(displayId, cleanedPngPath);
+        if (previewGlbs == null)
             return Json(new { success = false, error = "Preview GLB build failed" });
 
         // Derive the public URL from the (possibly cleaned) PNG's actual disk
@@ -1412,7 +1527,11 @@ public class ItemsController : Controller
         return Json(new
         {
             success = true,
-            glbUrl,
+            glbUrl = previewGlbs.GlbUrl,
+            // Shoulder displays carry the two authored M2s independently.
+            // The client mounts these by semantic attachment ID instead of
+            // cloning/mirroring ModelName1 into the other slot.
+            attachments = previewGlbs.Attachments,
             pngUrl,
             // pngPath is sent back to the client and echoed on commit. It's
             // re-validated server-side then (ValidateStagedPngPath) — the

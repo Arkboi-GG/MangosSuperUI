@@ -12,8 +12,9 @@ namespace MangosSuperUI.Services.WeaponForge;
 ///
 /// It is strict on purpose — it bakes node transforms, selects exactly one triangle primitive, and
 /// REJECTS skins, animation, morph targets, non-triangle primitives, missing normals/UV0, and unsafe
-/// counts rather than silently repairing them. Orientation/scale to the sword envelope (grip at the
-/// origin, blade along +X) is heuristic and always reported: ambiguous cases produce diagnostics, not
+/// counts rather than silently repairing them. Orientation/scale to the weapon envelope (palm at the
+/// origin, long axis +X, per-family donor extent/grip) is heuristic and always reported: ambiguous
+/// cases produce diagnostics, not
 /// silent guesses. The final mesh still passes the same compiler validation ladder as every route;
 /// emitting it as an M2 additionally requires the Phase-5 variable-topology writer.
 /// </summary>
@@ -21,9 +22,10 @@ public sealed class GlbWeaponImporter
 {
     private readonly ILogger<GlbWeaponImporter> _logger;
 
-    /// <summary>Donor blade X-extent (WoW units) that imports are scaled to fit (WEAPON_GEN.md §2.3
-    /// golden donor: min X ≈ -0.206, max X ≈ 0.889 → ~1.095).</summary>
-    public const float DonorBladeExtent = 1.095f;
+    /// <summary>Fallback donor X-extent (WoW units) when no family donor is resolved — the golden
+    /// 1H sword's measured envelope (WEAPON_GEN.md §2.3: min X ≈ -0.206, max X ≈ 0.889 → ~1.095).
+    /// Per-family extents come from <see cref="WeaponDonorResolver"/>.</summary>
+    public const float DefaultDonorExtent = 1.095f;
 
     public GlbWeaponImporter(ILogger<GlbWeaponImporter> logger) => _logger = logger;
 
@@ -59,56 +61,82 @@ public sealed class GlbWeaponImporter
         if (diag.HasErrors) return Fail(diag, sourceSha);
         if (candidates.Count == 0) { diag.Error("glb.nomesh", "No triangle mesh found."); return Fail(diag, sourceSha); }
 
-        // Choose exactly one primitive; if several, take the largest and say so.
+        // Merge EVERY triangle primitive into one weapon mesh. Multi-material AI exports split
+        // detail pieces (gems, fittings) into their own primitives — choosing "the biggest" used to
+        // silently drop them. Winding is fixed per primitive for mirrored node transforms; the
+        // base-color texture comes from the largest primitive that carries one.
+        candidates = candidates.OrderByDescending(c => c.Prim.GetIndices()?.Count ?? 0).ToList();
         if (candidates.Count > 1)
-            diag.Warn("glb.multiprim", $"{candidates.Count} primitives found; using the one with the most triangles. Merge upstream for a single-material weapon.");
-        var (prim, world) = candidates.OrderByDescending(c => c.Prim.GetIndices()?.Count ?? 0).First();
+            diag.Info("glb.multiprim", $"{candidates.Count} triangle primitives merged into one weapon mesh.");
 
-        var posAcc = prim.GetVertexAccessor("POSITION");
-        var nrmAcc = prim.GetVertexAccessor("NORMAL");
-        var uvAcc = prim.GetVertexAccessor("TEXCOORD_0");
-        if (posAcc is null) { diag.Error("glb.nopos", "Primitive has no POSITION."); return Fail(diag, sourceSha); }
-        if (nrmAcc is null) { diag.Error("glb.nonormal", "Primitive has no NORMAL; the importer does not fabricate normals."); return Fail(diag, sourceSha); }
-        if (uvAcc is null) { diag.Error("glb.nouv", "Primitive has no TEXCOORD_0 (UV0)."); return Fail(diag, sourceSha); }
+        var bakedList = new List<Vector3>();
+        var bakedNrmList = new List<Vector3>();
+        var mergedUv = new List<Vector2>();
+        var idxAll = new List<uint>();
+        MeshPrimitive? texPrim = null;
 
-        var srcPos = posAcc.AsVector3Array();
-        var srcNrm = nrmAcc.AsVector3Array();
-        var srcUv = uvAcc.AsVector2Array();
-        int n = srcPos.Count;
-        if (n > ushort.MaxValue) { diag.Error("glb.count", $"{n} vertices exceeds the UInt16 ceiling."); return Fail(diag, sourceSha); }
-        if (srcNrm.Count != n || srcUv.Count != n) { diag.Error("glb.attrlen", "POSITION/NORMAL/TEXCOORD_0 length mismatch."); return Fail(diag, sourceSha); }
-
-        // Bake the node world transform. Positions as points; normals via inverse-transpose. A
-        // negative-determinant (mirrored) transform flips winding once here (never again for the
-        // det-+1 Y↔Z rotation, which the mesh does not undergo — GLB is already Y-up glTF space).
-        Matrix4x4.Invert(world, out var inv);
-        var normalMatrix = Matrix4x4.Transpose(inv);
-        bool flip = CoordinateContract.NodeTransformFlipsWinding(world);
-
-        var baked = new Vector3[n];
-        var bakedNrm = new Vector3[n];
-        for (int i = 0; i < n; i++)
+        foreach (var (p, world) in candidates)
         {
-            baked[i] = Vector3.Transform(srcPos[i], world);
-            bakedNrm[i] = CoordinateContract.Normalize(Vector3.TransformNormal(srcNrm[i], normalMatrix));
+            var posAcc = p.GetVertexAccessor("POSITION");
+            var nrmAcc = p.GetVertexAccessor("NORMAL");
+            var uvAcc = p.GetVertexAccessor("TEXCOORD_0");
+            if (posAcc is null) { diag.Error("glb.nopos", "A primitive has no POSITION."); return Fail(diag, sourceSha); }
+            if (nrmAcc is null) { diag.Error("glb.nonormal", "A primitive has no NORMAL; the importer does not fabricate normals."); return Fail(diag, sourceSha); }
+            if (uvAcc is null) { diag.Error("glb.nouv", "A primitive has no TEXCOORD_0 (UV0)."); return Fail(diag, sourceSha); }
+
+            var srcPos = posAcc.AsVector3Array();
+            var srcNrm = nrmAcc.AsVector3Array();
+            var srcUv = uvAcc.AsVector2Array();
+            if (srcNrm.Count != srcPos.Count || srcUv.Count != srcPos.Count)
+            { diag.Error("glb.attrlen", "POSITION/NORMAL/TEXCOORD_0 length mismatch."); return Fail(diag, sourceSha); }
+
+            // Bake the node world transform. Positions as points; normals via inverse-transpose. A
+            // negative-determinant (mirrored) transform flips winding once here (never again for the
+            // det-+1 Y↔Z rotation, which the mesh does not undergo — GLB is already Y-up glTF space).
+            Matrix4x4.Invert(world, out var inv);
+            var normalMatrix = Matrix4x4.Transpose(inv);
+            bool flip = CoordinateContract.NodeTransformFlipsWinding(world);
+
+            uint baseIdx = (uint)bakedList.Count;
+            for (int i = 0; i < srcPos.Count; i++)
+            {
+                bakedList.Add(Vector3.Transform(srcPos[i], world));
+                bakedNrmList.Add(CoordinateContract.Normalize(Vector3.TransformNormal(srcNrm[i], normalMatrix)));
+                mergedUv.Add(srcUv[i]);
+            }
+
+            var idxList = p.GetIndices();
+            int startTri = idxAll.Count;
+            if (idxList is { Count: > 0 })
+                foreach (var ix in idxList) idxAll.Add(baseIdx + ix);
+            else
+                for (uint i = 0; i < srcPos.Count; i++) idxAll.Add(baseIdx + i); // non-indexed: sequential
+            if (flip)
+                for (int t = startTri; t + 2 < idxAll.Count; t += 3)
+                    (idxAll[t + 1], idxAll[t + 2]) = (idxAll[t + 2], idxAll[t + 1]);
+
+            if (texPrim is null && p.Material?.FindChannel("BaseColor")?.Texture?.PrimaryImage is not null)
+                texPrim = p;
         }
 
-        var idxList = prim.GetIndices();
-        var indices = new uint[idxList is { Count: > 0 } ? idxList.Count : n];
-        if (idxList is { Count: > 0 })
-            for (int i = 0; i < idxList.Count; i++) indices[i] = idxList[i];
-        else
-            for (uint i = 0; i < n; i++) indices[i] = i; // non-indexed: sequential
-        if (flip)
-            for (int t = 0; t + 2 < indices.Length; t += 3)
-                (indices[t + 1], indices[t + 2]) = (indices[t + 2], indices[t + 1]);
+        int n = bakedList.Count;
+        // The UInt16 ceiling is an M2 WRITER constraint, not an import constraint: high-poly source
+        // meshes are welcome here and are decimated to game budgets before forging. A hard sanity
+        // cap remains so a corrupt file cannot allocate absurd arrays.
+        if (n > 2_000_000) { diag.Error("glb.count", $"{n} vertices — not a plausible weapon mesh."); return Fail(diag, sourceSha); }
+        if (n > ushort.MaxValue) diag.Warn("glb.count", $"{n} vertices exceeds the M2 UInt16 ceiling — decimation is required before this can forge.");
 
-        // Orientation + scale to the sword envelope (heuristic, reported).
+        var baked = bakedList.ToArray();
+        var bakedNrm = bakedNrmList.ToArray();
+        var indices = idxAll.ToArray();
+
+        // Orientation + scale to the family's weapon envelope (heuristic, reported).
         var record = new MeshNormalizationRecord();
         Vector3[] finalPos = baked;
         Vector3[] finalNrm = bakedNrm;
         if (options.Reorient)
-            (finalPos, finalNrm, record) = SwordNormalizer.Normalize(baked, bakedNrm, DonorBladeExtent, diag);
+            (finalPos, finalNrm, record) = WeaponNormalizer.Normalize(baked, bakedNrm,
+                options.TargetExtent, options.PalmBackFraction, diag);
 
         if (options.FlipGripEnd)
         {
@@ -119,7 +147,7 @@ public sealed class GlbWeaponImporter
                 finalNrm[i] = CoordinateContract.Normalize(Vector3.TransformNormal(finalNrm[i], turn));
             }
             float min = finalPos.Min(p => p.X), max = finalPos.Max(p => p.X);
-            float back = -.188f * Math.Max(max - min, 1e-6f);
+            float back = -options.PalmBackFraction * Math.Max(max - min, 1e-6f);
             float shift = back - min;
             for (int i = 0; i < finalPos.Length; i++) finalPos[i].X += shift;
             diag.Info("glb.grip.manual", "Grip/tip choice reversed by the workbench; palm convention reapplied.");
@@ -152,6 +180,13 @@ public sealed class GlbWeaponImporter
             diag.Info("glb.roll.manual", $"Applied an additional {degrees:0.#}° roll about the blade axis.");
         }
 
+        if (options.BladeProfile > 0.001f)
+        {
+            ApplyLensProfile(finalPos, Math.Clamp(options.BladeProfile, 0f, 1f));
+            RecomputeSmoothNormals(finalPos, indices, finalNrm);
+            diag.Info("glb.profile", $"Lens cross-section applied at {options.BladeProfile:P0} — centre depth boosted, tapering to the edges.");
+        }
+
         // Decimating to game budgets routinely leaves a few zero-area sliver triangles (collapsed
         // edges). They render as nothing but would hard-fail validation, so sweep them out here —
         // same epsilon the validator uses on the same final positions — and report the count.
@@ -179,13 +214,15 @@ public sealed class GlbWeaponImporter
             return Fail(diag, sourceSha);
         }
 
-        var texturePng = ExtractBaseColorPng(prim, diag);
+        byte[]? texturePng;
+        if (texPrim is not null) texturePng = ExtractBaseColorPng(texPrim, diag);
+        else { diag.Info("glb.notex", "GLB has no base-color texture; a texture must be supplied separately."); texturePng = null; }
 
         var mesh = new RigidWeaponMesh
         {
             Positions = finalPos,
             Normals = finalNrm,
-            Uv0 = srcUv.ToArray(),
+            Uv0 = mergedUv.ToArray(),
             Indices = indices,
             VertexIds = null, // variable topology — no stable golden ids
             Material = new WeaponMaterial(),
@@ -193,7 +230,14 @@ public sealed class GlbWeaponImporter
         };
 
         // Same validation ladder as every route (variable topology).
-        var meshDiag = RigidWeaponMeshValidator.Validate(mesh, new MeshValidationOptions { Topology = WeaponTopologyMode.Variable });
+        // Import-stage validation: capacity ceilings (u16 verts, 1000-tri budget) are WARNINGS here
+        // — the import page decimates to budget before forging, and forge-time validation still
+        // hard-rejects. Without this, a high-poly source can never reach the decimator at all.
+        var meshDiag = RigidWeaponMeshValidator.Validate(mesh, new MeshValidationOptions
+        {
+            Topology = WeaponTopologyMode.Variable,
+            CapacityAsWarnings = true,
+        });
         diag.AddRange(meshDiag);
         WeaponMeshQualityAnalyzer.AddDiagnostics(WeaponMeshQualityAnalyzer.Analyze(mesh), diag);
 
@@ -207,6 +251,60 @@ public sealed class GlbWeaponImporter
             VertexCount = n,
             TriangleCount = indices.Length / 3,
         };
+    }
+
+    /// <summary>Diamond/lens cross-section: per length-station (X bin), push each vertex's depth (Z)
+    /// away from the local depth centre by an amount that peaks at the width centreline and falls to
+    /// zero at the edges. Added centre depth at full strength ≈ 35% of the local half-width, so the
+    /// thickness follows the blade's own taper toward the tip and never touches the silhouette.</summary>
+    private static void ApplyLensProfile(Vector3[] pos, float strength)
+    {
+        const int Bins = 24;
+        float minX = float.MaxValue, maxX = float.MinValue;
+        foreach (var p in pos) { minX = MathF.Min(minX, p.X); maxX = MathF.Max(maxX, p.X); }
+        float range = MathF.Max(maxX - minX, 1e-6f);
+
+        var minYb = new float[Bins]; var maxYb = new float[Bins];
+        var minZb = new float[Bins]; var maxZb = new float[Bins];
+        var count = new int[Bins];
+        Array.Fill(minYb, float.MaxValue); Array.Fill(maxYb, float.MinValue);
+        Array.Fill(minZb, float.MaxValue); Array.Fill(maxZb, float.MinValue);
+        int BinOf(float x) => Math.Clamp((int)((x - minX) / range * Bins), 0, Bins - 1);
+        foreach (var p in pos)
+        {
+            int b = BinOf(p.X);
+            minYb[b] = MathF.Min(minYb[b], p.Y); maxYb[b] = MathF.Max(maxYb[b], p.Y);
+            minZb[b] = MathF.Min(minZb[b], p.Z); maxZb[b] = MathF.Max(maxZb[b], p.Z);
+            count[b]++;
+        }
+
+        for (int i = 0; i < pos.Length; i++)
+        {
+            int b = BinOf(pos[i].X);
+            if (count[b] == 0) continue;
+            float cy = (minYb[b] + maxYb[b]) * 0.5f;
+            float hw = MathF.Max((maxYb[b] - minYb[b]) * 0.5f, 1e-5f);
+            float cz = (minZb[b] + maxZb[b]) * 0.5f;
+            float edge = Math.Clamp(MathF.Abs(pos[i].Y - cy) / hw, 0f, 1f);
+            float lens = 1f - edge * edge;                 // smooth peak at the centreline
+            float side = pos[i].Z - cz;
+            if (MathF.Abs(side) < 1e-5f) continue;         // single-sheet interior — stays in plane
+            pos[i].Z += MathF.Sign(side) * strength * 0.35f * hw * lens;
+        }
+    }
+
+    /// <summary>Area-weighted smooth normals recomputed from the displaced faces (in place).</summary>
+    private static void RecomputeSmoothNormals(Vector3[] pos, uint[] indices, Vector3[] nrm)
+    {
+        var acc = new Vector3[pos.Length];
+        for (int t = 0; t + 2 < indices.Length; t += 3)
+        {
+            var a = pos[indices[t]]; var b = pos[indices[t + 1]]; var c = pos[indices[t + 2]];
+            var fn = Vector3.Cross(b - a, c - a);
+            acc[indices[t]] += fn; acc[indices[t + 1]] += fn; acc[indices[t + 2]] += fn;
+        }
+        for (int i = 0; i < nrm.Length; i++)
+            if (acc[i].LengthSquared() > 1e-12f) nrm[i] = Vector3.Normalize(acc[i]);
     }
 
     private byte[]? ExtractBaseColorPng(MeshPrimitive prim, ForgeDiagnostics diag)
@@ -278,13 +376,27 @@ public sealed class GlbWeaponImporter
 
 public sealed class GlbImportOptions
 {
-    /// <summary>Reorient/scale to the sword envelope (grip at origin, blade +X). When false, the mesh
-    /// is imported in its authored space and only structurally validated.</summary>
+    /// <summary>Reorient/scale to the weapon envelope (palm at origin, long axis +X). When false, the
+    /// mesh is imported in its authored space and only structurally validated.</summary>
     public bool Reorient { get; init; } = true;
+
+    /// <summary>Target X extent in WoW units — the resolved family donor's measured length.
+    /// Defaults to the golden 1H sword.</summary>
+    public float TargetExtent { get; init; } = GlbWeaponImporter.DefaultDonorExtent;
+
+    /// <summary>Fraction of the extent placed behind the palm/origin — the resolved family donor's
+    /// measured value (golden sword 0.188; staff ~mid-shaft).</summary>
+    public float PalmBackFraction { get; init; } = 0.188f;
     public bool StraightenBlade { get; init; }
     public bool FlipGripEnd { get; init; }
     public float DepthScale { get; init; } = 1f;
     public float RollDegrees { get; init; }
+
+    /// <summary>0..1 lens profile: displaces depth (Z) by distance-from-centerline per length
+    /// station, so a flat slab gains a diamond/lens cross-section — thickest at the centerline,
+    /// tapering to nothing at the edges. Added centre depth at 1.0 ≈ 35% of the local half-width
+    /// (so the taper follows the blade's own narrowing toward the tip). 0 = untouched.</summary>
+    public float BladeProfile { get; init; }
 }
 
 public sealed class GlbImportResult

@@ -423,6 +423,9 @@ $(function () {
             legendarySuffixCaster: currentMode === 'batch'
                 ? ($('.lf-batch-leg-caster').val() || 'of Arcana')
                 : ($('#rsLegSuffixCaster').val() || 'of Arcana'),
+            legendaryNameStyle: currentMode === 'batch'
+                ? ($('.lf-batch-leg-namestyle').val() || 'named')
+                : ($('#rsLegNameStyle').val() || 'named'),
             legendaryItemEntry: parseInt($('#rsLegendaryItem').val()) || 0
         };
     }
@@ -1067,6 +1070,7 @@ $(function () {
                         + (result.regenRemapped ? ', ' + result.regenRemapped + ' owned copies rerolled' : '')
                         + (result.regenRemoved ? ', ' + result.regenRemoved + ' removed' : '');
                     showToast(msg, 'success');
+                    showPoolFeedback(result);
                     if (selectedCreature) selectCreature(selectedCreature.entry);
                 } else {
                     showToast('Commit failed: ' + (result.error || ''), 'error');
@@ -1127,6 +1131,7 @@ $(function () {
                     if (result.warnings && result.warnings.length > 0) {
                         showToast(result.warnings.length + ' pool(s) exceeded floor capacity — ' + result.warnings[0], 'warning');
                     }
+                    showPoolFeedback(result, true);
                     $('#commitPanel').hide();
                 } else {
                     showToast('Batch commit failed: ' + (result.error || ''), 'error');
@@ -1137,6 +1142,21 @@ $(function () {
                 showToast('Batch commit failed', 'error');
             }
         });
+    }
+
+    // Surface pool-health feedback from a commit response: a hard red toast when
+    // a grouped loot pool exceeds 100% (members past the 100% mark can never
+    // drop), plus the softer floor-capacity warnings on the single-commit path
+    // (the batch path shows those itself, so it passes skipWarnings).
+    function showPoolFeedback(result, skipWarnings) {
+        if (!skipWarnings && result.warnings && result.warnings.length > 0) {
+            showToast(result.warnings.length + ' pool warning(s) — ' + result.warnings[0], 'warning');
+        }
+        if (result.poolViolations && result.poolViolations.length > 0) {
+            var v = result.poolViolations[0];
+            showToast(result.poolViolations.length + ' loot pool(s) over 100% — e.g. ' + v.scope + ' #' + v.entry +
+                ' group ' + v.groupId + ' at ' + v.total + '%. Items past 100% never drop; roll back and rebuild.', 'error');
+        }
     }
 
     // ===================== ROLLBACK =====================

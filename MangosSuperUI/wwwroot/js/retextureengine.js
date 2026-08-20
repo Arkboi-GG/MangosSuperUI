@@ -493,10 +493,40 @@
     // the selected item is dressed on with equip.equipDisplay (-> /Items/ItemDressing),
     // showing the BASE item on the model. On-model preview of the RETEXTURED result
     // needs recolored assets fed to equipBodyAtlasRetextureDirect(slotUrls) [armor] /
-    // equipWeaponGlbDirect(glbUrl) [weapon] — pending the recolor-to-asset endpoints.
+    // equipWeaponGlbDirect(glbUrl, inventoryType, attachments) [model items].
     var viewerHandle = null;
     var viewerPromise = null;    // in-flight mount, so two callers can't mount twice
     var equipToken = 0;
+    var activeModelPreviewGlbs = [];
+
+    function modelPreviewGlbUrls(data) {
+        var urls = [];
+        if (data && data.glbUrl) urls.push(data.glbUrl);
+        var attachments = (data && data.attachments) || {};
+        Object.keys(attachments).forEach(function (key) {
+            if (attachments[key]) urls.push(attachments[key]);
+        });
+        return urls.filter(function (url, index) { return urls.indexOf(url) === index; });
+    }
+
+    function deleteModelPreviewGlbs(urls) {
+        (urls || []).forEach(function (url) {
+            $.ajax({
+                url: '/Items/DeletePreviewGlb',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ glbUrl: url })
+            });
+        });
+    }
+
+    function replaceActiveModelPreviewGlbs(urls) {
+        var next = urls || [];
+        deleteModelPreviewGlbs(activeModelPreviewGlbs.filter(function (url) {
+            return next.indexOf(url) < 0;
+        }));
+        activeModelPreviewGlbs = next;
+    }
 
     window.addEventListener('re-viewer-ready', function () {
         buildOutfitPicker();
@@ -608,7 +638,11 @@
             if (token !== equipToken) return;
 
             // Nothing selected — the dressed baseline IS the finished state.
-            if (!state.displayId) { $('#reViewerMsg').hide(); return; }
+            if (!state.displayId) {
+                replaceActiveModelPreviewGlbs([]);
+                $('#reViewerMsg').hide();
+                return;
+            }
 
             var res = await window.reEquip.equipDisplay(h.cv.character, state.displayId, state.itemId);
             if (token !== equipToken) return;
@@ -639,19 +673,31 @@
         }, valueParams());
 
         $('#reViewerMsg').text('Updating model\u2026').show();
+        var responseGlbs = [];
         try {
             var data = await $.getJSON('/RetextureEngine/PreviewOnModel', params);
-            if (token !== equipToken) return;
+            responseGlbs = modelPreviewGlbUrls(data);
+            if (token !== equipToken) {
+                deleteModelPreviewGlbs(responseGlbs);
+                return;
+            }
             if (!data.success) { $('#reViewerMsg').text('on-model: ' + (data.error || 'recolor failed')).show(); return; }
 
             if (data.kind === 'atlas') {
                 await window.reEquip.equipBodyAtlasRetextureDirect(h.cv.character, data.slotUrls);
             } else if (data.kind === 'weapon') {
-                await window.reEquip.equipWeaponGlbDirect(h.cv.character, data.glbUrl, state.inventoryType || 0);
+                var mounted = await window.reEquip.equipWeaponGlbDirect(
+                    h.cv.character, data.glbUrl, state.inventoryType || 0, data.attachments);
+                if (!mounted) throw new Error('model preview could not be mounted');
             }
-            if (token !== equipToken) return;
+            if (token !== equipToken) {
+                deleteModelPreviewGlbs(responseGlbs);
+                return;
+            }
+            replaceActiveModelPreviewGlbs(data.kind === 'weapon' ? responseGlbs : []);
             $('#reViewerMsg').hide();
         } catch (err) {
+            deleteModelPreviewGlbs(responseGlbs);
             $('#reViewerMsg').text('overlay error: ' + (err && err.message || err)).show();
         }
     }

@@ -54,6 +54,11 @@ $(function () {
             $('#cfgVmangosClientDataPath').val(s.vmangos.clientDataPath);
             $('#cfgVmapsDataPath').val(s.vmangos.vmapsDataPath || '');
 
+            // Weapon Forge (TBC import source)
+            if (s.weaponForge) {
+                $('#cfgTbcDataPath').val(s.weaponForge.tbcDataPath || '');
+            }
+
             // Kestrel
             $('#cfgKestrelUrl').val(s.kestrel.url);
 
@@ -482,6 +487,9 @@ $(function () {
                 clientM2Path: $('#cfgClientM2Path').val() || '',
                 clientDataPath: $('#cfgClientDataPath').val() || '',
                 patchOutputPath: $('#cfgPatchOutputPath').val() || ''
+            },
+            weaponForge: {
+                tbcDataPath: $('#cfgTbcDataPath').val() || ''
             },
             wiki: {
                 root: $('#cfgWikiRoot').val() || ''
