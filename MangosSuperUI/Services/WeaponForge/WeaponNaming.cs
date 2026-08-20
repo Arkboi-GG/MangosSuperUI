@@ -37,6 +37,14 @@ public static class WeaponNaming
     /// <summary>Physical MPQ BLP member path, e.g. Item\ObjectComponents\Weapon\SUI_W_0001_V01.blp.</summary>
     public static string TextureMpqPath(int modelIndex, int variant = 1) => $@"{WeaponDir}\{TextureStem(modelIndex, variant)}.blp";
 
+    /// <summary>Effect-texture stem for multi-pass weapons (glow layers), e.g. "SUI_W_0001_E01".
+    /// Unlike the display texture these are referenced by HARDCODED (Type-0) filenames inside the
+    /// M2 — the way stock glowing weapons bind their effect layers. slot is 1-based.</summary>
+    public static string EffectTextureStem(int modelIndex, int slot) => $"{ModelStem(modelIndex)}_E{slot:D2}";
+
+    /// <summary>Physical MPQ member for an effect texture, e.g. Item\ObjectComponents\Weapon\SUI_W_0001_E01.blp.</summary>
+    public static string EffectTextureMpqPath(int modelIndex, int slot) => $@"{WeaponDir}\{EffectTextureStem(modelIndex, slot)}.blp";
+
     /// <summary>The canonical DBC file member path inside the patch MPQ.</summary>
     public const string ItemDisplayInfoMember = @"DBFilesClient\ItemDisplayInfo.dbc";
 }

@@ -52,27 +52,73 @@ public sealed class RigidWeaponMesh
     /// </summary>
     public MeshNormalizationRecord Normalization { get; init; } = MeshNormalizationRecord.Identity;
 
+    /// <summary>
+    /// Multi-pass structure (TBC imports with glow layers). When present, <see cref="Indices"/> is
+    /// laid out submesh-contiguous and each pass draws one submesh range with its own render flags
+    /// and texture slot. Null = the whole mesh is one base pass with <see cref="Material"/> — every
+    /// pre-existing route (GLB import, parametric) stays on that path untouched.
+    /// </summary>
+    public IReadOnlyList<WeaponSubmeshRange>? SubmeshRanges { get; init; }
+
+    /// <summary>Render passes over <see cref="SubmeshRanges"/>; null = single-pass (see above).</summary>
+    public IReadOnlyList<WeaponPass>? Passes { get; init; }
+
     public int VertexCount => Positions.Length;
     public int TriangleCount => Indices.Length / 3;
 }
 
-/// <summary>The v1 material: one opaque base render pass bound to one Type-2 (empty-filename) M2
-/// texture slot whose pixels come from ItemDisplayInfo.TextureName1. DXT3/alpha/multi-pass are
-/// out of scope for v1 and are represented by later additions, not by overloading this.</summary>
+/// <summary>One contiguous submesh block inside a multi-pass mesh.</summary>
+public sealed record WeaponSubmeshRange
+{
+    public required int IndexStart { get; init; }   // into RigidWeaponMesh.Indices; multiple of 3
+    public required int IndexCount { get; init; }
+    public required int VertexStart { get; init; }
+    public required int VertexCount { get; init; }
+}
+
+/// <summary>One render pass of a multi-pass weapon: a submesh drawn with raw M2 render-flag bits
+/// and blend mode (carried verbatim from the source — vanilla supports GxBlend 0–6), layered by
+/// the M2 batch MaterialLayer, sampling one texture slot.</summary>
+public sealed record WeaponPass
+{
+    public required int SubmeshSlot { get; init; }
+
+    /// <summary>Raw M2 render-flag bits (0x01 unlit, 0x04 two-sided, 0x10 no-z-write …).</summary>
+    public required ushort RenderFlags { get; init; }
+
+    /// <summary>Raw M2 blend mode (0 opaque, 1 alpha-key, 2 alpha, 3/4 additive …).</summary>
+    public required ushort BlendMode { get; init; }
+
+    /// <summary>Batch MaterialLayer — orders coincident passes without z-fighting.</summary>
+    public required int Layer { get; init; }
+
+    /// <summary>0 = the DBC-driven base texture (Type-2 slot); 1.. = effect texture (Type-0
+    /// hardcoded SUI_W_####_E0N path packaged alongside the model).</summary>
+    public required int TextureSlot { get; init; }
+}
+
+/// <summary>The single-pass material: one base render pass bound to one Type-2 (empty-filename) M2
+/// texture slot whose pixels come from ItemDisplayInfo.TextureName1. Opaque (DXT1) is the default;
+/// <see cref="WeaponBlendMode.AlphaKey"/> (DXT3 + blend-mode-1 render flag) exists because many
+/// TBC blades cut their silhouette out of a sheet with texture alpha — imported opaque they render
+/// as solid black slabs. Multi-pass/additive stays out of scope; glow passes are dropped at import.</summary>
 public sealed class WeaponMaterial
 {
-    /// <summary>Opaque base pass — the only v1 blend mode. Present as an explicit field so a future
-    /// alpha pass is an added value, not a silent reinterpretation.</summary>
     public WeaponBlendMode BlendMode { get; init; } = WeaponBlendMode.Opaque;
 
-    /// <summary>Two-sided rendering. Weapons are single-sided in vanilla; kept false for v1.</summary>
+    /// <summary>Two-sided rendering (M2 render-flag bit 0x04). Vanilla weapons are single-sided;
+    /// alpha-cut TBC sheet blades are usually authored two-sided.</summary>
     public bool TwoSided { get; init; } = false;
 }
 
 public enum WeaponBlendMode
 {
-    /// <summary>Opaque base pass, no alpha (v1). Maps to M2 render flag / DXT1.</summary>
+    /// <summary>Opaque base pass, no alpha. Maps to M2 blend mode 0 / DXT1.</summary>
     Opaque = 0,
+
+    /// <summary>Alpha-keyed (tested) base pass — texture alpha cuts the silhouette.
+    /// Maps to M2 blend mode 1 / DXT3.</summary>
+    AlphaKey = 1,
 }
 
 /// <summary>Explicit record of the affine normalization applied to bring source geometry into the

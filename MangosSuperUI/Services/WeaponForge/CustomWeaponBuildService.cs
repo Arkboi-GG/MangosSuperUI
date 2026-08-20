@@ -121,6 +121,7 @@ public sealed class CustomWeaponBuildService
         var diag = new ForgeDiagnostics("build");
         byte[] m2;
         byte[] blp;
+        var effectBlps = new List<(string MpqPath, byte[] Blp)>();
         if (hasMesh)
         {
             // Envelope follows the source aspect (snapped to powers of two, ≤256) rather than a
@@ -130,13 +131,40 @@ public sealed class CustomWeaponBuildService
             if (request.TexturePng is { Length: > 0 })
             {
                 var (tw, th) = TargetBlpSize(request.TexturePng);
-                texture = new WeaponTexture { SourcePng = request.TexturePng, Width = tw, Height = th, UseDxt1 = true };
+                // Alpha-keyed materials (TBC cutout blades) need the alpha channel to survive —
+                // DXT3. Opaque stays DXT1 (the overwhelming stock envelope).
+                bool keepAlpha = request.Mesh?.Material.BlendMode == WeaponBlendMode.AlphaKey;
+                texture = new WeaponTexture { SourcePng = request.TexturePng, Width = tw, Height = th, UseDxt1 = !keepAlpha };
             }
+
+            // Effect textures (multi-pass glow): packaged as Type-0 members the emitted M2 names
+            // by hardcoded path. Alpha survives (DXT3) when any pass using the slot alpha-blends;
+            // pure additive glow works on RGB and stays DXT1.
+            List<WeaponTexture>? effectTextures = null;
+            List<string>? effectPaths = null;
+            if (request.EffectTexturesPng is { Count: > 0 } && request.Mesh?.Passes is { Count: > 0 } meshPasses)
+            {
+                effectTextures = new List<WeaponTexture>();
+                effectPaths = new List<string>();
+                for (int i = 0; i < request.EffectTexturesPng.Count; i++)
+                {
+                    var png = request.EffectTexturesPng[i];
+                    if (png is not { Length: > 0 })
+                        throw new InvalidOperationException($"Effect texture slot {i + 1} has no image bytes.");
+                    var (ew, eh) = TargetBlpSize(png);
+                    bool alpha = meshPasses.Any(p => p.TextureSlot == i + 1 && p.BlendMode is 1 or 2);
+                    effectTextures.Add(new WeaponTexture { SourcePng = png, Width = ew, Height = eh, UseDxt1 = !alpha });
+                    effectPaths.Add(WeaponNaming.EffectTextureMpqPath(modelIndex, i + 1));
+                }
+            }
+
             var compiled = _compiler.Compile(request.Mesh!, texture, new WeaponCompileOptions
             {
                 ModelIndex = modelIndex,
                 CanonicalInternalName = !request.KeepDonorInternalName,
                 DonorM2Path = donor.M2Path,
+                EffectTextures = effectTextures,
+                EffectTexturePaths = effectPaths,
                 MeshValidation = new MeshValidationOptions { Topology = request.Topology },
             });
             diag.AddRange(compiled.Diagnostics);
@@ -145,6 +173,8 @@ public sealed class CustomWeaponBuildService
                     compiled.Diagnostics.Items.Where(i => i.Severity == ForgeSeverity.Error).Select(i => i.Message)));
             m2 = compiled.M2;
             blp = compiled.Blp ?? ExtractDonorBlp(donor);
+            for (int i = 0; i < compiled.EffectBlps.Count && effectPaths is not null; i++)
+                effectBlps.Add((effectPaths[i], compiled.EffectBlps[i]));
         }
         else
         {
@@ -155,12 +185,16 @@ public sealed class CustomWeaponBuildService
         // 4) Persist FIRST — the stored compiled bytes are what every future unified rebuild
         //    re-packages, so a weapon that isn't durably recorded must not be handed out.
         //    The gameplay row clones donor 2131 with the family's subclass/inventory/sheath/
-        //    material/delay overrides, so a forged axe IS an axe to the core.
-        var sql = WeaponItemTemplateSql.Build(entryRes.Id, weaponName, dispRes.Id, buildId,
-            profile.ItemTemplateOverrides());
+        //    material/delay overrides, so a forged axe IS an axe to the core. Request-level
+        //    overrides (e.g. the TBC source item's own sheath/slot/delay) layer on top.
+        var overrides = profile.ItemTemplateOverrides();
+        if (request.ItemOverrides is not null)
+            foreach (var (col, val) in request.ItemOverrides)
+                overrides[col] = val;
+        var sql = WeaponItemTemplateSql.Build(entryRes.Id, weaponName, dispRes.Id, buildId, overrides);
         string iconStem = donor.IconStem.Length > 0 ? donor.IconStem : ReadDonorIconStem(baseReader);
         await PersistRecordsAsync(request, profile, donor, buildId, modelIndex, entryRes.Id, dispRes.Id,
-            weaponName, m2, blp, sql, donorGroupSound, iconStem);
+            weaponName, m2, blp, effectBlps, sql, donorGroupSound, iconStem);
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemDisplay, dispRes.Id, "committed");
 
@@ -176,8 +210,11 @@ public sealed class CustomWeaponBuildService
         if (assembly.Patch is null)
             throw new InvalidOperationException("Unified patch assembly produced no weapons — the just-persisted weapon should have been included.");
 
-        // 6) Preview the freshly packaged bytes.
-        var preview = _preview.RenderFromBytes(m2, blp);
+        // 6) Preview the freshly packaged bytes (effect textures bound by their hardcoded paths).
+        var preview = _preview.RenderFromBytes(m2, blp,
+            effectBlps.Count > 0
+                ? effectBlps.ToDictionary(e => e.MpqPath, e => e.Blp, StringComparer.OrdinalIgnoreCase)
+                : null);
 
         // 7) Write the build directory: straight patch-5.MPQ + item_template.sql (+ reports). No ZIP.
         var manifest = BuildManifest(request, profile, donor, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
@@ -406,6 +443,7 @@ public sealed class CustomWeaponBuildService
             await conn.OpenAsync();
             await conn.ExecuteAsync("DELETE FROM custom_weapon_item_manifest WHERE display_id = @displayId", new { displayId });
             await conn.ExecuteAsync("DELETE FROM custom_weapon_display WHERE display_id = @displayId", new { displayId });
+            await conn.ExecuteAsync("DELETE FROM custom_weapon_model_texture WHERE model_id = @displayId", new { displayId });
             await conn.ExecuteAsync("DELETE FROM custom_weapon_model WHERE model_id = @displayId", new { displayId });
         }
 
@@ -580,6 +618,11 @@ public sealed class CustomWeaponBuildService
         int replaced = baseReader.RemoveRowsWhere(id => customIds.Contains(id));
         byte[] cleanedBase = replaced > 0 ? baseReader.Write() : baseDbc;
 
+        // Effect textures (multi-pass glow) ride along as additional members, keyed by the
+        // hardcoded paths the packaged M2s reference.
+        var effectMembers = await LoadEffectTextureMembersAsync(
+            packaged.Select(w => (long)w.ModelId).ToHashSet());
+
         var input = new WeaponPatchInput
         {
             CleanItemDisplayInfoDbc = cleanedBase,
@@ -595,7 +638,9 @@ public sealed class CustomWeaponBuildService
             Models = packaged.GroupBy(w => w.ModelMpqPath, StringComparer.OrdinalIgnoreCase)
                 .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().M2! }).ToArray(),
             Textures = packaged.GroupBy(w => w.TextureMpqPath, StringComparer.OrdinalIgnoreCase)
-                .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().Blp! }).ToArray(),
+                .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().Blp! })
+                .Concat(effectMembers)
+                .ToArray(),
         };
         string tempDir = Path.Combine(Path.GetTempPath(), "weaponforge", tempKey);
         var patch = _patch.Build(input, tempDir);
@@ -676,7 +721,8 @@ public sealed class CustomWeaponBuildService
 
     private async Task PersistRecordsAsync(CustomWeaponBuildRequest request, WeaponTypeProfile profile,
         WeaponDonorInfo donor, string buildId, int modelIndex,
-        long entry, long display, string weaponName, byte[] m2, byte[] blp, GeneratedSql sql, uint groupSound,
+        long entry, long display, string weaponName, byte[] m2, byte[] blp,
+        IReadOnlyList<(string MpqPath, byte[] Blp)> effectBlps, GeneratedSql sql, uint groupSound,
         string iconStem)
     {
         string? sourceSha = request.SourceBlob is { Length: > 0 } src ? Sha256(src) : null;
@@ -744,6 +790,25 @@ public sealed class CustomWeaponBuildService
               VALUES (@build, @entry, @display, @gameplay, @sql, @sqlsha)
               ON DUPLICATE KEY UPDATE sql_sha256 = VALUES(sql_sha256), gameplay_json = VALUES(gameplay_json)",
             new { build = buildId, entry, display, gameplay = gameplayJson, sql = sql.Text, sqlsha = sql.Sha256 });
+
+        // Effect textures (multi-pass glow): replace the model's set wholesale — the emitted M2's
+        // hardcoded filenames and these rows must stay in lockstep.
+        await conn.ExecuteAsync("DELETE FROM custom_weapon_model_texture WHERE model_id = @model_id",
+            new { model_id = display });
+        for (int i = 0; i < effectBlps.Count; i++)
+        {
+            await conn.ExecuteAsync(
+                @"INSERT INTO custom_weapon_model_texture (model_id, slot, mpq_path, compiled_blp, blp_sha256)
+                  VALUES (@model_id, @slot, @path, @blp, @sha)",
+                new
+                {
+                    model_id = display,
+                    slot = i + 1,
+                    path = effectBlps[i].MpqPath,
+                    blp = effectBlps[i].Blp,
+                    sha = Sha256(effectBlps[i].Blp),
+                });
+        }
     }
 
     private sealed class PackagedWeaponRow
@@ -771,6 +836,26 @@ public sealed class CustomWeaponBuildService
                 catch { return null; }
             }
         }
+    }
+
+    /// <summary>Effect-texture MPQ members (multi-pass glow) for the given packaged models.</summary>
+    private async Task<List<MpqMember>> LoadEffectTextureMembersAsync(HashSet<long> modelIds)
+    {
+        if (modelIds.Count == 0) return new List<MpqMember>();
+        await using var conn = _db.Admin();
+        await conn.OpenAsync();
+        var rows = await conn.QueryAsync(
+            @"SELECT model_id AS ModelId, mpq_path AS MpqPath, compiled_blp AS Blp
+              FROM custom_weapon_model_texture
+              WHERE compiled_blp IS NOT NULL
+              ORDER BY model_id, slot");
+        var members = new List<MpqMember>();
+        foreach (var r in rows)
+        {
+            if (!modelIds.Contains(Convert.ToInt64(r.ModelId))) continue;
+            members.Add(new MpqMember { MpqPath = (string)r.MpqPath, Data = (byte[])r.Blp });
+        }
+        return members;
     }
 
     private async Task<List<PackagedWeaponRow>> LoadPackagedWeaponsAsync()
@@ -1002,12 +1087,22 @@ public sealed class CustomWeaponBuildRequest
     /// the display donor row (sound/icon). Unknown/empty falls back to the proven 1H sword.</summary>
     public string? WeaponTypeKey { get; init; }
 
+    /// <summary>Item_template column overrides layered OVER the family defaults — e.g. the TBC
+    /// import carries the source item's own sheath (the Warglaives are 1H swords with the
+    /// two-hander back-sheath value 1 — that's the crossed-on-back look), inventory slot, and
+    /// swing delay. Keys are validated against the fixture columns; fail-closed on unknowns.</summary>
+    public Dictionary<string, string>? ItemOverrides { get; init; }
+
     public RigidWeaponMesh? Mesh { get; init; }
     public WeaponTopologyMode Topology { get; init; } = WeaponTopologyMode.Variable;
 
     /// <summary>Optional PNG master (e.g. the GLB's embedded texture). Encoded to a 256×256 DXT1 BLP;
     /// when absent the donor texture is packaged so the model still samples something valid.</summary>
     public byte[]? TexturePng { get; init; }
+
+    /// <summary>Effect texture PNGs for the mesh's texture slots 1.. (multi-pass glow imports).
+    /// Encoded and packaged as Type-0 members the emitted M2 references by hardcoded path.</summary>
+    public IReadOnlyList<byte[]>? EffectTexturesPng { get; init; }
 
     public byte[]? PrecompiledM2 { get; init; }
     public byte[]? PrecompiledBlp { get; init; }

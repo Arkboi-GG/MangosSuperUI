@@ -33,15 +33,31 @@ public sealed class WeaponAssetCompiler
         var meshDiag = RigidWeaponMeshValidator.Validate(mesh, options.MeshValidation);
         diag.AddRange(meshDiag);
 
-        // 2) Texture → 128×64 DXT1 BLP (§2.4). Independent of mesh validity so a texture problem is
-        //    reported even when geometry is rejected.
+        // 2) Texture → BLP (§2.4). Independent of mesh validity so a texture problem is
+        //    reported even when geometry is rejected. Effect textures (multi-pass glow) encode
+        //    alongside — packaged as Type-0 members next to the model.
         byte[]? blp = null;
         if (texture is not null)
             blp = EncodeTexture(texture, diag);
 
+        var effectBlps = new List<byte[]>();
+        if (options.EffectTextures is { Count: > 0 })
+        {
+            for (int i = 0; i < options.EffectTextures.Count; i++)
+            {
+                var enc = EncodeTexture(options.EffectTextures[i], diag);
+                if (enc is null)
+                {
+                    diag.Error("blp.effect", $"Effect texture {i + 1} failed to encode.");
+                    break;
+                }
+                effectBlps.Add(enc);
+            }
+        }
+
         // 3) Mesh → M2, only if the mesh passed and a writer is available.
         byte[]? m2 = null;
-        if (!meshDiag.HasErrors)
+        if (!meshDiag.HasErrors && !diag.HasErrors)
         {
             var ctx = new WeaponWriteContext
             {
@@ -49,6 +65,7 @@ public sealed class WeaponAssetCompiler
                 Variant = options.Variant,
                 CanonicalInternalName = options.CanonicalInternalName,
                 DonorM2Path = options.DonorM2Path,
+                EffectTexturePaths = options.EffectTexturePaths,
             };
             m2 = _writer.WriteM2(mesh, ctx, diag);
         }
@@ -57,7 +74,11 @@ public sealed class WeaponAssetCompiler
         string? previewPath = null;
         if (m2 is not null)
         {
-            var pr = _preview.RenderFromBytes(m2, blp);
+            var extras = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+            if (options.EffectTexturePaths is not null)
+                for (int i = 0; i < effectBlps.Count && i < options.EffectTexturePaths.Count; i++)
+                    extras[options.EffectTexturePaths[i]] = effectBlps[i];
+            var pr = _preview.RenderFromBytes(m2, blp, extras.Count > 0 ? extras : null);
             if (pr.Ok) previewPath = pr.GlbWebPath;
             else diag.Warn("preview.failed", pr.Error ?? "preview failed");
         }
@@ -66,6 +87,7 @@ public sealed class WeaponAssetCompiler
         {
             M2 = m2,
             Blp = blp,
+            EffectBlps = effectBlps,
             PreviewGlbWebPath = previewPath,
             Diagnostics = diag,
         };
@@ -115,6 +137,11 @@ public sealed class WeaponWriteContext
     /// <summary>MPQ member path of the donor scaffold M2 to build on (bones, attachments,
     /// sequences follow the donor). Null → the writer's golden 1H sword.</summary>
     public string? DonorM2Path { get; init; }
+
+    /// <summary>Packaged MPQ member paths for the mesh's effect texture slots 1.. (multi-pass
+    /// glow output) — embedded as hardcoded Type-0 filenames in the emitted M2. Required when the
+    /// mesh's passes reference texture slots above 0.</summary>
+    public IReadOnlyList<string>? EffectTexturePaths { get; init; }
 }
 
 /// <summary>Phase-1 placeholder: the donor-scaffold M2 writer does not exist yet. Records a
@@ -149,6 +176,13 @@ public sealed class WeaponCompileOptions
     /// <summary>Donor scaffold M2 member for the writer (per weapon family). Null → golden sword.</summary>
     public string? DonorM2Path { get; init; }
 
+    /// <summary>Effect textures (multi-pass glow), parallel to <see cref="EffectTexturePaths"/>.</summary>
+    public IReadOnlyList<WeaponTexture>? EffectTextures { get; init; }
+
+    /// <summary>Packaged MPQ member paths for the effect texture slots — embedded as hardcoded
+    /// Type-0 filenames in the emitted M2 and added to the patch.</summary>
+    public IReadOnlyList<string>? EffectTexturePaths { get; init; }
+
     public MeshValidationOptions MeshValidation { get; init; } = new();
 }
 
@@ -156,6 +190,8 @@ public sealed class WeaponCompileOutput
 {
     public byte[]? M2 { get; init; }
     public byte[]? Blp { get; init; }
+    /// <summary>Encoded effect BLPs, parallel to the compile options' EffectTexturePaths.</summary>
+    public IReadOnlyList<byte[]> EffectBlps { get; init; } = [];
     public string? PreviewGlbWebPath { get; init; }
     public required ForgeDiagnostics Diagnostics { get; init; }
     public bool Ok => M2 is not null && !Diagnostics.HasErrors;

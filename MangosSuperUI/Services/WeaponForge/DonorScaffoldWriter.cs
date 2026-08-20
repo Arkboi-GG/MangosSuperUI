@@ -52,7 +52,7 @@ public sealed class DonorScaffoldWriter : IWeaponMeshWriter
 
         byte[]? outBytes = fixedTopology
             ? WriteFixedTopology(mesh, donor, doc, diag)
-            : WriteVariableTopology(mesh, donor, doc, diag);
+            : WriteVariableTopology(mesh, donor, doc, ctx, diag);
         if (outBytes is null) return null;
 
         // Canonical internal name (offset-preserving EOF append). Reported so the one deliberate
@@ -109,7 +109,8 @@ public sealed class DonorScaffoldWriter : IWeaponMeshWriter
 
     /// <summary>Variable topology (Phase 5): append a fresh vertex block + four equivalent views,
     /// reusing the donor's preserved tables. Both policies below need reference-client proof.</summary>
-    private byte[]? WriteVariableTopology(RigidWeaponMesh mesh, byte[] donor, RawM2Document doc, ForgeDiagnostics diag)
+    private byte[]? WriteVariableTopology(RigidWeaponMesh mesh, byte[] donor, RawM2Document doc,
+        WeaponWriteContext ctx, ForgeDiagnostics diag)
     {
         diag.Warn("writer.variable.views", "Variable topology emits four EQUIVALENT views (not per-LOD); confirm in the reference client.");
         diag.Warn("writer.variable.layout", "Geometry is appended after the donor, leaving the donor's original geometry as dead bytes; confirm in the reference client.");
@@ -121,7 +122,18 @@ public sealed class DonorScaffoldWriter : IWeaponMeshWriter
             posWoW[i] = CoordinateContract.MeshToWoW(mesh.Positions[i]);
             nrmWoW[i] = CoordinateContract.MeshNormalToWoW(mesh.Normals[i]);
         }
-        try { return M2VariableTopologyBuilder.Build(donor, posWoW, nrmWoW, mesh.Uv0, mesh.Indices, viewCount: 4); }
+        if (mesh.Passes is { Count: > 0 })
+            diag.Info("writer.passes",
+                $"Multi-pass output: {mesh.SubmeshRanges?.Count ?? 0} submesh(es), {mesh.Passes.Count} pass(es), " +
+                $"{ctx.EffectTexturePaths?.Count ?? 0} effect texture(s).");
+        else if (mesh.Material.BlendMode != WeaponBlendMode.Opaque || mesh.Material.TwoSided)
+            diag.Info("writer.material",
+                $"Render flag carries source material: blend={(int)mesh.Material.BlendMode}, twoSided={mesh.Material.TwoSided}.");
+        try
+        {
+            return M2VariableTopologyBuilder.Build(donor, posWoW, nrmWoW, mesh.Uv0, mesh,
+                viewCount: 4, material: mesh.Material, effectTexturePaths: ctx.EffectTexturePaths);
+        }
         catch (Exception ex) { diag.Error("writer.variable.build", ex.Message); return null; }
     }
 }

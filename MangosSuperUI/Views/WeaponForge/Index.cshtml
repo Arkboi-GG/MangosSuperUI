@@ -334,9 +334,11 @@
                 model.traverse((o) => {
                     if (o.isMesh) {
                         const map = o.material && o.material.map ? o.material.map : null;
+                        // alphaTest 0.5 mirrors the in-game alpha-key pass for cutout blades;
+                        // harmless for opaque textures (their alpha is 1 everywhere).
                         o.material = new THREE.MeshStandardMaterial({
                             map: map, color: map ? 0xffffff : 0xb8bec9, metalness: 0.15, roughness: 0.65,
-                            flatShading: true, side: THREE.DoubleSide });
+                            flatShading: true, side: THREE.DoubleSide, alphaTest: map ? 0.5 : 0 });
                     }
                 });
                 current = model; scene.add(model);
