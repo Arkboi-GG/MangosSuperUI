@@ -73,6 +73,8 @@ public class WeaponForgeController : Controller
         r.Name,
         r.WeaponType,
         r.WeaponTypeLabel,
+        r.InventoryType,
+        r.InventoryTypeLabel,
         r.SourceKind,
         r.ModelMember,
         r.TextureMember,
@@ -169,6 +171,8 @@ public class WeaponForgeController : Controller
                 {
                     key = p.Key,
                     label = p.Label,
+                    inventoryType = p.InventoryType,
+                    inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(p.InventoryType),
                     twoHanded = p.TwoHanded,
                     ok = true,
                     donorModel = (string?)d.ModelName,
@@ -185,6 +189,8 @@ public class WeaponForgeController : Controller
                 {
                     key = p.Key,
                     label = p.Label,
+                    inventoryType = p.InventoryType,
+                    inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(p.InventoryType),
                     twoHanded = p.TwoHanded,
                     ok = false,
                     donorModel = (string?)null,
@@ -297,6 +303,8 @@ public class WeaponForgeController : Controller
                     w.Name,
                     weaponType = w.WeaponType,
                     weaponTypeLabel = w.WeaponType is null ? null : WeaponTypeCatalog.Get(w.WeaponType).Label,
+                    inventoryType = w.InventoryType,
+                    inventoryTypeLabel = w.InventoryTypeLabel,
                     w.SourceKind,
                     w.ModelMpqPath,
                     w.BuildId,
@@ -461,7 +469,7 @@ public class WeaponForgeController : Controller
             grip = BuildGripInfo(mesh, profile, donor),
             preview,
             diagnostics = import.Diagnostics.Items.Select(i => i.ToString()),
-            note = "Preview only — nothing was packaged. Geometry, sidedness and pass order match the forge; WebGL approximates WoW multi-texture combiners.",
+            note = "Preview only — nothing was packaged. Forge builds this geometry and material into the game.",
         });
     }
 
@@ -695,6 +703,8 @@ public class WeaponForgeController : Controller
                         itemLevel = i.ItemLevel,
                         typeKey,
                         typeLabel = WeaponTypeCatalog.Get(typeKey).Label,
+                        inventoryType = i.InventoryType,
+                        inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(i.InventoryType),
                         w.DisplayRow,
                         model = w.ModelStem,
                         texture = w.TextureStem,
@@ -732,6 +742,8 @@ public class WeaponForgeController : Controller
                 itemLevel = 0,
                 typeKey = (string?)null,
                 typeLabel = (string?)null,
+                inventoryType = (int?)null,
+                inventoryTypeLabel = (string?)null,
                 w.DisplayRow,
                 model = w.ModelStem,
                 texture = w.TextureStem,
@@ -851,6 +863,7 @@ public class WeaponForgeController : Controller
             ? TbcItemCatalog.TypeKeyForSubclass(item.Subclass)
             : weaponType;
         var profile = WeaponTypeCatalog.Get(typeKey);
+        int effectiveInventoryType = EffectiveTbcInventoryType(item, profile);
         object? grip = null;
         try { grip = BuildGripInfo(mesh, profile, _donors.Resolve(profile)); }
         catch { /* grip markers are optional for preview */ }
@@ -866,6 +879,8 @@ public class WeaponForgeController : Controller
             sel.DisplayRow,
             weaponType = profile.Key,
             weaponTypeLabel = profile.Label,
+            inventoryType = effectiveInventoryType,
+            inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(effectiveInventoryType),
             vertexCount = mesh.VertexCount,
             triangleCount = mesh.TriangleCount,
             hasTexture = texturePng is { Length: > 0 },
@@ -873,7 +888,7 @@ public class WeaponForgeController : Controller
             grip,
             preview,
             diagnostics = diag.Items.Select(i => i.ToString()),
-            note = "Preview only — nothing was packaged. Geometry, sidedness and pass order match the forge; WebGL approximates WoW multi-texture combiners.",
+            note = "Preview only — nothing was packaged. Geometry, sidedness and pass order match the forge; WebGL approximates WoW multi-texture combiners and shows UV animation at its rest frame, while the forged M2 retains supported global UV tracks.",
         });
     }
 
@@ -925,6 +940,9 @@ public class WeaponForgeController : Controller
 
         try
         {
+            byte[]? adjustedTexturePng = AdjustTexture(texturePng, brightness, saturation);
+            bool sourceGradeUnchanged = brightness == 0 && saturation == 0 ||
+                ReferenceEquals(adjustedTexturePng, texturePng);
             var result = await _builder.BuildAsync(new CustomWeaponBuildRequest
             {
                 Name = !string.IsNullOrWhiteSpace(name) ? name
@@ -936,8 +954,8 @@ public class WeaponForgeController : Controller
                 Mesh = mesh,
                 Topology = WeaponTopologyMode.Variable,
                 VariableTriangleHardCeiling = MaxTbcForgeTriangles,
-                TexturePng = AdjustTexture(texturePng, brightness, saturation),
-                TextureBlp = brightness == 0 && saturation == 0 ? textureBlp : null,
+                TexturePng = adjustedTexturePng,
+                TextureBlp = sourceGradeUnchanged ? textureBlp : null,
                 EffectTexturesPng = effectPngs,
                 EffectTexturesBlp = effectBlps,
                 SourceBlob = m2Bytes,
@@ -966,6 +984,9 @@ public class WeaponForgeController : Controller
 
     /// <summary>"Sword_2H_Blood_D_02" → "Sword 2H Blood D 02" — a readable default item name.</summary>
     private static string PrettyTbcName(string stem) => stem.Replace('_', ' ');
+
+    private static int EffectiveTbcInventoryType(TbcItemInfo? item, WeaponTypeProfile profile) =>
+        item?.InventoryType is 13 or 17 or 21 or 22 ? item.InventoryType : profile.InventoryType;
 
     /// <summary>Decode a TBC BLP2's base mip to PNG for the texture pipeline. Null on failure.</summary>
     private static byte[]? BlpToPng(byte[] blp)

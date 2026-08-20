@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using SkiaSharp;
 
 namespace MangosSuperUI.Services.WeaponForge;
@@ -28,6 +29,24 @@ public sealed class WeaponAssetCompiler
     public WeaponCompileOutput Compile(RigidWeaponMesh mesh, WeaponTexture? texture, WeaponCompileOptions options)
     {
         var diag = new ForgeDiagnostics("compile");
+
+        int effectTextureCount = options.EffectTextures?.Count ?? 0;
+        int effectPathCount = options.EffectTexturePaths?.Count ?? 0;
+        if (effectTextureCount != effectPathCount)
+            diag.Error("texture.effect.parallel",
+                $"Effect texture count {effectTextureCount} does not match effect path count {effectPathCount}.");
+        if (options.EffectTexturePaths is { Count: > 0 } effectPaths)
+        {
+            var uniquePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < effectPaths.Count; i++)
+            {
+                string? path = effectPaths[i];
+                if (string.IsNullOrWhiteSpace(path))
+                    diag.Error("texture.effect.path", $"Effect texture path {i + 1} is empty.");
+                else if (!uniquePaths.Add(path))
+                    diag.Error("texture.effect.path", $"Effect texture path '{path}' is duplicated.");
+            }
+        }
 
         // 1) Input mesh validation (§7.1).
         var meshDiag = RigidWeaponMeshValidator.Validate(mesh, options.MeshValidation);
@@ -99,10 +118,10 @@ public sealed class WeaponAssetCompiler
         {
             if (texture.SourceBlp is { Length: > 0 } sourceBlp)
             {
-                if (sourceBlp.Length < 4 || sourceBlp[0] != (byte)'B' || sourceBlp[1] != (byte)'L' ||
-                    sourceBlp[2] != (byte)'P' || sourceBlp[3] != (byte)'2')
+                string? envelopeError = ValidateBlp2Envelope(sourceBlp);
+                if (envelopeError is not null)
                 {
-                    diag.Error("blp.source", "Pre-encoded source texture is not a BLP2 file.");
+                    diag.Error("blp.source", "Pre-encoded source BLP2 cannot be preserved: " + envelopeError);
                     return null;
                 }
 
@@ -133,6 +152,81 @@ public sealed class WeaponAssetCompiler
             diag.Error("blp.exception", $"Texture encode threw: {ex.Message}");
             return null;
         }
+    }
+
+    private static string? ValidateBlp2Envelope(byte[] blp)
+    {
+        const int headerBytes = 148;
+        const int paletteBytes = 1024;
+        const int dataStart = headerBytes + paletteBytes;
+        if (blp.Length < dataStart)
+            return $"file is {blp.Length} bytes; a complete BLP2 header/palette requires {dataStart}";
+        if (blp[0] != (byte)'B' || blp[1] != (byte)'L' || blp[2] != (byte)'P' || blp[3] != (byte)'2')
+            return "magic is not BLP2";
+        if (BinaryPrimitives.ReadUInt32LittleEndian(blp.AsSpan(4, 4)) != 1)
+            return "JPEG/type-0 BLP2 is not supported by the vanilla texture path";
+
+        byte encoding = blp[8], alphaDepth = blp[9], alphaType = blp[10];
+        bool formatOk = encoding switch
+        {
+            1 => alphaDepth is 0 or 1 or 4 or 8,
+            2 => (alphaType == 0 && alphaDepth is 0 or 1) ||
+                 (alphaType == 1 && alphaDepth is 4 or 8) ||
+                 (alphaType == 7 && alphaDepth == 8),
+            3 => alphaDepth is 0 or 8,
+            _ => false,
+        };
+        if (!formatOk)
+            return $"unsupported encoding/alpha tuple {encoding}/{alphaDepth}/{alphaType}";
+
+        uint width = BinaryPrimitives.ReadUInt32LittleEndian(blp.AsSpan(12, 4));
+        uint height = BinaryPrimitives.ReadUInt32LittleEndian(blp.AsSpan(16, 4));
+        static bool IsPowerOfTwo(uint value) => value != 0 && (value & (value - 1)) == 0;
+        if (width == 0 || height == 0 || width > 16384 || height > 16384)
+            return $"dimensions {width}x{height} are outside the supported BLP2 envelope";
+        if (!IsPowerOfTwo(width) || !IsPowerOfTwo(height))
+            return $"dimensions {width}x{height} violate the 1.12 compatibility policy (power-of-two required)";
+
+        bool sawBaseMip = false;
+        var mipSpans = new List<(ulong Start, ulong End, int Level)>();
+        for (int level = 0; level < 16; level++)
+        {
+            uint offset = BinaryPrimitives.ReadUInt32LittleEndian(blp.AsSpan(20 + level * 4, 4));
+            uint size = BinaryPrimitives.ReadUInt32LittleEndian(blp.AsSpan(84 + level * 4, 4));
+            if (offset == 0 && size == 0) continue;
+            if (offset == 0 || size == 0)
+                return $"mip {level} has an incomplete offset/size pair";
+            if (offset < dataStart || (ulong)offset + size > (ulong)blp.Length)
+                return $"mip {level} span [{offset},{(ulong)offset + size}) is outside the file";
+            ulong end = (ulong)offset + size;
+            foreach (var span in mipSpans)
+                if ((ulong)offset < span.End && end > span.Start)
+                    return $"mip {level} overlaps mip {span.Level}";
+
+            uint mipWidth = Math.Max(1u, width >> level);
+            uint mipHeight = Math.Max(1u, height >> level);
+            ulong pixels = (ulong)mipWidth * mipHeight;
+            ulong minimumBytes = encoding switch
+            {
+                1 => pixels + (alphaDepth switch
+                {
+                    0 => 0UL,
+                    1 => (pixels + 7) / 8,
+                    4 => (pixels + 1) / 2,
+                    _ => pixels,
+                }),
+                2 => (ulong)((mipWidth + 3) / 4) * ((mipHeight + 3) / 4) *
+                     (alphaType == 0 ? 8UL : 16UL),
+                3 => pixels * 4,
+                _ => ulong.MaxValue,
+            };
+            if (size < minimumBytes)
+                return $"mip {level} has {size} bytes; format requires at least {minimumBytes}";
+            if (level == 0) sawBaseMip = true;
+            mipSpans.Add((offset, end, level));
+        }
+
+        return sawBaseMip ? null : "base mip is absent";
     }
 }
 

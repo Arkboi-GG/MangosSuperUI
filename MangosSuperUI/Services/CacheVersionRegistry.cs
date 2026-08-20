@@ -296,6 +296,10 @@ public class CacheVersionRegistry
         SweepDirectory("character_models", SkinnedGlbVersion, ".glb");
         SweepDirectory(Path.Combine("character_textures", "skin"), SkinPngVersion, ".png");
         SweepDirectory("item_models", RigidGlbVersion, ".glb");
+        // ItemTextureService stores the input SHA-256 beside each rigid GLB.
+        // Sweep sidecars with the same writer stamp so obsolete build
+        // generations cannot accumulate indefinitely.
+        SweepDirectory("item_models", RigidGlbVersion, ".source");
         // Gameobject GLBs are generated on demand by GameObjectModelService.
         // This sweep also clears any legacy unstamped files from the retired
         // extractor workflow.

@@ -47,6 +47,12 @@ public sealed class WeaponPreviewService
 
         int triangleCount = m2.Indices.Count / 3;
 
+        // Generated multi-pass weapons can be reconstructed into the same render IR used by the
+        // authoring preview. This preserves batch order, rest colors and rest UV transforms that
+        // the legacy general-purpose M2→GLB path does not model.
+        var passAware = TryRenderPassAware(m2, blpBytes, effectBlpsByPath);
+        if (passAware is { Ok: true }) return passAware;
+
         if (File.Exists(fullPath))
             return new WeaponPreviewResult(true, webPath, m2.Vertices.Count, triangleCount, key, Cached: true, Error: null);
 
@@ -77,6 +83,53 @@ public sealed class WeaponPreviewService
         return new WeaponPreviewResult(true, webPath, m2.Vertices.Count, triangleCount, key, Cached: false, Error: null);
     }
 
+    private WeaponPreviewResult? TryRenderPassAware(M2Model m2, byte[]? baseBlp,
+        IReadOnlyDictionary<string, byte[]>? effectBlpsByPath)
+    {
+        if (m2.Batches.Count == 0 || m2.Submeshes.Count == 0) return null;
+        var diagnostics = new ForgeDiagnostics("preview-reconstruct");
+        var extracted = TbcWeaponMeshExtractor.Extract(m2, diagnostics);
+        if (extracted is null || diagnostics.HasErrors || extracted.SourceTextures.Count == 0) return null;
+
+        byte[]? ResolveBlp(TbcSourceTexture source)
+        {
+            if (source.SourcePath is null) return baseBlp;
+            return effectBlpsByPath is not null &&
+                   effectBlpsByPath.TryGetValue(source.SourcePath, out byte[]? effect)
+                ? effect
+                : null;
+        }
+
+        byte[]? basePng = BlpToPng(ResolveBlp(extracted.SourceTextures[0]));
+        if (basePng is null) return null;
+        var effectPngs = new List<byte[]?>();
+        for (int i = 1; i < extracted.SourceTextures.Count; i++)
+        {
+            byte[]? png = BlpToPng(ResolveBlp(extracted.SourceTextures[i]));
+            if (png is null) return null;
+            effectPngs.Add(png);
+        }
+        return RenderMesh(extracted.Mesh, basePng, effectPngs);
+    }
+
+    private static byte[]? BlpToPng(byte[]? blp)
+    {
+        if (blp is not { Length: > 0 }) return null;
+        try
+        {
+            byte[] bgra = BlpDecoder.GetPixels(blp, 0, out int width, out int height);
+            var info = new SkiaSharp.SKImageInfo(width, height, SkiaSharp.SKColorType.Bgra8888,
+                SkiaSharp.SKAlphaType.Unpremul);
+            using var image = SkiaSharp.SKImage.FromPixelCopy(info, bgra);
+            using var png = image?.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+            return png?.ToArray();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>Render a RigidWeaponMesh directly to a preview GLB (no M2 involved). This lets an
     /// imported/generated mesh be visualized in the weapon authoring space (Y-up glTF) before the
     /// M2 writer for its topology exists — the key to showing a sketch become 3D. Multi-pass meshes
@@ -103,11 +156,12 @@ public sealed class WeaponPreviewService
 
         try
         {
-            MaterialBuilder BuildMaterial(string name, byte[]? png, ushort blend, float staticAlpha,
-                bool twoSided)
+            MaterialBuilder BuildMaterial(string name, byte[]? png, ushort blend, Vector3 tint,
+                float staticAlpha, bool twoSided)
             {
                 if (!float.IsFinite(staticAlpha)) staticAlpha = 1f;
                 staticAlpha = Math.Clamp(staticAlpha, 0f, 1f);
+                tint = Vector3.Clamp(tint, Vector3.Zero, Vector3.One);
                 int alphaPercent = Math.Clamp((int)MathF.Round(staticAlpha * 100f), 0, 100);
 
                 // Keep this suffix at the very end of the name. blend-suffix.js uses it to
@@ -118,10 +172,10 @@ public sealed class WeaponPreviewService
                 if (png is { Length: > 0 })
                     m.WithBaseColor(new SharpGLTF.Memory.MemoryImage(png))
                      .WithChannelParam(KnownChannel.BaseColor, KnownProperty.RGBA,
-                         new Vector4(1f, 1f, 1f, staticAlpha));
+                         new Vector4(tint, staticAlpha));
                 else
                     m.WithChannelParam(KnownChannel.BaseColor, KnownProperty.RGBA,
-                        new Vector4(0.75f, 0.75f, 0.78f, staticAlpha));
+                        new Vector4(tint * new Vector3(0.75f, 0.75f, 0.78f), staticAlpha));
                 if (blend == 1) m.WithAlpha(AlphaMode.MASK, 0.5f);
                 else if (blend >= 2 || staticAlpha < 0.999f)
                     m.WithAlpha(AlphaMode.BLEND); // additive/modulate are restored by the viewer
@@ -132,15 +186,16 @@ public sealed class WeaponPreviewService
             var mb = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>("weapon");
 
             void AddRange(SharpGLTF.Geometry.PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture1, VertexEmpty> prim,
-                int indexStart, int indexCount, bool useUv1)
+                int indexStart, int indexCount, bool useUv1, WeaponRestTextureTransform? restTransform)
             {
                 int end = Math.Min(indexStart + indexCount, mesh.Indices.Length);
                 for (int i = indexStart; i + 2 < end; i += 3)
                 {
                     uint a = mesh.Indices[i], b = mesh.Indices[i + 1], c = mesh.Indices[i + 2];
                     if (a >= mesh.VertexCount || b >= mesh.VertexCount || c >= mesh.VertexCount) continue;
-                    prim.AddTriangle(MeshVertex(mesh, a, useUv1), MeshVertex(mesh, b, useUv1),
-                        MeshVertex(mesh, c, useUv1));
+                    prim.AddTriangle(MeshVertex(mesh, a, useUv1, restTransform),
+                        MeshVertex(mesh, b, useUv1, restTransform),
+                        MeshVertex(mesh, c, useUv1, restTransform));
                 }
             }
 
@@ -153,9 +208,11 @@ public sealed class WeaponPreviewService
                     if (pass.SubmeshSlot < 0 || pass.SubmeshSlot >= mesh.SubmeshRanges.Count) continue;
                     var range = mesh.SubmeshRanges[pass.SubmeshSlot];
                     bool twoSided = forceDoubleSided || (pass.RenderFlags & 0x04) != 0;
+                    Vector3 tint = pass.RestColor?.Rgb ?? Vector3.One;
+                    float colorAlpha = pass.RestColor?.Alpha ?? 1f;
 
                     void EmitBinding(int bindingIndex, int textureSlot, int textureCoordinate,
-                        float staticAlpha)
+                        float staticAlpha, WeaponRestTextureTransform? restTransform)
                     {
                         byte[]? png = TextureForSlot(textureSlot, texturePng, effectPngs);
 
@@ -169,8 +226,9 @@ public sealed class WeaponPreviewService
                                       mesh.Uv1.Length == mesh.VertexCount;
 
                         var material = BuildMaterial($"pass{sourcePassIndex}_tex{bindingIndex}", png,
-                            pass.BlendMode, staticAlpha, twoSided);
-                        AddRange(mb.UsePrimitive(material), range.IndexStart, range.IndexCount, useUv1);
+                            pass.BlendMode, tint, staticAlpha * colorAlpha, twoSided);
+                        AddRange(mb.UsePrimitive(material), range.IndexStart, range.IndexCount, useUv1,
+                            restTransform);
                     }
 
                     if (pass.TextureBindings is { Count: > 0 })
@@ -180,12 +238,13 @@ public sealed class WeaponPreviewService
                         {
                             EmitBinding(bindingIndex++, Convert.ToInt32(binding.TextureSlot),
                                 Convert.ToInt32(binding.TextureCoordinate),
-                                Convert.ToSingle(binding.StaticAlpha));
+                                Convert.ToSingle(binding.StaticAlpha), binding.RestTransform);
                         }
                     }
                     else
                     {
-                        EmitBinding(0, pass.TextureSlot, textureCoordinate: 0, staticAlpha: 1f);
+                        EmitBinding(0, pass.TextureSlot, textureCoordinate: 0, staticAlpha: 1f,
+                            restTransform: null);
                     }
                 }
             }
@@ -193,8 +252,9 @@ public sealed class WeaponPreviewService
             {
                 var material = BuildMaterial("weapon", texturePng,
                     mesh.Material.BlendMode == WeaponBlendMode.AlphaKey ? (ushort)1 : (ushort)0,
-                    staticAlpha: 1f, twoSided: forceDoubleSided || mesh.Material.TwoSided);
-                AddRange(mb.UsePrimitive(material), 0, mesh.Indices.Length, useUv1: false);
+                    Vector3.One, staticAlpha: 1f, twoSided: forceDoubleSided || mesh.Material.TwoSided);
+                AddRange(mb.UsePrimitive(material), 0, mesh.Indices.Length, useUv1: false,
+                    restTransform: null);
             }
 
             var scene = new SceneBuilder("weapon");
@@ -211,9 +271,18 @@ public sealed class WeaponPreviewService
     }
 
     private static VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty> MeshVertex(
-        RigidWeaponMesh m, uint i, bool useUv1)
+        RigidWeaponMesh m, uint i, bool useUv1, WeaponRestTextureTransform? restTransform)
     {
         Vector2 uv = useUv1 && m.Uv1 is { } uv1 && i < (uint)uv1.Length ? uv1[i] : m.Uv0[i];
+        if (restTransform is not null)
+        {
+            // M2 UV rotations pivot around the texture center, not the origin.
+            Vector3 center = new(0.5f, 0.5f, 0f);
+            Vector3 transformed = (new Vector3(uv, 0f) - center) * restTransform.Scale;
+            transformed = Vector3.Transform(transformed, restTransform.Rotation) + center +
+                          restTransform.Translation;
+            uv = new Vector2(transformed.X, transformed.Y);
+        }
         return new VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(
             new VertexPositionNormal(m.Positions[i], m.Normals[i]), new VertexTexture1(uv));
     }
@@ -237,7 +306,7 @@ public sealed class WeaponPreviewService
         using var stream = new MemoryStream();
         using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
         {
-            writer.Write("WeaponPreviewMesh/v2");
+            writer.Write("WeaponPreviewMesh/v4");
             writer.Write(forceDoubleSided);
             writer.Write((int)m.Material.BlendMode);
             writer.Write(m.Material.TwoSided);
@@ -292,6 +361,7 @@ public sealed class WeaponPreviewService
                     writer.Write(pass.PriorityPlane);
                     writer.Write(pass.ShaderId);
                     writer.Write(pass.ColorIndex);
+                    WriteRestColor(writer, pass.RestColor);
 
                     if (pass.TextureBindings is null)
                     {
@@ -306,6 +376,7 @@ public sealed class WeaponPreviewService
                             writer.Write(binding.TextureCoordinate);
                             writer.Write(binding.StaticAlpha);
                             writer.Write(binding.TextureTransform);
+                            WriteRestTransform(writer, binding.RestTransform);
                         }
                     }
                 }
@@ -363,18 +434,94 @@ public sealed class WeaponPreviewService
             writer.Write(bytes?.Length ?? -1);
             if (bytes is { Length: > 0 }) writer.Write(bytes);
         }
+
+        static void WriteRestColor(BinaryWriter writer, WeaponRestColor? color)
+        {
+            writer.Write(color is not null);
+            if (color is null) return;
+            writer.Write(color.Rgb.X); writer.Write(color.Rgb.Y); writer.Write(color.Rgb.Z);
+            writer.Write(color.Alpha); writer.Write(color.AnimationFrozen);
+        }
+
+        static void WriteRestTransform(BinaryWriter writer, WeaponRestTextureTransform? transform)
+        {
+            writer.Write(transform is not null);
+            if (transform is null) return;
+            writer.Write(transform.Translation.X); writer.Write(transform.Translation.Y); writer.Write(transform.Translation.Z);
+            writer.Write(transform.Rotation.X); writer.Write(transform.Rotation.Y);
+            writer.Write(transform.Rotation.Z); writer.Write(transform.Rotation.W);
+            writer.Write(transform.Scale.X); writer.Write(transform.Scale.Y); writer.Write(transform.Scale.Z);
+            writer.Write(transform.AnimationFrozen);
+            WriteGlobalVectorTrack(writer, transform.TranslationAnimation);
+            WriteGlobalQuaternionTrack(writer, transform.RotationAnimation);
+            WriteGlobalVectorTrack(writer, transform.ScaleAnimation);
+        }
+
+        static void WriteGlobalVectorTrack(BinaryWriter writer, WeaponGlobalVectorTrack? track)
+        {
+            writer.Write(track is not null);
+            if (track is null) return;
+            writer.Write(track.Interpolation);
+            writer.Write(track.SourceGlobalSequence);
+            writer.Write(track.DurationMs);
+            WriteUInt32Array(writer, track.Timestamps);
+            writer.Write(track.Keys?.Count ?? -1);
+            if (track.Keys is null) return;
+            foreach (Vector3 key in track.Keys)
+            {
+                writer.Write(key.X); writer.Write(key.Y); writer.Write(key.Z);
+            }
+        }
+
+        static void WriteGlobalQuaternionTrack(BinaryWriter writer, WeaponGlobalQuaternionTrack? track)
+        {
+            writer.Write(track is not null);
+            if (track is null) return;
+            writer.Write(track.Interpolation);
+            writer.Write(track.SourceGlobalSequence);
+            writer.Write(track.DurationMs);
+            WriteUInt32Array(writer, track.Timestamps);
+            writer.Write(track.Keys?.Count ?? -1);
+            if (track.Keys is null) return;
+            foreach (Quaternion key in track.Keys)
+            {
+                writer.Write(key.X); writer.Write(key.Y); writer.Write(key.Z); writer.Write(key.W);
+            }
+        }
+
+        static void WriteUInt32Array(BinaryWriter writer, IReadOnlyList<uint>? values)
+        {
+            writer.Write(values?.Count ?? -1);
+            if (values is null) return;
+            foreach (uint value in values) writer.Write(value);
+        }
     }
 
     private static string ContentKey(byte[] m2, byte[]? blp, IReadOnlyDictionary<string, byte[]>? extras = null)
     {
-        using var sha = SHA256.Create();
-        sha.TransformBlock(m2, 0, m2.Length, null, 0);
-        if (blp is { Length: > 0 }) sha.TransformBlock(blp, 0, blp.Length, null, 0);
-        if (extras is not null)
-            foreach (var kv in extras.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
-                sha.TransformBlock(kv.Value, 0, kv.Value.Length, null, 0);
-        sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-        return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write("WeaponPreviewBytes/v2");
+            WriteSegment(m2);
+            WriteSegment(blp);
+            writer.Write(extras?.Count ?? -1);
+            if (extras is not null)
+                foreach (var kv in extras.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    writer.Write(kv.Key);
+                    WriteSegment(kv.Value);
+                }
+
+            void WriteSegment(byte[]? bytes)
+            {
+                writer.Write(bytes?.Length ?? -1);
+                if (bytes is { Length: > 0 }) writer.Write(bytes);
+            }
+        }
+        stream.TryGetBuffer(out ArraySegment<byte> buffer);
+        return Convert.ToHexString(SHA256.HashData(buffer.AsSpan(0, checked((int)stream.Length))))
+            .ToLowerInvariant();
     }
 }
 

@@ -27,6 +27,8 @@ public class M2Model
     public Dictionary<int, M2RestTextureTransform> ReachableRestTextureTransforms { get; set; } = new();
     public Dictionary<int, string> RestColorErrors { get; set; } = new();
     public Dictionary<int, string> RestTextureTransformErrors { get; set; } = new();
+    public uint RibbonEmitterCount { get; set; }
+    public uint ParticleEmitterCount { get; set; }
 
     // ── Skeleton ─────────────────────────────────────────────────────────────
     public List<M2Bone> Bones { get; set; } = new();
@@ -39,6 +41,8 @@ public class M2Model
 
     // ── Transparency tracks (Session N — static evaluation only) ─────────────
     public List<float> TransparencyStaticAlphas { get; set; } = new();
+    public Dictionary<int, string> TransparencyStaticAlphaErrors { get; set; } = new();
+    public HashSet<int> FrozenTransparencyTracks { get; set; } = new();
     public List<ushort> TransparencyLookup { get; set; } = new();
 
     // ── Sequences (Session O — animation) ────────────────────────────────────
@@ -62,30 +66,35 @@ public class M2Model
     public bool HasSkeleton => Bones.Count > 0;
 
     /// <summary>
-    /// Resolve a batch's first texture unit's "is this drawn at all in idle pose?" alpha.
+    /// Resolve a batch's "is this drawn at all in idle pose?" alpha.
     /// Chain: batch.TextureWeightIndex → TransparencyLookup[idx] →
     ///        TransparencyStaticAlphas[idx]. Any link in the chain
     ///        missing → return 1.0 (fully visible, safe fallback).
     /// </summary>
-    public float GetStaticAlphaForBatch(M2Batch batch) =>
-        GetStaticAlphaForTextureUnit(batch, 0);
-
-    /// <summary>
-    /// Resolve one texture unit's static alpha. Multi-texture batches address
-    /// consecutive transparency-lookup entries starting at TextureWeightIndex.
-    /// Any invalid link returns 1.0 (fully visible, safe fallback).
-    /// </summary>
-    public float GetStaticAlphaForTextureUnit(M2Batch batch, int unit)
+    public float GetStaticAlphaForBatch(M2Batch batch)
     {
-        if (unit < 0) return 1.0f;
+        if (batch.TextureCount == 0 || batch.TextureWeightIndex == ushort.MaxValue)
+            return 1.0f;
 
-        int lookupIndex = batch.TextureWeightIndex + unit;
+        int lookupIndex = batch.TextureWeightIndex;
         if ((uint)lookupIndex >= (uint)TransparencyLookup.Count) return 1.0f;
 
         ushort trackIdx = TransparencyLookup[lookupIndex];
-        if (trackIdx >= TransparencyStaticAlphas.Count) return 1.0f;
+        if (trackIdx == ushort.MaxValue || trackIdx >= TransparencyStaticAlphas.Count)
+            return 1.0f;
 
         return TransparencyStaticAlphas[trackIdx];
+    }
+
+    /// <summary>
+    /// Resolve the batch-wide static alpha while retaining the texture-unit-shaped API used by
+    /// older callers. Unlike the texture, coordinate, and transform combos, a texture-weight
+    /// combo is one lookup for the entire batch; every texture unit receives the same alpha.
+    /// </summary>
+    public float GetStaticAlphaForTextureUnit(M2Batch batch, int unit)
+    {
+        if (unit < 0 || unit >= batch.TextureCount) return 1.0f;
+        return GetStaticAlphaForBatch(batch);
     }
 
     /// <summary>
@@ -176,12 +185,38 @@ public class M2TextureRef
 /// <summary>Deterministic Stand/time-zero sample of a source color record.</summary>
 public sealed record M2RestColor(Vector3 Rgb, float Alpha, bool AnimationFrozen);
 
+/// <summary>
+/// A referenced global-sequence Vector3 track that can be represented directly by vanilla v256.
+/// Source-global identity is retained so the writer can append and remap loop durations without
+/// disturbing global-sequence indices used by its donor scaffold.
+/// </summary>
+public sealed record M2GlobalVectorTrack(
+    ushort Interpolation,
+    int SourceGlobalSequence,
+    uint DurationMs,
+    IReadOnlyList<uint> Timestamps,
+    IReadOnlyList<Vector3> Keys);
+
+/// <summary>
+/// A referenced global-sequence texture-quaternion track. TBC packed components are decoded to
+/// texture-space XYZW floats; unlike bone rotations, no model-coordinate axis conversion applies.
+/// </summary>
+public sealed record M2GlobalQuaternionTrack(
+    ushort Interpolation,
+    int SourceGlobalSequence,
+    uint DurationMs,
+    IReadOnlyList<uint> Timestamps,
+    IReadOnlyList<Quaternion> Keys);
+
 /// <summary>Deterministic Stand/time-zero sample of a source UV-transform record.</summary>
 public sealed record M2RestTextureTransform(
     Vector3 Translation,
     Quaternion Rotation,
     Vector3 Scale,
-    bool AnimationFrozen);
+    bool AnimationFrozen,
+    M2GlobalVectorTrack? TranslationAnimation = null,
+    M2GlobalQuaternionTrack? RotationAnimation = null,
+    M2GlobalVectorTrack? ScaleAnimation = null);
 
 /// <summary>
 /// A skeleton joint in the M2 model. 108-byte stride in vanilla 1.12.
@@ -503,6 +538,8 @@ public class M2Reader
             ParseTransparencyLookup(data,
                 ReadUInt32(data, 0x0A4), ReadUInt32(data, 0x0A8), model);
             ParseReachableMaterialTracks(data, model);
+            model.RibbonEmitterCount = ReadUInt32(data, 0x134);
+            model.ParticleEmitterCount = ReadUInt32(data, 0x13C);
 
             // ── Attachments ─────────────────────────────────────────────────
             uint nAttachments = ReadUInt32(data, 0x104);
@@ -960,11 +997,18 @@ public class M2Reader
             model.Indices.Add(localIdx < nLocalVerts ? localVertexMap[localIdx] : (ushort)0);
         }
 
-        if (nSubmeshes > 0 && ofsSubmeshes > 0 && ofsSubmeshes + nSubmeshes * 32 <= data.Length)
+        // TBC added sort-center/radius data to each inline skin section, growing the record from
+        // vanilla's 32 bytes to 48 bytes. The fields consumed below retain their original offsets.
+        int submeshStride = model.Version >= 260 ? 48 : 32;
+        if (nSubmeshes > 0)
         {
+            if (ofsSubmeshes == 0 ||
+                ofsSubmeshes + (long)nSubmeshes * submeshStride > data.Length)
+                return false;
+
             for (uint i = 0; i < nSubmeshes; i++)
             {
-                int sOff = (int)(ofsSubmeshes + i * 32);
+                int sOff = checked((int)(ofsSubmeshes + i * (long)submeshStride));
                 model.Submeshes.Add(new M2Submesh
                 {
                     Id = ReadUInt16(data, sOff + 0),
@@ -1065,11 +1109,429 @@ public class M2Reader
         }
     }
 
+    // ── Reachable material tracks (TBC fidelity import, static rest sample) ──
+    // Vanilla/TBC colors are two 28-byte tracks (RGB, alpha); UV transforms are three
+    // (translation, rotation, scale). Nested offsets are absolute file offsets. Only records
+    // reachable from view-0 batches are decoded, and malformed referenced records are retained as
+    // indexed errors so the extractor can fail with a useful diagnostic instead of losing detail.
+    private delegate T RestKeyReader<T>(byte[] data, int offset, uint version);
+
+    private static void ParseReachableMaterialTracks(byte[] data, M2Model model)
+    {
+        model.ColorTrackCount = ReadUInt32(data, 0x054);
+        uint colorOffset = ReadUInt32(data, 0x058);
+        model.TextureTransformCount = ReadUInt32(data, 0x074);
+        uint transformOffset = ReadUInt32(data, 0x078);
+
+        foreach (int colorIndex in model.Batches.Where(b => b.ColorIndex >= 0)
+                     .Select(b => (int)b.ColorIndex).Distinct())
+        {
+            if ((uint)colorIndex >= model.ColorTrackCount) continue;
+            long record = colorOffset + (long)colorIndex * 56;
+            if (colorOffset == 0 || record < 0 || record + 56 > data.Length)
+            {
+                model.RestColorErrors[colorIndex] = "color record is outside the source file";
+                continue;
+            }
+
+            if (!TryReadRestTrack(data, checked((int)record), model, 12, Vector3.One,
+                    static (d, o, _) => new Vector3(ReadFloat(d, o), ReadFloat(d, o + 4), ReadFloat(d, o + 8)),
+                    out Vector3 rgb, out bool rgbAnimated, out string? rgbError))
+            {
+                model.RestColorErrors[colorIndex] = "RGB track: " + rgbError;
+                continue;
+            }
+            if (!TryReadRestTrack(data, checked((int)record + 28), model, 2, 1f,
+                    static (d, o, _) => Math.Clamp((short)ReadUInt16(d, o) / 32767f, 0f, 1f),
+                    out float alpha, out bool alphaAnimated, out string? alphaError))
+            {
+                model.RestColorErrors[colorIndex] = "alpha track: " + alphaError;
+                continue;
+            }
+            if (!IsFinite(rgb) || !float.IsFinite(alpha))
+            {
+                model.RestColorErrors[colorIndex] = "rest sample contains non-finite values";
+                continue;
+            }
+            model.ReachableRestColors[colorIndex] = new M2RestColor(rgb, alpha,
+                rgbAnimated || alphaAnimated);
+        }
+
+        var reachableTransforms = new HashSet<int>();
+        foreach (var batch in model.Batches)
+        {
+            if (batch.TextureTransformIndex == ushort.MaxValue) continue;
+            for (int unit = 0; unit < batch.TextureCount; unit++)
+            {
+                int combo = batch.TextureTransformIndex + unit;
+                if ((uint)combo >= (uint)model.TextureTransformLookup.Count) continue;
+                ushort transform = model.TextureTransformLookup[combo];
+                if (transform != ushort.MaxValue) reachableTransforms.Add(transform);
+            }
+        }
+
+        foreach (int transformIndex in reachableTransforms)
+        {
+            if ((uint)transformIndex >= model.TextureTransformCount) continue;
+            long record = transformOffset + (long)transformIndex * 84;
+            if (transformOffset == 0 || record < 0 || record + 84 > data.Length)
+            {
+                model.RestTextureTransformErrors[transformIndex] =
+                    "UV-transform record is outside the source file";
+                continue;
+            }
+
+            if (!TryReadRestTrack(data, checked((int)record), model, 12, Vector3.Zero,
+                    static (d, o, _) => new Vector3(ReadFloat(d, o), ReadFloat(d, o + 4), ReadFloat(d, o + 8)),
+                    out Vector3 translation, out bool translationAnimated, out string? translationError))
+            {
+                model.RestTextureTransformErrors[transformIndex] = "translation track: " + translationError;
+                continue;
+            }
+            if (!TryReadGlobalVectorAnimation(data, checked((int)record), model,
+                    out M2GlobalVectorTrack? translationAnimation, out translationError))
+            {
+                model.RestTextureTransformErrors[transformIndex] = "translation track: " + translationError;
+                continue;
+            }
+            if (!TryReadRestTrack(data, checked((int)record + 28), model,
+                    model.Version >= 260 ? 8 : 16, Quaternion.Identity, ReadRestQuaternion,
+                    out Quaternion rotation, out bool rotationAnimated, out string? rotationError))
+            {
+                model.RestTextureTransformErrors[transformIndex] = "rotation track: " + rotationError;
+                continue;
+            }
+            if (!TryReadGlobalQuaternionAnimation(data, checked((int)record + 28), model,
+                    out M2GlobalQuaternionTrack? rotationAnimation, out rotationError))
+            {
+                model.RestTextureTransformErrors[transformIndex] = "rotation track: " + rotationError;
+                continue;
+            }
+            if (!TryReadRestTrack(data, checked((int)record + 56), model, 12, Vector3.One,
+                    static (d, o, _) => new Vector3(ReadFloat(d, o), ReadFloat(d, o + 4), ReadFloat(d, o + 8)),
+                    out Vector3 scale, out bool scaleAnimated, out string? scaleError))
+            {
+                model.RestTextureTransformErrors[transformIndex] = "scale track: " + scaleError;
+                continue;
+            }
+            if (!TryReadGlobalVectorAnimation(data, checked((int)record + 56), model,
+                    out M2GlobalVectorTrack? scaleAnimation, out scaleError))
+            {
+                model.RestTextureTransformErrors[transformIndex] = "scale track: " + scaleError;
+                continue;
+            }
+
+            if (!IsFinite(translation) || !IsFinite(scale) || !IsFinite(rotation))
+            {
+                model.RestTextureTransformErrors[transformIndex] =
+                    "rest sample contains non-finite values";
+                continue;
+            }
+            float rotationLength = rotation.LengthSquared();
+            if (rotationLength < 1e-10f)
+            {
+                model.RestTextureTransformErrors[transformIndex] = "rest rotation is zero-length";
+                continue;
+            }
+            rotation = Quaternion.Normalize(rotation);
+            bool animationFrozen =
+                (translationAnimated && translationAnimation is null) ||
+                (rotationAnimated && rotationAnimation is null) ||
+                (scaleAnimated && scaleAnimation is null);
+            model.ReachableRestTextureTransforms[transformIndex] = new M2RestTextureTransform(
+                translation, rotation, scale,
+                animationFrozen,
+                translationAnimation,
+                rotationAnimation,
+                scaleAnimation);
+        }
+    }
+
+    private static bool TryReadRestTrack<T>(byte[] data, int trackOffset, M2Model model,
+        int valueStride, T defaultValue, RestKeyReader<T> readValue,
+        out T value, out bool animationFrozen, out string? error) where T : struct
+    {
+        value = defaultValue;
+        animationFrozen = false;
+        error = null;
+        if (trackOffset < 0 || trackOffset + ANIM_BLOCK_STRIDE_VANILLA > data.Length)
+        { error = "28-byte track header is out of bounds"; return false; }
+
+        ushort interpolation = ReadUInt16(data, trackOffset);
+        short globalSequence = (short)ReadUInt16(data, trackOffset + 2);
+        uint rangeCount = ReadUInt32(data, trackOffset + 4);
+        uint rangeOffset = ReadUInt32(data, trackOffset + 8);
+        uint timeCount = ReadUInt32(data, trackOffset + 12);
+        uint timeOffset = ReadUInt32(data, trackOffset + 16);
+        uint keyCount = ReadUInt32(data, trackOffset + 20);
+        uint keyOffset = ReadUInt32(data, trackOffset + 24);
+
+        if (interpolation > 3) { error = $"invalid interpolation {interpolation}"; return false; }
+        if (globalSequence < -1 || globalSequence >= 0 && globalSequence >= model.GlobalSequenceDurations.Count)
+        { error = $"global sequence {globalSequence} is outside count {model.GlobalSequenceDurations.Count}"; return false; }
+        if (timeCount != keyCount)
+        { error = $"timestamp/key counts differ ({timeCount}/{keyCount})"; return false; }
+
+        if (rangeCount > 0)
+        {
+            if (rangeOffset == 0 || rangeOffset + (long)rangeCount * 8 > data.Length)
+            { error = "range array is out of bounds"; return false; }
+            for (uint ri = 0; ri < rangeCount; ri++)
+            {
+                int ro = checked((int)(rangeOffset + ri * 8));
+                uint start = ReadUInt32(data, ro), end = ReadUInt32(data, ro + 4);
+                if (start > end || end >= keyCount)
+                { error = $"range {ri} [{start},{end}] is invalid for {keyCount} keys"; return false; }
+            }
+        }
+        if (keyCount == 0) return true;
+        if (timeOffset == 0 || timeOffset + (long)timeCount * 4 > data.Length)
+        { error = "timestamp array is out of bounds"; return false; }
+
+        int storedStride = checked(valueStride * (interpolation is 2 or 3 ? 3 : 1));
+        if (keyOffset == 0 || keyOffset + (long)keyCount * storedStride > data.Length)
+        { error = "key array is out of bounds"; return false; }
+
+        uint selectedKey = 0;
+        uint declaredSequenceCount = ReadUInt32(data, 0x01C);
+        // Legacy vanilla/TBC files may omit the per-sequence range table for a
+        // shared/static key stream. In that representation key 0 is the rest
+        // value. A present range table must still cover every source sequence.
+        if (globalSequence < 0 && declaredSequenceCount > 0 && rangeCount > 0)
+        {
+            if (declaredSequenceCount != model.Sequences.Count)
+            { error = "source sequence table is malformed, so a rest sequence cannot be selected"; return false; }
+            if (rangeCount < declaredSequenceCount)
+            { error = $"range count {rangeCount} is smaller than sequence count {declaredSequenceCount}"; return false; }
+            int sequence = model.TryFindSequenceIndexByAnimationId(0);
+            if (sequence < 0) sequence = 0;
+            selectedKey = ReadUInt32(data, checked((int)(rangeOffset + sequence * 8L)));
+        }
+
+        int valueOffset = checked((int)(keyOffset + selectedKey * (long)storedStride));
+        value = readValue(data, valueOffset, model.Version);
+        animationFrozen = keyCount > 1;
+        return true;
+    }
+
+    private static bool TryReadGlobalVectorAnimation(
+        byte[] data,
+        int trackOffset,
+        M2Model model,
+        out M2GlobalVectorTrack? animation,
+        out string? error)
+    {
+        animation = null;
+        if (!TryReadSupportedGlobalAnimation(
+                data,
+                trackOffset,
+                model,
+                12,
+                static (d, o, _) => new Vector3(
+                    ReadFloat(d, o), ReadFloat(d, o + 4), ReadFloat(d, o + 8)),
+                IsFinite,
+                out ushort interpolation,
+                out int sourceGlobalSequence,
+                out uint durationMs,
+                out uint[]? timestamps,
+                out Vector3[]? keys,
+                out error))
+            return false;
+
+        if (timestamps is not null && keys is not null)
+            animation = new M2GlobalVectorTrack(
+                interpolation, sourceGlobalSequence, durationMs, timestamps, keys);
+        return true;
+    }
+
+    private static bool TryReadGlobalQuaternionAnimation(
+        byte[] data,
+        int trackOffset,
+        M2Model model,
+        out M2GlobalQuaternionTrack? animation,
+        out string? error)
+    {
+        animation = null;
+        int valueStride = model.Version >= 260 ? 8 : 16;
+        if (!TryReadSupportedGlobalAnimation(
+                data,
+                trackOffset,
+                model,
+                valueStride,
+                ReadRestQuaternion,
+                static value => IsFinite(value) && value.LengthSquared() >= 1e-10f,
+                out ushort interpolation,
+                out int sourceGlobalSequence,
+                out uint durationMs,
+                out uint[]? timestamps,
+                out Quaternion[]? keys,
+                out error))
+            return false;
+
+        if (timestamps is not null && keys is not null)
+            animation = new M2GlobalQuaternionTrack(
+                interpolation, sourceGlobalSequence, durationMs, timestamps, keys);
+        return true;
+    }
+
+    /// <summary>
+    /// Decode the bounded subset of source material animation that can be transplanted without
+    /// importing the source sequence table: multi-key, range-free, global step/linear tracks.
+    /// Empty and one-key tracks remain represented by their deterministic static rest sample.
+    /// Any other animated form fails closed instead of silently becoming a frozen material.
+    /// </summary>
+    private static bool TryReadSupportedGlobalAnimation<T>(
+        byte[] data,
+        int trackOffset,
+        M2Model model,
+        int valueStride,
+        RestKeyReader<T> readValue,
+        Func<T, bool> isValidValue,
+        out ushort interpolation,
+        out int sourceGlobalSequence,
+        out uint durationMs,
+        out uint[]? timestamps,
+        out T[]? keys,
+        out string? error) where T : struct
+    {
+        interpolation = 0;
+        sourceGlobalSequence = -1;
+        durationMs = 0;
+        timestamps = null;
+        keys = null;
+        error = null;
+
+        if (trackOffset < 0 || trackOffset + ANIM_BLOCK_STRIDE_VANILLA > data.Length)
+        {
+            error = "28-byte track header is out of bounds";
+            return false;
+        }
+
+        interpolation = ReadUInt16(data, trackOffset);
+        short globalSequence = (short)ReadUInt16(data, trackOffset + 2);
+        uint rangeCount = ReadUInt32(data, trackOffset + 4);
+        uint timeCount = ReadUInt32(data, trackOffset + 12);
+        uint timeOffset = ReadUInt32(data, trackOffset + 16);
+        uint keyCount = ReadUInt32(data, trackOffset + 20);
+        uint keyOffset = ReadUInt32(data, trackOffset + 24);
+
+        if (keyCount <= 1)
+            return true;
+
+        if (interpolation > 1)
+        {
+            error = $"animated interpolation {interpolation} is not representable by the bounded vanilla writer (only step/linear are supported)";
+            return false;
+        }
+        if (globalSequence < 0)
+        {
+            error = "animated non-global track depends on the source sequence table and cannot be transplanted safely";
+            return false;
+        }
+        if (rangeCount != 0)
+        {
+            error = $"animated global track declares {rangeCount} range(s); only range-free global tracks are supported";
+            return false;
+        }
+        if ((uint)globalSequence >= (uint)model.GlobalSequenceDurations.Count)
+        {
+            error = $"global sequence {globalSequence} is outside count {model.GlobalSequenceDurations.Count}";
+            return false;
+        }
+        durationMs = model.GlobalSequenceDurations[globalSequence];
+        if (durationMs == 0)
+        {
+            error = $"global sequence {globalSequence} has zero duration";
+            return false;
+        }
+        if (timeCount != keyCount)
+        {
+            error = $"timestamp/key counts differ ({timeCount}/{keyCount})";
+            return false;
+        }
+        if (timeCount > int.MaxValue)
+        {
+            error = $"timestamp/key count {timeCount} exceeds the supported address space";
+            return false;
+        }
+        if (timeOffset == 0 || timeOffset + (long)timeCount * 4 > data.Length)
+        {
+            error = "timestamp array is out of bounds";
+            return false;
+        }
+        if (keyOffset == 0 || keyOffset + (long)keyCount * valueStride > data.Length)
+        {
+            error = "key array is out of bounds";
+            return false;
+        }
+
+        timestamps = new uint[checked((int)timeCount)];
+        keys = new T[checked((int)keyCount)];
+        uint previousTimestamp = 0;
+        for (int i = 0; i < timestamps.Length; i++)
+        {
+            uint timestamp = ReadUInt32(data, checked((int)(timeOffset + i * 4L)));
+            if (i > 0 && timestamp <= previousTimestamp)
+            {
+                error = $"timestamps are not strictly increasing at key {i} ({previousTimestamp}, {timestamp})";
+                timestamps = null;
+                keys = null;
+                return false;
+            }
+            if (timestamp > durationMs)
+            {
+                error = $"timestamp {timestamp} at key {i} exceeds global-sequence duration {durationMs}";
+                timestamps = null;
+                keys = null;
+                return false;
+            }
+
+            T value = readValue(data, checked((int)(keyOffset + i * (long)valueStride)), model.Version);
+            if (!isValidValue(value))
+            {
+                error = $"key {i} contains a non-finite or invalid value";
+                timestamps = null;
+                keys = null;
+                return false;
+            }
+
+            timestamps[i] = timestamp;
+            keys[i] = value;
+            previousTimestamp = timestamp;
+        }
+
+        sourceGlobalSequence = globalSequence;
+        return true;
+    }
+
+    private static Quaternion ReadRestQuaternion(byte[] data, int offset, uint version)
+    {
+        if (version >= 260)
+        {
+            // WoW 2.0+ stores texture quaternions as signed int16 components with an offset
+            // encoding. This is texture space, so unlike bone rotations there is no Y/Z axis swap.
+            static float Decode(ushort raw)
+            {
+                short value = unchecked((short)raw);
+                return (value < 0 ? value + 32768 : value - 32767) / 32767f;
+            }
+            return new Quaternion(Decode(ReadUInt16(data, offset)), Decode(ReadUInt16(data, offset + 2)),
+                Decode(ReadUInt16(data, offset + 4)), Decode(ReadUInt16(data, offset + 6)));
+        }
+        return new Quaternion(ReadFloat(data, offset), ReadFloat(data, offset + 4),
+            ReadFloat(data, offset + 8), ReadFloat(data, offset + 12));
+    }
+
+    private static bool IsFinite(Vector3 value) =>
+        float.IsFinite(value.X) && float.IsFinite(value.Y) && float.IsFinite(value.Z);
+    private static bool IsFinite(Quaternion value) =>
+        float.IsFinite(value.X) && float.IsFinite(value.Y) &&
+        float.IsFinite(value.Z) && float.IsFinite(value.W);
+
     // ── Transparency static alphas (Session N — see GlbWriter docs) ─────────
     //
-    // Same AnimationBlockM2 wire format as bone TRS tracks (28 bytes), but
-    // we only care about keys[0] of the first sequence for static evaluation.
-    // The full Session N decode lives here verbatim from the prior version.
+    // Same AnimationBlockM2 wire format as color/UV tracks (28 bytes). Sample the
+    // deterministic Stand/sequence-0 rest key rather than blindly taking keys[0].
     private static void ParseTransparencyStaticAlphas(byte[] data, uint count, uint offset, M2Model model)
     {
         if (count == 0 || offset == 0) return;
@@ -1080,20 +1542,18 @@ public class M2Reader
         {
             int off = (int)(offset + i * ANIM_BLOCK_STRIDE_VANILLA);
 
-            uint nKeys = ReadUInt32(data, off + 20);
-            uint ofsKeys = ReadUInt32(data, off + 24);
-
-            float alpha = 1.0f;
-
-            if (nKeys > 0 && ofsKeys > 0 && ofsKeys + 2 <= data.Length)
+            if (TryReadRestTrack(data, off, model, 2, 1f,
+                    static (d, o, _) => Math.Clamp((short)ReadUInt16(d, o) / 32767f, 0f, 1f),
+                    out float alpha, out bool animationFrozen, out string? error))
             {
-                short firstKey = (short)ReadUInt16(data, (int)ofsKeys);
-                alpha = firstKey / 32767f;
-                if (alpha < 0f) alpha = 0f;
-                if (alpha > 1f) alpha = 1f;
+                model.TransparencyStaticAlphas.Add(alpha);
+                if (animationFrozen) model.FrozenTransparencyTracks.Add((int)i);
             }
-
-            model.TransparencyStaticAlphas.Add(alpha);
+            else
+            {
+                model.TransparencyStaticAlphas.Add(float.NaN);
+                model.TransparencyStaticAlphaErrors[(int)i] = error ?? "unknown malformed track";
+            }
         }
     }
 

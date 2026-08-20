@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Threading;
 using MangosSuperUI.Services.Mpq;
 
@@ -27,6 +28,9 @@ namespace MangosSuperUI.Services;
 /// live Data/patch-4.MPQ is never held open here, so any writer/deploy can
 /// overwrite it freely, and the content is always current — a rebuild changes the
 /// file, which forces a fresh scratch copy on the next read.
+/// Live patches created after singleton initialization are catalogued on demand.
+/// A missing patch is confirmed across a short replacement grace window, then
+/// retired from precedence without disposing snapshots held by in-flight readers.
 ///
 /// To avoid re-copying patch-4 on every unrelated asset read (ExtractFile probes
 /// every archive for overrides), the scratch copy is keyed on the live file's
@@ -60,15 +64,41 @@ public class MpqReaderService : IDisposable
     /// <summary>SuperUI-written patches served from fresh scratch copies, highest
     /// priority first (patch-5 before patch-4). Not held open.</summary>
     private readonly List<LivePatch> _livePatches = new();
+    /// <summary>Removed live patches retained only so an in-flight reader's
+    /// archive is never disposed underneath it. Reappearance reuses the same
+    /// object; final disposal happens with the service.</summary>
+    private readonly Dictionary<string, LivePatch> _retiredLivePatches =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _livePatchListLock = new();
+    private readonly object _livePatchCatalogLock = new();
+
+    private const int LivePatchReplacementGraceMs = 250;
+    private const int LivePatchReplacementPollMs = 25;
+    private static readonly long LivePatchReplacementGraceTicks =
+        Math.Max(1L, Stopwatch.Frequency * LivePatchReplacementGraceMs / 1000L);
 
     private string _scratchDir = "";
+    private string _dataPath = "";
+    private long _dataDirectoryWriteTicks = long.MinValue;
     private int _scratchCounter;
 
-    private bool _initialized;
+    private volatile bool _initialized;
     private readonly object _initLock = new();
 
     public bool IsInitialized => _initialized;
-    public int ArchiveCount => _archives.Count + _livePatches.Count;
+    public int ArchiveCount
+    {
+        get
+        {
+            int heldCount;
+            _rw.EnterReadLock();
+            try { heldCount = _archives.Count; }
+            finally { _rw.ExitReadLock(); }
+
+            lock (_livePatchListLock)
+                return heldCount + _livePatches.Count;
+        }
+    }
 
     public MpqReaderService(IConfiguration config, ILogger<MpqReaderService> logger)
     {
@@ -111,25 +141,18 @@ public class MpqReaderService : IDisposable
         var dataPath = _config["Vmangos:ClientDataPath"]
             ?? _config["SpellCreator:ClientDataPath"]
             ?? "/home/wowvmangos/wowclient/Data";
+        _dataPath = dataPath;
+
+        // Prepare this even when Data does not exist yet. A mounted volume (or
+        // a test fixture) can appear after singleton initialization, and live
+        // patch discovery must still have somewhere safe to snapshot it.
+        PrepareScratchDirectory();
 
         if (!Directory.Exists(dataPath))
         {
             _logger.LogWarning("MpqReader: Client data path not found: {Path}", dataPath);
             _initialized = true;
             return;
-        }
-
-        // Private scratch dir for fresh copies of the live patches. Cleaned on
-        // start so a crash can't leave stale copies behind.
-        _scratchDir = Path.Combine(Path.GetTempPath(), "superui-mpq-live");
-        try
-        {
-            if (Directory.Exists(_scratchDir)) Directory.Delete(_scratchDir, recursive: true);
-            Directory.CreateDirectory(_scratchDir);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning("MpqReader: could not prepare scratch dir {Dir}: {Err}", _scratchDir, ex.Message);
         }
 
         _logger.LogInformation("MpqReader: Opening MPQ archives from {Path}", dataPath);
@@ -154,8 +177,7 @@ public class MpqReaderService : IDisposable
             // Live patch: record it, do NOT open (read fresh on demand).
             if (IsLivePatch(name))
             {
-                _livePatches.Add(new LivePatch(name, mpqPath));
-                _logger.LogInformation("MpqReader: {Name} registered as LIVE (read from a fresh copy on demand)", name);
+                RegisterLivePatch(name, mpqPath);
                 continue;
             }
 
@@ -182,11 +204,288 @@ public class MpqReaderService : IDisposable
             }
         }
 
-        // Highest priority first (numeric: patch-10 before patch-5 before patch-4 before patch).
-        _livePatches.Sort((a, b) => MpqPatchOrder.CompareDescending(a.Name, b.Name));
+        Volatile.Write(ref _dataDirectoryWriteTicks, GetDirectoryWriteTicks(dataPath));
 
-        _logger.LogInformation("MpqReader: {Held} held, {Live} live archive(s)", _archives.Count, _livePatches.Count);
+        int liveCount;
+        lock (_livePatchListLock) liveCount = _livePatches.Count;
+        _logger.LogInformation("MpqReader: {Held} held, {Live} live archive(s)", _archives.Count, liveCount);
         _initialized = true;
+    }
+
+    private void PrepareScratchDirectory()
+    {
+        // Private scratch dir for fresh copies of the live patches. Cleaned on
+        // start so a crash can't leave stale copies behind.
+        _scratchDir = Path.Combine(Path.GetTempPath(), "superui-mpq-live");
+        try
+        {
+            if (Directory.Exists(_scratchDir)) Directory.Delete(_scratchDir, recursive: true);
+            Directory.CreateDirectory(_scratchDir);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("MpqReader: could not prepare scratch dir {Dir}: {Err}", _scratchDir, ex.Message);
+        }
+    }
+
+    private static long GetDirectoryWriteTicks(string dataPath)
+    {
+        try
+        {
+            return Directory.Exists(dataPath)
+                ? Directory.GetLastWriteTimeUtc(dataPath).Ticks
+                : long.MinValue;
+        }
+        catch
+        {
+            return long.MinValue;
+        }
+    }
+
+    private static List<string> EnumerateLivePatchFiles(string dataPath)
+    {
+        if (!Directory.Exists(dataPath)) return new List<string>();
+
+        return Directory.GetFiles(dataPath, "*.MPQ", SearchOption.TopDirectoryOnly)
+            .Concat(Directory.GetFiles(dataPath, "*.mpq", SearchOption.TopDirectoryOnly))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(path => IsLivePatch(Path.GetFileName(path)))
+            .OrderBy(path => Path.GetFileName(path), Comparer<string>.Create(MpqPatchOrder.CompareDescending))
+            .ToList();
+    }
+
+    private bool TryEnumerateLivePatchFiles(string dataPath, out List<string> paths)
+    {
+        try
+        {
+            paths = EnumerateLivePatchFiles(dataPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            paths = new List<string>();
+            _logger.LogWarning("MpqReader: live patch discovery failed in {Path}: {Err}", dataPath, ex.Message);
+            return false;
+        }
+    }
+
+    private static string NormalizePath(string path)
+    {
+        try { return Path.GetFullPath(path); }
+        catch { return path; }
+    }
+
+    private bool RegisterLivePatch(string name, string path)
+    {
+        string fullPath = NormalizePath(path);
+        bool reactivated = false;
+
+        lock (_livePatchListLock)
+        {
+            var active = _livePatches.FirstOrDefault(lp =>
+                string.Equals(lp.LivePath, fullPath, StringComparison.OrdinalIgnoreCase));
+            if (active != null)
+            {
+                // A disappearance was observed, even if the replacement arrived inside the
+                // grace window. Do not trust matching mtime/size metadata: a fast atomic replace
+                // can produce a different archive with the same pair.
+                if (Volatile.Read(ref active.MissingSinceTimestamp) != 0)
+                    active.ForceRefresh = true;
+                Volatile.Write(ref active.MissingSinceTimestamp, 0);
+                return false;
+            }
+
+            LivePatch patch;
+            if (_retiredLivePatches.Remove(fullPath, out var retired))
+            {
+                patch = retired;
+                patch.ForceRefresh = true;
+                reactivated = true;
+            }
+            else
+            {
+                patch = new LivePatch(name, fullPath);
+            }
+
+            Volatile.Write(ref patch.MissingSinceTimestamp, 0);
+            _livePatches.Add(patch);
+            // Highest priority first (numeric: patch-10 before patch-5 before patch-4).
+            _livePatches.Sort((a, b) => MpqPatchOrder.CompareDescending(a.Name, b.Name));
+            _allPaths = null;
+        }
+
+        _logger.LogInformation("MpqReader: {Name} {Action} as LIVE (read from a fresh copy on demand)",
+            name, reactivated ? "reactivated" : "registered");
+        return true;
+    }
+
+    private static HashSet<string> NormalizeLivePathSet(IEnumerable<string> paths) =>
+        paths.Select(NormalizePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private static long ObserveMissing(LivePatch patch, long now)
+    {
+        long since = Volatile.Read(ref patch.MissingSinceTimestamp);
+        if (since != 0) return since;
+
+        long prior = Interlocked.CompareExchange(ref patch.MissingSinceTimestamp, now, 0);
+        return prior == 0 ? now : prior;
+    }
+
+    private static bool MissingGraceElapsed(LivePatch patch, long now)
+    {
+        long since = Volatile.Read(ref patch.MissingSinceTimestamp);
+        return since != 0 && now - since >= LivePatchReplacementGraceTicks;
+    }
+
+    private bool HasActivePatchMissingFrom(IReadOnlySet<string> present)
+    {
+        lock (_livePatchListLock)
+            return _livePatches.Any(lp => !present.Contains(lp.LivePath));
+    }
+
+    private void ObserveActivePatchesMissingFrom(IReadOnlySet<string> present)
+    {
+        long now = Stopwatch.GetTimestamp();
+        lock (_livePatchListLock)
+        {
+            foreach (var patch in _livePatches)
+            {
+                if (!present.Contains(patch.LivePath))
+                    ObserveMissing(patch, now);
+            }
+        }
+    }
+
+    private bool HasExpiredMissingPatch()
+    {
+        long now = Stopwatch.GetTimestamp();
+        lock (_livePatchListLock)
+            return _livePatches.Any(lp => MissingGraceElapsed(lp, now));
+    }
+
+    private bool HasReappearedRetiredPatch()
+    {
+        lock (_livePatchListLock)
+        {
+            foreach (string path in _retiredLivePatches.Keys)
+            {
+                try { if (File.Exists(path)) return true; }
+                catch { }
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Apply one complete directory observation. Present paths are
+    /// registered/reactivated. Missing active paths are first marked so an
+    /// automatic scan can tolerate a short replace-by-rename gap; a confirmed
+    /// refresh retires them immediately after its bounded confirmation poll.</summary>
+    private (int Added, int Retired) ReconcileLivePatches(
+        IReadOnlyList<string> paths, bool retireAllMissing)
+    {
+        int added = 0;
+        foreach (string path in paths)
+        {
+            if (RegisterLivePatch(Path.GetFileName(path), path)) added++;
+        }
+
+        var present = NormalizeLivePathSet(paths);
+        var retiredNames = new List<string>();
+        long now = Stopwatch.GetTimestamp();
+
+        lock (_livePatchListLock)
+        {
+            for (int i = _livePatches.Count - 1; i >= 0; i--)
+            {
+                var patch = _livePatches[i];
+                if (present.Contains(patch.LivePath))
+                {
+                    Volatile.Write(ref patch.MissingSinceTimestamp, 0);
+                    continue;
+                }
+
+                ObserveMissing(patch, now);
+                if (!retireAllMissing && !MissingGraceElapsed(patch, now))
+                    continue;
+
+                _livePatches.RemoveAt(i);
+                patch.ForceRefresh = true;
+                _retiredLivePatches[patch.LivePath] = patch;
+                retiredNames.Add(patch.Name);
+                _allPaths = null;
+            }
+        }
+
+        foreach (string name in retiredNames)
+            _logger.LogInformation("MpqReader: retired missing live patch {Name}", name);
+
+        return (added, retiredNames.Count);
+    }
+
+    /// <summary>
+    /// Force a rescan for writable patch-4/patch-5 archives. A missing known
+    /// patch is polled briefly to tolerate replace-by-rename deployment gaps;
+    /// if it remains absent it is retired before this method returns. Retired
+    /// snapshots remain alive only for readers that already captured them.
+    /// </summary>
+    public int RefreshLivePatches()
+    {
+        EnsureInitialized();
+        lock (_livePatchCatalogLock)
+        {
+            if (!TryEnumerateLivePatchFiles(_dataPath, out var paths)) return 0;
+
+            var present = NormalizeLivePathSet(paths);
+            if (HasActivePatchMissingFrom(present))
+            {
+                // Record the observed gap before polling. If the path returns
+                // with identical length/mtime, RegisterLivePatch can still
+                // force a fresh snapshot rather than accepting old metadata.
+                ObserveActivePatchesMissingFrom(present);
+                long deadline = Stopwatch.GetTimestamp() + LivePatchReplacementGraceTicks;
+                do
+                {
+                    Thread.Sleep(LivePatchReplacementPollMs);
+                    if (!TryEnumerateLivePatchFiles(_dataPath, out paths)) return 0;
+                    present = NormalizeLivePathSet(paths);
+                    if (!HasActivePatchMissingFrom(present)) break;
+                }
+                while (Stopwatch.GetTimestamp() < deadline);
+            }
+
+            var result = ReconcileLivePatches(paths, retireAllMissing: true);
+            Volatile.Write(ref _dataDirectoryWriteTicks, GetDirectoryWriteTicks(_dataPath));
+            return result.Added;
+        }
+    }
+
+    /// <summary>
+    /// Detect a newly-created live patch without reopening the application.
+    /// A directory timestamp stat is the hot-path cost; enumeration happens
+    /// only when the Data directory's membership changes. Existing live patch
+    /// content changes are handled separately by ResolveLivePatch's mtime/size
+    /// fingerprint.
+    /// </summary>
+    private void EnsureLivePatchCatalogCurrent()
+    {
+        long observed = GetDirectoryWriteTicks(_dataPath);
+        if (observed == Volatile.Read(ref _dataDirectoryWriteTicks) &&
+            !HasExpiredMissingPatch() &&
+            !HasReappearedRetiredPatch())
+            return;
+
+        lock (_livePatchCatalogLock)
+        {
+            observed = GetDirectoryWriteTicks(_dataPath);
+            if (observed == Volatile.Read(ref _dataDirectoryWriteTicks) &&
+                !HasExpiredMissingPatch() &&
+                !HasReappearedRetiredPatch())
+                return;
+
+            if (!TryEnumerateLivePatchFiles(_dataPath, out var paths)) return;
+            ReconcileLivePatches(paths, retireAllMissing: false);
+            Volatile.Write(ref _dataDirectoryWriteTicks, observed);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -200,6 +499,8 @@ public class MpqReaderService : IDisposable
         public readonly object RefreshLock = new();
         public volatile Snapshot? Current;    // in use now
         public Snapshot? PendingDispose;      // replaced last refresh; disposed a generation later (lock-held)
+        public long MissingSinceTimestamp;    // Stopwatch ticks; 0 while present
+        public volatile bool ForceRefresh;    // set when a retired path reappears
 
         public LivePatch(string name, string livePath) { Name = name; LivePath = livePath; }
     }
@@ -212,6 +513,15 @@ public class MpqReaderService : IDisposable
         public string ScratchPath = "";
     }
 
+    private static MpqArchive? ResolveMissingLivePatch(LivePatch patch)
+    {
+        long now = Stopwatch.GetTimestamp();
+        long since = ObserveMissing(patch, now);
+        return now - since < LivePatchReplacementGraceTicks
+            ? patch.Current?.Archive
+            : null;
+    }
+
     /// <summary>Return an open archive for this live patch backed by a copy that
     /// matches the current live file; refresh the copy if the live file changed.
     /// Null if the live file is missing or unreadable.</summary>
@@ -221,7 +531,8 @@ public class MpqReaderService : IDisposable
         try
         {
             var fi = new FileInfo(lp.LivePath);
-            if (!fi.Exists) return lp.Current?.Archive;   // vanished mid-run: fall back to last good copy
+            if (!fi.Exists) return ResolveMissingLivePatch(lp);
+            Volatile.Write(ref lp.MissingSinceTimestamp, 0);
             mtime = fi.LastWriteTimeUtc.Ticks;
             size = fi.Length;
         }
@@ -229,7 +540,7 @@ public class MpqReaderService : IDisposable
 
         // Fast path: cached copy still matches the live file — no lock, no copy.
         var snap = lp.Current;
-        if (snap != null && snap.Mtime == mtime && snap.Size == size)
+        if (!lp.ForceRefresh && snap != null && snap.Mtime == mtime && snap.Size == size)
             return snap.Archive;
 
         lock (lp.RefreshLock)
@@ -239,14 +550,15 @@ public class MpqReaderService : IDisposable
             try
             {
                 var fi = new FileInfo(lp.LivePath);
-                if (!fi.Exists) return lp.Current?.Archive;
+                if (!fi.Exists) return ResolveMissingLivePatch(lp);
+                Volatile.Write(ref lp.MissingSinceTimestamp, 0);
                 mtime = fi.LastWriteTimeUtc.Ticks;
                 size = fi.Length;
             }
             catch { return lp.Current?.Archive; }
 
             snap = lp.Current;
-            if (snap != null && snap.Mtime == mtime && snap.Size == size)
+            if (!lp.ForceRefresh && snap != null && snap.Mtime == mtime && snap.Size == size)
                 return snap.Archive;
 
             // Copy the live file to a UNIQUE scratch name (never overwrite a
@@ -277,6 +589,7 @@ public class MpqReaderService : IDisposable
             var toKill = lp.PendingDispose;
             lp.PendingDispose = snap;
             lp.Current = newSnap;
+            lp.ForceRefresh = false;
             if (toKill != null)
             {
                 try { toKill.Archive.Dispose(); } catch { }
@@ -299,10 +612,13 @@ public class MpqReaderService : IDisposable
     /// <summary>Live patch archives with their names, highest priority first.</summary>
     private IEnumerable<(string Name, MpqArchive Archive)> LiveArchivesNamed()
     {
-        for (int i = 0; i < _livePatches.Count; i++)
+        LivePatch[] patches;
+        lock (_livePatchListLock) patches = _livePatches.ToArray();
+
+        foreach (var patch in patches)
         {
-            var a = ResolveLivePatch(_livePatches[i]);
-            if (a != null) yield return (_livePatches[i].Name, a);
+            var archive = ResolveLivePatch(patch);
+            if (archive != null) yield return (patch.Name, archive);
         }
     }
 
@@ -391,6 +707,7 @@ public class MpqReaderService : IDisposable
     public byte[]? ExtractFile(string mpqPath, Func<string, bool>? skipArchive)
     {
         EnsureInitialized();
+        EnsureLivePatchCatalogCurrent();
 
         // Live patches override everything held.
         foreach (var (liveName, archive) in LiveArchivesNamed())
@@ -474,6 +791,7 @@ public class MpqReaderService : IDisposable
     public List<MpqHit> FindByExactPaths(IEnumerable<string> candidatePaths)
     {
         EnsureInitialized();
+        EnsureLivePatchCatalogCurrent();
         var hits = new List<MpqHit>();
         var candidates = candidatePaths as IList<string> ?? candidatePaths.ToList();
 
@@ -545,6 +863,7 @@ public class MpqReaderService : IDisposable
     public List<string> GetAllPaths()
     {
         EnsureInitialized();
+        EnsureLivePatchCatalogCurrent();
         var cached = _allPaths;
         if (cached != null) return cached;
         lock (_allPathsLock)
@@ -614,12 +933,22 @@ public class MpqReaderService : IDisposable
         finally { _rw.ExitWriteLock(); }
         _rw.Dispose();
 
-        foreach (var lp in _livePatches)
+        LivePatch[] livePatches;
+        lock (_livePatchListLock)
+        {
+            livePatches = _livePatches
+                .Concat(_retiredLivePatches.Values)
+                .Distinct()
+                .ToArray();
+            _livePatches.Clear();
+            _retiredLivePatches.Clear();
+        }
+
+        foreach (var lp in livePatches)
         {
             try { lp.Current?.Archive.Dispose(); } catch { }
             try { lp.PendingDispose?.Archive.Dispose(); } catch { }
         }
-        _livePatches.Clear();
 
         try { if (!string.IsNullOrEmpty(_scratchDir) && Directory.Exists(_scratchDir)) Directory.Delete(_scratchDir, true); } catch { }
     }

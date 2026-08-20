@@ -12,7 +12,12 @@ namespace MangosSuperUI.Services.WeaponForge;
 public static class TbcWeaponMeshExtractor
 {
     private sealed record SourceTexture(string? Path, uint Flags, uint Type);
-    private sealed record SourceBinding(SourceTexture Texture, ushort Coordinate, float StaticAlpha, ushort Transform);
+    private sealed record SourceBinding(
+        SourceTexture Texture,
+        ushort Coordinate,
+        float StaticAlpha,
+        ushort Transform,
+        M2RestTextureTransform? RestTransform);
     private sealed record SourcePass(
         int SourceOrder,
         int SrcSubmesh,
@@ -20,6 +25,7 @@ public static class TbcWeaponMeshExtractor
         sbyte PriorityPlane,
         ushort ShaderId,
         short ColorIndex,
+        M2RestColor? RestColor,
         ushort RenderFlags,
         ushort BlendMode,
         int Layer,
@@ -31,6 +37,11 @@ public static class TbcWeaponMeshExtractor
 
     public static TbcExtractResult? Extract(M2Model m2, ForgeDiagnostics diag)
     {
+        if (m2.RibbonEmitterCount > 0 || m2.ParticleEmitterCount > 0)
+            diag.Warn("tbc.emitters.unsupported",
+                $"Source model contains {m2.RibbonEmitterCount} ribbon and {m2.ParticleEmitterCount} particle emitter(s). " +
+                "The 1.12 donor scaffold cannot transplant those TBC emitter graphs; fixed-function mesh passes are preserved independently.");
+
         var plan = PlanPasses(m2, diag);
         if (plan is null) return ExtractSinglePass(m2, diag);
         if (plan.Fatal) return null;
@@ -121,6 +132,7 @@ public static class TbcWeaponMeshExtractor
                 TextureCoordinate = b.Coordinate,
                 StaticAlpha = Math.Clamp(b.StaticAlpha, 0f, 1f),
                 TextureTransform = b.Transform,
+                RestTransform = b.RestTransform is null ? null : CopyTextureTransform(b.RestTransform),
             }).ToArray();
             int primaryTexture = bindings.Length > 0 ? bindings[0].TextureSlot : 0;
             weaponPasses.Add(new WeaponPass
@@ -135,6 +147,10 @@ public static class TbcWeaponMeshExtractor
                 PriorityPlane = sp.PriorityPlane,
                 ShaderId = sp.ShaderId,
                 ColorIndex = sp.ColorIndex,
+                RestColor = sp.RestColor is null ? null : new WeaponRestColor(
+                    sp.RestColor.Rgb,
+                    sp.RestColor.Alpha,
+                    sp.RestColor.AnimationFrozen),
                 TextureBindings = bindings,
             });
 
@@ -183,7 +199,38 @@ public static class TbcWeaponMeshExtractor
         };
     }
 
-    /// <summary>Build a lossless static batch plan. No visibility threshold, blend filter, pass cap,
+    private static WeaponRestTextureTransform CopyTextureTransform(M2RestTextureTransform source) =>
+        new(
+            source.Translation,
+            source.Rotation,
+            source.Scale,
+            source.AnimationFrozen,
+            CopyVectorAnimation(source.TranslationAnimation),
+            CopyQuaternionAnimation(source.RotationAnimation),
+            CopyVectorAnimation(source.ScaleAnimation));
+
+    private static WeaponGlobalVectorTrack? CopyVectorAnimation(M2GlobalVectorTrack? source) =>
+        source is null
+            ? null
+            : new WeaponGlobalVectorTrack(
+                source.Interpolation,
+                source.SourceGlobalSequence,
+                source.DurationMs,
+                source.Timestamps.ToArray(),
+                source.Keys.ToArray());
+
+    private static WeaponGlobalQuaternionTrack? CopyQuaternionAnimation(
+        M2GlobalQuaternionTrack? source) =>
+        source is null
+            ? null
+            : new WeaponGlobalQuaternionTrack(
+                source.Interpolation,
+                source.SourceGlobalSequence,
+                source.DurationMs,
+                source.Timestamps.ToArray(),
+                source.Keys.ToArray());
+
+    /// <summary>Build a lossless source batch plan. No visibility threshold, blend filter, pass cap,
     /// or base/overlay reordering is applied.</summary>
     private static PassPlan? PlanPasses(M2Model m2, ForgeDiagnostics diag)
     {
@@ -256,6 +303,7 @@ public static class TbcWeaponMeshExtractor
         }
 
         var passes = new List<SourcePass>(m2.Batches.Count);
+        var frozenTransparencyTracks = new HashSet<int>();
         for (int sourceOrder = 0; sourceOrder < m2.Batches.Count; sourceOrder++)
         {
             var batch = m2.Batches[sourceOrder];
@@ -268,6 +316,24 @@ public static class TbcWeaponMeshExtractor
                     $"Batch {sourceOrder} references render flag {batch.MaterialIndex}, outside the render-flag table (count {m2.RenderFlags.Count}).");
             M2RenderFlag rf = m2.RenderFlags[batch.MaterialIndex];
 
+            M2RestColor? restColor = null;
+            if (batch.ColorIndex < -1)
+                return Fatal("tbc.color.sentinel",
+                    $"Batch {sourceOrder} has invalid color index {batch.ColorIndex}; only -1 denotes no color track.");
+            if (batch.ColorIndex >= 0)
+            {
+                int colorIndex = batch.ColorIndex;
+                if ((uint)colorIndex >= m2.ColorTrackCount)
+                    return Fatal("tbc.color.index",
+                        $"Batch {sourceOrder} references color {colorIndex}, outside the color table (count {m2.ColorTrackCount}).");
+                if (m2.RestColorErrors.TryGetValue(colorIndex, out string? colorError))
+                    return Fatal("tbc.color.track",
+                        $"Batch {sourceOrder} references malformed color {colorIndex}: {colorError}.");
+                if (!m2.ReachableRestColors.TryGetValue(colorIndex, out restColor))
+                    return Fatal("tbc.color.missing",
+                        $"Batch {sourceOrder} references color {colorIndex}, but no validated rest sample was decoded.");
+            }
+
             int unitCount = batch.TextureCount;
             if (unitCount == 0)
                 return Fatal("tbc.texture.units.zero",
@@ -279,12 +345,33 @@ public static class TbcWeaponMeshExtractor
             if (!HasDeclaredSpan(m2.TextureCoordinateLookup, batch.TextureCoordinateIndex, unitCount))
                 return Fatal("tbc.texture.coordinate-span",
                     $"Batch {sourceOrder} declares {unitCount} texture unit(s) at coordinate-combo {batch.TextureCoordinateIndex}, outside the coordinate lookup (count {m2.TextureCoordinateLookup.Count}).");
-            if (!HasDeclaredSpan(m2.TransparencyLookup, batch.TextureWeightIndex, unitCount))
+            // Texture weights are batch-wide in the WoW client. TextureCount spans the texture,
+            // coordinate, and transform combo tables, but not the transparency lookup.
+            if (!HasDeclaredSpan(m2.TransparencyLookup, batch.TextureWeightIndex, 1))
                 return Fatal("tbc.texture.weight-span",
-                    $"Batch {sourceOrder} declares {unitCount} texture unit(s) at weight-combo {batch.TextureWeightIndex}, outside the transparency lookup (count {m2.TransparencyLookup.Count}).");
+                    $"Batch {sourceOrder} references weight-combo {batch.TextureWeightIndex}, outside the transparency lookup (count {m2.TransparencyLookup.Count}).");
             if (!HasDeclaredSpan(m2.TextureTransformLookup, batch.TextureTransformIndex, unitCount))
                 return Fatal("tbc.texture.transform-span",
                     $"Batch {sourceOrder} declares {unitCount} texture unit(s) at transform-combo {batch.TextureTransformIndex}, outside the transform lookup (count {m2.TextureTransformLookup.Count}).");
+
+            ushort weight = ResolveOptionalLookup(
+                m2.TransparencyLookup, batch.TextureWeightIndex, 0);
+            float batchStaticAlpha = 1f;
+            if (weight != ushort.MaxValue)
+            {
+                if (weight >= m2.TransparencyStaticAlphas.Count)
+                    return Fatal("tbc.texture.weight",
+                        $"Batch {sourceOrder}: transparency combo resolves track {weight}, outside the transparency table (count {m2.TransparencyStaticAlphas.Count}).");
+                if (m2.TransparencyStaticAlphaErrors.TryGetValue(weight, out string? alphaError))
+                    return Fatal("tbc.texture.alpha-track",
+                        $"Batch {sourceOrder}: transparency track {weight} is malformed: {alphaError}.");
+                batchStaticAlpha = m2.TransparencyStaticAlphas[weight];
+                if (!float.IsFinite(batchStaticAlpha))
+                    return Fatal("tbc.texture.alpha",
+                        $"Batch {sourceOrder}: transparency track {weight} has a non-finite static alpha.");
+                if (m2.FrozenTransparencyTracks.Contains(weight))
+                    frozenTransparencyTracks.Add(weight);
+            }
 
             var bindings = new List<SourceBinding>(unitCount);
             for (int unit = 0; unit < unitCount; unit++)
@@ -295,28 +382,29 @@ public static class TbcWeaponMeshExtractor
 
                 ushort coordinate = ResolveOptionalLookup(
                     m2.TextureCoordinateLookup, batch.TextureCoordinateIndex, unit);
-                ushort weight = ResolveOptionalLookup(
-                    m2.TransparencyLookup, batch.TextureWeightIndex, unit);
                 ushort transform = ResolveOptionalLookup(
                     m2.TextureTransformLookup, batch.TextureTransformIndex, unit);
 
-                float staticAlpha = 1f;
-                if (weight != ushort.MaxValue)
+                M2RestTextureTransform? restTransform = null;
+                if (transform != ushort.MaxValue)
                 {
-                    if (weight >= m2.TransparencyStaticAlphas.Count)
-                        return Fatal("tbc.texture.weight",
-                            $"Batch {sourceOrder}, texture unit {unit}: transparency combo resolves track {weight}, outside the transparency table (count {m2.TransparencyStaticAlphas.Count}).");
-                    staticAlpha = m2.TransparencyStaticAlphas[weight];
-                    if (!float.IsFinite(staticAlpha))
-                        return Fatal("tbc.texture.alpha",
-                            $"Batch {sourceOrder}, texture unit {unit}: transparency track {weight} has a non-finite static alpha.");
+                    if (transform >= m2.TextureTransformCount)
+                        return Fatal("tbc.texture.transform",
+                            $"Batch {sourceOrder}, texture unit {unit}: transform combo resolves record {transform}, outside the UV-transform table (count {m2.TextureTransformCount}).");
+                    if (m2.RestTextureTransformErrors.TryGetValue(transform, out string? transformError))
+                        return Fatal("tbc.texture.transform-track",
+                            $"Batch {sourceOrder}, texture unit {unit}: UV-transform {transform} is malformed: {transformError}.");
+                    if (!m2.ReachableRestTextureTransforms.TryGetValue(transform, out restTransform))
+                        return Fatal("tbc.texture.transform-missing",
+                            $"Batch {sourceOrder}, texture unit {unit}: UV-transform {transform} has no validated rest sample.");
                 }
 
                 bindings.Add(new SourceBinding(
                     texture!,
                     coordinate,
-                    staticAlpha,
-                    transform));
+                    batchStaticAlpha,
+                    transform,
+                    restTransform));
             }
 
             passes.Add(new SourcePass(
@@ -326,11 +414,16 @@ public static class TbcWeaponMeshExtractor
                 batch.PriorityPlane,
                 batch.ShaderId,
                 batch.ColorIndex,
+                restColor,
                 rf.Flags,
                 rf.BlendingMode,
                 batch.MaterialLayer,
                 bindings));
         }
+
+        if (frozenTransparencyTracks.Count > 0)
+            diag.Warn("tbc.transparency.frozen",
+                $"{frozenTransparencyTracks.Count} animated transparency track(s) were frozen at their deterministic rest value for vanilla output.");
 
         // Slot zero is the image used by the largest ordinary surface, because ItemDisplayInfo can
         // provide exactly one replaceable weapon texture. Remaining distinct source images/flag

@@ -127,14 +127,32 @@ public sealed class DonorScaffoldWriter : IWeaponMeshWriter
             diag.Info("writer.passes",
                 $"Multi-pass output: {mesh.SubmeshRanges?.Count ?? 0} submesh(es), {mesh.Passes.Count} pass(es), " +
                 $"{ctx.EffectTexturePaths?.Count ?? 0} effect texture(s).");
-            int transformedUnits = mesh.Passes.Sum(p => p.TextureBindings?.Count(b => b.TextureTransform != ushort.MaxValue) ?? 0);
-            if (transformedUnits > 0)
+            int transformedUnits = mesh.Passes.Sum(p => p.TextureBindings?.Count(b => b.RestTransform is not null) ?? 0);
+            int animatedTransformUnits = mesh.Passes.Sum(p => p.TextureBindings?.Count(b =>
+                b.RestTransform is { } transform &&
+                (transform.TranslationAnimation is not null ||
+                 transform.RotationAnimation is not null ||
+                 transform.ScaleAnimation is not null)) ?? 0);
+            int frozenTransformUnits = mesh.Passes.Sum(p =>
+                p.TextureBindings?.Count(b => b.RestTransform?.AnimationFrozen == true) ?? 0);
+            int purelyStaticTransformUnits = transformedUnits - animatedTransformUnits;
+            if (purelyStaticTransformUnits > 0)
+                diag.Info("writer.uv-transform.static",
+                    $"{purelyStaticTransformUnits} texture unit(s) carry relocated constant UV translation/rotation/scale tracks.");
+            if (animatedTransformUnits > 0)
+                diag.Info("writer.uv-animation.preserved",
+                    $"{animatedTransformUnits} texture unit(s) retain range-free global UV animation timestamps and keys.");
+            if (frozenTransformUnits > 0)
                 diag.Warn("writer.uv-animation.static",
-                    $"{transformedUnits} texture unit(s) reference TBC UV animation tracks. Their base UV set is preserved, but animated scrolling/rotation is disabled on the vanilla donor scaffold.");
-            int coloredPasses = mesh.Passes.Count(p => p.ColorIndex >= 0);
+                    $"{frozenTransformUnits} texture unit(s) still have unsupported source UV animation components; their deterministic rest values are preserved, but those components are frozen.");
+            int coloredPasses = mesh.Passes.Count(p => p.RestColor is not null);
+            int frozenColoredPasses = mesh.Passes.Count(p => p.RestColor?.AnimationFrozen == true);
             if (coloredPasses > 0)
+                diag.Info("writer.color.rest",
+                    $"{coloredPasses} pass(es) carry relocated constant RGB/alpha color tracks.");
+            if (frozenColoredPasses > 0)
                 diag.Warn("writer.color.static",
-                    $"{coloredPasses} pass(es) reference TBC color tracks. Source textures/passes are preserved, but animated color tint is not transplanted.");
+                    $"{frozenColoredPasses} pass(es) had animated TBC color tracks. Their deterministic rest values are preserved, but animation is frozen.");
         }
         else if (mesh.Material.BlendMode != WeaponBlendMode.Opaque || mesh.Material.TwoSided)
             diag.Info("writer.material",

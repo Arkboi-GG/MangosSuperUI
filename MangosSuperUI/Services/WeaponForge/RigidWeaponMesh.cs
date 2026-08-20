@@ -114,6 +114,12 @@ public sealed record WeaponPass
     public short ColorIndex { get; init; } = -1;
 
     /// <summary>
+    /// Evaluated source color/opacity at the deterministic rest sample. The raw
+    /// <see cref="ColorIndex"/> remains source provenance; writers allocate a new v256 record.
+    /// </summary>
+    public WeaponRestColor? RestColor { get; init; }
+
+    /// <summary>
     /// Texture units bound by this batch. Null preserves compatibility with legacy one-texture
     /// passes, which use <see cref="TextureSlot"/> with UV0 and full static alpha.
     /// </summary>
@@ -127,7 +133,42 @@ public sealed record WeaponTextureBinding
     public ushort TextureCoordinate { get; init; } = 0;
     public float StaticAlpha { get; init; } = 1f;
     public ushort TextureTransform { get; init; } = 0xFFFF;
+
+    /// <summary>Evaluated source UV transform. Null means the source lookup sentinel was 0xFFFF.</summary>
+    public WeaponRestTextureTransform? RestTransform { get; init; }
 }
+
+/// <summary>A source material color frozen to a deterministic static sample.</summary>
+public sealed record WeaponRestColor(Vector3 Rgb, float Alpha, bool AnimationFrozen);
+
+/// <summary>A range-free global Vector3 track preserved from a source material animation.</summary>
+public sealed record WeaponGlobalVectorTrack(
+    ushort Interpolation,
+    int SourceGlobalSequence,
+    uint DurationMs,
+    IReadOnlyList<uint> Timestamps,
+    IReadOnlyList<Vector3> Keys);
+
+/// <summary>A range-free global texture-quaternion track, decoded to float XYZW keys.</summary>
+public sealed record WeaponGlobalQuaternionTrack(
+    ushort Interpolation,
+    int SourceGlobalSequence,
+    uint DurationMs,
+    IReadOnlyList<uint> Timestamps,
+    IReadOnlyList<Quaternion> Keys);
+
+/// <summary>
+/// A deterministic source texture-transform sample plus any supported global animation payload.
+/// <see cref="AnimationFrozen"/> is true only when source animation could not be represented.
+/// </summary>
+public sealed record WeaponRestTextureTransform(
+    Vector3 Translation,
+    Quaternion Rotation,
+    Vector3 Scale,
+    bool AnimationFrozen,
+    WeaponGlobalVectorTrack? TranslationAnimation = null,
+    WeaponGlobalQuaternionTrack? RotationAnimation = null,
+    WeaponGlobalVectorTrack? ScaleAnimation = null);
 
 /// <summary>Source metadata for one texture slot.</summary>
 public sealed record WeaponTextureSlot

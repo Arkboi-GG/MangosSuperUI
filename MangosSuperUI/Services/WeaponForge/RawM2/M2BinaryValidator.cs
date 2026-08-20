@@ -71,6 +71,7 @@ public static class M2BinaryValidator
         }
 
         ValidateTransparencyTracks(m2, doc, d);
+        ValidateMaterialTracks(m2, doc, d);
 
         // One Type-2 texture (empty embedded filename is expected; not enforced here).
         var tex = doc.FindArray("textures");
@@ -140,8 +141,19 @@ public static class M2BinaryValidator
 
             CheckSpan(texStart, units, textureComboCount, "texture", label);
             CheckSpan(coordStart, units, coordinateComboCount, "coordinate", label);
-            CheckSpan(weightStart, units, weightComboCount, "weight", label);
+            // The client resolves one texture-weight combo for the entire batch. TextureCount does
+            // not define a span in this table (unlike texture/coordinate/transform combos).
+            if (units > 0) CheckOptionalIndex(weightStart, weightComboCount, "weight", label);
             CheckSpan(transformStart, units, transformComboCount, "transform", label);
+
+            if (units > 0 && weightCombos?.InBounds == true &&
+                weightStart != ushort.MaxValue && weightStart < weightComboCount)
+            {
+                ushort weight = U16At(checked((int)weightComboOffset + weightStart * 2));
+                if (weight != ushort.MaxValue && weight >= transparencyCount)
+                    d.Error("m2.batch.weight",
+                        $"{label} resolves transparency {weight}, count {transparencyCount}.");
+            }
 
             for (int unit = 0; unit < units; unit++)
             {
@@ -150,12 +162,6 @@ public static class M2BinaryValidator
                     ushort texture = U16At(checked((int)textureComboOffset + (texStart + unit) * 2));
                     if (texture >= textureCount)
                         d.Error("m2.batch.texture", $"{label} unit {unit} resolves texture {texture}, count {textureCount}.");
-                }
-                if (weightCombos?.InBounds == true && weightStart + unit < weightComboCount)
-                {
-                    ushort weight = U16At(checked((int)weightComboOffset + (weightStart + unit) * 2));
-                    if (weight != ushort.MaxValue && weight >= transparencyCount)
-                        d.Error("m2.batch.weight", $"{label} unit {unit} resolves transparency {weight}, count {transparencyCount}.");
                 }
                 if (transformCombos?.InBounds == true && transformStart + unit < transformComboCount)
                 {
@@ -170,6 +176,13 @@ public static class M2BinaryValidator
         {
             if ((uint)start + count > available)
                 d.Error($"m2.batch.{kind}-span", $"{label} {kind} combo span [{start},{start + count}) exceeds count {available}.");
+        }
+
+        void CheckOptionalIndex(ushort index, uint available, string kind, string label)
+        {
+            if (index != ushort.MaxValue && index >= available)
+                d.Error($"m2.batch.{kind}-span",
+                    $"{label} {kind} combo index {index} exceeds count {available}.");
         }
 
         ushort U16At(int offset) => BinaryPrimitives.ReadUInt16LittleEndian(m2.AsSpan(offset, 2));
@@ -253,6 +266,131 @@ public static class M2BinaryValidator
                 bool valid = count == 0 || offset > 0 && offset + (long)count * stride <= m2.Length;
                 if (!valid)
                     d.Error("m2.transparency.array-oob",
+                        $"{label} {name} array count={count}, offset=0x{offset:X} is out of bounds.");
+                return valid;
+            }
+        }
+
+        ushort U16At(int offset) => BinaryPrimitives.ReadUInt16LittleEndian(m2.AsSpan(offset, 2));
+        short I16At(int offset) => BinaryPrimitives.ReadInt16LittleEndian(m2.AsSpan(offset, 2));
+        uint U32At(int offset) => BinaryPrimitives.ReadUInt32LittleEndian(m2.AsSpan(offset, 4));
+    }
+
+    /// <summary>Deep-validate the nested v256 tracks inside material colors and UV transforms.</summary>
+    private static void ValidateMaterialTracks(byte[] m2, RawM2Document doc, ForgeDiagnostics d)
+    {
+        uint sequenceCount = doc.FindArray("sequences")?.Count ?? 0;
+        uint globalSequenceCount = doc.FindArray("globalLoops")?.Count ?? 0;
+        var colors = doc.FindArray("colors");
+        var transforms = doc.FindArray("uvAnimations");
+
+        if (colors is { Count: > 0 } && CheckRecords(colors, 56, "Color"))
+        {
+            for (int i = 0; i < colors.Count; i++)
+            {
+                int record = checked((int)colors.Offset + i * 56);
+                ValidateTrack(record, 12, true, $"Color {i} RGB");
+                ValidateTrack(record + 28, 2, false, $"Color {i} alpha");
+            }
+        }
+
+        if (transforms is { Count: > 0 } && CheckRecords(transforms, 84, "UV transform"))
+        {
+            for (int i = 0; i < transforms.Count; i++)
+            {
+                int record = checked((int)transforms.Offset + i * 84);
+                ValidateTrack(record, 12, true, $"UV transform {i} translation");
+                ValidateTrack(record + 28, 16, true, $"UV transform {i} rotation", quaternionValues: true);
+                ValidateTrack(record + 56, 12, true, $"UV transform {i} scale");
+            }
+        }
+
+        bool CheckRecords(RawM2Array records, int stride, string label)
+        {
+            bool valid = records.Offset > 0 && records.Offset + (long)records.Count * stride <= m2.Length;
+            if (!valid)
+                d.Error("m2.material.records-oob",
+                    $"{label} record array count={records.Count}, offset=0x{records.Offset:X} is out of bounds.");
+            return valid;
+        }
+
+        void ValidateTrack(int track, int valueStride, bool floatValues, string label,
+            bool quaternionValues = false)
+        {
+            ushort interpolation = U16At(track);
+            short globalSequence = I16At(track + 2);
+            uint rangeCount = U32At(track + 4), rangeOffset = U32At(track + 8);
+            uint timeCount = U32At(track + 12), timeOffset = U32At(track + 16);
+            uint keyCount = U32At(track + 20), keyOffset = U32At(track + 24);
+
+            if (interpolation > 3)
+                d.Error("m2.material.interpolation", $"{label} has invalid interpolation type {interpolation}.");
+            if (globalSequence < -1 || globalSequence >= 0 && globalSequence >= globalSequenceCount)
+                d.Error("m2.material.global-sequence",
+                    $"{label} references global sequence {globalSequence}, count {globalSequenceCount}.");
+
+            bool rangesInBounds = CheckArray(rangeCount, rangeOffset, 8, "ranges");
+            bool timesInBounds = CheckArray(timeCount, timeOffset, 4, "timestamps");
+            int storedStride = checked(valueStride * (interpolation is 2 or 3 ? 3 : 1));
+            bool keysInBounds = CheckArray(keyCount, keyOffset, storedStride, "keys");
+            if (!rangesInBounds || !timesInBounds || !keysInBounds) return;
+
+            if (timeCount != keyCount)
+                d.Error("m2.material.key-count",
+                    $"{label} has {timeCount} timestamp(s) but {keyCount} key(s).");
+            if (keyCount > 0 && globalSequence == -1 && sequenceCount > 0 &&
+                rangeCount > 0 && rangeCount < sequenceCount)
+                d.Error("m2.material.range-count",
+                    $"{label} has {rangeCount} range(s) for {sequenceCount} animation sequence(s).");
+
+            for (int ri = 0; ri < rangeCount; ri++)
+            {
+                int range = checked((int)rangeOffset + ri * 8);
+                uint start = U32At(range), end = U32At(range + 4);
+                if (start > end || end >= timeCount || end >= keyCount)
+                    d.Error("m2.material.range",
+                        $"{label} range {ri} [{start},{end}] is invalid for {timeCount} timestamp(s) and {keyCount} key(s).");
+            }
+
+            if (floatValues)
+            {
+                long floatCount = (long)keyCount * storedStride / 4;
+                for (long i = 0; i < floatCount; i++)
+                {
+                    float value = BinaryPrimitives.ReadSingleLittleEndian(
+                        m2.AsSpan(checked((int)(keyOffset + i * 4)), 4));
+                    if (!float.IsFinite(value))
+                    {
+                        d.Error("m2.material.nonfinite", $"{label} contains a non-finite key value.");
+                        break;
+                    }
+                }
+            }
+            if (quaternionValues)
+            {
+                for (uint key = 0; key < keyCount; key++)
+                {
+                    int value = checked((int)(keyOffset + key * (long)storedStride));
+                    float x = BinaryPrimitives.ReadSingleLittleEndian(m2.AsSpan(value, 4));
+                    float y = BinaryPrimitives.ReadSingleLittleEndian(m2.AsSpan(value + 4, 4));
+                    float z = BinaryPrimitives.ReadSingleLittleEndian(m2.AsSpan(value + 8, 4));
+                    float w = BinaryPrimitives.ReadSingleLittleEndian(m2.AsSpan(value + 12, 4));
+                    float lengthSquared = x * x + y * y + z * z + w * w;
+                    if (!float.IsFinite(lengthSquared) || lengthSquared < 1e-10f)
+                    {
+                        d.Error("m2.material.quaternion", $"{label} key {key} is a zero/invalid quaternion.");
+                        continue;
+                    }
+                    if (MathF.Abs(MathF.Sqrt(lengthSquared) - 1f) > 0.05f)
+                        d.Warn("m2.material.quaternion", $"{label} key {key} is not normalized.");
+                }
+            }
+
+            bool CheckArray(uint count, uint offset, int stride, string name)
+            {
+                bool valid = count == 0 || offset > 0 && offset + (long)count * stride <= m2.Length;
+                if (!valid)
+                    d.Error("m2.material.array-oob",
                         $"{label} {name} array count={count}, offset=0x{offset:X} is out of bounds.");
                 return valid;
             }

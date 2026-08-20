@@ -1,6 +1,8 @@
 using Dapper;
 using MangosSuperUI.Models;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace MangosSuperUI.Services;
@@ -44,6 +46,11 @@ public class ItemTextureService
 
     // Cache: displayId → extracted texture info
     private readonly ConcurrentDictionary<uint, ItemTextureInfo?> _cache = new();
+
+    // Process-wide because ItemTextureService itself is scoped per request.
+    // Serializes source capture, fingerprinting, and promotion of the canonical
+    // GLB + sidecar across concurrent HTTP requests for the same display.
+    private static readonly ConcurrentDictionary<uint, object> GlbBuildLocks = new();
 
     // Disk cache directory for decoded PNGs
     private string CacheDir => Path.Combine(_env.WebRootPath, "item_textures_cache");
@@ -89,30 +96,48 @@ public class ItemTextureService
     /// Extracts M2 + BLPs from MPQ, converts to GLB via GlbWriter, caches on disk.
     /// Returns the web path to the GLB, or null if conversion fails.
     ///
-    /// === Filename versioning ===
-    /// The cache filename embeds the current RigidGlbVersion (e.g.
-    /// "31506.v2.glb"). When GlbWriter changes, bumping the constant
-    /// makes prior versions invisible to File.Exists, forcing
-    /// regeneration. Stale files get swept at service startup.
+    /// === Code + source versioning ===
+    /// The canonical filename embeds RigidGlbVersion (e.g. "31506.v2.glb")
+    /// for writer changes. A sibling .source file stores a SHA-256 over the
+    /// resolved model identity, raw M2, and every bound texture slot. A missing
+    /// or mismatched stamp regenerates the GLB even when the display ID did not
+    /// change. The returned URL carries that fingerprint as a query token so a
+    /// browser cannot reuse an older same-display response.
     /// </summary>
     public string? EnsureGlb(uint displayId)
     {
         if (displayId == 0) return null;
 
-        // Check if GLB already exists on disk (pre-extracted or previously generated)
+        // Lock before resolving any DB/DBC/MPQ input, not merely before the
+        // final write. Otherwise an older request can capture generation A,
+        // wait while a newer request publishes B, then overwrite B with A.
+        object buildLock = GlbBuildLocks.GetOrAdd(displayId, static _ => new object());
+        lock (buildLock)
+            return EnsureGlbLocked(displayId);
+    }
+
+    /// <summary>Source capture, fingerprinting, validation, and promotion for
+    /// one display. The caller holds that display's process-wide lock for the
+    /// entire operation, so generations can only commit in capture order.</summary>
+    private string? EnsureGlbLocked(uint displayId)
+    {
         var glbDir = Path.Combine(_env.WebRootPath, "item_models");
         var naturalFilename = $"{displayId}.glb";
         var versionedFilename = CacheVersionRegistry.MakeVersioned(
             naturalFilename, CacheVersionRegistry.RigidGlbVersion);
         var glbPath = Path.Combine(glbDir, versionedFilename);
-        var webPath = $"/item_models/{versionedFilename}";
-
-        if (File.Exists(glbPath))
-            return webPath;
+        var sourceFilename = CacheVersionRegistry.MakeVersioned(
+            $"{displayId}.source", CacheVersionRegistry.RigidGlbVersion);
+        var sourcePath = Path.Combine(glbDir, sourceFilename);
 
         // Generate on demand
         try
         {
+            // MpqReaderService is a singleton and may have initialized before
+            // the first patch-5 existed. Force an idempotent catalog refresh at
+            // the display-asset boundary before resolving any source bytes.
+            _mpq.RefreshLivePatches();
+
             // ── Check if this is a custom retexture (displayId 60000+) ──
             // If so, use the ORIGINAL displayId's M2/textures but swap in
             // the custom BLP from the DB. This makes the 3D viewer show
@@ -234,23 +259,141 @@ public class ItemTextureService
                 // Still try — model will render with fallback grey material
             }
 
-            Directory.CreateDirectory(glbDir);
-            bool ok = GlbWriter.SaveGlb(m2Model, textures, glbPath);
+            string sourceFingerprint = ComputeGlbSourceFingerprint(
+                displayId, resolvedDisplayId, modelInfo.Value, modelName,
+                retexInfo, m2Data, textures);
+            string webPath = $"/item_models/{versionedFilename}?source={sourceFingerprint}";
 
-            if (ok)
-            {
-                _logger.LogInformation("ItemTexture: Generated GLB for displayId {Id} ({Model}, {Size}KB)",
-                    displayId, modelName, new FileInfo(glbPath).Length / 1024);
+            if (GlbCacheMatchesSource(glbPath, sourcePath, sourceFingerprint))
                 return webPath;
+
+            Directory.CreateDirectory(glbDir);
+            if (!WriteGlbCacheAtomically(
+                    m2Model, textures, glbPath, sourcePath, sourceFingerprint))
+            {
+                _logger.LogWarning("ItemTexture: GlbWriter failed for displayId {Id}", displayId);
+                return null;
             }
 
-            _logger.LogWarning("ItemTexture: GlbWriter failed for displayId {Id}", displayId);
-            return null;
+            _logger.LogInformation("ItemTexture: Generated GLB for displayId {Id} ({Model}, {Size}KB)",
+                displayId, modelName, new FileInfo(glbPath).Length / 1024);
+            return webPath;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "ItemTexture: GLB generation failed for displayId {Id}", displayId);
             return null;
+        }
+    }
+
+    private static string ComputeGlbSourceFingerprint(
+        uint displayId,
+        uint resolvedDisplayId,
+        ItemModelDbc modelInfo,
+        string selectedModelName,
+        RetextureGlbInfo? retexture,
+        byte[] m2Data,
+        IReadOnlyDictionary<int, byte[]> textures)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+        // Domain/version marker makes future changes to the fingerprint framing
+        // an intentional cache invalidation rather than an accidental collision.
+        AppendFingerprintString(hash, "ItemTextureService.EnsureGlb/source-v1");
+        AppendFingerprintUInt32(hash, displayId);
+        AppendFingerprintUInt32(hash, resolvedDisplayId);
+        AppendFingerprintString(hash, selectedModelName);
+        AppendFingerprintString(hash, modelInfo.ModelName1);
+        AppendFingerprintString(hash, modelInfo.ModelName2);
+        AppendFingerprintString(hash, modelInfo.TextureName1);
+        AppendFingerprintString(hash, modelInfo.TextureName2);
+        AppendFingerprintUInt32(hash, retexture?.OrigDisplayId ?? 0);
+        AppendFingerprintString(hash, retexture?.OrigTexFilename);
+        AppendFingerprintBytes(hash, m2Data);
+
+        AppendFingerprintUInt32(hash, checked((uint)textures.Count));
+        foreach (var texture in textures.OrderBy(pair => pair.Key))
+        {
+            AppendFingerprintInt32(hash, texture.Key);
+            AppendFingerprintBytes(hash, texture.Value);
+        }
+
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    private static void AppendFingerprintString(IncrementalHash hash, string? value)
+    {
+        AppendFingerprintBytes(hash, Encoding.UTF8.GetBytes(value ?? string.Empty));
+    }
+
+    private static void AppendFingerprintBytes(IncrementalHash hash, byte[] value)
+    {
+        Span<byte> length = stackalloc byte[8];
+        BinaryPrimitives.WriteInt64LittleEndian(length, value.LongLength);
+        hash.AppendData(length);
+        hash.AppendData(value);
+    }
+
+    private static void AppendFingerprintUInt32(IncrementalHash hash, uint value)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
+        hash.AppendData(bytes);
+    }
+
+    private static void AppendFingerprintInt32(IncrementalHash hash, int value)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+        hash.AppendData(bytes);
+    }
+
+    private static bool GlbCacheMatchesSource(
+        string glbPath, string sourcePath, string expectedFingerprint)
+    {
+        if (!File.Exists(glbPath) || !File.Exists(sourcePath)) return false;
+
+        try
+        {
+            string actual = File.ReadAllText(sourcePath).Trim();
+            return string.Equals(actual, expectedFingerprint, StringComparison.Ordinal);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool WriteGlbCacheAtomically(
+        M2Model m2Model,
+        Dictionary<int, byte[]> textures,
+        string glbPath,
+        string sourcePath,
+        string sourceFingerprint)
+    {
+        string nonce = Guid.NewGuid().ToString("N");
+        string tempGlbPath = $"{glbPath}.{nonce}.tmp";
+        string tempSourcePath = $"{sourcePath}.{nonce}.tmp";
+
+        try
+        {
+            if (!GlbWriter.SaveGlb(m2Model, textures, tempGlbPath))
+                return false;
+
+            File.WriteAllText(tempSourcePath, sourceFingerprint, new UTF8Encoding(false));
+
+            // Invalidate the old stamp before replacing the GLB, then promote
+            // the new stamp last. Every interruption point therefore leaves a
+            // missing stamp, never a new GLB blessed by the old fingerprint.
+            if (File.Exists(sourcePath)) File.Delete(sourcePath);
+            File.Move(tempGlbPath, glbPath, overwrite: true);
+            File.Move(tempSourcePath, sourcePath, overwrite: true);
+            return true;
+        }
+        finally
+        {
+            try { if (File.Exists(tempGlbPath)) File.Delete(tempGlbPath); } catch { }
+            try { if (File.Exists(tempSourcePath)) File.Delete(tempSourcePath); } catch { }
         }
     }
 
@@ -1165,17 +1308,32 @@ public class ItemTextureService
     {
         _cache.TryRemove(displayId, out _);
 
-        // Also delete the cached GLB so it regenerates with the new texture
+        // Also delete the cached GLB and its source stamp so the next request
+        // regenerates with the new model/texture inputs. Share EnsureGlb's
+        // display-scoped lock so invalidation cannot race an atomic promotion.
         try
         {
-            var glbDir = Path.Combine(_env.WebRootPath, "item_models");
-            if (Directory.Exists(glbDir))
+            object buildLock = GlbBuildLocks.GetOrAdd(displayId, static _ => new object());
+            lock (buildLock)
             {
-                // Match both versioned and unversioned filenames
-                foreach (var file in Directory.GetFiles(glbDir, $"{displayId}.*glb"))
+                var glbDir = Path.Combine(_env.WebRootPath, "item_models");
+                if (Directory.Exists(glbDir))
                 {
-                    File.Delete(file);
-                    _logger.LogInformation("ItemTexture: Deleted cached GLB {File} for invalidation", Path.GetFileName(file));
+                    // Match versioned/unversioned GLBs, source sidecars, and
+                    // any same-display temp artifact left by an interrupted run.
+                    foreach (var file in Directory.GetFiles(glbDir, $"{displayId}.*"))
+                    {
+                        string extension = Path.GetExtension(file);
+                        if (!extension.Equals(".glb", StringComparison.OrdinalIgnoreCase) &&
+                            !extension.Equals(".source", StringComparison.OrdinalIgnoreCase) &&
+                            !extension.Equals(".tmp", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        File.Delete(file);
+                        _logger.LogInformation(
+                            "ItemTexture: Deleted cached GLB artifact {File} for invalidation",
+                            Path.GetFileName(file));
+                    }
                 }
             }
         }

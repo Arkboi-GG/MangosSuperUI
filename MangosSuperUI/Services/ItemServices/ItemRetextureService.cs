@@ -1455,11 +1455,16 @@ public class ItemRetextureService
     public async Task<bool> DeleteRetextureAsync(int id)
     {
         using var conn = _db.Admin();
+        long? newDisplayId = await conn.ExecuteScalarAsync<long?>(
+            "SELECT new_display_id FROM custom_item_retexture WHERE id = @Id", new { Id = id });
+        if (newDisplayId is null) return false;
+
         int affected = await conn.ExecuteAsync(
             "DELETE FROM custom_item_retexture WHERE id = @Id", new { Id = id });
 
         if (affected > 0)
         {
+            _itemTextures.InvalidateCache(checked((uint)newDisplayId.Value));
             await RebuildPatchMAsync();
             return true;
         }

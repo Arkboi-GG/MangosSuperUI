@@ -281,6 +281,15 @@ public static class RigidWeaponMeshValidator
             if (pass.Layer < 0 || pass.Layer > ushort.MaxValue)
                 d.Error("mesh.pass.layer",
                     $"Pass {passIndex} layer {pass.Layer} is outside the UInt16 range 0..{ushort.MaxValue}.");
+            if (pass.ColorIndex < -1)
+                d.Error("mesh.pass.color", $"Pass {passIndex} has invalid color index {pass.ColorIndex}.");
+            if ((pass.ColorIndex >= 0) != (pass.RestColor is not null))
+                d.Error("mesh.pass.color",
+                    $"Pass {passIndex} color reference and validated rest-color sample do not match.");
+            if (pass.RestColor is { } color &&
+                (!IsFinite(color.Rgb) || !float.IsFinite(color.Alpha) || color.Alpha < 0f || color.Alpha > 1f))
+                d.Error("mesh.pass.color",
+                    $"Pass {passIndex} rest color contains non-finite values or alpha outside [0,1].");
 
             if (pass.TextureBindings is { } bindings)
             {
@@ -309,6 +318,31 @@ public static class RigidWeaponMeshValidator
                         binding.StaticAlpha < 0f || binding.StaticAlpha > 1f)
                         d.Error("mesh.binding.alpha",
                             $"Pass {passIndex} texture binding {bindingIndex} static alpha {binding.StaticAlpha} is not finite within [0,1].");
+                    if ((binding.TextureTransform != ushort.MaxValue) != (binding.RestTransform is not null))
+                        d.Error("mesh.binding.transform",
+                            $"Pass {passIndex} texture binding {bindingIndex} transform reference and validated rest sample do not match.");
+                    if (binding.RestTransform is { } transform)
+                    {
+                        string transformLabel = $"Pass {passIndex} texture binding {bindingIndex}";
+                        if (!IsFinite(transform.Translation) || !IsFinite(transform.Scale) ||
+                            !IsFinite(transform.Rotation) || transform.Rotation.LengthSquared() < 1e-10f)
+                            d.Error("mesh.binding.transform",
+                                $"{transformLabel} rest transform contains non-finite or invalid values.");
+
+                        bool hasAnimation = transform.TranslationAnimation is not null ||
+                                            transform.RotationAnimation is not null ||
+                                            transform.ScaleAnimation is not null;
+                        if (transform.AnimationFrozen && hasAnimation)
+                            d.Error("mesh.binding.transform.animation",
+                                $"{transformLabel} cannot be marked AnimationFrozen while carrying an animation payload.");
+
+                        ValidateGlobalVectorTrack(transform.TranslationAnimation,
+                            $"{transformLabel} translation animation", d);
+                        ValidateGlobalQuaternionTrack(transform.RotationAnimation,
+                            $"{transformLabel} rotation animation", d);
+                        ValidateGlobalVectorTrack(transform.ScaleAnimation,
+                            $"{transformLabel} scale animation", d);
+                    }
                 }
 
                 if (bindings[0] is { } primary && pass.TextureSlot != primary.TextureSlot)
@@ -422,4 +456,86 @@ public static class RigidWeaponMeshValidator
     }
 
     private static bool IsFinite(Vector3 v) => float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z);
+    private static bool IsFinite(Quaternion q) =>
+        float.IsFinite(q.X) && float.IsFinite(q.Y) && float.IsFinite(q.Z) && float.IsFinite(q.W);
+
+    private static void ValidateGlobalVectorTrack(WeaponGlobalVectorTrack? track, string label,
+        ForgeDiagnostics d)
+    {
+        if (track is null) return;
+        ValidateGlobalTrackShape(track.Interpolation, track.SourceGlobalSequence, track.DurationMs,
+            track.Timestamps, track.Keys?.Count ?? -1, label, d);
+
+        if (track.Keys is null)
+        {
+            d.Error("mesh.binding.transform.animation", $"{label} has a null key list.");
+            return;
+        }
+        for (int i = 0; i < track.Keys.Count; i++)
+            if (!IsFinite(track.Keys[i]))
+                d.Error("mesh.binding.transform.animation",
+                    $"{label} key {i} contains a non-finite vector.");
+    }
+
+    private static void ValidateGlobalQuaternionTrack(WeaponGlobalQuaternionTrack? track, string label,
+        ForgeDiagnostics d)
+    {
+        if (track is null) return;
+        ValidateGlobalTrackShape(track.Interpolation, track.SourceGlobalSequence, track.DurationMs,
+            track.Timestamps, track.Keys?.Count ?? -1, label, d);
+
+        if (track.Keys is null)
+        {
+            d.Error("mesh.binding.transform.animation", $"{label} has a null key list.");
+            return;
+        }
+        for (int i = 0; i < track.Keys.Count; i++)
+        {
+            Quaternion key = track.Keys[i];
+            if (!IsFinite(key) || key.LengthSquared() < 1e-10f)
+                d.Error("mesh.binding.transform.animation",
+                    $"{label} key {i} is a non-finite or zero-length quaternion.");
+        }
+    }
+
+    private static void ValidateGlobalTrackShape(ushort interpolation, int sourceGlobalSequence,
+        uint durationMs, IReadOnlyList<uint>? timestamps, int keyCount, string label,
+        ForgeDiagnostics d)
+    {
+        if (interpolation is not 0 and not 1)
+            d.Error("mesh.binding.transform.animation",
+                $"{label} interpolation {interpolation} is unsupported; expected 0 or 1.");
+        if (sourceGlobalSequence < 0)
+            d.Error("mesh.binding.transform.animation",
+                $"{label} source global sequence {sourceGlobalSequence} is negative.");
+        if (durationMs == 0)
+            d.Error("mesh.binding.transform.animation", $"{label} duration must be greater than zero.");
+        if (timestamps is null)
+        {
+            d.Error("mesh.binding.transform.animation", $"{label} has a null timestamp list.");
+            return;
+        }
+        if (timestamps.Count < 2 || keyCount < 2 || timestamps.Count != keyCount)
+            d.Error("mesh.binding.transform.animation",
+                $"{label} requires equal timestamp/key counts of at least 2; got {timestamps.Count}/{keyCount}.");
+
+        bool orderReported = false;
+        bool durationReported = false;
+        for (int i = 0; i < timestamps.Count; i++)
+        {
+            uint timestamp = timestamps[i];
+            if (!durationReported && timestamp > durationMs)
+            {
+                d.Error("mesh.binding.transform.animation",
+                    $"{label} timestamp {i} ({timestamp}) exceeds duration {durationMs} ms.");
+                durationReported = true;
+            }
+            if (!orderReported && i > 0 && timestamp <= timestamps[i - 1])
+            {
+                d.Error("mesh.binding.transform.animation",
+                    $"{label} timestamps are not strictly increasing at index {i} ({timestamps[i - 1]} then {timestamp}).");
+                orderReported = true;
+            }
+        }
+    }
 }

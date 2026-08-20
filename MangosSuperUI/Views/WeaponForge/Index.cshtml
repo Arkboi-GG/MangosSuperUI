@@ -119,7 +119,9 @@
             The import station: bring a <strong>finished GLB</strong> (UVs + texture authored elsewhere), decimate it
             to a game budget, and forge it into the game. Forging inserts the item into the world database, reloads
             <code>item_template</code>, and deploys <code>patch-5.MPQ</code> to the client Data folder. Restart the
-            client, then <code>.additem</code> the new entry. All build files are also kept in the artifact folder.
+            client, then <code>.additem</code> the new entry. If an existing custom entry shows an old name or equip
+            slot, fully close WoW and remove <code>WDB\itemcache.wdb</code> (or the whole <code>WDB</code> cache
+            directory) before relaunching; the client recreates it. All build files are also kept in the artifact folder.
         </div>
         <div class="wf-pills" id="wfPills">
             <span class="wf-pill" id="pillFixture">fixture …</span>
@@ -203,8 +205,8 @@
                         <i class="fa-solid fa-magnifying-glass"></i> Browse TBC weapons…</button>
                     <div class="wf-field" style="flex:1;min-width:200px;"><label>Selected model</label>
                         <input type="text" id="tbcSelected" readonly placeholder="nothing selected" style="width:100%;"></div>
-                    <div class="wf-field" title="Drives the vanilla gameplay row and the donor scaffold — pick what this weapon should BE in vanilla">
-                        <label>Weapon type</label>
+                    <div class="wf-field" title="Chooses the vanilla weapon family and donor scaffold; a named TBC item's own One-Hand/Main Hand/Off Hand slot is preserved separately">
+                        <label>Weapon family</label>
                         <select id="tbcType"><option value="sword1h" selected>1H Sword</option></select>
                     </div>
                     <div class="wf-field"><label>Name (optional)</label>
@@ -220,11 +222,13 @@
                     <button class="wf-btn" data-action="tbcForge" id="tbcForgeBtn" disabled>Forge item</button>
                 </div>
                 <div class="wf-note">
-                    The forged item gets the chosen family's stats/sheath/sounds; enchant-glow attachment points come
-                    from the vanilla donor scaffold, not the TBC model. Source geometry, texture units, wrap flags,
-                    blend modes, overlay order, UV0/UV1, rest-pose transparency, and BLP2 mip data are preserved.
-                    Unsupported color/UV-animation tracks are called out in the diagnostics instead of silently
-                    deleting geometry or substituting a donor material.
+                    The forged item gets the chosen family's vanilla stats/sounds while a named TBC item's authentic
+                    equip slot, sheath, and swing delay are preserved. Enchant-glow attachment points come from the
+                    vanilla donor scaffold, not the TBC model. Source geometry, texture units, wrap flags,
+                    blend modes, overlay order, UV0/UV1, rest-pose color/transparency/UV transforms, and BLP2 mip
+                    data are preserved. Compatible global UV animation is transplanted into vanilla; the Web preview
+                    shows its rest frame. Unsupported animated material tracks and TBC ribbon/particle emitters are
+                    reported instead of being silently discarded.
                 </div>
             </div>
 
@@ -444,7 +448,9 @@
                 title: titleOk + (allApplied ? ' & applied to server' : ' — some apply steps need attention'),
                 kv: {
                     'Item entry': d.itemEntry, 'Display id': d.displayId,
-                    'Type': d.weaponTypeLabel || d.weaponType || '1H Sword', 'Model': d.modelMember,
+                    'Type': d.weaponTypeLabel || d.weaponType || '1H Sword',
+                    'Equip slot': d.inventoryTypeLabel || (d.inventoryType != null ? `Inventory type ${d.inventoryType}` : '—'),
+                    'Model': d.modelMember,
                     'Weapons in patch': d.packagedWeaponCount + (d.skippedWeaponCount ? ` (${d.skippedWeaponCount} skipped)` : ''),
                     'Verified': d.allMembersVerified ? 'yes' : 'NO', 'Triangles': d.triangleCount,
                 },
@@ -459,8 +465,8 @@
                     ...(d.diagnostics || []),
                 ],
                 note: allApplied
-                    ? `Live on the server. Restart the client(s), then .additem ${d.itemEntry}.`
-                    : 'One or more steps require manual action — see the lines above; the downloads contain the files. Then restart the client and .additem.'
+                    ? `Live on the server. Fully restart the client(s), then .additem ${d.itemEntry}. If that entry was cached with older metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`
+                    : 'One or more steps require manual action — see the lines above; the downloads contain the files. Then fully restart the client and .additem. If metadata is stale, close WoW and remove WDB\\itemcache.wdb or the whole WDB cache directory.'
             });
             loadGlb(previewUrl(d));
             loadWeapons();
@@ -558,6 +564,7 @@
                     title: d.ok ? `TBC preview — ${d.itemName || tbcSel.name}` : 'TBC preview failed',
                     kv: d.ok ? {
                         'Type': d.weaponTypeLabel || '1H Sword',
+                        'Equip slot': d.inventoryTypeLabel || (d.inventoryType != null ? `Inventory type ${d.inventoryType}` : '—'),
                         'Model': d.model,
                         'Triangles': (d.triangleCount ?? 0).toLocaleString() +
                             (d.withinForgeBudget === false ? ' — OVER vanilla UInt16 limit' : ''),
@@ -646,15 +653,17 @@
                 else {
                     const itemMode = d.mode === 'items';
                     let html = itemMode
-                        ? '<table><tr><th>Name</th><th>ilvl</th><th>Type</th><th>Model</th><th>ID</th></tr>'
+                        ? '<table><tr><th>Name</th><th>ilvl</th><th>Type</th><th>Slot</th><th>Model</th><th>ID</th></tr>'
                         : '<table><tr><th>Model</th><th>Texture</th><th>Row</th></tr>';
                     for (const w of d.weapons) {
                         const attrs = `data-entry="${w.entry || 0}" data-model="${esc(w.model)}" data-row="${w.displayRow}"` +
-                                      ` data-type="${esc(w.typeKey || '')}" data-name="${esc(w.name)}"`;
+                                      ` data-type="${esc(w.typeKey || '')}" data-name="${esc(w.name)}"` +
+                                      ` data-inventory-type="${w.inventoryType ?? ''}" data-slot-label="${esc(w.inventoryTypeLabel || '')}"`;
                         if (itemMode) {
                             const col = QUALITY_COLORS[w.quality] || QUALITY_COLORS[1];
                             html += `<tr ${attrs}><td style="color:${col};font-weight:600;">${esc(w.name)}</td>` +
                                     `<td class="muted">${w.itemLevel || '—'}</td><td class="muted">${esc(w.typeLabel || '—')}</td>` +
+                                    `<td class="muted">${esc(w.inventoryTypeLabel || '—')}</td>` +
                                     `<td class="muted">${esc(w.model)}</td><td class="muted">${w.entry}</td></tr>`;
                         } else {
                             html += `<tr ${attrs}><td>${esc(w.model)}</td><td class="muted">${esc(w.texture)}</td>` +
@@ -679,9 +688,13 @@
                 displayRow: +tr.dataset.row,
                 name: tr.dataset.name || tr.dataset.model,
                 typeKey: tr.dataset.type || '',
+                inventoryType: +(tr.dataset.inventoryType || 0),
+                inventoryTypeLabel: tr.dataset.slotLabel || '',
             };
             document.getElementById('tbcSelected').value =
-                tbcSel.entry ? `${tbcSel.name} (item ${tbcSel.entry})` : `${tbcSel.model} (row ${tbcSel.displayRow})`;
+                tbcSel.entry
+                    ? `${tbcSel.name} — ${tbcSel.inventoryTypeLabel || 'unknown slot'} (item ${tbcSel.entry})`
+                    : `${tbcSel.model} (row ${tbcSel.displayRow})`;
             // Pre-select the family from the TBC subclass; the name field defaults to the item name.
             const typeSel = document.getElementById('tbcType');
             if (tbcSel.typeKey && [...typeSel.options].some(o => o.value === tbcSel.typeKey && !o.disabled))
@@ -709,9 +722,10 @@
                 const d = await (await fetch('/WeaponForge/ListWeapons')).json();
                 if (!d.ok) { host.innerHTML = `<span class="empty">Could not load: ${esc(d.error || 'unknown')}</span>`; return; }
                 if (!d.weapons.length) { host.innerHTML = '<span class="empty">Nothing forged yet.</span>'; return; }
-                let html = '<table><tr><th>Name</th><th>Type</th><th>Entry</th><th>Display</th><th>Source</th><th>Created</th><th></th></tr>';
+                let html = '<table><tr><th>Name</th><th>Type</th><th>Slot</th><th>Entry</th><th>Display</th><th>Source</th><th>Created</th><th></th></tr>';
                 for (const w of d.weapons) {
                     html += `<tr><td>${esc(w.name)}</td><td class="muted">${esc(w.weaponTypeLabel || '—')}</td>` +
+                            `<td class="muted">${esc(w.inventoryTypeLabel || (w.inventoryType != null ? `Inventory type ${w.inventoryType}` : '—'))}</td>` +
                             `<td class="muted">${w.itemEntry || '—'}</td>` +
                             `<td class="muted">${w.displayId}</td><td class="muted">${esc(w.sourceKind)}</td>` +
                             `<td class="muted">${esc(w.createdAt)}</td>` +
@@ -752,7 +766,7 @@
                         applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
                     ],
                     downloads: d.patchDownloadUrl ? [{ label: 'patch-5.MPQ', url: d.patchDownloadUrl }] : [],
-                    note: 'IDs returned to the pool. Restart the client to clear its model caches.'
+                    note: 'IDs returned to the pool. Fully restart the client. If a reused entry shows cached item metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory); WoW recreates it.'
                 });
             } finally { btn.disabled = false; loadWeapons(); }
         }

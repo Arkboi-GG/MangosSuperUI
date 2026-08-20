@@ -220,10 +220,11 @@ public sealed class CustomWeaponBuildService
         if (request.ItemOverrides is not null)
             foreach (var (col, val) in request.ItemOverrides)
                 overrides[col] = val;
+        int effectiveInventoryType = ResolveEffectiveInventoryType(profile, overrides);
         var sql = WeaponItemTemplateSql.Build(entryRes.Id, weaponName, dispRes.Id, buildId, overrides);
         string iconStem = donor.IconStem.Length > 0 ? donor.IconStem : ReadDonorIconStem(baseReader);
         await PersistRecordsAsync(request, profile, donor, buildId, modelIndex, entryRes.Id, dispRes.Id,
-            weaponName, m2, blp, effectBlps, sql, donorGroupSound, iconStem);
+            weaponName, effectiveInventoryType, m2, blp, effectBlps, sql, donorGroupSound, iconStem);
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemDisplay, dispRes.Id, "committed");
 
@@ -247,7 +248,8 @@ public sealed class CustomWeaponBuildService
 
         // 7) Write the build directory: straight patch-5.MPQ + item_template.sql (+ reports). No ZIP.
         var manifest = BuildManifest(request, profile, donor, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
-            donorGroupSound, sql, assembly.Patch, assembly.PackagedCount, assembly.SkippedCount, assembly.ReplacedInBase);
+            effectiveInventoryType, donorGroupSound, sql, assembly.Patch, assembly.PackagedCount,
+            assembly.SkippedCount, assembly.ReplacedInBase);
         string buildDir = WriteOutputs(buildId, entryRes.Id, dispRes.Id, modelIndex, assembly.Patch, sql, manifest, diag);
 
         // 8) Apply — like the app's other tools: world DB row, core reload, client patch deploy.
@@ -283,6 +285,8 @@ public sealed class CustomWeaponBuildService
                 buildId,
                 itemEntry = entryRes.Id,
                 displayId = dispRes.Id,
+                inventoryType = effectiveInventoryType,
+                inventoryTypeLabel = InventoryTypeLabel(effectiveInventoryType),
                 model = WeaponNaming.ModelMpqPath(modelIndex),
                 mpqSha256 = assembly.Patch.MpqSha256,
                 weaponsInPatch = assembly.PackagedCount,
@@ -305,6 +309,8 @@ public sealed class CustomWeaponBuildService
             Name = weaponName,
             WeaponType = profile.Key,
             WeaponTypeLabel = profile.Label,
+            InventoryType = effectiveInventoryType,
+            InventoryTypeLabel = InventoryTypeLabel(effectiveInventoryType),
             SourceKind = request.SourceKind,
             ModelMember = WeaponNaming.ModelMpqPath(modelIndex),
             TextureMember = WeaponNaming.TextureMpqPath(modelIndex),
@@ -389,7 +395,8 @@ public sealed class CustomWeaponBuildService
                      mo.model_mpq_path  AS ModelMpqPath,
                      ma.item_entry      AS ItemEntry,
                      ma.build_id        AS BuildId,
-                     ma.gameplay_json   AS GameplayJson
+                     ma.gameplay_json   AS GameplayJson,
+                     mo.generator_params_json AS GeneratorParamsJson
               FROM custom_weapon_display d
               JOIN custom_weapon_model mo ON mo.model_id = d.model_id
               LEFT JOIN custom_weapon_item_manifest ma ON ma.display_id = d.display_id
@@ -400,12 +407,28 @@ public sealed class CustomWeaponBuildService
         {
             long entry = r.ItemEntry is null ? 0L : (long)Convert.ToInt64(r.ItemEntry);
             string? gameplayJson = (string?)r.GameplayJson;
+            string? generatorParamsJson = (string?)r.GeneratorParamsJson;
+            string? weaponType = ReadGameplayJsonField(gameplayJson, "weaponType");
+            int? inventoryType = ReadGameplayJsonInteger(gameplayJson, "inventoryType")
+                ?? ReadGameplayJsonInteger(generatorParamsJson, "tbcInventoryType");
+            if (inventoryType is <= 0) inventoryType = null;
+            if (inventoryType is null && !string.IsNullOrWhiteSpace(weaponType))
+            {
+                var legacyProfile = WeaponTypeCatalog.All.FirstOrDefault(p =>
+                    p.Key.Equals(weaponType, StringComparison.OrdinalIgnoreCase));
+                inventoryType = legacyProfile?.InventoryType;
+            }
+            string? inventoryTypeLabel = ReadGameplayJsonField(gameplayJson, "inventoryTypeLabel");
+            if (string.IsNullOrWhiteSpace(inventoryTypeLabel) && inventoryType is { } resolvedInventoryType)
+                inventoryTypeLabel = InventoryTypeLabel(resolvedInventoryType);
             list.Add(new ForgedWeaponInfo
             {
                 DisplayId = Convert.ToInt64(r.DisplayId),
                 ItemEntry = entry,
                 Name = ReadGameplayJsonField(gameplayJson, "name") ?? (entry > 0 ? $"Weapon {entry}" : "Unnamed weapon"),
-                WeaponType = ReadGameplayJsonField(gameplayJson, "weaponType"),
+                WeaponType = weaponType,
+                InventoryType = inventoryType,
+                InventoryTypeLabel = inventoryTypeLabel,
                 SourceKind = (string)r.SourceKind,
                 ModelMpqPath = (string)r.ModelMpqPath,
                 DonorDisplayRow = r.DonorDisplayRow is null ? 0L : (long)Convert.ToInt64(r.DonorDisplayRow),
@@ -744,13 +767,73 @@ public sealed class CustomWeaponBuildService
         catch { return null; }
     }
 
+    private static int? ReadGameplayJsonInteger(string? json, string field)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty(field, out var value)) return null;
+            if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int number)) return number;
+            if (value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out number)) return number;
+        }
+        catch { /* older/malformed optional metadata falls through to the family default */ }
+        return null;
+    }
+
+    private static int ResolveEffectiveInventoryType(WeaponTypeProfile profile,
+        IReadOnlyDictionary<string, string> effectiveOverrides)
+    {
+        if (!effectiveOverrides.TryGetValue("inventory_type", out string? value) ||
+            !int.TryParse(value, out int inventoryType) || inventoryType <= 0)
+            throw new InvalidOperationException(
+                $"Weapon type '{profile.Key}' produced invalid inventory_type '{value ?? "<missing>"}'.");
+        return inventoryType;
+    }
+
+    /// <summary>Human equip-slot label for the vanilla/TBC inventory enum. Kept separate from the
+    /// weapon-family label because a 1H Sword may be unrestricted, Main Hand, or Off Hand.</summary>
+    public static string InventoryTypeLabel(int inventoryType) => inventoryType switch
+    {
+        0 => "Non-equip",
+        1 => "Head",
+        2 => "Neck",
+        3 => "Shoulder",
+        4 => "Shirt",
+        5 => "Chest",
+        6 => "Waist",
+        7 => "Legs",
+        8 => "Feet",
+        9 => "Wrist",
+        10 => "Hands",
+        11 => "Finger",
+        12 => "Trinket",
+        13 => "One-Hand",
+        14 => "Shield",
+        15 => "Ranged",
+        16 => "Back",
+        17 => "Two-Hand",
+        18 => "Bag",
+        19 => "Tabard",
+        20 => "Robe",
+        21 => "Main Hand",
+        22 => "Off Hand",
+        23 => "Held Off-Hand",
+        24 => "Ammo",
+        25 => "Thrown",
+        26 => "Ranged",
+        27 => "Quiver",
+        28 => "Relic",
+        _ => $"Inventory type {inventoryType}",
+    };
+
     // ═══════════════════════════════════════════════════════════════════
     // PERSISTENCE
     // ═══════════════════════════════════════════════════════════════════
 
     private async Task PersistRecordsAsync(CustomWeaponBuildRequest request, WeaponTypeProfile profile,
         WeaponDonorInfo donor, string buildId, int modelIndex,
-        long entry, long display, string weaponName, byte[] m2, byte[] blp,
+        long entry, long display, string weaponName, int effectiveInventoryType, byte[] m2, byte[] blp,
         IReadOnlyList<(string MpqPath, byte[] Blp)> effectBlps, GeneratedSql sql, uint groupSound,
         string iconStem)
     {
@@ -762,11 +845,14 @@ public sealed class CustomWeaponBuildService
             sourceKind = request.SourceKind,
             weaponType = profile.Key,
             weaponTypeLabel = profile.Label,
+            inventoryType = effectiveInventoryType,
+            inventoryTypeLabel = InventoryTypeLabel(effectiveInventoryType),
             donorModel = donor.ModelName,
         });
 
         await using var conn = _db.Admin();
         await conn.OpenAsync();
+        await using var transaction = await conn.BeginTransactionAsync();
 
         await conn.ExecuteAsync(
             @"INSERT INTO custom_weapon_model
@@ -789,7 +875,7 @@ public sealed class CustomWeaponBuildService
                 @params = request.GeneratorParamsJson,
                 writer = request.WriterVersion,
                 ccv = CoordinateContract.Version,
-            });
+            }, transaction: transaction);
 
         await conn.ExecuteAsync(
             @"INSERT INTO custom_weapon_display
@@ -811,19 +897,20 @@ public sealed class CustomWeaponBuildService
                 icon = iconStem,
                 donor = donor.DisplayRow,
                 fields = dbcFieldsJson,
-            });
+            }, transaction: transaction);
 
         await conn.ExecuteAsync(
             @"INSERT INTO custom_weapon_item_manifest
                 (build_id, item_entry, display_id, gameplay_json, sql_text, sql_sha256)
               VALUES (@build, @entry, @display, @gameplay, @sql, @sqlsha)
               ON DUPLICATE KEY UPDATE sql_sha256 = VALUES(sql_sha256), gameplay_json = VALUES(gameplay_json)",
-            new { build = buildId, entry, display, gameplay = gameplayJson, sql = sql.Text, sqlsha = sql.Sha256 });
+            new { build = buildId, entry, display, gameplay = gameplayJson, sql = sql.Text, sqlsha = sql.Sha256 },
+            transaction: transaction);
 
         // Effect textures (multi-pass glow): replace the model's set wholesale — the emitted M2's
         // hardcoded filenames and these rows must stay in lockstep.
         await conn.ExecuteAsync("DELETE FROM custom_weapon_model_texture WHERE model_id = @model_id",
-            new { model_id = display });
+            new { model_id = display }, transaction: transaction);
         for (int i = 0; i < effectBlps.Count; i++)
         {
             await conn.ExecuteAsync(
@@ -836,8 +923,10 @@ public sealed class CustomWeaponBuildService
                     path = effectBlps[i].MpqPath,
                     blp = effectBlps[i].Blp,
                     sha = Sha256(effectBlps[i].Blp),
-                });
+                }, transaction: transaction);
         }
+
+        await transaction.CommitAsync();
     }
 
     private sealed class PackagedWeaponRow
@@ -913,7 +1002,8 @@ public sealed class CustomWeaponBuildService
 
     private object BuildManifest(CustomWeaponBuildRequest request, WeaponTypeProfile profile,
         WeaponDonorInfo donorInfo, string buildId, long entry, long display,
-        int modelIndex, string weaponName, uint donorGroupSound, GeneratedSql sql, WeaponPatchResult patch,
+        int modelIndex, string weaponName, int effectiveInventoryType, uint donorGroupSound,
+        GeneratedSql sql, WeaponPatchResult patch,
         int packagedCount, int skippedCount, int replacedInBase) => new
     {
         buildId,
@@ -924,7 +1014,9 @@ public sealed class CustomWeaponBuildService
             key = profile.Key,
             label = profile.Label,
             subclass = profile.Subclass,
-            inventoryType = profile.InventoryType,
+            familyInventoryType = profile.InventoryType,
+            inventoryType = effectiveInventoryType,
+            inventoryTypeLabel = InventoryTypeLabel(effectiveInventoryType),
             sheath = profile.Sheath,
             material = profile.Material,
             delayMs = profile.DelayMs,
@@ -1068,7 +1160,8 @@ public sealed class CustomWeaponBuildService
         sb.AppendLine($"- `{PatchFileName}` contains EVERY forged weapon and sits ABOVE the Retexture Engine's");
         sb.AppendLine("  patch-4.MPQ — the two install side by side; never overwrite patch-4 with this file.");
         sb.AppendLine();
-        sb.AppendLine("1. Fully RESTART the Blizzard client and MSUIClient (a warm client caches DBC/model lookups).");
+        sb.AppendLine("1. Fully close the Blizzard client and MSUIClient (a warm client caches DBC/model lookups).");
+        sb.AppendLine("   If this entry was ever seen with different metadata, remove WDB\\itemcache.wdb (or the whole WDB cache directory) before relaunching; WoW recreates it.");
         sb.AppendLine($"2. On a GM: `.additem {entry}` and verify query/name/icon.");
         sb.AppendLine("3. Check main hand, offhand (where allowed), held and sheathed states, and dressing view.");
         sb.AppendLine("4. Assign the same display via an NPC virtual weapon and verify that path.");
@@ -1167,6 +1260,8 @@ public sealed class CustomWeaponBuildResult
     public required string Name { get; init; }
     public required string WeaponType { get; init; }
     public required string WeaponTypeLabel { get; init; }
+    public required int InventoryType { get; init; }
+    public required string InventoryTypeLabel { get; init; }
     public required string SourceKind { get; init; }
     public required string ModelMember { get; init; }
     public required string TextureMember { get; init; }
@@ -1214,6 +1309,10 @@ public sealed class ForgedWeaponInfo
     public required string Name { get; init; }
     /// <summary>Family key recorded at forge time; null for weapons forged before types existed.</summary>
     public string? WeaponType { get; init; }
+    /// <summary>Effective item_template inventory_type after request overrides. Recovered from TBC
+    /// generator metadata or the family for older gameplay_json rows when possible.</summary>
+    public int? InventoryType { get; init; }
+    public string? InventoryTypeLabel { get; init; }
     public required string SourceKind { get; init; }
     public required string ModelMpqPath { get; init; }
     /// <summary>Stock ItemDisplayInfo row the display was cloned from (0 when unrecorded).</summary>

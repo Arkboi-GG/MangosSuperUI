@@ -67,6 +67,29 @@ public static class M2VariableTopologyBuilder
                 ? bindings
                 : new[] { new WeaponTextureBinding { TextureSlot = pass.TextureSlot } };
         var passBindings = passes.Select(BindingsOf).ToArray();
+        var restColors = passes.Where(p => p.RestColor is not null)
+            .Select(p => p.RestColor!).Distinct().ToList();
+        // Texture-transform provenance is the source lookup index, not the evaluated rest value.
+        // Two source records can share the same rest pose but carry different animation, while one
+        // source record can be referenced by several units. Preserve first-use source identity and
+        // reject contradictory copies instead of collapsing records through record equality.
+        var transformPlans = new List<(ushort SourceIndex, WeaponRestTextureTransform Payload)>();
+        var transformPlanIndex = new Dictionary<ushort, int>();
+        foreach (var binding in passBindings.SelectMany(b => b))
+        {
+            if (binding.TextureTransform == ushort.MaxValue || binding.RestTransform is null) continue;
+            if (transformPlanIndex.TryGetValue(binding.TextureTransform, out int existing))
+            {
+                if (!SameTransformPayload(transformPlans[existing].Payload, binding.RestTransform))
+                    throw new ArgumentException(
+                        $"Source UV transform {binding.TextureTransform} is referenced with conflicting payloads.");
+                continue;
+            }
+
+            transformPlanIndex[binding.TextureTransform] = transformPlans.Count;
+            transformPlans.Add((binding.TextureTransform, binding.RestTransform));
+        }
+        var restTransforms = transformPlans.Select(p => p.Payload).ToList();
         int effectSlots = passBindings.SelectMany(b => b).Max(b => b.TextureSlot);
         if (effectSlots < 0)
             throw new InvalidOperationException($"Mesh references invalid negative texture slot {effectSlots}.");
@@ -74,6 +97,10 @@ public static class M2VariableTopologyBuilder
         int texCount = Math.Max(checked(1 + effectSlots), mesh.TextureSlots?.Count ?? 0);
         if (texCount > ushort.MaxValue)
             throw new InvalidOperationException($"Texture count {texCount} exceeds the v256 UInt16 lookup address space ({ushort.MaxValue}).");
+        if (restColors.Count > short.MaxValue)
+            throw new InvalidOperationException($"Color count {restColors.Count} exceeds the v256 signed batch index address space ({short.MaxValue}).");
+        if (restTransforms.Count > ushort.MaxValue)
+            throw new InvalidOperationException($"UV-transform count {restTransforms.Count} exceeds the v256 lookup address space ({ushort.MaxValue}).");
         int requiredEffectPaths = texCount - 1;
         if (requiredEffectPaths > 0 && (effectTexturePaths is null || effectTexturePaths.Count < requiredEffectPaths))
             throw new InvalidOperationException(
@@ -101,6 +128,12 @@ public static class M2VariableTopologyBuilder
 
         for (int pi = 0; pi < nBatch; pi++)
         {
+            if (passes[pi].ColorIndex < -1)
+                throw new ArgumentException(
+                    $"Pass {pi} has invalid color index {passes[pi].ColorIndex}; only -1 denotes no color track.");
+            if ((passes[pi].ColorIndex >= 0) != (passes[pi].RestColor is not null))
+                throw new ArgumentException(
+                    $"Pass {pi} color provenance/sample mismatch; referenced colors must carry a validated rest sample.");
             int submeshSlot = passes[pi].SubmeshSlot;
             if (submeshSlot < 0 || submeshSlot >= nSub || submeshSlot > ushort.MaxValue)
                 throw new ArgumentException($"Pass {pi} references invalid submesh slot {submeshSlot} (count {nSub}).");
@@ -108,10 +141,68 @@ public static class M2VariableTopologyBuilder
                 throw new ArgumentException(
                     $"Pass {pi} texture-unit count {passBindings[pi].Count} exceeds UInt16 ({ushort.MaxValue}).");
             foreach (var binding in passBindings[pi])
+            {
                 if (binding.TextureSlot < 0 || binding.TextureSlot >= texCount || binding.TextureSlot > ushort.MaxValue)
                     throw new ArgumentException(
                         $"Pass {pi} references invalid texture slot {binding.TextureSlot} (count {texCount}).");
+                if ((binding.TextureTransform != ushort.MaxValue) != (binding.RestTransform is not null))
+                    throw new ArgumentException(
+                        $"Pass {pi} texture transform provenance/sample mismatch; referenced transforms must carry a validated rest sample.");
+            }
         }
+
+        foreach (var color in restColors)
+            if (!IsFinite(color.Rgb) || !float.IsFinite(color.Alpha))
+                throw new ArgumentException("A rest color contains non-finite values.");
+        foreach (var transform in restTransforms)
+            if (!IsFinite(transform.Translation) || !IsFinite(transform.Rotation) ||
+                !IsFinite(transform.Scale) || transform.Rotation.LengthSquared() < 1e-10f)
+                throw new ArgumentException("A rest UV transform contains non-finite or invalid values.");
+
+        // Preserve the donor's global-loop indices as an unchanged prefix. Imported identities are
+        // source-index + duration pairs because distinct source globals may coincidentally share a
+        // duration. They are appended in transform/component first-use order and remapped below.
+        uint donorGlobalCountRaw = BinaryPrimitives.ReadUInt32LittleEndian(donor.AsSpan(0x14, 4));
+        uint donorGlobalOffset = BinaryPrimitives.ReadUInt32LittleEndian(donor.AsSpan(0x18, 4));
+        if (donorGlobalCountRaw > int.MaxValue ||
+            donorGlobalCountRaw > 0 &&
+            (donorGlobalOffset == 0 || donorGlobalOffset + (long)donorGlobalCountRaw * 4 > donor.Length))
+            throw new InvalidOperationException("Donor global-loop array is out of bounds.");
+        var donorGlobalDurations = new uint[checked((int)donorGlobalCountRaw)];
+        for (int i = 0; i < donorGlobalDurations.Length; i++)
+            donorGlobalDurations[i] = BinaryPrimitives.ReadUInt32LittleEndian(
+                donor.AsSpan(checked((int)donorGlobalOffset + i * 4), 4));
+
+        var importedGlobalIdentities = new List<(int SourceGlobalSequence, uint DurationMs)>();
+        var importedGlobalIndex = new Dictionary<(int SourceGlobalSequence, uint DurationMs), int>();
+        void RegisterGlobalIdentity(int sourceGlobalSequence, uint durationMs)
+        {
+            var identity = (sourceGlobalSequence, durationMs);
+            if (importedGlobalIndex.ContainsKey(identity)) return;
+            importedGlobalIndex[identity] = importedGlobalIdentities.Count;
+            importedGlobalIdentities.Add(identity);
+        }
+
+        for (int i = 0; i < transformPlans.Count; i++)
+        {
+            var transform = transformPlans[i].Payload;
+            ValidateGlobalVectorTrack(transform.TranslationAnimation,
+                $"Source UV transform {transformPlans[i].SourceIndex} translation");
+            ValidateGlobalQuaternionTrack(transform.RotationAnimation,
+                $"Source UV transform {transformPlans[i].SourceIndex} rotation");
+            ValidateGlobalVectorTrack(transform.ScaleAnimation,
+                $"Source UV transform {transformPlans[i].SourceIndex} scale");
+
+            if (transform.TranslationAnimation is { } translation)
+                RegisterGlobalIdentity(translation.SourceGlobalSequence, translation.DurationMs);
+            if (transform.RotationAnimation is { } rotation)
+                RegisterGlobalIdentity(rotation.SourceGlobalSequence, rotation.DurationMs);
+            if (transform.ScaleAnimation is { } scale)
+                RegisterGlobalIdentity(scale.SourceGlobalSequence, scale.DurationMs);
+        }
+        if ((long)donorGlobalDurations.Length + importedGlobalIdentities.Count > short.MaxValue + 1L)
+            throw new InvalidOperationException(
+                "Combined donor/imported global-loop count exceeds the signed Int16 track index address space.");
 
         // Donor templates whose byte contents we reuse verbatim so their index references into the
         // donor's preserved tables stay valid. Measured donor evidence (InspectWeapon, 2026-08-18):
@@ -154,8 +245,15 @@ public static class M2VariableTopologyBuilder
         // every batch are parallel starts and TextureCount units resolve contiguously.
         int texTableOff = 0, texLookupOff = 0, coordLookupOff = 0, weightLookupOff = 0,
             transformLookupOff = 0, rfTableOff = 0, alphaTrackOff = 0, alphaRangeOff = 0,
-            alphaTimeOff = 0, alphaKeysOff = 0;
+            alphaTimeOff = 0, alphaKeysOff = 0, colorTableOff = 0, colorRgbKeysOff = 0,
+            colorAlphaKeysOff = 0, transformTableOff = 0, globalLoopsOff = 0;
         int alphaRangeCount = 0;
+        var transformTranslationTimeOff = new int[restTransforms.Count];
+        var transformTranslationKeysOff = new int[restTransforms.Count];
+        var transformRotationTimeOff = new int[restTransforms.Count];
+        var transformRotationKeysOff = new int[restTransforms.Count];
+        var transformScaleTimeOff = new int[restTransforms.Count];
+        var transformScaleKeysOff = new int[restTransforms.Count];
         var texNameOffs = new int[texCount];   // string offset per effect texture (0 = none)
         var texNameBytes = new byte[texCount][];
         var rfEntries = new List<(ushort Flags, ushort Blend)>();
@@ -188,11 +286,9 @@ public static class M2VariableTopologyBuilder
                     if (alphaIndex < 0) { alphaIndex = alphaKeys.Count; alphaKeys.Add(alpha); }
                     weightCombos.Add((ushort)alphaIndex);
 
-                    // Source UV animation tracks contain nested offsets into the TBC file and
-                    // cannot be referenced from the donor scaffold. A static texture coordinate
-                    // is still preserved; the transform lookup explicitly says "none" rather
-                    // than accidentally sampling the donor's animation table.
-                    transformCombos.Add(ushort.MaxValue);
+                    transformCombos.Add(binding.RestTransform is null
+                        ? ushort.MaxValue
+                        : checked((ushort)transformPlanIndex[binding.TextureTransform]));
                 }
             }
             if (textureCombos.Count > ushort.MaxValue)
@@ -210,6 +306,52 @@ public static class M2VariableTopologyBuilder
             cursor = Align4(cursor); alphaRangeOff = cursor; cursor += alphaRangeCount * 8;
             cursor = Align4(cursor); alphaTimeOff = cursor; cursor += 4;  // timestamp 0, shared
             cursor = Align4(cursor); alphaKeysOff = cursor; cursor += alphaKeys.Count * 2;
+
+            // Color records contain RGB + fixed16 alpha tracks. Static UV components retain the
+            // same constant [0,0] sequence ranges/timestamp; optional imported global components
+            // own their range-free timestamp and key arrays.
+            cursor = Align4(cursor); colorTableOff = cursor; cursor += restColors.Count * 56;
+            cursor = Align4(cursor); colorRgbKeysOff = cursor; cursor += restColors.Count * 12;
+            cursor = Align4(cursor); colorAlphaKeysOff = cursor; cursor += restColors.Count * 2;
+            cursor = Align4(cursor); transformTableOff = cursor; cursor += restTransforms.Count * 84;
+
+            void AllocateTransformTrack(bool animated, int keyCount, int keyStride,
+                out int timeOffset, out int keyOffset)
+            {
+                if (animated)
+                {
+                    cursor = Align4(cursor); timeOffset = cursor;
+                    cursor = checked(cursor + checked(keyCount * 4));
+                }
+                else
+                {
+                    timeOffset = alphaTimeOff;
+                    keyCount = 1;
+                }
+                cursor = Align4(cursor); keyOffset = cursor;
+                cursor = checked(cursor + checked(keyCount * keyStride));
+            }
+
+            for (int i = 0; i < restTransforms.Count; i++)
+            {
+                var transform = restTransforms[i];
+                AllocateTransformTrack(transform.TranslationAnimation is not null,
+                    transform.TranslationAnimation?.Keys.Count ?? 1, 12,
+                    out transformTranslationTimeOff[i], out transformTranslationKeysOff[i]);
+                AllocateTransformTrack(transform.RotationAnimation is not null,
+                    transform.RotationAnimation?.Keys.Count ?? 1, 16,
+                    out transformRotationTimeOff[i], out transformRotationKeysOff[i]);
+                AllocateTransformTrack(transform.ScaleAnimation is not null,
+                    transform.ScaleAnimation?.Keys.Count ?? 1, 12,
+                    out transformScaleTimeOff[i], out transformScaleKeysOff[i]);
+            }
+
+            if (importedGlobalIdentities.Count > 0)
+            {
+                cursor = Align4(cursor); globalLoopsOff = cursor;
+                cursor = checked(cursor +
+                    checked((donorGlobalDurations.Length + importedGlobalIdentities.Count) * 4));
+            }
 
             foreach (var p in passes)
                 if (!rfEntries.Contains((p.RenderFlags, p.BlendMode)))
@@ -291,7 +433,9 @@ public static class M2VariableTopologyBuilder
                     outp[t + 1] = unchecked((byte)p.PriorityPlane);
                     U16(outp, t + 2, p.ShaderId);
                     int rfIdx = rfEntries.IndexOf((p.RenderFlags, p.BlendMode));
-                    I16(outp, t + 8, -1);                          // source color tracks are not donor-compatible
+                    I16(outp, t + 8, p.RestColor is null
+                        ? (short)-1
+                        : checked((short)restColors.IndexOf(p.RestColor)));
                     U16(outp, t + 10, (ushort)rfIdx);              // render-flag table
                     U16(outp, t + 12, checked((ushort)p.Layer));   // material layer
                     U16(outp, t + 14, checked((ushort)passBindings[bi].Count));
@@ -371,6 +515,88 @@ public static class M2VariableTopologyBuilder
             }
             U32(outp, 0x64, (uint)alphaKeys.Count); U32(outp, 0x68, (uint)alphaTrackOff);
 
+            // Constant rest-pose material colors. Alpha uses the native signed fixed16 encoding.
+            for (int i = 0; i < restColors.Count; i++)
+            {
+                var color = restColors[i];
+                int record = colorTableOff + i * 56;
+                WriteConstantTrack(outp, record, alphaRangeCount, alphaRangeOff, alphaTimeOff,
+                    colorRgbKeysOff + i * 12);
+                WriteConstantTrack(outp, record + 28, alphaRangeCount, alphaRangeOff, alphaTimeOff,
+                    colorAlphaKeysOff + i * 2);
+                WriteVec3(outp, colorRgbKeysOff + i * 12, color.Rgb);
+                I16(outp, colorAlphaKeysOff + i * 2, (short)Math.Clamp(
+                    (int)MathF.Round(Math.Clamp(color.Alpha, 0f, 1f) * 32767f), 0, 32767));
+            }
+            U32(outp, 0x54, (uint)restColors.Count);
+            U32(outp, 0x58, restColors.Count == 0 ? 0u : (uint)colorTableOff);
+
+            // Texture transforms. Static components retain deterministic rest keys; supported
+            // range-free global step/linear components retain all timestamps and keys. v256 uses
+            // float4 quaternion keys, so decoded TBC compact quaternions are written as floats.
+            int RemappedGlobalSequence(int sourceGlobalSequence, uint durationMs)
+            {
+                int imported = importedGlobalIndex[(sourceGlobalSequence, durationMs)];
+                return checked(donorGlobalDurations.Length + imported);
+            }
+
+            for (int i = 0; i < restTransforms.Count; i++)
+            {
+                var transform = restTransforms[i];
+                int record = transformTableOff + i * 84;
+                if (transform.TranslationAnimation is { } translation)
+                    WriteGlobalVectorTrack(outp, record, translation,
+                        RemappedGlobalSequence(
+                            translation.SourceGlobalSequence, translation.DurationMs),
+                        transformTranslationTimeOff[i], transformTranslationKeysOff[i]);
+                else
+                {
+                    WriteConstantTrack(outp, record, alphaRangeCount, alphaRangeOff,
+                        transformTranslationTimeOff[i], transformTranslationKeysOff[i]);
+                    WriteVec3(outp, transformTranslationKeysOff[i], transform.Translation);
+                }
+
+                if (transform.RotationAnimation is { } rotationAnimation)
+                    WriteGlobalQuaternionTrack(outp, record + 28, rotationAnimation,
+                        RemappedGlobalSequence(
+                            rotationAnimation.SourceGlobalSequence, rotationAnimation.DurationMs),
+                        transformRotationTimeOff[i], transformRotationKeysOff[i]);
+                else
+                {
+                    WriteConstantTrack(outp, record + 28, alphaRangeCount, alphaRangeOff,
+                        transformRotationTimeOff[i], transformRotationKeysOff[i]);
+                    WriteQuaternion(outp, transformRotationKeysOff[i],
+                        Quaternion.Normalize(transform.Rotation));
+                }
+
+                if (transform.ScaleAnimation is { } scale)
+                    WriteGlobalVectorTrack(outp, record + 56, scale,
+                        RemappedGlobalSequence(scale.SourceGlobalSequence, scale.DurationMs),
+                        transformScaleTimeOff[i], transformScaleKeysOff[i]);
+                else
+                {
+                    WriteConstantTrack(outp, record + 56, alphaRangeCount, alphaRangeOff,
+                        transformScaleTimeOff[i], transformScaleKeysOff[i]);
+                    WriteVec3(outp, transformScaleKeysOff[i], transform.Scale);
+                }
+            }
+            U32(outp, 0x74, (uint)restTransforms.Count);
+            U32(outp, 0x78, restTransforms.Count == 0 ? 0u : (uint)transformTableOff);
+
+            // Existing donor globals remain byte-value-identical at the same indices; imported
+            // identities follow them. Repoint only when at least one imported track needs a loop.
+            if (importedGlobalIdentities.Count > 0)
+            {
+                for (int i = 0; i < donorGlobalDurations.Length; i++)
+                    U32(outp, globalLoopsOff + i * 4, donorGlobalDurations[i]);
+                for (int i = 0; i < importedGlobalIdentities.Count; i++)
+                    U32(outp, globalLoopsOff + (donorGlobalDurations.Length + i) * 4,
+                        importedGlobalIdentities[i].DurationMs);
+                U32(outp, 0x14,
+                    checked((uint)(donorGlobalDurations.Length + importedGlobalIdentities.Count)));
+                U32(outp, 0x18, (uint)globalLoopsOff);
+            }
+
             // Render flags: distinct (flags, blend) pairs carried verbatim from the source passes.
             for (int i = 0; i < rfEntries.Count; i++)
             {
@@ -427,9 +653,171 @@ public static class M2VariableTopologyBuilder
     }
 
     private static int Align4(int x) => (x + 3) & ~3;
+    private static bool IsFinite(Vector3 v) =>
+        float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z);
+    private static bool IsFinite(Quaternion q) =>
+        float.IsFinite(q.X) && float.IsFinite(q.Y) && float.IsFinite(q.Z) && float.IsFinite(q.W);
+
+    private static bool SameTransformPayload(
+        WeaponRestTextureTransform left,
+        WeaponRestTextureTransform right) =>
+        left.Translation == right.Translation &&
+        left.Rotation == right.Rotation &&
+        left.Scale == right.Scale &&
+        left.AnimationFrozen == right.AnimationFrozen &&
+        SameGlobalVectorTrack(left.TranslationAnimation, right.TranslationAnimation) &&
+        SameGlobalQuaternionTrack(left.RotationAnimation, right.RotationAnimation) &&
+        SameGlobalVectorTrack(left.ScaleAnimation, right.ScaleAnimation);
+
+    private static bool SameGlobalVectorTrack(
+        WeaponGlobalVectorTrack? left,
+        WeaponGlobalVectorTrack? right)
+    {
+        if (ReferenceEquals(left, right)) return true;
+        if (left is null || right is null) return false;
+        return left.Interpolation == right.Interpolation &&
+               left.SourceGlobalSequence == right.SourceGlobalSequence &&
+               left.DurationMs == right.DurationMs &&
+               left.Timestamps.SequenceEqual(right.Timestamps) &&
+               left.Keys.SequenceEqual(right.Keys);
+    }
+
+    private static bool SameGlobalQuaternionTrack(
+        WeaponGlobalQuaternionTrack? left,
+        WeaponGlobalQuaternionTrack? right)
+    {
+        if (ReferenceEquals(left, right)) return true;
+        if (left is null || right is null) return false;
+        return left.Interpolation == right.Interpolation &&
+               left.SourceGlobalSequence == right.SourceGlobalSequence &&
+               left.DurationMs == right.DurationMs &&
+               left.Timestamps.SequenceEqual(right.Timestamps) &&
+               left.Keys.SequenceEqual(right.Keys);
+    }
+
+    private static void ValidateGlobalVectorTrack(WeaponGlobalVectorTrack? track, string label)
+    {
+        if (track is null) return;
+        ValidateGlobalTrackHeader(track.Interpolation, track.SourceGlobalSequence,
+            track.DurationMs, track.Timestamps, track.Keys.Count, label);
+        for (int i = 0; i < track.Keys.Count; i++)
+            if (!IsFinite(track.Keys[i]))
+                throw new ArgumentException($"{label} key {i} contains a non-finite vector.");
+    }
+
+    private static void ValidateGlobalQuaternionTrack(
+        WeaponGlobalQuaternionTrack? track,
+        string label)
+    {
+        if (track is null) return;
+        ValidateGlobalTrackHeader(track.Interpolation, track.SourceGlobalSequence,
+            track.DurationMs, track.Timestamps, track.Keys.Count, label);
+        for (int i = 0; i < track.Keys.Count; i++)
+            if (!IsFinite(track.Keys[i]) || track.Keys[i].LengthSquared() < 1e-10f)
+                throw new ArgumentException($"{label} key {i} contains a non-finite or zero-length quaternion.");
+    }
+
+    private static void ValidateGlobalTrackHeader(
+        ushort interpolation,
+        int sourceGlobalSequence,
+        uint durationMs,
+        IReadOnlyList<uint> timestamps,
+        int keyCount,
+        string label)
+    {
+        if (interpolation > 1)
+            throw new ArgumentException(
+                $"{label} interpolation {interpolation} is unsupported; only step/linear (0/1) can be written.");
+        if (sourceGlobalSequence < 0)
+            throw new ArgumentException($"{label} has invalid source global sequence {sourceGlobalSequence}.");
+        if (durationMs == 0)
+            throw new ArgumentException($"{label} has zero global-loop duration.");
+        if (timestamps is null)
+            throw new ArgumentException($"{label} has a null timestamp collection.");
+        if (timestamps.Count == 0 || keyCount == 0 || timestamps.Count != keyCount)
+            throw new ArgumentException(
+                $"{label} timestamp/key counts must be equal and nonzero ({timestamps.Count}/{keyCount}).");
+        uint previous = 0;
+        for (int i = 0; i < timestamps.Count; i++)
+        {
+            uint timestamp = timestamps[i];
+            if (i > 0 && timestamp <= previous)
+                throw new ArgumentException(
+                    $"{label} timestamps are not strictly increasing at key {i} ({previous}, {timestamp}).");
+            if (timestamp > durationMs)
+                throw new ArgumentException(
+                    $"{label} timestamp {timestamp} at key {i} exceeds duration {durationMs}.");
+            previous = timestamp;
+        }
+    }
+
+    private static void WriteConstantTrack(byte[] b, int track, int rangeCount, int rangeOffset,
+        int timeOffset, int keyOffset)
+    {
+        U16(b, track, 0);
+        U16(b, track + 2, ushort.MaxValue);
+        U32(b, track + 4, (uint)rangeCount); U32(b, track + 8, (uint)rangeOffset);
+        U32(b, track + 12, 1); U32(b, track + 16, (uint)timeOffset);
+        U32(b, track + 20, 1); U32(b, track + 24, (uint)keyOffset);
+    }
+
+    private static void WriteGlobalVectorTrack(
+        byte[] b,
+        int trackOffset,
+        WeaponGlobalVectorTrack track,
+        int outputGlobalSequence,
+        int timeOffset,
+        int keyOffset)
+    {
+        WriteGlobalTrackHeader(b, trackOffset, track.Interpolation, outputGlobalSequence,
+            track.Timestamps.Count, timeOffset, keyOffset);
+        for (int i = 0; i < track.Timestamps.Count; i++)
+        {
+            U32(b, timeOffset + i * 4, track.Timestamps[i]);
+            WriteVec3(b, keyOffset + i * 12, track.Keys[i]);
+        }
+    }
+
+    private static void WriteGlobalQuaternionTrack(
+        byte[] b,
+        int trackOffset,
+        WeaponGlobalQuaternionTrack track,
+        int outputGlobalSequence,
+        int timeOffset,
+        int keyOffset)
+    {
+        WriteGlobalTrackHeader(b, trackOffset, track.Interpolation, outputGlobalSequence,
+            track.Timestamps.Count, timeOffset, keyOffset);
+        for (int i = 0; i < track.Timestamps.Count; i++)
+        {
+            U32(b, timeOffset + i * 4, track.Timestamps[i]);
+            WriteQuaternion(b, keyOffset + i * 16, track.Keys[i]);
+        }
+    }
+
+    private static void WriteGlobalTrackHeader(
+        byte[] b,
+        int trackOffset,
+        ushort interpolation,
+        int outputGlobalSequence,
+        int count,
+        int timeOffset,
+        int keyOffset)
+    {
+        U16(b, trackOffset, interpolation);
+        I16(b, trackOffset + 2, checked((short)outputGlobalSequence));
+        U32(b, trackOffset + 4, 0); U32(b, trackOffset + 8, 0); // global: no sequence ranges
+        U32(b, trackOffset + 12, checked((uint)count)); U32(b, trackOffset + 16, (uint)timeOffset);
+        U32(b, trackOffset + 20, checked((uint)count)); U32(b, trackOffset + 24, (uint)keyOffset);
+    }
+
     private static void U16(byte[] b, int o, ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(b.AsSpan(o, 2), v);
     private static void I16(byte[] b, int o, short v) => BinaryPrimitives.WriteInt16LittleEndian(b.AsSpan(o, 2), v);
     private static void U32(byte[] b, int o, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(o, 4), v);
     private static void WriteF(byte[] b, int o, float f) => BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(o, 4), f);
     private static void WriteVec3(byte[] b, int o, Vector3 v) { WriteF(b, o, v.X); WriteF(b, o + 4, v.Y); WriteF(b, o + 8, v.Z); }
+    private static void WriteQuaternion(byte[] b, int o, Quaternion q)
+    {
+        WriteF(b, o, q.X); WriteF(b, o + 4, q.Y); WriteF(b, o + 8, q.Z); WriteF(b, o + 12, q.W);
+    }
 }
