@@ -3,53 +3,50 @@ using System.Numerics;
 namespace MangosSuperUI.Services.WeaponForge;
 
 /// <summary>
-/// Converts a parsed TBC weapon M2 into the pipeline's multi-pass <see cref="RigidWeaponMesh"/>.
-/// Measured TBC anatomy (Warglaive, 2026-08-19): several batches layer over shared submeshes —
-/// an opaque BASE pass whose texture is often a HARDCODED (Type-0) file baked into the M2, plus
-/// reflect/tint overlays and ADDITIVE GLOW shells sampling the DBC-driven Type-2 slot (that's how
-/// one glaive model serves green/blue variants).
-///
-/// Selection rules:
-///   • per submesh, ONE base pass — the lowest-layer visible batch with blend 0–2; its geometry,
-///     blend/two-sided bits, and texture define the submesh;
-///   • additive passes (blend 3/4) are KEPT as their own passes — this is the glow; their submesh
-///     geometry is included and their texture (usually the DBC slot) becomes an effect texture;
-///   • modulate/reflect passes (blend 5/6) are dropped — they depend on env-mapping the static
-///     import can't reproduce;
-///   • extra alpha overlays beyond the base (same submesh, higher layer, blend 1/2) are dropped;
-///   • idle-invisible batches (static transparency &lt; 0.5) are dropped.
-///
-/// Texture slots are keyed by SOURCE IMAGE: slot 0 = whatever the dominant base pass samples
-/// (packaged as the weapon's DBC-driven texture), each further distinct image = an effect slot
-/// (packaged as a Type-0 hardcoded SUI_W_####_E0N.blp). <see cref="TbcExtractResult.SourceTextures"/>
-/// maps slots to TBC archive paths (null = the display row's Type-2 texture).
-///
-/// Geometry is compacted per submesh into contiguous vertex/index blocks (shared vertices are
-/// duplicated — weapons are small). Models with no usable batch tables fall back to a single
-/// opaque pass over the whole triangle list. TBC geometry is already palm-at-origin in WoW units,
-/// so positions pass through untouched apart from a degenerate sweep and a UV clamp.
+/// Converts the visible render graph from a TBC weapon M2 into the Forge's rigid mesh IR.
+/// TBC and vanilla v256 share the fixed-function weapon batch format, so batches are retained in
+/// source order instead of being reduced to a guessed "base + glow" pair. Geometry is compacted
+/// once per referenced source submesh; every source batch can then draw that range with its own
+/// blend mode, flags, shader, texture units, UV source, and static transparency.
 /// </summary>
 public static class TbcWeaponMeshExtractor
 {
-    /// <summary>Sanity cap — no stock weapon needs more; a runaway table won't inflate the M2.</summary>
-    private const int MaxPasses = 6;
-
-    private sealed record SourcePass(int SrcSubmesh, ushort Flags, ushort Blend, int Layer, string TexKey);
+    private sealed record SourceTexture(string? Path, uint Flags, uint Type);
+    private sealed record SourceBinding(SourceTexture Texture, ushort Coordinate, float StaticAlpha, ushort Transform);
+    private sealed record SourcePass(
+        int SourceOrder,
+        int SrcSubmesh,
+        byte BatchFlags,
+        sbyte PriorityPlane,
+        ushort ShaderId,
+        short ColorIndex,
+        ushort RenderFlags,
+        ushort BlendMode,
+        int Layer,
+        IReadOnlyList<SourceBinding> Bindings);
+    private sealed record PassPlan(
+        List<SourcePass> Passes,
+        List<SourceTexture> Textures,
+        bool Fatal = false);
 
     public static TbcExtractResult? Extract(M2Model m2, ForgeDiagnostics diag)
     {
         var plan = PlanPasses(m2, diag);
         if (plan is null) return ExtractSinglePass(m2, diag);
-        var (passes, texSlots) = plan.Value;
+        if (plan.Fatal) return null;
+        var passes = plan.Passes;
+        var textureSlots = plan.Textures;
 
-        // ── Compact geometry: one contiguous vertex+index block per distinct source submesh ──
+        // One contiguous block per source submesh. Shared source vertices are deliberately copied
+        // into each block because vanilla skin-section vertex/index spans are UInt16 ranges.
         var slotBySrcSubmesh = new Dictionary<int, int>();
         var ranges = new List<WeaponSubmeshRange>();
         var pos = new List<Vector3>();
         var nrm = new List<Vector3>();
-        var uv = new List<Vector2>();
+        var uv0 = new List<Vector2>();
+        var uv1 = new List<Vector2>();
         var indices = new List<uint>();
-        int uvClamped = 0, dropped = 0;
+        int dropped = 0, repairedUv = 0;
 
         foreach (var sp in passes)
         {
@@ -62,8 +59,10 @@ public static class TbcWeaponMeshExtractor
             for (int k = 0; k + 2 < count && start + k + 2 < m2.Indices.Count; k += 3)
             {
                 int a = m2.Indices[start + k], b = m2.Indices[start + k + 1], c = m2.Indices[start + k + 2];
-                if (a >= m2.Vertices.Count || b >= m2.Vertices.Count || c >= m2.Vertices.Count) { dropped++; continue; }
+                if (a >= m2.Vertices.Count || b >= m2.Vertices.Count || c >= m2.Vertices.Count)
+                { dropped++; continue; }
                 if (a == b || b == c || a == c) { dropped++; continue; }
+
                 var va = m2.Vertices[a]; var vb = m2.Vertices[b]; var vc = m2.Vertices[c];
                 var pa = new Vector3(va.PosX, va.PosY, va.PosZ);
                 var e0 = new Vector3(vb.PosX, vb.PosY, vb.PosZ) - pa;
@@ -77,17 +76,25 @@ public static class TbcWeaponMeshExtractor
                     pos.Add(new Vector3(v.PosX, v.PosY, v.PosZ));
                     var normal = new Vector3(v.NormX, v.NormY, v.NormZ);
                     nrm.Add(normal.LengthSquared() > 1e-10f ? Vector3.Normalize(normal) : Vector3.UnitY);
-                    float uC = Math.Clamp(v.TexU, 0f, 1f), vC = Math.Clamp(v.TexV, 0f, 1f);
-                    if (uC != v.TexU || vC != v.TexV) uvClamped++;
-                    uv.Add(new Vector2(uC, vC));
+
+                    static float FiniteOrZero(float value) => float.IsFinite(value) ? value : 0f;
+                    var t0 = new Vector2(FiniteOrZero(v.TexU), FiniteOrZero(v.TexV));
+                    var t1 = new Vector2(FiniteOrZero(v.TexU2), FiniteOrZero(v.TexV2));
+                    if (!float.IsFinite(v.TexU) || !float.IsFinite(v.TexV) ||
+                        !float.IsFinite(v.TexU2) || !float.IsFinite(v.TexV2)) repairedUv++;
+                    // Do not clamp: authored values outside [0,1] are how wrapped and reflected
+                    // weapon materials address their texture.
+                    uv0.Add(t0); uv1.Add(t1);
+
                     uint id = (uint)(pos.Count - 1);
                     remap[src] = id;
                     return id;
                 }
+
                 indices.Add(Map(a)); indices.Add(Map(b)); indices.Add(Map(c));
             }
 
-            if (indices.Count == indexStart) continue; // submesh contributed nothing usable
+            if (indices.Count == indexStart) continue;
             slotBySrcSubmesh[sp.SrcSubmesh] = ranges.Count;
             ranges.Add(new WeaponSubmeshRange
             {
@@ -100,29 +107,48 @@ public static class TbcWeaponMeshExtractor
 
         if (indices.Count == 0) return ExtractSinglePass(m2, diag);
         if (dropped > 0) diag.Info("tbc.degenerate.dropped", $"{dropped} degenerate/invalid triangle(s) dropped.");
-        if (uvClamped > 0) diag.Info("tbc.uv.clamped", $"{uvClamped} UV(s) outside [0,1] clamped to the vanilla policy.");
+        if (repairedUv > 0) diag.Warn("tbc.uv.nonfinite", $"{repairedUv} vertex UV pair(s) contained non-finite values and were replaced with zero.");
 
-        var weaponPasses = new List<WeaponPass>();
-        bool baseAlpha = false, baseTwoSided = false;
+        var textureIndex = textureSlots.Select((t, i) => (t, i)).ToDictionary(x => x.t, x => x.i);
+        var weaponPasses = new List<WeaponPass>(passes.Count);
+        bool baseAlpha = false, anyTwoSided = false;
         foreach (var sp in passes)
         {
             if (!slotBySrcSubmesh.TryGetValue(sp.SrcSubmesh, out int slot)) continue;
+            var bindings = sp.Bindings.Select(b => new WeaponTextureBinding
+            {
+                TextureSlot = textureIndex[b.Texture],
+                TextureCoordinate = b.Coordinate,
+                StaticAlpha = Math.Clamp(b.StaticAlpha, 0f, 1f),
+                TextureTransform = b.Transform,
+            }).ToArray();
+            int primaryTexture = bindings.Length > 0 ? bindings[0].TextureSlot : 0;
             weaponPasses.Add(new WeaponPass
             {
                 SubmeshSlot = slot,
-                RenderFlags = sp.Flags,
-                BlendMode = sp.Blend,
+                RenderFlags = sp.RenderFlags,
+                BlendMode = sp.BlendMode,
                 Layer = sp.Layer,
-                TextureSlot = texSlots.IndexOf(sp.TexKey),
+                TextureSlot = primaryTexture,
+                SourceOrder = sp.SourceOrder,
+                BatchFlags = sp.BatchFlags,
+                PriorityPlane = sp.PriorityPlane,
+                ShaderId = sp.ShaderId,
+                ColorIndex = sp.ColorIndex,
+                TextureBindings = bindings,
             });
-            if (sp.Blend is 1 or 2) { baseAlpha = true; }
-            if ((sp.Flags & 0x04) != 0) baseTwoSided = true;
+
+            if (bindings.Any(b => b.TextureSlot == 0) && sp.BlendMode is 1 or 2 or 4) baseAlpha = true;
+            if ((sp.RenderFlags & 0x04) != 0) anyTwoSided = true;
         }
         if (weaponPasses.Count == 0) return ExtractSinglePass(m2, diag);
 
-        int glowCount = weaponPasses.Count(p => p.BlendMode >= 3);
-        if (glowCount > 0)
-            diag.Info("tbc.passes.glow", $"{glowCount} additive glow pass(es) carried over ({texSlots.Count - 1} effect texture(s)).");
+        int layered = weaponPasses.Count - weaponPasses.Select(p => p.SubmeshSlot).Distinct().Count();
+        int multiTexture = weaponPasses.Count(p => p.TextureBindings is { Count: > 1 });
+        int glow = weaponPasses.Count(p => p.BlendMode is 3 or 4);
+        diag.Info("tbc.passes.preserved",
+            $"Preserved {weaponPasses.Count} source batch(es) over {ranges.Count} submesh(es) in source draw order " +
+            $"({layered} overlay, {glow} additive, {multiTexture} multi-texture).");
 
         return new TbcExtractResult
         {
@@ -130,148 +156,226 @@ public static class TbcWeaponMeshExtractor
             {
                 Positions = pos.ToArray(),
                 Normals = nrm.ToArray(),
-                Uv0 = uv.ToArray(),
+                Uv0 = uv0.ToArray(),
+                Uv1 = uv1.ToArray(),
                 Indices = indices.ToArray(),
                 VertexIds = null,
-                // Material summarizes the BASE look (texture encode + preview defaults).
                 Material = new WeaponMaterial
                 {
                     BlendMode = baseAlpha ? WeaponBlendMode.AlphaKey : WeaponBlendMode.Opaque,
-                    TwoSided = baseTwoSided,
+                    TwoSided = anyTwoSided,
                 },
                 SubmeshRanges = ranges,
                 Passes = weaponPasses,
+                TextureSlots = textureSlots.Select(t => new WeaponTextureSlot { Flags = t.Flags }).ToArray(),
                 Normalization = new MeshNormalizationRecord
                 {
                     Scale = 1f,
-                    Method = "tbc-import passthrough — WoW-authored geometry, palm at origin preserved",
+                    Method = "tbc-import passthrough — source geometry and render-batch order preserved",
                 },
             },
-            SourceTextures = texSlots.Select(k => k == DbcTextureKey ? null : k).ToList(),
+            SourceTextures = textureSlots.Select(t => new TbcSourceTexture
+            {
+                SourcePath = t.Path,
+                Flags = t.Flags,
+                SourceType = t.Type,
+            }).ToList(),
         };
     }
 
-    private const string DbcTextureKey = "\0DBC";
-
-    /// <summary>Decide which batches survive and how texture slots are assigned.
-    /// Null → no usable tables; caller falls back to single-pass.</summary>
-    private static (List<SourcePass> Passes, List<string> TexSlots)? PlanPasses(M2Model m2, ForgeDiagnostics diag)
+    /// <summary>Build a lossless static batch plan. No visibility threshold, blend filter, pass cap,
+    /// or base/overlay reordering is applied.</summary>
+    private static PassPlan? PlanPasses(M2Model m2, ForgeDiagnostics diag)
     {
-        if (m2.Batches.Count == 0 || m2.Submeshes.Count == 0 || m2.RenderFlags.Count == 0)
+        if (m2.Batches.Count == 0 || m2.Submeshes.Count == 0)
         {
-            diag.Info("tbc.batches.none", "No batch/render-flag tables — importing the whole triangle list as opaque.");
+            diag.Info("tbc.batches.none", "No batch/submesh tables — importing the whole triangle list as opaque.");
             return null;
         }
 
-        string TexKeyOf(M2Batch batch)
+        PassPlan Fatal(string code, string message)
         {
-            if (batch.TextureIndex < m2.TextureLookup.Count)
+            diag.Error(code, message);
+            return new PassPlan([], [], Fatal: true);
+        }
+
+        bool TryResolveTexture(M2Batch batch, int unit, out SourceTexture? texture, out string? error)
+        {
+            texture = null;
+            error = null;
+
+            int combo = batch.TextureIndex + unit;
+            if ((uint)combo >= (uint)m2.TextureLookup.Count)
             {
-                int ti = m2.TextureLookup[batch.TextureIndex];
-                if (ti >= 0 && ti < m2.Textures.Count)
+                error = $"texture-combo entry {combo} is outside the texture lookup (count {m2.TextureLookup.Count})";
+                return false;
+            }
+
+            int textureIndex = m2.TextureLookup[combo];
+            if ((uint)textureIndex >= (uint)m2.Textures.Count)
+            {
+                error = $"texture-combo entry {combo} resolves texture {textureIndex}, outside the texture table (count {m2.Textures.Count})";
+                return false;
+            }
+
+            var source = m2.Textures[textureIndex];
+            switch (source.Type)
+            {
+                case 0 when !string.IsNullOrWhiteSpace(source.Filename):
+                    texture = new SourceTexture(source.Filename, source.Flags, source.Type);
+                    return true;
+                case 0:
+                    error = $"texture {textureIndex} is Type-0 but has no hardcoded filename";
+                    return false;
+                case 2:
+                    // Type-2 is the one replaceable texture supplied by ItemDisplayInfo for an
+                    // object/weapon. It is the only texture kind for which a null source path is
+                    // meaningful to the controller.
+                    texture = new SourceTexture(null, source.Flags, source.Type);
+                    return true;
+                default:
+                    error = $"texture {textureIndex} uses unsupported replaceable type {source.Type}";
+                    return false;
+            }
+        }
+
+        static bool HasDeclaredSpan(IReadOnlyList<ushort> lookup, ushort start, int count)
+        {
+            // A direct 0xFFFF start is the old-format sentinel for an absent optional combo. A
+            // sentinel inside a real span is data too (notably "no transform" and "no weight")
+            // and must pass through unchanged.
+            return start == ushort.MaxValue || (long)start + count <= lookup.Count;
+        }
+
+        static ushort ResolveOptionalLookup(
+            IReadOnlyList<ushort> lookup,
+            ushort start,
+            int unit)
+        {
+            return start == ushort.MaxValue ? ushort.MaxValue : lookup[start + unit];
+        }
+
+        var passes = new List<SourcePass>(m2.Batches.Count);
+        for (int sourceOrder = 0; sourceOrder < m2.Batches.Count; sourceOrder++)
+        {
+            var batch = m2.Batches[sourceOrder];
+            if (batch.SubmeshIndex >= m2.Submeshes.Count)
+                return Fatal("tbc.batch.submesh",
+                    $"Batch {sourceOrder} references submesh {batch.SubmeshIndex}, outside the submesh table (count {m2.Submeshes.Count}).");
+
+            if (batch.MaterialIndex >= m2.RenderFlags.Count)
+                return Fatal("tbc.batch.material",
+                    $"Batch {sourceOrder} references render flag {batch.MaterialIndex}, outside the render-flag table (count {m2.RenderFlags.Count}).");
+            M2RenderFlag rf = m2.RenderFlags[batch.MaterialIndex];
+
+            int unitCount = batch.TextureCount;
+            if (unitCount == 0)
+                return Fatal("tbc.texture.units.zero",
+                    $"Batch {sourceOrder} declares zero texture units; the fidelity writer cannot represent an untextured batch without fabricating a binding.");
+
+            if ((long)batch.TextureIndex + unitCount > m2.TextureLookup.Count)
+                return Fatal("tbc.texture.span",
+                    $"Batch {sourceOrder} declares {unitCount} texture unit(s) at texture-combo {batch.TextureIndex}, outside the texture lookup (count {m2.TextureLookup.Count}).");
+            if (!HasDeclaredSpan(m2.TextureCoordinateLookup, batch.TextureCoordinateIndex, unitCount))
+                return Fatal("tbc.texture.coordinate-span",
+                    $"Batch {sourceOrder} declares {unitCount} texture unit(s) at coordinate-combo {batch.TextureCoordinateIndex}, outside the coordinate lookup (count {m2.TextureCoordinateLookup.Count}).");
+            if (!HasDeclaredSpan(m2.TransparencyLookup, batch.TextureWeightIndex, unitCount))
+                return Fatal("tbc.texture.weight-span",
+                    $"Batch {sourceOrder} declares {unitCount} texture unit(s) at weight-combo {batch.TextureWeightIndex}, outside the transparency lookup (count {m2.TransparencyLookup.Count}).");
+            if (!HasDeclaredSpan(m2.TextureTransformLookup, batch.TextureTransformIndex, unitCount))
+                return Fatal("tbc.texture.transform-span",
+                    $"Batch {sourceOrder} declares {unitCount} texture unit(s) at transform-combo {batch.TextureTransformIndex}, outside the transform lookup (count {m2.TextureTransformLookup.Count}).");
+
+            var bindings = new List<SourceBinding>(unitCount);
+            for (int unit = 0; unit < unitCount; unit++)
+            {
+                if (!TryResolveTexture(batch, unit, out var texture, out string? textureError))
+                    return Fatal("tbc.texture.resolve",
+                        $"Batch {sourceOrder}, texture unit {unit}: {textureError}.");
+
+                ushort coordinate = ResolveOptionalLookup(
+                    m2.TextureCoordinateLookup, batch.TextureCoordinateIndex, unit);
+                ushort weight = ResolveOptionalLookup(
+                    m2.TransparencyLookup, batch.TextureWeightIndex, unit);
+                ushort transform = ResolveOptionalLookup(
+                    m2.TextureTransformLookup, batch.TextureTransformIndex, unit);
+
+                float staticAlpha = 1f;
+                if (weight != ushort.MaxValue)
                 {
-                    var t = m2.Textures[ti];
-                    if (t.Type == 0 && t.Filename.Length > 0) return t.Filename;
-                    return DbcTextureKey; // any DBC-replaceable type — supplied by the display row
+                    if (weight >= m2.TransparencyStaticAlphas.Count)
+                        return Fatal("tbc.texture.weight",
+                            $"Batch {sourceOrder}, texture unit {unit}: transparency combo resolves track {weight}, outside the transparency table (count {m2.TransparencyStaticAlphas.Count}).");
+                    staticAlpha = m2.TransparencyStaticAlphas[weight];
+                    if (!float.IsFinite(staticAlpha))
+                        return Fatal("tbc.texture.alpha",
+                            $"Batch {sourceOrder}, texture unit {unit}: transparency track {weight} has a non-finite static alpha.");
                 }
-            }
-            return DbcTextureKey;
-        }
 
-        var basePasses = new Dictionary<int, SourcePass>();   // srcSubmesh → base
-        var glowPasses = new List<SourcePass>();
-        int droppedReflect = 0, droppedOverlay = 0, droppedInvisible = 0;
-
-        foreach (var batch in m2.Batches)
-        {
-            var flag = batch.MaterialIndex < m2.RenderFlags.Count ? m2.RenderFlags[batch.MaterialIndex] : null;
-            ushort blend = flag?.BlendingMode ?? 0;
-            ushort bits = flag?.Flags ?? 0;
-            if (batch.SubmeshIndex >= m2.Submeshes.Count) continue;
-            if (m2.GetStaticAlphaForBatch(batch) < 0.5f) { droppedInvisible++; continue; }
-
-            if (blend >= 5) { droppedReflect++; continue; }   // modulate/reflect env layers
-            if (blend >= 3)
-            {
-                glowPasses.Add(new SourcePass(batch.SubmeshIndex, bits, blend, batch.MaterialLayer, TexKeyOf(batch)));
-                continue;
+                bindings.Add(new SourceBinding(
+                    texture!,
+                    coordinate,
+                    staticAlpha,
+                    transform));
             }
 
-            var candidate = new SourcePass(batch.SubmeshIndex, bits, blend, batch.MaterialLayer, TexKeyOf(batch));
-            if (basePasses.TryGetValue(batch.SubmeshIndex, out var existing))
-            {
-                if (candidate.Layer < existing.Layer) { basePasses[batch.SubmeshIndex] = candidate; }
-                droppedOverlay++;
-            }
-            else basePasses[batch.SubmeshIndex] = candidate;
+            passes.Add(new SourcePass(
+                sourceOrder,
+                batch.SubmeshIndex,
+                batch.Flags,
+                batch.PriorityPlane,
+                batch.ShaderId,
+                batch.ColorIndex,
+                rf.Flags,
+                rf.BlendingMode,
+                batch.MaterialLayer,
+                bindings));
         }
 
-        if (basePasses.Count == 0 && glowPasses.Count == 0)
-        {
-            diag.Warn("tbc.batches.empty", "Batch filtering left no geometry — importing the whole triangle list as opaque.");
-            return null;
-        }
+        // Slot zero is the image used by the largest ordinary surface, because ItemDisplayInfo can
+        // provide exactly one replaceable weapon texture. Remaining distinct source images/flag
+        // combinations become hardcoded Type-0 effect slots in first-use order.
+        var dominant = passes
+            .Where(p => p.BlendMode <= 2 && p.Bindings.Count > 0)
+            .OrderByDescending(p => m2.Submeshes[p.SrcSubmesh].IndexCount)
+            .ThenBy(p => p.SourceOrder)
+            .Select(p => p.Bindings[0].Texture)
+            .FirstOrDefault()
+            ?? passes.SelectMany(p => p.Bindings).Select(b => b.Texture).First();
 
-        // Base passes first (submesh order), then glow passes (layer order), capped.
-        var passes = basePasses.Values.OrderBy(p => p.SrcSubmesh)
-            .Concat(glowPasses.OrderBy(p => p.Layer).ThenBy(p => p.SrcSubmesh))
-            .Take(MaxPasses)
-            .ToList();
+        var textures = new List<SourceTexture> { dominant };
+        foreach (var binding in passes.SelectMany(p => p.Bindings))
+            if (!textures.Contains(binding.Texture)) textures.Add(binding.Texture);
 
-        // Texture slots: the dominant base pass's image is slot 0 (the DBC-driven skin);
-        // every other distinct image becomes an effect slot.
-        string baseKey = basePasses.Count > 0
-            ? basePasses.Values.OrderByDescending(p =>
-                  p.SrcSubmesh < m2.Submeshes.Count ? m2.Submeshes[p.SrcSubmesh].IndexCount : 0)
-              .First().TexKey
-            : passes[0].TexKey;
-        var texSlots = new List<string> { baseKey };
-        foreach (var p in passes)
-            if (!texSlots.Contains(p.TexKey))
-                texSlots.Add(p.TexKey);
-
-        if (baseKey != DbcTextureKey)
-            diag.Info("tbc.texture.hardcoded", $"Base pass samples the hardcoded texture '{baseKey}' — using it as the skin.");
-        if (droppedReflect > 0)
-            diag.Info("tbc.batches.reflect", $"{droppedReflect} modulate/reflect pass(es) dropped (need env-mapping).");
-        if (droppedOverlay > 0)
-            diag.Info("tbc.batches.overlay", $"{droppedOverlay} overlay layer(s) dropped — one base pass per submesh.");
-        if (droppedInvisible > 0)
-            diag.Info("tbc.batches.invisible", $"{droppedInvisible} idle-invisible batch(es) dropped.");
-
-        return (passes, texSlots);
+        if (dominant.Path is not null)
+            diag.Info("tbc.texture.hardcoded", $"Dominant surface samples hardcoded texture '{dominant.Path}'; its pixels become the display texture.");
+        return new PassPlan(passes, textures);
     }
 
-    /// <summary>Fallback: whole triangle list, one opaque pass — for models without usable tables.</summary>
+    /// <summary>Fallback for models with no batch table: whole triangle list, one opaque pass.</summary>
     private static TbcExtractResult? ExtractSinglePass(M2Model m2, ForgeDiagnostics diag)
     {
         int n = m2.Vertices.Count;
         var pos = new Vector3[n];
         var nrm = new Vector3[n];
-        var uv = new Vector2[n];
-        int uvClamped = 0;
+        var uv0 = new Vector2[n];
+        var uv1 = new Vector2[n];
         for (int i = 0; i < n; i++)
         {
             var v = m2.Vertices[i];
             pos[i] = new Vector3(v.PosX, v.PosY, v.PosZ);
             var normal = new Vector3(v.NormX, v.NormY, v.NormZ);
             nrm[i] = normal.LengthSquared() > 1e-10f ? Vector3.Normalize(normal) : Vector3.UnitY;
-            float uC = Math.Clamp(v.TexU, 0f, 1f), vC = Math.Clamp(v.TexV, 0f, 1f);
-            if (uC != v.TexU || vC != v.TexV) uvClamped++;
-            uv[i] = new Vector2(uC, vC);
+            uv0[i] = new Vector2(float.IsFinite(v.TexU) ? v.TexU : 0, float.IsFinite(v.TexV) ? v.TexV : 0);
+            uv1[i] = new Vector2(float.IsFinite(v.TexU2) ? v.TexU2 : 0, float.IsFinite(v.TexV2) ? v.TexV2 : 0);
         }
-        if (uvClamped > 0)
-            diag.Info("tbc.uv.clamped", $"{uvClamped} UV(s) outside [0,1] clamped to the vanilla policy.");
 
         var kept = new List<uint>(m2.Indices.Count);
         for (int t = 0; t + 2 < m2.Indices.Count; t += 3)
         {
             uint a = m2.Indices[t], b = m2.Indices[t + 1], c = m2.Indices[t + 2];
-            if (a >= n || b >= n || c >= n) continue;
-            if (a == b || b == c || a == c) continue;
-            var e0 = pos[b] - pos[a];
-            var e1 = pos[c] - pos[a];
-            if (Vector3.Cross(e0, e1).LengthSquared() < 1e-14f) continue;
+            if (a >= n || b >= n || c >= n || a == b || b == c || a == c) continue;
+            if (Vector3.Cross(pos[b] - pos[a], pos[c] - pos[a]).LengthSquared() < 1e-14f) continue;
             kept.Add(a); kept.Add(b); kept.Add(c);
         }
         if (kept.Count == 0) return null;
@@ -282,26 +386,34 @@ public static class TbcWeaponMeshExtractor
             {
                 Positions = pos,
                 Normals = nrm,
-                Uv0 = uv,
+                Uv0 = uv0,
+                Uv1 = uv1,
                 Indices = kept.ToArray(),
                 VertexIds = null,
-                Material = new WeaponMaterial(),
+                Material = new WeaponMaterial { TwoSided = true },
+                TextureSlots = [new WeaponTextureSlot { Flags = 0 }],
                 Normalization = new MeshNormalizationRecord
                 {
                     Scale = 1f,
-                    Method = "tbc-import passthrough — WoW-authored geometry, palm at origin preserved",
+                    Method = "tbc-import fallback — no usable batch table",
                 },
             },
-            SourceTextures = new List<string?> { null },
+            SourceTextures = [new TbcSourceTexture { SourcePath = null, Flags = 0, SourceType = 2 }],
         };
     }
 }
 
-/// <summary>Result of a TBC weapon extraction: the (possibly multi-pass) mesh plus the source
-/// texture per slot — slot 0 is the base skin, further slots are effect/glow textures. A null
-/// path means "the display row's Type-2 texture"; otherwise it is the hardcoded TBC MPQ path.</summary>
+/// <summary>One source image used by an extracted TBC render graph. A null path means the item
+/// display's replaceable weapon texture; otherwise it is a hardcoded TBC MPQ member.</summary>
+public sealed record TbcSourceTexture
+{
+    public required string? SourcePath { get; init; }
+    public required uint Flags { get; init; }
+    public required uint SourceType { get; init; }
+}
+
 public sealed record TbcExtractResult
 {
     public required RigidWeaponMesh Mesh { get; init; }
-    public required List<string?> SourceTextures { get; init; }
+    public required List<TbcSourceTexture> SourceTextures { get; init; }
 }

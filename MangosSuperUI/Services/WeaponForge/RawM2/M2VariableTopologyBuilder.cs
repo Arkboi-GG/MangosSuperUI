@@ -17,13 +17,10 @@ namespace MangosSuperUI.Services.WeaponForge.RawM2;
 ///    donor arrays). Optionally patches the donor render-flag record in place for alpha-key /
 ///    two-sided materials (fixed-width, offset-preserving).
 ///
-///  • MULTI-PASS (mesh.Passes set — TBC imports with glow layers): N submeshes + N batches per view,
-///    plus APPENDED textures / texture-lookup / render-flags tables (headers 0x5C/0x60, 0x94/0x98,
-///    0x84/0x88 repointed). Texture slot 0 stays Type-2 (DBC-driven); effect slots are Type-0 with
-///    hardcoded SUI_W_####_E0N.blp filenames packaged alongside — exactly how stock glowing weapons
-///    bind their effect layers, so the 1.12 client needs nothing new. Batch fields not overridden
-///    (transparency weight, texture transform, shader) still copy the donor template, whose indices
-///    resolve against the untouched donor tables.
+///  • MULTI-PASS (mesh.Passes set — TBC imports): N submeshes + the complete source batch stack per
+///    view. Textures, render flags, texture/coordinate/weight/transform combo tables, and constant
+///    transparency tracks are appended and repointed. All 24 bytes of each batch are authored from
+///    the render IR; no source pass inherits unrelated shader or combo indices from the donor.
 ///
 /// Two deliberate policies still require reference-client proof (they are reported by the caller):
 ///   1. Four EQUIVALENT views (not real per-LOD structures).
@@ -52,6 +49,7 @@ public static class M2VariableTopologyBuilder
         if (normalWoW.Count != n || uv0.Count != n) throw new ArgumentException("Vertex attribute length mismatch.");
         int t3 = indices.Length;
         if (t3 == 0 || t3 % 3 != 0) throw new ArgumentException($"Index count {t3} is not a positive multiple of 3.");
+        if (t3 > ushort.MaxValue) throw new ArgumentException($"Index count {t3} exceeds the v256 skin-section address space ({ushort.MaxValue}).");
         foreach (var ix in indices) if (ix >= n) throw new ArgumentException($"Index {ix} out of range (>= {n}).");
 
         // Pass plan: single pseudo-pass over everything, or the mesh's own multi-pass structure.
@@ -64,10 +62,56 @@ public static class M2VariableTopologyBuilder
             : new[] { new WeaponPass { SubmeshSlot = 0, RenderFlags = 0, BlendMode = 0, Layer = 0, TextureSlot = 0 } };
         int nSub = ranges.Count, nBatch = passes.Count;
 
-        int effectSlots = passes.Max(p => p.TextureSlot);
-        if (effectSlots > 0 && (effectTexturePaths is null || effectTexturePaths.Count < effectSlots))
+        static IReadOnlyList<WeaponTextureBinding> BindingsOf(WeaponPass pass) =>
+            pass.TextureBindings is { Count: > 0 } bindings
+                ? bindings
+                : new[] { new WeaponTextureBinding { TextureSlot = pass.TextureSlot } };
+        var passBindings = passes.Select(BindingsOf).ToArray();
+        int effectSlots = passBindings.SelectMany(b => b).Max(b => b.TextureSlot);
+        if (effectSlots < 0)
+            throw new InvalidOperationException($"Mesh references invalid negative texture slot {effectSlots}.");
+
+        int texCount = Math.Max(checked(1 + effectSlots), mesh.TextureSlots?.Count ?? 0);
+        if (texCount > ushort.MaxValue)
+            throw new InvalidOperationException($"Texture count {texCount} exceeds the v256 UInt16 lookup address space ({ushort.MaxValue}).");
+        int requiredEffectPaths = texCount - 1;
+        if (requiredEffectPaths > 0 && (effectTexturePaths is null || effectTexturePaths.Count < requiredEffectPaths))
             throw new InvalidOperationException(
-                $"Mesh references {effectSlots} effect texture slot(s) but only {effectTexturePaths?.Count ?? 0} path(s) were supplied.");
+                $"Mesh requires {requiredEffectPaths} effect texture path(s) but only {effectTexturePaths?.Count ?? 0} were supplied.");
+
+        if (nSub > ushort.MaxValue)
+            throw new ArgumentException($"Submesh count {nSub} exceeds the v256 UInt16 batch address space ({ushort.MaxValue}).");
+
+        foreach (var r in ranges)
+        {
+            if (r.VertexStart < 0 || r.VertexCount < 0 || r.IndexStart < 0 || r.IndexCount < 0 ||
+                r.VertexStart > ushort.MaxValue || r.VertexCount > ushort.MaxValue ||
+                r.IndexStart > ushort.MaxValue || r.IndexCount > ushort.MaxValue)
+                throw new ArgumentException("A submesh range exceeds the UInt16 fields available in a v256 skin section.");
+            if ((long)r.VertexStart + r.VertexCount > n)
+                throw new ArgumentException(
+                    $"Submesh vertex span [{r.VertexStart},{(long)r.VertexStart + r.VertexCount}) exceeds vertex count {n}.");
+            if ((long)r.IndexStart + r.IndexCount > t3)
+                throw new ArgumentException(
+                    $"Submesh index span [{r.IndexStart},{(long)r.IndexStart + r.IndexCount}) exceeds index count {t3}.");
+            if (r.IndexStart % 3 != 0 || r.IndexCount % 3 != 0)
+                throw new ArgumentException(
+                    $"Submesh index span start/count ({r.IndexStart}/{r.IndexCount}) is not triangle-aligned.");
+        }
+
+        for (int pi = 0; pi < nBatch; pi++)
+        {
+            int submeshSlot = passes[pi].SubmeshSlot;
+            if (submeshSlot < 0 || submeshSlot >= nSub || submeshSlot > ushort.MaxValue)
+                throw new ArgumentException($"Pass {pi} references invalid submesh slot {submeshSlot} (count {nSub}).");
+            if (passBindings[pi].Count > ushort.MaxValue)
+                throw new ArgumentException(
+                    $"Pass {pi} texture-unit count {passBindings[pi].Count} exceeds UInt16 ({ushort.MaxValue}).");
+            foreach (var binding in passBindings[pi])
+                if (binding.TextureSlot < 0 || binding.TextureSlot >= texCount || binding.TextureSlot > ushort.MaxValue)
+                    throw new ArgumentException(
+                        $"Pass {pi} references invalid texture slot {binding.TextureSlot} (count {texCount}).");
+        }
 
         // Donor templates whose byte contents we reuse verbatim so their index references into the
         // donor's preserved tables stay valid. Measured donor evidence (InspectWeapon, 2026-08-18):
@@ -106,21 +150,66 @@ public static class M2VariableTopologyBuilder
             cursor = Align4(cursor); batchOff[i] = cursor; cursor += nBatch * 24;
         }
 
-        // Multi-pass: appended textures / texture-lookup / render-flags tables + filename strings.
-        int texTableOff = 0, texLookupOff = 0, rfTableOff = 0;
-        int texCount = 1 + effectSlots;
+        // Multi-pass material tables. Combo arrays are flattened per pass so +16/+18/+20/+22 in
+        // every batch are parallel starts and TextureCount units resolve contiguously.
+        int texTableOff = 0, texLookupOff = 0, coordLookupOff = 0, weightLookupOff = 0,
+            transformLookupOff = 0, rfTableOff = 0, alphaTrackOff = 0, alphaRangeOff = 0,
+            alphaTimeOff = 0, alphaKeysOff = 0;
+        int alphaRangeCount = 0;
         var texNameOffs = new int[texCount];   // string offset per effect texture (0 = none)
         var texNameBytes = new byte[texCount][];
-        List<(ushort Flags, ushort Blend)> rfEntries = new();
+        var rfEntries = new List<(ushort Flags, ushort Blend)>();
+        var comboStarts = new int[nBatch];
+        var textureCombos = new List<ushort>();
+        var coordCombos = new List<ushort>();
+        var weightCombos = new List<ushort>();
+        var transformCombos = new List<ushort>();
+        var alphaKeys = new List<short>();
         if (multiPass)
         {
-            for (int s = 1; s <= effectSlots; s++)
+            for (int s = 1; s < texCount; s++)
             {
                 texNameBytes[s] = Encoding.ASCII.GetBytes(effectTexturePaths![s - 1] + "\0");
                 cursor = Align4(cursor); texNameOffs[s] = cursor; cursor += texNameBytes[s].Length;
             }
             cursor = Align4(cursor); texTableOff = cursor; cursor += texCount * 16;
-            cursor = Align4(cursor); texLookupOff = cursor; cursor += texCount * 2;
+
+            for (int pi = 0; pi < nBatch; pi++)
+            {
+                comboStarts[pi] = textureCombos.Count;
+                foreach (var binding in passBindings[pi])
+                {
+                    textureCombos.Add((ushort)binding.TextureSlot);
+                    coordCombos.Add(binding.TextureCoordinate);
+
+                    short alpha = (short)Math.Clamp(
+                        (int)MathF.Round(Math.Clamp(binding.StaticAlpha, 0f, 1f) * 32767f), 0, 32767);
+                    int alphaIndex = alphaKeys.IndexOf(alpha);
+                    if (alphaIndex < 0) { alphaIndex = alphaKeys.Count; alphaKeys.Add(alpha); }
+                    weightCombos.Add((ushort)alphaIndex);
+
+                    // Source UV animation tracks contain nested offsets into the TBC file and
+                    // cannot be referenced from the donor scaffold. A static texture coordinate
+                    // is still preserved; the transform lookup explicitly says "none" rather
+                    // than accidentally sampling the donor's animation table.
+                    transformCombos.Add(ushort.MaxValue);
+                }
+            }
+            if (textureCombos.Count > ushort.MaxValue)
+                throw new InvalidOperationException("Texture combo count exceeds the v256 UInt16 batch address space.");
+
+            cursor = Align4(cursor); texLookupOff = cursor; cursor += textureCombos.Count * 2;
+            cursor = Align4(cursor); coordLookupOff = cursor; cursor += coordCombos.Count * 2;
+            cursor = Align4(cursor); weightLookupOff = cursor; cursor += weightCombos.Count * 2;
+            cursor = Align4(cursor); transformLookupOff = cursor; cursor += transformCombos.Count * 2;
+
+            // One constant vanilla AnimationBlockM2 per distinct static alpha. This freezes the
+            // source's rest-pose weight without retaining pointers into the TBC file.
+            alphaRangeCount = checked((int)Math.Max(1u, doc.FindArray("sequences")?.Count ?? 0));
+            cursor = Align4(cursor); alphaTrackOff = cursor; cursor += alphaKeys.Count * 28;
+            cursor = Align4(cursor); alphaRangeOff = cursor; cursor += alphaRangeCount * 8;
+            cursor = Align4(cursor); alphaTimeOff = cursor; cursor += 4;  // timestamp 0, shared
+            cursor = Align4(cursor); alphaKeysOff = cursor; cursor += alphaKeys.Count * 2;
 
             foreach (var p in passes)
                 if (!rfEntries.Contains((p.RenderFlags, p.BlendMode)))
@@ -142,7 +231,11 @@ public static class M2VariableTopologyBuilder
             // bones (o+16..19) already zero
             WriteVec3(outp, o + 20, CoordinateContract.Normalize(normalWoW[i]));
             WriteF(outp, o + 32, uv0[i].X); WriteF(outp, o + 36, uv0[i].Y);
-            // uv1 (o+40..47) zero
+            if (mesh.Uv1 is { Length: > 0 } uv1 && i < uv1.Length)
+            {
+                WriteF(outp, o + 40, uv1[i].X);
+                WriteF(outp, o + 44, uv1[i].Y);
+            }
             min = Vector3.Min(min, posWoW[i]); max = Vector3.Max(max, posWoW[i]);
         }
         float radius = 0f;
@@ -183,8 +276,8 @@ public static class M2VariableTopologyBuilder
                 WriteVec3(outp, s + 20, subCenters[si]);
             }
 
-            // Batches: copy the donor template (its transparency/transform indices resolve against
-            // donor tables), then override the per-pass fields.
+            // Batches. Single-pass keeps the proven donor record. Multi-pass authors all 24 bytes
+            // from the TBC render IR and points every dependent index at the appended tables.
             for (int bi = 0; bi < nBatch; bi++)
             {
                 int t = batchOff[vi] + bi * 24;
@@ -194,10 +287,18 @@ public static class M2VariableTopologyBuilder
                 U16(outp, t + 6, (ushort)p.SubmeshSlot);   // geoset index (mirrors submesh in stock weapons)
                 if (multiPass)
                 {
+                    outp[t + 0] = p.BatchFlags;
+                    outp[t + 1] = unchecked((byte)p.PriorityPlane);
+                    U16(outp, t + 2, p.ShaderId);
                     int rfIdx = rfEntries.IndexOf((p.RenderFlags, p.BlendMode));
-                    U16(outp, t + 10, (ushort)rfIdx);          // render-flag (material) index → new table
-                    U16(outp, t + 12, (ushort)p.Layer);        // material layer
-                    U16(outp, t + 16, (ushort)p.TextureSlot);  // texture lookup index → new identity table
+                    I16(outp, t + 8, -1);                          // source color tracks are not donor-compatible
+                    U16(outp, t + 10, (ushort)rfIdx);              // render-flag table
+                    U16(outp, t + 12, checked((ushort)p.Layer));   // material layer
+                    U16(outp, t + 14, checked((ushort)passBindings[bi].Count));
+                    U16(outp, t + 16, (ushort)comboStarts[bi]);    // texture combo start
+                    U16(outp, t + 18, (ushort)comboStarts[bi]);    // texture-coordinate combo start
+                    U16(outp, t + 20, (ushort)comboStarts[bi]);    // texture-weight combo start
+                    U16(outp, t + 22, (ushort)comboStarts[bi]);    // texture-transform combo start
                 }
             }
 
@@ -214,8 +315,8 @@ public static class M2VariableTopologyBuilder
         // Multi-pass appended tables + header repoints.
         if (multiPass)
         {
-            // Textures: slot 0 = Type-2 (DBC-driven; copy the donor's Type-2 flags so wrap behavior
-            // matches), slots 1.. = Type-0 hardcoded members.
+            // Textures: slot 0 = Type-2 (DBC-driven), slots 1.. = Type-0 hardcoded members. TBC
+            // wrap/clamp flags are retained per slot instead of copied from one donor texture.
             uint donorTexFlags = 0;
             uint nDonorTex = BinaryPrimitives.ReadUInt32LittleEndian(donor.AsSpan(0x5C, 4));
             uint ofsDonorTex = BinaryPrimitives.ReadUInt32LittleEndian(donor.AsSpan(0x60, 4));
@@ -226,17 +327,49 @@ public static class M2VariableTopologyBuilder
             {
                 int o = texTableOff + s * 16;
                 U32(outp, o + 0, s == 0 ? 2u : 0u);          // type
-                U32(outp, o + 4, donorTexFlags);             // flags (wrap bits)
+                uint textureFlags = mesh.TextureSlots is { } slots && s < slots.Count
+                    ? slots[s].Flags
+                    : donorTexFlags;
+                U32(outp, o + 4, textureFlags);              // flags (wrap bits)
                 if (s > 0)
                 {
                     Array.Copy(texNameBytes[s], 0, outp, texNameOffs[s], texNameBytes[s].Length);
                     U32(outp, o + 8, (uint)texNameBytes[s].Length);   // filename length (incl. NUL)
                     U32(outp, o + 12, (uint)texNameOffs[s]);          // filename offset
                 }
-                U16(outp, texLookupOff + s * 2, (ushort)s);  // identity texture lookup
             }
             U32(outp, 0x5C, (uint)texCount); U32(outp, 0x60, (uint)texTableOff);
-            U32(outp, 0x94, (uint)texCount); U32(outp, 0x98, (uint)texLookupOff);
+
+            for (int i = 0; i < textureCombos.Count; i++)
+            {
+                U16(outp, texLookupOff + i * 2, textureCombos[i]);
+                U16(outp, coordLookupOff + i * 2, coordCombos[i]);
+                U16(outp, weightLookupOff + i * 2, weightCombos[i]);
+                U16(outp, transformLookupOff + i * 2, transformCombos[i]);
+            }
+            U32(outp, 0x94, (uint)textureCombos.Count); U32(outp, 0x98, (uint)texLookupOff);
+            U32(outp, 0x9C, (uint)coordCombos.Count); U32(outp, 0xA0, (uint)coordLookupOff);
+            U32(outp, 0xA4, (uint)weightCombos.Count); U32(outp, 0xA8, (uint)weightLookupOff);
+            U32(outp, 0xAC, (uint)transformCombos.Count); U32(outp, 0xB0, (uint)transformLookupOff);
+
+            // Constant rest-pose transparency tracks.
+            for (int i = 0; i < alphaRangeCount; i++)
+            {
+                U32(outp, alphaRangeOff + i * 8 + 0, 0);
+                U32(outp, alphaRangeOff + i * 8 + 4, 0);
+            }
+            U32(outp, alphaTimeOff, 0);
+            for (int i = 0; i < alphaKeys.Count; i++)
+            {
+                int track = alphaTrackOff + i * 28;
+                U16(outp, track + 0, 0);            // interpolation: none
+                U16(outp, track + 2, ushort.MaxValue); // no global sequence
+                U32(outp, track + 4, (uint)alphaRangeCount); U32(outp, track + 8, (uint)alphaRangeOff);
+                U32(outp, track + 12, 1); U32(outp, track + 16, (uint)alphaTimeOff);
+                U32(outp, track + 20, 1); U32(outp, track + 24, (uint)(alphaKeysOff + i * 2));
+                I16(outp, alphaKeysOff + i * 2, alphaKeys[i]);
+            }
+            U32(outp, 0x64, (uint)alphaKeys.Count); U32(outp, 0x68, (uint)alphaTrackOff);
 
             // Render flags: distinct (flags, blend) pairs carried verbatim from the source passes.
             for (int i = 0; i < rfEntries.Count; i++)
@@ -295,6 +428,7 @@ public static class M2VariableTopologyBuilder
 
     private static int Align4(int x) => (x + 3) & ~3;
     private static void U16(byte[] b, int o, ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(b.AsSpan(o, 2), v);
+    private static void I16(byte[] b, int o, short v) => BinaryPrimitives.WriteInt16LittleEndian(b.AsSpan(o, 2), v);
     private static void U32(byte[] b, int o, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(b.AsSpan(o, 4), v);
     private static void WriteF(byte[] b, int o, float f) => BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(o, 4), f);
     private static void WriteVec3(byte[] b, int o, Vector3 v) { WriteF(b, o, v.X); WriteF(b, o + 4, v.Y); WriteF(b, o + 8, v.Z); }

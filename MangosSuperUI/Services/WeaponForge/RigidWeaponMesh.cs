@@ -9,9 +9,9 @@ namespace MangosSuperUI.Services.WeaponForge;
 /// GLB/sketch Route B) produces one of these.
 ///
 /// Authoring space is right-handed **Y-up** (see <see cref="CoordinateContract"/>): +X grip→tip,
-/// grip at the origin, one unit == one WoW unit. Exactly one triangle-list primitive, one
-/// material, UV0 present, UV1 implicitly (0,0). Positions/normals/UV0 are parallel arrays indexed
-/// by vertex; <see cref="Indices"/> is a flat triangle list (multiple of 3).
+/// grip at the origin, one unit == one WoW unit. Positions, normals, and UV0 are parallel arrays;
+/// UV1 is optional for imported multi-texture assets. <see cref="Indices"/> is a flat triangle
+/// list (multiple of 3), optionally partitioned into submeshes and render passes.
 /// </summary>
 public sealed class RigidWeaponMesh
 {
@@ -23,6 +23,9 @@ public sealed class RigidWeaponMesh
 
     /// <summary>Per-vertex UV0, top-left image convention (U right, V down).</summary>
     public required Vector2[] Uv0 { get; init; }
+
+    /// <summary>Optional per-vertex UV1, parallel to <see cref="Uv0"/>.</summary>
+    public Vector2[]? Uv1 { get; init; }
 
     /// <summary>Flat triangle-list indices into the vertex arrays. Length is a multiple of 3.</summary>
     public required uint[] Indices { get; init; }
@@ -63,6 +66,9 @@ public sealed class RigidWeaponMesh
     /// <summary>Render passes over <see cref="SubmeshRanges"/>; null = single-pass (see above).</summary>
     public IReadOnlyList<WeaponPass>? Passes { get; init; }
 
+    /// <summary>Optional per-slot source texture metadata, including M2 wrap flags.</summary>
+    public IReadOnlyList<WeaponTextureSlot>? TextureSlots { get; init; }
+
     public int VertexCount => Positions.Length;
     public int TriangleCount => Indices.Length / 3;
 }
@@ -95,13 +101,45 @@ public sealed record WeaponPass
     /// <summary>0 = the DBC-driven base texture (Type-2 slot); 1.. = effect texture (Type-0
     /// hardcoded SUI_W_####_E0N path packaged alongside the model).</summary>
     public required int TextureSlot { get; init; }
+
+    /// <summary>Original batch order in the source view.</summary>
+    public int SourceOrder { get; init; }
+
+    /// <summary>Raw batch flags and signed priority plane.</summary>
+    public byte BatchFlags { get; init; }
+    public sbyte PriorityPlane { get; init; }
+
+    /// <summary>Raw source shader ID and optional vertex-color track index.</summary>
+    public ushort ShaderId { get; init; }
+    public short ColorIndex { get; init; } = -1;
+
+    /// <summary>
+    /// Texture units bound by this batch. Null preserves compatibility with legacy one-texture
+    /// passes, which use <see cref="TextureSlot"/> with UV0 and full static alpha.
+    /// </summary>
+    public IReadOnlyList<WeaponTextureBinding>? TextureBindings { get; init; }
+}
+
+/// <summary>One texture unit within an M2 batch.</summary>
+public sealed record WeaponTextureBinding
+{
+    public required int TextureSlot { get; init; }
+    public ushort TextureCoordinate { get; init; } = 0;
+    public float StaticAlpha { get; init; } = 1f;
+    public ushort TextureTransform { get; init; } = 0xFFFF;
+}
+
+/// <summary>Source metadata for one texture slot.</summary>
+public sealed record WeaponTextureSlot
+{
+    public required uint Flags { get; init; }
 }
 
 /// <summary>The single-pass material: one base render pass bound to one Type-2 (empty-filename) M2
 /// texture slot whose pixels come from ItemDisplayInfo.TextureName1. Opaque (DXT1) is the default;
 /// <see cref="WeaponBlendMode.AlphaKey"/> (DXT3 + blend-mode-1 render flag) exists because many
 /// TBC blades cut their silhouette out of a sheet with texture alpha — imported opaque they render
-/// as solid black slabs. Multi-pass/additive stays out of scope; glow passes are dropped at import.</summary>
+/// as solid black slabs. Imported multi-pass/additive materials use <see cref="WeaponPass"/>.</summary>
 public sealed class WeaponMaterial
 {
     public WeaponBlendMode BlendMode { get; init; } = WeaponBlendMode.Opaque;

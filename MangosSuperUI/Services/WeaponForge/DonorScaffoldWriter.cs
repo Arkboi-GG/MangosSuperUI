@@ -123,9 +123,19 @@ public sealed class DonorScaffoldWriter : IWeaponMeshWriter
             nrmWoW[i] = CoordinateContract.MeshNormalToWoW(mesh.Normals[i]);
         }
         if (mesh.Passes is { Count: > 0 })
+        {
             diag.Info("writer.passes",
                 $"Multi-pass output: {mesh.SubmeshRanges?.Count ?? 0} submesh(es), {mesh.Passes.Count} pass(es), " +
                 $"{ctx.EffectTexturePaths?.Count ?? 0} effect texture(s).");
+            int transformedUnits = mesh.Passes.Sum(p => p.TextureBindings?.Count(b => b.TextureTransform != ushort.MaxValue) ?? 0);
+            if (transformedUnits > 0)
+                diag.Warn("writer.uv-animation.static",
+                    $"{transformedUnits} texture unit(s) reference TBC UV animation tracks. Their base UV set is preserved, but animated scrolling/rotation is disabled on the vanilla donor scaffold.");
+            int coloredPasses = mesh.Passes.Count(p => p.ColorIndex >= 0);
+            if (coloredPasses > 0)
+                diag.Warn("writer.color.static",
+                    $"{coloredPasses} pass(es) reference TBC color tracks. Source textures/passes are preserved, but animated color tint is not transplanted.");
+        }
         else if (mesh.Material.BlendMode != WeaponBlendMode.Opaque || mesh.Material.TwoSided)
             diag.Info("writer.material",
                 $"Render flag carries source material: blend={(int)mesh.Material.BlendMode}, twoSided={mesh.Material.TwoSided}.");

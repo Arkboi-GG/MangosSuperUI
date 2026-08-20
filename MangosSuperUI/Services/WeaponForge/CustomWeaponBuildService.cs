@@ -78,6 +78,13 @@ public sealed class CustomWeaponBuildService
             ? cfg
             : Path.Combine(_env.WebRootPath, "weapon_forge_builds");
 
+    private static bool PassUsesTextureSlot(WeaponPass pass, int textureSlot) =>
+        pass.TextureBindings is { Count: > 0 } bindings
+            ? bindings.Any(binding => binding.TextureSlot == textureSlot)
+            : pass.TextureSlot == textureSlot;
+
+    private static bool PassNeedsTextureAlpha(WeaponPass pass) => pass.BlendMode is 1 or 2 or 4;
+
     // ═══════════════════════════════════════════════════════════════════
     // BUILD (one new weapon → persist → unified patch)
     // ═══════════════════════════════════════════════════════════════════
@@ -124,35 +131,53 @@ public sealed class CustomWeaponBuildService
         var effectBlps = new List<(string MpqPath, byte[] Blp)>();
         if (hasMesh)
         {
-            // Envelope follows the source aspect (snapped to powers of two, ≤256) rather than a
-            // forced square: a 2:1 zone atlas encodes as 256×128, a square reconstruction texture
-            // stays 256×256. Forcing 256×256 previously stretched every zone atlas vertically 2×.
+            // A pre-encoded source BLP2 (the TBC fidelity route) is packaged byte-for-byte. PNG
+            // authoring routes retain their existing power-of-two envelope and encoder policy.
             WeaponTexture? texture = null;
-            if (request.TexturePng is { Length: > 0 })
+            if (request.TextureBlp is { Length: > 0 } sourceBlp)
+            {
+                texture = new WeaponTexture { SourceBlp = sourceBlp };
+            }
+            else if (request.TexturePng is { Length: > 0 })
             {
                 var (tw, th) = TargetBlpSize(request.TexturePng);
-                // Alpha-keyed materials (TBC cutout blades) need the alpha channel to survive —
-                // DXT3. Opaque stays DXT1 (the overwhelming stock envelope).
-                bool keepAlpha = request.Mesh?.Material.BlendMode == WeaponBlendMode.AlphaKey;
+                // Alpha-keyed materials and TBC pass modes that consume texture alpha need DXT3.
+                // TextureBindings handles multi-texture source batches; TextureSlot remains the
+                // compatibility fallback for ordinary one-texture passes.
+                bool keepAlpha = request.Mesh?.Material.BlendMode == WeaponBlendMode.AlphaKey ||
+                    request.Mesh?.Passes?.Any(p => PassUsesTextureSlot(p, 0) && PassNeedsTextureAlpha(p)) == true;
                 texture = new WeaponTexture { SourcePng = request.TexturePng, Width = tw, Height = th, UseDxt1 = !keepAlpha };
             }
 
             // Effect textures (multi-pass glow): packaged as Type-0 members the emitted M2 names
-            // by hardcoded path. Alpha survives (DXT3) when any pass using the slot alpha-blends;
-            // pure additive glow works on RGB and stays DXT1.
+            // by hardcoded path. Alpha survives (DXT3) when any pass using the slot consumes it;
+            // pure additive blend mode 3 works on RGB and stays DXT1.
             List<WeaponTexture>? effectTextures = null;
             List<string>? effectPaths = null;
-            if (request.EffectTexturesPng is { Count: > 0 } && request.Mesh?.Passes is { Count: > 0 } meshPasses)
+            int encodedEffectCount = request.EffectTexturesBlp?.Count ?? 0;
+            int pngEffectCount = request.EffectTexturesPng?.Count ?? 0;
+            int effectCount = Math.Max(encodedEffectCount, pngEffectCount);
+            if (effectCount > 0 && request.Mesh?.Passes is { Count: > 0 } meshPasses)
             {
                 effectTextures = new List<WeaponTexture>();
                 effectPaths = new List<string>();
-                for (int i = 0; i < request.EffectTexturesPng.Count; i++)
+                for (int i = 0; i < effectCount; i++)
                 {
-                    var png = request.EffectTexturesPng[i];
+                    if (i < encodedEffectCount && request.EffectTexturesBlp![i] is { Length: > 0 } effectBlp)
+                    {
+                        effectTextures.Add(new WeaponTexture { SourceBlp = effectBlp });
+                        effectPaths.Add(WeaponNaming.EffectTextureMpqPath(modelIndex, i + 1));
+                        continue;
+                    }
+
+                    if (i >= pngEffectCount)
+                        throw new InvalidOperationException($"Effect texture slot {i + 1} has no BLP2 or PNG source.");
+                    var png = request.EffectTexturesPng![i];
                     if (png is not { Length: > 0 })
                         throw new InvalidOperationException($"Effect texture slot {i + 1} has no image bytes.");
                     var (ew, eh) = TargetBlpSize(png);
-                    bool alpha = meshPasses.Any(p => p.TextureSlot == i + 1 && p.BlendMode is 1 or 2);
+                    bool alpha = meshPasses.Any(p =>
+                        PassUsesTextureSlot(p, i + 1) && PassNeedsTextureAlpha(p));
                     effectTextures.Add(new WeaponTexture { SourcePng = png, Width = ew, Height = eh, UseDxt1 = !alpha });
                     effectPaths.Add(WeaponNaming.EffectTextureMpqPath(modelIndex, i + 1));
                 }
@@ -165,7 +190,11 @@ public sealed class CustomWeaponBuildService
                 DonorM2Path = donor.M2Path,
                 EffectTextures = effectTextures,
                 EffectTexturePaths = effectPaths,
-                MeshValidation = new MeshValidationOptions { Topology = request.Topology },
+                MeshValidation = new MeshValidationOptions
+                {
+                    Topology = request.Topology,
+                    VariableHardCeiling = request.VariableTriangleHardCeiling,
+                },
             });
             diag.AddRange(compiled.Diagnostics);
             if (compiled.M2 is null || compiled.Diagnostics.HasErrors)
@@ -1096,13 +1125,25 @@ public sealed class CustomWeaponBuildRequest
     public RigidWeaponMesh? Mesh { get; init; }
     public WeaponTopologyMode Topology { get; init; } = WeaponTopologyMode.Variable;
 
+    /// <summary>Route-specific variable-topology ceiling. Arbitrary authored/imported meshes keep
+    /// the Forge's conservative 1,000-triangle policy; the TBC fidelity route explicitly raises
+    /// this to the vanilla skin section's UInt16 index capacity.</summary>
+    public int VariableTriangleHardCeiling { get; init; } = 1000;
+
     /// <summary>Optional PNG master (e.g. the GLB's embedded texture). Encoded to a 256×256 DXT1 BLP;
     /// when absent the donor texture is packaged so the model still samples something valid.</summary>
     public byte[]? TexturePng { get; init; }
 
+    /// <summary>Optional already-encoded BLP2 master. Used by TBC fidelity imports so texture
+    /// dimensions, mipmaps, alpha and compressed blocks are packaged without a lossy round trip.</summary>
+    public byte[]? TextureBlp { get; init; }
+
     /// <summary>Effect texture PNGs for the mesh's texture slots 1.. (multi-pass glow imports).
     /// Encoded and packaged as Type-0 members the emitted M2 references by hardcoded path.</summary>
     public IReadOnlyList<byte[]>? EffectTexturesPng { get; init; }
+
+    /// <summary>Pre-encoded BLP2 sources parallel to texture slots 1..; preferred over PNG entries.</summary>
+    public IReadOnlyList<byte[]>? EffectTexturesBlp { get; init; }
 
     public byte[]? PrecompiledM2 { get; init; }
     public byte[]? PrecompiledBlp { get; init; }

@@ -195,8 +195,8 @@
                 <p>Browse the weapon models of a <strong>TBC (2.4.3) client</strong> and forge them into vanilla
                    items. The TBC mesh and texture pass through the same pipeline as a GLB import: the geometry is
                    re-emitted as a native vanilla M2 on the selected family's donor scaffold (TBC files are v260+,
-                   which the 1.12 client refuses as-is), and the TBC texture is decoded and re-encoded as a vanilla
-                   BLP. Set the <strong>TBC Client Data Path</strong> on the <a href="/Settings">Settings page</a>.</p>
+                   which the 1.12 client refuses as-is), while compatible source BLP2 textures are packaged
+                   byte-for-byte. Set the <strong>TBC Client Data Path</strong> on the <a href="/Settings">Settings page</a>.</p>
                 <div id="tbcState" style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Checking TBC mount…</div>
                 <div class="wf-row">
                     <button class="wf-btn secondary" data-action="tbcBrowse" id="tbcBrowseBtn" disabled>
@@ -211,17 +211,20 @@
                         <input type="text" id="tbcName" placeholder="auto from model"></div>
                 </div>
                 <div class="wf-row" style="margin-top:10px;">
-                    <div class="wf-field wf-slider" title="'keep' preserves the TBC triangle count (still decimates anything above the 1000 M2 ceiling); set a value to decimate to budget">
-                        <label style="min-width:96px;">Target triangles</label>
-                        <input type="range" id="tbcTarget" min="0" max="1000" step="25" value="0">
-                        <span class="val" id="tbcTargetVal">keep</span>
+                    <div class="wf-field" title="TBC fidelity mode preserves the complete source topology and render-pass structure">
+                        <label style="min-width:96px;">Geometry</label>
+                        <input type="hidden" id="tbcTarget" value="0">
+                        <span class="val" id="tbcTargetVal">exact source</span>
                     </div>
                     <button class="wf-btn secondary" data-action="tbcPreview" id="tbcPreviewBtn" disabled>Preview</button>
                     <button class="wf-btn" data-action="tbcForge" id="tbcForgeBtn" disabled>Forge item</button>
                 </div>
                 <div class="wf-note">
                     The forged item gets the chosen family's stats/sheath/sounds; enchant-glow attachment points come
-                    from the vanilla donor scaffold, not the TBC model. Multi-texture TBC models keep their base texture.
+                    from the vanilla donor scaffold, not the TBC model. Source geometry, texture units, wrap flags,
+                    blend modes, overlay order, UV0/UV1, rest-pose transparency, and BLP2 mip data are preserved.
+                    Unsupported color/UV-animation tracks are called out in the diagnostics instead of silently
+                    deleting geometry or substituting a donor material.
                 </div>
             </div>
 
@@ -287,6 +290,7 @@
         import * as THREE from 'three';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { applyBlendSuffix } from '/js/character-viewer/blend-suffix.js';
 
         // ---------- 3D viewer ----------
         const host = document.getElementById('wfViewer');
@@ -330,17 +334,11 @@
             loader.load(url + '?t=' + Date.now(), (gltf) => {
                 if (current) { scene.remove(current); }
                 const model = gltf.scene;
-                // Re-material for readable, lit previews (in-game weapons are unlit; this reveals form).
-                model.traverse((o) => {
-                    if (o.isMesh) {
-                        const map = o.material && o.material.map ? o.material.map : null;
-                        // alphaTest 0.5 mirrors the in-game alpha-key pass for cutout blades;
-                        // harmless for opaque textures (their alpha is 1 everywhere).
-                        o.material = new THREE.MeshStandardMaterial({
-                            map: map, color: map ? 0xffffff : 0xb8bec9, metalness: 0.15, roughness: 0.65,
-                            flatShading: true, side: THREE.DoubleSide, alphaTest: map ? 0.5 : 0 });
-                    }
-                });
+                // Keep the authored glTF material (including its sidedness and alpha mode), then
+                // restore the WoW-only blend/static-alpha state encoded in its material name.
+                // Replacing materials here used to turn every pass into an alpha-keyed,
+                // double-sided opaque surface, hiding culling errors and destroying glow layers.
+                applyBlendSuffix(model);
                 current = model; scene.add(model);
                 frameObject(model);
                 drawGripMarkers();
@@ -555,14 +553,16 @@
                 });
                 const d = await (await fetch('/WeaponForge/TbcPreviewWeapon?' + q)).json();
                 lastGrip = d.grip || null;
+                document.getElementById('tbcForgeBtn').disabled = !d.ok || d.withinForgeBudget === false;
                 setResult({
                     title: d.ok ? `TBC preview — ${d.itemName || tbcSel.name}` : 'TBC preview failed',
                     kv: d.ok ? {
                         'Type': d.weaponTypeLabel || '1H Sword',
                         'Model': d.model,
-                        'Triangles': (d.triangleCount ?? 0).toLocaleString(),
+                        'Triangles': (d.triangleCount ?? 0).toLocaleString() +
+                            (d.withinForgeBudget === false ? ' — OVER vanilla UInt16 limit' : ''),
                         'Vertices': (d.vertexCount ?? 0).toLocaleString(),
-                        'Texture': d.hasTexture ? d.texture : 'MISSING — donor texture will be used',
+                        'Texture': d.hasTexture ? d.texture : 'MISSING — fidelity import stopped',
                     } : undefined,
                     diagnostics: d.diagnostics, note: d.grip && d.grip.note, error: d.error,
                 });
@@ -607,7 +607,7 @@
         function tbcTargetTris() { return +document.getElementById('tbcTarget').value || 0; }
         const tbcTargetEl = document.getElementById('tbcTarget');
         tbcTargetEl.addEventListener('input', () => {
-            document.getElementById('tbcTargetVal').textContent = tbcTargetTris() === 0 ? 'keep' : tbcTargetTris() + ' tris';
+            document.getElementById('tbcTargetVal').textContent = tbcTargetTris() === 0 ? 'exact source' : tbcTargetTris() + ' tris';
             if (tbcSel) { clearTimeout(sliderTimer); sliderTimer = setTimeout(() => actions.tbcPreview(null), 500); }
         });
         document.getElementById('tbcType').addEventListener('change', () => { if (tbcSel) actions.tbcPreview(null); });

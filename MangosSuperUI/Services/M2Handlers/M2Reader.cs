@@ -19,6 +19,14 @@ public class M2Model
     public List<M2Batch> Batches { get; set; } = new();
     public List<M2TextureRef> Textures { get; set; } = new();
     public List<ushort> TextureLookup { get; set; } = new();
+    public List<ushort> TextureCoordinateLookup { get; set; } = new();
+    public List<ushort> TextureTransformLookup { get; set; } = new();
+    public uint ColorTrackCount { get; set; }
+    public uint TextureTransformCount { get; set; }
+    public Dictionary<int, M2RestColor> ReachableRestColors { get; set; } = new();
+    public Dictionary<int, M2RestTextureTransform> ReachableRestTextureTransforms { get; set; } = new();
+    public Dictionary<int, string> RestColorErrors { get; set; } = new();
+    public Dictionary<int, string> RestTextureTransformErrors { get; set; } = new();
 
     // ── Skeleton ─────────────────────────────────────────────────────────────
     public List<M2Bone> Bones { get; set; } = new();
@@ -54,17 +62,27 @@ public class M2Model
     public bool HasSkeleton => Bones.Count > 0;
 
     /// <summary>
-    /// Resolve a batch's "is this drawn at all in idle pose?" alpha.
+    /// Resolve a batch's first texture unit's "is this drawn at all in idle pose?" alpha.
     /// Chain: batch.TextureWeightIndex → TransparencyLookup[idx] →
     ///        TransparencyStaticAlphas[idx]. Any link in the chain
     ///        missing → return 1.0 (fully visible, safe fallback).
     /// </summary>
-    public float GetStaticAlphaForBatch(M2Batch batch)
-    {
-        ushort ti = batch.TextureWeightIndex;
-        if (ti >= TransparencyLookup.Count) return 1.0f;
+    public float GetStaticAlphaForBatch(M2Batch batch) =>
+        GetStaticAlphaForTextureUnit(batch, 0);
 
-        ushort trackIdx = TransparencyLookup[ti];
+    /// <summary>
+    /// Resolve one texture unit's static alpha. Multi-texture batches address
+    /// consecutive transparency-lookup entries starting at TextureWeightIndex.
+    /// Any invalid link returns 1.0 (fully visible, safe fallback).
+    /// </summary>
+    public float GetStaticAlphaForTextureUnit(M2Batch batch, int unit)
+    {
+        if (unit < 0) return 1.0f;
+
+        int lookupIndex = batch.TextureWeightIndex + unit;
+        if ((uint)lookupIndex >= (uint)TransparencyLookup.Count) return 1.0f;
+
+        ushort trackIdx = TransparencyLookup[lookupIndex];
         if (trackIdx >= TransparencyStaticAlphas.Count) return 1.0f;
 
         return TransparencyStaticAlphas[trackIdx];
@@ -116,6 +134,7 @@ public struct M2Vertex
     public float PosX, PosY, PosZ;
     public float NormX, NormY, NormZ;
     public float TexU, TexV;
+    public float TexU2, TexV2;
 
     public byte BoneWeight0, BoneWeight1, BoneWeight2, BoneWeight3;
     public byte BoneIndex0, BoneIndex1, BoneIndex2, BoneIndex3;
@@ -133,7 +152,7 @@ public class M2Submesh
 public class M2Batch
 {
     public byte Flags { get; set; }
-    public byte PriorityPlane { get; set; }
+    public sbyte PriorityPlane { get; set; }
     public ushort ShaderId { get; set; }
     public ushort SubmeshIndex { get; set; }
     public ushort GeosetIndex { get; set; }
@@ -142,8 +161,9 @@ public class M2Batch
     public ushort MaterialLayer { get; set; }
     public ushort TextureCount { get; set; }
     public ushort TextureIndex { get; set; }
-    public ushort TextureTransformIndex { get; set; }
+    public ushort TextureCoordinateIndex { get; set; }
     public ushort TextureWeightIndex { get; set; }
+    public ushort TextureTransformIndex { get; set; }
 }
 
 public class M2TextureRef
@@ -152,6 +172,16 @@ public class M2TextureRef
     public uint Flags { get; set; }
     public string Filename { get; set; } = "";
 }
+
+/// <summary>Deterministic Stand/time-zero sample of a source color record.</summary>
+public sealed record M2RestColor(Vector3 Rgb, float Alpha, bool AnimationFrozen);
+
+/// <summary>Deterministic Stand/time-zero sample of a source UV-transform record.</summary>
+public sealed record M2RestTextureTransform(
+    Vector3 Translation,
+    Quaternion Rotation,
+    Vector3 Scale,
+    bool AnimationFrozen);
 
 /// <summary>
 /// A skeleton joint in the M2 model. 108-byte stride in vanilla 1.12.
@@ -381,9 +411,9 @@ public struct AnimationRange
 /// 0x084  M2Array   renderFlags
 /// 0x08C  M2Array   boneLookup
 /// 0x094  M2Array   textureLookup
-/// 0x09C  M2Array   textureUnits
+/// 0x09C  M2Array   textureCoordinateLookup
 /// 0x0A4  M2Array   transparencyLookup
-/// 0x0AC  M2Array   uvAnimationLookup
+/// 0x0AC  M2Array   textureTransformLookup
 /// 0x0B4..0x0E8  bounding box / collision data (floats)
 /// 0x0EC  M2Array   collisionTriangles
 /// 0x0F4  M2Array   collisionVertices
@@ -463,11 +493,16 @@ public class M2Reader
             // ── Textures + lookups + render flags + transparency ────────────
             ParseTextures(data, ReadUInt32(data, 0x05C), ReadUInt32(data, 0x060), model);
             ParseTextureLookup(data, ReadUInt32(data, 0x094), ReadUInt32(data, 0x098), model);
+            ParseUShortLookup(data, ReadUInt32(data, 0x09C), ReadUInt32(data, 0x0A0),
+                model.TextureCoordinateLookup);
+            ParseUShortLookup(data, ReadUInt32(data, 0x0AC), ReadUInt32(data, 0x0B0),
+                model.TextureTransformLookup);
             ParseRenderFlags(data, ReadUInt32(data, 0x084), ReadUInt32(data, 0x088), model);
             ParseTransparencyStaticAlphas(data,
                 ReadUInt32(data, 0x064), ReadUInt32(data, 0x068), model);
             ParseTransparencyLookup(data,
                 ReadUInt32(data, 0x0A4), ReadUInt32(data, 0x0A8), model);
+            ParseReachableMaterialTracks(data, model);
 
             // ── Attachments ─────────────────────────────────────────────────
             uint nAttachments = ReadUInt32(data, 0x104);
@@ -520,6 +555,8 @@ public class M2Reader
 
             float u = ReadFloat(data, off + 32);
             float v = ReadFloat(data, off + 36);
+            float u2 = ReadFloat(data, off + 40);
+            float v2 = ReadFloat(data, off + 44);
 
             model.Vertices.Add(new M2Vertex
             {
@@ -531,6 +568,8 @@ public class M2Reader
                 NormZ = -ny,
                 TexU = u,
                 TexV = v,
+                TexU2 = u2,
+                TexV2 = v2,
                 BoneWeight0 = bw0,
                 BoneWeight1 = bw1,
                 BoneWeight2 = bw2,
@@ -945,7 +984,7 @@ public class M2Reader
                 model.Batches.Add(new M2Batch
                 {
                     Flags = data[bOff + 0],
-                    PriorityPlane = data[bOff + 1],
+                    PriorityPlane = unchecked((sbyte)data[bOff + 1]),
                     ShaderId = ReadUInt16(data, bOff + 2),
                     SubmeshIndex = ReadUInt16(data, bOff + 4),
                     GeosetIndex = ReadUInt16(data, bOff + 6),
@@ -954,8 +993,9 @@ public class M2Reader
                     MaterialLayer = ReadUInt16(data, bOff + 12),
                     TextureCount = ReadUInt16(data, bOff + 14),
                     TextureIndex = ReadUInt16(data, bOff + 16),
-                    TextureTransformIndex = ReadUInt16(data, bOff + 18),
+                    TextureCoordinateIndex = ReadUInt16(data, bOff + 18),
                     TextureWeightIndex = ReadUInt16(data, bOff + 20),
+                    TextureTransformIndex = ReadUInt16(data, bOff + 22),
                 });
             }
         }
@@ -991,6 +1031,20 @@ public class M2Reader
         if (offset + count * 2 > data.Length) return;
         for (uint i = 0; i < count; i++)
             model.TextureLookup.Add(ReadUInt16(data, (int)(offset + i * 2)));
+    }
+
+    private static void ParseUShortLookup(
+        byte[] data,
+        uint count,
+        uint offset,
+        List<ushort> destination)
+    {
+        if (count == 0 || offset == 0) return;
+        if (offset + count * 2 > data.Length) return;
+
+        destination.Capacity = Math.Max(destination.Capacity, (int)count);
+        for (uint i = 0; i < count; i++)
+            destination.Add(ReadUInt16(data, (int)(offset + i * 2)));
     }
 
     private static void ParseRenderFlags(byte[] data, uint count, uint offset, M2Model model)

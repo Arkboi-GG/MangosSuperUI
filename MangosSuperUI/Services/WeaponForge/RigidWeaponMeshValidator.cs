@@ -67,6 +67,8 @@ public static class RigidWeaponMeshValidator
             d.Error("mesh.array.mismatch", $"Normals length {mesh.Normals.Length} != vertex count {vc}.");
         if (mesh.Uv0.Length != vc)
             d.Error("mesh.array.mismatch", $"Uv0 length {mesh.Uv0.Length} != vertex count {vc}.");
+        if (mesh.Uv1 is { } uv1Array && uv1Array.Length != vc)
+            d.Error("mesh.array.mismatch", $"Uv1 length {uv1Array.Length} != vertex count {vc}.");
         if (mesh.VertexIds is { } ids && ids.Length != vc)
             d.Error("mesh.array.mismatch", $"VertexIds length {ids.Length} != vertex count {vc}.");
 
@@ -81,6 +83,9 @@ public static class RigidWeaponMeshValidator
         // index into them and would throw on a mismatch.
         if (d.HasErrors) return d;
 
+        // ── Optional multi-pass render graph ────────────────────────────────────────────────
+        ValidateRenderGraph(mesh, d, vc, ic);
+
         // ── UInt16-safe global counts (M2 view lookups are uint16) ───────────────────────────
         if (vc > ushort.MaxValue)
         {
@@ -88,6 +93,13 @@ public static class RigidWeaponMeshValidator
                 d.Warn("mesh.count.u16", $"Vertex count {vc} exceeds the UInt16 ceiling {ushort.MaxValue} — decimation required before forging.");
             else
                 d.Error("mesh.count.u16", $"Vertex count {vc} exceeds the UInt16 ceiling {ushort.MaxValue}.");
+        }
+        if (ic > ushort.MaxValue)
+        {
+            if (options.CapacityAsWarnings)
+                d.Warn("mesh.indices.u16", $"Index count {ic} exceeds the UInt16 ceiling {ushort.MaxValue} — decimation required before forging.");
+            else
+                d.Error("mesh.indices.u16", $"Index count {ic} exceeds the UInt16 ceiling {ushort.MaxValue}.");
         }
 
         // ── Finite positions / normals / UV0; non-zero normals ───────────────────────────────
@@ -107,9 +119,17 @@ public static class RigidWeaponMeshValidator
             var uv = mesh.Uv0[i];
             if (!float.IsFinite(uv.X) || !float.IsFinite(uv.Y))
                 d.Error("mesh.uv.nonfinite", $"Vertex {i} UV0 is not finite.");
-            else if (uv.X < -options.UvEpsilon || uv.X > 1f + options.UvEpsilon ||
-                     uv.Y < -options.UvEpsilon || uv.Y > 1f + options.UvEpsilon)
+            else if (mesh.Passes is null &&
+                    (uv.X < -options.UvEpsilon || uv.X > 1f + options.UvEpsilon ||
+                     uv.Y < -options.UvEpsilon || uv.Y > 1f + options.UvEpsilon))
                 d.Error("mesh.uv.range", $"Vertex {i} UV0 {uv} is outside the [0,1] policy.");
+
+            if (mesh.Uv1 is { } secondaryUvs)
+            {
+                var uvSecondary = secondaryUvs[i];
+                if (!float.IsFinite(uvSecondary.X) || !float.IsFinite(uvSecondary.Y))
+                    d.Error("mesh.uv1.nonfinite", $"Vertex {i} UV1 is not finite.");
+            }
         }
 
         // ── Index range + degenerate triangles ───────────────────────────────────────────────
@@ -148,6 +168,193 @@ public static class RigidWeaponMeshValidator
         d.Info("mesh.uv.overlap.skipped", "UV island overlap/guttering analysis not yet implemented; not validated.");
 
         return d;
+    }
+
+    private static void ValidateRenderGraph(RigidWeaponMesh mesh, ForgeDiagnostics d, int vc, int ic)
+    {
+        bool rangesSpecified = mesh.SubmeshRanges is not null;
+        bool passesSpecified = mesh.Passes is not null;
+        if (rangesSpecified != passesSpecified)
+        {
+            d.Error("mesh.rendergraph.pair",
+                "SubmeshRanges and Passes must either both be absent or both be present.");
+            return;
+        }
+        if (!rangesSpecified) return;
+
+        var ranges = mesh.SubmeshRanges!;
+        var passes = mesh.Passes!;
+        if (ranges.Count == 0 || passes.Count == 0)
+        {
+            d.Error("mesh.rendergraph.empty",
+                "A multi-pass render graph requires at least one submesh range and one pass.");
+            return;
+        }
+
+        var validRanges = new bool[ranges.Count];
+        var indexSpans = new List<(int Start, int End, int Slot)>(ranges.Count);
+        for (int slot = 0; slot < ranges.Count; slot++)
+        {
+            var range = ranges[slot];
+            if (range is null)
+            {
+                d.Error("mesh.submesh.null", $"Submesh range {slot} is null.");
+                continue;
+            }
+
+            bool valid = true;
+            if (range.IndexStart < 0 || range.IndexCount <= 0 ||
+                range.IndexStart % 3 != 0 || range.IndexCount % 3 != 0)
+            {
+                d.Error("mesh.submesh.indices",
+                    $"Submesh {slot} index range must have a non-negative triangle-aligned start and a positive triangle-aligned count; got start {range.IndexStart}, count {range.IndexCount}.");
+                valid = false;
+            }
+            long indexEnd = (long)range.IndexStart + range.IndexCount;
+            if (range.IndexStart < 0 || indexEnd > ic)
+            {
+                d.Error("mesh.submesh.indexrange",
+                    $"Submesh {slot} index span [{range.IndexStart},{indexEnd}) exceeds index count {ic}.");
+                valid = false;
+            }
+
+            long vertexEnd = (long)range.VertexStart + range.VertexCount;
+            if (range.VertexStart < 0 || range.VertexCount <= 0 || vertexEnd > vc)
+            {
+                d.Error("mesh.submesh.vertexrange",
+                    $"Submesh {slot} vertex span [{range.VertexStart},{vertexEnd}) is outside vertex count {vc}.");
+                valid = false;
+            }
+
+            if (!valid) continue;
+            validRanges[slot] = true;
+            indexSpans.Add((range.IndexStart, checked((int)indexEnd), slot));
+
+            for (int i = range.IndexStart; i < indexEnd; i++)
+            {
+                uint index = mesh.Indices[i];
+                if (index < range.VertexStart || index >= vertexEnd)
+                {
+                    d.Error("mesh.submesh.vertexmembership",
+                        $"Submesh {slot} index {i} resolves vertex {index}, outside its declared vertex span [{range.VertexStart},{vertexEnd}).");
+                    break;
+                }
+            }
+        }
+
+        // The render-graph contract partitions the flat triangle list into submesh-contiguous
+        // spans. Gaps would never be rendered; overlaps duplicate geometry unexpectedly.
+        indexSpans.Sort((a, b) => a.Start.CompareTo(b.Start));
+        int expectedStart = 0;
+        foreach (var span in indexSpans)
+        {
+            if (span.Start != expectedStart)
+            {
+                string problem = span.Start < expectedStart ? "overlaps a previous span" : "leaves an uncovered gap";
+                d.Error("mesh.submesh.partition",
+                    $"Submesh {span.Slot} starts at index {span.Start} and {problem}; expected {expectedStart}.");
+            }
+            expectedStart = Math.Max(expectedStart, span.End);
+        }
+        if (expectedStart != ic)
+            d.Error("mesh.submesh.partition",
+                $"Submesh ranges cover indices through {expectedStart}, but the mesh has {ic} indices.");
+
+        var referencedSubmeshes = new bool[ranges.Count];
+        var referencedTextureSlots = new HashSet<int>();
+        long totalBindings = 0;
+        for (int passIndex = 0; passIndex < passes.Count; passIndex++)
+        {
+            var pass = passes[passIndex];
+            if (pass is null)
+            {
+                d.Error("mesh.pass.null", $"Pass {passIndex} is null.");
+                continue;
+            }
+
+            if (pass.SubmeshSlot < 0 || pass.SubmeshSlot >= ranges.Count)
+                d.Error("mesh.pass.submesh",
+                    $"Pass {passIndex} references submesh slot {pass.SubmeshSlot}, count {ranges.Count}.");
+            else
+                referencedSubmeshes[pass.SubmeshSlot] = true;
+
+            if (pass.Layer < 0 || pass.Layer > ushort.MaxValue)
+                d.Error("mesh.pass.layer",
+                    $"Pass {passIndex} layer {pass.Layer} is outside the UInt16 range 0..{ushort.MaxValue}.");
+
+            if (pass.TextureBindings is { } bindings)
+            {
+                if (bindings.Count == 0)
+                {
+                    d.Error("mesh.pass.bindings", $"Pass {passIndex} has an empty texture-binding list.");
+                    continue;
+                }
+                if (bindings.Count > ushort.MaxValue)
+                    d.Error("mesh.pass.bindings",
+                        $"Pass {passIndex} has {bindings.Count} texture bindings, exceeding {ushort.MaxValue}.");
+
+                totalBindings += bindings.Count;
+                for (int bindingIndex = 0; bindingIndex < bindings.Count; bindingIndex++)
+                {
+                    var binding = bindings[bindingIndex];
+                    if (binding is null)
+                    {
+                        d.Error("mesh.binding.null",
+                            $"Pass {passIndex} texture binding {bindingIndex} is null.");
+                        continue;
+                    }
+                    ValidateTextureSlot(binding.TextureSlot,
+                        $"Pass {passIndex} texture binding {bindingIndex}");
+                    if (!float.IsFinite(binding.StaticAlpha) ||
+                        binding.StaticAlpha < 0f || binding.StaticAlpha > 1f)
+                        d.Error("mesh.binding.alpha",
+                            $"Pass {passIndex} texture binding {bindingIndex} static alpha {binding.StaticAlpha} is not finite within [0,1].");
+                }
+
+                if (bindings[0] is { } primary && pass.TextureSlot != primary.TextureSlot)
+                    d.Error("mesh.pass.primarytexture",
+                        $"Pass {passIndex} primary TextureSlot {pass.TextureSlot} does not match its first binding slot {primary.TextureSlot}.");
+            }
+            else
+            {
+                totalBindings++;
+                ValidateTextureSlot(pass.TextureSlot, $"Pass {passIndex}");
+            }
+        }
+
+        if (totalBindings > ushort.MaxValue)
+            d.Error("mesh.binding.count",
+                $"Render graph has {totalBindings} texture bindings, exceeding the UInt16 combo-table limit {ushort.MaxValue}.");
+
+        for (int slot = 0; slot < referencedSubmeshes.Length; slot++)
+            if (validRanges[slot] && !referencedSubmeshes[slot])
+                d.Error("mesh.submesh.unused", $"Submesh range {slot} is not referenced by any pass.");
+
+        if (mesh.TextureSlots is { } textureSlots)
+        {
+            if (textureSlots.Count == 0)
+                d.Error("mesh.textures.empty", "TextureSlots is present but empty.");
+            for (int slot = 0; slot < textureSlots.Count; slot++)
+            {
+                if (textureSlots[slot] is null)
+                    d.Error("mesh.texture.null", $"Texture slot metadata {slot} is null.");
+                if (!referencedTextureSlots.Contains(slot))
+                    d.Error("mesh.texture.unused", $"Texture slot metadata {slot} is not referenced by any pass.");
+            }
+        }
+
+        void ValidateTextureSlot(int textureSlot, string label)
+        {
+            if (textureSlot < 0)
+            {
+                d.Error("mesh.texture.slot", $"{label} references negative texture slot {textureSlot}.");
+                return;
+            }
+            referencedTextureSlots.Add(textureSlot);
+            if (mesh.TextureSlots is { } slots && textureSlot >= slots.Count)
+                d.Error("mesh.texture.slot",
+                    $"{label} references texture slot {textureSlot}, but metadata count is {slots.Count}.");
+        }
     }
 
     private static void ValidateOrientation(RigidWeaponMesh mesh, MeshValidationOptions options, ForgeDiagnostics d)

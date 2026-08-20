@@ -5,7 +5,7 @@
 > **For AI assistants helping with installation:** This guide was written with hard-won gotchas from real deployments. Every warning box exists because someone hit that exact problem. Pay special attention to the ⚠️ blocks — they document SuperUI-Core-specific quirks that aren't documented anywhere else. If a user reports "RA authentication always fails", check for `Ra.MinLevel = 3` in mangosd.conf FIRST — it's the cause 90% of the time.
 
 > **Database:** SuperUI-Core works with MySQL 5.5+ or MariaDB 10.x+. Most Linux installs use MariaDB. MangosSuperUI uses the `MySqlConnector` .NET library which speaks the same wire protocol to either.
->
+> 
 > **Compatibility names:** Internal settings and database identifiers such as `Vmangos:*` and `vmangos_admin`, plus existing `/vmangos/` directory examples, are legacy application names. Keep them unchanged when following this guide.
 
 ---
@@ -14,6 +14,9 @@
 
 These steps prepare your SuperUI-Core server for MangosSuperUI. Complete them in order.
 
+
+**PLEASE BE AWARE THAT THIS SETUP IS VALID AND TESTED FOR LINUX ONLY. YOU  CAN USE WSL ON WINDOWS (IT'S FREE, YOU RUN IT FROM POWERSHELL) - IT'S JUST A BIT MORE PAINFUL TO SETUP THE CONNECTIONS. MY RECOMMANDATION IS THAT YOU RUN THIS ON A SEPARATE PHYSICAL MACHINE AND PICK SOMETHING LIKE UBUNTU LTS OR LINT (THESE ARE LINUX OPERATING SYSTEMS.**
+
 ---
 
 ### Step 1: Identify Your SuperUI-Core Paths
@@ -21,35 +24,40 @@ These steps prepare your SuperUI-Core server for MangosSuperUI. Complete them in
 You need to know where your SuperUI-Core installation lives. Run these commands and note the results.
 
 **Find your mangosd.conf:**
+
 ```bash
 find / -name "mangosd.conf" 2>/dev/null
 ```
 
 **Find your binary directory:**
+
 ```bash
 find / -name "mangosd" -type f -executable 2>/dev/null
 ```
+
 > You may see multiple results (e.g. one in `build/` and one in `run/bin/`). You want the one in your **runtime** directory — typically something like `/home/YOU/vmangos/run/bin/`, NOT the one inside a `build/` directory.
 
 **Find your realmd binary name:**
+
 ```bash
 ls YOUR_BIN_DIRECTORY/ | grep realmd
 ```
 
 **Note your OS username:**
+
 ```bash
 whoami
 ```
 
 Write down these values — you'll use them throughout this guide:
 
-| Item | Your Value |
-|------|-----------|
-| OS Username | ______________ |
-| mangosd.conf path | ______________ |
+| Item                            | Your Value     |
+| ------------------------------- | -------------- |
+| OS Username                     | ______________ |
+| mangosd.conf path               | ______________ |
 | Binary directory (the run/ one) | ______________ |
-| mangosd binary name | ______________ |
-| realmd binary name | ______________ |
+| mangosd binary name             | ______________ |
+| realmd binary name              | ______________ |
 
 ---
 
@@ -72,6 +80,7 @@ Note the exact filenames — you'll need them for the systemd service files.
 MangosSuperUI communicates with mangosd through the Remote Access (RA) TCP interface. You must enable it.
 
 **Open mangosd.conf:**
+
 ```bash
 nano YOUR_MANGOSD_CONF_PATH
 ```
@@ -81,12 +90,14 @@ nano YOUR_MANGOSD_CONF_PATH
 > **Note:** The first match will likely land you in a block of **comments** (lines starting with `#`, shown in blue text in nano). These are documentation lines, not the actual settings. Press `Ctrl+W` again and hit Enter to search forward — keep searching until you find the **uncommented** lines that look like `Ra.Enable = 0` (no `#` at the start).
 
 **Set these values:**
+
 ```
 Ra.Enable = 1
 Ra.Restricted = 0
 ```
 
 **CRITICAL — Add a new line** directly after `Ra.Restricted`. Type this exactly (it does not exist in the default config file but is required by the SuperUI-Core source code):
+
 ```
 Ra.MinLevel = 3
 ```
@@ -96,11 +107,13 @@ Ra.MinLevel = 3
 **Save and exit:** `Ctrl+O`, Enter, `Ctrl+X`.
 
 **Verify your changes:**
+
 ```bash
 grep -E "^Ra\." YOUR_MANGOSD_CONF_PATH
 ```
 
 Expected output:
+
 ```
 Ra.Enable = 1
 Ra.IP = 0.0.0.0
@@ -121,6 +134,7 @@ SuperUI-Core needs to run as system services so MangosSuperUI can start/stop/res
 **Create the mangosd service:**
 
 Before pasting, replace the four placeholders below with your values from Step 1:
+
 - `YOUR_USERNAME` → your OS username
 - `YOUR_BIN_DIRECTORY` → your binary directory path (two occurrences)
 - `YOUR_MANGOSD_BINARY` → your mangosd binary name
@@ -150,6 +164,7 @@ EOF
 > This command produces no output on success. That's normal.
 
 **Verify it wrote correctly:**
+
 ```bash
 cat /etc/systemd/system/mangosd.service
 ```
@@ -181,11 +196,13 @@ EOF
 ```
 
 **Verify:**
+
 ```bash
 cat /etc/systemd/system/realmd.service
 ```
 
 **Enable the services:**
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable mangosd realmd
@@ -200,11 +217,13 @@ sudo systemctl enable mangosd realmd
 MangosSuperUI needs a game account with GM level 6 to authenticate with RA. Level 6 is the highest GM level in SuperUI-Core and ensures full access to all RA commands. This account **must** be created through the mangosd console — creating accounts via raw SQL does not generate the required password hash (SRP6) and RA authentication will always fail.
 
 **Install screen** (if not already installed):
+
 ```bash
 sudo apt install screen -y
 ```
 
 **Start a screen session:**
+
 ```bash
 screen -S mangosd-setup
 ```
@@ -212,6 +231,7 @@ screen -S mangosd-setup
 This drops you into a new shell inside screen.
 
 **Start mangosd manually:**
+
 ```bash
 cd YOUR_BIN_DIRECTORY && ./YOUR_MANGOSD_BINARY
 ```
@@ -219,11 +239,13 @@ cd YOUR_BIN_DIRECTORY && ./YOUR_MANGOSD_BINARY
 **Wait for the `mangos>` prompt to appear** (approximately 10-15 seconds). You will see loading messages scroll by.
 
 **Create the account — pick a username and password and write them down:**
+
 ```
 .account create YOUR_RA_USERNAME YOUR_RA_PASSWORD
 ```
 
 **Set GM level:**
+
 ```
 .account set gmlevel YOUR_RA_USERNAME 6
 ```
@@ -231,6 +253,7 @@ cd YOUR_BIN_DIRECTORY && ./YOUR_MANGOSD_BINARY
 > **Write down the RA username and password now.** You will need them during the setup script in Part 2. These are the only values the setup script cannot auto-discover.
 
 **Shut down mangosd cleanly:**
+
 ```
 .server shutdown 0
 ```
@@ -238,6 +261,7 @@ cd YOUR_BIN_DIRECTORY && ./YOUR_MANGOSD_BINARY
 **Wait for mangosd to fully shut down** (you'll see "Halting process..." messages and eventually return to a shell prompt).
 
 **Exit the screen session:**
+
 ```
 exit
 ```
@@ -277,6 +301,7 @@ telnet 127.0.0.1 3443
 ```
 
 You should see:
+
 ```
 Welcome to World of Warcraft!
 Patch 1.12: Drums of War is now live!
@@ -300,6 +325,7 @@ sudo visudo -f /etc/sudoers.d/mangossuperui
 ```
 
 This opens an editor. Paste this single line (replace `YOUR_USERNAME` with your OS username):
+
 ```
 YOUR_USERNAME ALL=(ALL) NOPASSWD: /usr/bin/systemctl start mangosd, /usr/bin/systemctl stop mangosd, /usr/bin/systemctl restart mangosd, /usr/bin/systemctl start realmd, /usr/bin/systemctl stop realmd, /usr/bin/systemctl restart realmd, /usr/bin/systemctl status mangosd, /usr/bin/systemctl status realmd
 ```
@@ -307,6 +333,7 @@ YOUR_USERNAME ALL=(ALL) NOPASSWD: /usr/bin/systemctl start mangosd, /usr/bin/sys
 **Save and exit:** `Ctrl+X`, then Enter.
 
 **Verify:**
+
 ```bash
 sudo cat /etc/sudoers.d/mangossuperui
 ```
@@ -336,6 +363,7 @@ sudo cat /etc/sudoers.d/mangossuperui
 ```
 
 You should see:
+
 - Both services `active (running)`
 - Your RA account with gmlevel 6
 - The sudoers line with your username
@@ -355,11 +383,13 @@ These steps install MangosSuperUI itself and get the dashboard green.
 MangosSuperUI is an ASP.NET Core 8.0 application. You need the ASP.NET Core runtime (not the full SDK) to run a pre-built release. You also need `curl` and `unzip` for later steps.
 
 **Install curl and unzip:**
+
 ```bash
 sudo apt install curl unzip -y
 ```
 
 **Add the Microsoft package repository:**
+
 ```bash
 wget https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb -O packages-microsoft-prod.deb
 sudo dpkg -i packages-microsoft-prod.deb
@@ -367,6 +397,7 @@ rm packages-microsoft-prod.deb
 ```
 
 **Install the ASP.NET Core 8.0 runtime:**
+
 ```bash
 sudo apt update
 sudo apt install aspnetcore-runtime-8.0 -y
@@ -375,6 +406,7 @@ sudo apt install aspnetcore-runtime-8.0 -y
 > If you want to build from source on the server instead of deploying a pre-built release, install `dotnet-sdk-8.0` instead. The SDK includes the runtime.
 
 **Verify:**
+
 ```bash
 dotnet --list-runtimes | grep AspNetCore
 ```
@@ -388,6 +420,7 @@ You should see a line containing `Microsoft.AspNetCore.App 8.0.x`.
 There are two ways to get MangosSuperUI onto your server. Pick whichever suits you.
 
 **First, create the install directory:**
+
 ```bash
 sudo mkdir -p /opt/mangossuperui
 ```
@@ -403,13 +436,14 @@ cd /tmp
 wget https://github.com/Yafrovon/MangosSuperUI/releases/latest/download/MangosSuperUI-linux-x64.zip
 ```
 
-
 Extract it to the install directory:
+
 ```bash
 sudo unzip MangosSuperUI-linux-x64.zip -d /opt/mangossuperui
 ```
 
 Set ownership to your user:
+
 ```bash
 sudo chown -R YOUR_USERNAME:YOUR_USERNAME /opt/mangossuperui
 ```
@@ -426,6 +460,7 @@ dotnet publish -c Release -o /tmp/mangossuperui-publish
 ```
 
 Copy the published output to the install directory:
+
 ```bash
 sudo cp -r /tmp/mangossuperui-publish/* /opt/mangossuperui/
 sudo chown -R YOUR_USERNAME:YOUR_USERNAME /opt/mangossuperui
@@ -469,6 +504,7 @@ EOF
 ```
 
 **Enable the service (but do NOT start it yet):**
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable mangossuperui
@@ -489,13 +525,15 @@ sudo mysql -e "CREATE DATABASE IF NOT EXISTS vmangos_admin; GRANT ALL PRIVILEGES
 ```
 
 > If your SuperUI-Core installation uses a different database username or host, adjust the command accordingly. For example, if your database user is `vmangos` instead of `mangos`:
+> 
 > ```bash
 > sudo mysql -e "CREATE DATABASE IF NOT EXISTS vmangos_admin; GRANT ALL PRIVILEGES ON vmangos_admin.* TO 'vmangos'@'localhost'; FLUSH PRIVILEGES;"
 > ```
->
+> 
 > The username and host must match what's in your `mangosd.conf` database connection lines (e.g. `WorldDatabase.Info = "127.0.0.1;3306;mangos;mangos;mangos"` — the third field is the username).
 
 **Verify the database exists and the grant works:**
+
 ```bash
 mysql -u mangos -pmangos -e "USE vmangos_admin; SELECT 'OK';"
 ```
@@ -511,13 +549,14 @@ You should see `OK`. If you get "Access denied", double-check the username and r
 MangosSuperUI needs a `server-config.json` file that tells it how to connect to your databases, where your SuperUI-Core files are, and your RA credentials. Rather than filling this out manually, the setup script auto-discovers everything from your `mangosd.conf`.
 
 **Download the setup script:**
+
 ```bash
 cd ~
 wget https://github.com/Yafrovon/MangosSuperUI/releases/latest/download/setup-mangossuperui.sh
 ```
 
-
 **Run it:**
+
 ```bash
 sudo bash ~/setup-mangossuperui.sh
 ```
@@ -541,6 +580,7 @@ The script will:
 8. **Start MangosSuperUI** — starts (or restarts) the service so the new configuration takes effect. This is the first real boot.
 
 **Example output from a successful run:**
+
 ```
 Step 1: Locating mangosd.conf
   ✓ Found: /home/nicholas/vmangos/run/etc/mangosd.conf
@@ -630,11 +670,13 @@ If you see all green checkmarks and the summary looks correct, you're done with 
 ### Step 14: Verify the Dashboard
 
 Open your browser and navigate to:
+
 ```
 http://YOUR_SERVER_IP:5000
 ```
 
 The Dashboard should show:
+
 - **mangosd**: green (running)
 - **realmd**: green (running)
 - **RA**: green (connected)
@@ -653,6 +695,7 @@ The Diagnose feature checks: configuration status, process detection (configured
 > **First-run auto-detect:** If all three indicators (mangosd, realmd, RA) are down on first load, the Dashboard auto-runs Diagnose and shows a setup banner.
 
 > **If the Admin database shows red** with "Access denied for user 'mangos'@'localhost' to database 'vmangos_admin'", the database permissions from Step 12 didn't take effect. Re-run the grant command and restart MangosSuperUI:
+> 
 > ```bash
 > sudo mysql -e "CREATE DATABASE IF NOT EXISTS vmangos_admin; GRANT ALL PRIVILEGES ON vmangos_admin.* TO 'mangos'@'localhost'; FLUSH PRIVILEGES;"
 > sudo systemctl restart mangossuperui
@@ -676,32 +719,34 @@ The setup script reads these from your `mangosd.conf` database lines (e.g. `Worl
 
 TCP connection to mangosd's RA console. The setup script reads the port from `Ra.Port` in `mangosd.conf` and uses `127.0.0.1` as the host (assumes MangosSuperUI runs on the same machine as mangosd).
 
-| Field | What It Is |
-|-------|------------|
-| Host | IP address of the machine running mangosd |
-| Port | RA port (default `3443`, read from `Ra.Port` in mangosd.conf) |
-| Username | The RA account created in Part 1, Step 5 |
-| Password | The RA account password |
-| Timeout (ms) | How long to wait for RA command responses (default `5000`) |
+| Field        | What It Is                                                    |
+| ------------ | ------------------------------------------------------------- |
+| Host         | IP address of the machine running mangosd                     |
+| Port         | RA port (default `3443`, read from `Ra.Port` in mangosd.conf) |
+| Username     | The RA account created in Part 1, Step 5                      |
+| Password     | The RA account password                                       |
+| Timeout (ms) | How long to wait for RA command responses (default `5000`)    |
 
 #### SuperUI-Core Paths & Processes
 
 Where your SuperUI-Core installation lives on the filesystem. The setup script discovers all of these automatically.
 
-| Field | Example | What It's For |
-|-------|---------|---------------|
-| Bin Directory | `/home/YOU/vmangos/run/bin` | Location of the mangosd/realmd binaries |
-| Log Directory | `/home/YOU/vmangos/run/bin` | Live Logs page reads `.log` files from here |
-| Config Directory | `/home/YOU/vmangos/run/etc` | Directory containing `mangosd.conf` |
-| World Server Process Name | `mangosd` or `mangosd-main` | The process name as the OS sees it — used for status detection |
-| Auth Server Process Name | `realmd` or `realmd-main` | Same as above, for the auth server |
-| mangosd.conf Path | `/home/YOU/vmangos/run/etc/mangosd.conf` | Full path — used by the Config Editor page |
-| Server Logs Directory | `/home/YOU/vmangos/run/bin` | Used by the Live Logs page for real-time log tailing |
+| Field                     | Example                                  | What It's For                                                  |
+| ------------------------- | ---------------------------------------- | -------------------------------------------------------------- |
+| Bin Directory             | `/home/YOU/vmangos/run/bin`              | Location of the mangosd/realmd binaries                        |
+| Log Directory             | `/home/YOU/vmangos/run/bin`              | Live Logs page reads `.log` files from here                    |
+| Config Directory          | `/home/YOU/vmangos/run/etc`              | Directory containing `mangosd.conf`                            |
+| World Server Process Name | `mangosd` or `mangosd-main`              | The process name as the OS sees it — used for status detection |
+| Auth Server Process Name  | `realmd` or `realmd-main`                | Same as above, for the auth server                             |
+| mangosd.conf Path         | `/home/YOU/vmangos/run/etc/mangosd.conf` | Full path — used by the Config Editor page                     |
+| Server Logs Directory     | `/home/YOU/vmangos/run/bin`              | Used by the Live Logs page for real-time log tailing           |
 
 > **Finding your process names:** If you need to check what your binaries register as, run this while the server is running:
+> 
 > ```bash
 > cat /proc/$(pgrep -f mangosd)/comm
 > ```
+> 
 > As of v1.1, MangosSuperUI auto-scans `/proc` as a 3-strategy fallback if the configured name doesn't match. But setting the correct name avoids the 30-second scan cache delay.
 
 #### DBC Data Files
@@ -728,13 +773,13 @@ The URL MangosSuperUI listens on. Default: `http://0.0.0.0:5000` (all network in
 
 These paths are only needed if you use the Spell Creator or 3D World Viewer features. Configure them in Settings after completing Part 4.
 
-| Field | Example | What It's For |
-|-------|---------|---------------|
-| Pre-extracted M2 Files | `/home/YOU/wowclient/m2` | Spell particle M2 models for the Spell Creator |
-| Client Data Directory | `/home/YOU/wowclient/Data` | WoW 1.12.1 MPQ archives for WorldViewer terrain/WMO rendering |
-| Patch Output Directory | `/opt/mangossuperui/wwwroot/patches` | Where patch-3.MPQ (Spell Creator) and patch-Z.MPQ (WorldViewer) are built |
-| Vanilla BLP Directory | `/home/YOU/wowclient/rawblps/m2_blps` | Extracted vanilla BLP headers for texture format matching |
-| Spell Creator Data | `/opt/mangossuperui/data` | Contains `m2_texture_graph.json` and `blp_to_m2_reverse.json` |
+| Field                  | Example                               | What It's For                                                             |
+| ---------------------- | ------------------------------------- | ------------------------------------------------------------------------- |
+| Pre-extracted M2 Files | `/home/YOU/wowclient/m2`              | Spell particle M2 models for the Spell Creator                            |
+| Client Data Directory  | `/home/YOU/wowclient/Data`            | WoW 1.12.1 MPQ archives for WorldViewer terrain/WMO rendering             |
+| Patch Output Directory | `/opt/mangossuperui/wwwroot/patches`  | Where patch-3.MPQ (Spell Creator) and patch-Z.MPQ (WorldViewer) are built |
+| Vanilla BLP Directory  | `/home/YOU/wowclient/rawblps/m2_blps` | Extracted vanilla BLP headers for texture format matching                 |
+| Spell Creator Data     | `/opt/mangossuperui/data`             | Contains `m2_texture_graph.json` and `blp_to_m2_reverse.json`             |
 
 ---
 
@@ -742,12 +787,12 @@ These paths are only needed if you use the Spell Creator or 3D World Viewer feat
 
 MangosSuperUI does **not** require any pre-extracted assets. Icons, 3D models (items, game objects), and minimap tiles are all read directly from the WoW 1.12.1 client's MPQ archives at request time:
 
-| Asset | Source | Served Via |
-|-------|--------|-----------|
-| Item & spell icons | `Interface\Icons\*.blp` in the MPQs | `/Icon/Get` (decoded to PNG in memory) |
-| Item 3D models | M2 + BLP from the MPQs | Generated GLB, cached in `wwwroot/item_models/` |
-| Game object 3D models | M2/WMO + BLP from the MPQs | Generated GLB, cached in `wwwroot/models/` |
-| Minimap tiles | `textures\Minimap\` in the MPQs | `/WorldMap/Tile` (decoded PNG, cached in `wwwroot/minimap/`) |
+| Asset                 | Source                              | Served Via                                                   |
+| --------------------- | ----------------------------------- | ------------------------------------------------------------ |
+| Item & spell icons    | `Interface\Icons\*.blp` in the MPQs | `/Icon/Get` (decoded to PNG in memory)                       |
+| Item 3D models        | M2 + BLP from the MPQs              | Generated GLB, cached in `wwwroot/item_models/`              |
+| Game object 3D models | M2/WMO + BLP from the MPQs          | Generated GLB, cached in `wwwroot/models/`                   |
+| Minimap tiles         | `textures\Minimap\` in the MPQs     | `/WorldMap/Tile` (decoded PNG, cached in `wwwroot/minimap/`) |
 
 The only requirement is **Vmangos:ClientDataPath** pointing at the client's `Data/` directory (see Part 3). The `wwwroot` caches are created and version-swept automatically — never populate them by hand.
 
@@ -766,6 +811,7 @@ nano ~/deploy-ui.sh
 ```
 
 Paste:
+
 ```bash
 #!/bin/bash
 echo "Stopping MangosSuperUI..."
@@ -787,12 +833,14 @@ chmod +x ~/deploy-ui.sh
 ```
 
 **Usage from your development machine (Windows PowerShell):**
+
 ```powershell
 # After publishing in Visual Studio (Release → Publish)
 scp -r bin/Release/net8.0/publish/* YOUR_USERNAME@YOUR_SERVER_IP:/tmp/mangossuperui-deploy/
 ```
 
 **Then SSH into the server:**
+
 ```bash
 ~/deploy-ui.sh
 ```
@@ -810,6 +858,7 @@ sudo systemctl status mangossuperui --no-pager | head -3
 ```
 
 Open the Dashboard in your browser at `http://YOUR_SERVER_IP:5000` and confirm:
+
 - mangosd: green (running)
 - realmd: green (running)
 - RA: green (connected)
@@ -839,6 +888,7 @@ Open the **Dashboard → Diagnostics** panel:
 - **Icon Loader (on-demand)** — should be green (the server test-decodes an icon straight from the MPQs).
 
 **Spot-check in the browser:**
+
 - **Icons:** Open the Items page, search for any item — icons should appear next to item names.
 - **Game Object models:** Open the Game Objects page, click any object — the 3D model generates on first view.
 - **Item models:** Open the Items page, click an item with a weapon/armor model — same.
@@ -851,33 +901,41 @@ Generated models and tiles are cached under `wwwroot/` after first request, so r
 ## Troubleshooting
 
 ### RA authentication always fails
+
 - **Most common cause:** `Ra.MinLevel = 3` is missing from `mangosd.conf`. The default config file does NOT include this setting, but the SuperUI-Core source code requires it. Add it and restart mangosd.
 - **Second most common cause:** Account was created via raw SQL INSERT instead of `.account create` in the mangosd console. The SRP6 password hash is not generated by SQL — delete the account and recreate it through the console.
 
 ### mangosd starts then immediately stops as a systemd service
+
 - The service file needs `StandardInput=tty-force` and `TTYPath=/dev/tty20`. Without this, mangosd receives EOF on stdin and interprets it as a shutdown command.
 
 ### "Connection refused" on telnet to port 3443
+
 - mangosd may still be loading (takes 10-15 seconds). Wait and try again.
 - Check that `Ra.Enable = 1` is set in mangosd.conf.
 - Check that mangosd is actually running: `sudo systemctl status mangosd`
 
 ### Terminal looks garbled after exiting screen
+
 - This is normal. Close your terminal window and reconnect via SSH.
 
 ### MangosSuperUI won't start / port 5000 connection refused
+
 - Check the service status: `sudo systemctl status mangossuperui --no-pager`
 - Check the journal for errors: `sudo journalctl -u mangossuperui --no-pager -n 50`
 - If you see `Unable to bind to address`, something else is using port 5000. Change the Kestrel listen URL in Settings or in `appsettings.json` directly and restart.
 - If you see DBC-related errors on first start, verify your DBC path is correct in Settings. The app will still start without DBC files — those errors are warnings, not fatal.
 
 ### MangosSuperUI crashes on startup after running the setup script
+
 - The setup script may have written invalid values into `server-config.json`. Check the file: `cat /opt/mangossuperui/server-config.json`
 - If the connection string values contain warning messages instead of actual connection strings (e.g. "not found in mangosd.conf"), the script failed to parse your `mangosd.conf`. Delete the config and try again: `sudo rm /opt/mangossuperui/server-config.json && sudo systemctl restart mangossuperui`
 - You can also configure everything manually through the Settings page in the web interface instead of using the setup script.
 
 ### Dashboard shows "Access denied" for vmangos_admin database
+
 - The SuperUI-Core database user does not have permission to access the `vmangos_admin` database. Run the grant command from Step 12:
+  
   ```bash
   sudo mysql -e "CREATE DATABASE IF NOT EXISTS vmangos_admin; GRANT ALL PRIVILEGES ON vmangos_admin.* TO 'mangos'@'localhost'; FLUSH PRIVILEGES;"
   ```
@@ -885,40 +943,50 @@ Generated models and tiles are cached under `wwwroot/` after first request, so r
 - After granting permissions, restart MangosSuperUI: `sudo systemctl restart mangossuperui`
 
 ### Dashboard shows databases as red/unreachable
+
 - Verify MariaDB/MySQL is running: `sudo systemctl status mariadb` or `sudo systemctl status mysql`
 - Verify the connection strings in Settings match your database server address, port, username, and password.
 - If MangosSuperUI is on a different machine than the database, ensure the database user has remote access privileges.
 
 ### Dashboard shows RA as red but databases are green
+
 - mangosd may not be running. Check: `sudo systemctl status mangosd`
 - The RA username or password in Settings may be wrong. Double-check against what you created in Step 5.
 - If mangosd is running but RA still won't connect, verify `Ra.Enable = 1` and `Ra.MinLevel = 3` in `mangosd.conf` and restart mangosd.
 
 ### DBC Reload shows zero records
+
 - The DBC path in Settings is wrong or the directory is empty. Verify the path contains `.dbc` files: `ls YOUR_DBC_PATH/*.dbc | head`
 - The DBC files must be the 1.12.1 (build 5875) versions. Other client versions will fail to parse or show incorrect data.
 
 ### Settings changes don't take effect
+
 - Most settings apply immediately after clicking Save (database connections, RA credentials, paths). The **Kestrel listen URL** is the exception — changing the port requires a full service restart: `sudo systemctl restart mangossuperui`
 
 ### World Map shows no Z-resolution / objects spawn at sea level
+
 - Verify the Maps Data path is set correctly in Settings and points to a directory containing `.map` files: `ls YOUR_MAPS_PATH/*.map | head`
 - If the minimap tiles display but Z-resolution doesn't work, check the minimap folder names have proper casing (e.g. `Azeroth/`, `Kalimdor/`, not `azeroth/`, `kalimdor/`). The HeightMapService matches these folder names against the map data. If your folders are lowercase, rename them to match the original WoW map names:
+  
   ```bash
   cd /opt/mangossuperui/wwwroot/minimap
   mv azeroth Azeroth
   mv kalimdor Kalimdor
   # ... etc. for each map directory
   ```
+  
   This is typically caused by using an older version of the MangosSuperUI Extractor that lowercased folder names. Re-extracting with the current version will produce the correct casing.
 
 ### Setup script finds wrong binary directory (build/ instead of run/)
+
 - The script prefers paths containing `/run/` over `/build/`, but if your directory structure is unusual it may pick the wrong one. Check the Configuration Summary output. If the Bin Dir points to a `build/` path, you can either re-run the script and adjust `server-config.json` manually afterwards, or edit the config through the Settings page in the web interface.
 
 ### Dashboard shows processes as "Offline" but they're clearly running
+
 - The configured process name doesn't match what the OS reports. The binary on disk may be `mangosd` but `/proc/PID/comm` reports `mangosd-main`. MangosSuperUI v1.1+ auto-scans `/proc` as a fallback, but you can also fix it in Settings. Discovery command: `cat /proc/$(pgrep -f mangosd)/comm`. The Dashboard Diagnose button detects this automatically.
 
 ### Spell Creator says "M2 NOT FOUND" or crashes with empty path
+
 - The Spell Creator paths (ClientM2Path, PatchOutputPath) are empty or not loaded. Check `http://YOUR_SERVER_IP:5000/Settings/Current` — if the paths show as empty strings, they weren't saved or the app wasn't restarted after saving. Fix: verify paths in Settings, click Save, then `sudo systemctl restart mangossuperui`.
 
 ---
@@ -934,6 +1002,7 @@ These steps are only needed if you use the Spell Creator (custom spell visual ef
 The World Viewer reads terrain, WMO buildings, and doodad models directly from the WoW 1.12.1 client's MPQ archives. The Spell Creator reads M2 particle files from the same source as a fallback.
 
 **From Windows PowerShell:**
+
 ```powershell
 scp -r "C:\path\to\WoW\Data" YOUR_USERNAME@YOUR_SERVER_IP:/home/YOUR_USERNAME/wowclient/Data
 ```

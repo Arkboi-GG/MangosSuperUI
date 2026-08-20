@@ -42,6 +42,9 @@ public class WeaponForgeController : Controller
     private const long MaxGlbBytes = 128 * 1024 * 1024;   // 128 MB
     // The variable-topology M2 writer's hard ceiling (RigidWeaponMeshValidator.VariableHardCeiling).
     private const int MaxForgeTriangles = 1000;
+    // A preserved TBC mesh is bounded by the vanilla view's UInt16 index count, not the Forge's
+    // authoring/decimation policy used for arbitrary GLB uploads.
+    private const int MaxTbcForgeTriangles = ushort.MaxValue / 3;
 
     public WeaponForgeController(MpqReaderService mpq, WeaponPreviewService preview,
         CustomWeaponBuildService builder, GlbWeaponImporter glbImporter, WeaponDonorResolver donors,
@@ -458,7 +461,7 @@ public class WeaponForgeController : Controller
             grip = BuildGripInfo(mesh, profile, donor),
             preview,
             diagnostics = import.Diagnostics.Items.Select(i => i.ToString()),
-            note = "Preview only — nothing was packaged. Forge builds exactly this result into the game.",
+            note = "Preview only — nothing was packaged. Geometry, sidedness and pass order match the forge; WebGL approximates WoW multi-texture combiners.",
         });
     }
 
@@ -764,118 +767,71 @@ public class WeaponForgeController : Controller
         return (ResolveTbcEntry(model, displayRow), item);
     }
 
-    /// <summary>Shared TBC extract + parse + mesh-build + optional decimation front half.
-    /// EffectPngs are the decoded textures for the mesh's texture slots 1.. (glow layers).</summary>
-    private (RigidWeaponMesh? Mesh, byte[]? M2Bytes, byte[]? TexturePng, List<byte[]>? EffectPngs, ForgeDiagnostics Diag, string? Error)
+    /// <summary>Shared TBC extract + parse + mesh-build front half. PNGs feed the web preview;
+    /// original BLP2 bytes feed the forge so the source texture/mips/compression are not altered.</summary>
+    private (RigidWeaponMesh? Mesh, byte[]? M2Bytes, byte[]? TexturePng, List<byte[]>? EffectPngs,
+        byte[]? TextureBlp, List<byte[]>? EffectBlps, ForgeDiagnostics Diag, string? Error)
         LoadTbcWeapon(TbcWeaponEntry entry, int targetTriangles)
     {
         var diag = new ForgeDiagnostics("tbc-import");
 
         var m2Bytes = _tbc.ExtractFile(entry.M2Path);
         if (m2Bytes is null)
-            return (null, null, null, null, diag, $"Could not extract {entry.M2Path} from the TBC archives.");
+            return (null, null, null, null, null, null, diag, $"Could not extract {entry.M2Path} from the TBC archives.");
 
         var m2 = M2Reader.Parse(m2Bytes);
         if (m2 is null)
-            return (null, m2Bytes, null, null, diag, "The TBC M2 could not be parsed (version ≥ 264 or malformed).");
+            return (null, m2Bytes, null, null, null, null, diag, "The TBC M2 could not be parsed (version ≥ 264 or malformed).");
         diag.Info("tbc.source", $"{entry.ModelStem}: M2 v{m2.Version}, {m2.Vertices.Count} verts, {m2.Indices.Count / 3} tris.");
 
         var extracted = TbcWeaponMeshExtractor.Extract(m2, diag);
         if (extracted is null)
-            return (null, m2Bytes, null, null, diag, "The TBC model has no usable triangles.");
+            return (null, m2Bytes, null, null, null, null, diag, "The TBC model has no usable triangles.");
         var mesh = extracted.Mesh;
 
         // Resolve each texture slot: a hardcoded TBC path, or null = the display row's Type-2 BLP.
-        byte[]? SlotPng(string? sourcePath, string slotName)
+        (byte[]? Png, byte[]? Blp) SlotTexture(string? sourcePath, string slotName)
         {
             string? path = sourcePath ?? entry.BlpPath;
-            if (path is null) { diag.Warn("tbc.texture", $"No texture source for {slotName}."); return null; }
+            if (path is null) { diag.Warn("tbc.texture", $"No texture source for {slotName}."); return (null, null); }
             var blp = _tbc.ExtractFile(path);
-            if (blp is not { Length: > 0 }) { diag.Warn("tbc.texture", $"TBC BLP {path} not found ({slotName})."); return null; }
+            if (blp is not { Length: > 0 }) { diag.Warn("tbc.texture", $"TBC BLP {path} not found ({slotName})."); return (null, null); }
             var png = BlpToPng(blp);
             if (png is null) diag.Warn("tbc.texture", $"TBC BLP {path} could not be decoded ({slotName}).");
-            return png;
+            return (png, blp);
         }
 
-        byte[]? texturePng = SlotPng(extracted.SourceTextures.Count > 0 ? extracted.SourceTextures[0] : null, "base");
+        var baseTexture = SlotTexture(extracted.SourceTextures.Count > 0 ? extracted.SourceTextures[0].SourcePath : null, "base");
+        byte[]? texturePng = baseTexture.Png;
+        if (texturePng is null)
+            return (null, m2Bytes, null, null, baseTexture.Blp, null, diag,
+                "The TBC weapon's required base texture is unavailable; fidelity mode will not substitute the donor texture.");
         List<byte[]>? effectPngs = null;
+        List<byte[]>? effectBlps = null;
         if (extracted.SourceTextures.Count > 1 && mesh.Passes is not null)
         {
             effectPngs = new List<byte[]>();
+            effectBlps = new List<byte[]>();
             for (int s = 1; s < extracted.SourceTextures.Count; s++)
             {
-                var png = SlotPng(extracted.SourceTextures[s], $"effect slot {s}");
-                if (png is null) { effectPngs = null; break; }
-                effectPngs.Add(png);
-            }
-            if (effectPngs is null)
-            {
-                // An effect texture is unavailable — fall back to base-only passes rather than
-                // shipping a glow layer that samples garbage.
-                diag.Warn("tbc.passes.stripped", "Effect texture unavailable — glow passes dropped, importing the base look only.");
-                mesh = StripToBasePasses(mesh);
+                var effect = SlotTexture(extracted.SourceTextures[s].SourcePath, $"effect slot {s}");
+                if (effect.Png is null || effect.Blp is null)
+                    return (null, m2Bytes, texturePng, null, baseTexture.Blp, null, diag,
+                        $"The TBC weapon's required texture slot {s} is unavailable; fidelity mode will not drop its render pass.");
+                effectPngs.Add(effect.Png);
+                effectBlps.Add(effect.Blp);
             }
         }
 
-        // Decimate when a target is set, or unconditionally when over the writer's hard ceiling.
-        // The decimator merges geometry, so pass structure cannot survive it — glow is dropped.
-        int target = targetTriangles > 0 ? Math.Clamp(targetTriangles, 50, MaxForgeTriangles) : 0;
-        if (target == 0 && mesh.TriangleCount > MaxForgeTriangles) target = MaxForgeTriangles;
-        if (target > 0 && mesh.TriangleCount > target)
-        {
-            if (mesh.Passes is not null)
-            {
-                diag.Warn("tbc.passes.decimated", "Decimation merges the mesh — glow passes dropped; raise the triangle target to keep them.");
-                mesh = StripToBasePasses(mesh);
-                effectPngs = null;
-            }
-            try
-            {
-                mesh = UvPreservingDecimator.Decimate(mesh, target, out var decimation);
-                if (decimation is not null) diag.Info("tbc.decimated", decimation);
-            }
-            catch (Exception ex)
-            {
-                return (null, m2Bytes, null, null, diag, "Decimation failed: " + ex.Message);
-            }
-        }
+        // TBC imports are fidelity-first. Decimation merges submeshes and destroys the source
+        // batch/pass structure that carries cutouts, overlays and glow, so the legacy triangle
+        // target is intentionally ignored on this route. Arbitrary GLB imports retain their
+        // separate 1,000-triangle authoring policy.
+        if (targetTriangles > 0)
+            diag.Info("tbc.fidelity.target-ignored",
+                $"Triangle target {targetTriangles:N0} ignored in TBC fidelity mode; preserved all {mesh.TriangleCount:N0} source triangles and render passes.");
 
-        if (texturePng is null)
-            diag.Warn("tbc.texture", "No base texture decoded; the family donor texture will be used.");
-
-        return (mesh, m2Bytes, texturePng, effectPngs, diag, null);
-    }
-
-    /// <summary>Reduce a multi-pass mesh to its base passes' geometry as a single-pass mesh
-    /// (glow layers removed) — the fallback when effect textures are unavailable or decimation
-    /// destroys the pass structure.</summary>
-    private static RigidWeaponMesh StripToBasePasses(RigidWeaponMesh mesh)
-    {
-        if (mesh.Passes is null || mesh.SubmeshRanges is null) return mesh;
-
-        var keep = mesh.Passes.Where(p => p.BlendMode <= 2 && p.SubmeshSlot < mesh.SubmeshRanges.Count)
-            .Select(p => p.SubmeshSlot).Distinct().OrderBy(s => s).ToList();
-        if (keep.Count == 0)
-            keep = Enumerable.Range(0, mesh.SubmeshRanges.Count).ToList();
-
-        var indices = new List<uint>();
-        foreach (int s in keep)
-        {
-            var r = mesh.SubmeshRanges[s];
-            for (int k = 0; k < r.IndexCount && r.IndexStart + k < mesh.Indices.Length; k++)
-                indices.Add(mesh.Indices[r.IndexStart + k]);
-        }
-
-        return new RigidWeaponMesh
-        {
-            Positions = mesh.Positions,
-            Normals = mesh.Normals,
-            Uv0 = mesh.Uv0,
-            Indices = indices.ToArray(),
-            VertexIds = null,
-            Material = mesh.Material,
-            Normalization = mesh.Normalization,
-        };
+        return (mesh, m2Bytes, texturePng, effectPngs, baseTexture.Blp, effectBlps, diag, null);
     }
 
     /// <summary>GET /WeaponForge/TbcPreviewWeapon — render one TBC weapon through the import
@@ -887,7 +843,7 @@ public class WeaponForgeController : Controller
         var (sel, item) = ResolveTbcSelection(entry, model, displayRow);
         if (sel is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon (entry {entry}, model '{model}')." });
 
-        var (mesh, _, texturePng, effectPngs, diag, err) = LoadTbcWeapon(sel, targetTriangles);
+        var (mesh, _, texturePng, effectPngs, _, _, diag, err) = LoadTbcWeapon(sel, targetTriangles);
         if (mesh is null)
             return Json(new { ok = false, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
 
@@ -913,16 +869,16 @@ public class WeaponForgeController : Controller
             vertexCount = mesh.VertexCount,
             triangleCount = mesh.TriangleCount,
             hasTexture = texturePng is { Length: > 0 },
-            withinForgeBudget = mesh.TriangleCount <= MaxForgeTriangles,
+            withinForgeBudget = mesh.TriangleCount <= MaxTbcForgeTriangles,
             grip,
             preview,
             diagnostics = diag.Items.Select(i => i.ToString()),
-            note = "Preview only — nothing was packaged. Forge builds exactly this result into the game.",
+            note = "Preview only — nothing was packaged. Geometry, sidedness and pass order match the forge; WebGL approximates WoW multi-texture combiners.",
         });
     }
 
-    /// <summary>POST /WeaponForge/ForgeTbc — package one TBC weapon for real: mesh + decoded BLP
-    /// through the standard pipeline, emitted as vanilla v256 on the family donor scaffold.</summary>
+    /// <summary>POST /WeaponForge/ForgeTbc — package one TBC weapon for real: its render graph is
+    /// emitted as vanilla v256 on the family donor scaffold and compatible BLP2 bytes stay intact.</summary>
     [HttpPost]
     public async Task<IActionResult> ForgeTbc(uint entry = 0, string? model = null, uint displayRow = 0,
         string? name = null, string? weaponType = null, int targetTriangles = 0,
@@ -940,14 +896,14 @@ public class WeaponForgeController : Controller
         catch (Exception ex)
         { return Json(new { ok = false, error = $"No stock donor for {profile.Label}: {ex.Message}" }); }
 
-        var (mesh, m2Bytes, texturePng, effectPngs, diag, err) = LoadTbcWeapon(sel, targetTriangles);
+        var (mesh, m2Bytes, texturePng, effectPngs, textureBlp, effectBlps, diag, err) = LoadTbcWeapon(sel, targetTriangles);
         if (mesh is null)
             return Json(new { ok = false, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
-        if (mesh.TriangleCount > MaxForgeTriangles)
+        if (mesh.TriangleCount > MaxTbcForgeTriangles)
             return Json(new
             {
                 ok = false,
-                error = $"{mesh.TriangleCount:N0} triangles exceeds the M2 budget ({MaxForgeTriangles:N0}).",
+                error = $"{mesh.TriangleCount:N0} triangles exceeds the vanilla M2 UInt16 index budget ({MaxTbcForgeTriangles:N0}).",
             });
 
         // Carry the SOURCE item's own presentation fields over the family defaults: sheath is the
@@ -979,8 +935,11 @@ public class WeaponForgeController : Controller
                 ItemOverrides = itemOverrides,
                 Mesh = mesh,
                 Topology = WeaponTopologyMode.Variable,
+                VariableTriangleHardCeiling = MaxTbcForgeTriangles,
                 TexturePng = AdjustTexture(texturePng, brightness, saturation),
+                TextureBlp = brightness == 0 && saturation == 0 ? textureBlp : null,
                 EffectTexturesPng = effectPngs,
+                EffectTexturesBlp = effectBlps,
                 SourceBlob = m2Bytes,
                 GeneratorParamsJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
@@ -994,7 +953,7 @@ public class WeaponForgeController : Controller
                     tbcGlowPasses = mesh.Passes?.Count(p => p.BlendMode >= 3) ?? 0,
                     targetTriangles,
                 }),
-                WriterVersion = "variable-topology-v1",
+                WriterVersion = "tbc-rendergraph-v2",
             });
             return Json(BuildResultJson(result, BuildGripInfo(mesh, profile, donor)));
         }

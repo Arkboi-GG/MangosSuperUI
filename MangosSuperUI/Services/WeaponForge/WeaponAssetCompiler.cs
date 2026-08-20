@@ -97,7 +97,28 @@ public sealed class WeaponAssetCompiler
     {
         try
         {
-            using var src = SKBitmap.Decode(texture.SourcePng);
+            if (texture.SourceBlp is { Length: > 0 } sourceBlp)
+            {
+                if (sourceBlp.Length < 4 || sourceBlp[0] != (byte)'B' || sourceBlp[1] != (byte)'L' ||
+                    sourceBlp[2] != (byte)'P' || sourceBlp[3] != (byte)'2')
+                {
+                    diag.Error("blp.source", "Pre-encoded source texture is not a BLP2 file.");
+                    return null;
+                }
+
+                // TBC and the supported vanilla client both consume BLP2. Keeping the original
+                // bytes preserves its dimensions, mip chain, alpha encoding and DXT blocks.
+                diag.Info("blp.preserved", $"Packaged source BLP2 byte-for-byte ({sourceBlp.Length:N0} bytes).");
+                return sourceBlp.ToArray();
+            }
+
+            if (texture.SourcePng is not { Length: > 0 } sourcePng)
+            {
+                diag.Error("blp.source", "Texture has neither source BLP2 bytes nor a PNG master.");
+                return null;
+            }
+
+            using var src = SKBitmap.Decode(sourcePng);
             if (src is null) { diag.Error("blp.decode", "Could not decode source texture PNG."); return null; }
 
             using var resized = src.Resize(new SKImageInfo(texture.Width, texture.Height), SKSamplingOptions.Default);
@@ -161,7 +182,8 @@ public sealed class NullWeaponMeshWriter : IWeaponMeshWriter
 /// opaque DXT1). Region masks (Route A) are carried alongside but not required.</summary>
 public sealed class WeaponTexture
 {
-    public required byte[] SourcePng { get; init; }
+    public byte[]? SourcePng { get; init; }
+    public byte[]? SourceBlp { get; init; }
     public int Width { get; init; } = 128;
     public int Height { get; init; } = 64;
     public bool UseDxt1 { get; init; } = true;
