@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.Numerics;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Dapper;
 using SkiaSharp;
 using MangosSuperUI.Models;
@@ -36,6 +38,8 @@ public class WeaponForgeController : Controller
     private readonly TbcMpqSource _tbc;
     private readonly TbcItemCatalog _tbcItems;
     private readonly ConnectionFactory _db;
+    private readonly DbcService _dbc;
+    private readonly VanillaItemSpellCatalog _itemSpells;
     private readonly ILogger<WeaponForgeController> _logger;
 
     // High-poly sources are welcome — they are decimated to budget before forging.
@@ -45,10 +49,19 @@ public class WeaponForgeController : Controller
     // A preserved TBC mesh is bounded by the vanilla view's UInt16 index count, not the Forge's
     // authoring/decimation policy used for arbitrary GLB uploads.
     private const int MaxTbcForgeTriangles = ushort.MaxValue / 3;
+    private const int MaxItemConfigurationChars = 64 * 1024;
+
+    private static readonly JsonSerializerOptions ItemConfigurationJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+    };
 
     public WeaponForgeController(MpqReaderService mpq, WeaponPreviewService preview,
         CustomWeaponBuildService builder, GlbWeaponImporter glbImporter, WeaponDonorResolver donors,
-        TbcMpqSource tbc, TbcItemCatalog tbcItems, ConnectionFactory db, ILogger<WeaponForgeController> logger)
+        TbcMpqSource tbc, TbcItemCatalog tbcItems, ConnectionFactory db, DbcService dbc,
+        VanillaItemSpellCatalog itemSpells,
+        ILogger<WeaponForgeController> logger)
     {
         _mpq = mpq;
         _preview = preview;
@@ -58,7 +71,141 @@ public class WeaponForgeController : Controller
         _tbc = tbc;
         _tbcItems = tbcItems;
         _db = db;
+        _dbc = dbc;
+        _itemSpells = itemSpells;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Deserialize and validate the optional typed Vanilla gameplay contract carried as the
+    /// multipart <c>itemConfig</c> JSON field. Unknown JSON properties fail closed so a typo can
+    /// never silently produce a donor-default item. Spell ids are checked against the complete
+    /// installed Vanilla Spell.dbc when that DBC was available at startup.
+    /// </summary>
+    private async Task<(ValidatedVanillaItemBuildConfiguration? Configuration, IReadOnlyList<string> Errors)>
+        ParseItemConfigurationAsync(string? itemConfig, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(itemConfig))
+            return (null, Array.Empty<string>());
+
+        if (itemConfig.Length > MaxItemConfigurationChars)
+            return (null, [$"itemConfig exceeds the {MaxItemConfigurationChars:N0}-character limit."]);
+
+        VanillaItemBuildConfiguration? request;
+        try
+        {
+            request = JsonSerializer.Deserialize<VanillaItemBuildConfiguration>(
+                itemConfig, ItemConfigurationJsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            string location = ex.Path is { Length: > 0 } ? $" at {ex.Path}" : "";
+            return (null, [$"itemConfig is not valid JSON{location}: {ex.Message}"]);
+        }
+
+        if (request is null)
+            return (null, ["itemConfig must be a JSON object, not null."]);
+
+        Func<uint, bool>? spellExists = _dbc.IsLoaded && _dbc.AllSpellEntries.Count > 0
+            ? spellId => _dbc.AllSpellEntries.ContainsKey(spellId)
+            : null;
+        Func<int, bool>? requiredSkillExists = _dbc.IsLoaded && _dbc.SkillLineIds.Count > 0
+            ? id => _dbc.SkillLineIds.Contains((uint)id)
+            : null;
+        Func<int, bool>? reputationFactionExists = _dbc.IsLoaded && _dbc.FactionIds.Count > 0
+            ? id => _dbc.FactionIds.Contains((uint)id)
+            : null;
+
+        if (!VanillaItemBuildConfigurationTranslator.TryTranslate(
+                request, spellExists, requiredSkillExists, reputationFactionExists,
+                out var validated, out var errors))
+            return (null, errors);
+
+        if (request.Spells is { Count: > 0 })
+        {
+            IReadOnlyList<NativeItemSpellUsage> nativeUsage;
+            try
+            {
+                nativeUsage = await _itemSpells.GetUsageAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "WeaponForge: could not validate native item spell effects");
+                return (null, ["Item spell effects cannot be validated against stock Vanilla items right now."]);
+            }
+
+            var nativeErrors = new List<string>();
+            for (int i = 0; i < request.Spells.Count; i++)
+            {
+                var spell = request.Spells[i]!; // structural/null validation already passed above
+                uint spellId = (uint)spell.SpellId!.Value;
+                int trigger = spell.Trigger!.Value;
+                int charges = spell.Charges ?? 0;
+                float ppmRate = spell.PpmRate ?? 0;
+                int cooldownMs = spell.CooldownMs ?? -1;
+                int category = spell.Category ?? 0;
+                int categoryCooldownMs = spell.CategoryCooldownMs ?? -1;
+                bool exactStockSlot = nativeUsage.Any(x =>
+                    x.SpellId == spellId &&
+                    x.TriggerValue == trigger &&
+                    x.Charges == charges &&
+                    x.PpmRate == ppmRate &&
+                    x.CooldownMs == cooldownMs &&
+                    x.Category == category &&
+                    x.CategoryCooldownMs == categoryCooldownMs);
+                if (!exactStockSlot)
+                    nativeErrors.Add($"spells[{i}] must preserve a complete stock Vanilla item-spell slot; " +
+                        $"spell {spellId} is not available with that {ItemSpellTriggerLabel(trigger)}, charges, PPM, and cooldown combination.");
+            }
+            if (nativeErrors.Count > 0)
+                return (null, nativeErrors);
+        }
+
+        return (validated, Array.Empty<string>());
+    }
+
+    private static string ItemSpellTriggerLabel(int trigger) => trigger switch
+    {
+        0 => "Use",
+        1 => "On Equip",
+        2 => "Chance on Hit",
+        _ => $"trigger {trigger}"
+    };
+
+    private static IReadOnlyList<string> ValidateConfigurationForWeaponFamily(
+        WeaponTypeProfile profile, ValidatedVanillaItemBuildConfiguration? configured)
+    {
+        if (configured is null ||
+            !configured.Overrides.TryGetValue("inventory_type", out var rawInventoryType) ||
+            !int.TryParse(rawInventoryType, out int inventoryType))
+            return Array.Empty<string>();
+
+        bool compatible = profile.TwoHanded
+            ? inventoryType == 17
+            : inventoryType is 13 or 21 or 22;
+        if (compatible) return Array.Empty<string>();
+
+        string allowed = profile.TwoHanded
+            ? "Two-Hand (17)"
+            : "One-Hand, Main Hand, or Off Hand (13, 21, or 22)";
+        return [$"inventoryType is incompatible with {profile.Label}; choose {allowed}."];
+    }
+
+    private static Dictionary<string, string>? MergeItemOverrides(
+        Dictionary<string, string>? existing,
+        ValidatedVanillaItemBuildConfiguration? configured)
+    {
+        if (configured is null || configured.Overrides.Count == 0)
+            return existing;
+
+        existing ??= new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (column, value) in configured.Overrides)
+            existing[column] = value;
+        return existing;
     }
 
     /// <summary>Uniform response for every full weapon build: ids, hashes, direct downloads for the
@@ -481,14 +628,27 @@ public class WeaponForgeController : Controller
     public async Task<IActionResult> ForgeGlb(IFormFile? file, string? name = null, string? weaponType = null,
         bool reorient = true,
         int targetTriangles = 500, float rollDegrees = 0f, bool flipGripEnd = false, bool straightenBlade = false,
-        int bladeProfile = 0, int brightness = 0, int saturation = 0)
+        int bladeProfile = 0, int brightness = 0, int saturation = 0, string? itemConfig = null)
     {
+        var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
+            itemConfig, HttpContext.RequestAborted);
+        if (configurationErrors.Count > 0)
+            return BadRequest(new
+            {
+                ok = false,
+                error = "The Vanilla item configuration is invalid.",
+                errors = configurationErrors,
+            });
+
         var (bytes, err) = await ReadBounded(file, MaxGlbBytes);
         if (err is not null) return BadRequest(new { ok = false, error = err });
         if (bytes!.Length < 12 || !(bytes[0] == 'g' && bytes[1] == 'l' && bytes[2] == 'T' && bytes[3] == 'F'))
             return BadRequest(new { ok = false, error = "Not a binary glTF (.glb): missing 'glTF' magic." });
 
         var profile = WeaponTypeCatalog.Get(weaponType);
+        var familyErrors = ValidateConfigurationForWeaponFamily(profile, configuredItem);
+        if (familyErrors.Count > 0)
+            return BadRequest(new { ok = false, error = "The item configuration does not match the weapon family.", errors = familyErrors });
         WeaponDonorInfo donor;
         try { donor = _donors.Resolve(profile); }
         catch (Exception ex)
@@ -515,9 +675,10 @@ public class WeaponForgeController : Controller
         {
             var result = await _builder.BuildAsync(new CustomWeaponBuildRequest
             {
-                Name = name,
+                Name = configuredItem?.Name ?? name,
                 SourceKind = "glb_import",
                 WeaponTypeKey = profile.Key,
+                ItemOverrides = MergeItemOverrides(null, configuredItem),
                 Mesh = mesh,
                 Topology = WeaponTopologyMode.Variable,
                 TexturePng = AdjustTexture(import.TexturePng, brightness, saturation),
@@ -897,8 +1058,18 @@ public class WeaponForgeController : Controller
     [HttpPost]
     public async Task<IActionResult> ForgeTbc(uint entry = 0, string? model = null, uint displayRow = 0,
         string? name = null, string? weaponType = null, int targetTriangles = 0,
-        int brightness = 0, int saturation = 0)
+        int brightness = 0, int saturation = 0, string? itemConfig = null)
     {
+        var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
+            itemConfig, HttpContext.RequestAborted);
+        if (configurationErrors.Count > 0)
+            return BadRequest(new
+            {
+                ok = false,
+                error = "The Vanilla item configuration is invalid.",
+                errors = configurationErrors,
+            });
+
         var (sel, item) = ResolveTbcSelection(entry, model, displayRow);
         if (sel is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon (entry {entry}, model '{model}')." });
 
@@ -906,6 +1077,9 @@ public class WeaponForgeController : Controller
             ? TbcItemCatalog.TypeKeyForSubclass(item.Subclass)
             : weaponType;
         var profile = WeaponTypeCatalog.Get(typeKey);
+        var familyErrors = ValidateConfigurationForWeaponFamily(profile, configuredItem);
+        if (familyErrors.Count > 0)
+            return BadRequest(new { ok = false, error = "The item configuration does not match the weapon family.", errors = familyErrors });
         WeaponDonorInfo donor;
         try { donor = _donors.Resolve(profile); }
         catch (Exception ex)
@@ -937,6 +1111,9 @@ public class WeaponForgeController : Controller
             if (item.InventoryType is 13 or 17 or 21 or 22)
                 itemOverrides["inventory_type"] = item.InventoryType.ToString();
         }
+        // Explicit modal values layer over both the family defaults (inside the builder) and the
+        // source TBC presentation values above. Omitted values preserve those existing contracts.
+        itemOverrides = MergeItemOverrides(itemOverrides, configuredItem);
 
         try
         {
@@ -945,7 +1122,8 @@ public class WeaponForgeController : Controller
                 ReferenceEquals(adjustedTexturePng, texturePng);
             var result = await _builder.BuildAsync(new CustomWeaponBuildRequest
             {
-                Name = !string.IsNullOrWhiteSpace(name) ? name
+                Name = !string.IsNullOrWhiteSpace(configuredItem?.Name) ? configuredItem.Name
+                     : !string.IsNullOrWhiteSpace(name) ? name
                      : item is not null ? item.Name
                      : PrettyTbcName(sel.ModelStem),
                 SourceKind = "tbc_import",

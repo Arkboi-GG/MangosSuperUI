@@ -23,6 +23,7 @@ $(function () {
 
             // Paths & Processes
             $('#cfgBinDir').val(s.vmangos.binDirectory);
+            $('#cfgRunDir').val(s.vmangos.runDirectory || '');
             $('#cfgLogDir').val(s.vmangos.logDirectory);
             $('#cfgConfDir').val(s.vmangos.configDirectory);
             $('#cfgMangosdProcess').val(s.vmangos.mangosdProcess);
@@ -456,6 +457,7 @@ $(function () {
             },
             vmangos: {
                 binDirectory: $('#cfgBinDir').val(),
+                runDirectory: $('#cfgRunDir').val() || '',
                 logDirectory: $('#cfgLogDir').val(),
                 configDirectory: $('#cfgConfDir').val(),
                 mangosdProcess: $('#cfgMangosdProcess').val() || 'mangosd',

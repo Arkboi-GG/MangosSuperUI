@@ -3,6 +3,7 @@ namespace MangosSuperUI.Services;
 public class VmangosSettings
 {
     public string BinDirectory { get; set; } = "";
+    public string RunDirectory { get; set; } = "";   // working dir when launching mangosd/realmd on Windows (falls back to BinDirectory)
     public string LogDirectory { get; set; } = "";
     public string ConfigDirectory { get; set; } = "";
     public string MangosdProcess { get; set; } = "mangosd";

@@ -63,6 +63,7 @@ public class SettingsController : Controller
             Vmangos = new VmangosConfig
             {
                 BinDirectory = _config["Vmangos:BinDirectory"] ?? "",
+                RunDirectory = _config["Vmangos:RunDirectory"] ?? "",
                 LogDirectory = _config["Vmangos:LogDirectory"] ?? "",
                 ConfigDirectory = _config["Vmangos:ConfigDirectory"] ?? "",
                 MangosdProcess = _config["Vmangos:MangosdProcess"] ?? "mangosd",
@@ -315,6 +316,7 @@ public class RemoteAccessConfig
 public class VmangosConfig
 {
     public string BinDirectory { get; set; } = "";
+    public string RunDirectory { get; set; } = "";
     public string LogDirectory { get; set; } = "";
     public string ConfigDirectory { get; set; } = "";
     public string MangosdProcess { get; set; } = "mangosd";

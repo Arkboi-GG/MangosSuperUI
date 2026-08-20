@@ -121,6 +121,13 @@
                             <input type="text" class="form-input cfg-input" id="cfgBinDir" data-path="vmangos.binDirectory" />
                         </div>
                         <div class="col-md-4">
+                            <label class="cmd-label">
+                                Run Directory
+                                <i class="fa-solid fa-circle-question cfg-hint" title="Working directory used when the app launches mangosd/realmd (Windows). mangosd resolves mangosd.conf and data/ relative to this. Leave blank to use the Bin Directory."></i>
+                            </label>
+                            <input type="text" class="form-input cfg-input" id="cfgRunDir" data-path="vmangos.runDirectory" placeholder="(defaults to Bin Directory)" />
+                        </div>
+                        <div class="col-md-4">
                             <label class="cmd-label">Log Directory</label>
                             <input type="text" class="form-input cfg-input" id="cfgLogDir" data-path="vmangos.logDirectory" />
                         </div>

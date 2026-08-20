@@ -7,6 +7,7 @@ public class ProcessManagerService
 {
     private readonly IOptionsMonitor<VmangosSettings> _settingsMonitor;
     private readonly ILogger<ProcessManagerService> _logger;
+    private readonly RaService _raService;
 
     // Cache the auto-detected process names so we don't re-scan /proc every poll
     private string? _resolvedMangosdName;
@@ -14,10 +15,18 @@ public class ProcessManagerService
     private DateTime _lastResolveScan = DateTime.MinValue;
     private static readonly TimeSpan ResolveCacheDuration = TimeSpan.FromSeconds(30);
 
-    public ProcessManagerService(IOptionsMonitor<VmangosSettings> settings, ILogger<ProcessManagerService> logger)
+    // Windows graceful-shutdown tuning (see StopWindowsProcessAsync / TryGracefulShutdownAsync).
+    private const int GracefulShutdownDelaySec = 5;   // "server shutdown N" countdown sent over RA
+    private const int GracefulExitGraceSec = 30;      // extra time to let mangosd save + exit before force-kill
+
+    public ProcessManagerService(
+        IOptionsMonitor<VmangosSettings> settings,
+        ILogger<ProcessManagerService> logger,
+        RaService raService)
     {
         _settingsMonitor = settings;
         _logger = logger;
+        _raService = raService;
     }
 
     private VmangosSettings Settings => _settingsMonitor.CurrentValue;
@@ -25,13 +34,24 @@ public class ProcessManagerService
     public ProcessStatus GetMangosdStatus() => GetProcessStatus("mangosd", Settings.MangosdProcess);
     public ProcessStatus GetRealmdStatus() => GetProcessStatus("realmd", Settings.RealmdProcess);
 
-    public async Task<string> StartMangosdAsync() => await RunSystemctlAsync("start", "mangosd");
-    public async Task<string> StopMangosdAsync() => await RunSystemctlAsync("stop", "mangosd");
-    public async Task<string> RestartMangosdAsync() => await RunSystemctlAsync("restart", "mangosd");
+    public Task<string> StartMangosdAsync() => ControlAsync("start", "mangosd", Settings.MangosdProcess);
+    public Task<string> StopMangosdAsync() => ControlAsync("stop", "mangosd", Settings.MangosdProcess);
+    public Task<string> RestartMangosdAsync() => ControlAsync("restart", "mangosd", Settings.MangosdProcess);
 
-    public async Task<string> StartRealmdAsync() => await RunSystemctlAsync("start", "realmd");
-    public async Task<string> StopRealmdAsync() => await RunSystemctlAsync("stop", "realmd");
-    public async Task<string> RestartRealmdAsync() => await RunSystemctlAsync("restart", "realmd");
+    public Task<string> StartRealmdAsync() => ControlAsync("start", "realmd", Settings.RealmdProcess);
+    public Task<string> StopRealmdAsync() => ControlAsync("stop", "realmd", Settings.RealmdProcess);
+    public Task<string> RestartRealmdAsync() => ControlAsync("restart", "realmd", Settings.RealmdProcess);
+
+    /// <summary>
+    /// Dispatches process control to the platform-appropriate mechanism:
+    /// systemctl on Linux, direct executable start/kill on Windows.
+    /// </summary>
+    private Task<string> ControlAsync(string action, string keyword, string configuredName)
+    {
+        if (OperatingSystem.IsWindows())
+            return RunWindowsProcessControlAsync(action, keyword, configuredName);
+        return RunSystemctlAsync(action, keyword);
+    }
 
     /// <summary>
     /// Returns diagnostics about process detection — what name was configured,
@@ -117,6 +137,170 @@ public class ProcessManagerService
     }
 
     /// <summary>
+    /// Windows control path. mangosd/realmd are treated as plain executables under
+    /// Vmangos:BinDirectory (as produced by a CMake/Visual Studio build) — no service
+    /// manager is assumed. Start launches the exe detached in its own console window
+    /// with Vmangos:RunDirectory as the working directory; stop shuts mangosd down
+    /// cleanly over RA (falling back to a hard kill); restart is stop-then-start.
+    /// </summary>
+    private async Task<string> RunWindowsProcessControlAsync(string action, string keyword, string configuredName)
+    {
+        _logger.LogInformation("Windows process control: {Action} {Name}", action, configuredName);
+
+        switch (action)
+        {
+            case "start":
+                return StartWindowsProcess(keyword, configuredName);
+            case "stop":
+                return await StopWindowsProcessAsync(keyword, configuredName);
+            case "restart":
+                await StopWindowsProcessAsync(keyword, configuredName);
+                await Task.Delay(1500); // let the OS release listening ports before relaunch
+                return StartWindowsProcess(keyword, configuredName);
+            default:
+                throw new ArgumentException($"Unknown action '{action}'");
+        }
+    }
+
+    private string StartWindowsProcess(string keyword, string configuredName)
+    {
+        // Mirror `systemctl start` on an already-active unit: treat as a no-op success.
+        var existing = GetProcessStatus(keyword, configuredName);
+        if (existing.IsRunning)
+            return $"{configuredName} is already running (PID {existing.Pid})";
+
+        if (string.IsNullOrWhiteSpace(Settings.BinDirectory))
+            throw new InvalidOperationException(
+                $"Vmangos:BinDirectory is not set. Point it at the folder containing {StripExe(configuredName)}.exe.");
+
+        var exeName = StripExe(configuredName) + ".exe";
+        var exePath = Path.Combine(Settings.BinDirectory, exeName);
+        if (!File.Exists(exePath))
+            throw new FileNotFoundException(
+                $"Could not find '{exeName}' in '{Settings.BinDirectory}'. "
+                + "Check Vmangos:BinDirectory and the configured process name.", exePath);
+
+        // The executable lives in BinDirectory, but mangosd/realmd resolve their .conf
+        // and data/ relative to the working directory. Prefer an explicit RunDirectory;
+        // fall back to BinDirectory when it isn't configured.
+        var workingDir = !string.IsNullOrWhiteSpace(Settings.RunDirectory)
+            ? Settings.RunDirectory
+            : Settings.BinDirectory;
+        if (!Directory.Exists(workingDir))
+            throw new DirectoryNotFoundException(
+                $"Working directory '{workingDir}' does not exist. Check Vmangos:RunDirectory (or BinDirectory).");
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = exePath,
+            WorkingDirectory = workingDir,
+            UseShellExecute = true // own console window, detached from the web app's lifetime
+        };
+
+        var proc = Process.Start(psi)
+            ?? throw new InvalidOperationException($"Failed to launch {exePath}");
+
+        _logger.LogInformation("Started {Exe} (PID {Pid}, cwd {Cwd})", exePath, proc.Id, workingDir);
+        return $"{configuredName} started (PID {proc.Id})";
+    }
+
+    /// <summary>
+    /// Stops a Windows process. mangosd carries live world state, so it is asked to shut
+    /// down cleanly over RA first ("server shutdown N", which saves players/AH/etc.);
+    /// realmd is stateless and goes straight to terminate. A hard kill is the fallback
+    /// whenever the graceful path is unavailable or the process doesn't exit in time.
+    /// </summary>
+    private async Task<string> StopWindowsProcessAsync(string keyword, string configuredName)
+    {
+        var winName = StripExe(configuredName);
+
+        if (Process.GetProcessesByName(winName).Length == 0)
+            return $"{configuredName} is not running";
+
+        if (keyword == "mangosd")
+        {
+            var graceful = await TryGracefulShutdownAsync(winName);
+            if (graceful != null)
+                return graceful;
+            _logger.LogWarning("Graceful RA shutdown unavailable for {Name}; terminating process.", winName);
+        }
+
+        return KillWindowsProcess(winName, configuredName);
+    }
+
+    /// <summary>
+    /// Asks mangosd to shut down cleanly via the RA console ("server shutdown N") and
+    /// waits for the process to exit. Returns a success message if it exits within the
+    /// grace window, or null (caller falls back to a hard kill) when RA is unreachable
+    /// or the process is still alive once the window elapses.
+    /// </summary>
+    private async Task<string?> TryGracefulShutdownAsync(string winName)
+    {
+        bool sent;
+        try
+        {
+            _logger.LogInformation("Requesting graceful shutdown of {Name} via RA (server shutdown {Delay})",
+                winName, GracefulShutdownDelaySec);
+            await _raService.SendCommandAsync($"server shutdown {GracefulShutdownDelaySec}");
+            sent = true;
+        }
+        catch (Exception ex)
+        {
+            // Reading the reply can fail as the server stops responding mid-shutdown, so
+            // the command may still have landed. Poll briefly for exit before giving up
+            // rather than assuming failure — but keep the wait short since RA may be down.
+            _logger.LogWarning(ex, "RA 'server shutdown' reply not received for {Name}", winName);
+            sent = false;
+        }
+
+        var windowSec = sent ? GracefulShutdownDelaySec + GracefulExitGraceSec : GracefulShutdownDelaySec + 5;
+        var deadline = TimeSpan.FromSeconds(windowSec);
+        var step = TimeSpan.FromMilliseconds(500);
+        for (var waited = TimeSpan.Zero; waited < deadline; waited += step)
+        {
+            if (Process.GetProcessesByName(winName).Length == 0)
+            {
+                _logger.LogInformation("{Name} shut down gracefully after ~{Sec:0.0}s", winName, waited.TotalSeconds);
+                return $"{winName} shut down gracefully";
+            }
+            await Task.Delay(step);
+        }
+
+        return null;
+    }
+
+    private string KillWindowsProcess(string winName, string configuredName)
+    {
+        var procs = Process.GetProcessesByName(winName);
+        if (procs.Length == 0)
+            return $"{configuredName} is not running";
+
+        var killed = 0;
+        foreach (var p in procs)
+        {
+            try
+            {
+                p.Kill(entireProcessTree: true);
+                p.WaitForExit(5000);
+                killed++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to terminate {Name} PID {Pid}", winName, p.Id);
+            }
+        }
+
+        if (killed == 0)
+            throw new InvalidOperationException(
+                $"Found {procs.Length} '{winName}' process(es) but could not terminate any (permission denied?).");
+
+        return $"{configuredName} stopped ({killed} process(es) terminated)";
+    }
+
+    private static string StripExe(string name) =>
+        name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name[..^4] : name;
+
+    /// <summary>
     /// Gets process status using a multi-strategy approach:
     /// 1. Try the configured process name via Process.GetProcessesByName
     /// 2. If not found, scan /proc for any process whose comm or cmdline contains the keyword
@@ -124,6 +308,34 @@ public class ProcessManagerService
     /// </summary>
     private ProcessStatus GetProcessStatus(string keyword, string configuredName)
     {
+        // Windows has no /proc, so the comm-scan and bin-directory ownership checks
+        // used by the Linux strategies below can never match. Detect by process name.
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                var winName = StripExe(configuredName);
+                var proc = Process.GetProcessesByName(winName).FirstOrDefault();
+                if (proc != null)
+                {
+                    UpdateResolvedName(keyword, winName);
+                    return new ProcessStatus
+                    {
+                        IsRunning = true,
+                        Pid = proc.Id,
+                        ProcessName = winName,
+                        StartTime = TryGetStartTime(proc),
+                        Uptime = TryGetUptime(proc)
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Windows process lookup for {Name} failed", configuredName);
+            }
+            return new ProcessStatus { IsRunning = false };
+        }
+
         // Strategy 1: Try configured name directly (fast path)
         try
         {

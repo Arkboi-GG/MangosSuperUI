@@ -189,7 +189,9 @@ public class HomeController : Controller
                 : "Not running",
             Fix = procDiag.MangosdRunning
                 ? procDiag.MangosdHint
-                : "Start it: sudo systemctl start mangosd"
+                : (OperatingSystem.IsWindows()
+                    ? "Start it from the Processes panel (launches mangosd.exe from the bin directory)."
+                    : "Start it: sudo systemctl start mangosd")
         });
 
         checks.Add(new DiagnosticCheck
@@ -202,7 +204,9 @@ public class HomeController : Controller
                 : "Not running",
             Fix = procDiag.RealmdRunning
                 ? procDiag.RealmdHint
-                : "Start it: sudo systemctl start realmd"
+                : (OperatingSystem.IsWindows()
+                    ? "Start it from the Processes panel (launches realmd.exe from the bin directory)."
+                    : "Start it: sudo systemctl start realmd")
         });
 
         // ── 3. RA connectivity ──
@@ -247,7 +251,9 @@ public class HomeController : Controller
                     raDetail = $"Cannot connect to {ra.Host}:{ra.Port} — connection refused or timed out.";
                     raFix = procDiag.MangosdRunning
                         ? "mangosd is running but RA port is closed. Check Ra.Enable = 1 in mangosd.conf and restart mangosd."
-                        : "mangosd is not running. Start it first: sudo systemctl start mangosd";
+                        : (OperatingSystem.IsWindows()
+                            ? "mangosd is not running. Start it first from the Processes panel."
+                            : "mangosd is not running. Start it first: sudo systemctl start mangosd");
                 }
             }
             catch (Exception ex)
@@ -593,7 +599,9 @@ public class HomeController : Controller
                 TargetType = "service",
                 TargetName = request.Service,
                 Success = true,
-                Notes = $"systemctl {request.Action} {request.Service}"
+                Notes = OperatingSystem.IsWindows()
+                    ? $"process {request.Action} {request.Service}"
+                    : $"systemctl {request.Action} {request.Service}"
             });
 
             return Json(new { success = true, message = $"{request.Service} {request.Action} completed" });

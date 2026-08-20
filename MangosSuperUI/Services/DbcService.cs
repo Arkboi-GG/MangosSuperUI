@@ -39,11 +39,21 @@ public partial class DbcService
     public IReadOnlyDictionary<uint, SpellRangeEntry> SpellRanges { get; private set; }
         = new Dictionary<uint, SpellRangeEntry>();
 
-    /// <summary>spellId → SpellDbcEntry (lightweight, for source spell search fallback).
-    /// Parsed from Spell.dbc — covers ALL ~22k vanilla spells, unlike spell_template which
-    /// only has server-side overrides.</summary>
+    /// <summary>spellId → visible SpellDbcEntry (lightweight, for ordinary source-spell search).
+    /// Hidden client helper spells are deliberately omitted from this view.</summary>
     public IReadOnlyDictionary<uint, SpellDbcEntry> SpellEntries { get; private set; }
         = new Dictionary<uint, SpellDbcEntry>();
+
+    /// <summary>Every spell row installed in the active Vanilla Spell.dbc, including hidden or
+    /// unnamed passive/helper rows used by item equip effects. Validation must use this complete
+    /// view: an item spell can be valid even when it has no spellbook-facing label.</summary>
+    public IReadOnlyDictionary<uint, SpellDbcEntry> AllSpellEntries { get; private set; }
+        = new Dictionary<uint, SpellDbcEntry>();
+
+    /// <summary>IDs installed in the active Vanilla SkillLine.dbc and Faction.dbc.
+    /// Item Forge uses these sets to reject impossible numeric equip requirements.</summary>
+    public IReadOnlySet<uint> SkillLineIds { get; private set; } = new HashSet<uint>();
+    public IReadOnlySet<uint> FactionIds { get; private set; } = new HashSet<uint>();
 
     /// <summary>displayId → model info (model names + texture names from DBC fields [1-4]).
     /// Used by ItemTextureService to resolve displayId → M2 file path.</summary>
@@ -416,6 +426,10 @@ public partial class DbcService
         IsLoaded = false;
         LoadError = null;
         LoadedCounts.Clear();
+        AllSpellEntries = new Dictionary<uint, SpellDbcEntry>();
+        SpellEntries = new Dictionary<uint, SpellDbcEntry>();
+        SkillLineIds = new HashSet<uint>();
+        FactionIds = new HashSet<uint>();
 
         // Read path from config — check server-config.json override first, then appsettings.json
         DbcPath = _configuration["Vmangos:DbcPath"]
@@ -439,7 +453,12 @@ public partial class DbcService
             SpellDurations = LoadSpellDuration(Path.Combine(DbcPath, "SpellDuration.dbc"));
             SpellCastTimes = LoadSpellCastTimes(Path.Combine(DbcPath, "SpellCastTimes.dbc"));
             SpellRanges = LoadSpellRange(Path.Combine(DbcPath, "SpellRange.dbc"));
-            SpellEntries = LoadSpellEntries(Path.Combine(DbcPath, "Spell.dbc"));
+            AllSpellEntries = LoadSpellEntries(Path.Combine(DbcPath, "Spell.dbc"));
+            SpellEntries = AllSpellEntries
+                .Where(kv => !kv.Value.Hidden && !string.IsNullOrWhiteSpace(kv.Value.Name))
+                .ToDictionary(kv => kv.Key, kv => kv.Value);
+            SkillLineIds = LoadEntryIds(Path.Combine(DbcPath, "SkillLine.dbc"), "SkillLine");
+            FactionIds = LoadFactionRequirementIds(Path.Combine(DbcPath, "Faction.dbc"));
             CharacterSections = LoadCharSections(Path.Combine(DbcPath, "CharSections.dbc"));
             CharacterHairGeosets = LoadCharHairGeosets(Path.Combine(DbcPath, "CharHairGeosets.dbc"));
             HelmetGeosetVisData = LoadHelmetGeosetVisData(Path.Combine(DbcPath, "HelmetGeosetVisData.dbc"));
@@ -452,6 +471,10 @@ public partial class DbcService
         catch (Exception ex)
         {
             LoadError = $"{ex.GetType().Name}: {ex.Message}";
+            AllSpellEntries = new Dictionary<uint, SpellDbcEntry>();
+            SpellEntries = new Dictionary<uint, SpellDbcEntry>();
+            SkillLineIds = new HashSet<uint>();
+            FactionIds = new HashSet<uint>();
             _logger.LogError(ex, "DbcService: Failed to load DBC files");
         }
     }
@@ -687,10 +710,10 @@ public partial class DbcService
 
     /// <summary>
     /// Spell.dbc — 173 fields, 692 bytes per record (vanilla 1.12.1 build 5875).
-    /// Only parses the fields needed for source-spell search:
+    /// Only parses the fields needed for source-spell search and item-effect validation:
     ///   [0]   ID
     ///   [6]   Attributes (check HIDDEN bit 0x80)
-    ///   [25]  SpellLevel
+    ///   [28]  SpellLevel
     ///   [115] SpellVisualID[0]
     ///   [117] SpellIconID
     ///   [120] Name_lang enUS (stringref)
@@ -706,7 +729,7 @@ public partial class DbcService
             return dict;
         }
 
-        var (records, stringBlock, recordSize) = ReadDbcFile(filePath);
+        var (records, stringBlock, recordSize) = ReadDbcFile(filePath, expectedFieldCount: 173, expectedRecordSize: 692);
 
         for (int i = 0; i < records.Length / recordSize; i++)
         {
@@ -714,10 +737,9 @@ public partial class DbcService
             uint id = BitConverter.ToUInt32(records, o);
             uint attributes = BitConverter.ToUInt32(records, o + 6 * 4);
 
-            // Skip hidden spells (attribute bit 0x80)
-            if ((attributes & 0x80) != 0) continue;
+            bool hidden = (attributes & 0x80) != 0;
 
-            uint spellLevel = BitConverter.ToUInt32(records, o + 25 * 4);
+            uint spellLevel = BitConverter.ToUInt32(records, o + 28 * 4);
             uint spellVisual1 = BitConverter.ToUInt32(records, o + 115 * 4);
             uint spellIconId = BitConverter.ToUInt32(records, o + 117 * 4);
             uint nameOffset = BitConverter.ToUInt32(records, o + 120 * 4);
@@ -725,16 +747,15 @@ public partial class DbcService
             uint descOffset = BitConverter.ToUInt32(records, o + 138 * 4);
 
             string name = ReadString(stringBlock, nameOffset);
-            if (string.IsNullOrEmpty(name)) continue;
-
             string subtext = ReadString(stringBlock, subtextOffset);
             string description = ReadString(stringBlock, descOffset);
 
-            dict[id] = new SpellDbcEntry(id, name, subtext, 0, spellVisual1, spellIconId, spellLevel, description);
+            dict[id] = new SpellDbcEntry(id, name, subtext, 0, spellVisual1, spellIconId,
+                spellLevel, description, hidden);
         }
 
         LoadedCounts["Spell"] = dict.Count;
-        _logger.LogInformation("DbcService: Parsed {Count} Spell.dbc entries (non-hidden)", dict.Count);
+        _logger.LogInformation("DbcService: Parsed all {Count} Spell.dbc rows (including hidden/unnamed)", dict.Count);
         return dict;
     }
 
@@ -1141,14 +1162,69 @@ public partial class DbcService
         return System.Text.RegularExpressions.Regex.Replace(internalName, "(?<=[a-z])(?=[A-Z])", " ");
     }
 
-    // ── WDBC file reader (original, unchanged) ──────────────────────────────────────────────────
+    /// <summary>Load the primary ID (field 0) from a Vanilla DBC without guessing any
+    /// table-specific payload layout. Every client DBC row begins with this uint32 key.</summary>
+    private IReadOnlySet<uint> LoadFactionRequirementIds(string filePath)
+    {
+        const string label = "Faction";
+        if (!File.Exists(filePath))
+        {
+            _logger.LogWarning("DbcService: Faction.dbc not found at {Path}", filePath);
+            LoadedCounts[label] = 0;
+            return new HashSet<uint>();
+        }
+
+        var (records, _, recordSize) = ReadDbcFile(filePath);
+        if (recordSize < 2 * sizeof(uint))
+            throw new InvalidDataException($"Faction.dbc record size {recordSize} cannot contain ID and reputationListID.");
+
+        var ids = new HashSet<uint>();
+        for (int offset = 0; offset < records.Length; offset += recordSize)
+        {
+            uint id = BitConverter.ToUInt32(records, offset);
+            int reputationListId = BitConverter.ToInt32(records, offset + sizeof(uint));
+            if (id != 0 && reputationListId >= 0) ids.Add(id);
+        }
+
+        LoadedCounts[label] = ids.Count;
+        _logger.LogInformation("DbcService: Parsed {Count} reputation-bearing Faction.dbc IDs", ids.Count);
+        return ids;
+    }
+
+    private IReadOnlySet<uint> LoadEntryIds(string filePath, string label)
+    {
+        if (!File.Exists(filePath))
+        {
+            _logger.LogWarning("DbcService: {Label}.dbc not found at {Path}", label, filePath);
+            LoadedCounts[label] = 0;
+            return new HashSet<uint>();
+        }
+
+        var (records, _, recordSize) = ReadDbcFile(filePath);
+        if (recordSize < sizeof(uint))
+            throw new InvalidDataException($"{label}.dbc record size {recordSize} cannot contain an ID.");
+
+        var ids = new HashSet<uint>();
+        for (int offset = 0; offset < records.Length; offset += recordSize)
+        {
+            uint id = BitConverter.ToUInt32(records, offset);
+            if (id != 0) ids.Add(id);
+        }
+
+        LoadedCounts[label] = ids.Count;
+        _logger.LogInformation("DbcService: Parsed {Count} {Label}.dbc IDs", ids.Count, label);
+        return ids;
+    }
+
+    // ── WDBC file reader ────────────────────────────────────────────────────────────────────────
 
     /// <summary>
     /// Reads a WDBC file and returns the raw record bytes, string block, and record size.
     /// Header: 4 bytes magic ("WDBC"), 4 bytes recordCount, 4 bytes fieldCount,
     ///         4 bytes recordSize, 4 bytes stringBlockSize.
     /// </summary>
-    private (byte[] records, byte[] stringBlock, int recordSize) ReadDbcFile(string filePath)
+    private (byte[] records, byte[] stringBlock, int recordSize) ReadDbcFile(
+        string filePath, int? expectedFieldCount = null, int? expectedRecordSize = null)
     {
         using var fs = File.OpenRead(filePath);
         using var br = new BinaryReader(fs);
@@ -1163,11 +1239,33 @@ public partial class DbcService
         uint recordSize = br.ReadUInt32();
         uint stringBlockSize = br.ReadUInt32();
 
+        if (recordSize == 0)
+            throw new InvalidDataException($"DBC record size is zero in {filePath}.");
+        if (expectedFieldCount is int requiredFields && fieldCount != (uint)requiredFields)
+            throw new InvalidDataException(
+                $"Unexpected DBC field count in {filePath}: {fieldCount} (expected {requiredFields}).");
+        if (expectedRecordSize is int requiredSize && recordSize != (uint)requiredSize)
+            throw new InvalidDataException(
+                $"Unexpected DBC record size in {filePath}: {recordSize} (expected {requiredSize}).");
+
+        long recordByteCount;
+        try { recordByteCount = checked((long)recordCount * recordSize); }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException($"DBC record section is too large in {filePath}.", ex);
+        }
+        if (recordByteCount > int.MaxValue || stringBlockSize > int.MaxValue)
+            throw new InvalidDataException($"DBC sections exceed supported in-memory size in {filePath}.");
+
         // Read all records as a flat byte array
-        byte[] records = br.ReadBytes((int)(recordCount * recordSize));
+        byte[] records = br.ReadBytes((int)recordByteCount);
+        if (records.Length != (int)recordByteCount)
+            throw new EndOfStreamException($"DBC record section is truncated in {filePath}.");
 
         // Read string block
         byte[] stringBlock = br.ReadBytes((int)stringBlockSize);
+        if (stringBlock.Length != (int)stringBlockSize)
+            throw new EndOfStreamException($"DBC string block is truncated in {filePath}.");
 
         return (records, stringBlock, (int)recordSize);
     }
@@ -1234,7 +1332,8 @@ public record SpellDbcEntry(
     uint SpellVisual1,
     uint SpellIconId,
     uint SpellLevel,
-    string Description = ""
+    string Description = "",
+    bool Hidden = false
 );
 
 /// <summary>

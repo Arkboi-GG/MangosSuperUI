@@ -31,8 +31,8 @@ public static class WeaponItemTemplateSql
             throw new ArgumentOutOfRangeException(nameof(entry), $"Entry {entry} outside the custom item range [{WeaponIdReservationService.ItemEntryFloor}, {WeaponIdReservationService.MediumIntUnsignedMax}].");
         if (displayId < WeaponIdReservationService.ItemDisplayFloor || displayId > WeaponIdReservationService.MediumIntUnsignedMax)
             throw new ArgumentOutOfRangeException(nameof(displayId), $"Display id {displayId} outside the custom display range.");
-        if (string.IsNullOrWhiteSpace(name) || name.Length > 255)
-            throw new ArgumentException("Name must be 1..255 chars.", nameof(name));
+        if (string.IsNullOrWhiteSpace(name) || name.Length > 255 || name.Any(char.IsControl))
+            throw new ArgumentException("Name must be 1..255 characters and contain no control characters.", nameof(name));
 
         var cols = DonorItemTemplateFixture.Columns;
         var vals = (string[])DonorItemTemplateFixture.DonorValues.Clone();
@@ -65,8 +65,10 @@ public static class WeaponItemTemplateSql
         var sql = new StringBuilder();
         sql.Append("-- Weapon Forge — item_template row for a custom weapon\n");
         sql.Append($"-- Build: {buildId}\n");
-        sql.Append($"-- Entry: {entry}   Display: {displayId}   Name: {name}\n");
-        sql.Append("-- Cloned from donor 2131 (Shortsword); gameplay identical except the identity fields.\n");
+        // Never interpolate user-authored text into SQL comments. A newline in a name would end
+        // the comment and turn the remainder into executable SQL before the quoted VALUES row.
+        sql.Append($"-- Entry: {entry}   Display: {displayId}\n");
+        sql.Append("-- Donor 2131 (Shortsword) supplies the base row; validated requested gameplay overrides are included.\n");
         sql.Append("-- FAIL-CLOSED: (entry,patch) is the PRIMARY KEY, so a colliding entry ERRORS instead of\n");
         sql.Append("-- overwriting a live row. Verify the entry is free before applying:\n");
         sql.Append($"--   SELECT entry, name, display_id FROM item_template WHERE entry = {entry};\n");
@@ -81,12 +83,14 @@ public static class WeaponItemTemplateSql
         return new GeneratedSql(text, hash);
     }
 
-    /// <summary>Escape a string value for a single-quoted MySQL literal. Weapon names are simple,
-    /// but backslash and quote are escaped defensively.</summary>
+    /// <summary>Encode user-authored text as a UTF-8 hex expression. This is unambiguous under
+    /// both MySQL string modes (with or without NO_BACKSLASH_ESCAPES) and cannot terminate the
+    /// VALUES expression.</summary>
     private static string SqlString(string s)
     {
-        var e = s.Replace("\\", "\\\\").Replace("'", "\\'");
-        return $"'{e}'";
+        if (s.Length == 0) return "''";
+        var hex = Convert.ToHexString(Encoding.UTF8.GetBytes(s));
+        return $"CONVERT(0x{hex} USING utf8mb4)";
     }
 }
 
