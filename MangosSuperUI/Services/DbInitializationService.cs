@@ -500,6 +500,7 @@ public class DbInitializationService
         ("custom_id_allocator", Sql_CustomIdAllocator),
         ("custom_id_reservation", Sql_CustomIdReservation),
         ("custom_weapon_model", Sql_CustomWeaponModel),
+        ("custom_weapon_model_texture", Sql_CustomWeaponModelTexture),
         ("custom_weapon_display", Sql_CustomWeaponDisplay),
         ("custom_weapon_item_manifest", Sql_CustomWeaponItemManifest),
         ("weapon_forge_config", Sql_WeaponForgeConfig),
@@ -561,6 +562,19 @@ public class DbInitializationService
             validation_report            LONGTEXT        NULL,
             created_at                   DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
             INDEX idx_model_kind (source_kind)
+        ) ENGINE=InnoDB;";
+
+    // Effect textures for multi-pass weapons (TBC glow imports): the emitted M2 references these
+    // members by HARDCODED (Type-0) path, so rows and the M2's embedded filenames stay in lockstep.
+    private const string Sql_CustomWeaponModelTexture = @"
+        CREATE TABLE custom_weapon_model_texture (
+            model_id     BIGINT UNSIGNED NOT NULL,
+            slot         INT             NOT NULL,
+            mpq_path     VARCHAR(255)    NOT NULL,
+            compiled_blp LONGBLOB        NULL,
+            blp_sha256   CHAR(64)        NULL,
+            created_at   DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            PRIMARY KEY (model_id, slot)
         ) ENGINE=InnoDB;";
 
     // One display = one texture bound to a model, plus the explicit 23-field ItemDisplayInfo state.

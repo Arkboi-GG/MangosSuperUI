@@ -595,7 +595,7 @@ public class M2Reader
 
     // ── Bones ───────────────────────────────────────────────────────────────
     //
-    // ModelBoneM2<vanilla> layout (108 bytes — verified empirically
+    // ModelBoneM2<vanilla> layout (108 bytes — verified empirically)
     //
     //   +0    int32   keyBoneId
     //   +4    uint32  flags
@@ -606,32 +606,43 @@ public class M2Reader
     //  +68    AnimationBlockM2<Vector3>     scale         (28 bytes)
     //  +96    float[3] pivot                              (12 bytes)
     //
-    // CRITICAL: vanilla stores rotation keys as unpacked Vector4 (4 floats =
-    // 16 bytes per key), NOT as PACK_QUATERNION (4 int16s = 8 bytes per key).
-    // The packed format was introduced in TBC. the 8-byte PACK_QUATERNION path is only
-    // reached on TBC+. Getting this wrong would produce garbage rotations
-    // that look superficially valid (since the byte pattern overlaps).
+    // TBC (v260–263) inserted 4 bytes (boneNameCRC) after submeshId, making the
+    // record 112 bytes and shifting the tracks/pivot by +4. Measured against the
+    // real 2.4.3 archives (2026-08-19): parsing TBC bones with the vanilla stride
+    // reads misaligned garbage track headers, and a garbage count cast to a
+    // negative List.Capacity threw — killing Parse for roughly half the TBC
+    // weapon models. TBC also packs rotation keys as 4×int16 M2CompQuat (8 bytes)
+    // instead of vanilla's unpacked 4×float (16 bytes).
+    //
+    // CRITICAL (vanilla): rotation keys are unpacked Vector4 floats. Getting this
+    // wrong would produce garbage rotations that look superficially valid
+    // (since the byte pattern overlaps).
     private static void ParseBones(byte[] data, uint count, uint offset, M2Model model)
     {
         if (count == 0 || offset == 0) return;
-        if (offset + count * BONE_STRIDE > data.Length) return;
+
+        bool tbc = model.Version >= 260;
+        int stride = tbc ? 112 : BONE_STRIDE;
+        int shift = tbc ? 4 : 0;   // fields after submeshId sit 4 bytes later in TBC
+
+        if (offset + (long)count * stride > data.Length) return;
 
         int sequenceCount = model.Sequences.Count;
 
         model.Bones.Capacity = (int)count;
         for (uint i = 0; i < count; i++)
         {
-            int off = (int)(offset + i * BONE_STRIDE);
+            int off = (int)(offset + i * stride);
 
             int keyBoneId = (int)ReadUInt32(data, off + 0);
             uint flags = ReadUInt32(data, off + 4);
             short parent = (short)ReadUInt16(data, off + 8);
             ushort submeshId = ReadUInt16(data, off + 10);
 
-            // Pivot at +96, with Z-up → Y-up swap 
-            float px = ReadFloat(data, off + 96);
-            float py = ReadFloat(data, off + 100);
-            float pz = ReadFloat(data, off + 104);
+            // Pivot at +96 (+100 TBC), with Z-up → Y-up swap
+            float px = ReadFloat(data, off + 96 + shift);
+            float py = ReadFloat(data, off + 100 + shift);
+            float pz = ReadFloat(data, off + 104 + shift);
             var pivot = new Vector3(px, pz, -py);
 
             // ── Animation tracks (Session O) ────────────────────────────────
@@ -665,7 +676,7 @@ public class M2Reader
             // alternative is to negate w as well (Option 1 in the Session O
             // handoff "Possible bugs" section).
             var translation = ParseAnimTrack<Vector3>(
-                data, off + 12, sequenceCount,
+                data, off + 12 + shift, sequenceCount,
                 keyStride: 12,
                 readKey: (d, o) =>
                 {
@@ -675,20 +686,34 @@ public class M2Reader
                     return new Vector3(x, z, -y);
                 });
 
-            var rotation = ParseAnimTrack<Vector4>(
-                data, off + 40, sequenceCount,
-                keyStride: 16,
-                readKey: (d, o) =>
-                {
-                    float qx = ReadFloat(d, o + 0);
-                    float qy = ReadFloat(d, o + 4);
-                    float qz = ReadFloat(d, o + 8);
-                    float qw = ReadFloat(d, o + 12);
-                    return new Vector4(qx, qz, -qy, qw);
-                });
+            // Rotation keys: vanilla = 4×float (16 B); TBC = M2CompQuat 4×int16 (8 B),
+            // decoded as (v − 32767) / 32767 per component.
+            var rotation = tbc
+                ? ParseAnimTrack<Vector4>(
+                    data, off + 40 + shift, sequenceCount,
+                    keyStride: 8,
+                    readKey: (d, o) =>
+                    {
+                        float qx = (ReadUInt16(d, o + 0) - 32767) / 32767f;
+                        float qy = (ReadUInt16(d, o + 2) - 32767) / 32767f;
+                        float qz = (ReadUInt16(d, o + 4) - 32767) / 32767f;
+                        float qw = (ReadUInt16(d, o + 6) - 32767) / 32767f;
+                        return new Vector4(qx, qz, -qy, qw);
+                    })
+                : ParseAnimTrack<Vector4>(
+                    data, off + 40, sequenceCount,
+                    keyStride: 16,
+                    readKey: (d, o) =>
+                    {
+                        float qx = ReadFloat(d, o + 0);
+                        float qy = ReadFloat(d, o + 4);
+                        float qz = ReadFloat(d, o + 8);
+                        float qw = ReadFloat(d, o + 12);
+                        return new Vector4(qx, qz, -qy, qw);
+                    });
 
             var scale = ParseAnimTrack<Vector3>(
-                data, off + 68, sequenceCount,
+                data, off + 68 + shift, sequenceCount,
                 keyStride: 12,
                 readKey: (d, o) =>
                 {
@@ -752,12 +777,16 @@ public class M2Reader
         uint nKeys = ReadUInt32(data, blockOffset + 20);
         uint ofsKeys = ReadUInt32(data, blockOffset + 24);
 
+        // All bounds math in LONG: a misaligned/garbage count (e.g. reading a TBC-stride bone with
+        // the vanilla stride, before that was version-gated) could overflow uint multiplication,
+        // slip past the check, and then throw as a negative List.Capacity — killing the whole Parse.
+
         // Ranges: one entry per sequence. Stride 8 (2 × uint32).
         // We DON'T cap at sequenceCount because some character M2s appear to
         // have a sentinel/extra range — let it through, callers index by
         // sequence and out-of-range access falls through to "no animation".
         if (nRanges > 0 && ofsRanges > 0 &&
-            ofsRanges + nRanges * RANGE_STRIDE <= data.Length)
+            ofsRanges + (long)nRanges * RANGE_STRIDE <= data.Length)
         {
             track.Ranges.Capacity = (int)nRanges;
             for (uint i = 0; i < nRanges; i++)
@@ -773,7 +802,7 @@ public class M2Reader
 
         // Timestamps: uint32 ms positions. Shared across all sequences.
         if (nTimestamps > 0 && ofsTimestamps > 0 &&
-            ofsTimestamps + nTimestamps * 4 <= data.Length)
+            ofsTimestamps + (long)nTimestamps * 4 <= data.Length)
         {
             track.Timestamps.Capacity = (int)nTimestamps;
             for (uint i = 0; i < nTimestamps; i++)
@@ -782,7 +811,7 @@ public class M2Reader
 
         // Keys: T per entry. Caller delegates parse + transform.
         if (nKeys > 0 && ofsKeys > 0 &&
-            ofsKeys + nKeys * keyStride <= data.Length)
+            ofsKeys + (long)nKeys * keyStride <= data.Length)
         {
             track.Keys.Capacity = (int)nKeys;
             for (uint i = 0; i < nKeys; i++)
