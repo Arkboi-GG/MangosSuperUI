@@ -27,9 +27,11 @@ $(function () {
     // ── Segmented retexture staging (preview-before-save) ──────────────
     // A selected variant lives here, fully temporary, until Save commits it.
     //   stagedRetexture = { displayId, mpqPath, filename, itemName,
-    //                       unitColors, unitLightness, glbUrl, pngUrl, name }
-    // glbUrl is a temp preview GLB (no DB row, no patch). On Save we POST
-    // CommitSegmentedRetexture to persist and get the real displayId.
+    //                       unitColors, unitLightness, glbUrl, attachments,
+    //                       pngUrl, name }
+    // glbUrl is the primary temp preview GLB; paired slots such as shoulders
+    // also carry their authored side URLs in attachments. No DB row or patch
+    // exists until Save commits the staged PNG.
     var stagedRetexture = null;
     var stagedPreviewGlbs = [];   // temp GLB urls to clean up on modal close
 
@@ -42,6 +44,20 @@ $(function () {
 
     function hasUnsavedRetexture() {
         return stagedRetexture != null && !stagedRetexture.committed;
+    }
+
+    // Return every temp GLB referenced by a preview response/staging object.
+    // For shoulders `glbUrl` is also attachments.shoulderLeft, so de-duplicate
+    // before tracking or deleting it.
+    function previewGlbUrls(preview) {
+        if (!preview) return [];
+        var urls = [];
+        if (preview.glbUrl) urls.push(preview.glbUrl);
+        var attachments = preview.attachments || {};
+        Object.keys(attachments).forEach(function (key) {
+            if (attachments[key]) urls.push(attachments[key]);
+        });
+        return urls.filter(function (url, idx) { return urls.indexOf(url) === idx; });
     }
 
     // Guard against losing an unsaved retexture on tab close / navigation.
@@ -544,17 +560,26 @@ $(function () {
                 html += '</div>';
             }
 
-            var spells = [];
-            for (var j = 1; j <= 5; j++) {
-                var sid = item['spellid_' + j] || item['spell_id_' + j];
-                var trigger = item['spelltrigger_' + j] || item['spell_trigger_' + j];
-                if (sid > 0) spells.push({ id: sid, trigger: trigger });
+            // Prefer the server-resolved spells (with name + Spell.dbc tooltip
+            // text); fall back to reconstructing bare ids from raw item fields.
+            var spells = (data.spells && data.spells.length) ? data.spells : [];
+            if (!spells.length) {
+                for (var j = 1; j <= 5; j++) {
+                    var sid = item['spellid_' + j] || item['spell_id_' + j];
+                    var trigger = item['spelltrigger_' + j] || item['spell_trigger_' + j];
+                    if (sid > 0) spells.push({ id: sid, trigger: trigger });
+                }
             }
             if (spells.length > 0) {
                 html += '<div class="detail-section"><div class="detail-section-title">Spells</div>';
                 spells.forEach(function (sp) {
+                    var triggerLabel = esc(TRIGGER_NAMES[sp.trigger] || 'Trigger ' + sp.trigger);
+                    var title = sp.name ? esc(sp.name) : ('Spell #' + sp.id);
                     html += '<div class="spell-line"><i class="fa-solid fa-bolt" style="font-size: 10px;"></i> ' +
-                        esc(TRIGGER_NAMES[sp.trigger] || 'Trigger ' + sp.trigger) + ': Spell #' + sp.id + '</div>';
+                        triggerLabel + ': ' + title +
+                        ' <span class="spell-id-tag">#' + sp.id + '</span></div>';
+                    if (sp.description)
+                        html += '<div class="spell-desc">' + esc(sp.description) + '</div>';
                 });
                 html += '</div>';
             }
@@ -948,9 +973,12 @@ $(function () {
             return;
         }
 
-        // Reset staging on (re)open.
+        // Reset staging on (re)open. Closing the panel deliberately keeps the
+        // selected preview alive so Save can commit it; if the user opens the
+        // retexture panel again, that staged selection is being discarded, so
+        // release every temp GLB (including both shoulder sides) first.
+        cleanupStagedPreviewGlbs(null);
         stagedRetexture = null;
-        stagedPreviewGlbs = [];
 
         var $panel = $('#retexturePanel');
         $panel.html(buildRetexturePanelContent(texData));
@@ -989,7 +1017,7 @@ $(function () {
         // earlier equipWeaponGlbDirect call — its temp file lives until Save
         // or until the stale-sweep runs server-side).
         cleanupStagedPreviewGlbs(
-            hasUnsavedRetexture() ? stagedRetexture.glbUrl : null);
+            hasUnsavedRetexture() ? previewGlbUrls(stagedRetexture) : null);
 
         return true;
     }
@@ -1110,12 +1138,14 @@ $(function () {
         });
     });
 
-    // Best-effort delete of temp preview GLBs (skip `keepUrl` if the staged
-    // one is still in use on the character). Called by closeRetexturePanel
+    // Best-effort delete of temp preview GLBs (skip `keepUrls` if the staged
+    // pair is still in use on the character). Called by closeRetexturePanel
     // and by the panel's re-open path (which resets staging).
-    function cleanupStagedPreviewGlbs(keepUrl) {
+    function cleanupStagedPreviewGlbs(keepUrls) {
+        if (typeof keepUrls === 'string') keepUrls = [keepUrls];
+        var keep = new Set(keepUrls || []);
         (stagedPreviewGlbs || []).forEach(function (url) {
-            if (url === keepUrl) return;
+            if (keep.has(url)) return;
             $.ajax({
                 url: '/Items/DeletePreviewGlb',
                 method: 'POST',
@@ -1123,7 +1153,7 @@ $(function () {
                 data: JSON.stringify({ glbUrl: url })
             });
         });
-        stagedPreviewGlbs = (keepUrl ? [keepUrl] : []);
+        stagedPreviewGlbs = Array.from(keep);
     }
 
     // Mode toggle: show/hide sections based on mode. No modal-layout
@@ -1354,12 +1384,12 @@ $(function () {
             }),
             success: function (data) {
                 $img.css('opacity', prevOpacity || 1);
-                if (!data.success || !data.glbUrl) {
+                if (!data.success || previewGlbUrls(data).length === 0) {
                     showToast('Preview failed: ' + (data.error || 'unknown'), 'error');
                     $card.removeClass('selected');
                     return;
                 }
-                stagedPreviewGlbs.push(data.glbUrl);
+                previewGlbUrls(data).forEach(function (url) { stagedPreviewGlbs.push(url); });
 
                 // Stage the selection (temporary — commits on Save).
                 var inventoryType = currentDetailItem ? (currentDetailItem.inventory_type || 0) : 0;
@@ -1369,6 +1399,7 @@ $(function () {
                     filename: filename,
                     itemName: itemName,
                     glbUrl: data.glbUrl,
+                    attachments: data.attachments || null,
                     pngUrl: data.pngUrl,
                     pngPath: data.pngPath,
                     name: name,
@@ -1381,7 +1412,7 @@ $(function () {
 
                 if (window.retexEquipWeaponGlbDirect && window.cv && window.cv.character) {
                     Promise.resolve(window.retexEquipWeaponGlbDirect(
-                        window.cv.character, data.glbUrl, inventoryType
+                        window.cv.character, data.glbUrl, inventoryType, data.attachments
                     )).catch(function (err) {
                         console.warn('[retex] character preview apply failed', err);
                         showToast('Couldn\u2019t apply preview to character', 'warning');
@@ -1426,7 +1457,7 @@ $(function () {
     // ctx carries the form data needed at commit time (displayId / itemName
     // / mpqPath / filename / mode / styleDirection).
     function stagePreviewResult(data, ctx) {
-        if (!data || !data.success || !data.glbUrl || !data.pngPath) {
+        if (!data || !data.success || previewGlbUrls(data).length === 0 || !data.pngPath) {
             showToast('Preview failed: ' + ((data && data.error) || 'unknown'), 'error');
             $('#retextureStatus').html(
                 '<div style="font-size:11px;color:var(--status-error);">' +
@@ -1435,13 +1466,14 @@ $(function () {
             return;
         }
 
-        stagedPreviewGlbs.push(data.glbUrl);
+        previewGlbUrls(data).forEach(function (url) { stagedPreviewGlbs.push(url); });
         stagedRetexture = {
             displayId: ctx.displayId,
             mpqPath: ctx.mpqPath,
             filename: ctx.filename,
             itemName: ctx.itemName,
             glbUrl: data.glbUrl,
+            attachments: data.attachments || null,
             pngUrl: data.pngUrl,
             pngPath: data.pngPath,
             name: ctx.name || (data.mode || 'Preview'),
@@ -1464,7 +1496,8 @@ $(function () {
         // Mount on the live character viewer.
         if (window.retexEquipWeaponGlbDirect && window.cv && window.cv.character) {
             Promise.resolve(window.retexEquipWeaponGlbDirect(
-                window.cv.character, data.glbUrl, stagedRetexture.inventoryType
+                window.cv.character, data.glbUrl, stagedRetexture.inventoryType,
+                stagedRetexture.attachments
             )).catch(function (err) {
                 console.warn('[retex] character preview apply failed', err);
                 showToast('Couldn\u2019t apply preview to character', 'warning');
@@ -2255,7 +2288,9 @@ $(function () {
                     var savedEntry = data.entry;
                     // Reset save button before closing
                     $('#btnSaveItem').prop('disabled', false).html('<i class="fa-solid fa-floppy-disk"></i> Save');
-                    // Clear any staged retexture — it's now committed + assigned.
+                    // Clear every temp GLB (both authored shoulder sides, when
+                    // present) now that the committed display is assigned.
+                    cleanupStagedPreviewGlbs(null);
                     stagedRetexture = null;
                     // Close editor and return to browse mode
                     closeEditPanel();

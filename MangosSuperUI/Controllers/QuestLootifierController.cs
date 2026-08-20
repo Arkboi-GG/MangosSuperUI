@@ -1632,6 +1632,13 @@ public class QuestLootifierController : Controller
             ? ruleset.bands.ToList()
             : DefaultBands(ruleset.includeGodsBand);
 
+        // The quest-named legendary IS the item's legendary — don't also mint the
+        // generic "of the Gods" suffix legendary, or every reward gets two. When a
+        // named legendary is being generated (the default), drop the legendary-tier
+        // band so there's exactly one legendary per item.
+        if (ruleset.generateLegendary)
+            bands = bands.Where(b => CanonicalTier(b.label ?? "", b.maxBoostPct) != "gods").ToList();
+
         // White cap (preserves the locked white ladder): a white reward never mints
         // purple/orange, so drop the of Glory and of the Gods bands — white keeps
         // only Improved / of Power (green).

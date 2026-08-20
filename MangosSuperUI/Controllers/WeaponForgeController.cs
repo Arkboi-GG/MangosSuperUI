@@ -34,6 +34,7 @@ public class WeaponForgeController : Controller
     private readonly GlbWeaponImporter _glbImporter;
     private readonly WeaponDonorResolver _donors;
     private readonly TbcMpqSource _tbc;
+    private readonly TbcItemCatalog _tbcItems;
     private readonly ConnectionFactory _db;
     private readonly ILogger<WeaponForgeController> _logger;
 
@@ -44,7 +45,7 @@ public class WeaponForgeController : Controller
 
     public WeaponForgeController(MpqReaderService mpq, WeaponPreviewService preview,
         CustomWeaponBuildService builder, GlbWeaponImporter glbImporter, WeaponDonorResolver donors,
-        TbcMpqSource tbc, ConnectionFactory db, ILogger<WeaponForgeController> logger)
+        TbcMpqSource tbc, TbcItemCatalog tbcItems, ConnectionFactory db, ILogger<WeaponForgeController> logger)
     {
         _mpq = mpq;
         _preview = preview;
@@ -52,6 +53,7 @@ public class WeaponForgeController : Controller
         _glbImporter = glbImporter;
         _donors = donors;
         _tbc = tbc;
+        _tbcItems = tbcItems;
         _db = db;
         _logger = logger;
     }
@@ -590,15 +592,22 @@ public class WeaponForgeController : Controller
     // server-built index — raw MPQ paths are never accepted from the client.
     // ═══════════════════════════════════════════════════════════════════
 
-    /// <summary>GET /WeaponForge/TbcStatus — mount state of the configured TBC Data folder.</summary>
+    /// <summary>GET /WeaponForge/TbcStatus — mount state of the configured TBC Data folder plus
+    /// the shipped item-name catalog join.</summary>
     [HttpGet]
     public IActionResult TbcStatus()
     {
         var (configured, path, archiveCount, error) = _tbc.Status();
-        int weaponCount = 0;
+        int weaponCount = 0, itemCount = 0;
         if (configured && error is null)
         {
-            try { weaponCount = _tbc.WeaponIndex().Count; }
+            try
+            {
+                var index = _tbc.WeaponIndex();
+                weaponCount = index.Count;
+                var rows = index.Select(w => w.DisplayRow).ToHashSet();
+                itemCount = _tbcItems.Items.Count(i => i.ItemClass == 2 && rows.Contains(i.DisplayId));
+            }
             catch (Exception ex) { error = ex.Message; }
         }
         return Json(new
@@ -607,49 +616,109 @@ public class WeaponForgeController : Controller
             path,
             archiveCount,
             weaponCount,
+            itemCount,
+            catalogItems = _tbcItems.Items.Count,
             error,
             note = "Set the TBC client Data path on the Settings page (Weapon Forge section).",
         });
     }
 
-    /// <summary>GET /WeaponForge/TbcWeapons?search=&amp;page=&amp;pageSize= — paged browse of the
-    /// TBC weapon catalog (display rows whose model resolves in the TBC archives).</summary>
+    /// <summary>GET /WeaponForge/TbcWeapons?search=&amp;page=&amp;pageSize= — paged browse. When the
+    /// shipped item catalog is present, rows are real TBC ITEMS (name/quality/ilvl, joined to the
+    /// mounted archives by display id, weapon type pre-mapped from the TBC subclass); without it,
+    /// the browse degrades to raw model stems.</summary>
     [HttpGet]
     public IActionResult TbcWeapons(string? search = null, int page = 1, int pageSize = 60)
     {
-        IReadOnlyList<TbcWeaponEntry> all;
-        try { all = _tbc.WeaponIndex(); }
+        IReadOnlyList<TbcWeaponEntry> index;
+        try { index = _tbc.WeaponIndex(); }
         catch (Exception ex) { return Json(new { ok = false, error = ex.Message }); }
 
-        IEnumerable<TbcWeaponEntry> filtered = all;
-        if (!string.IsNullOrWhiteSpace(search))
+        pageSize = Math.Clamp(pageSize, 10, 200);
+        string s = search?.Trim() ?? "";
+
+        var byRow = index.ToDictionary(w => w.DisplayRow, w => w);
+
+        // Item mode: shipped names joined to the user's archives. Weapons only — armor/shields
+        // ship in the catalog for the future armor import but are not forgeable yet.
+        var items = _tbcItems.Items
+            .Where(i => i.ItemClass == 2 &&
+                        TbcItemCatalog.TypeKeyForSubclass(i.Subclass) is not null &&
+                        byRow.ContainsKey(i.DisplayId))
+            .ToList();
+        if (items.Count > 0)
         {
-            string s = search.Trim();
-            filtered = all.Where(w =>
+            IEnumerable<TbcItemInfo> filtered = items;
+            if (s.Length > 0)
+                filtered = items.Where(i =>
+                    i.Name.Contains(s, StringComparison.OrdinalIgnoreCase) ||
+                    byRow[i.DisplayId].ModelStem.Contains(s, StringComparison.OrdinalIgnoreCase) ||
+                    i.Entry.ToString() == s);
+
+            var list = filtered.OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase).ThenBy(i => i.Entry).ToList();
+            int total = list.Count;
+            int pages = Math.Max(1, (total + pageSize - 1) / pageSize);
+            page = Math.Clamp(page, 1, pages);
+
+            return Json(new
+            {
+                ok = true,
+                mode = "items",
+                total,
+                page,
+                pages,
+                weapons = list.Skip((page - 1) * pageSize).Take(pageSize).Select(i =>
+                {
+                    var w = byRow[i.DisplayId];
+                    string typeKey = TbcItemCatalog.TypeKeyForSubclass(i.Subclass)!;
+                    return new
+                    {
+                        entry = i.Entry,
+                        name = i.Name,
+                        quality = i.Quality,
+                        itemLevel = i.ItemLevel,
+                        typeKey,
+                        typeLabel = WeaponTypeCatalog.Get(typeKey).Label,
+                        w.DisplayRow,
+                        model = w.ModelStem,
+                        texture = w.TextureStem,
+                    };
+                }),
+            });
+        }
+
+        // Model-stem fallback (catalog missing, or nothing joined).
+        IEnumerable<TbcWeaponEntry> mFiltered = index;
+        if (s.Length > 0)
+            mFiltered = index.Where(w =>
                 w.ModelStem.Contains(s, StringComparison.OrdinalIgnoreCase) ||
                 w.TextureStem.Contains(s, StringComparison.OrdinalIgnoreCase) ||
                 w.IconStem.Contains(s, StringComparison.OrdinalIgnoreCase));
-        }
 
-        var list = filtered.OrderBy(w => w.ModelStem, StringComparer.OrdinalIgnoreCase)
+        var mList = mFiltered.OrderBy(w => w.ModelStem, StringComparer.OrdinalIgnoreCase)
             .ThenBy(w => w.DisplayRow).ToList();
-        pageSize = Math.Clamp(pageSize, 10, 200);
-        int total = list.Count;
-        int pages = Math.Max(1, (total + pageSize - 1) / pageSize);
-        page = Math.Clamp(page, 1, pages);
+        int mTotal = mList.Count;
+        int mPages = Math.Max(1, (mTotal + pageSize - 1) / pageSize);
+        page = Math.Clamp(page, 1, mPages);
 
         return Json(new
         {
             ok = true,
-            total,
+            mode = "models",
+            total = mTotal,
             page,
-            pages,
-            weapons = list.Skip((page - 1) * pageSize).Take(pageSize).Select(w => new
+            pages = mPages,
+            weapons = mList.Skip((page - 1) * pageSize).Take(pageSize).Select(w => new
             {
+                entry = 0u,
+                name = w.ModelStem,
+                quality = 1,
+                itemLevel = 0,
+                typeKey = (string?)null,
+                typeLabel = (string?)null,
                 w.DisplayRow,
                 model = w.ModelStem,
                 texture = w.TextureStem,
-                icon = w.IconStem,
             }),
         });
     }
@@ -667,6 +736,19 @@ public class WeaponForgeController : Controller
             if (byRow is not null) return byRow;
         }
         return index.FirstOrDefault(w => w.ModelStem.Equals(model.Trim(), StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>Resolve a browse selection: a catalog item entry (preferred — carries name, quality
+    /// and the subclass-mapped weapon type) or a bare model stem/display row from the fallback mode.</summary>
+    private (TbcWeaponEntry? Entry, TbcItemInfo? Item) ResolveTbcSelection(uint itemEntry, string? model, uint displayRow)
+    {
+        TbcItemInfo? item = itemEntry > 0 ? _tbcItems.FindByEntry(itemEntry) : null;
+        if (item is not null)
+        {
+            var byRow = _tbc.WeaponIndex().FirstOrDefault(w => w.DisplayRow == item.DisplayId);
+            if (byRow is not null) return (byRow, item);
+        }
+        return (ResolveTbcEntry(model, displayRow), item);
     }
 
     /// <summary>Shared TBC extract + parse + mesh-build + optional decimation front half.</summary>
@@ -723,17 +805,20 @@ public class WeaponForgeController : Controller
     /// <summary>GET /WeaponForge/TbcPreviewWeapon — render one TBC weapon through the import
     /// pipeline (same mesh + texture the forge would package) without packaging anything.</summary>
     [HttpGet]
-    public IActionResult TbcPreviewWeapon(string? model = null, uint displayRow = 0, string? weaponType = null,
-        int targetTriangles = 0, int brightness = 0, int saturation = 0)
+    public IActionResult TbcPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
+        string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0)
     {
-        var entry = ResolveTbcEntry(model, displayRow);
-        if (entry is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon model '{model}'." });
+        var (sel, item) = ResolveTbcSelection(entry, model, displayRow);
+        if (sel is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon (entry {entry}, model '{model}')." });
 
-        var (mesh, _, texturePng, diag, err) = LoadTbcWeapon(entry, targetTriangles);
+        var (mesh, _, texturePng, diag, err) = LoadTbcWeapon(sel, targetTriangles);
         if (mesh is null)
             return Json(new { ok = false, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
 
-        var profile = WeaponTypeCatalog.Get(weaponType);
+        string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
+            ? TbcItemCatalog.TypeKeyForSubclass(item.Subclass)
+            : weaponType;
+        var profile = WeaponTypeCatalog.Get(typeKey);
         object? grip = null;
         try { grip = BuildGripInfo(mesh, profile, _donors.Resolve(profile)); }
         catch { /* grip markers are optional for preview */ }
@@ -742,9 +827,11 @@ public class WeaponForgeController : Controller
         return Json(new
         {
             ok = preview.Ok,
-            model = entry.ModelStem,
-            texture = entry.TextureStem,
-            entry.DisplayRow,
+            itemEntry = item?.Entry ?? 0,
+            itemName = item?.Name,
+            model = sel.ModelStem,
+            texture = sel.TextureStem,
+            sel.DisplayRow,
             weaponType = profile.Key,
             weaponTypeLabel = profile.Label,
             vertexCount = mesh.VertexCount,
@@ -761,19 +848,23 @@ public class WeaponForgeController : Controller
     /// <summary>POST /WeaponForge/ForgeTbc — package one TBC weapon for real: mesh + decoded BLP
     /// through the standard pipeline, emitted as vanilla v256 on the family donor scaffold.</summary>
     [HttpPost]
-    public async Task<IActionResult> ForgeTbc(string? model = null, uint displayRow = 0, string? name = null,
-        string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0)
+    public async Task<IActionResult> ForgeTbc(uint entry = 0, string? model = null, uint displayRow = 0,
+        string? name = null, string? weaponType = null, int targetTriangles = 0,
+        int brightness = 0, int saturation = 0)
     {
-        var entry = ResolveTbcEntry(model, displayRow);
-        if (entry is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon model '{model}'." });
+        var (sel, item) = ResolveTbcSelection(entry, model, displayRow);
+        if (sel is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon (entry {entry}, model '{model}')." });
 
-        var profile = WeaponTypeCatalog.Get(weaponType);
+        string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
+            ? TbcItemCatalog.TypeKeyForSubclass(item.Subclass)
+            : weaponType;
+        var profile = WeaponTypeCatalog.Get(typeKey);
         WeaponDonorInfo donor;
         try { donor = _donors.Resolve(profile); }
         catch (Exception ex)
         { return Json(new { ok = false, error = $"No stock donor for {profile.Label}: {ex.Message}" }); }
 
-        var (mesh, m2Bytes, texturePng, diag, err) = LoadTbcWeapon(entry, targetTriangles);
+        var (mesh, m2Bytes, texturePng, diag, err) = LoadTbcWeapon(sel, targetTriangles);
         if (mesh is null)
             return Json(new { ok = false, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
         if (mesh.TriangleCount > MaxForgeTriangles)
@@ -787,7 +878,9 @@ public class WeaponForgeController : Controller
         {
             var result = await _builder.BuildAsync(new CustomWeaponBuildRequest
             {
-                Name = string.IsNullOrWhiteSpace(name) ? PrettyTbcName(entry.ModelStem) : name,
+                Name = !string.IsNullOrWhiteSpace(name) ? name
+                     : item is not null ? item.Name
+                     : PrettyTbcName(sel.ModelStem),
                 SourceKind = "tbc_import",
                 WeaponTypeKey = profile.Key,
                 Mesh = mesh,
@@ -796,9 +889,11 @@ public class WeaponForgeController : Controller
                 SourceBlob = m2Bytes,
                 GeneratorParamsJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
-                    tbcModel = entry.ModelStem,
-                    tbcTexture = entry.TextureStem,
-                    tbcDisplayRow = entry.DisplayRow,
+                    tbcItemEntry = item?.Entry ?? 0,
+                    tbcItemName = item?.Name,
+                    tbcModel = sel.ModelStem,
+                    tbcTexture = sel.TextureStem,
+                    tbcDisplayRow = sel.DisplayRow,
                     targetTriangles,
                 }),
                 WriterVersion = "variable-topology-v1",
@@ -807,7 +902,7 @@ public class WeaponForgeController : Controller
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "WeaponForge: ForgeTbc {Model} failed", entry.ModelStem);
+            _logger.LogError(ex, "WeaponForge: ForgeTbc {Model} failed", sel.ModelStem);
             return Json(new { ok = false, error = ex.Message });
         }
     }

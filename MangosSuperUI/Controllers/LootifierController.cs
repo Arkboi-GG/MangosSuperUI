@@ -856,6 +856,9 @@ public class LootifierController : Controller
         var trackingItemRows = new List<(int genEntry, int baseEntry, int creatureEntry, float budgetPct, string tierName)>();
         var trackingLootRows = new List<(int creatureEntry, string table, int lootEntry, int itemEntry, string action, float origChance, float newChance)>();
 
+        // Every loot table touched, for the post-write >100% pool sweep.
+        var touchedLootIds = new HashSet<int>();
+
         foreach (var creatureGroup in request.creatures)
         {
             int lootId = await mangosConn.ExecuteScalarAsync<int>(@"
@@ -867,6 +870,8 @@ public class LootifierController : Controller
             if (!additive && lootId == 0) continue;
             // Additive is built once per creature — re-run rolls it back first.
             if (additive && additivized.Contains(creatureGroup.creatureEntry)) continue;
+
+            if (lootId > 0) touchedLootIds.Add(lootId);
 
             // Collected per-creature variant sets for the single additive pool.
             var additiveBatch = new List<(int baseItemEntry, List<int> variantEntries, CommitRoll[] rolls)>();
@@ -1049,6 +1054,7 @@ public class LootifierController : Controller
                         new { L = effLootId, E = creatureGroup.creatureEntry });
                     minted = true;
                 }
+                if (effLootId > 0) touchedLootIds.Add(effLootId);
                 totalLootRowsCreated += await BuildAdditivePool(mangosConn, adminConn, trackingLootRows,
                     creatureGroup.creatureEntry, effLootId, minted, additiveBatch, poolDropPct);
                 additivized.Add(creatureGroup.creatureEntry);
@@ -1073,6 +1079,12 @@ public class LootifierController : Controller
         if (trackingItemRows.Count > 0) await FlushTrackingItems(adminConn, trackingItemRows);
         if (trackingLootRows.Count > 0) await FlushTrackingLoot(adminConn, trackingLootRows);
 
+        // Post-write safety sweep across every loot table touched by the batch.
+        var touchedRefs = await GetReferencedPoolsAsync(mangosConn, touchedLootIds);
+        var poolViolations = await FindOverfullGroupsAsync(mangosConn, touchedRefs, touchedLootIds);
+        foreach (dynamic v in poolViolations)
+            _poolWarnings?.Add($"Loot pool over 100%: {v.scope} entry {v.entry} group {v.groupId} sums to {v.total}%. Items past the 100% mark can never drop — roll back and rebuild this pool.");
+
         await _audit.LogAsync(new AuditEntry
         {
             Operator = "admin",
@@ -1090,7 +1102,7 @@ public class LootifierController : Controller
                 + (request.regenerate ? $"; regenerate: {regenReused} refreshed in place, {regenRemoved} removed, {regenRemapped} owned copies rerolled" : "")
         });
 
-        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, creaturesProcessed, pairsSkipped, regenReused, regenRemoved, regenRemapped, variantsRequested, variantsShort, itemsShort, warnings = _poolWarnings });
+        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, creaturesProcessed, pairsSkipped, regenReused, regenRemoved, regenRemapped, variantsRequested, variantsShort, itemsShort, warnings = _poolWarnings, poolViolations });
     }
 
     /// <summary>
@@ -1330,6 +1342,7 @@ public class LootifierController : Controller
         }
 
         // Additive: build the single independent pool now (minting a loot_id if none).
+        int additiveEffLootId = 0;
         if (additive && additiveBatch.Count > 0)
         {
             int effLootId = lootId;
@@ -1342,9 +1355,21 @@ public class LootifierController : Controller
                     new { L = effLootId, E = request.creatureEntry });
                 minted = true;
             }
+            additiveEffLootId = effLootId;
             totalLootRowsCreated += await BuildAdditivePool(mangosConn, adminConn, null,
                 request.creatureEntry, effLootId, minted, additiveBatch, poolDropPct);
         }
+
+        // Post-write safety sweep: confirm no grouped pool this creature points at
+        // exceeds 100%. The clamps in JoinExistingPool / CreatePoolFromDirect keep
+        // this commit from ever creating an overflow, so anything caught here is a
+        // pre-existing bad pool — surfaced as a loud warning, not a silent success.
+        var touchedLootIds = new List<int> { lootId };
+        if (additiveEffLootId > 0) touchedLootIds.Add(additiveEffLootId);
+        var touchedRefs = await GetReferencedPoolsAsync(mangosConn, touchedLootIds);
+        var poolViolations = await FindOverfullGroupsAsync(mangosConn, touchedRefs, touchedLootIds);
+        foreach (dynamic v in poolViolations)
+            _poolWarnings?.Add($"Loot pool over 100%: {v.scope} entry {v.entry} group {v.groupId} sums to {v.total}%. Items past the 100% mark can never drop — roll back and rebuild this pool.");
 
         await _audit.LogAsync(new AuditEntry
         {
@@ -1363,7 +1388,35 @@ public class LootifierController : Controller
                 + (request.regenerate ? $" (regenerate: {regenReused} refreshed in place, {regenRemoved} removed, {regenRemapped} owned copies rerolled)" : "")
         });
 
-        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, regenReused, regenRemoved, regenRemapped, details = commitLog, warnings = _poolWarnings });
+        return Json(new { success = true, totalItemsCreated, totalLootRowsCreated, regenReused, regenRemoved, regenRemapped, details = commitLog, warnings = _poolWarnings, poolViolations });
+    }
+
+    /// <summary>
+    /// GET /Lootifier/ValidatePools?creatureEntry=NNN — read-only pool-health
+    /// check. Reports any grouped loot pool the creature points at (or its own
+    /// loot table) whose chances sum above 100%. Lets the UI flag a bad table
+    /// before/after committing without changing anything.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> ValidatePools(int creatureEntry)
+    {
+        if (creatureEntry <= 0)
+            return Json(new { success = false, error = "Invalid creature entry" });
+
+        using var mangosConn = _db.Mangos();
+        int lootId = await mangosConn.ExecuteScalarAsync<int>(@"
+            SELECT loot_id FROM creature_template
+            WHERE entry = @E ORDER BY patch DESC LIMIT 1",
+            new { E = creatureEntry });
+
+        if (lootId == 0)
+            return Json(new { success = true, creatureEntry, ok = true, violations = Array.Empty<object>(), note = "Creature has no loot table" });
+
+        var lootIds = new[] { lootId };
+        var refs = await GetReferencedPoolsAsync(mangosConn, lootIds);
+        var violations = await FindOverfullGroupsAsync(mangosConn, refs, lootIds);
+
+        return Json(new { success = true, creatureEntry, lootId, ok = violations.Count == 0, violations });
     }
 
     // ===================== ROLLBACK =====================
@@ -2684,12 +2737,15 @@ public class LootifierController : Controller
     /// <summary>Build the legendary item name from boss name + item name.</summary>
     private string BuildLegendaryName(string bossName, string itemName, string family, RulesetDto ruleset, bool forceSuffix = false)
     {
-        // Shared / non-unique items (dropped by many creatures) get NO creature
-        // name — there's no single creature to name them after. Use the generic
-        // family suffix ("of Destruction" etc.) so the name is stable regardless
-        // of how many mobs drop it. Only truly unique-drop items keep the
+        // Suffix when either (a) the user picked the "suffix" naming style, or
+        // (b) the item is shared / non-unique (dropped by many creatures) so there
+        // is no single creature to name it after. The generic family suffix
+        // ("of Destruction" etc.) keeps the name stable regardless of how many
+        // mobs drop it. Only unique-drop items in "named" style keep the
         // possessive creature name.
-        if (forceSuffix)
+        bool suffixStyle = forceSuffix
+            || string.Equals(ruleset.legendaryNameStyle, "suffix", StringComparison.OrdinalIgnoreCase);
+        if (suffixStyle)
             return itemName + " " + GenericLegendarySuffix(family, ruleset);
 
         // Check if boss name overlaps with item name (any word ≥ 4 chars in common)
@@ -3255,11 +3311,31 @@ public class LootifierController : Controller
             baseOrigShare = Math.Max(MIN_POOL_CHANCE, Math.Abs(liveChance ?? 100f));
         }
 
+        // Overflow guard: never let this base's expansion push the group over
+        // 100%. Tally every OTHER live member (this base + the new variants are
+        // (re)written just below, so exclude them), and cap the base's slice to
+        // whatever room is actually left. Keeps the pool valid even when earlier
+        // members already over-fill it (stale data, orphaned prior variants).
+        var tallyExclude = new List<int> { baseItemEntry };
+        tallyExclude.AddRange(variantEntries);
+        float liveOtherTotal = await SumRefGroupExcludingAsync(mangosConn, refEntry, groupId, tallyExclude);
+        float room = Math.Max(0f, 100f - liveOtherTotal);
+        if (room < BASE_FLOOR_PCT)
+        {
+            _poolWarnings?.Add(
+                $"Item {baseItemEntry}: reference pool {refEntry} group {groupId} is already at {liveOtherTotal:0.##}% — no room to add its variants without exceeding 100%. Skipped; roll back or repair that pool first.");
+            return 0;
+        }
+
         // v6 split: base becomes a RARE fallback at BASE_FLOOR_PCT; the
         // variants + legendary take the rest of this base's original share.
         // The base floor is special — exempt from the member floor.
-        float baseKeep = Math.Min(BASE_FLOOR_PCT, baseOrigShare); // never exceed the slice
-        float variantPool = Math.Max(0f, baseOrigShare - baseKeep);
+        float baseKeep = Math.Min(Math.Min(BASE_FLOOR_PCT, baseOrigShare), room); // never exceed the slice or the room
+        float intendedVariantPool = Math.Max(0f, baseOrigShare - baseKeep);
+        float variantPool = Math.Min(intendedVariantPool, room - baseKeep);
+        if (variantPool + 1e-3f < intendedVariantPool)
+            _poolWarnings?.Add(
+                $"Item {baseItemEntry}: reference pool {refEntry} group {groupId} had only {room:0.##}% free, so its variant share was capped from {intendedVariantPool:0.##}% to {variantPool:0.##}% to keep the pool at 100%. Use Regenerate to reclaim space from earlier variants.");
 
         int memberCount = Math.Min(variantEntries.Count, rolls.Length);
         var rawWeights = new float[memberCount];
@@ -3351,6 +3427,87 @@ public class LootifierController : Controller
     }
 
     /// <summary>
+    /// Live sum of a reference pool group's member chances, optionally excluding
+    /// the items we're about to (re)write. Used to compute how much headroom is
+    /// left before a grouped pool would exceed 100%.
+    /// </summary>
+    private static async Task<float> SumRefGroupExcludingAsync(MySqlConnector.MySqlConnection mangosConn,
+        int refEntry, int groupId, IEnumerable<int>? exclude)
+    {
+        var ex = (exclude ?? Enumerable.Empty<int>()).Distinct().ToArray();
+        string sql = ex.Length > 0
+            ? "SELECT COALESCE(SUM(ChanceOrQuestChance),0) FROM reference_loot_template WHERE entry=@E AND groupid=@G AND item NOT IN @Ex"
+            : "SELECT COALESCE(SUM(ChanceOrQuestChance),0) FROM reference_loot_template WHERE entry=@E AND groupid=@G";
+        var sum = await mangosConn.ExecuteScalarAsync<double?>(sql, new { E = refEntry, G = groupId, Ex = ex });
+        return (float)(sum ?? 0d);
+    }
+
+    /// <summary>
+    /// Returns every grouped loot pool (reference or creature, groupid &lt;&gt; 0)
+    /// among the given ref entries / loot ids whose member chances sum above 100%.
+    /// Group 0 rows are independent coin-flips (no sum constraint) and excluded.
+    /// A grouped pool that sums over 100 is invalid: VMaNGOS' single-roll walk
+    /// can never reach the members past the 100% mark, so they never drop.
+    /// </summary>
+    private static async Task<List<object>> FindOverfullGroupsAsync(MySqlConnector.MySqlConnection mangosConn,
+        IEnumerable<int>? refEntries, IEnumerable<int>? lootIds)
+    {
+        const double LIMIT = 100.01d;
+        var violations = new List<object>();
+
+        var refs = (refEntries ?? Enumerable.Empty<int>()).Where(e => e > 0).Distinct().ToArray();
+        if (refs.Length > 0)
+        {
+            var rows = await mangosConn.QueryAsync<dynamic>(@"
+                SELECT entry, groupid, SUM(ChanceOrQuestChance) AS total
+                FROM reference_loot_template
+                WHERE entry IN @Refs AND groupid <> 0
+                GROUP BY entry, groupid HAVING SUM(ChanceOrQuestChance) > @Limit",
+                new { Refs = refs, Limit = LIMIT });
+            foreach (var r in rows)
+                violations.Add(new
+                {
+                    scope = "reference_loot_template",
+                    entry = Convert.ToInt32(r.entry),
+                    groupId = Convert.ToInt32(r.groupid),
+                    total = Math.Round(Convert.ToDouble(r.total), 2)
+                });
+        }
+
+        var loots = (lootIds ?? Enumerable.Empty<int>()).Where(e => e > 0).Distinct().ToArray();
+        if (loots.Length > 0)
+        {
+            var rows = await mangosConn.QueryAsync<dynamic>(@"
+                SELECT entry, groupid, SUM(ChanceOrQuestChance) AS total
+                FROM creature_loot_template
+                WHERE entry IN @Loots AND groupid <> 0
+                GROUP BY entry, groupid HAVING SUM(ChanceOrQuestChance) > @Limit",
+                new { Loots = loots, Limit = LIMIT });
+            foreach (var r in rows)
+                violations.Add(new
+                {
+                    scope = "creature_loot_template",
+                    entry = Convert.ToInt32(r.entry),
+                    groupId = Convert.ToInt32(r.groupid),
+                    total = Math.Round(Convert.ToDouble(r.total), 2)
+                });
+        }
+
+        return violations;
+    }
+
+    /// <summary>All reference pools a creature's loot table points at (via negative mincountOrRef).</summary>
+    private static async Task<List<int>> GetReferencedPoolsAsync(MySqlConnector.MySqlConnection mangosConn, IEnumerable<int> lootIds)
+    {
+        var loots = lootIds.Where(e => e > 0).Distinct().ToArray();
+        if (loots.Length == 0) return new List<int>();
+        var rows = await mangosConn.QueryAsync<int>(
+            "SELECT DISTINCT ABS(mincountOrRef) FROM creature_loot_template WHERE entry IN @L AND mincountOrRef < 0",
+            new { L = loots });
+        return rows.ToList();
+    }
+
+    /// <summary>
     /// Direct-drop base with no existing pool: mint a reference_loot_template
     /// group holding base + variants normalized to 100, then replace the base's
     /// direct creature_loot_template row with a single 100%/1 pointer to it.
@@ -3409,8 +3566,19 @@ public class LootifierController : Controller
         // v6 split for a minted pool: the pool's full budget is 100 (pointer is
         // 100%/1). Base becomes the rare fallback at BASE_FLOOR_PCT; variants +
         // legendary split the remaining 100 - base with the member floor.
-        float baseKeep = Math.Min(BASE_FLOOR_PCT, 100f);
-        float variantPool = 100f - baseKeep;
+        // On a fresh mint the group is empty so room == 100 and this is a no-op;
+        // on reuse (re-commit) it caps against members left from a prior run so
+        // the group can never exceed 100%.
+        var tallyExclude = new List<int> { baseItemEntry };
+        tallyExclude.AddRange(variantEntries);
+        float liveOtherTotal = await SumRefGroupExcludingAsync(mangosConn, refEntry, POOL_GROUP_ID, tallyExclude);
+        float room = Math.Max(0f, 100f - liveOtherTotal);
+        if (room < BASE_FLOOR_PCT)
+            _poolWarnings?.Add(
+                $"Item {baseItemEntry}: minted pool {refEntry} is already at {liveOtherTotal:0.##}% — variant shares capped to keep it at 100%. Roll back and re-commit to rebuild cleanly.");
+
+        float baseKeep = Math.Min(BASE_FLOOR_PCT, room);
+        float variantPool = Math.Max(0f, room - baseKeep);
 
         int memberCount = Math.Min(variantEntries.Count, rolls.Length);
         var rawWeights = new float[memberCount];
@@ -3923,6 +4091,10 @@ public class RulesetDto
     public string legendarySuffixMelee { get; set; } = "of Destruction";
     public string legendarySuffixRanged { get; set; } = "of the Hunt";
     public string legendarySuffixCaster { get; set; } = "of Arcana";
+    // How legendaries are named: "named" = boss/source-named ("Edwin VanCleef's
+    // Blade"); "suffix" = generic family suffix ("Blade of Destruction"). Shared
+    // drops (no single source) always fall back to the suffix regardless.
+    public string legendaryNameStyle { get; set; } = "named";
     public int legendaryItemEntry { get; set; } = 0; // Single mode: user-chosen item. 0 = random.
 }
 

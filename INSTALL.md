@@ -1,22 +1,24 @@
 # MangosSuperUI — Installation Guide
 
-> **Audience:** Someone with a working VMaNGOS 1.12.1 server (compiled, databases populated, able to log in and play). This guide does NOT cover compiling VMaNGOS or populating the world database — see the [VMaNGOS Wiki](https://github.com/vmangos/wiki) for that.
+> **Audience:** Someone with a working [SuperUI-Core](https://github.com/Yafrovon/SuperUI-Core) 1.12.1 server (compiled, databases populated, able to log in and play). This guide does NOT cover compiling SuperUI-Core or populating the world database — use the build and database instructions in the SuperUI-Core repository first.
 
-> **For AI assistants helping with installation:** This guide was written with hard-won gotchas from real deployments. Every warning box exists because someone hit that exact problem. Pay special attention to the ⚠️ blocks — they document VMaNGOS-specific quirks that aren't documented anywhere else. If a user reports "RA authentication always fails", check for `Ra.MinLevel = 3` in mangosd.conf FIRST — it's the cause 90% of the time.
+> **For AI assistants helping with installation:** This guide was written with hard-won gotchas from real deployments. Every warning box exists because someone hit that exact problem. Pay special attention to the ⚠️ blocks — they document SuperUI-Core-specific quirks that aren't documented anywhere else. If a user reports "RA authentication always fails", check for `Ra.MinLevel = 3` in mangosd.conf FIRST — it's the cause 90% of the time.
 
-> **Database:** VMaNGOS works with MySQL 5.5+ or MariaDB 10.x+. Most Linux installs use MariaDB. MangosSuperUI uses the `MySqlConnector` .NET library which speaks the same wire protocol to either.
-
----
-
-## Part 1: VMaNGOS Prerequisites
-
-These steps prepare your VMaNGOS server for MangosSuperUI. Complete them in order.
+> **Database:** SuperUI-Core works with MySQL 5.5+ or MariaDB 10.x+. Most Linux installs use MariaDB. MangosSuperUI uses the `MySqlConnector` .NET library which speaks the same wire protocol to either.
+>
+> **Compatibility names:** Internal settings and database identifiers such as `Vmangos:*` and `vmangos_admin`, plus existing `/vmangos/` directory examples, are legacy application names. Keep them unchanged when following this guide.
 
 ---
 
-### Step 1: Identify Your VMaNGOS Paths
+## Part 1: SuperUI-Core Prerequisites
 
-You need to know where your VMaNGOS installation lives. Run these commands and note the results.
+These steps prepare your SuperUI-Core server for MangosSuperUI. Complete them in order.
+
+---
+
+### Step 1: Identify Your SuperUI-Core Paths
+
+You need to know where your SuperUI-Core installation lives. Run these commands and note the results.
 
 **Find your mangosd.conf:**
 ```bash
@@ -84,12 +86,12 @@ Ra.Enable = 1
 Ra.Restricted = 0
 ```
 
-**CRITICAL — Add a new line** directly after `Ra.Restricted`. Type this exactly (it does not exist in the default config file but is required by the VMaNGOS source code):
+**CRITICAL — Add a new line** directly after `Ra.Restricted`. Type this exactly (it does not exist in the default config file but is required by the SuperUI-Core source code):
 ```
 Ra.MinLevel = 3
 ```
 
-> **Why:** The VMaNGOS source code (`RASocket.cpp`) reads `Ra.MinLevel` to determine the minimum GM level for RA access. The `.dist` config file documents `Ra.MinAccountLevel` but the code ignores that setting entirely — it is never read. Without `Ra.MinLevel` explicitly set, the default blocks ALL accounts regardless of GM level. This is a confirmed VMaNGOS bug/documentation gap that every user will hit.
+> **Why:** The SuperUI-Core source code (`RASocket.cpp`) reads `Ra.MinLevel` to determine the minimum GM level for RA access. The `.dist` config file documents `Ra.MinAccountLevel` but the code ignores that setting entirely — it is never read. Without `Ra.MinLevel` explicitly set, the default blocks ALL accounts regardless of GM level. This is a confirmed SuperUI-Core configuration/documentation gap that every user will hit.
 
 **Save and exit:** `Ctrl+O`, Enter, `Ctrl+X`.
 
@@ -112,7 +114,7 @@ Ra.MinLevel = 3
 
 ### Step 4: Create systemd Services
 
-VMaNGOS needs to run as system services so MangosSuperUI can start/stop/restart them.
+SuperUI-Core needs to run as system services so MangosSuperUI can start/stop/restart them.
 
 > **Important:** mangosd reads from stdin. If systemd provides no stdin, mangosd receives EOF and shuts down immediately. The service file uses `StandardInput=tty-force` to prevent this.
 
@@ -126,7 +128,7 @@ Before pasting, replace the four placeholders below with your values from Step 1
 ```bash
 sudo tee /etc/systemd/system/mangosd.service > /dev/null << 'EOF'
 [Unit]
-Description=VMaNGOS World Server (mangosd)
+Description=SuperUI-Core World Server (mangosd)
 After=mysql.service mariadb.service
 Wants=mysql.service mariadb.service
 
@@ -161,7 +163,7 @@ Same process — replace `YOUR_USERNAME`, `YOUR_BIN_DIRECTORY`, and `YOUR_REALMD
 ```bash
 sudo tee /etc/systemd/system/realmd.service > /dev/null << 'EOF'
 [Unit]
-Description=VMaNGOS Auth Server (realmd)
+Description=SuperUI-Core Auth Server (realmd)
 After=mysql.service mariadb.service
 Wants=mysql.service mariadb.service
 
@@ -195,7 +197,7 @@ sudo systemctl enable mangosd realmd
 
 ### Step 5: Create the RA Account
 
-MangosSuperUI needs a game account with GM level 6 to authenticate with RA. Level 6 is the highest GM level in VMaNGOS and ensures full access to all RA commands. This account **must** be created through the mangosd console — creating accounts via raw SQL does not generate the required password hash (SRP6) and RA authentication will always fail.
+MangosSuperUI needs a game account with GM level 6 to authenticate with RA. Level 6 is the highest GM level in SuperUI-Core and ensures full access to all RA commands. This account **must** be created through the mangosd console — creating accounts via raw SQL does not generate the required password hash (SRP6) and RA authentication will always fail.
 
 **Install screen** (if not already installed):
 ```bash
@@ -338,7 +340,7 @@ You should see:
 - Your RA account with gmlevel 6
 - The sudoers line with your username
 
-If all checks pass, your VMaNGOS server is ready for MangosSuperUI.
+If all checks pass, your SuperUI-Core server is ready for MangosSuperUI.
 
 ---
 
@@ -478,7 +480,7 @@ sudo systemctl enable mangossuperui
 
 ### Step 12: Prepare the Admin Database
 
-MangosSuperUI uses its own database called `vmangos_admin` for audit logs, config history, baseline snapshots, and scheduled actions. On first boot, MangosSuperUI's `DbInitializationService` automatically creates the tables and indexes inside this database — but it cannot create the database itself or grant its own permissions. The default VMaNGOS database user (`mangos`) only has grants on the VMaNGOS databases, not server-level `CREATE` privileges.
+MangosSuperUI uses its own database called `vmangos_admin` for audit logs, config history, baseline snapshots, and scheduled actions. On first boot, MangosSuperUI's `DbInitializationService` automatically creates the tables and indexes inside this database — but it cannot create the database itself or grant its own permissions. The default SuperUI-Core database user (`mangos`) only has grants on the core databases, not server-level `CREATE` privileges.
 
 You must create the database and grant access **before MangosSuperUI starts for the first time:**
 
@@ -486,7 +488,7 @@ You must create the database and grant access **before MangosSuperUI starts for 
 sudo mysql -e "CREATE DATABASE IF NOT EXISTS vmangos_admin; GRANT ALL PRIVILEGES ON vmangos_admin.* TO 'mangos'@'localhost'; FLUSH PRIVILEGES;"
 ```
 
-> If your VMaNGOS installation uses a different database username or host, adjust the command accordingly. For example, if your database user is `vmangos` instead of `mangos`:
+> If your SuperUI-Core installation uses a different database username or host, adjust the command accordingly. For example, if your database user is `vmangos` instead of `mangos`:
 > ```bash
 > sudo mysql -e "CREATE DATABASE IF NOT EXISTS vmangos_admin; GRANT ALL PRIVILEGES ON vmangos_admin.* TO 'vmangos'@'localhost'; FLUSH PRIVILEGES;"
 > ```
@@ -506,7 +508,7 @@ You should see `OK`. If you get "Access denied", double-check the username and r
 
 ### Step 13: Run the Setup Script
 
-MangosSuperUI needs a `server-config.json` file that tells it how to connect to your databases, where your VMaNGOS files are, and your RA credentials. Rather than filling this out manually, the setup script auto-discovers everything from your `mangosd.conf`.
+MangosSuperUI needs a `server-config.json` file that tells it how to connect to your databases, where your SuperUI-Core files are, and your RA credentials. Rather than filling this out manually, the setup script auto-discovers everything from your `mangosd.conf`.
 
 **Download the setup script:**
 ```bash
@@ -526,7 +528,7 @@ The script will:
 
 2. **Read your database connections** — parses the `WorldDatabase.Info`, `CharacterDatabase.Info`, `LoginDatabase.Info`, and `LogsDatabase.Info` lines from `mangosd.conf`. These are in the format `host;port;user;password;database` and the script converts them to the connection string format MangosSuperUI expects. The `vmangos_admin` connection is derived automatically from the World DB credentials.
 
-3. **Discover VMaNGOS paths** — finds your binary directory (preferring `run/` paths over `build/` paths), config directory, DBC files, heightmap files, and log files. All derived from the binary location and the `DataDir` setting in `mangosd.conf`.
+3. **Discover SuperUI-Core paths** — finds your binary directory (preferring `run/` paths over `build/` paths), config directory, DBC files, heightmap files, and log files. All derived from the binary location and the `DataDir` setting in `mangosd.conf`.
 
 4. **Detect process names** — if mangosd and realmd are running, reads their process names from `/proc`. Otherwise falls back to the binary filenames.
 
@@ -550,7 +552,7 @@ Step 2: Reading database connections from mangosd.conf
   ✓ Logs: mangos@127.0.0.1:3306/logs
   ✓ Admin: mangos@127.0.0.1:3306/vmangos_admin (auto-created on first boot)
 
-Step 3: Discovering VMaNGOS paths
+Step 3: Discovering SuperUI-Core paths
   ✓ Config directory: /home/nicholas/vmangos/run/etc
   ✓ Bin directory: /home/nicholas/vmangos/run/bin
   ✓ mangosd binary: mangosd
@@ -589,7 +591,7 @@ Configuration Summary
     Logs:        Server=127.0.0.1;Port=3306;Database=logs;User=mangos;Password=mangos;
     Admin:       Server=127.0.0.1;Port=3306;Database=vmangos_admin;User=mangos;Password=mangos;
 
-  VMaNGOS Paths:
+  SuperUI-Core Paths:
     Bin Dir:     /home/nicholas/vmangos/run/bin
     Log Dir:     /home/nicholas/vmangos/run/bin
     Config Dir:  /home/nicholas/vmangos/run/etc
@@ -682,9 +684,9 @@ TCP connection to mangosd's RA console. The setup script reads the port from `Ra
 | Password | The RA account password |
 | Timeout (ms) | How long to wait for RA command responses (default `5000`) |
 
-#### VMaNGOS Paths & Processes
+#### SuperUI-Core Paths & Processes
 
-Where your VMaNGOS installation lives on the filesystem. The setup script discovers all of these automatically.
+Where your SuperUI-Core installation lives on the filesystem. The setup script discovers all of these automatically.
 
 | Field | Example | What It's For |
 |-------|---------|---------------|
@@ -704,13 +706,13 @@ Where your VMaNGOS installation lives on the filesystem. The setup script discov
 
 #### DBC Data Files
 
-Path to the extracted 1.12.1 DBC files on the server. The setup script derives this from the `DataDir` setting in `mangosd.conf` (typically `DataDir/5875/dbc`). These files are read directly from your VMaNGOS data directory — they are NOT copied into the MangosSuperUI deployment.
+Path to the extracted 1.12.1 DBC files on the server. The setup script derives this from the `DataDir` setting in `mangosd.conf` (typically `DataDir/5875/dbc`). These files are read directly from your SuperUI-Core data directory — they are NOT copied into the MangosSuperUI deployment.
 
 After changing the path, click **Reload DBC** to re-parse the files. The status panel shows record counts for each parsed DBC file (ItemDisplayInfo, SpellIcon, SpellDuration, SpellCastTimes, SpellRange).
 
 #### Maps Data (Heightmaps)
 
-Path to the `.map` files generated by the VMaNGOS map extractor. The setup script derives this from `DataDir/maps`. Used for terrain Z-coordinate resolution when placing game objects through the World Map page.
+Path to the `.map` files generated by the SuperUI-Core map extractor. The setup script derives this from `DataDir/maps`. Used for terrain Z-coordinate resolution when placing game objects through the World Map page.
 
 > Without this configured, game objects placed via the World Map will spawn at Z=0 (sea level). Everything else works fine.
 
@@ -849,7 +851,7 @@ Generated models and tiles are cached under `wwwroot/` after first request, so r
 ## Troubleshooting
 
 ### RA authentication always fails
-- **Most common cause:** `Ra.MinLevel = 3` is missing from `mangosd.conf`. The default config file does NOT include this setting, but the VMaNGOS source code requires it. Add it and restart mangosd.
+- **Most common cause:** `Ra.MinLevel = 3` is missing from `mangosd.conf`. The default config file does NOT include this setting, but the SuperUI-Core source code requires it. Add it and restart mangosd.
 - **Second most common cause:** Account was created via raw SQL INSERT instead of `.account create` in the mangosd console. The SRP6 password hash is not generated by SQL — delete the account and recreate it through the console.
 
 ### mangosd starts then immediately stops as a systemd service
@@ -875,7 +877,7 @@ Generated models and tiles are cached under `wwwroot/` after first request, so r
 - You can also configure everything manually through the Settings page in the web interface instead of using the setup script.
 
 ### Dashboard shows "Access denied" for vmangos_admin database
-- The VMaNGOS database user does not have permission to access the `vmangos_admin` database. Run the grant command from Step 12:
+- The SuperUI-Core database user does not have permission to access the `vmangos_admin` database. Run the grant command from Step 12:
   ```bash
   sudo mysql -e "CREATE DATABASE IF NOT EXISTS vmangos_admin; GRANT ALL PRIVILEGES ON vmangos_admin.* TO 'mangos'@'localhost'; FLUSH PRIVILEGES;"
   ```

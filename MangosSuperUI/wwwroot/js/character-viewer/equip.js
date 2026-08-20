@@ -374,23 +374,42 @@ async function mountAttachmentsFromPayload(character, attachments, inventoryType
  * `window.retexEquipWeaponGlbDirect` alias the items page calls.
  *
  * @param {object} character   loader.loadCharacterGlb() result
- * @param {string} glbUrl      Temp preview GLB url (/item_models/_preview/..)
+ * @param {string|null} glbUrl Primary temp preview GLB url (/item_models/_preview/..)
  * @param {number} [inventoryType]  Item slot; picks the attachment + (for
  *                                  weapons) the hand. Defaults to mainhand.
+ * @param {Object<string,string>} [attachmentUrls]
+ *        Authored attachment pair for model slots that need more than one GLB.
+ *        Shoulder previews provide { shoulderLeft, shoulderRight }.
  * @returns {Promise<boolean>} true if mounted
  */
-export async function equipWeaponGlbDirect(character, glbUrl, inventoryType) {
-    if (!character || !glbUrl) return false;
+export async function equipWeaponGlbDirect(character, glbUrl, inventoryType, attachmentUrls = null) {
+    if (!character) return false;
 
     const t = inventoryType ?? 21;   // default: Main Hand
 
-    // Shoulders get both sides. The preview GLB is the LEFT model (ModelName1);
-    // mount it left and a mirrored clone right so the recolored pauldron shows
-    // on BOTH shoulders. Handled separately from the payload path because that
-    // path loads one URL → one attachment.
+    // Shoulder displays contain two authored M2s. Never clone or mirror one
+    // spaulder: L/R geometry is not symmetric, and reflecting the converted GLB
+    // across X flips its forward axis rather than its lateral axis. The preview
+    // endpoints now return both URLs and we feed them through the same payload
+    // path used by committed items. With an older endpoint, mount only the
+    // primary (ModelName1/left) GLB instead of reproducing the broken duplicate.
     if (t === SHOULDER_INVENTORY_TYPE) {
-        return mountShouldersBothSides(character, glbUrl);
+        const hasAuthoredPairPayload = !!attachmentUrls &&
+            (Object.prototype.hasOwnProperty.call(attachmentUrls, 'shoulderLeft') ||
+             Object.prototype.hasOwnProperty.call(attachmentUrls, 'shoulderRight'));
+        if (!hasAuthoredPairPayload && !glbUrl) return false;
+        const payload = {
+            shoulderLeft: hasAuthoredPairPayload ? (attachmentUrls.shoulderLeft || null) : glbUrl,
+            shoulderRight: attachmentUrls?.shoulderRight || null,
+        };
+        if (!payload.shoulderRight) {
+            console.warn('[equip] shoulder preview has no authored right-side GLB; mounting left side only');
+        }
+        const mounted = await mountAttachmentsFromPayload(character, payload, t);
+        return mounted > 0;
     }
+
+    if (!glbUrl) return false;
 
     let payload;
     if (WEAPON_INVENTORY_TYPES.has(t)) {
@@ -405,57 +424,6 @@ export async function equipWeaponGlbDirect(character, glbUrl, inventoryType) {
 
     const mounted = await mountAttachmentsFromPayload(character, payload, t);
     return mounted > 0;
-}
-
-/**
- * Mount a shoulder preview GLB on BOTH shoulders: the loaded model on the left
- * (it's ModelName1 = the left/LShoulder model), and a MIRRORED clone on the
- * right. Vanilla ships separate L/R shoulder models, so the right bone is not a
- * mirror transform — we mirror the clone across X (scale.x = -1) to approximate
- * the right pauldron. DoubleSide keeps the flipped winding from culling the
- * clone inside-out (its shading may read slightly flat — fine for a recolor
- * preview, which is about color, not lighting).
- *
- * This is an approximation: the faithful right side would come from building
- * ModelName2 server-side and mounting it. If the right pauldron ever looks
- * wrong-facing, drop the `scale.x *= -1` line — that's the one knob.
- *
- * @param {object} character
- * @param {string} glbUrl
- * @returns {Promise<boolean>} true if either side mounted
- */
-async function mountShouldersBothSides(character, glbUrl) {
-    let gltf;
-    try {
-        gltf = await loadGlb(glbUrl);
-    } catch (err) {
-        console.warn('[equip] shoulder preview load failed:', err);
-        return false;
-    }
-
-    const left = gltf.scene;
-    const okLeft = dresser.mountAttachment(character, ATTACHMENT_SHOULDER_LEFT, left);
-
-    // Mirrored clone for the right shoulder. clone(true) shares materials, so
-    // clone each material before flipping its side — otherwise DoubleSide would
-    // leak back onto the left model's shared material.
-    const right = left.clone(true);
-    right.scale.x *= -1;
-    right.traverse(o => {
-        if (!o.isMesh || !o.material) return;
-        if (Array.isArray(o.material)) {
-            o.material = o.material.map(m => {
-                const c = m.clone(); c.side = THREE.DoubleSide; return c;
-            });
-        } else {
-            const c = o.material.clone(); c.side = THREE.DoubleSide; o.material = c;
-        }
-    });
-    const okRight = dresser.mountAttachment(character, ATTACHMENT_SHOULDER_RIGHT, right);
-
-    if (!okLeft && !okRight)
-        console.warn('[equip] shoulder mount failed — no shoulder attachment nodes on character');
-    return okLeft || okRight;
 }
 
 /**

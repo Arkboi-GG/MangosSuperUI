@@ -129,6 +129,13 @@
                                         <div id="legendaryConfig" class="lf-legendary-config" style="display:none;">
                                             <div class="lf-ruleset-grid" style="margin-top:8px;">
                                                 <div class="lf-ruleset-field">
+                                                    <label>Naming</label>
+                                                    <select class="form-input" id="rsLegNameStyle" style="font-size:11px;padding:5px 8px;" title="Named: boss/source-named (e.g. &quot;Edwin VanCleef's Blade&quot;). Suffix: generic family suffix (e.g. &quot;Blade of Destruction&quot;). Items dropped by many creatures always use the suffix.">
+                                                        <option value="named" selected>Boss / source-named</option>
+                                                        <option value="suffix">Suffix</option>
+                                                    </select>
+                                                </div>
+                                                <div class="lf-ruleset-field">
                                                     <label>Legendary Item</label>
                                                     <select class="form-input" id="rsLegendaryItem" style="font-size:11px;padding:5px 8px;">
                                                         <option value="0">Random (any selected)</option>
@@ -258,6 +265,15 @@
                                     <div class="lf-legendary-config lf-batch-legendary-config" style="display:none;">
                                         @* Switch + Effective Drop % live on the Boss Legendary row. *@
                                         <input type="hidden" class="lf-batch-leg-drop" value="0.2" />
+                                        <div class="lf-ruleset-grid" style="margin-top:6px;">
+                                            <div class="lf-ruleset-field">
+                                                <label>Naming</label>
+                                                <select class="form-input lf-batch-leg-namestyle" style="font-size:11px;padding:5px 8px;" title="Named: boss/source-named. Suffix: generic family suffix. Items dropped by many creatures always use the suffix.">
+                                                    <option value="named" selected>Boss / source-named</option>
+                                                    <option value="suffix">Suffix</option>
+                                                </select>
+                                            </div>
+                                        </div>
                                         <div class="lf-ruleset-grid" style="margin-top:6px;">
                                             <div class="lf-ruleset-field">
                                                 <label>Melee Suffix</label>

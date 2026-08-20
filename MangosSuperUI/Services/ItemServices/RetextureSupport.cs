@@ -214,12 +214,12 @@ public partial class RetextureSupport
 
     /// <summary>
     /// Recolor the model's DBC-controlled texture with the seeded recipe and bake
-    /// a preview GLB; returns its web URL for equip.equipWeaponGlbDirect. The
+    /// the preview GLB assets needed by the model viewer. The
     /// recolor is deterministic and pixel-sharp, so we skip the upscaler cleanup
     /// pass (BuildPreviewResponse's skipCleanup path). null when the display has
     /// no recolorable model texture.
     /// </summary>
-    public async Task<string?> RecolorModelGlbAsync(
+    public async Task<PreviewGlbAssets?> RecolorModelGlbAsync(
         uint displayId, int seed, string theory,
         (float kd, float ku, float m, float pop) shape,
         (float budget, float leash) policy,
@@ -237,7 +237,7 @@ public partial class RetextureSupport
             theory, shape.kd, shape.ku, shape.m, shape.pop, policy.budget, policy.leash, value);
         if (ok == null) return null;
 
-        return _itemTextures.BuildPreviewGlb(displayId, outPng);
+        return _itemTextures.BuildPreviewGlbs(displayId, outPng);
     }
 
     // ══ Commit-to-DB retexture (self-contained; SEEDED path only) ═══════════

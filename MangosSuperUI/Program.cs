@@ -100,6 +100,8 @@ builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponPreviewSe
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponDonorResolver>();
 // Read-only TBC client archive mount (WeaponForge:TbcDataPath) for the TBC-import section.
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.TbcMpqSource>();
+// Shipped TBC item-name catalog (wwwroot/data/tbc-item-catalog.json) — names never live in MPQs.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.TbcItemCatalog>();
 // Phase-3 donor-scaffold writer: emits real custom geometry on the donor scaffold (fixed topology).
 // Swap back to NullWeaponMeshWriter only to isolate the compiler from the writer during debugging.
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.IWeaponMeshWriter,

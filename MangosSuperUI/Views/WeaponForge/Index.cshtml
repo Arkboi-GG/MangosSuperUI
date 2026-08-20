@@ -260,7 +260,7 @@
             <button class="wf-close" id="tbcModalClose" title="Close">✕</button></h3>
         <div class="wf-row">
             <div class="wf-field" style="flex:1;">
-                <input type="text" id="tbcSearch" placeholder="Search model / texture / icon (e.g. sword_2h, blood, arcanite)…" style="width:100%;">
+                <input type="text" id="tbcSearch" placeholder="Search by item name, model, or item ID (e.g. Gorehowl, sword_2h, arcanite)…" style="width:100%;">
             </div>
         </div>
         <div class="wf-modal-list" id="tbcList"><div style="padding:14px;color:var(--text-muted);font-size:12px;">Loading…</div></div>
@@ -547,16 +547,17 @@
             async tbcPreview(btn) {
                 if (!tbcSel) return setResult({ title: 'No TBC weapon selected', error: 'Browse and pick one first.' });
                 const q = new URLSearchParams({
-                    model: tbcSel.model, displayRow: tbcSel.displayRow,
+                    entry: tbcSel.entry, model: tbcSel.model, displayRow: tbcSel.displayRow,
                     weaponType: document.getElementById('tbcType').value || 'sword1h',
                     targetTriangles: tbcTargetTris(),
                 });
                 const d = await (await fetch('/WeaponForge/TbcPreviewWeapon?' + q)).json();
                 lastGrip = d.grip || null;
                 setResult({
-                    title: d.ok ? `TBC preview — ${tbcSel.model}` : 'TBC preview failed',
+                    title: d.ok ? `TBC preview — ${d.itemName || tbcSel.name}` : 'TBC preview failed',
                     kv: d.ok ? {
                         'Type': d.weaponTypeLabel || '1H Sword',
+                        'Model': d.model,
                         'Triangles': (d.triangleCount ?? 0).toLocaleString(),
                         'Vertices': (d.vertexCount ?? 0).toLocaleString(),
                         'Texture': d.hasTexture ? d.texture : 'MISSING — donor texture will be used',
@@ -568,6 +569,7 @@
             async tbcForge(btn) {
                 if (!tbcSel) return setResult({ title: 'No TBC weapon selected', error: 'Browse and pick one first.' });
                 const fd = new FormData();
+                fd.append('entry', tbcSel.entry);
                 fd.append('model', tbcSel.model);
                 fd.append('displayRow', tbcSel.displayRow);
                 fd.append('weaponType', document.getElementById('tbcType').value || 'sword1h');
@@ -618,11 +620,17 @@
                 }
                 if (s.error) { el.innerHTML = `<span style="color:#b42318;">TBC mount problem: ${esc(s.error)}</span>`; return; }
                 el.innerHTML = `Mounted <b>${s.archiveCount}</b> archive(s) from <code>${esc(s.path)}</code> — ` +
-                               `<b>${s.weaponCount.toLocaleString()}</b> browsable weapon displays.`;
+                               (s.itemCount > 0
+                                   ? `<b>${s.itemCount.toLocaleString()}</b> named TBC weapons browsable ` +
+                                     `(${s.weaponCount.toLocaleString()} models).`
+                                   : `<b>${s.weaponCount.toLocaleString()}</b> weapon models browsable (no item-name catalog).`);
                 const enable = s.weaponCount > 0;
                 for (const id of ['tbcBrowseBtn']) document.getElementById(id).disabled = !enable;
             } catch (e) { el.textContent = 'TBC status unavailable: ' + e; }
         }
+
+        // WoW quality colors (0 poor … 5 legendary).
+        const QUALITY_COLORS = ['#9d9d9d', '#e6e8ea', '#1eff00', '#0070dd', '#a335ee', '#ff8000', '#e6cc80'];
 
         async function loadTbcPage(page) {
             tbcPage = page;
@@ -634,11 +642,23 @@
                 if (!d.ok) { list.innerHTML = `<div style="padding:14px;font-size:12px;color:#b42318;">${esc(d.error || 'failed')}</div>`; return; }
                 if (!d.weapons.length) { list.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:12px;">No matches.</div>'; }
                 else {
-                    let html = '<table><tr><th>Model</th><th>Texture</th><th>Icon</th><th>Row</th></tr>';
-                    for (const w of d.weapons)
-                        html += `<tr data-model="${esc(w.model)}" data-row="${w.displayRow}" data-tex="${esc(w.texture)}">` +
-                                `<td>${esc(w.model)}</td><td class="muted">${esc(w.texture)}</td>` +
-                                `<td class="muted">${esc(w.icon)}</td><td class="muted">${w.displayRow}</td></tr>`;
+                    const itemMode = d.mode === 'items';
+                    let html = itemMode
+                        ? '<table><tr><th>Name</th><th>ilvl</th><th>Type</th><th>Model</th><th>ID</th></tr>'
+                        : '<table><tr><th>Model</th><th>Texture</th><th>Row</th></tr>';
+                    for (const w of d.weapons) {
+                        const attrs = `data-entry="${w.entry || 0}" data-model="${esc(w.model)}" data-row="${w.displayRow}"` +
+                                      ` data-type="${esc(w.typeKey || '')}" data-name="${esc(w.name)}"`;
+                        if (itemMode) {
+                            const col = QUALITY_COLORS[w.quality] || QUALITY_COLORS[1];
+                            html += `<tr ${attrs}><td style="color:${col};font-weight:600;">${esc(w.name)}</td>` +
+                                    `<td class="muted">${w.itemLevel || '—'}</td><td class="muted">${esc(w.typeLabel || '—')}</td>` +
+                                    `<td class="muted">${esc(w.model)}</td><td class="muted">${w.entry}</td></tr>`;
+                        } else {
+                            html += `<tr ${attrs}><td>${esc(w.model)}</td><td class="muted">${esc(w.texture)}</td>` +
+                                    `<td class="muted">${w.displayRow}</td></tr>`;
+                        }
+                    }
                     list.innerHTML = html + '</table>';
                     list.querySelectorAll('tr[data-model]').forEach(tr => tr.addEventListener('click', () => selectTbc(tr)));
                 }
@@ -651,8 +671,20 @@
         }
 
         function selectTbc(tr) {
-            tbcSel = { model: tr.dataset.model, displayRow: +tr.dataset.row, texture: tr.dataset.tex };
-            document.getElementById('tbcSelected').value = `${tbcSel.model} (row ${tbcSel.displayRow})`;
+            tbcSel = {
+                entry: +tr.dataset.entry || 0,
+                model: tr.dataset.model,
+                displayRow: +tr.dataset.row,
+                name: tr.dataset.name || tr.dataset.model,
+                typeKey: tr.dataset.type || '',
+            };
+            document.getElementById('tbcSelected').value =
+                tbcSel.entry ? `${tbcSel.name} (item ${tbcSel.entry})` : `${tbcSel.model} (row ${tbcSel.displayRow})`;
+            // Pre-select the family from the TBC subclass; the name field defaults to the item name.
+            const typeSel = document.getElementById('tbcType');
+            if (tbcSel.typeKey && [...typeSel.options].some(o => o.value === tbcSel.typeKey && !o.disabled))
+                typeSel.value = tbcSel.typeKey;
+            document.getElementById('tbcName').placeholder = tbcSel.name;
             document.getElementById('tbcPreviewBtn').disabled = false;
             document.getElementById('tbcForgeBtn').disabled = false;
             document.getElementById('tbcModal').classList.remove('open');

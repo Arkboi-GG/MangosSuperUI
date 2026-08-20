@@ -254,11 +254,18 @@ public class RetextureEngineController : Controller
         if (slots != null)
             return Json(new { success = true, kind = "atlas", slotUrls = slots, value = vTag });
 
-        // Weapon / model item: recolor the DBC texture and bake a preview GLB.
-        var glbUrl = await _support.RecolorModelGlbAsync(
+        // Weapon / model item: recolor the DBC texture and bake its preview GLB assets.
+        var assets = await _support.RecolorModelGlbAsync(
             displayId, seed, theory, shape, policy, vset, "retexture_engine_model", ct);
-        if (glbUrl != null)
-            return Json(new { success = true, kind = "weapon", glbUrl, value = vTag });
+        if (assets != null)
+            return Json(new
+            {
+                success = true,
+                kind = "weapon",
+                glbUrl = assets.GlbUrl,
+                attachments = assets.Attachments,
+                value = vTag
+            });
 
         return Json(new { success = false, error = "no atlas slots and no recolorable model texture for this display" });
     }
