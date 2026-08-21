@@ -39,7 +39,7 @@ public sealed record WeaponTypeProfile
     public uint? PinnedDisplayRow { get; init; }
 
     /// <summary>Case-insensitive ModelName1 prefixes used to find a stock visual donor
-    /// (e.g. "staff_" matches Staff_2H_Standard_A_01.mdx).</summary>
+    /// (e.g. "stave_2h" matches Stave_2H_Long_A_01.mdx).</summary>
     public string[] DonorModelPatterns { get; init; } = [];
 
     /// <summary>Column overrides applied to the donor-2131 gameplay clone so a forged axe is an
@@ -114,14 +114,18 @@ public static class WeaponTypeCatalog
             Key = "staff", Label = "Staff", DefaultNoun = "Staff",
             Subclass = 10, InventoryType = 17, Sheath = 2, Material = 2, DelayMs = 3200,
             TwoHanded = true, SecondHandFraction = 0.30f,
-            DonorModelPatterns = ["staff_"],
+            // Vanilla names staves Stave_2H_* (Stave_2H_Long_A_01 ...); "staff_" is kept for
+            // clients whose patches add Staff_* rows.
+            DonorModelPatterns = ["stave_2h", "staff_"],
         },
         new()
         {
             Key = "polearm", Label = "Polearm", DefaultNoun = "Polearm",
             Subclass = 6, InventoryType = 17, Sheath = 1, Material = 1, DelayMs = 3300,
             TwoHanded = true, SecondHandFraction = 0.18f,
-            DonorModelPatterns = ["spear_2h", "halberd_2h", "pike_", "spear_"],
+            // Vanilla names every polearm Polearm_2H_* (Polearm_2H_Bladed_A_01 ...); the
+            // spear/halberd/pike stems only appear in later clients.
+            DonorModelPatterns = ["polearm_2h", "spear_2h", "halberd_2h", "pike_", "spear_"],
         },
     ];
 

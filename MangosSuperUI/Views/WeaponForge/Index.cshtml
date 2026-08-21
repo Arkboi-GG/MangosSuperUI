@@ -1825,6 +1825,7 @@
                     o.textContent = t.ok ? t.label : `${t.label} (no donor)`;
                     o.disabled = !t.ok;
                     if (t.ok && t.donorModel) o.title = `donor: ${t.donorModel} (row ${t.donorDisplayRow})`;
+                    else if (!t.ok && t.error) o.title = t.error;
                     sel.appendChild(o);
                 }
                 sel.value = [...sel.options].some(o => o.value === keep && !o.disabled) ? keep : 'sword1h';

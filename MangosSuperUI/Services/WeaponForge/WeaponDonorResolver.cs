@@ -34,8 +34,10 @@ public sealed class WeaponDonorResolver
     private readonly object _dbcLock = new();
     private DbcWriterService? _dbc;
 
-    /// <summary>Bound on extract-and-parse attempts per scan pass, so a pattern that matches
-    /// hundreds of rows cannot turn resolution into a full-archive sweep.</summary>
+    /// <summary>Bound on extract-and-parse attempts per scan pass, counted per DISTINCT model
+    /// stem (hundreds of display rows reuse the same handful of .m2 files — 379 Sword_2H rows map
+    /// to 36 models), so a family's whole stock model set is covered without turning resolution
+    /// into a full-archive sweep.</summary>
     private const int MaxCandidateProbes = 60;
 
     public WeaponDonorResolver(MpqReaderService mpq, ILogger<WeaponDonorResolver> logger)
@@ -65,8 +67,12 @@ public sealed class WeaponDonorResolver
         foreach (bool strict in new[] { true, false })
         {
             int probes = 0;
+            var probedStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var row in MatchingRows(dbc, profile))
             {
+                // One probe per model: every later row naming the same .m2 would fail (or pass)
+                // identically on structure, and the first row for a model wins deterministically.
+                if (!probedStems.Add(ModelStem(dbc.ReadString(row[WeaponDisplayInfoRow.F_ModelName1])))) continue;
                 if (++probes > MaxCandidateProbes) break;
                 var info = TryCandidate(dbc, row, profile, strict);
                 if (info is not null)
