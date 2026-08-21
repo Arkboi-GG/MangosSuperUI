@@ -1,6 +1,6 @@
 # MangosSuperUI
 
-https://discord.gg/AzCdnyPHPY - Community Discord for updates, questions, bugs, etc.
+[https://discord.gg/AzCdnyPHPY](https://discord.gg/3u3tnMnweE) - Community Discord for updates, questions, bugs, etc.
 
 https://www.youtube.com/@Yafrovon — Video walkthroughs and feature demos
 
