@@ -214,15 +214,15 @@ public class ZoneSafetyMap
     // When ONE bot proves a destination unpathable (an honest MOVE_FAILED
     // no_path/empty_path from the core), every other bot can skip that pocket
     // for a while instead of re-proving it. TTL'd (terrain doesn't change, but
-    // fixes/mmap reloads do). In-memory only — a restart forgets, fine: re-proving costs seconds.
-    // [FINDING_019] The 017 follow-up over-blacklisted and froze ~66% of the fleet from leveling.
-    // Two fixes here: (1) cell 50yd->12yd — one objective that's only ~5-15yd off-mesh no longer
-    // blacklists a 2500yd^2 block full of REACHABLE neighbors; (2) record-ONCE, not refresh (see
-    // RecordNoPathDest) so the 90-min TTL actually elapses and the fleet re-proves. The old
-    // unconditional refresh kept hot cells alive forever under fleet load (many bots re-hitting the
-    // same dest thousands of times) -> the reachable quest set emptied -> frozen-questing livelock.
+    // fixes/mmap reloads do) and 50yd-cell keyed. In-memory only — a restart
+    // forgets, which is fine: re-proving costs seconds post-FINDING_017.
+    // [FINDING_019] NOTE: a cell-shrink + record-once experiment here (2026-08-20) was REVERTED —
+    // it un-blacklisted the unreachable hot dests and the fleet STAMPEDED to them (71 bots piled at
+    // Menethil, 43 at Duskwood border, congregation fleet-wide). The over-blacklist is also load-
+    // bearing: it keeps bots off objectives that are genuinely off-mesh. Fixing leveling needs the
+    // dests to become REACHABLE (core-side navmesh snap, FINDING_019 locus 3), not just un-skipped.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(int Map, int Cx, int Cy), DateTime> _noPathDests = new();
-    private const float NOPATH_CELL_YARDS = 12f;
+    private const float NOPATH_CELL_YARDS = 50f;
     private const int NOPATH_TTL_MINUTES = 90;
     private const int NOPATH_CAP = 4096;
 
@@ -237,12 +237,7 @@ public class ZoneSafetyMap
             if (_noPathDests.Count >= NOPATH_CAP) return;   // full of live entries — drop the record
         }
         var key = (mapId, (int)MathF.Round(x / NOPATH_CELL_YARDS), (int)MathF.Round(y / NOPATH_CELL_YARDS));
-        // [FINDING_019] Record ONCE. Keep the ORIGINAL expiry while the entry is still live — do NOT
-        // refresh on every re-failure (that unconditional write made the TTL never elapse under fleet
-        // load). Only arm a fresh 90-min window when the key is new or has already expired, so a
-        // genuinely-bad pocket is periodically re-proven and a transiently-bad one decays out.
-        var expiry = DateTime.UtcNow.AddMinutes(NOPATH_TTL_MINUTES);
-        _noPathDests.AddOrUpdate(key, expiry, (_, existing) => existing > DateTime.UtcNow ? existing : expiry);
+        _noPathDests[key] = DateTime.UtcNow.AddMinutes(NOPATH_TTL_MINUTES);
     }
 
     public bool IsNoPathDest(int mapId, float x, float y)
