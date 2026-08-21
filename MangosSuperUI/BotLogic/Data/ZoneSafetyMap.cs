@@ -214,10 +214,15 @@ public class ZoneSafetyMap
     // When ONE bot proves a destination unpathable (an honest MOVE_FAILED
     // no_path/empty_path from the core), every other bot can skip that pocket
     // for a while instead of re-proving it. TTL'd (terrain doesn't change, but
-    // fixes/mmap reloads do) and 50yd-cell keyed. In-memory only — a restart
-    // forgets, which is fine: re-proving costs seconds post-FINDING_017.
+    // fixes/mmap reloads do). In-memory only — a restart forgets, fine: re-proving costs seconds.
+    // [FINDING_019] The 017 follow-up over-blacklisted and froze ~66% of the fleet from leveling.
+    // Two fixes here: (1) cell 50yd->12yd — one objective that's only ~5-15yd off-mesh no longer
+    // blacklists a 2500yd^2 block full of REACHABLE neighbors; (2) record-ONCE, not refresh (see
+    // RecordNoPathDest) so the 90-min TTL actually elapses and the fleet re-proves. The old
+    // unconditional refresh kept hot cells alive forever under fleet load (many bots re-hitting the
+    // same dest thousands of times) -> the reachable quest set emptied -> frozen-questing livelock.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(int Map, int Cx, int Cy), DateTime> _noPathDests = new();
-    private const float NOPATH_CELL_YARDS = 50f;
+    private const float NOPATH_CELL_YARDS = 12f;
     private const int NOPATH_TTL_MINUTES = 90;
     private const int NOPATH_CAP = 4096;
 
@@ -232,7 +237,12 @@ public class ZoneSafetyMap
             if (_noPathDests.Count >= NOPATH_CAP) return;   // full of live entries — drop the record
         }
         var key = (mapId, (int)MathF.Round(x / NOPATH_CELL_YARDS), (int)MathF.Round(y / NOPATH_CELL_YARDS));
-        _noPathDests[key] = DateTime.UtcNow.AddMinutes(NOPATH_TTL_MINUTES);
+        // [FINDING_019] Record ONCE. Keep the ORIGINAL expiry while the entry is still live — do NOT
+        // refresh on every re-failure (that unconditional write made the TTL never elapse under fleet
+        // load). Only arm a fresh 90-min window when the key is new or has already expired, so a
+        // genuinely-bad pocket is periodically re-proven and a transiently-bad one decays out.
+        var expiry = DateTime.UtcNow.AddMinutes(NOPATH_TTL_MINUTES);
+        _noPathDests.AddOrUpdate(key, expiry, (_, existing) => existing > DateTime.UtcNow ? existing : expiry);
     }
 
     public bool IsNoPathDest(int mapId, float x, float y)
