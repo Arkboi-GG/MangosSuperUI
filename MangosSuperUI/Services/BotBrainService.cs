@@ -530,6 +530,32 @@ public class BotBrainService : BackgroundService
         await _groupManager.SaveGroupsToDbAsync();
     }
 
+    /// <summary>
+    /// Disband every active group from the dashboard ("Manage Bot Groups" → Dissolve All).
+    /// Snapshots the group list first so a concurrent Form can't interleave with the walk,
+    /// sends DISBAND_GROUP to each leader, then persists once. Returns the number disbanded.
+    /// </summary>
+    public async Task<int> DisbandAllGroupsAsync()
+    {
+        var snapshot = _groupManager.GetAllGroups().ToList();
+        int disbanded = 0;
+        foreach (var group in snapshot)
+        {
+            int leaderGuid = group.LeaderGuid;
+            var members = group.MemberGuids.ToList();
+            if (!_groupManager.DisbandGroup(group.GroupId)) continue;
+            disbanded++;
+            foreach (var guid in members)
+                if (_bots.TryGetValue(guid, out var bot))
+                    _groupManager.EnrichBotIdentity(bot);
+            try { await _bridge.SendToBotAsync(leaderGuid, "DISBAND_GROUP", new { }); }
+            catch (Exception ex) { _logger.LogWarning(ex, "BotBrain: DISBAND_GROUP send failed for leader {Guid}", leaderGuid); }
+        }
+        if (disbanded > 0)
+            await _groupManager.SaveGroupsToDbAsync();
+        return disbanded;
+    }
+
     /// <summary>Auto-form groups from the dashboard. Returns the formed groups.</summary>
     public async Task<List<BotGroup>> AutoFormGroupsAsync()
     {

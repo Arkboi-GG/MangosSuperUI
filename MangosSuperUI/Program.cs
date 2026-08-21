@@ -150,6 +150,11 @@ builder.Services.AddSingleton<IBotPlanner, HubErrandPlanner>();  // Goal.Vendori
 // line after Build() below is what actually constructs it before the first bot connects.
 builder.Services.AddSingleton<RotationService>();
 
+// [RAID-PLAN] Raid plan documents (the Encounter Lab's exports) — storage, assignment
+// persistence, LOAD_RAID_PLAN push (PLAN_19 M-B). Same self-wire + eager-construction
+// pattern as RotationService.
+builder.Services.AddSingleton<RaidPlanService>();
+
 builder.Services.AddSingleton<BotBrain>();
 builder.Services.AddSingleton<BotDiagnosticsService>();
 
@@ -235,6 +240,10 @@ await app.Services.GetRequiredService<SpellProgressionLoader>().LoadAsync();
 // BEFORE the bridge accepts the first HELLO — a lazily-resolved singleton would otherwise not
 // exist until the first API call, and every bot login before that would miss its re-push.
 app.Services.GetRequiredService<RotationService>();
+
+// [RAID-PLAN] Same eager construction, same reason: the HELLO re-push seam must be
+// wired before the first bot connects (PLAN_19 M-B).
+app.Services.GetRequiredService<RaidPlanService>();
 
 // ---------- Pipeline ----------
 if (!app.Environment.IsDevelopment())

@@ -10,10 +10,9 @@
 //   4. Trails          — a bot's incidents stitched in sequence: see the loop.
 // Filter by bot, by fault type, by tier, and toggle each layer. Pull-only, 4s poll.
 //
-// Coordinate note: many log lines don't carry an explicit map= token, so an
-// incident's map is often -1 (unknown). The fleet lives in map 0 (Eastern
-// Kingdoms: Elwynn/Westfall/Northshire) or map 1 (Kalimdor), so unknown-map
-// faults are drawn on whichever map is currently selected.
+// Coordinate note: incidents without an explicit map= token remain map -1
+// (unknown). They stay available to the non-spatial diagnostics, but must never
+// be projected onto an arbitrary continent.
 
 (function () {
     'use strict';
@@ -189,7 +188,7 @@
 
     function zeroPad(n) { return n < 10 ? '0' + n : '' + n; }
     function currentMapId() { return MAP_DEFS[currentMapKey].mapId; }
-    function onCurrentMap(mapId) { return mapId === currentMapId() || mapId == null || mapId < 0; }
+    function onCurrentMap(mapId) { return mapId === currentMapId(); }
 
     // ══════════════════════════════════════════════════════════
     //  POLLING
@@ -709,7 +708,7 @@
     function clusterIncidents(mapId, cx, cy) {
         return ((data && data.recent) || []).filter(function (i) {
             if (!i.hasPos) return false;
-            if (!(i.map === mapId || (i.map < 0 && (mapId < 0 || mapId === currentMapId())))) return false;
+            if (i.map !== mapId) return false;
             return Math.floor(i.x / 100) === cx && Math.floor(i.y / 100) === cy;
         });
     }

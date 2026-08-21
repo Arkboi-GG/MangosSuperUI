@@ -696,6 +696,14 @@ public partial class BotsController : Controller
         return Json(new { success = true, groupId = req.GroupId });
     }
 
+    /// <summary>Dissolve every active bot group (Manage Bot Groups → Dissolve All).</summary>
+    [HttpPost]
+    public async Task<IActionResult> DisbandAllGroups()
+    {
+        var disbanded = await _brain.DisbandAllGroupsAsync();
+        return Json(new { success = true, disbanded });
+    }
+
     // ==================== Bot Quest Progress ====================
 
     /// <summary>

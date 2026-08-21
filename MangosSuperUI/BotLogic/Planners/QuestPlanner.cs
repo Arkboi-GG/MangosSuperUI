@@ -666,7 +666,27 @@ public sealed class QuestPlanner : IBotPlanner
             var farObj = q.Batch.Where(b => b.Accepted && !b.TurnedIn && !b.Failed && !b.Deferred && HasUnmet(ctx, b)).ToList();
             var farPick = PriorityLeg(ctx, farObj, startedGlobal: true);    // far trek: started-global — finish a started quest before starting fresh far work
             if (farPick != null)
-                return DispatchObjectiveLeg(ctx, q, farPick.Value);
+            {
+                // TREK DISTANCE CEILING (Tankftw, Dalaran-ish, 2026-08-21). PriorityLeg's only distance guard
+                // is the giver->leg RAIL, which is a property of the QUEST (leg-near-its-own-giver), NOT of
+                // where the bot stands -- so an accepted quest whose objective sits near its giver but
+                // ~10,000yd from the BOT sailed through uncapped. The bot then MOVE_TO'd 10,389yd across the
+                // map in pure travel mode (paths AROUND mobs, never engages), ran through hostile camps,
+                // bled 100%->0% without fighting back, died, rez'd in place, and re-trekked to die again --
+                // exactly the "he just kept running away until he died" the operator watched. Level 17's
+                // reach ceiling is ~6000yd; 10,389 is a cross-map suicide march. Cap the trek at the widest
+                // sane reach tier: a leg past it is durably shelved (KEPT in the log) so the bot does LOCAL
+                // content -- the killable mobs right where it stands -- instead. It re-competes when the bot
+                // is closer / higher-level, or when the deferral expires.
+                float legDist = Dist2(ctx.Pos.X, ctx.Pos.Y, farPick.Value.Leg.X, farPick.Value.Leg.Y);
+                float trekCeiling = ZoneSafetyMap.GetMaxTravelDistance(ctx.Level, ctx.ZoneId, MaxReachTier);
+                if (legDist <= trekCeiling)
+                    return DispatchObjectiveLeg(ctx, q, farPick.Value);
+                _logger.LogWarning("[QUEST] {Name} far trek [{Id}] leg {D:F0}yd exceeds reach ceiling {Cap:F0}yd -- shelving (local content, not a cross-map death march)",
+                    ctx.Name, farPick.Value.Quest.QuestId, legDist, trekCeiling);
+                DeferAcceptedQuest(ctx, farPick.Value.Quest, "too_far");
+                continue;   // re-derive with the far quest shelved -> local seed (above) / grind-lock
+            }
 
             // -- 5. nothing to accept / work / turn in / discover -> batch exhausted --
             // The carried set (incl. any Failed-this-sweep quests still in the C++ log) is resumed on
@@ -695,6 +715,29 @@ public sealed class QuestPlanner : IBotPlanner
             int workableId = WorkableInLog(ctx);
             if (workableId != 0)
             {
+                // LIVELOCK BREAK (Orincat, Darkshore 2026-08-21): the carried set reads "workable in the
+                // log" (WorkableInLog has no reach cap) but produced NO dispatchable leg THIS sweep -- every
+                // carried objective is past the near-sweep radius and the far trek rejected it (too far /
+                // path-shelved from here). Plain reselect just rebuilds the IDENTICAL dead batch: BuildBatch
+                // resumes the same in-log quests, none dispatch, WorkableInLog suppresses again -> SET_TASK
+                // IDLE at ~3Hz forever while the bot stands in a hub full of pickable quests (GoalSelector
+                // read pick>0 the whole time). The empty-batch seed (PickFor, widening reach) that would
+                // travel him to a reachable hub NEVER fires because the batch isn't empty -- it's full of
+                // unworkable carried quests. So seed it HERE: grab the nearest reachable FRESH pick and let
+                // phase-1 accept walk him there to pick up new work. The carried quests stay in the log and
+                // re-compete once he's closer; this only ADDS forward motion, it never abandons them.
+                var seedId = ctx.Identity;
+                if (seedId != null && !q.Batch.Any(b => !b.Accepted && !b.Failed))   // no fresh pick already pending accept
+                {
+                    var seed = PickFor(ctx);
+                    if (seed != null && !IsGrey(seed, seedId.Level) && !q.Batch.Any(b => b.QuestId == seed.QuestId))
+                    {
+                        q.Batch.Add(new BatchQuest { QuestId = seed.QuestId, Node = seed, Accepted = false });
+                        _logger.LogInformation("[QUEST] {Name} carried set unworkable here ([{Id}] workable-in-log but no dispatchable leg) -- seeding fresh reachable pick [{Seed}] \"{Title}\" to travel for new quests",
+                            ctx.Name, workableId, seed.QuestId, seed.Title);
+                        continue;   // re-derive: phase-1 accept dispatches the walk to the seed's giver
+                    }
+                }
                 _logger.LogWarning("[QUEST] {Name} exhaust suppressed -- quest [{Id}] still workable in the log (batch starvation, not a real exhaust); reselecting instead of grind-lock",
                     ctx.Name, workableId);
                 ctx.Quest = null;
@@ -733,8 +776,19 @@ public sealed class QuestPlanner : IBotPlanner
         // [FINDING_017 follow-up] fleet-wide no-path memory: one bot's honest no_path
         // teaches every other bot to skip the same pocket for a while (TTL'd; consumed
         // by the grind relocate + DispatchObjectiveLeg). Per-bot defers below unchanged.
+        // [FINDING_020] …but ONLY when the failure is about the DEST. A bot whose own start is a
+        // navmesh island / WMO pocket / water fails toward EVERY dest instantly; recording those
+        // poisoned the shared memory with reachable quest cells (76% of the inflow measured
+        // 2026-08-21) and re-armed them in lockstep at every TTL expiry. The core tags such
+        // failures start_isolated=1 (probe of the bot's own surroundings); skip them here.
         if (f.Reason is "no_path" or "empty_path" && f.Dest is { } npDest)
-            _safety.RecordNoPathDest(npDest.Map, npDest.X, npDest.Y);
+        {
+            if (f.StartIsolated)
+                _logger.LogInformation("[QUEST] {Name} no_path to ({X:F0},{Y:F0}) from an ISOLATED start — not recorded to the fleet no-path memory",
+                    ctx.Name, npDest.X, npDest.Y);
+            else
+                _safety.RecordNoPathDest(npDest.Map, npDest.X, npDest.Y);
+        }
 
         // no_path on the LAST LEG to a giver/turn-in = a WMO-interior NPC the navmesh
         // can't reach. force_* bypasses proximity (300 yd, all eligibility gates intact).
@@ -996,6 +1050,13 @@ public sealed class QuestPlanner : IBotPlanner
         GatherLocals(ctx, q);
         if (q.Batch.Count == 0)
         {
+            // [QUEST-DIAG] GatherLocals came up empty -> we are about to SEED a single far pick. Log
+            // every available quest whose giver is near the bot and WHY it did or didn't make the
+            // pickable cut, so a "bot skipped its starter quests" report can be read straight off the
+            // brain log instead of guessed (e.g. a L1 dwarf getting only [182] The Troll Cave because
+            // the boar/collect/talk openers are excluded as GO/unresolved-item "phase 2").
+            LogSeedDiagnostics(ctx);
+
             var seed = PickFor(ctx);
             if (seed != null && !IsGrey(seed, id.Level))
             {
@@ -1069,9 +1130,14 @@ public sealed class QuestPlanner : IBotPlanner
         int tier = ReachTier(pickable, id, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.ZoneId);
         if (tier < 0) return null;
         float cap = ZoneSafetyMap.GetMaxTravelDistance(id.Level, ctx.ZoneId, tier);
+        // Within the minimal reach tier: LOWEST quest level first, distance as the tiebreak
+        // (2026-08-21). Pure nearest-giver seeded every fresh dwarf onto the L4 "Troll Cave" over
+        // the L3 "Boar Hunter" / L1 openers purely on yards; a newbie should open on the easiest
+        // work in reach and climb. The tier stays minimal, so this never widens the walk.
         return pickable
             .Where(n => InReach(n, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, cap))
-            .OrderBy(n => Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver!.X, n.Giver!.Y))
+            .OrderBy(n => QuestLevelOf(n) > 0 ? QuestLevelOf(n) : int.MaxValue)
+            .ThenBy(n => Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver!.X, n.Giver!.Y))
             .FirstOrDefault();
     }
 
@@ -1113,6 +1179,73 @@ public sealed class QuestPlanner : IBotPlanner
             && q.ItemObjectives.All(it => it.BestDropSource is not { } s
                                           || WithinObjectiveRail(q.Giver, s.GrindMap, s.GrindX, s.GrindY));   // same rail on the item leg's resolved drop source (null already fails the BestDropSource!=null clause above)
 
+
+    // [QUEST-DIAG] Distance (yards) within which the seed diagnostic reports nearby available quests.
+    private const float SeedDiagRadius = 500f;
+
+    /// <summary>[QUEST-DIAG] The FIRST reason quest <paramref name="q"/> fails IsPickable for this bot,
+    /// or null if it IS pickable. Mirrors IsPickable clause-for-clause (kept adjacent so they can't
+    /// drift) — purely for logging why a starter quest was skipped.</summary>
+    private static string? PickableReject(QuestNode q, BotIdentity id)
+    {
+        if (q.Giver == null) return "giver-null";
+        if (!q.Objectives.All(o => o.IsCreature)) return "noncreature-obj(GO/talk/use)";
+        if (!q.Objectives.All(o => !o.TargetFriendly || IsCastDrivable(o, q.QuestId))) return "friendly-target";
+        if (!q.ItemObjectives.All(it => it.BestDropSource != null))
+        {
+            var missing = q.ItemObjectives.First(it => it.BestDropSource == null);
+            return $"item-no-creature-dropsource(item {missing.ItemId}, {missing.DropSources.Count} loot rows, {missing.GoSources.Count} GO rows)";
+        }
+        if (id.CompletedQuestIds.Contains(q.QuestId)) return "completed";
+        if (id.DeferredQuestIds.ContainsKey(q.QuestId)) return "deferred";
+        if (id.AbandonedGreyQuestIds.Contains(q.QuestId)) return "abandoned-grey";
+        if (IsGrey(q, id.Level)) return "grey";
+        if (IsRed(q, id.Level)) return "red(over-level)";
+        if (id.IsPathBlacklisted(q.Giver.X, q.Giver.Y)) return "giver-blacklisted";
+        if (!q.Objectives.All(o => !id.IsPathBlacklisted(o.GrindX, o.GrindY))) return "obj-blacklisted";
+        if (!q.Objectives.All(o => WithinObjectiveRail(q.Giver, o.GrindMap, o.GrindX, o.GrindY))) return "obj-drift-rail";
+        foreach (var it in q.ItemObjectives)
+        {
+            if (it.BestDropSource is not { } s || WithinObjectiveRail(q.Giver, s.GrindMap, s.GrindX, s.GrindY)) continue;
+            return $"item-drift-rail(item {it.ItemId} via {s.CreatureEntry} {s.CreatureName} @ ({s.GrindX:F0},{s.GrindY:F0}) map{s.GrindMap}, {Dist2(q.Giver.X, q.Giver.Y, s.GrindX, s.GrindY):F0}yd from giver)";
+        }
+        return null;   // pickable
+    }
+
+    /// <summary>[QUEST-DIAG] Log every available quest whose giver is within SeedDiagRadius of the bot,
+    /// each tagged PICKABLE or with its first reject reason. Fires only on the seed path (empty batch),
+    /// so it costs nothing in steady state and directly explains a "skipped its starter quests" report.</summary>
+    private void LogSeedDiagnostics(BotContext ctx)
+    {
+        var id = ctx.Identity;
+        if (id == null || !_quests.IsLoaded) return;
+        int raceBit = QuestGraphLoader.RaceToBitmask(id.Race);
+        int classBit = QuestGraphLoader.ClassToBitmask(id.ClassId);
+        // Dist2 returns REAL yards (it sqrt's), so compare to the radius directly — the first cut
+        // of this diagnostic compared against radius² and printed sqrt(yards), which read "16yd"
+        // for a giver 256yd away and let a Redridge quest 2,000yd off show as "45yd".
+        var near = _quests.GetAvailableQuests(raceBit, classBit, id.Level, id.CompletedQuestIds)
+            .Where(n => n.Giver != null && n.Giver.Map == ctx.MapId
+                        && Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver.X, n.Giver.Y) <= SeedDiagRadius)
+            .OrderBy(n => Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver!.X, n.Giver!.Y))
+            .Take(15)
+            .ToList();
+        if (near.Count == 0)
+        {
+            _logger.LogInformation("[QUEST-DIAG] {Name} seed @ {Pos} L{Lvl} zone={Z}: NO available quest giver within {R:F0}yd",
+                ctx.Name, ctx.Pos, id.Level, ctx.ZoneId, SeedDiagRadius);
+            return;
+        }
+        _logger.LogInformation("[QUEST-DIAG] {Name} seed @ {Pos} L{Lvl} zone={Z}: {N} available giver(s) within {R:F0}yd --",
+            ctx.Name, ctx.Pos, id.Level, ctx.ZoneId, near.Count, SeedDiagRadius);
+        foreach (var n in near)
+        {
+            string why = PickableReject(n, id) ?? "PICKABLE";
+            _logger.LogInformation("[QUEST-DIAG]   [{Id}] \"{Title}\" q{Q} d={D:F0}yd -> {Why}",
+                n.QuestId, n.Title, QuestLevelOf(n),
+                Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver!.X, n.Giver!.Y), why);
+        }
+    }
 
     /// <summary>
     /// Range gate (OPEN #1): giver on the bot's map within the level/zone travel cap.
@@ -1251,7 +1384,10 @@ public sealed class QuestPlanner : IBotPlanner
             if (IsCastDrivable(o, b.QuestId)) continue;   // cast objective -- driven by the CAST phase (QUEST_CAST), never a grind leg
             int rem = RawRemaining(ctx, b.QuestId, o);
             if (rem <= 0) continue;
-            var p = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
+            // [FINDING_020] nearest spawn whose cell is NOT fleet-known no_path (null = every spawn of this
+            // objective is blacklisted → no leg this tick; the quest re-competes when a cell lapses).
+            var pp = NearestPathableSpawnPoint(o.GrindMap, o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
+            if (pp is not { } p) continue;
             yield return new GrindLeg(o.CreatureEntry, p.X, p.Y, p.Z, o.GrindMap, rem);   // kill objective — no alt entries, ever
         }
         foreach (var it in b.Node.ItemObjectives)
@@ -1261,9 +1397,37 @@ public sealed class QuestPlanner : IBotPlanner
             if (rem <= 0) continue;
             var src = it.BestDropSource;                       // creature-sourced only (GO-sourced = phase 2)
             if (src == null || src.SpawnCount <= 0) continue;
-            var p = NearestSpawnPoint(src.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, src.GrindX, src.GrindY, src.GrindZ);
+            var pp = NearestPathableSpawnPoint(src.GrindMap, src.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, src.GrindX, src.GrindY, src.GrindZ);   // [FINDING_020]
+            if (pp is not { } p) continue;
             yield return new GrindLeg(src.CreatureEntry, p.X, p.Y, p.Z, src.GrindMap, rem, it.AltDropEntries);
         }
+    }
+
+    // [FINDING_020] NearestSpawnPoint, fleet-no-path-aware: the nearest spawn of the objective whose
+    // 12-yd cell is NOT currently in ZoneSafetyMap's fleet no-path memory. Before this, one spawn that
+    // sits in an unpathable pocket (a hilltop, a lake, a cave island) was re-picked by every bot for
+    // which it was the nearest, failed, got blacklisted, and then DispatchObjectiveLeg SKIPPED THE
+    // WHOLE QUEST while the objective's other spawns were perfectly reachable — the skip→reselect
+    // churn measured at 24k lines / 5 min even after the WorkableInLog mirror. Null = every spawn
+    // (and the canonical fallback) is blacklisted → the caller yields no leg for this objective.
+    // UnmetLegs and WorkableInLog both go through here, so "what dispatch would walk to" and "is it
+    // workable" stay one verdict.
+    private (float X, float Y, float Z)? NearestPathableSpawnPoint(
+        int mapId, IReadOnlyList<(float X, float Y, float Z)> spawns, float fromX, float fromY,
+        float fallbackX, float fallbackY, float fallbackZ)
+    {
+        if (spawns == null || spawns.Count == 0)
+            return _safety.IsNoPathDest(mapId, fallbackX, fallbackY) ? null : (fallbackX, fallbackY, fallbackZ);
+        (float X, float Y, float Z)? best = null;
+        float bestD = float.MaxValue;
+        for (int i = 0; i < spawns.Count; i++)
+        {
+            float d = Dist2(fromX, fromY, spawns[i].X, spawns[i].Y);
+            if (d >= bestD) continue;
+            if (_safety.IsNoPathDest(mapId, spawns[i].X, spawns[i].Y)) continue;
+            bestD = d; best = spawns[i];
+        }
+        return best;
     }
 
 
@@ -1466,6 +1630,13 @@ public sealed class QuestPlanner : IBotPlanner
                 if (o.TargetFriendly && !IsCastDrivable(o, node.QuestId)) continue;   // Fix 5: an unkillable friendly target is NOT workable -- UNLESS cast-drivable (the CAST phase can complete it), so it counts and the bot doesn't grind-lock while a cast is pending
                 if (o.GrindMap != ctx.MapId) continue;
                 if (!WithinObjectiveRail(node.Giver, o.GrindMap, o.GrindX, o.GrindY)) continue;   // drift rail: a railed leg is NOT workable -- MUST mirror PriorityLeg, or the phase-5 exhaust suppression livelocks (rail blocks the leg, this says workable, Block->reselect->rebuild->repeat)
+                // [FINDING_020] Fleet no-path mirror — the SAME invariant as the rail line above, for the
+                // SAME reason: DispatchObjectiveLeg skips a leg whose dest cell is fleet-known no_path, so
+                // that leg must not count as workable here or phase 5 "exhaust suppressed" Blocks → Idle →
+                // Questing → identical batch → identical skip at ~1–2 Hz forever (518 bots, 131k skips /
+                // 10 min measured 2026-08-21). Resolve the SAME point the dispatch would walk to
+                // (NearestSpawnPoint, as UnmetLegs does) so the two verdicts cannot disagree.
+                if (NearestPathableSpawnPoint(o.GrindMap, o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ) is null) continue;
                 int got = (o.Slot >= 1 && o.Slot <= e.MobCounts.Length) ? e.MobCounts[o.Slot - 1] : 0;
                 if (got < o.Count) return qid;
             }
@@ -1475,6 +1646,7 @@ public sealed class QuestPlanner : IBotPlanner
                 var src = it.BestDropSource;                          // creature-sourced only (GO-sourced = phase 2)
                 if (src == null || src.GrindMap != ctx.MapId) continue;
                 if (!WithinObjectiveRail(node.Giver, src.GrindMap, src.GrindX, src.GrindY)) continue;   // drift rail mirror (see kill branch)
+                if (NearestPathableSpawnPoint(src.GrindMap, src.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, src.GrindX, src.GrindY, src.GrindZ) is null) continue;   // [FINDING_020] fleet no-path mirror (see kill branch)
                 int got = (it.Slot >= 1 && it.Slot <= e.ItemCounts.Length) ? e.ItemCounts[it.Slot - 1] : 0;
                 if (got < it.Count) return qid;
             }

@@ -138,6 +138,27 @@ public class ZoneSafetyMap
         return cells.Contains((ix, iy));
     }
 
+    /// <summary>True when an enemy guard cell lies within the requested world radius. Global
+    /// relocation must use a buffer, not only reject the exact 100yd guard cell: hostile wildlife
+    /// immediately outside an enemy town is still an enemy-town landing.</summary>
+    public bool IsNearEnemyGuardCell(int mapId, float x, float y, Team team, float radiusYards)
+    {
+        if (!_guardCellsByTeam[(int)team].TryGetValue(mapId, out var cells)) return false;
+        var (cx, cy) = WorldToGrid(x, y);
+        int cr = Math.Max(1, (int)MathF.Ceiling(radiusYards / CELL_SIZE));
+        float radiusSq = radiusYards * radiusYards;
+        for (int ix = cx - cr; ix <= cx + cr; ix++)
+            for (int iy = cy - cr; iy <= cy + cr; iy++)
+            {
+                if (!cells.Contains((ix, iy))) continue;
+                float gx = ix * CELL_SIZE - COORD_OFFSET + CELL_SIZE * 0.5f;
+                float gy = iy * CELL_SIZE - COORD_OFFSET + CELL_SIZE * 0.5f;
+                float dx = gx - x, dy = gy - y;
+                if (dx * dx + dy * dy <= radiusSq) return true;
+            }
+        return false;
+    }
+
     /// <summary>
     /// Find the nearest cell worth GRINDING for level-appropriate XP. Box-scans cells within
     /// maxRadiusYards of (botX,botY) and keeps the best-scoring one that is: populated but not a
@@ -191,8 +212,11 @@ public class ZoneSafetyMap
                 if (cell.MaxLevel > ceilLvl) continue;                          // a red mob lives here
                 if (cell.AvgLevel < loLvl || cell.AvgLevel > hiLvl) continue;   // grey or too hot on average
 
-                float wx = ix * CELL_SIZE - COORD_OFFSET + CELL_SIZE * 0.5f;
-                float wy = iy * CELL_SIZE - COORD_OFFSET + CELL_SIZE * 0.5f;
+                // Aim at the hostile-spawn centroid, not the arbitrary 100yd cell center. A center can
+                // be 70yd from every spawn (outside the 60yd grind leash); the centroid is where the
+                // evidence for this cell actually lives.
+                float wx = cell.AvgX;
+                float wy = cell.AvgY;
                 float dsq = (wx - botX) * (wx - botX) + (wy - botY) * (wy - botY);
                 if (dsq > maxRadSq) continue;
                 if (reject != null && reject(wx, wy)) continue;
@@ -203,11 +227,122 @@ public class ZoneSafetyMap
                 if (score > bestScore)
                 {
                     bestScore = score;
-                    best = new GrindCell(wx, wy, cell.AvgLevel, cell.MaxLevel, cell.SpawnCount, dist);
+                    best = new GrindCell(mapId, wx, wy, cell.AvgZ, cell.AvgLevel, cell.MaxLevel, cell.SpawnCount, dist);
                 }
             }
 
         return best;
+    }
+
+    /// <summary>
+    /// Pick a proven hostile-spawn camp for a bot whose wildcard grind scan reported no target.
+    /// This is deliberately WORLD-wide: prefer the other continent so a bad local zone/town cannot
+    /// recycle the bot, then fall back to either continent only when the preferred map has no safe
+    /// band. Strict candidates average at or just below the bot's level, contain no mob above L+1,
+    /// have 3-16 hostile spawns, and have no >24yd vertical stack (avoids cave/surface centroids).
+    /// A relaxed second pass widens only enough to guarantee a destination. The seed selects among
+    /// the best 48 cells so a fleet release spreads across camps instead of creating a new pileup.
+    /// </summary>
+    public GrindCell? FindGlobalGrindCell(
+        int botLevel, Team team, int seed, int preferredMap,
+        Func<int, float, float, bool>? reject = null)
+    {
+        // Never fall back to an unrestricted world scan. "Hostile to this team" proves only that
+        // the creature is attackable; it does NOT prove that its territory is friendly. Enemy
+        // starter/quest hubs contain excellent level-banded hostile data and otherwise rank highly.
+        return FindGlobalGrindCellPass(botLevel, team, seed, preferredMap,
+                   lowOffset: 3, highOffset: 0, dangerCeil: 1, minSpawn: 3, maxSpawn: 16, reject)
+            ?? FindGlobalGrindCellPass(botLevel, team, seed, preferredMap,
+                   lowOffset: 5, highOffset: 1, dangerCeil: 2, minSpawn: 2, maxSpawn: 24, reject);
+    }
+
+    private GrindCell? FindGlobalGrindCellPass(
+        int botLevel, Team team, int seed, int preferredMap,
+        int lowOffset, int highOffset, int dangerCeil, int minSpawn, int maxSpawn,
+        Func<int, float, float, bool>? reject)
+    {
+        var key = (team, botLevel, preferredMap, lowOffset, highOffset, dangerCeil, minSpawn, maxSpawn);
+        var ranked = _globalGrindCache.GetOrAdd(key, _ =>
+        {
+            var candidates = new List<(GrindCell Cell, float Score)>();
+            int loLvl = Math.Max(1, botLevel - lowOffset);
+            int hiLvl = botLevel + highOffset;
+            int ceilLvl = botLevel + dangerCeil;
+
+            foreach (var (mapId, grid) in TeamGrid(team))
+            {
+                if (preferredMap >= 0 && mapId != preferredMap) continue;
+                _guardCellsByTeam[(int)team].TryGetValue(mapId, out var guardCells);
+
+                for (int ix = 0; ix < GRID_DIM; ix++)
+                    for (int iy = 0; iy < GRID_DIM; iy++)
+                    {
+                        var cell = grid[ix, iy];
+                        if (cell.SpawnCount < minSpawn || cell.SpawnCount > maxSpawn) continue;
+                        if (cell.AvgLevel < loLvl || cell.AvgLevel > hiLvl) continue;
+                        if (cell.MaxLevel > ceilLvl) continue;
+                        if (cell.MaxZ - cell.MinZ > 24f) continue; // do not average cave + surface layers
+                        if (guardCells?.Contains((ix, iy)) == true) continue;
+                        if (!IsFactionOwnedGrindRegion(team, mapId, cell.AvgX, cell.AvgY, botLevel)) continue;
+                        if (IsNearEnemyGuardCell(mapId, cell.AvgX, cell.AvgY, team, 650f)) continue;
+
+                        float levelFit = -MathF.Abs(cell.AvgLevel - Math.Max(1, botLevel - 1)) * 100f;
+                        float densityFit = -MathF.Abs(cell.SpawnCount - 7) * 4f;
+                        candidates.Add((
+                            new GrindCell(mapId, cell.AvgX, cell.AvgY, cell.AvgZ, cell.AvgLevel,
+                                cell.MaxLevel, cell.SpawnCount, 0f),
+                            levelFit + densityFit));
+                    }
+            }
+
+            // Keep enough diversity for per-bot rejection + guid spreading without retaining the
+            // whole world grid for every level key.
+            return candidates.OrderByDescending(c => c.Score).Take(128).Select(c => c.Cell).ToArray();
+        });
+
+        var top = ranked.Where(c => reject?.Invoke(c.MapId, c.X, c.Y) != true).Take(48).ToArray();
+        if (top.Length == 0) return null;
+        int idx = (int)((uint)seed % (uint)top.Length);
+        return top[idx];
+    }
+
+    // Curated faction-owned quest regions. These are anchors, not teleport coordinates: the chosen
+    // landing remains a real level-appropriate hostile-spawn centroid within the surrounding region.
+    // This provides the missing territorial fact that faction_template.hostile_mask cannot encode.
+    private readonly record struct GrindRegion(Team Team, int Map, float X, float Y,
+        int MinLevel, int MaxLevel, float Radius);
+
+    private static readonly GrindRegion[] FactionGrindRegions =
+    {
+        // Alliance — Eastern Kingdoms / Kalimdor
+        new(Team.Alliance, 0, -10628f,  1036f,  8, 18, 2200f), // Sentinel Hill / Westfall
+        new(Team.Alliance, 0,  -9235f, -2215f, 15, 27, 2100f), // Lakeshire / Redridge
+        new(Team.Alliance, 0,   -715f,  -512f, 22, 37, 2300f), // Southshore / Hillsbrad
+        new(Team.Alliance, 0,  -1262f, -2529f, 30, 45, 2300f), // Refuge Pointe / Arathi
+        new(Team.Alliance, 1,   6400f,   500f, 10, 24, 2500f), // Auberdine / Darkshore
+        new(Team.Alliance, 1,   2750f,  -380f, 18, 34, 2300f), // Astranaar / Ashenvale
+        new(Team.Alliance, 1,  -3828f, -4517f, 28, 45, 2400f), // Theramore / Dustwallow
+
+        // Horde — Eastern Kingdoms / Kalimdor
+        new(Team.Horde,    0,   2247f,   252f,  8, 18, 2100f), // Brill / Tirisfal
+        new(Team.Horde,    0,    457f,  1548f, 14, 28, 2300f), // Sepulcher / Silverpine
+        new(Team.Horde,    0,    -28f,  -899f, 20, 37, 2300f), // Tarren Mill / Hillsbrad
+        new(Team.Horde,    0, -12388f,   172f, 28, 46, 2400f), // Grom'gol / Stranglethorn
+        new(Team.Horde,    1,    338f, -4688f,  8, 18, 2100f), // Razor Hill / Durotar
+        new(Team.Horde,    1,   -472f, -2653f, 14, 30, 2500f), // Crossroads / Barrens
+        new(Team.Horde,    1,  -1916f, -1105f, 22, 37, 2200f), // Sun Rock / Stonetalon
+        new(Team.Horde,    1,  -5471f, -2460f, 28, 45, 2300f), // Freewind / Thousand Needles
+    };
+
+    private static bool IsFactionOwnedGrindRegion(Team team, int map, float x, float y, int level)
+    {
+        foreach (var r in FactionGrindRegions)
+        {
+            if (r.Team != team || r.Map != map || level < r.MinLevel || level > r.MaxLevel) continue;
+            float dx = x - r.X, dy = y - r.Y;
+            if (dx * dx + dy * dy <= r.Radius * r.Radius) return true;
+        }
+        return false;
     }
 
     // ── Fleet-wide no-path destination memory (FINDING_017 follow-up) ──────────
@@ -225,6 +360,13 @@ public class ZoneSafetyMap
     private const float NOPATH_CELL_YARDS = 12f;
     private const int NOPATH_TTL_MINUTES = 90;
     private const int NOPATH_CAP = 4096;
+
+    // Static spawn grid -> static global camp rankings. A fleet-wide release can deliver hundreds of
+    // GRIND_BLOCKED events together; cache each team/level/band scan so that burst does not rescan both
+    // 343x343 continent grids once per bot. Per-bot reject/spread happens over the cached shortlist.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<
+        (Team Team, int Level, int Map, int Low, int High, int Ceil, int MinSpawn, int MaxSpawn),
+        GrindCell[]> _globalGrindCache = new();
 
     public void RecordNoPathDest(int mapId, float x, float y)
     {
@@ -520,6 +662,7 @@ public class ZoneSafetyMap
     public async Task LoadAsync()
     {
         _logger.LogInformation("ZoneSafetyMap: loading creature level grid from mangos DB...");
+        _globalGrindCache.Clear();
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         try
@@ -534,6 +677,7 @@ public class ZoneSafetyMap
                     c.map,
                     c.position_x,
                     c.position_y,
+                    c.position_z,
                     ct.level_min AS MinLevel,
                     ct.level_max AS MaxLevel,
                     ct.flags_extra AS FlagsExtra,
@@ -576,7 +720,8 @@ public class ZoneSafetyMap
             };
 
             static void AddSpawn(Dictionary<int, Dictionary<(int ix, int iy), CellAccum>> accum,
-                                 int mapId, int ix, int iy, float avgLvl, int maxLvl)
+                                 int mapId, int ix, int iy, float x, float y, float z,
+                                 float avgLvl, int maxLvl)
             {
                 if (!accum.TryGetValue(mapId, out var mapAccum))
                 {
@@ -589,6 +734,11 @@ public class ZoneSafetyMap
                     mapAccum[(ix, iy)] = cell;
                 }
                 cell.TotalLevel += avgLvl;
+                cell.TotalX += x;
+                cell.TotalY += y;
+                cell.TotalZ += z;
+                cell.MinZ = MathF.Min(cell.MinZ, z);
+                cell.MaxZ = MathF.Max(cell.MaxZ, z);
                 cell.Count++;
                 if (maxLvl > cell.MaxLevel) cell.MaxLevel = maxLvl;
                 cell.Levels[Math.Clamp(maxLvl, 1, 63)]++;   // threat histogram keys the spawn's MAX level (danger is worst-case)
@@ -613,6 +763,7 @@ public class ZoneSafetyMap
                 int mapId = (int)r.map;
                 float x = (float)r.position_x;
                 float y = (float)r.position_y;
+                float z = (float)r.position_z;
                 int minLvl = (int)r.MinLevel;
                 int maxLvl = (int)r.MaxLevel;
                 int hostileMask = (int)r.HostileMask;
@@ -623,8 +774,8 @@ public class ZoneSafetyMap
                 var (ix, iy) = WorldToGrid(x, y);
                 if (ix < 0 || ix >= GRID_DIM || iy < 0 || iy >= GRID_DIM) continue;
 
-                if ((hostileMask & 3) != 0) { AddSpawn(accumByTeam[(int)Team.Alliance], mapId, ix, iy, avgLvl, maxLvl); allianceContribs++; }
-                if ((hostileMask & 5) != 0) { AddSpawn(accumByTeam[(int)Team.Horde],    mapId, ix, iy, avgLvl, maxLvl); hordeContribs++; }
+                if ((hostileMask & 3) != 0) { AddSpawn(accumByTeam[(int)Team.Alliance], mapId, ix, iy, x, y, z, avgLvl, maxLvl); allianceContribs++; }
+                if ((hostileMask & 5) != 0) { AddSpawn(accumByTeam[(int)Team.Horde],    mapId, ix, iy, x, y, z, avgLvl, maxLvl); hordeContribs++; }
                 if (isGuard)   // guard-flagged → mark the ENEMY team's guard set (same bucketing as the grid)
                 {
                     if ((hostileMask & 3) != 0) AddGuardCell(_guardCellsByTeam[(int)Team.Alliance], mapId, ix, iy);
@@ -644,6 +795,11 @@ public class ZoneSafetyMap
                         grid[ix, iy] = new CellData
                         {
                             AvgLevel = cell.TotalLevel / cell.Count,
+                            AvgX = cell.TotalX / cell.Count,
+                            AvgY = cell.TotalY / cell.Count,
+                            AvgZ = cell.TotalZ / cell.Count,
+                            MinZ = cell.MinZ,
+                            MaxZ = cell.MaxZ,
                             MaxLevel = cell.MaxLevel,
                             SpawnCount = cell.Count,
                             LevelCounts = cell.Levels
@@ -699,6 +855,8 @@ public class ZoneSafetyMap
     private struct CellData
     {
         public float AvgLevel;
+        public float AvgX, AvgY, AvgZ;
+        public float MinZ, MaxZ;
         public int MaxLevel;
         public int SpawnCount;
 
@@ -715,6 +873,9 @@ public class ZoneSafetyMap
     private class CellAccum
     {
         public float TotalLevel;
+        public float TotalX, TotalY, TotalZ;
+        public float MinZ = float.MaxValue;
+        public float MaxZ = float.MinValue;
         public int Count;
         public int MaxLevel;
         public int[] Levels = new int[64];   // per-level spawn counts (see CellData.LevelCounts)
@@ -735,8 +896,9 @@ public readonly struct PathThreat
 /// <summary>A grind-worthy cell: world center + the cell's level/density + distance from the bot.</summary>
 public readonly struct GrindCell
 {
-    public readonly float X, Y, AvgLevel, DistYards;
+    public readonly int MapId;
+    public readonly float X, Y, Z, AvgLevel, DistYards;
     public readonly int MaxLevel, SpawnCount;
-    public GrindCell(float x, float y, float avg, int max, int spawn, float dist)
-    { X = x; Y = y; AvgLevel = avg; MaxLevel = max; SpawnCount = spawn; DistYards = dist; }
+    public GrindCell(int mapId, float x, float y, float z, float avg, int max, int spawn, float dist)
+    { MapId = mapId; X = x; Y = y; Z = z; AvgLevel = avg; MaxLevel = max; SpawnCount = spawn; DistYards = dist; }
 }

@@ -224,7 +224,7 @@ public partial class BotsController
 
         // coordinate hotspots — round to a 100-yd cell per map; cell label is its center.
         var hotspots = incidents
-            .Where(i => i.HasPos && i.Tier != "info")
+            .Where(i => i.HasPos && i.Map >= 0 && i.Tier != "info")
             .GroupBy(i => new { i.Map, cx = (int)Math.Floor(i.X / 100.0), cy = (int)Math.Floor(i.Y / 100.0) })
             .Select(g => new
             {

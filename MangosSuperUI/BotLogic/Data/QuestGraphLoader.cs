@@ -943,9 +943,25 @@ public class QuestGraphLoader
         {
             foreach (var itemObj in quest.ItemObjectives)
             {
-                if (!dropMap.TryGetValue(itemObj.ItemId, out var sources))
+                if (!dropMap.TryGetValue(itemObj.ItemId, out var sharedSources))
                     continue;
 
+                // PER-OBJECTIVE COPY (2026-08-21, the Dwarven-Outfitters bug). dropMap holds ONE
+                // ItemDropSource list per item, and every quest that needs that item used to get the
+                // SAME objects. The per-quest resolution below then wrote SpawnCount/Grind* onto the
+                // shared object, so quests contaminated each other: Tough Wolf Meat (750) is needed by
+                // Northshire's "Wolves Across the Border" AND Coldridge's "Dwarven Outfitters" (179);
+                // Northshire stamped Timber Wolf with its Elwynn cluster, Coldridge stamped Ragged Timber
+                // Wolf with its Dun Morogh cluster, and the computed BestDropSource (highest |chance|,
+                // then highest SpawnCount — all wolves tie at 80) picked the BIGGER Elwynn cluster for
+                // BOTH quests. Quest 179's wolf leg therefore read ~2,550yd from Sten Stoutarm, failed
+                // the 2,500yd giver rail, and the quest standing 16yd from every dwarf spawn was
+                // unpickable — which is exactly why fresh dwarves skipped their opener and seeded the
+                // L4 Troll Cave instead. Each objective now owns its copies, so BestDropSource is the
+                // creature THIS quest resolved, near THIS quest's giver.
+                var sources = sharedSources
+                    .Select(s => new ItemDropSource { CreatureEntry = s.CreatureEntry, CreatureName = s.CreatureName, DropChance = s.DropChance })
+                    .ToList();
                 itemObj.DropSources = sources;
                 resolved++;
 

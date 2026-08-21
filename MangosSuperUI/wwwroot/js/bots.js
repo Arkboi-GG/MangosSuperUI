@@ -2516,6 +2516,179 @@ $(function () {
             .always(function () { $btn.prop('disabled', false); });
     });
 
+    // ==================== Manage Bot Groups modal ====================
+    // Header button → overlay listing every active group (BrainStatus), filterable by member
+    // name / group id, with per-group Disband and a Dissolve All. Reuses the Add Bots modal
+    // chrome (.ab-*) so the two dialogs look like one family.
+    $('head').append(
+        '<style>' +
+        '.mg-modal{max-width:640px;}' +
+        '.mg-tools{display:flex;align-items:center;gap:10px;margin-bottom:12px;}' +
+        '.mg-search{flex:1;position:relative;}' +
+        '.mg-search i{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text-muted,#787c99);font-size:12px;pointer-events:none;}' +
+        '.mg-search input{width:100%;box-sizing:border-box;padding:7px 10px 7px 30px;border-radius:8px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);color:var(--text-secondary,#c0caf5);font-size:12.5px;outline:none;transition:border-color .12s;}' +
+        '.mg-search input:focus{border-color:var(--accent,#7aa2f7);}' +
+        '.mg-sum{font-size:11px;color:var(--text-muted,#787c99);white-space:nowrap;font-variant-numeric:tabular-nums;}' +
+        '.mg-row{display:flex;align-items:center;gap:10px;padding:9px 11px 9px 14px;border-radius:10px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);margin-bottom:8px;position:relative;overflow:hidden;}' +
+        '.mg-row::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--gc,#7aa2f7);}' +
+        '.mg-gid{font-size:11px;font-weight:700;padding:1px 7px;border-radius:4px;color:var(--gc,#7aa2f7);background:color-mix(in srgb,var(--gc,#7aa2f7) 14%,transparent);border:1px solid color-mix(in srgb,var(--gc,#7aa2f7) 40%,transparent);flex:none;}' +
+        '.mg-members{flex:1;min-width:0;display:flex;flex-wrap:wrap;gap:4px 8px;font-size:12px;}' +
+        '.mg-members .mg-lead{color:#e0af68;}' +
+        '.mg-members mark{background:rgba(224,175,104,0.35);color:inherit;border-radius:2px;padding:0 1px;}' +
+        '.mg-meta{font-size:10.5px;color:var(--text-muted,#787c99);white-space:nowrap;flex:none;}' +
+        '.mg-dis{font-size:11px;padding:4px 10px;border-radius:7px;border:1px solid rgba(247,118,142,0.5);background:rgba(247,118,142,0.12);color:#f7768e;cursor:pointer;flex:none;transition:all .12s;}' +
+        '.mg-dis:hover{background:#f7768e;color:#1a1b26;}' +
+        '.mg-dis:disabled{opacity:.5;cursor:default;}' +
+        '.mg-empty{color:var(--text-muted,#787c99);font-size:12px;padding:18px 4px;text-align:center;}' +
+        '.mg-hint{font-size:11px;color:var(--text-muted,#787c99);}' +
+        '.mg-hint b{color:var(--text-secondary,#c0caf5);font-weight:600;}' +
+        '.mg-all{font-size:13px;font-weight:600;padding:9px 16px;border:none;border-radius:9px;cursor:pointer;color:#fff;display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,#f7768e,#ff9e64);box-shadow:0 4px 14px rgba(247,118,142,0.3);transition:transform .12s,box-shadow .12s,filter .12s;}' +
+        '.mg-all:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(247,118,142,0.42);}' +
+        '.mg-all:disabled{filter:grayscale(.5) brightness(.7);cursor:default;transform:none;box-shadow:none;}' +
+        '</style>'
+    );
+
+    $('body').append(
+        '<div class="ab-overlay" id="manageGroupsModal">' +
+        '<div class="ab-modal mg-modal">' +
+        '<div class="ab-header">' +
+        '<div class="ab-hleft"><div class="ab-hicon"><i class="fa-solid fa-people-group"></i></div>' +
+        '<div class="ab-htxt"><b>Manage Bot Groups</b><span>Find a group by member name, disband one, or dissolve every group at once</span></div></div>' +
+        '<button class="ab-close" id="mgClose"><i class="fa-solid fa-xmark"></i></button></div>' +
+        '<div class="ab-body">' +
+        '<div class="mg-tools">' +
+        '<div class="mg-search"><i class="fa-solid fa-magnifying-glass"></i><input type="text" id="mgSearch" placeholder="Search by bot name or group #..." autocomplete="off"></div>' +
+        '<span class="mg-sum" id="mgSummary"></span>' +
+        '</div>' +
+        '<div id="mgList"><div class="mg-empty">Loading...</div></div>' +
+        '</div>' +
+        '<div class="ab-foot">' +
+        '<span class="mg-hint" id="mgHint"></span>' +
+        '<button class="mg-all" id="mgDissolveAll"><i class="fa-solid fa-people-arrows"></i> Dissolve All <span class="ab-tot" id="mgAllCount">0</span></button>' +
+        '</div></div></div>'
+    );
+
+    var mgGroups = [], mgNames = {}, mgModeName = '';
+
+    function mgEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+    function mgHighlight(name, q) {
+        var safe = mgEsc(name);
+        if (!q) return safe;
+        var i = name.toLowerCase().indexOf(q);
+        if (i < 0) return safe;
+        return mgEsc(name.slice(0, i)) + '<mark>' + mgEsc(name.slice(i, i + q.length)) + '</mark>' + mgEsc(name.slice(i + q.length));
+    }
+    function mgNameOf(guid) {
+        if (mgNames[guid]) return mgNames[guid];
+        var s = botStates[guid];
+        return s && s.name ? s.name : ('Bot #' + guid);
+    }
+    function mgAge(formedAt) {
+        var t = Date.parse(formedAt); if (isNaN(t)) return '';
+        var m = Math.max(0, Math.round((Date.now() - t) / 60000));
+        if (m < 60) return m + 'm';
+        var h = Math.floor(m / 60); if (h < 48) return h + 'h ' + (m % 60) + 'm';
+        return Math.floor(h / 24) + 'd';
+    }
+
+    function renderManageGroups() {
+        var q = ($('#mgSearch').val() || '').trim().toLowerCase();
+        var shown = mgGroups.filter(function (g) {
+            if (!q) return true;
+            if (('#' + g.groupId).indexOf(q) === 0 || ('g' + g.groupId).indexOf(q) === 0 || String(g.groupId) === q) return true;
+            return (g.memberGuids || []).some(function (guid) { return mgNameOf(guid).toLowerCase().indexOf(q) >= 0; });
+        });
+        var grouped = 0; mgGroups.forEach(function (g) { grouped += (g.memberGuids || []).length; });
+        $('#mgSummary').text(mgGroups.length + ' group' + (mgGroups.length === 1 ? '' : 's') + ' \u00b7 ' + grouped + ' bots' + (q ? ' \u00b7 ' + shown.length + ' match' : ''));
+        $('#mgAllCount').text(mgGroups.length);
+        $('#mgDissolveAll').prop('disabled', mgGroups.length === 0);
+        $('#mgHint').html(mgModeName ? ('Grouping mode: <b>' + mgEsc(mgModeName) + '</b>' + (mgModeName !== 'Off' ? ' \u2014 auto-forming may regroup freed bots' : '')) : '');
+
+        if (!mgGroups.length) { $('#mgList').html('<div class="mg-empty">No active groups</div>'); return; }
+        if (!shown.length) { $('#mgList').html('<div class="mg-empty">No group has a member matching "' + mgEsc(q) + '"</div>'); return; }
+
+        var html = '';
+        shown.forEach(function (g) {
+            var c = groupColor(g.groupId) || '#7aa2f7';
+            var members = (g.memberGuids || []).slice().sort(function (a, b) { return (a === g.leaderGuid ? 0 : 1) - (b === g.leaderGuid ? 0 : 1); })
+                .map(function (guid) {
+                    var lead = guid === g.leaderGuid;
+                    return '<span class="' + (lead ? 'mg-lead' : '') + '" title="guid ' + guid + (lead ? ' (leader)' : '') + '">'
+                        + (lead ? '<i class="fa-solid fa-crown" style="font-size:10px;margin-right:3px;"></i>' : '')
+                        + mgHighlight(mgNameOf(guid), q) + '</span>';
+                }).join('');
+            var age = mgAge(g.formedAt);
+            html += '<div class="mg-row" style="--gc:' + c + ';">'
+                + '<span class="mg-gid">G' + g.groupId + '</span>'
+                + '<span class="mg-members">' + members + '</span>'
+                + '<span class="mg-meta">' + (g.memberGuids || []).length + ' bots' + (age ? ' \u00b7 ' + age : '') + '</span>'
+                + '<button class="mg-dis" data-mg-disband="' + g.groupId + '"><i class="fa-solid fa-link-slash"></i> Disband</button>'
+                + '</div>';
+        });
+        $('#mgList').html(html);
+    }
+
+    function loadManageGroups() {
+        $.getJSON('/Bots/BrainStatus').done(function (data) {
+            mgGroups = data.groups || [];
+            mgModeName = data.groupingModeName || '';
+            mgNames = {};
+            (data.bots || []).forEach(function (b) { if (b.name) mgNames[b.guid] = b.name; });
+            renderManageGroups();
+            updateGroupingUI(data);
+        }).fail(function (xhr) {
+            $('#mgList').html('<div class="mg-empty">Failed to load groups (' + xhr.status + ')</div>');
+        });
+    }
+
+    $('#btnManageGroups').on('click', function () {
+        $('#mgList').html('<div class="mg-empty">Loading...</div>');
+        $('#manageGroupsModal').addClass('active');
+        loadManageGroups();
+        setTimeout(function () { $('#mgSearch').trigger('focus'); }, 50);
+    });
+    $('#mgClose').on('click', function () { $('#manageGroupsModal').removeClass('active'); });
+    $('#manageGroupsModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
+    $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#manageGroupsModal').removeClass('active'); });
+    $('#mgSearch').on('input', renderManageGroups);
+
+    $(document).on('click', '[data-mg-disband]', function () {
+        var gid = parseInt($(this).attr('data-mg-disband'), 10);
+        if (!gid) return;
+        var $btn = $(this).prop('disabled', true);
+        $.ajax({ url: '/Bots/DisbandGroup', type: 'POST', contentType: 'application/json', data: JSON.stringify({ groupId: gid }) })
+            .done(function (data) {
+                if (data && data.success) {
+                    showToast('Group #' + gid + ' disbanded');
+                    mgGroups = mgGroups.filter(function (g) { return g.groupId !== gid; });
+                    renderManageGroups();
+                    refreshGroupingStatus();
+                } else {
+                    showToast('Disband failed: ' + ((data && data.error) || 'unknown'), true);
+                    $btn.prop('disabled', false);
+                }
+            })
+            .fail(function (xhr) { showToast('Disband failed (' + xhr.status + ')', true); $btn.prop('disabled', false); });
+    });
+
+    $('#mgDissolveAll').on('click', function () {
+        var n = mgGroups.length;
+        if (!n) return;
+        if (!confirm('Dissolve all ' + n + ' bot group' + (n === 1 ? '' : 's') + '? Every member goes solo and DISBAND_GROUP is sent to each leader.')) return;
+        var $btn = $(this).prop('disabled', true);
+        $.ajax({ url: '/Bots/DisbandAllGroups', type: 'POST' })
+            .done(function (data) {
+                if (data && data.success) {
+                    showToast('Dissolved ' + data.disbanded + ' group' + (data.disbanded === 1 ? '' : 's'));
+                    loadManageGroups();
+                } else {
+                    showToast('Dissolve all failed: ' + ((data && data.error) || 'unknown'), true);
+                }
+            })
+            .fail(function (xhr) { showToast('Dissolve all failed (' + xhr.status + ')', true); })
+            .always(function () { $btn.prop('disabled', false); });
+    });
+
     $(document).on('click', '#btnBotReport', function (e) {
         e.stopPropagation();
         openBotReport();

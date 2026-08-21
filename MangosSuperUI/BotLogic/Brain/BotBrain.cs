@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Planners;
 
 namespace MangosSuperUI.BotLogic.Brain;
@@ -123,6 +124,18 @@ public sealed class BotBrain
         // 1b. A repeated group no-path is quarantined until the coordinator
         //     changes the order. It never becomes a teleport-to-destination.
         if (await TryQuarantineUnreachableGroupLegAsync(ctx)) return;
+
+        // 1b-1. [STUCK-STILL] Ground truth: if the bot hasn't physically MOVED in the still-window,
+        //       it is stuck — full stop — regardless of what goal/why it is cycling. A walking,
+        //       questing or grinding bot always moves, so this never touches a bot mid-trek. Checked
+        //       before the outcome-based wedge/streak machinery so a frozen bot ejects on the first
+        //       window instead of after 6 wedges.
+        if (await TryEjectIfPhysicallyStuckAsync(ctx)) return;
+
+        // 1b-2. [FINDING_020] Island escape. A bot whose OWN start cannot path anywhere (core-tagged
+        //       start_isolated on N consecutive fails from one spot) has no move that can succeed —
+        //       port it to its level-band home. Before the wedge breaker, which such a bot never trips.
+        if (await TryEscapeIslandAsync(ctx)) return;
 
         // 1c. No-progress circuit breaker. Fires before goal/plan so a wedged bot is parked, not driven.
         if (await TryBreakWedgeAsync(ctx)) return;
@@ -269,41 +282,32 @@ public sealed class BotBrain
             id.WedgeStreak++;
             if (id.WedgeStreak >= StrandedWedgeCap && !ctx.Dead && !ctx.InCombat && !ctx.InPlayerParty)
             {
-                // Level-banded home (Northshire-pileup fix): over-leveled bots go to a town with
-                // level-appropriate content, not the L1 start where every kill is grey.
-                var home = BotIdentity.HomeFor(id.Race, id.Level);
-
-                // Already-home guard: a bot stranded AT its home town gains nothing from a re-port
-                // — the old no-op port every ~15 min was pure churn (and at scale, the resulting
-                // pileup drove the core's dynamic visibility to its floor). Reset the streak and
-                // let the normal wedge ladder keep working the spot.
-                float hdx = ctx.Pos.X - home.X, hdy = ctx.Pos.Y - home.Y;
-                bool alreadyHome = home.Map == ctx.MapId && (hdx * hdx + hdy * hdy) < 300f * 300f;
-                if (alreadyHome)
+                // [ESCAPE-BANDS] Level-appropriate escape: the LOWEST band whose range holds the bot's
+                // level, rolling a same-faction spot that is NOT the pocket it's stuck in (so a bot
+                // stuck in its own starter rolls a different same-faction starter — valid at 1-5). This
+                // replaces the level-blind HomeFor + PickEscapeTown that could fling a L2 into Loch
+                // Modan. HomeFor is the defensive fallback only if the level lands outside every band.
+                (float X, float Y, float Z, int Map)? dest =
+                    PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
+                if (dest is null)
                 {
+                    var home = BotIdentity.HomeFor(id.Race, id.Level);
+                    if (home.Map >= 0) dest = home;
+                }
+
+                if (dest is { } d)
+                {
+                    await IssueEscapePortAsync(ctx, id, d,
+                        $"STRANDED (wedge streak {StrandedWedgeCap}, goal {ctx.Goal}, L{id.Level})");
+                }
+                else
+                {
+                    // No alternate town on this map at all (shouldn't happen for a live bot) — reset
+                    // and let the wedge ladder keep shuffling it locally.
                     id.WedgeStreak = 0;
                     _logger.LogInformation(
-                        "[ESCAPE] {Name} stranded at its own home town ({X:F0},{Y:F0})@map{Map} — skipping no-op port",
-                        ctx.Name, home.X, home.Y, home.Map);
-                }
-                else if (home.Map >= 0)
-                {
-                    id.WedgeStreak = 0;
-                    id.GrindLockUntil = null;
-                    id.GrindLockReleaseCooldownUntil = null;
-                    id.AddPathBlacklist(ctx.Pos.X, ctx.Pos.Y, id.Level + 10);
-                    ctx.Grind = null;
-                    _logger.LogWarning(
-                        "[ESCAPE] {Name} STRANDED (wedge streak {N}, goal {G} @ {Pos}) — PORT_HOME to level-band home ({X:F0},{Y:F0})@map{Map}",
-                        ctx.Name, StrandedWedgeCap, ctx.Goal, ctx.Pos, home.X, home.Y, home.Map);
-                    await _executor.IssueNoWaitAsync(ctx, new BridgeCommand("SET_TASK", new
-                    {
-                        task = "PORT_HOME",
-                        home_x = home.X,
-                        home_y = home.Y,
-                        home_z = home.Z,
-                        home_map = home.Map
-                    }));
+                        "[ESCAPE] {Name} stranded @ {Pos} but no alt escape town on map{Map} — parking",
+                        ctx.Name, ctx.Pos, ctx.MapId);
                 }
             }
         }
@@ -313,6 +317,243 @@ public sealed class BotBrain
             ctx.Name, noProg, fails, WedgeBackoffSec, ctx.Goal, ctx.Pos);
 
         await EnterGoalAsync(ctx, Goal.Idle);   // next tick reselects; parks while the backoff holds
+        return true;
+    }
+
+    // [FINDING_020] Island escape knobs. IslandEscapeCap consecutive core-tagged start_isolated
+    // MOVE_FAILEDs from one ~10yd spot = the bot is on a navmesh island / WMO pocket / in water and
+    // cannot path out (post-FINDING_011 the straight-line shortcut is gone). The 3-fail cap is well
+    // above a single transient mis-probe; the cooldown bounds worst-case port churn if the bot walks
+    // straight back into the same trap.
+    private const int IslandEscapeCap = 3;
+    private const double IslandEscapeCooldownSec = 600;
+
+    // [FINDING_020 round 4] Escape destinations — vetted, guarded, on-mesh town spots (the same
+    // coords HomeFor trusts), spread across each continent. A bot wedged AT its home town is ported
+    // to a DIFFERENT same-map town from this pool. This replaces the old "skipping no-op port" trap
+    // that pinned ~300 bots / 20 min in the Menethil gate-tower / Crossroads-inn / Auberdine pockets:
+    // porting to the coord you're STUCK on is a no-op, but porting to another town is a real escape.
+    // guid+rotation spread so a mass of stuck bots diffuses across towns instead of re-piling on one.
+
+    // [STUCK-STILL] Physical-stuck detector knobs. A bot within StuckStillRadius of its anchor for
+    // StuckStillSeconds (alive/solo/OOC, and not currently landing kills) is physically frozen.
+    private const float StuckStillRadius = 3f;
+    private const double StuckStillSeconds = 120;
+
+    /// <summary>[STUCK-STILL] Ground-truth physical-stuck eject. If the bot hasn't physically moved
+    /// more than StuckStillRadius in StuckStillSeconds (alive + solo + out of combat), teleport it to a
+    /// friendly hub — on the FIRST window, no wedge streak. A bot mid-trek moves, so this never fires on
+    /// it; a bot still landing REAL kills (in-place grind) is productive, so a recent kill defers it.</summary>
+    private async Task<bool> TryEjectIfPhysicallyStuckAsync(BotContext ctx)
+    {
+        var id = ctx.Identity;
+
+        // Not eligible (dead / in combat / player-driven): hold the anchor here so the window starts
+        // fresh the moment the bot becomes eligible again.
+        if (id == null || ctx.Dead || ctx.InCombat || ctx.InPlayerParty)
+        {
+            if (id != null) { id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow; }
+            return false;
+        }
+
+        // First sight this session: seed the anchor.
+        if (id.StillSinceUtc == default)
+        {
+            id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow;
+            return false;
+        }
+
+        // Moved beyond the radius → not stuck; restart the window from the new spot.
+        float dx = ctx.Pos.X - id.StillAnchorX, dy = ctx.Pos.Y - id.StillAnchorY;
+        if (dx * dx + dy * dy > StuckStillRadius * StuckStillRadius)
+        {
+            id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow;
+            return false;
+        }
+
+        // Still landing real kills → productive in-place grind, not stuck. (LastKillUtc advances only
+        // on REAL kills — trash/grey kills don't count — so a chicken farmer still reads as stuck.)
+        if ((DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds < StuckStillSeconds)
+            return false;
+
+        // Not yet frozen for the whole window.
+        if ((DateTime.UtcNow - id.StillSinceUtc).TotalSeconds < StuckStillSeconds)
+            return false;
+
+        // Physically frozen for the whole window → eject to a level-appropriate friendly hub.
+        // [ESCAPE-BANDS] lowest band containing the level, same-faction, never the pocket we're in.
+        (float X, float Y, float Z, int Map)? dest =
+            PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
+        if (dest is null)
+        {
+            var home = BotIdentity.HomeFor(id.Race, id.Level);
+            if (home.Map >= 0) dest = home;
+        }
+
+        if (dest is not { } d)
+        {
+            // Nowhere friendly to send (shouldn't happen for a live bot) — restart the window so we
+            // don't re-evaluate every tick, and let the wedge ladder remain the fallback.
+            id.StillSinceUtc = DateTime.UtcNow;
+            return false;
+        }
+
+        _logger.LogWarning(
+            "[STUCK] {Name} physically frozen {Sec:F0}s (<{R:F0}yd) @ {Pos} — ejecting to friendly hub ({X:F0},{Y:F0})@map{Map}",
+            ctx.Name, StuckStillSeconds, StuckStillRadius, ctx.Pos, d.X, d.Y, d.Map);
+        await IssueEscapePortAsync(ctx, id, d, $"STUCK — no movement {StuckStillSeconds:F0}s");
+        id.StillAnchorX = d.X; id.StillAnchorY = d.Y; id.StillSinceUtc = DateTime.UtcNow;
+        return true;
+    }
+
+    private const float EscapeSpreadYards = 500f;   // a candidate spot this close to the bot = the pocket it's in → skip it
+
+    // ── [ESCAPE-BANDS] Level-appropriate escape destinations ───────────────────────────────────
+    // The prior escape pool was level-BLIND (filtered only by map + faction + distance), so a stuck L2
+    // human "at home" (Northshire) could roll Thelsamar (Loch Modan, 10-18) or Menethil (Wetlands,
+    // 20-30) — dumped into a zone it cannot survive. These bands make the roll level-aware: each band is
+    // a level range and a same-faction destination set whose OWN zone range
+    // brackets that band, so a bot only ever ports to content it can handle:
+    //   1-5   any same-faction STARTER zone (cross-continent OK — a gnome in Northshire is valid)
+    //   6-10  the starter-zone hub towns (Goldshire / Kharanos / Dolanaar · Razor Hill / Brill / Bloodhoof)
+    //   11-20 first real questing zones (Westfall / Loch Modan / Darkshore · Barrens / Silverpine / Stonetalon)
+    //   21+   mid zones (Duskwood / Wetlands / Ashenvale · Hillsbrad / Ashenvale / Barrens)
+    // Bands are non-overlapping and authored low→high; the selector takes the FIRST (lowest) band whose
+    // range contains the level ("lowest safe band" — a L10 lands in the 6-10 tier, not 11-20). Coords are
+    // canonical game_tele / playercreateinfo spots (verified 2026-08-21), all inside guard coverage.
+    private static readonly (int Min, int Max, (float X, float Y, float Z, int Map, Team Team)[] Spots)[] EscapeBands =
+    {
+        (1, 5, new[]
+        {
+            (-8949.95f, -132.493f, 83.5312f, 0, Team.Alliance),  // Northshire (Elwynn)        1-6
+            (-6240.32f, 331.033f,  382.758f, 0, Team.Alliance),  // Coldridge Valley (Dun Morogh) 1-6
+            (10311.3f,  831.463f,  1326.41f, 1, Team.Alliance),  // Shadowglen (Teldrassil)    1-6
+            (-618.518f, -4251.67f, 38.718f,  1, Team.Horde),     // Valley of Trials (Durotar) 1-6
+            (1676.35f,  1677.45f,  121.67f,  0, Team.Horde),     // Deathknell (Tirisfal)      1-6
+            (-2917.58f, -257.98f,  52.9968f, 1, Team.Horde),     // Camp Narache (Mulgore)     1-6
+        }),
+        (6, 10, new[]
+        {
+            (-9448.55f, 68.236f,   56.3225f, 0, Team.Alliance),  // Goldshire (Elwynn)         1-10
+            (-5597.31f, -483.398f, 396.981f, 0, Team.Alliance),  // Kharanos (Dun Morogh)      1-10
+            (9821.0f,   959.0f,    1314.0f,  1, Team.Alliance),  // Dolanaar (Teldrassil)      6-12
+            (338.0f,    -4688.0f,  17.0f,    1, Team.Horde),     // Razor Hill (Durotar)       6-12
+            (2247.0f,   252.0f,    34.0f,    0, Team.Horde),     // Brill (Tirisfal)           6-12
+            (-2361.0f,  -349.0f,   -9.0f,    1, Team.Horde),     // Bloodhoof Village (Mulgore) 5-12
+        }),
+        (11, 20, new[]
+        {
+            (-10628.0f, 1036.0f,   33.0f,    0, Team.Alliance),  // Sentinel Hill (Westfall)   10-20
+            (-5360.0f,  -2953.0f,  323.0f,   0, Team.Alliance),  // Thelsamar (Loch Modan)     10-18
+            (6420.0f,   529.0f,    9.0f,     1, Team.Alliance),  // Auberdine (Darkshore)      10-20
+            (-472.0f,   -2653.0f,  97.0f,    1, Team.Horde),     // The Crossroads (Barrens)   10-25
+            (457.0f,    1548.0f,   132.0f,   0, Team.Horde),     // The Sepulcher (Silverpine) 10-20
+            (966.147f,  926.499f,  104.649f, 1, Team.Horde),     // Sun Rock Retreat (Stonetalon) 15-27
+        }),
+        (21, 999, new[]
+        {
+            (-10559.0f, -1189.0f,  28.0f,    0, Team.Alliance),  // Darkshire (Duskwood)       18-30
+            (-3688.0f,  -830.0f,   10.0f,    0, Team.Alliance),  // Menethil Harbor (Wetlands) 20-30
+            (2676.19f,  -422.905f, 107.123f, 1, Team.Alliance),  // Astranaar (Ashenvale)      18-30
+            (-34.1467f, -923.366f, 54.5576f, 0, Team.Horde),     // Tarren Mill (Hillsbrad)    20-30
+            (2270.94f,  -2538.19f, 93.9198f, 1, Team.Horde),     // Splintertree Post (Ashenvale) 18-30
+            (-472.0f,   -2653.0f,  97.0f,    1, Team.Horde),     // The Crossroads (Barrens)   10-25
+        }),
+    };
+
+    /// <summary>[ESCAPE-BANDS] Level-appropriate escape destination. Picks the LOWEST band whose range
+    /// contains the bot's level, then rolls a same-faction spot in it — excluding any spot within
+    /// EscapeSpreadYards of where the bot stands (so it is never the pocket it is stuck in; a bot stuck
+    /// IN its own starter therefore rolls a DIFFERENT same-faction starter, which is valid at 1-5).
+    /// guid+rotation spread diffuses a mass of stuck bots across the band. Null only if the level is
+    /// outside every band (unreachable: last band is open-ended) — caller falls back to HomeFor.</summary>
+    private static (float X, float Y, float Z, int Map)? PickBandedEscape(BotContext ctx, int level, int rotation, Team team)
+    {
+        (float X, float Y, float Z, int Map, Team Team)[]? spots = null;
+        foreach (var band in EscapeBands)
+            if (level >= band.Min && level <= band.Max) { spots = band.Spots; break; }
+        if (spots == null) return null;
+
+        var pool = new List<(float X, float Y, float Z, int Map)>(spots.Length);
+        var near = new List<(float X, float Y, float Z, int Map)>(spots.Length);   // excluded "stuck pocket" spots
+        foreach (var s in spots)
+        {
+            if (s.Team != team) continue;
+            float dx = s.X - ctx.Pos.X, dy = s.Y - ctx.Pos.Y;
+            bool sameMapNear = s.Map == ctx.MapId && (dx * dx + dy * dy) < EscapeSpreadYards * EscapeSpreadYards;
+            if (sameMapNear) near.Add((s.X, s.Y, s.Z, s.Map));
+            else pool.Add((s.X, s.Y, s.Z, s.Map));
+        }
+        if (pool.Count == 0) pool = near;   // every spot was the pocket (shouldn't happen cross-map) — port anyway
+        if (pool.Count == 0) return null;
+        int idx = (int)(((uint)ctx.Guid + (uint)rotation) % (uint)pool.Count);
+        return pool[idx];
+    }
+
+    /// <summary>[FINDING_020 round 4] Shared escape port: clear the wedge/island/grind-lock state and
+    /// fire PORT_HOME to a chosen safe destination. Used by both the wedge stranded-escape and the
+    /// island escape so "get the bot OUT" is one code path with one behaviour.</summary>
+    private async Task IssueEscapePortAsync(BotContext ctx, BotIdentity id, (float X, float Y, float Z, int Map) dest, string kind)
+    {
+        id.WedgeStreak = 0;
+        id.IslandStreak = 0;
+        id.GrindLockUntil = null;
+        id.GrindLockReleaseCooldownUntil = null;
+        id.AddPathBlacklist(ctx.Pos.X, ctx.Pos.Y, id.Level + 10);
+        ctx.Grind = null;
+        _executor.ClearPending(ctx);
+        ctx.Failure = null;
+        ctx.ConsecutiveFailures = 0;
+        id.EscapeRotation++;
+        _logger.LogWarning("[ESCAPE] {Name} {Kind} @ {Pos} — PORT_HOME to ({X:F0},{Y:F0})@map{Map}",
+            ctx.Name, kind, ctx.Pos, dest.X, dest.Y, dest.Map);
+        await _executor.IssueNoWaitAsync(ctx, new BridgeCommand("SET_TASK", new
+        {
+            task = "PORT_HOME",
+            home_x = dest.X,
+            home_y = dest.Y,
+            home_z = dest.Z,
+            home_map = dest.Map
+        }));
+    }
+
+    /// <summary>
+    /// [FINDING_020] Port a bot whose OWN start is isolated (BotIdentity.IslandStreak ≥ cap) to its
+    /// level-band home. Unlike the FINDING_010 stranded escape this deliberately does NOT apply the
+    /// "already home" guard — the measured islands (Crossroads inn/graveyard, Menethil pier, Darkshire
+    /// smithy) are all INSIDE their home town's 300yd box; the home coordinate itself is on-mesh and
+    /// 30–70yd away, which is exactly the hop needed. Alive + out-of-combat + solo only (core refuses
+    /// PORT_HOME in combat anyway). Clears the in-flight WAIT/failure so the planner re-plans from the
+    /// new spot; keeps quest/grind state (the bot was mid-plan, nothing about its goals changed).
+    /// </summary>
+    private async Task<bool> TryEscapeIslandAsync(BotContext ctx)
+    {
+        var id = ctx.Identity;
+        if (id == null || id.IslandStreak < IslandEscapeCap) return false;
+        if (ctx.Dead || ctx.InCombat || ctx.InPlayerParty) return false;
+        if (id.IslandEscapeCooldownUntil is DateTime cd && DateTime.UtcNow < cd) return false;
+
+        // [ESCAPE-BANDS] Level-appropriate destination: lowest band containing the level, same-faction,
+        // never the pocket the bot is islanded in. HomeFor is the fallback if the level is off every band.
+        (float X, float Y, float Z, int Map)? dest =
+            PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
+        if (dest is null)
+        {
+            var home = BotIdentity.HomeFor(id.Race, id.Level);
+            if (home.Map < 0) { id.IslandStreak = 0; return false; }
+            dest = home;
+        }
+
+        id.IslandEscapeCooldownUntil = DateTime.UtcNow.AddSeconds(IslandEscapeCooldownSec);
+        if (dest is not { } d)
+        {
+            // no alternate town on this map — cool down and let the wedge ladder handle it
+            id.IslandStreak = 0;
+            return false;
+        }
+
+        int streak = id.IslandStreak;
+        await IssueEscapePortAsync(ctx, id, d, $"ISOLATED start (x{streak} start_isolated fails, goal {ctx.Goal})");
         return true;
     }
 
@@ -547,7 +788,13 @@ public sealed class BotBrain
         switch (action.Kind)
         {
             case StallActionKind.ReselectGoal:
-                _logger.LogDebug("[BRAIN] {Name} {Goal} reselect: {Detail}", ctx.Name, ctx.Goal, action.Detail);
+                // Track reselect churn: a reselect with no real progress (kill/quest/level) since the last
+                // one is the bot recomputing the SAME dead answer. MarkProgress zeroes this, so a streak
+                // only builds while the bot is genuinely stuck — the physical-stuck ejector reads it to
+                // eject a dead-pocket bot on a short window instead of the full still window.
+                ctx.ConsecutiveReselects++;
+                ctx.LastReselectUtc = DateTime.UtcNow;
+                _logger.LogDebug("[BRAIN] {Name} {Goal} reselect: {Detail} (churn={Churn})", ctx.Name, ctx.Goal, action.Detail, ctx.ConsecutiveReselects);
                 // Stop the current patrol and drop to Idle; next tick reselects and
                 // re-arms a fresh grind wherever the bot now stands (no phantom STUCK —
                 // a grind never armed a Pending).

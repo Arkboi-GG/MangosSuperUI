@@ -39,6 +39,8 @@ public sealed class GrindPlanner : IBotPlanner
     private const int RelocatePathDangerCeil = 5;    // corridor mobs over botLevel+this → reject the route
     private const int RelocateCooldownMin = 15;      // one relocate ATTEMPT per ~lock window (009 lesson: never at tick speed)
     private static readonly TimeSpan RelocateDeadline = TimeSpan.FromMinutes(3); // 350yd at ~7yd/s + recovery slack
+    private const int GrindHubJumpCooldownMin = 10;  // bound a bad camp/data landing; never continent-ping-pong
+    private const int GrindHubQuestRescanParkSec = 8; // wait for cross-map STATE, then select quests at the new camp
 
     private readonly ILogger<GrindPlanner> _log;
     private readonly ZoneSafetyMap _safety;
@@ -53,6 +55,102 @@ public sealed class GrindPlanner : IBotPlanner
 
     public StepResult PlanNext(BotContext ctx, BotStateSnapshot snap)
     {
+        // [GRIND-HUB] C++ already tells us the decisive fact after three wildcard scans:
+        // GRIND_BLOCKED reason=no_target. QuestPlanner consumes that signal for objective grinds,
+        // but filler Grinding historically ignored it (ctx.Failure stayed set forever) and waited
+        // for the 150s/6-wedge town escape. Consume it here and jump to a PROVEN hostile-spawn camp,
+        // preferring the other continent so a bad local town/zone cannot recycle the bot.
+        //
+        // The jump clears grind-lock and parks briefly. Once the cross-map STATE arrives,
+        // GoalSelector runs normally from the new position: nearby viable quests win; only if none
+        // exist does it re-arm wildcard grinding at the already-validated level-safe camp.
+        // The core signal is authoritative when its scan is literally empty. It is not sufficient by
+        // itself, though: a town can contain a nominally valid mob that never becomes a REAL kill
+        // (unreachable/contested/bad combat pocket), so C++ never says no_target. The old 45s planner
+        // stall then re-issued SET_TASK GRIND, resetting the core scan and preserving the bad pocket.
+        // Treat the planner's own bounded no-real-kill verdict as the same relocation request.
+        WaitFailure? empty = ctx.Failure is { CommandType: "GRIND", Reason: "no_target" } reported
+            ? reported
+            : ctx.Failure == null
+              && ctx.Grind != null
+              && ctx.TimeInGoalSec >= ArmGraceSec
+              && (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds >= KillRecencySec
+                ? new WaitFailure
+                {
+                    CommandType = "GRIND",
+                    Reason = "no_kills",
+                    Dest = ctx.Grind.AreaCenter,
+                    Utc = DateTime.UtcNow
+                }
+                : null;
+
+        if (empty != null && ctx.Identity is { } hid)
+        {
+            ctx.Failure = null;
+            ctx.RecordDeadGrindCell(empty.Dest?.X ?? snap.X, empty.Dest?.Y ?? snap.Y);
+
+            if (ctx.InCombat || ctx.InPlayerParty)
+            {
+                hid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
+                ctx.Grind = null;
+                _log.LogInformation("[GRIND-HUB] {Name} empty grind but combat/player-party blocks port — parking {P}s",
+                    ctx.Name, GuardTownParkSec);
+                return StepResult.Block("grind:hub-port-blocked");
+            }
+
+            if (hid.GrindHubJumpCooldownUntil is DateTime hcd && DateTime.UtcNow < hcd)
+            {
+                hid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
+                ctx.Grind = null;
+                _log.LogInformation("[GRIND-HUB] {Name} empty grind during hub-jump cooldown — parking {P}s",
+                    ctx.Name, GuardTownParkSec);
+                return StepResult.Block("grind:hub-cooldown");
+            }
+
+            int otherContinent = snap.MapId == 0 ? 1 : 0;
+            var hteam = ZoneSafetyMap.TeamFromFaction(hid.Faction);
+            int seed = unchecked((int)ctx.Guid + hid.GrindHubJumpRotation * 7919);
+            var hub = _safety.FindGlobalGrindCell(
+                ctx.Level, hteam, seed, otherContinent,
+                reject: (map, x, y) =>
+                    map == snap.MapId && (ctx.IsDeadGrindCell(x, y) || hid.IsPathBlacklisted(x, y)));
+
+            if (hub is { } h)
+            {
+                hid.GrindHubJumpCooldownUntil = DateTime.UtcNow.AddMinutes(GrindHubJumpCooldownMin);
+                hid.GrindHubJumpRotation++;
+                hid.GrindLockUntil = null;
+                hid.GrindLockReleaseCooldownUntil = null;
+                hid.ClearGrindRelocate();
+                hid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GrindHubQuestRescanParkSec);
+                ctx.LastProgressUtc = hid.WedgeBackoffUntil.Value;
+                ctx.Grind = null;
+                ctx.Quest = null;
+                ctx.ClearObjective();
+
+                _log.LogWarning(
+                    "[GRIND-HUB] {Name} barren grind ({Reason}) @ map{From} ({PX:F0},{PY:F0}) — cross-continent jump to map{Map} camp ({X:F0},{Y:F0},{Z:F0}) avg L{Avg:F1} max L{Max} spawns {N}; quest rescan after {Park}s",
+                    ctx.Name, empty.Reason, snap.MapId, snap.X, snap.Y, h.MapId, h.X, h.Y, h.Z,
+                    h.AvgLevel, h.MaxLevel, h.SpawnCount, GrindHubQuestRescanParkSec);
+                return StepResult.Fire(new BridgeCommand("SET_TASK", new
+                {
+                    task = "PORT_HOME",
+                    home_x = h.X,
+                    home_y = h.Y,
+                    home_z = h.Z,
+                    home_map = h.MapId
+                }));
+            }
+
+            // No camp data is safer than a blind teleport. Park and let the existing wedge ladder
+            // remain the fail-safe; this path is visible and bounded rather than lying as Grinding.
+            hid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
+            ctx.Grind = null;
+            _log.LogWarning("[GRIND-HUB] {Name} no level-safe camp found on either continent — parking {P}s",
+                ctx.Name, GuardTownParkSec);
+            return StepResult.Block("grind:no-global-hub");
+        }
+
         // Arm / re-arm: indefinite grind at the bot's CURRENT position. C++ SelectGrindTarget
         // does the nearest-level-appropriate-XP-mob scan and keeps rescanning; we never steer it
         // beyond "here". creature_entry=0 = "nearest valid hostile" (C++ skips critters/grey);
@@ -100,7 +198,9 @@ public sealed class GrindPlanner : IBotPlanner
                     // relocate leg failed — grind here as before; this window's attempt is spent
                     if (rf.Reason is "no_path" or "empty_path")
                     {
-                        _safety.RecordNoPathDest(snap.MapId, rid.GrindRelocateX, rid.GrindRelocateY);
+                        // [FINDING_020] an isolated START says nothing about the dest — keep it per-bot only
+                        if (!rf.StartIsolated)
+                            _safety.RecordNoPathDest(snap.MapId, rid.GrindRelocateX, rid.GrindRelocateY);
                         ctx.RecordDeadGrindCell(rid.GrindRelocateX, rid.GrindRelocateY);
                     }
                     rid.ClearGrindRelocate();
@@ -196,8 +296,15 @@ public sealed class GrindPlanner : IBotPlanner
         // A relocate walk IS progress (per the BotIdentity design note): the Send deadline
         // bounds it, and the goal-change / wedge clears abort it — no unbounded pass.
         if (ctx.Identity is { GrindRelocating: true }) return true;
-        if (ctx.TimeInGoalSec < ArmGraceSec) return true;        // arm grace: let the patrol get going
-        return (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds < KillRecencySec;  // REAL kills only (gated in BotExecutor)
+
+        // Once armed, PlanNext owns the no-real-kill verdict and converts it into the same hub jump as
+        // GRIND_BLOCKED. Returning false here used to route through OnStall -> EnterGoal(Idle), which
+        // cancelled and re-issued the C++ patrol every ~45s before its negative feedback could help.
+        // Keep the patrol intact; PlanNext still runs every tick because grind carries no Pending WAIT.
+        if (ctx.Grind != null) return true;
+
+        return ctx.TimeInGoalSec < ArmGraceSec
+            || (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds < KillRecencySec;
     }
 
     public StallAction OnStall(BotContext ctx)

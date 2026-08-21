@@ -448,6 +448,19 @@ public class BotBridgeService : BackgroundService
         _logger.LogInformation("BotBridge: RotationService wired for HELLO re-push");
     }
 
+    private RaidPlanService? _raidPlans;   // [RAID-PLAN] late-wired by RaidPlanService's ctor (same pattern)
+
+    /// <summary>
+    /// [RAID-PLAN] Called by RaidPlanService from its constructor — the SetRotationService
+    /// late-wire pattern. Enables the HELLO re-push so raid-plan assignments survive
+    /// restarts and relogs (PLAN_19 M-B).
+    /// </summary>
+    public void SetRaidPlanService(RaidPlanService raidPlans)
+    {
+        _raidPlans = raidPlans;
+        _logger.LogInformation("BotBridge: RaidPlanService wired for HELLO re-push");
+    }
+
     /// <summary>
     /// Called by ChatCoordinator.StartAsync to wire itself in (C0, §5.5).
     /// Same late-wire pattern as SetBrainService — see _chat field comment.
@@ -633,6 +646,11 @@ public class BotBridgeService : BackgroundService
         // forget so a slow push can never delay the HELLO handshake. Failures log inside.
         if (_rotations != null)
             _ = _rotations.OnBotHelloAsync(hello.Guid, hello.Name);
+
+        // [RAID-PLAN] Same law for the raid plan: the persisted assignment re-pushes
+        // on every HELLO, fire-and-forget, failures log inside (PLAN_19 M-B).
+        if (_raidPlans != null)
+            _ = _raidPlans.OnBotHelloAsync(hello.Guid, hello.Name);
     }
 
     private async Task HandleStateAsync(JsonElement payload, BotConnection conn)

@@ -110,11 +110,11 @@ public sealed class BotExecutor
         // one-line grep: "issue MOVE_TO -> (X,Y)" followed by "issue QUEST_INTERACT npc=N from (px,py)"
         // with (px,py) nowhere near (X,Y). Everything else logs exactly as before.
         if (cmd.Type == "MOVE_TO" && moveTgt is { } mt)
-            _logger.LogDebug("[EXEC] {Name} issue MOVE_TO -> ({X:F0},{Y:F0}) from ({PX:F0},{PY:F0}) d={D:F0} expect={Expect} deadline={Sec}s",
-                ctx.Name, mt.X, mt.Y, ctx.Pos.X, ctx.Pos.Y, ctx.DistToTarget, expectedEvent, deadline.TotalSeconds);
+            _logger.LogDebug("[EXEC] {Name} issue MOVE_TO map={Map} -> ({X:F0},{Y:F0}) from ({PX:F0},{PY:F0}) d={D:F0} expect={Expect} deadline={Sec}s",
+                ctx.Name, ctx.MapId, mt.X, mt.Y, ctx.Pos.X, ctx.Pos.Y, ctx.DistToTarget, expectedEvent, deadline.TotalSeconds);
         else if (cmd.Type == "QUEST_INTERACT")
-            _logger.LogDebug("[EXEC] {Name} issue QUEST_INTERACT npc={Npc} from ({PX:F0},{PY:F0}) expect={Expect} deadline={Sec}s",
-                ctx.Name, cmd.Payload.TryGetValue("npc_entry", out var ne) ? ne : "?", ctx.Pos.X, ctx.Pos.Y, expectedEvent, deadline.TotalSeconds);
+            _logger.LogDebug("[EXEC] {Name} issue QUEST_INTERACT map={Map} npc={Npc} from ({PX:F0},{PY:F0}) expect={Expect} deadline={Sec}s",
+                ctx.Name, ctx.MapId, cmd.Payload.TryGetValue("npc_entry", out var ne) ? ne : "?", ctx.Pos.X, ctx.Pos.Y, expectedEvent, deadline.TotalSeconds);
         else
             _logger.LogDebug("[EXEC] {Name} issue {Type} expect={Expect} deadline={Sec}s",
                 ctx.Name, cmd.Type, expectedEvent, deadline.TotalSeconds);
@@ -285,6 +285,28 @@ public sealed class BotExecutor
             if (mfk.TryGetValue("reason", out var mfr) && mfr == "no_path"
                 && mfk.TryGetValue("dest_x", out var mfx) && mfk.TryGetValue("dest_y", out var mfy))
                 idNoPath.RecordNoPath(ctx.MapId, ParseF(mfx), ParseF(mfy));
+
+            // [FINDING_020] Island streak. The core tags a MOVE_FAILED start_isolated=1 when the bot's
+            // OWN start cannot path ~20yd in any direction (navmesh island / WMO pocket / harbour water).
+            // Post-FINDING_011 such a bot has no move that succeeds, so count consecutive isolated fails
+            // from the SAME spot (WAIT or fire-and-forget alike — same reasoning as the no_path streak
+            // above) and let BotBrain.TryEscapeIslandAsync port it out. Moving >10yd resets the streak.
+            if (mfk.TryGetValue("start_isolated", out var iso) && iso == "1")
+            {
+                float sdx = ctx.Pos.X - idNoPath.IslandStreakX, sdy = ctx.Pos.Y - idNoPath.IslandStreakY;
+                if (idNoPath.IslandStreak == 0 || (sdx * sdx + sdy * sdy) > 10f * 10f)
+                {
+                    idNoPath.IslandStreak = 0;
+                    idNoPath.IslandStreakX = ctx.Pos.X;
+                    idNoPath.IslandStreakY = ctx.Pos.Y;
+                }
+                idNoPath.IslandStreak++;
+            }
+            else if (idNoPath.IslandStreak > 0)
+            {
+                // a non-isolated failure means the start CAN path somewhere — not an island
+                idNoPath.IslandStreak = 0;
+            }
         }
 
         var pending = ctx.Pending;
@@ -413,6 +435,7 @@ public sealed class BotExecutor
             Dest = dest,
             DangerLevel = danger,
             QuestId = qid,
+            StartIsolated = kv.TryGetValue("start_isolated", out var isoS) && isoS == "1",   // [FINDING_020]
             Utc = DateTime.UtcNow
         };
 

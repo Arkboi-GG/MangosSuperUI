@@ -306,6 +306,35 @@ public class BotIdentity
     public int WedgeStreak { get; set; }
 
     /// <summary>
+    /// [FINDING_020] Consecutive MOVE_FAILED events tagged start_isolated=1 by the core from the same
+    /// ~10yd spot (BotExecutor.OnEvent). The bot's own start is a navmesh island / WMO pocket / water
+    /// and — post-FINDING_011 (no straight-line shortcut) — it has no move that can succeed. At
+    /// BotBrain.IslandEscapeCap the brain ports it to its level-band home (TryEscapeIslandAsync).
+    /// Reset when a failure is NOT isolated, when the bot has moved >10yd, and on the escape.
+    /// </summary>
+    public int IslandStreak { get; set; }
+    public float IslandStreakX { get; set; }
+    public float IslandStreakY { get; set; }
+    /// <summary>[FINDING_020] Don't re-port for this long after an island escape (lets the bot walk
+    /// away from home before the next verdict; bounds the worst-case port churn).</summary>
+    public DateTime? IslandEscapeCooldownUntil { get; set; }
+
+    /// <summary>[FINDING_020 round 4] Rotates the alt-town escape pick each time a stuck bot is
+    /// ported, so a bot that re-sticks at one town goes to a different one next time (diffusion,
+    /// not a re-pile). Bumped on every escape port.</summary>
+    public int EscapeRotation { get; set; }
+
+    /// <summary>[STUCK-STILL 2026-08-21] Ground-truth physical-stuck detector, INDEPENDENT of the
+    /// outcome-based wedge/streak machinery. Anchor = where the bot was when it last physically moved
+    /// more than the still-radius; StillSinceUtc = when that was. If it stays within the radius of the
+    /// anchor for the still-window (alive/solo/out-of-combat), it is physically stuck — a walking,
+    /// questing or grinding bot always moves — and BotBrain ejects it to a friendly hub on the FIRST
+    /// window, no wedge streak. default(DateTime) = not seeded yet (first sight seeds it).</summary>
+    public float StillAnchorX { get; set; }
+    public float StillAnchorY { get; set; }
+    public DateTime StillSinceUtc { get; set; }
+
+    /// <summary>
     /// Suppress the Training goal until this UTC time. Set by TrainingPlanner on a give-up
     /// (trainer unreachable / TRAIN_FAIL / timeout) so a bot doesn't immediately re-trek toward
     /// the same unreachable trainer. Cleared on LEVEL_UP (new spells justify a fresh attempt) and
@@ -328,6 +357,14 @@ public class BotIdentity
     /// cleared by ClearGrindRelocate — a failed/aborted relocate must not re-arm at tick speed
     /// (the FINDING_009 lesson); the bot grinds in place until the cooldown lapses.</summary>
     public DateTime? GrindRelocateCooldownUntil { get; set; }
+
+    /// <summary>
+    /// After C++ explicitly reports that a filler grind has no target, the brain may world-port to
+    /// a data-backed camp on the other continent. Bound retries so a bad landing/data cell cannot
+    /// produce a cross-continent ping-pong; GrindHubJumpRotation changes the selected top-ranked camp.
+    /// </summary>
+    public DateTime? GrindHubJumpCooldownUntil { get; set; }
+    public int GrindHubJumpRotation { get; set; }
 
     /// <summary>Clear all grind-relocation phase flags (relocate finished or aborted).</summary>
     public void ClearGrindRelocate()

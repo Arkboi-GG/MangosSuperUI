@@ -96,6 +96,10 @@ public sealed class WaitFailure
     public int DangerLevel { get; init; }               // PATH_UNSAFE danger_level (0 if n/a)
     public int? QuestId { get; init; }                  // QUEST_INTERACT_FAIL quest_id (if carried)
     public DateTime Utc { get; init; }
+    /// <summary>[FINDING_020] MOVE_FAILED start_isolated=1: the core probed the bot's OWN start and
+    /// found it cannot path ~20yd in any direction (navmesh island / WMO pocket / water). The failure
+    /// says nothing about the destination — do NOT feed it into the fleet no-path memory.</summary>
+    public bool StartIsolated { get; init; }
 
     public double AgeSec => (DateTime.UtcNow - Utc).TotalSeconds;
 }
@@ -397,6 +401,16 @@ public sealed class BotContext
     // Reset on any positive ack / kill (OnGrindProgress / the executor's ack path).
     public int ConsecutiveFailures { get; set; }
 
+    // ConsecutiveReselects: quest/goal reselects (StallActionKind.ReselectGoal — e.g. quest:no_progress)
+    // fired since the last REAL progress. A bot that keeps reselecting the SAME dead batch without a
+    // kill/quest/level advance in between is churning in place: GoalSelector reads pick>0 and returns
+    // Questing, QuestPlanner can't realize any leg and stalls, the reselect bounces through SET_TASK IDLE,
+    // and next tick recomputes the identical dead answer (the Darkshore "standing still" livelock). The
+    // physical-stuck ejector reads this to SHORTEN its window — a churning + physically-frozen bot is
+    // provably in a dead pocket, so it need not wait the full still window. Reset on any real progress.
+    public int ConsecutiveReselects { get; set; }
+    public DateTime LastReselectUtc { get; set; } = DateTime.MinValue;
+
     // Recently-tried grind cell centers (cell granularity) that produced no kills. The breaker records
     // the current spot here on a wedge so the next forced relocation goes somewhere NEW, not back onto
     // the same grid-"good"-but-dead cell. Cleared on a real KILL/level (OnGrindProgress).
@@ -582,8 +596,12 @@ public sealed class BotContext
         Step = step;
     }
 
-    /// <summary>Stamp generic forward progress (resets the no-progress clock).</summary>
-    public void MarkProgress() => LastProgressUtc = DateTime.UtcNow;
+    /// <summary>Stamp generic forward progress (resets the no-progress clock + the reselect-churn streak).</summary>
+    public void MarkProgress()
+    {
+        LastProgressUtc = DateTime.UtcNow;
+        ConsecutiveReselects = 0;   // real progress ⇒ not churning a dead batch
+    }
 
     /// <summary>Refresh the sensory fields from the latest bridge snapshot. No control logic here.</summary>
     public void Sense(BotStateSnapshot snap)
