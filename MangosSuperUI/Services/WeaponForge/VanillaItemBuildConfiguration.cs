@@ -106,7 +106,10 @@ public static class VanillaItemBuildConfigurationTranslator
 
     // The forged assets are static melee weapons; these are the weapon inventory bindings the
     // pipeline and its TBC preservation path support.
-    private static readonly HashSet<int> WeaponInventoryTypes = [13, 17, 21, 22];
+    /// <summary>Equippable vanilla weapon slots: 13 one-hand, 17 two-hand, 21 main hand, 22 off
+    /// hand, 15 ranged (bows), 25 thrown, 26 ranged-right (guns, crossbows, wands). Which of
+    /// these a given family accepts is enforced per family by the controller.</summary>
+    private static readonly HashSet<int> WeaponInventoryTypes = [13, 14, 15, 17, 21, 22, 25, 26];
 
     public static bool TryTranslate(
         VanillaItemBuildConfiguration configuration,
@@ -144,7 +147,7 @@ public static class VanillaItemBuildConfigurationTranslator
         if (configuration.InventoryType is int inventoryType)
         {
             if (!WeaponInventoryTypes.Contains(inventoryType))
-                problems.Add("inventoryType must be a supported Vanilla weapon slot: 13, 17, 21, or 22.");
+                problems.Add("inventoryType must be a supported Vanilla weapon slot: 13, 17, 21, 22 (melee) or 15, 25, 26 (ranged).");
             else
                 overrides["inventory_type"] = IntLiteral(inventoryType);
         }

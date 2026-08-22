@@ -117,13 +117,24 @@ public sealed class TbcItemCatalog
         }
     }
 
-    /// <summary>TBC class-2 subclass → Forge weapon-family key. Subclasses the static pipeline
-    /// cannot represent (bows/guns/wands/thrown/fishing poles are animated or paired) return null
-    /// and are excluded from the browse.</summary>
+    /// <summary>TBC class-2 subclass → Forge weapon-family key. Ranged subclasses map onto the
+    /// ranged families (the import is rigid on the family scaffold's root bone — a TBC bow's limb
+    /// draw animation is not carried, its projectile visual and slot are). Subclasses the pipeline
+    /// cannot represent (fist weapons pair two models; fishing poles) return null and are excluded
+    /// from the browse.</summary>
+    public static string? TypeKeyFor(int itemClass, int subclass) => itemClass switch
+    {
+        2 => TypeKeyForSubclass(subclass),
+        4 when subclass == 6 => "shield",   // armor class, shield subclass — the Shield family
+        _ => null,
+    };
+
     public static string? TypeKeyForSubclass(int subclass) => subclass switch
     {
         0 => "axe1h",
         1 => "axe2h",
+        2 => "bow",
+        3 => "gun",
         4 => "mace1h",
         5 => "mace2h",
         6 => "polearm",
@@ -132,6 +143,9 @@ public sealed class TbcItemCatalog
         10 => "staff",
         14 => "sword1h",   // Miscellaneous (brooms etc.) — closest static 1H contract
         15 => "dagger",
+        16 => "thrown",
+        18 => "crossbow",
+        19 => "wand",
         _ => null,
     };
 }

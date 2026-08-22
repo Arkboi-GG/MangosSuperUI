@@ -66,6 +66,60 @@ public static class UvPreservingDecimator
             facesOfWeld[wa].Add(f); facesOfWeld[wb].Add(f); facesOfWeld[wc].Add(f);
         }
 
+        // ---- Connected components + per-part floors ----
+        // Multi-piece exports (gems, fittings, pommels as separate shells) are where plain QEM does
+        // its worst: a 54-triangle gem carries almost no geometric error, so at game budgets whole
+        // parts collapse to nothing while the blade keeps triangles it does not need. Every part
+        // gets a floor proportional to its share of the budget (never below a few triangles), and a
+        // collapse that would take its part under the floor is refused — detail is reduced, not
+        // deleted. Floors that cannot all fit the budget are scaled down but keep the minimum, so
+        // a tiny budget yields low-poly blobs where the gems were rather than holes.
+        var compOf = new int[weldCount];
+        int compCount;
+        {
+            var parent = new int[weldCount];
+            for (int w = 0; w < weldCount; w++) parent[w] = w;
+            int Find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+            void Union(int x, int y) { x = Find(x); y = Find(y); if (x != y) parent[x] = y; }
+            for (int f = 0; f < faceCount; f++)
+            {
+                if (!faceAlive[f]) continue;
+                int wa = weldOf[faces[f * 3]], wb = weldOf[faces[f * 3 + 1]], wc = weldOf[faces[f * 3 + 2]];
+                Union(wa, wb); Union(wb, wc);
+            }
+            var ids = new Dictionary<int, int>();
+            for (int w = 0; w < weldCount; w++)
+            {
+                int root = Find(w);
+                if (!ids.TryGetValue(root, out int id)) { id = ids.Count; ids[root] = id; }
+                compOf[w] = id;
+            }
+            compCount = ids.Count;
+        }
+        var compAlive = new int[compCount];
+        for (int f = 0; f < faceCount; f++)
+            if (faceAlive[f]) compAlive[compOf[weldOf[faces[f * 3]]]]++;
+        const int MinPartFloor = 4;
+        var compFloor = new int[compCount];
+        {
+            double ratio = (double)targetTriangles / Math.Max(alive, 1);
+            long floorSum = 0;
+            for (int c = 0; c < compCount; c++)
+            {
+                compFloor[c] = Math.Max(MinPartFloor, (int)Math.Round(compAlive[c] * ratio));
+                compFloor[c] = Math.Min(compFloor[c], compAlive[c]);
+                floorSum += compFloor[c];
+            }
+            // If the proportional floors cannot all fit (many tiny parts at a small budget), scale
+            // them down toward the minimum so the budget remains reachable where possible.
+            if (floorSum > targetTriangles && compCount > 1)
+            {
+                double scale = (double)targetTriangles / floorSum;
+                for (int c = 0; c < compCount; c++)
+                    compFloor[c] = Math.Min(compAlive[c], Math.Max(MinPartFloor, (int)Math.Floor(compFloor[c] * scale)));
+            }
+        }
+
         // ---- Lock seams and boundaries ----
         // Seam vertex: its wedges carry more than one distinct UV. Boundary vertex: on an edge with
         // only one adjacent face. Both must survive stage 1 so charts keep their outlines.
@@ -182,7 +236,7 @@ public static class UvPreservingDecimator
         Array.Fill(weldAliveArr, true);
         var version = new int[weldCount];
         var heap = new PriorityQueue<(int A, int B, int Va, int Vb), double>();
-        int flipRejected = 0;
+        int flipRejected = 0, floorRejected = 0;
         bool relaxed = false;
 
         void PushEdgesOf(int w, bool relax)
@@ -260,8 +314,6 @@ public static class UvPreservingDecimator
             // Decide kill-vs-move for EVERY face of a BEFORE mutating the wedge→weld mapping:
             // wedges are shared between faces, so remapping one face's wedge makes later faces
             // spuriously "contain b" and killing them blows holes in the fan around the collapse.
-            weldAliveArr[a] = false;
-            version[a]++; version[b]++;
             var toKill = new List<int>();
             var toMove = new List<int>();
             foreach (int f in facesOfWeld[a])
@@ -269,7 +321,13 @@ public static class UvPreservingDecimator
                 if (!faceAlive[f]) continue;
                 if (FaceUsesWeld(f, b)) toKill.Add(f); else toMove.Add(f);
             }
-            foreach (int f in toKill) { faceAlive[f] = false; alive--; }
+            // Part floor: never take a connected piece (gem, pommel, fitting) below its share.
+            int comp = compOf[a];
+            if (compAlive[comp] - toKill.Count < compFloor[comp]) { floorRejected++; continue; }
+
+            weldAliveArr[a] = false;
+            version[a]++; version[b]++;
+            foreach (int f in toKill) { faceAlive[f] = false; alive--; compAlive[comp]--; }
             foreach (int f in toMove)
             {
                 for (int k = 0; k < 3; k++)
@@ -321,9 +379,13 @@ public static class UvPreservingDecimator
             newNrm[i] = n.LengthSquared() > 1e-12f ? Vector3.Normalize(n) : Vector3.UnitY;
         }
 
+        int partsAtFloor = 0;
+        for (int c = 0; c < compCount; c++) if (compAlive[c] > 0 && compAlive[c] <= compFloor[c]) partsAtFloor++;
         summary = $"decimated {faceCount:N0} → {alive:N0} triangles " +
                   $"({featureEdges:N0} silhouette edges protected, {(relaxed ? "silhouette-slide" : "interior-only")}, " +
-                  $"{flipRejected} flip-rejected, UVs preserved)";
+                  $"{flipRejected} flip-rejected, {compCount} part{(compCount == 1 ? "" : "s")} kept" +
+                  $"{(partsAtFloor > 0 ? $" — {partsAtFloor} at their detail floor, {floorRejected} collapses refused to keep them" : "")}" +
+                  $"{(alive > targetTriangles ? $"; stopped above the {targetTriangles:N0} target because every part is at its floor — raise the budget for more detail" : "")}, UVs preserved)";
         return new RigidWeaponMesh
         {
             Positions = newPos.ToArray(),

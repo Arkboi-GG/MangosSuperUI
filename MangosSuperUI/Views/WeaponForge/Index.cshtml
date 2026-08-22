@@ -75,6 +75,27 @@
         .wf-slider .val { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
             color: var(--text-primary); min-width: 88px; text-align: right; }
 
+        /* GLB import adjustment groups: labelled boxes of compact "label · slider · value" rows. */
+        .wf-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; margin-top: 12px; }
+        .wf-group { border: 1px solid var(--border-light); border-radius: 8px; padding: 10px 12px 11px; background: var(--bg-input, transparent); }
+        .wf-group-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px;
+            font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); }
+        .wf-ctl { display: grid; grid-template-columns: 96px 1fr 56px; align-items: center; gap: 8px; min-height: 24px; }
+        .wf-ctl + .wf-ctl { margin-top: 2px; }
+        .wf-ctl label { font-size: 11px; color: var(--text-muted); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .wf-ctl input[type=range] { width: 100%; min-width: 0; margin: 0; }
+        .wf-ctl .val { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: var(--text-primary); text-align: right; white-space: nowrap; }
+        .wf-checks { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+        .wf-checks label, .wf-check { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-muted); cursor: pointer; white-space: nowrap; }
+        .wf-checks input, .wf-check input { margin: 0; }
+        .wf-mini { padding: 2px 8px; font-size: 10.5px; font-weight: 600; border-radius: 5px; cursor: pointer; text-transform: none; letter-spacing: 0;
+            border: 1px solid var(--border-light); background: transparent; color: var(--text-primary); }
+        .wf-mini:hover { border-color: var(--accent, #2563eb); color: var(--accent, #2563eb); }
+        .wf-actions { align-items: center; }
+        .wf-actions .wf-ctl label { white-space: nowrap; }
+        .wf-group-stack { display: flex; flex-direction: column; gap: 10px; }
+        .wf-group-stack .wf-group { flex: 0 0 auto; }
+
         /* TBC browse modal */
         .wf-modal-backdrop { position: fixed; inset: 0; z-index: 70; background: #000a; display: none; }
         .wf-modal-backdrop.open { display: flex; align-items: center; justify-content: center; }
@@ -306,57 +327,139 @@
                 <p>Accepts any triangle count — a ZBrush export, a TRELLIS reconstruction, anything with
                    <strong>UV0 and an embedded texture</strong> already authored. The slider decimates it with a
                    UV-preserving edge collapse (seams locked, the texture never smears), so what you preview is
-                   byte-for-byte what forges. Vanilla weapons are ~100–250 triangles; the M2 hard ceiling is 1000.</p>
+                   byte-for-byte what forges. Vanilla weapons are ~100–250 triangles; detail-heavy exports (separate gems,
+                   fittings, pommels) keep their pieces best at 1,000–2,000 — every part keeps a floor of detail, so nothing
+                   vanishes, it just gets coarser. The Forge ceiling is 4,000.</p>
                 <div class="wf-row">
                     <div class="wf-field" style="flex:1;min-width:220px;">
                         <label>Finished GLB (.glb, UVs + texture)</label>
                         <input type="file" id="glbFile" accept=".glb" class="wf-file">
                     </div>
-                    <div class="wf-field" title="Drives the gameplay row (subclass/inventory/sheath/delay), the donor scaffold the M2 is built on (bones, attachments, sounds, icon), and where the grip lands — a staff grips mid-shaft, an axe low on the haft">
+                    <div class="wf-field" title="Drives the gameplay row (subclass/inventory/sheath/delay; ranged slot, ammo and range for bows, guns, crossbows, thrown and wands), the donor scaffold the M2 is built on (bones, attachments, sounds, icon, projectile visual), and where the grip lands — a staff grips mid-shaft, an axe low on the haft, a bow at the centre of its limbs">
                         <label>Weapon type</label>
                         <select id="impType"><option value="sword1h" selected>1H Sword</option></select>
                     </div>
                     <div class="wf-field"><label>Name (optional)</label>
                         <input type="text" id="glbName" placeholder="Imported Blade"></div>
                 </div>
-                <div class="wf-row" style="margin-top:10px;">
-                    <div class="wf-field" title="Tilt about the blade axis, applied after auto-orientation — fix a wrongly-rolled import (±90 stands a flat blade up)">
-                        <label>Extra roll °</label>
-                        <input type="number" id="impRoll" value="0" min="-180" max="180" step="15"></div>
-                    <label style="font-size:11px;color:var(--text-muted);padding-bottom:7px;" title="Rotate 180° so the grip and tip swap ends"><input type="checkbox" id="impFlip"> flip grip/tip</label>
-                    <label style="font-size:11px;color:var(--text-muted);padding-bottom:7px;" title="Straighten the blade centerline (off by default — don't bend a finished model unless it needs it)"><input type="checkbox" id="impStraighten"> straighten centerline</label>
-                    <label style="font-size:11px;color:var(--text-muted);padding-bottom:7px;" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand zone on two-handers (animation-placed, approximate)"><input type="checkbox" id="impShowGrip" checked> grip markers</label>
+                <!-- Adjustment groups. Every family gets every control; each group is one labelled box of
+                     compact "label · slider · value" rows so the card reads as sections, not a wall. -->
+                <div class="wf-groups">
+                    <div class="wf-group-stack">
+                    <div class="wf-group" title="Discrete orientation fixes, applied after the automatic orientation">
+                        <div class="wf-group-title"><span>Orientation</span></div>
+                        <div class="wf-checks">
+                            <label title="Rotate 180° so the grip and tip swap ends"><input type="checkbox" id="impFlip"> flip grip/tip</label>
+                            <label title="Roll 180° about the long axis — bow string side, rifle stock, crossbow stock or axe blade ended up on the wrong side"><input type="checkbox" id="impFlipUp"> flip upside down</label>
+                            <label title="Mirror left/right across the hand (true reflection; faces stay outward) — bolt handles, one-sided ornaments"><input type="checkbox" id="impMirror"> mirror left/right</label>
+                            <label title="Straighten the blade centerline (off by default — don't bend a finished model unless it needs it)"><input type="checkbox" id="impStraighten"> straighten centerline</label>
+                        </div>
+                        <div class="wf-ctl" style="margin-top:8px;" title="Tilt about the blade axis, applied after auto-orientation — fix a wrongly-rolled import (±90 stands a flat blade up)">
+                            <label>Extra roll</label>
+                            <input type="range" id="impRoll" min="-180" max="180" step="5" value="0">
+                            <span class="val" id="impRollVal">0°</span>
+                        </div>
+                    </div>
+                    <div class="wf-group" title="Embedded texture grading — applied to the PNG before it becomes the BLP">
+                        <div class="wf-group-title"><span>Texture</span></div>
+                        <div class="wf-ctl" title="Multiplies the embedded texture's brightness: +100 ≈ double, −100 ≈ half; blacks stay black">
+                            <label>Brightness</label>
+                            <input type="range" id="impBright" min="-100" max="100" step="5" value="0">
+                            <span class="val" id="impBrightVal">0</span>
+                        </div>
+                        <div class="wf-ctl" title="Saturation: +100 vivid, −100 grayscale — lift a muted texture with brightness and saturation together">
+                            <label>Saturation</label>
+                            <input type="range" id="impSat" min="-100" max="100" step="5" value="0">
+                            <span class="val" id="impSatVal">0</span>
+                        </div>
+                    </div>
+                    </div>
+
+                    <div class="wf-group" title="The forged mesh is rigid on the hand bone: these move the model relative to its origin — the green band in the preview is the hand">
+                        <div class="wf-group-title"><span>Hand placement</span>
+                            <button type="button" class="wf-mini" id="impResetPlacement" title="Back to the family's stock hand position, no offsets or tilt, 100% shape, flips off">Reset all</button></div>
+                        <div class="wf-ctl" title="Where the hand sits along the length, as % of the length from the back (pommel/butt) end — 19% for a sword, ~50% for a bow. Defaults to the family's stock measurement; move it to slide the grip toward the tip or the butt">
+                            <label>Hand position</label>
+                            <input type="range" id="impGrip" min="0" max="100" step="1" value="19">
+                            <span class="val" id="impGripVal">19%</span>
+                        </div>
+                        <div class="wf-ctl" title="Shift the model up/down through the hand (cm; + raises the model above the palm, e.g. a rifle barrel)">
+                            <label>Up / down</label>
+                            <input type="range" id="impUp" min="-50" max="50" step="1" value="0">
+                            <span class="val" id="impUpVal">0 cm</span>
+                        </div>
+                        <div class="wf-ctl" title="Shift the model sideways through the hand (cm)">
+                            <label>Sideways</label>
+                            <input type="range" id="impSide" min="-50" max="50" step="1" value="0">
+                            <span class="val" id="impSideVal">0 cm</span>
+                        </div>
+                        <div class="wf-ctl" title="Tilt the tip up or down around the hand (degrees)">
+                            <label>Pitch</label>
+                            <input type="range" id="impPitch" min="-45" max="45" step="1" value="0">
+                            <span class="val" id="impPitchVal">0°</span>
+                        </div>
+                        <div class="wf-ctl" title="Tilt the tip sideways around the hand (degrees)">
+                            <label>Yaw</label>
+                            <input type="range" id="impYaw" min="-45" max="45" step="1" value="0">
+                            <span class="val" id="impYawVal">0°</span>
+                        </div>
+                    </div>
+
+                    <div class="wf-group" title="Shape — 100% = the family's stock proportions; labels read per family (a crossbow's Width is its prod span, a rifle's Length its barrel, an axe's Tip end its head)">
+                        <div class="wf-group-title"><span>Shape</span></div>
+                        <div class="wf-ctl" title="Uniform size about the hand — 100% = the family's stock weapon length (the import is scaled to it automatically)">
+                            <label>Size</label>
+                            <input type="range" id="impSize" min="50" max="200" step="5" value="100">
+                            <span class="val" id="impSizeVal">100%</span>
+                        </div>
+                        <div class="wf-ctl" title="Length along the long axis only, about the hand — longer barrel / haft / blade / limbs, cross-section unchanged">
+                            <label>Length</label>
+                            <input type="range" id="impLength" min="50" max="200" step="5" value="100">
+                            <span class="val" id="impLengthVal">100%</span>
+                        </div>
+                        <div class="wf-ctl" title="Width across the family's wide axis — blade flat, bow limb depth, crossbow prod span, axe blade height">
+                            <label>Width</label>
+                            <input type="range" id="impWidth" min="25" max="250" step="5" value="100">
+                            <span class="val" id="impWidthVal">100%</span>
+                        </div>
+                        <div class="wf-ctl" title="Depth across the narrow axis — blade thickness, rifle/crossbow stock height, haft roundness">
+                            <label>Depth</label>
+                            <input type="range" id="impDepth" min="25" max="250" step="5" value="100">
+                            <span class="val" id="impDepthVal">100%</span>
+                        </div>
+                        <div class="wf-ctl" title="Tip end size — scales the front 40% of the length across the long axis (axe/mace/thrown heads, wand ornaments, gun muzzle, crossbow prod end); the shaft is untouched">
+                            <label>Tip end size</label>
+                            <input type="range" id="impHead" min="50" max="200" step="5" value="100">
+                            <span class="val" id="impHeadVal">100%</span>
+                        </div>
+                        <div class="wf-ctl" title="Shaft thickness — fattens or slims the thin handle/haft/barrel/limb vertices; fat parts (heads, stocks, prods) stay put">
+                            <label>Shaft thickness</label>
+                            <input type="range" id="impHaft" min="50" max="200" step="5" value="100">
+                            <span class="val" id="impHaftVal">100%</span>
+                        </div>
+                        <div class="wf-ctl" title="Lens cross-section: pushes depth out at the centreline, tapering to nothing at the edges — gives a paper-flat blade a diamond profile without touching its silhouette">
+                            <label>Centre thickness</label>
+                            <input type="range" id="impProfile" min="0" max="100" step="5" value="0">
+                            <span class="val" id="impProfileVal">off</span>
+                        </div>
+                    </div>
+
                 </div>
-                <div class="wf-row" style="margin-top:10px;">
-                    <div class="wf-field wf-slider" style="min-width:240px;" title="Lens cross-section: pushes depth out at the centreline, tapering to nothing at the edges — gives a paper-flat blade a diamond profile without touching its silhouette">
-                        <label style="min-width:96px;">Centre thickness</label>
-                        <input type="range" id="impProfile" min="0" max="100" step="5" value="0">
-                        <span class="val" id="impProfileVal">off</span>
+
+                <div class="wf-row wf-actions" style="margin-top:12px;">
+                    <div class="wf-ctl" style="flex:1;min-width:260px;grid-template-columns:110px 1fr 64px;" title="Target triangle budget — the decimator collapses down to this before preview/forge">
+                        <label>Target triangles</label>
+                        <input type="range" id="impTarget" min="100" max="4000" step="50" value="800">
+                        <span class="val" id="impTargetVal">800 tris</span>
                     </div>
-                    <div class="wf-field wf-slider" style="min-width:240px;" title="Multiplies the embedded texture's brightness: +100 ≈ double, −100 ≈ half; blacks stay black">
-                        <label style="min-width:96px;">Brightness</label>
-                        <input type="range" id="impBright" min="-100" max="100" step="5" value="0">
-                        <span class="val" id="impBrightVal">0</span>
-                    </div>
-                    <div class="wf-field wf-slider" style="min-width:240px;" title="Saturation: +100 vivid, −100 grayscale — lift a muted texture with brightness and saturation together">
-                        <label style="min-width:96px;">Saturation</label>
-                        <input type="range" id="impSat" min="-100" max="100" step="5" value="0">
-                        <span class="val" id="impSatVal">0</span>
-                    </div>
-                </div>
-                <div class="wf-row" style="margin-top:10px;">
-                    <div class="wf-field wf-slider" title="Target triangle budget — the decimator collapses down to this before preview/forge">
-                        <label style="min-width:96px;">Target triangles</label>
-                        <input type="range" id="impTarget" min="100" max="1000" step="25" value="500">
-                        <span class="val" id="impTargetVal">500 tris</span>
-                    </div>
+                    <label class="wf-check" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand zone on two-handers (animation-placed, approximate)"><input type="checkbox" id="impShowGrip" checked> grip markers</label>
                     <button class="wf-btn secondary" data-action="uploadGlb">Preview mesh</button>
                     <button class="wf-btn" data-action="forgeGlb"><i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
                 <div class="wf-note">
                     Requirements: single mesh, <code>TEXCOORD_0</code>, normals, embedded texture. After the first
                     preview, moving the slider re-previews automatically at the new budget. Vanilla look ≈ 100–250 tris;
-                    500 is a comfortable default; the forge refuses anything still above 1000.
+                    800 is a comfortable default for multi-piece imports; the forge refuses anything still above 4,000.
                 </div>
             </div>
 
@@ -900,7 +1003,8 @@
         const ITEM_DAMAGE_NAMES = ['Physical', 'Holy', 'Fire', 'Nature', 'Frost', 'Shadow', 'Arcane'];
         const ITEM_STAT_NAMES = { 0: 'Mana', 1: 'Health', 3: 'Agility', 4: 'Strength', 5: 'Intellect', 6: 'Spirit', 7: 'Stamina' };
         const ITEM_TRIGGER_NAMES = { 0: 'Use', 1: 'On Equip', 2: 'Chance on Hit' };
-        const ITEM_SLOT_NAMES = { 13: 'One-Hand', 17: 'Two-Hand', 21: 'Main Hand', 22: 'Off Hand' };
+        const ITEM_SLOT_NAMES = { 13: 'One-Hand', 17: 'Two-Hand', 21: 'Main Hand', 22: 'Off Hand', 15: 'Ranged (bow)', 25: 'Thrown', 26: 'Ranged (gun / crossbow / wand)', 14: 'Shield' };
+        const ITEM_SLOT_VALUES = [13, 14, 15, 17, 21, 22, 25, 26];
         const weaponTypeMeta = new Map();
         let itemBuildState = { mode: null, tab: 'basics', source: '', familyKey: '', familyLabel: '', lastFocus: null };
         let itemBuildSubmitting = false;
@@ -974,8 +1078,12 @@
             set('ibQuality', Math.max(0, Math.min(6, seed.quality ?? 1)));
             configureItemInventoryTypes(seed.familyKey, seed.inventoryType);
             set('ibDescription', ''); set('ibItemLevel', seed.itemLevel || 3); set('ibRequiredLevel', 1);
-            set('ibDamageMin', 2); set('ibDamageMax', 4); set('ibDamageType', 0); set('ibSpeed', '');
+            // Shields are armor: no damage/speed (the family contract writes 0), armor + block instead.
+            const seedMeta = weaponTypeMeta.get(seed.familyKey);
+            const seedShield = !!(seedMeta && seedMeta.isShield);
+            set('ibDamageMin', seedShield ? 0 : 2); set('ibDamageMax', seedShield ? 0 : 4); set('ibDamageType', 0); set('ibSpeed', '');
             for (const id of ['ibArmor','ibBlock','ibHolyRes','ibFireRes','ibNatureRes','ibFrostRes','ibShadowRes','ibArcaneRes']) set(id, 0);
+            if (seedShield) { set('ibArmor', seedMeta.armor ?? 75); set('ibBlock', seedMeta.block ?? 2); }
             set('ibMaxDurability', 20); set('ibBonding', 0);
             for (const id of ['ibRequiredSkill','ibRequiredSkillRank','ibRequiredSpell','ibRequiredHonorRank','ibRequiredReputationFaction','ibRequiredReputationRank']) set(id, 0);
             set('ibBuyGold', 0); set('ibBuySilver', 0); set('ibBuyCopper', 54);
@@ -993,11 +1101,19 @@
         function configureItemInventoryTypes(familyKey, preferred) {
             const meta = weaponTypeMeta.get(familyKey);
             const twoHanded = meta ? !!meta.twoHanded : (familyKey.includes('2h') || familyKey === 'staff' || familyKey === 'polearm');
-            const allowed = twoHanded ? [17] : [13, 21, 22];
+            const ranged = meta ? !!meta.isRanged : ['bow', 'gun', 'crossbow', 'thrown', 'wand'].includes(familyKey);
+            // The server catalog names the slots each family may bind to (ranged families exactly
+            // one: bows 15, guns/crossbows/wands 26, thrown 25); the local rule is only a fallback.
+            const allowed = (meta && Array.isArray(meta.allowedInventoryTypes) && meta.allowedInventoryTypes.length)
+                ? meta.allowedInventoryTypes.map(Number)
+                : ranged ? [+(meta?.inventoryType || (familyKey === 'bow' ? 15 : familyKey === 'thrown' ? 25 : 26))]
+                : twoHanded ? [17] : [13, 21, 22];
             const select = document.getElementById('ibInventoryType');
-            select.innerHTML = allowed.map(value => `<option value="${value}">${ITEM_SLOT_NAMES[value]}</option>`).join('');
+            select.innerHTML = allowed.map(value => `<option value="${value}">${ITEM_SLOT_NAMES[value] || `Inventory type ${value}`}</option>`).join('');
             select.value = allowed.includes(+preferred) ? String(+preferred) : String(allowed[0]);
-            select.title = twoHanded
+            select.title = ranged
+                ? 'Ranged weapon families are bound to their vanilla ranged slot (bows 15, guns/crossbows/wands 26, thrown 25).'
+                : twoHanded
                 ? 'Two-hand weapon families are bound to the Two-Hand slot.'
                 : 'One-hand weapon families may be unrestricted, Main Hand, or Off Hand.';
         }
@@ -1271,7 +1387,7 @@
             if (config.name.length > 255) errors.push('Item name must be 255 characters or fewer.');
             if ((config.description || '').length > 255) errors.push('Description must be 255 characters or fewer.');
             if (!Number.isInteger(config.quality) || config.quality < 0 || config.quality > 6) errors.push('Choose a valid vanilla item quality.');
-            if (![13,17,21,22].includes(config.inventoryType)) errors.push('Choose a valid weapon equip slot.');
+            if (!ITEM_SLOT_VALUES.includes(config.inventoryType)) errors.push('Choose a valid weapon equip slot.');
             if (!Number.isInteger(config.itemLevel) || config.itemLevel < 1 || config.itemLevel > 255) errors.push('Item level must be between 1 and 255.');
             if (!Number.isInteger(config.requiredLevel) || config.requiredLevel < 0 || config.requiredLevel > 60) errors.push('Required level must be between 0 and 60.');
             if (!Number.isInteger(config.requiredHonorRank) || config.requiredHonorRank < 0 || config.requiredHonorRank > 14) errors.push('Honor rank must be between 0 and 14.');
@@ -1500,6 +1616,20 @@
             fd.append('bladeProfile', +document.getElementById('impProfile').value || 0);
             fd.append('brightness', +document.getElementById('impBright').value || 0);
             fd.append('saturation', +document.getElementById('impSat').value || 0);
+            // Shape + hand-placement sliders (bind to GlbShapeControls server-side).
+            fd.append('flipUpsideDown', document.getElementById('impFlipUp').checked);
+            fd.append('mirrorSide', document.getElementById('impMirror').checked);
+            fd.append('sizePercent', +document.getElementById('impSize').value || 100);
+            fd.append('lengthPercent', +document.getElementById('impLength').value || 100);
+            fd.append('widthPercent', +document.getElementById('impWidth').value || 100);
+            fd.append('depthPercent', +document.getElementById('impDepth').value || 100);
+            fd.append('headPercent', +document.getElementById('impHead').value || 100);
+            fd.append('haftPercent', +document.getElementById('impHaft').value || 100);
+            fd.append('gripPercent', +document.getElementById('impGrip').value);
+            fd.append('offsetUpCm', +document.getElementById('impUp').value || 0);
+            fd.append('offsetSideCm', +document.getElementById('impSide').value || 0);
+            fd.append('pitchDegrees', +document.getElementById('impPitch').value || 0);
+            fd.append('yawDegrees', +document.getElementById('impYaw').value || 0);
         }
         function schedulePreviewIfLive() {
             // After the first preview, orientation/budget changes re-preview automatically.
@@ -1511,7 +1641,6 @@
             targetVal.textContent = targetTris() + ' tris';
             schedulePreviewIfLive();
         });
-        document.getElementById('impRoll').addEventListener('input', schedulePreviewIfLive);
         document.getElementById('impFlip').addEventListener('change', schedulePreviewIfLive);
         document.getElementById('impStraighten').addEventListener('change', schedulePreviewIfLive);
         document.getElementById('impType').addEventListener('change', schedulePreviewIfLive);
@@ -1519,9 +1648,49 @@
             const el = document.getElementById(id), lab = document.getElementById(valId);
             el.addEventListener('input', () => { lab.textContent = fmt(+el.value); schedulePreviewIfLive(); });
         }
+        bindGrade('impRoll', 'impRollVal', v => (v > 0 ? '+' : '') + v + '°');
         bindGrade('impProfile', 'impProfileVal', v => v === 0 ? 'off' : v + '%');
         bindGrade('impBright', 'impBrightVal', v => (v > 0 ? '+' : '') + v);
         bindGrade('impSat', 'impSatVal', v => (v > 0 ? '+' : '') + v);
+        // Shape + hand-placement sliders.
+        bindGrade('impSize', 'impSizeVal', v => v + '%');
+        bindGrade('impLength', 'impLengthVal', v => v + '%');
+        bindGrade('impWidth', 'impWidthVal', v => v + '%');
+        bindGrade('impDepth', 'impDepthVal', v => v + '%');
+        bindGrade('impHead', 'impHeadVal', v => v + '%');
+        bindGrade('impHaft', 'impHaftVal', v => v + '%');
+        bindGrade('impGrip', 'impGripVal', v => v + '%' + (Math.abs(v - donorGripPercent()) < 0.5 ? ' (stock)' : ''));
+        bindGrade('impUp', 'impUpVal', v => (v > 0 ? '+' : '') + v + ' cm');
+        bindGrade('impSide', 'impSideVal', v => (v > 0 ? '+' : '') + v + ' cm');
+        bindGrade('impPitch', 'impPitchVal', v => (v > 0 ? '+' : '') + v + '°');
+        bindGrade('impYaw', 'impYawVal', v => (v > 0 ? '+' : '') + v + '°');
+        document.getElementById('impFlipUp').addEventListener('change', schedulePreviewIfLive);
+        document.getElementById('impMirror').addEventListener('change', schedulePreviewIfLive);
+        // Every family gets every control; the only family-specific thing is where the stock hand sits.
+        function donorGripPercent() {
+            const meta = weaponTypeMeta.get(document.getElementById('impType').value || 'sword1h');
+            return Math.round(((meta && meta.ok ? meta.palmBackFraction : 0.188) || 0) * 100);
+        }
+        function applyImportFamilyControls(resetGrip) {
+            if (resetGrip) {
+                const g = donorGripPercent();
+                document.getElementById('impGrip').value = g;
+                document.getElementById('impGripVal').textContent = g + '% (stock)';
+            }
+        }
+        document.getElementById('impType').addEventListener('change', () => applyImportFamilyControls(true));
+        document.getElementById('impResetPlacement').addEventListener('click', () => {
+            for (const [id, v] of [['impSize', 100], ['impLength', 100], ['impWidth', 100], ['impDepth', 100], ['impHead', 100], ['impHaft', 100], ['impProfile', 0], ['impRoll', 0], ['impUp', 0], ['impSide', 0], ['impPitch', 0], ['impYaw', 0]]) {
+                const el = document.getElementById(id); el.value = v; el.dispatchEvent(new Event('input'));
+            }
+            for (const id of ['impFlip', 'impFlipUp', 'impMirror', 'impStraighten']) document.getElementById(id).checked = false;
+            applyImportFamilyControls(true);
+            schedulePreviewIfLive();
+        });
+        // Seed once the family catalog (with stock hand positions) has loaded.
+        const seedFamilyControls = setInterval(() => {
+            if (weaponTypeMeta.size) { clearInterval(seedFamilyControls); applyImportFamilyControls(true); }
+        }, 250);
 
         const actions = {
             async uploadGlb(btn) {
@@ -1822,9 +1991,13 @@
                 for (const t of types) {
                     const o = document.createElement('option');
                     o.value = t.key;
-                    o.textContent = t.ok ? t.label : `${t.label} (no donor)`;
-                    o.disabled = !t.ok;
-                    if (t.ok && t.donorModel) o.title = `donor: ${t.donorModel} (row ${t.donorDisplayRow})`;
+                    // Families without an arbitrary-GLB route (shields: no long axis/grip to find)
+                    // are TBC-import only, so the GLB card lists them disabled with the reason.
+                    const glbBlocked = id === 'impType' && t.glbImport === false;
+                    o.textContent = !t.ok ? `${t.label} (no donor)` : glbBlocked ? `${t.label} (TBC import only)` : t.label;
+                    o.disabled = !t.ok || glbBlocked;
+                    if (glbBlocked) o.title = 'Shields have no long axis or grip for the GLB heuristics — import them from the TBC browse instead.';
+                    else if (t.ok && t.donorModel) o.title = `donor: ${t.donorModel} (row ${t.donorDisplayRow})`;
                     else if (!t.ok && t.error) o.title = t.error;
                     sel.appendChild(o);
                 }

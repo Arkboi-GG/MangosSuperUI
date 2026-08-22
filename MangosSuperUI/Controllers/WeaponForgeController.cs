@@ -45,7 +45,11 @@ public class WeaponForgeController : Controller
     // High-poly sources are welcome — they are decimated to budget before forging.
     private const long MaxGlbBytes = 128 * 1024 * 1024;   // 128 MB
     // The variable-topology M2 writer's hard ceiling (RigidWeaponMeshValidator.VariableHardCeiling).
-    private const int MaxForgeTriangles = 1000;
+    /// <summary>GLB-route triangle ceiling. Raised from 1,000 (2026-08-21): the vanilla client
+    /// renders multi-thousand-triangle weapons fine (the TBC route already forges 2–3k-triangle
+    /// models through the same writer), and detail-heavy Sketchfab exports lose their gems/pommel
+    /// when crushed to a few hundred. Stays far under the UInt16 skin-section capacity.</summary>
+    private const int MaxForgeTriangles = 4000;
     // A preserved TBC mesh is bounded by the vanilla view's UInt16 index count, not the Forge's
     // authoring/decimation policy used for arbitrary GLB uploads.
     private const int MaxTbcForgeTriangles = ushort.MaxValue / 3;
@@ -184,15 +188,8 @@ public class WeaponForgeController : Controller
             !int.TryParse(rawInventoryType, out int inventoryType))
             return Array.Empty<string>();
 
-        bool compatible = profile.TwoHanded
-            ? inventoryType == 17
-            : inventoryType is 13 or 21 or 22;
-        if (compatible) return Array.Empty<string>();
-
-        string allowed = profile.TwoHanded
-            ? "Two-Hand (17)"
-            : "One-Hand, Main Hand, or Off Hand (13, 21, or 22)";
-        return [$"inventoryType is incompatible with {profile.Label}; choose {allowed}."];
+        if (profile.AllowedInventoryTypes.Contains(inventoryType)) return Array.Empty<string>();
+        return [$"inventoryType is incompatible with {profile.Label}; choose {profile.AllowedInventoryTypesLabel}."];
     }
 
     private static Dictionary<string, string>? MergeItemOverrides(
@@ -291,7 +288,11 @@ public class WeaponForgeController : Controller
             maxX,
             extent = donor.ExtentX,
             palmBackFraction = donor.PalmBackFraction,
-            note = "Green band = main-hand palm (model origin, exact)." +
+            note = (profile.IsShield
+                       ? "Green band = forearm strap (model origin, exact) — shields hang from the left forearm at the centre of the face."
+                       : profile.IsRanged
+                       ? "Green band = hand on the weapon (model origin, exact) — bows grip at the centre of the limbs, guns/crossbows at the trigger grip, thrown/wands at the handle."
+                       : "Green band = main-hand palm (model origin, exact).") +
                    (secondHand is not null ? " Blue band ≈ off-hand zone (animation-placed, approximate)." : ""),
         };
     }
@@ -321,11 +322,22 @@ public class WeaponForgeController : Controller
                     inventoryType = p.InventoryType,
                     inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(p.InventoryType),
                     twoHanded = p.TwoHanded,
+                    isRanged = p.IsRanged,
+                    isShield = p.IsShield,
+                    armor = p.Armor,
+                    block = p.Block,
+                    glbImport = p.GlbImportSupported,
+                    allowedInventoryTypes = p.AllowedInventoryTypes,
                     ok = true,
                     donorModel = (string?)d.ModelName,
                     donorDisplayRow = d.DisplayRow,
+                    measureModel = d.MeasureModelName,
+                    measureDisplayRow = d.MeasureDisplayRow,
+                    spellVisualId = d.SpellVisualId,
+                    mirrorModelName2 = d.MirrorModelName2,
                     extent = d.ExtentX,
                     palmBackFraction = d.PalmBackFraction,
+                    orientation = (string?)d.Orientation.ToString(),
                     error = (string?)null,
                 };
             }
@@ -339,11 +351,22 @@ public class WeaponForgeController : Controller
                     inventoryType = p.InventoryType,
                     inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(p.InventoryType),
                     twoHanded = p.TwoHanded,
+                    isRanged = p.IsRanged,
+                    isShield = p.IsShield,
+                    armor = p.Armor,
+                    block = p.Block,
+                    glbImport = p.GlbImportSupported,
+                    allowedInventoryTypes = p.AllowedInventoryTypes,
                     ok = false,
                     donorModel = (string?)null,
                     donorDisplayRow = 0u,
+                    measureModel = (string?)null,
+                    measureDisplayRow = (uint?)null,
+                    spellVisualId = 0u,
+                    mirrorModelName2 = false,
                     extent = 0f,
                     palmBackFraction = 0f,
+                    orientation = (string?)null,
                     error = (string?)ex.Message,
                 };
             }
@@ -534,17 +557,33 @@ public class WeaponForgeController : Controller
     /// donor supplies the target length and palm-back fraction the normalizer lands on.</summary>
     private (RigidWeaponMesh? Mesh, GlbImportResult Import, int OriginalTriangles, string? Decimation, string? Error)
         ImportAndDecimate(byte[] bytes, WeaponDonorInfo donor, bool reorient, int targetTriangles,
-            float rollDegrees, bool flipGripEnd, bool straightenBlade, int bladeProfile)
+            float rollDegrees, bool flipGripEnd, bool straightenBlade, int bladeProfile,
+            GlbShapeControls? shape = null)
     {
+        shape ??= new GlbShapeControls();
         var import = _glbImporter.Import(bytes, new GlbImportOptions
         {
             Reorient = reorient,
             TargetExtent = donor.ExtentX,
             PalmBackFraction = donor.PalmBackFraction,
+            Orientation = donor.Orientation,
             RollDegrees = rollDegrees,
             FlipGripEnd = flipGripEnd,
             StraightenBlade = straightenBlade,
             BladeProfile = Math.Clamp(bladeProfile, 0, 100) / 100f,
+            SizeScale = shape.SizePercent <= 0 ? 1f : Math.Clamp(shape.SizePercent, 25, 400) / 100f,
+            LengthScale = shape.LengthPercent <= 0 ? 1f : Math.Clamp(shape.LengthPercent, 25, 400) / 100f,
+            WidthScale = shape.WidthPercent <= 0 ? 1f : Math.Clamp(shape.WidthPercent, 25, 400) / 100f,
+            DepthScale = shape.DepthPercent <= 0 ? 1f : Math.Clamp(shape.DepthPercent, 25, 400) / 100f,
+            FlipUpsideDown = shape.FlipUpsideDown,
+            MirrorSide = shape.MirrorSide,
+            HeadScale = shape.HeadPercent <= 0 ? 1f : Math.Clamp(shape.HeadPercent, 25, 400) / 100f,
+            HaftScale = shape.HaftPercent <= 0 ? 1f : Math.Clamp(shape.HaftPercent, 25, 400) / 100f,
+            GripFraction = shape.GripPercent < 0 ? null : Math.Clamp(shape.GripPercent, 0, 100) / 100f,
+            OffsetUp = Math.Clamp(shape.OffsetUpCm, -200, 200) / 100f,
+            OffsetSide = Math.Clamp(shape.OffsetSideCm, -200, 200) / 100f,
+            PitchDegrees = Math.Clamp(shape.PitchDegrees, -90, 90),
+            YawDegrees = Math.Clamp(shape.YawDegrees, -90, 90),
         });
         if (!import.Ok || import.Mesh is null)
             return (null, import, 0, null, "GLB import failed — fix the model and retry.");
@@ -576,7 +615,7 @@ public class WeaponForgeController : Controller
     [RequestSizeLimit(MaxGlbBytes)]
     public async Task<IActionResult> UploadGlb(IFormFile? file, string? weaponType = null, bool reorient = true,
         int targetTriangles = 500, float rollDegrees = 0f, bool flipGripEnd = false, bool straightenBlade = false,
-        int bladeProfile = 0, int brightness = 0, int saturation = 0)
+        int bladeProfile = 0, int brightness = 0, int saturation = 0, GlbShapeControls? shape = null)
     {
         var (bytes, err) = await ReadBounded(file, MaxGlbBytes);
         if (err is not null) return BadRequest(new { ok = false, error = err });
@@ -590,7 +629,7 @@ public class WeaponForgeController : Controller
         { return Json(new { ok = false, error = $"No stock donor for {profile.Label}: {ex.Message}" }); }
 
         var (mesh, import, original, decimation, importErr) =
-            ImportAndDecimate(bytes, donor, reorient, targetTriangles, rollDegrees, flipGripEnd, straightenBlade, bladeProfile);
+            ImportAndDecimate(bytes, donor, reorient, targetTriangles, rollDegrees, flipGripEnd, straightenBlade, bladeProfile, shape);
         if (mesh is null)
             return Json(new
             {
@@ -628,7 +667,8 @@ public class WeaponForgeController : Controller
     public async Task<IActionResult> ForgeGlb(IFormFile? file, string? name = null, string? weaponType = null,
         bool reorient = true,
         int targetTriangles = 500, float rollDegrees = 0f, bool flipGripEnd = false, bool straightenBlade = false,
-        int bladeProfile = 0, int brightness = 0, int saturation = 0, string? itemConfig = null)
+        int bladeProfile = 0, int brightness = 0, int saturation = 0, string? itemConfig = null,
+        GlbShapeControls? shape = null)
     {
         var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
             itemConfig, HttpContext.RequestAborted);
@@ -655,7 +695,7 @@ public class WeaponForgeController : Controller
         { return Json(new { ok = false, error = $"No stock donor for {profile.Label}: {ex.Message}" }); }
 
         var (mesh, import, _, decimation, importErr) =
-            ImportAndDecimate(bytes, donor, reorient, targetTriangles, rollDegrees, flipGripEnd, straightenBlade, bladeProfile);
+            ImportAndDecimate(bytes, donor, reorient, targetTriangles, rollDegrees, flipGripEnd, straightenBlade, bladeProfile, shape);
         if (mesh is null)
             return Json(new
             {
@@ -678,11 +718,21 @@ public class WeaponForgeController : Controller
                 Name = configuredItem?.Name ?? name,
                 SourceKind = "glb_import",
                 WeaponTypeKey = profile.Key,
+                VariableTriangleHardCeiling = MaxForgeTriangles,
                 ItemOverrides = MergeItemOverrides(null, configuredItem),
                 Mesh = mesh,
                 Topology = WeaponTopologyMode.Variable,
                 TexturePng = AdjustTexture(import.TexturePng, brightness, saturation),
                 SourceBlob = bytes,
+                GeneratorParamsJson = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    reorient, targetTriangles, rollDegrees, flipGripEnd, straightenBlade, bladeProfile,
+                    brightness, saturation,
+                    shape = shape ?? new GlbShapeControls(),
+                    donorDisplayRow = donor.DisplayRow,
+                    donorExtent = donor.ExtentX,
+                    donorPalmBackFraction = donor.PalmBackFraction,
+                }),
                 WriterVersion = "variable-topology-v1",
             });
             if (decimation is not null)
@@ -791,7 +841,7 @@ public class WeaponForgeController : Controller
                 var index = _tbc.WeaponIndex();
                 weaponCount = index.Count;
                 var rows = index.Select(w => w.DisplayRow).ToHashSet();
-                itemCount = _tbcItems.Items.Count(i => i.ItemClass == 2 && rows.Contains(i.DisplayId));
+                itemCount = _tbcItems.Items.Count(i => TbcItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass) is not null && rows.Contains(i.DisplayId));
             }
             catch (Exception ex) { error = ex.Message; }
         }
@@ -825,10 +875,10 @@ public class WeaponForgeController : Controller
         var byRow = index.ToDictionary(w => w.DisplayRow, w => w);
 
         // Item mode: shipped names joined to the user's archives. Weapons only — armor/shields
-        // ship in the catalog for the future armor import but are not forgeable yet.
+        // ship in the catalog for the future armor import; shields (class 4 / subclass 6) are the
+        // one armor family that is forgeable.
         var items = _tbcItems.Items
-            .Where(i => i.ItemClass == 2 &&
-                        TbcItemCatalog.TypeKeyForSubclass(i.Subclass) is not null &&
+            .Where(i => TbcItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass) is not null &&
                         byRow.ContainsKey(i.DisplayId))
             .ToList();
         if (items.Count > 0)
@@ -855,7 +905,7 @@ public class WeaponForgeController : Controller
                 weapons = list.Skip((page - 1) * pageSize).Take(pageSize).Select(i =>
                 {
                     var w = byRow[i.DisplayId];
-                    string typeKey = TbcItemCatalog.TypeKeyForSubclass(i.Subclass)!;
+                    string typeKey = TbcItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass)!;
                     return new
                     {
                         entry = i.Entry,
@@ -1021,13 +1071,16 @@ public class WeaponForgeController : Controller
             return Json(new { ok = false, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
 
         string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
-            ? TbcItemCatalog.TypeKeyForSubclass(item.Subclass)
+            ? TbcItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
             : weaponType;
         var profile = WeaponTypeCatalog.Get(typeKey);
         int effectiveInventoryType = EffectiveTbcInventoryType(item, profile);
         object? grip = null;
         try { grip = BuildGripInfo(mesh, profile, _donors.Resolve(profile)); }
         catch { /* grip markers are optional for preview */ }
+        if (profile.IsRanged)
+            diag.Warn("tbc.ranged.rigid",
+                $"{profile.Label} import is rigid on the family scaffold's root bone: the TBC model's limb/string/hammer animation is not carried; its projectile visual and ranged slot are.");
 
         var preview = _preview.RenderMesh(mesh, AdjustTexture(texturePng, brightness, saturation), effectPngs);
         return Json(new
@@ -1074,7 +1127,7 @@ public class WeaponForgeController : Controller
         if (sel is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon (entry {entry}, model '{model}')." });
 
         string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
-            ? TbcItemCatalog.TypeKeyForSubclass(item.Subclass)
+            ? TbcItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
             : weaponType;
         var profile = WeaponTypeCatalog.Get(typeKey);
         var familyErrors = ValidateConfigurationForWeaponFamily(profile, configuredItem);
@@ -1108,9 +1161,15 @@ public class WeaponForgeController : Controller
                 ["sheath"] = item.Sheath.ToString(),
                 ["delay"] = item.DelayMs.ToString(),
             };
-            if (item.InventoryType is 13 or 17 or 21 or 22)
+            // Melee families keep the TBC item's own slot binding; ranged families are bound to
+            // exactly one vanilla slot (bows 15, guns/crossbows/wands 26, thrown 25), so the
+            // family contract wins even when the TBC row used a different ranged slot.
+            if (!profile.IsRanged && item.InventoryType is 13 or 17 or 21 or 22)
                 itemOverrides["inventory_type"] = item.InventoryType.ToString();
         }
+        if (profile.IsRanged)
+            diag.Warn("tbc.ranged.rigid",
+                $"{profile.Label} import is rigid on the family scaffold's root bone: the TBC model's limb/string/hammer animation is not carried; its projectile visual ({donor.SpellVisualId}) and ranged slot are.");
         // Explicit modal values layer over both the family defaults (inside the builder) and the
         // source TBC presentation values above. Omitted values preserve those existing contracts.
         itemOverrides = MergeItemOverrides(itemOverrides, configuredItem);
@@ -1164,7 +1223,7 @@ public class WeaponForgeController : Controller
     private static string PrettyTbcName(string stem) => stem.Replace('_', ' ');
 
     private static int EffectiveTbcInventoryType(TbcItemInfo? item, WeaponTypeProfile profile) =>
-        item?.InventoryType is 13 or 17 or 21 or 22 ? item.InventoryType : profile.InventoryType;
+        !profile.IsRanged && item?.InventoryType is 13 or 17 or 21 or 22 ? item.InventoryType : profile.InventoryType;
 
     /// <summary>Decode a TBC BLP2's base mip to PNG for the texture pipeline. Null on failure.</summary>
     private static byte[]? BlpToPng(byte[] blp)

@@ -252,7 +252,7 @@ public partial class DbcService
     /// Called by ItemRetextureService after creating a retexture.
     /// </summary>
     public void RegisterCustomDisplayEntry(uint newDisplayId, uint sourceDisplayId,
-        string? customModelName = null, string? customTextureName = null)
+        string? customModelName = null, string? customTextureName = null, string? customModelName2 = null)
     {
         // Clone icon from source
         if (ItemDisplayIcons is Dictionary<uint, string> iconDict)
@@ -269,7 +269,9 @@ public partial class DbcService
                 var custom = new ItemModelDbc
                 {
                     ModelName1 = customModelName ?? sourceModel.ModelName1,
-                    ModelName2 = sourceModel.ModelName2,
+                    // Weapon Forge passes "" to clear a donor's second model, or its own SUI_W name
+                    // when the family mirrors ModelName2 (thrown weapons); null inherits.
+                    ModelName2 = customModelName2 ?? sourceModel.ModelName2,
                     TextureName1 = customTextureName ?? sourceModel.TextureName1,
                     TextureName2 = sourceModel.TextureName2,
                     // Session C: clone (don't share reference) the array

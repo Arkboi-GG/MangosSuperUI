@@ -5,10 +5,12 @@ namespace MangosSuperUI.Services.WeaponForge;
 /// <summary>
 /// Builds an explicit, purpose-built ItemDisplayInfo.dbc row for a generated weapon (WEAPON_GEN.md
 /// §2.2). Every one of the 23 fields is set deliberately rather than inherited from a cloned donor,
-/// so a weapon can never silently pick up a donor's ModelName2, body-atlas texture, spell/item
-/// visual, or geoset state. Field 9 (flags) and field 10 (SpellVisualID) are BOTH zero for v1 — the
-/// raw installed-DBC evidence in WEAPON_GEN.md §2.2 (field 9 nonzero only in 11 armor rows; field 10
-/// carries ranged SpellVisual values) settles that field 9 is flags and field 10 is SpellVisualID.
+/// so a weapon can never silently pick up a donor's body-atlas texture, item visual, or geoset
+/// state. Field 9 (flags) is always zero. Field 10 (SpellVisualID) carries the family donor's
+/// value — zero for every melee family, the ranged projectile visual for bows/guns/thrown (the raw
+/// installed-DBC evidence in WEAPON_GEN.md §2.2: field 9 nonzero only in 11 armor rows; field 10
+/// carries ranged SpellVisual values) — and ModelName2 is empty unless the family mirrors
+/// ModelName1 the way every stock thrown weapon does.
 /// </summary>
 public static class WeaponDisplayInfoRow
 {
@@ -50,17 +52,20 @@ public static class WeaponDisplayInfoRow
 
         // String references. AddString dedupes and returns the offset assigned at Write time; an
         // empty string maps to offset 0 (the DBC's mandatory empty entry).
-        row[F_ModelName1] = dbc.AddString(WeaponNaming.DbcModelName(p.ModelIndex));
-        row[F_ModelName2] = 0; // ordinary weapon: no second model
+        uint modelRef = dbc.AddString(WeaponNaming.DbcModelName(p.ModelIndex));
+        row[F_ModelName1] = modelRef;
+        // Ordinary weapon: no second model. Thrown weapons mirror their own model name, exactly as
+        // every stock Thrown_1H_* row does (the client draws the second copy for the thrown slot).
+        row[F_ModelName2] = p.MirrorModelName2 ? modelRef : 0;
         row[F_TextureName1] = dbc.AddString(WeaponNaming.DbcTextureName(p.ModelIndex, p.Variant));
         row[F_TextureName2] = 0;
         row[F_InventoryIcon] = string.IsNullOrEmpty(p.IconStem) ? 0u : dbc.AddString(p.IconStem);
 
-        // Geoset groups, helmet visibility, body-atlas textures, flags, spell/item visuals all zero.
+        // Geoset groups, helmet visibility, body-atlas textures, flags, item visual all zero.
         row[F_GeosetGroup0] = row[F_GeosetGroup1] = row[F_GeosetGroup2] = 0;
         row[F_Flags] = 0;
-        row[F_SpellVisualId] = 0;
-        row[F_GroupSoundIndex] = p.GroupSoundIndex; // preserve a simple-sword sound group
+        row[F_SpellVisualId] = p.SpellVisualId;   // family donor's ranged projectile visual; 0 for melee
+        row[F_GroupSoundIndex] = p.GroupSoundIndex; // preserve the family donor's sound group
         row[F_HelmetGeosetVis0] = row[F_HelmetGeosetVis1] = 0;
         for (int i = F_Texture0; i < F_Texture0 + 8; i++) row[i] = 0;
         row[F_ItemVisual] = p.ItemVisual; // 0 until enchant effects are explicitly implemented
@@ -69,22 +74,24 @@ public static class WeaponDisplayInfoRow
         return row;
     }
 
-    /// <summary>Validate a built row against the v1 contract (WEAPON_GEN.md §7.3). String presence is
+    /// <summary>Validate a built row against the contract (WEAPON_GEN.md §7.3). String presence is
     /// checked against the writer so ModelName1 must resolve to a non-empty string and ModelName2
-    /// must be empty.</summary>
+    /// must be empty or mirror ModelName1.</summary>
     public static void Validate(DbcWriterService dbc, uint[] row, ForgeDiagnostics d)
     {
         if (row.Length != FieldCount)
         { d.Error("dbc.row.width", $"Row has {row.Length} fields, expected {FieldCount}."); return; }
 
-        if (row[F_ModelName1] == 0 || string.IsNullOrEmpty(dbc.ReadString(row[F_ModelName1])))
+        string model1 = row[F_ModelName1] == 0 ? "" : dbc.ReadString(row[F_ModelName1]);
+        if (string.IsNullOrEmpty(model1))
             d.Error("dbc.modelname1.missing", "ModelName1 is empty.");
-        if (row[F_ModelName2] != 0 && !string.IsNullOrEmpty(dbc.ReadString(row[F_ModelName2])))
-            d.Error("dbc.modelname2.present", "ModelName2 must be empty for an ordinary weapon.");
+        string model2 = row[F_ModelName2] == 0 ? "" : dbc.ReadString(row[F_ModelName2]);
+        if (model2.Length != 0 && !string.Equals(model2, model1, StringComparison.OrdinalIgnoreCase))
+            d.Error("dbc.modelname2.present", "ModelName2 must be empty (or mirror ModelName1 for thrown weapons).");
         if (row[F_TextureName1] == 0 || string.IsNullOrEmpty(dbc.ReadString(row[F_TextureName1])))
             d.Error("dbc.texturename1.missing", "TextureName1 is empty.");
-        if (row[F_Flags] != 0) d.Error("dbc.flags.nonzero", $"Field 9 (flags) must be 0 for v1 (got {row[F_Flags]}).");
-        if (row[F_SpellVisualId] != 0) d.Error("dbc.spellvisual.nonzero", $"Field 10 (SpellVisualID) must be 0 for v1 (got {row[F_SpellVisualId]}).");
+        if (row[F_Flags] != 0) d.Error("dbc.flags.nonzero", $"Field 9 (flags) must be 0 (got {row[F_Flags]}).");
+        if (row[F_SpellVisualId] != 0) d.Info("dbc.spellvisual", $"Field 10 (SpellVisualID) = {row[F_SpellVisualId]} (ranged projectile visual inherited from the family donor).");
         if (row[F_ItemVisual] != 0) d.Error("dbc.itemvisual.nonzero", $"ItemVisual must be 0 for v1 (got {row[F_ItemVisual]}).");
         for (int i = F_Texture0; i < F_Texture0 + 8; i++)
             if (row[i] != 0) d.Warn("dbc.bodytexture.present", $"Body-atlas texture field {i} is non-zero; weapons should leave these empty.");
@@ -99,7 +106,11 @@ public sealed class WeaponDisplayInfoParams
     public int Variant { get; init; } = 1;
     /// <summary>Interface\Icons stem to reuse initially; empty → no icon reference.</summary>
     public string IconStem { get; init; } = "";
-    /// <summary>GroupSoundIndex to preserve (a simple-sword donor value). 0 is acceptable for v1.</summary>
+    /// <summary>GroupSoundIndex to preserve (the family donor's value). 0 is acceptable.</summary>
     public uint GroupSoundIndex { get; init; } = 0;
+    /// <summary>SpellVisualID (field 10): the family donor's ranged projectile visual; 0 for melee.</summary>
+    public uint SpellVisualId { get; init; } = 0;
+    /// <summary>Write ModelName2 = ModelName1 (stock thrown-weapon shape).</summary>
+    public bool MirrorModelName2 { get; init; }
     public uint ItemVisual { get; init; } = 0;
 }

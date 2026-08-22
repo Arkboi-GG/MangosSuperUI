@@ -166,7 +166,7 @@ public sealed class CustomWeaponBuildService
                     if (i < encodedEffectCount && request.EffectTexturesBlp![i] is { Length: > 0 } effectBlp)
                     {
                         effectTextures.Add(new WeaponTexture { SourceBlp = effectBlp });
-                        effectPaths.Add(WeaponNaming.EffectTextureMpqPath(modelIndex, i + 1));
+                        effectPaths.Add(WeaponNaming.EffectTextureMpqPath(modelIndex, i + 1, profile.ComponentDir));
                         continue;
                     }
 
@@ -179,7 +179,7 @@ public sealed class CustomWeaponBuildService
                     bool alpha = meshPasses.Any(p =>
                         PassUsesTextureSlot(p, i + 1) && PassNeedsTextureAlpha(p));
                     effectTextures.Add(new WeaponTexture { SourcePng = png, Width = ew, Height = eh, UseDxt1 = !alpha });
-                    effectPaths.Add(WeaponNaming.EffectTextureMpqPath(modelIndex, i + 1));
+                    effectPaths.Add(WeaponNaming.EffectTextureMpqPath(modelIndex, i + 1, profile.ComponentDir));
                 }
             }
 
@@ -233,7 +233,7 @@ public sealed class CustomWeaponBuildService
         // the Retexture Engine does for its custom displays. Without this the forged weapon's display
         // id is absent from the statically-loaded server DBC and renders as the red "?" with no
         // texture. Cloned from the family's donor row, then overridden with the weapon's own SUI_W names.
-        RegisterDisplayWithDbc(dispRes.Id, modelIndex, donor.DisplayRow);
+        RegisterDisplayWithDbc(dispRes.Id, modelIndex, donor.DisplayRow, donor.MirrorModelName2);
 
         // 5) Unified rebuild: every custom weapon with stored bytes, this one included.
         var assembly = await AssembleUnifiedPatchAsync(diag, buildId);
@@ -250,7 +250,7 @@ public sealed class CustomWeaponBuildService
         var manifest = BuildManifest(request, profile, donor, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
             effectiveInventoryType, donorGroupSound, sql, assembly.Patch, assembly.PackagedCount,
             assembly.SkippedCount, assembly.ReplacedInBase);
-        string buildDir = WriteOutputs(buildId, entryRes.Id, dispRes.Id, modelIndex, assembly.Patch, sql, manifest, diag);
+        string buildDir = WriteOutputs(buildId, entryRes.Id, dispRes.Id, modelIndex, assembly.Patch, sql, manifest, diag, profile.ComponentDir);
 
         // 8) Apply — like the app's other tools: world DB row, core reload, client patch deploy.
         //    Each step is best-effort and individually reported; failures leave that step manual.
@@ -287,7 +287,7 @@ public sealed class CustomWeaponBuildService
                 displayId = dispRes.Id,
                 inventoryType = effectiveInventoryType,
                 inventoryTypeLabel = InventoryTypeLabel(effectiveInventoryType),
-                model = WeaponNaming.ModelMpqPath(modelIndex),
+                model = WeaponNaming.ModelMpqPath(modelIndex, profile.ComponentDir),
                 mpqSha256 = assembly.Patch.MpqSha256,
                 weaponsInPatch = assembly.PackagedCount,
                 applied = apply,
@@ -312,8 +312,8 @@ public sealed class CustomWeaponBuildService
             InventoryType = effectiveInventoryType,
             InventoryTypeLabel = InventoryTypeLabel(effectiveInventoryType),
             SourceKind = request.SourceKind,
-            ModelMember = WeaponNaming.ModelMpqPath(modelIndex),
-            TextureMember = WeaponNaming.TextureMpqPath(modelIndex),
+            ModelMember = WeaponNaming.ModelMpqPath(modelIndex, profile.ComponentDir),
+            TextureMember = WeaponNaming.TextureMpqPath(modelIndex, 1, profile.ComponentDir),
             MpqSha256 = assembly.Patch.MpqSha256,
             DbcSha256 = assembly.Patch.DbcSha256,
             SqlSha256 = sql.Sha256,
@@ -465,13 +465,15 @@ public sealed class CustomWeaponBuildService
     /// <summary>Clone the family donor's ItemDisplayInfo row into the in-memory DBC under the forged
     /// display id, overriding the model/texture with the weapon's own SUI_W names. Best-effort: a
     /// failure here only costs the web preview, never the build.</summary>
-    private void RegisterDisplayWithDbc(long displayId, int modelIndex, uint donorDisplayRow)
+    private void RegisterDisplayWithDbc(long displayId, int modelIndex, uint donorDisplayRow, bool mirrorModelName2 = false)
     {
         try
         {
+            string model = WeaponNaming.DbcModelName(modelIndex);
             _dbc.RegisterCustomDisplayEntry((uint)displayId, donorDisplayRow,
-                WeaponNaming.DbcModelName(modelIndex),
-                WeaponNaming.DbcTextureName(modelIndex));
+                model,
+                WeaponNaming.DbcTextureName(modelIndex),
+                customModelName2: mirrorModelName2 ? model : "");
         }
         catch (Exception ex)
         {
@@ -685,6 +687,8 @@ public sealed class CustomWeaponBuildService
                 GroupSoundIndex = w.GroupSoundIndex ?? donorGroupSound,
                 // Package-time fallback heals rows persisted before the icon fix (empty stem = red "?").
                 IconStem = string.IsNullOrEmpty(w.IconStem) ? donorIcon : w.IconStem,
+                SpellVisualId = w.SpellVisualId ?? 0,
+                MirrorModelName2 = w.MirrorModelName2,
                 ItemVisual = (uint)w.ItemVisual,
             }).ToArray(),
             Models = packaged.GroupBy(w => w.ModelMpqPath, StringComparer.OrdinalIgnoreCase)
@@ -838,7 +842,15 @@ public sealed class CustomWeaponBuildService
         string iconStem)
     {
         string? sourceSha = request.SourceBlob is { Length: > 0 } src ? Sha256(src) : null;
-        string dbcFieldsJson = JsonSerializer.Serialize(new { groupSoundIndex = groupSound });
+        // Everything the unified rebuild needs to re-author this display row from DB state alone:
+        // the family donor's sound group, its ranged projectile SpellVisual, and whether the row
+        // mirrors ModelName2 (thrown weapons) — so a later rebuild never has to re-resolve donors.
+        string dbcFieldsJson = JsonSerializer.Serialize(new
+        {
+            groupSoundIndex = groupSound,
+            spellVisualId = donor.SpellVisualId,
+            mirrorModelName2 = donor.MirrorModelName2,
+        });
         string gameplayJson = JsonSerializer.Serialize(new
         {
             name = weaponName,
@@ -866,7 +878,7 @@ public sealed class CustomWeaponBuildService
             new
             {
                 model_id = display,
-                path = WeaponNaming.ModelMpqPath(modelIndex),
+                path = WeaponNaming.ModelMpqPath(modelIndex, profile.ComponentDir),
                 m2,
                 m2sha = Sha256(m2),
                 kind = request.SourceKind,
@@ -890,7 +902,7 @@ public sealed class CustomWeaponBuildService
             {
                 display,
                 model_id = display,
-                tex = WeaponNaming.TextureMpqPath(modelIndex),
+                tex = WeaponNaming.TextureMpqPath(modelIndex, 1, profile.ComponentDir),
                 blp,
                 blpsha = Sha256(blp),
                 srctex = request.TexturePng,
@@ -941,18 +953,36 @@ public sealed class CustomWeaponBuildService
         public string ModelMpqPath { get; set; } = "";
         public byte[]? M2 { get; set; }
 
-        public uint? GroupSoundIndex
+        public uint? GroupSoundIndex => ReadUInt("groupSoundIndex");
+
+        /// <summary>Ranged projectile SpellVisual persisted at build time; null on rows built
+        /// before ranged families existed (packaged as 0 — the melee value).</summary>
+        public uint? SpellVisualId => ReadUInt("spellVisualId");
+
+        /// <summary>ModelName2 mirrors ModelName1 (thrown weapons); absent/false on older rows.</summary>
+        public bool MirrorModelName2
         {
             get
             {
-                if (string.IsNullOrEmpty(DbcFieldsJson)) return null;
+                if (string.IsNullOrEmpty(DbcFieldsJson)) return false;
                 try
                 {
                     var doc = JsonSerializer.Deserialize<JsonElement>(DbcFieldsJson);
-                    return doc.TryGetProperty("groupSoundIndex", out var gs) ? gs.GetUInt32() : null;
+                    return doc.TryGetProperty("mirrorModelName2", out var m) && m.ValueKind == JsonValueKind.True;
                 }
-                catch { return null; }
+                catch { return false; }
             }
+        }
+
+        private uint? ReadUInt(string property)
+        {
+            if (string.IsNullOrEmpty(DbcFieldsJson)) return null;
+            try
+            {
+                var doc = JsonSerializer.Deserialize<JsonElement>(DbcFieldsJson);
+                return doc.TryGetProperty(property, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetUInt32() : null;
+            }
+            catch { return null; }
         }
     }
 
@@ -1020,6 +1050,9 @@ public sealed class CustomWeaponBuildService
             sheath = profile.Sheath,
             material = profile.Material,
             delayMs = profile.DelayMs,
+            isRanged = profile.IsRanged,
+            ammoType = profile.AmmoType,
+            rangeMod = profile.RangeMod,
         },
         itemEntry = entry,
         displayId = display,
@@ -1028,9 +1061,9 @@ public sealed class CustomWeaponBuildService
         names = new
         {
             model = WeaponNaming.DbcModelName(modelIndex),
-            modelMember = WeaponNaming.ModelMpqPath(modelIndex),
+            modelMember = WeaponNaming.ModelMpqPath(modelIndex, profile.ComponentDir),
             texture = WeaponNaming.DbcTextureName(modelIndex),
-            textureMember = WeaponNaming.TextureMpqPath(modelIndex),
+            textureMember = WeaponNaming.TextureMpqPath(modelIndex, 1, profile.ComponentDir),
             dbcMember = WeaponNaming.ItemDisplayInfoMember,
         },
         versions = new
@@ -1045,8 +1078,13 @@ public sealed class CustomWeaponBuildService
             model = donorInfo.ModelName,
             m2Path = donorInfo.M2Path,
             groupSoundIndex = donorGroupSound,
+            spellVisualId = donorInfo.SpellVisualId,
+            mirrorModelName2 = donorInfo.MirrorModelName2,
+            measureDisplayRow = donorInfo.MeasureDisplayRow,
+            measureModel = donorInfo.MeasureModelName,
             extentX = donorInfo.ExtentX,
             palmBackFraction = donorInfo.PalmBackFraction,
+            orientation = donorInfo.Orientation.ToString(),
         },
         packaging = new
         {
@@ -1065,7 +1103,7 @@ public sealed class CustomWeaponBuildService
     };
 
     private string WriteOutputs(string buildId, long entry, long display, int modelIndex,
-        WeaponPatchResult patch, GeneratedSql sql, object manifest, ForgeDiagnostics diag)
+        WeaponPatchResult patch, GeneratedSql sql, object manifest, ForgeDiagnostics diag, string componentDir)
     {
         string buildDir = Path.Combine(ArtifactRoot, $"weapon-build-{buildId}");
         Directory.CreateDirectory(buildDir);
@@ -1078,7 +1116,7 @@ public sealed class CustomWeaponBuildService
             JsonSerializer.Serialize(manifest, jsonOpts), new UTF8Encoding(false));
 
         File.WriteAllText(Path.Combine(buildDir, "validation-report.md"),
-            RenderValidationMarkdown(buildId, entry, display, modelIndex, patch, diag), new UTF8Encoding(false));
+            RenderValidationMarkdown(buildId, entry, display, modelIndex, patch, diag, componentDir), new UTF8Encoding(false));
         File.WriteAllText(Path.Combine(buildDir, "OWNER_CHECKLIST.md"),
             RenderOwnerChecklist(buildId, entry, display, patch, sql), new UTF8Encoding(false));
 
@@ -1115,15 +1153,15 @@ public sealed class CustomWeaponBuildService
     }
 
     private static string RenderValidationMarkdown(string buildId, long entry, long display, int modelIndex,
-        WeaponPatchResult patch, ForgeDiagnostics diag)
+        WeaponPatchResult patch, ForgeDiagnostics diag, string? componentDir = null)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"# Validation report — build {buildId}");
         sb.AppendLine();
         sb.AppendLine($"- Item entry: **{entry}**");
         sb.AppendLine($"- Display id: **{display}**");
-        sb.AppendLine($"- Model: `{WeaponNaming.DbcModelName(modelIndex)}` → `{WeaponNaming.ModelMpqPath(modelIndex)}`");
-        sb.AppendLine($"- Texture: `{WeaponNaming.DbcTextureName(modelIndex)}` → `{WeaponNaming.TextureMpqPath(modelIndex)}`");
+        sb.AppendLine($"- Model: `{WeaponNaming.DbcModelName(modelIndex)}` → `{WeaponNaming.ModelMpqPath(modelIndex, componentDir)}`");
+        sb.AppendLine($"- Texture: `{WeaponNaming.DbcTextureName(modelIndex)}` → `{WeaponNaming.TextureMpqPath(modelIndex, 1, componentDir)}`");
         sb.AppendLine($"- MPQ SHA-256: `{patch.MpqSha256}`");
         sb.AppendLine($"- DBC SHA-256: `{patch.DbcSha256}`");
         sb.AppendLine($"- All members byte-verified after repack: **{(patch.AllVerified ? "yes" : "NO")}**");

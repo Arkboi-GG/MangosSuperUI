@@ -146,12 +146,23 @@ public sealed class TbcMpqSource : IDisposable
             if (row.Length < 6) continue;
             string model = dbc.ReadString(row[WeaponDisplayInfoRow.F_ModelName1]);
             if (model.Length == 0) continue;
-            if (dbc.ReadString(row[WeaponDisplayInfoRow.F_ModelName2]).Length != 0) continue; // paired models (fist weapons)
+            // Paired models (fist weapons) are excluded; a second model naming the SAME file is the
+            // stock thrown-weapon shape and stays importable (the Forge mirrors it on its own row).
+            string model2 = dbc.ReadString(row[WeaponDisplayInfoRow.F_ModelName2]);
+            if (model2.Length != 0 && !string.Equals(model2, model, StringComparison.OrdinalIgnoreCase)) continue;
 
             string stem = StripToStem(model);
             if (stem.Length == 0) continue;
-            string m2Path = $@"{WeaponNaming.WeaponDir}\{stem}.m2";
-            if (!HasMember(m2Path)) continue;
+            // Weapons (melee + ranged) live in the Weapon folder, shields in the Shield folder; the
+            // DBC name is bare, so probe both and remember which one the member came from.
+            string dir = WeaponNaming.WeaponDir;
+            string m2Path = $@"{dir}\{stem}.m2";
+            if (!HasMember(m2Path))
+            {
+                dir = WeaponNaming.ShieldDir;
+                m2Path = $@"{dir}\{stem}.m2";
+                if (!HasMember(m2Path)) continue;
+            }
 
             string texStem = dbc.ReadString(row[WeaponDisplayInfoRow.F_TextureName1]);
             list.Add(new TbcWeaponEntry
@@ -160,7 +171,7 @@ public sealed class TbcMpqSource : IDisposable
                 ModelStem = stem,
                 M2Path = m2Path,
                 TextureStem = texStem,
-                BlpPath = texStem.Length > 0 ? $@"{WeaponNaming.WeaponDir}\{texStem}.blp" : null,
+                BlpPath = texStem.Length > 0 ? $@"{dir}\{texStem}.blp" : null,
                 IconStem = dbc.ReadString(row[WeaponDisplayInfoRow.F_InventoryIcon]),
             });
         }
@@ -186,11 +197,27 @@ public sealed class TbcMpqSource : IDisposable
             return;
         }
 
+        // Base archives (common/expansion/patch/patch-2) at the top level, then the locale folder's
+        // archives (enUS\locale-enUS.MPQ, patch-enUS.MPQ, patch-enUS-2.MPQ …) — a 2.4.3 client keeps
+        // DBFilesClient\ItemDisplayInfo.dbc ONLY in the locale archives, so without them the browse
+        // is empty. Later in the list = higher precedence (ExtractFile walks it backwards).
         var mpqFiles = Directory.GetFiles(path, "*.MPQ", SearchOption.TopDirectoryOnly)
             .Concat(Directory.GetFiles(path, "*.mpq", SearchOption.TopDirectoryOnly))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(f => Path.GetFileName(f), Comparer<string>.Create(MpqPatchOrder.CompareAscending))
             .ToList();
+        foreach (var localeDir in Directory.GetDirectories(path).OrderBy(d => d, StringComparer.OrdinalIgnoreCase))
+        {
+            string localeName = Path.GetFileName(localeDir);
+            if (localeName.Length != 4) continue; // enUS / enGB / deDE … — skip unrelated folders
+            var localeFiles = Directory.GetFiles(localeDir, "*.MPQ", SearchOption.TopDirectoryOnly)
+                .Concat(Directory.GetFiles(localeDir, "*.mpq", SearchOption.TopDirectoryOnly))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(f => !Path.GetFileName(f).StartsWith("speech-", StringComparison.OrdinalIgnoreCase)) // voice-over only
+                .OrderBy(f => Path.GetFileName(f), Comparer<string>.Create(MpqPatchOrder.CompareAscending))
+                .ToList();
+            mpqFiles.AddRange(localeFiles);
+        }
 
         foreach (var mpqPath in mpqFiles)
         {
