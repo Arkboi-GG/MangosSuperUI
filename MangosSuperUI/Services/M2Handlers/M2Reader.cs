@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using System.Text;
 
 namespace MangosSuperUI.Services;
@@ -12,6 +12,20 @@ public class M2Model
 {
     public uint Version { get; set; }
     public string Name { get; set; } = "";
+
+    /// <summary>
+    /// The bytes this model was parsed from, kept so a consumer can re-read a field this reader
+    /// deliberately narrows.
+    ///
+    /// It exists for <see cref="M2Fx.M2FxReader"/>: the parse collapses every material colour /
+    /// alpha / UV track to one rest value on purpose (the forge needs a value it can re-emit, not a
+    /// curve), so the previewer's animation manifest has to go back to the source. Handing it the
+    /// buffer beats either widening this type with preview-only keyframe arrays or making every
+    /// caller thread the bytes through a second parameter.
+    ///
+    /// Null when a caller constructed an M2Model by hand rather than parsing one.
+    /// </summary>
+    public byte[]? SourceBytes { get; set; }
 
     public List<M2Vertex> Vertices { get; set; } = new();
     public List<ushort> Indices { get; set; } = new();
@@ -29,6 +43,10 @@ public class M2Model
     public Dictionary<int, string> RestTextureTransformErrors { get; set; } = new();
     public uint RibbonEmitterCount { get; set; }
     public uint ParticleEmitterCount { get; set; }
+    /// <summary>Rest-pose summary of each particle emitter (position in reader space, texture,
+    /// dominant colour, scale, blend) — enough to suggest a vanilla enchant-style ItemVisual for
+    /// models whose emitter graphs cannot be transplanted. Empty when the record layout is unknown.</summary>
+    public List<M2ParticleEmitterInfo> ParticleEmitters { get; set; } = new();
 
     // ── Skeleton ─────────────────────────────────────────────────────────────
     public List<M2Bone> Bones { get; set; } = new();
@@ -478,7 +496,8 @@ public class M2Reader
 
             var model = new M2Model
             {
-                Version = ReadUInt32(data, 0x04)
+                Version = ReadUInt32(data, 0x04),
+                SourceBytes = data,
             };
 
             // Vanilla only (v256). WotLK (264+) splits .skin into external files
@@ -540,6 +559,7 @@ public class M2Reader
             ParseReachableMaterialTracks(data, model);
             model.RibbonEmitterCount = ReadUInt32(data, 0x134);
             model.ParticleEmitterCount = ReadUInt32(data, 0x13C);
+            ParseParticleEmitters(data, model.ParticleEmitterCount, ReadUInt32(data, 0x140), model);
 
             // ── Attachments ─────────────────────────────────────────────────
             uint nAttachments = ReadUInt32(data, 0x104);
@@ -1567,6 +1587,85 @@ public class M2Reader
             model.TransparencyLookup.Add(ReadUInt16(data, (int)(offset + i * 2)));
     }
 
+    // ── Particle emitters (rest summary) ────────────────────────────────────
+    //
+    // M2Particle ≤ v263 is 504 bytes (measured on the 1.12 and 2.4.3 clients — every record after
+    // the first lands on id −1 / valid bone / valid texture only at that stride). Fields used:
+    //   +8  C3Vector position (model space)   +22 uint16 texture index
+    //   +40 uint16 blendingType               +336 CImVector colorValues[3] (BGRA)
+    //   +348 float scaleValues[3]
+    // Everything else (spin, tumble, wind) stays unread — the vanilla scaffold cannot host
+    // the emitter anyway; this is the evidence the ItemVisual suggester needs.
+    private const int PARTICLE_STRIDE_LEGACY = 504;
+
+    // The ten float M2Tracks, in record order. ≤ v263 M2Track is 28 bytes —
+    //   +0 uint16 interpolation | +2 int16 globalSequence | +4 ranges | +12 timestamps | +20 values
+    // — each of the three being an M2Array{uint32 count; uint32 offset}. So a track's value array is
+    // (count @ track+20, offset @ track+24). These are the same eleven starts
+    // M2EmitterTransplanter.TrackStarts uses; the eleventh (476, "enabled") is a uint8 track and is
+    // deliberately not read here.
+    private static readonly int[] PARTICLE_TRACK_STARTS_LEGACY =
+        { 52, 80, 108, 136, 164, 192, 220, 248, 276, 304 };
+
+    /// <summary>One CImVector particle colour keyframe (BGRA on disk) as RGB, 0–255 per channel.</summary>
+    private static Vector3 ReadEmitterKeyColour(byte[] data, int offset) =>
+        offset + 4 > data.Length
+            ? Vector3.Zero
+            : new Vector3(data[offset + 2], data[offset + 1], data[offset]);
+
+    /// <summary>First keyframe of a ≤ v263 float M2Track, or 0 when the track is empty/malformed.</summary>
+    private static float ReadTrackFirstFloat(byte[] data, int trackStart)
+    {
+        uint count = ReadUInt32(data, trackStart + 20), offset = ReadUInt32(data, trackStart + 24);
+        if (count == 0 || offset == 0 || offset + 4 > data.Length) return 0f;
+        float v = ReadFloat(data, (int)offset);
+        return float.IsFinite(v) ? v : 0f;
+    }
+
+    private static void ParseParticleEmitters(byte[] data, uint count, uint offset, M2Model model)
+    {
+        if (count == 0 || offset == 0 || offset + (long)count * PARTICLE_STRIDE_LEGACY > data.Length) return;
+        for (uint i = 0; i < count; i++)
+        {
+            int o = (int)(offset + i * PARTICLE_STRIDE_LEGACY);
+            float px = ReadFloat(data, o + 8), py = ReadFloat(data, o + 12), pz = ReadFloat(data, o + 16);
+            int tex = ReadUInt16(data, o + 22);
+            string? texName = tex >= 0 && tex < model.Textures.Count && model.Textures[tex].Type == 0
+                ? model.Textures[tex].Filename : null;
+            // Three keyframes (start / mid / end): the middle one is what the eye sees most, and is
+            // what the hue/intent heuristics want. The whole ramp is kept alongside it so a rebuild
+            // can reproduce the curve rather than a flat average of it.
+            var ramp = new M2EmitterColorRamp(
+                ReadEmitterKeyColour(data, o + 336),
+                ReadEmitterKeyColour(data, o + 340),
+                ReadEmitterKeyColour(data, o + 344));
+            Vector3? colour = null;
+            for (int k = 1; k >= 0 && colour is null; k--)
+            {
+                int c = o + 336 + k * 4;
+                byte b = data[c], g = data[c + 1], r = data[c + 2], a = data[c + 3];
+                if (a > 0 || r > 0 || g > 0 || b > 0) colour = new Vector3(r, g, b);
+            }
+            float scale = MathF.Max(ReadFloat(data, o + 348), MathF.Max(ReadFloat(data, o + 352), ReadFloat(data, o + 356)));
+            int rows = Math.Max(1, (int)ReadUInt16(data, o + 48)), cols = Math.Max(1, (int)ReadUInt16(data, o + 50));
+            var t = PARTICLE_TRACK_STARTS_LEGACY;
+            var motion = new M2EmitterMotion(
+                EmissionSpeed: ReadTrackFirstFloat(data, o + t[0]),
+                SpeedVariation: ReadTrackFirstFloat(data, o + t[1]),
+                VerticalRange: ReadTrackFirstFloat(data, o + t[2]),
+                HorizontalRange: ReadTrackFirstFloat(data, o + t[3]),
+                Gravity: ReadTrackFirstFloat(data, o + t[4]),
+                Lifespan: ReadTrackFirstFloat(data, o + t[5]),
+                EmissionRate: ReadTrackFirstFloat(data, o + t[6]),
+                EmissionAreaLength: ReadTrackFirstFloat(data, o + t[7]),
+                EmissionAreaWidth: ReadTrackFirstFloat(data, o + t[8]),
+                ZSource: ReadTrackFirstFloat(data, o + t[9]));
+            model.ParticleEmitters.Add(new M2ParticleEmitterInfo(
+                new Vector3(px, pz, -py), texName, colour, float.IsFinite(scale) ? scale : 0f, (byte)ReadUInt16(data, o + 40), rows, cols,
+                motion.IsUsable ? motion : null, ramp));
+        }
+    }
+
     // ── Binary helpers ──────────────────────────────────────────────────────
 
     private static uint ReadUInt32(byte[] data, int offset)
@@ -1577,4 +1676,76 @@ public class M2Reader
 
     private static float ReadFloat(byte[] data, int offset)
         => offset + 4 > data.Length ? 0f : BitConverter.ToSingle(data, offset);
+}
+
+/// <summary>Rest-pose summary of one M2 particle emitter (see <see cref="M2Model.ParticleEmitters"/>).
+/// <paramref name="Position"/> is reader space (glTF Y-up, same frame as the vertices);
+/// <paramref name="ColorRgb"/> is 0–255 per channel or null when the record carried no colour.
+/// <paramref name="Motion"/> is the emitter's own timing — see <see cref="M2EmitterMotion"/> — and is
+/// null when the record's tracks could not be read.
+/// <paramref name="ColorRamp"/> is the full start→mid→end colour curve; <paramref name="ColorRgb"/>
+/// stays the single representative colour that the hue/intent heuristics read.</summary>
+public sealed record M2ParticleEmitterInfo(Vector3 Position, string? TextureName, Vector3? ColorRgb, float Scale, byte BlendMode, int TileRows = 1, int TileCols = 1, M2EmitterMotion? Motion = null, M2EmitterColorRamp? ColorRamp = null);
+
+/// <summary>The emitter's three colour keyframes, 0–255 per channel, in birth → mid → death order.
+///
+/// Particle colour is a ramp, not a value: Worldbreaker's shoulder fire goes (255,219,143) →
+/// (255,121,23) → (58,26,2) — a white-hot core cooling through orange to a dark ember. Collapsing
+/// that to the mid key and painting it on all three keyframes (what the forge did before this
+/// existed) makes every particle a uniform blob of one colour, which removes the shading that
+/// otherwise reads as depth and lets the population churn show through.</summary>
+public sealed record M2EmitterColorRamp(Vector3 Start, Vector3 Mid, Vector3 End)
+{
+    public bool IsFlat =>
+        Vector3.DistanceSquared(Start, Mid) < 1f && Vector3.DistanceSquared(Mid, End) < 1f;
+}
+
+/// <summary>
+/// The rest values of a particle emitter's ten float tracks — everything that decides how the effect
+/// MOVES, as opposed to where it sits and what colour it is.
+///
+/// === Why this exists (measured — do NOT re-derive) ===
+///
+/// The forge rebuilds a later-client emitter by transplanting a stock 1.12 one
+/// (<see cref="MangosSuperUI.Services.WeaponForge.RawM2.M2EmitterTransplanter"/>) and retargeting its
+/// position, colour and size. That leaves the donor deciding the TIMING, and the donor's timing is
+/// authored for the donor's own item. Worldbreaker (Shaman T8) is the measured case:
+///
+///   source  <c>LShoulder_Mail_RaidShaman_G_01.m2</c> emitter 0 — lifespan <b>2.30 s</b>,
+///           rate <b>8/s</b>, speed 0.111, spread 0/6.283, area 0.083², scale 0.333→0.139, 1×1 tile.
+///           ⇒ ~18 large, slow, overlapping particles: one continuous flame.
+///   donor   FLAMELICKSMALL (<c>Thrown_1H_Molotov_A_01.m2</c>) — lifespan <b>0.75 s</b>,
+///           rate <b>7/s</b>, 4×4 tile (16-cell flipbook).
+///           ⇒ ~5 sparse particles, each stepping 16 flipbook cells in 0.75 s ≈ 21 cell-changes/s.
+///
+/// Same colour, same size, same place — and it reads as a fast on/off strobe rather than fire,
+/// because the two numbers that decide whether particles OVERLAP (rate × lifespan) were thrown away.
+/// Carrying these values across is what turns "photograph of the donor's effect" into "the source's
+/// effect, played on Blizzard's own 1.12 emitter".
+///
+/// Values are in the source's own units (seconds, particles/second, m/s, radians) and are read at the
+/// first keyframe of each track — every measured item emitter, both clients, stores a single constant
+/// key per track, so "first key" IS the value.
+/// </summary>
+public sealed record M2EmitterMotion(
+    float EmissionSpeed,
+    float SpeedVariation,
+    float VerticalRange,
+    float HorizontalRange,
+    float Gravity,
+    float Lifespan,
+    float EmissionRate,
+    float EmissionAreaLength,
+    float EmissionAreaWidth,
+    float ZSource)
+{
+    /// <summary>Particles alive at once in the steady state — the single number that decides whether
+    /// the effect reads as a continuous body of fire or as a stutter of separate sprites.</summary>
+    public float SteadyStateParticles => EmissionRate * Lifespan;
+
+    /// <summary>True when enough of this was readable to be worth applying. A record whose lifespan
+    /// or rate came back zero draws nothing, and would silence a donor that works.</summary>
+    public bool IsUsable =>
+        float.IsFinite(Lifespan) && Lifespan > 0.01f && Lifespan < 60f &&
+        float.IsFinite(EmissionRate) && EmissionRate > 0.01f && EmissionRate < 10000f;
 }

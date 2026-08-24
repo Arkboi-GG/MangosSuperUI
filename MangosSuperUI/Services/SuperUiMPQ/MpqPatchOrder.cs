@@ -16,12 +16,19 @@ namespace MangosSuperUI.Services.Mpq;
 public static class MpqPatchOrder
 {
     private static readonly Regex PatchN = new(@"^patch-(\d+)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    /// <summary>Locale patches of the 2.x/3.x clients: <c>patch-enUS</c>, <c>patch-enUS-2</c>,
+    /// <c>patch-enUS-3</c> … (bare = the first one, ranked like the bare <c>patch</c>).</summary>
+    private static readonly Regex LocalePatchN = new(@"^patch-[a-z]{4}(?:-(\d+))?$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private const int BaseArchiveRank = 1_000_000;
     private const int PatchBaseRank = 2_000_000;
 
-    /// <summary>Higher wins. patch-N → 2,000,000 + N; bare patch → 2,000,000; any other (base
-    /// data) archive → 1,000,000. Non-numeric patch names fall back to the patch base rank.</summary>
+    /// <summary>Higher wins. patch-N / patch-xxXX-N → 2,000,000 + N; bare patch / patch-xxXX →
+    /// 2,000,000; any other (base data) archive → 1,000,000. Non-numeric patch names fall back to
+    /// the patch base rank. Locale-patch awareness matters for the TBC/WotLK import mounts
+    /// (<c>enUS\patch-enUS-3.MPQ</c> carries the newest ItemDisplayInfo.dbc and must beat
+    /// <c>patch-enUS.MPQ</c>; plain name order put the bare one last); vanilla 1.12 has no such
+    /// archives, so its ordering is unchanged.</summary>
     public static int Rank(string archiveName)
     {
         var stem = Path.GetFileNameWithoutExtension(archiveName);
@@ -31,6 +38,10 @@ public static class MpqPatchOrder
         var m = PatchN.Match(stem);
         if (m.Success && int.TryParse(m.Groups[1].Value, out int n))
             return PatchBaseRank + n;
+
+        var lm = LocalePatchN.Match(stem);
+        if (lm.Success)
+            return PatchBaseRank + (lm.Groups[1].Success && int.TryParse(lm.Groups[1].Value, out int ln) ? ln : 0);
 
         return BaseArchiveRank;
     }

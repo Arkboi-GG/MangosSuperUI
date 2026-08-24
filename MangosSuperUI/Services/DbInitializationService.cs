@@ -149,6 +149,7 @@ public class DbInitializationService
                 // exists, so columns added after an install shipped can only reach
                 // existing databases through here.
                 await MigrateColumnsAsync(conn, dbName);
+                await MigrateArmorForgeAsync(conn, dbName);
             }
 
             AdminDbReady = true;
@@ -248,6 +249,42 @@ public class DbInitializationService
     /// once an install is current. A failure here is logged and swallowed — a missing optional
     /// column degrades the change graph, it does not justify refusing to start the panel.
     /// </summary>
+    /// <summary>Armor Forge v2 (TBC model import): the first cut shipped a mirror flag and a
+    /// (display, slot) component key; v2 needs a distinct right-shoulder model name and one component
+    /// row per gender suffix (_M/_F/_U). Guarded by information_schema so it's a no-op once current.</summary>
+    private async Task MigrateArmorForgeAsync(MySqlConnection conn, string dbName)
+    {
+        try
+        {
+            if (await TableExistsAsync(conn, dbName, "custom_armor_display")
+                && !await ColumnExistsAsync(conn, dbName, "custom_armor_display", "model_name2"))
+            {
+                await conn.ExecuteAsync("ALTER TABLE custom_armor_display ADD COLUMN model_name2 VARCHAR(128) NULL AFTER model_name");
+                _logger.LogInformation("DbInitializationService: Added custom_armor_display.model_name2");
+            }
+            if (await TableExistsAsync(conn, dbName, "custom_armor_component"))
+            {
+                if (!await ColumnExistsAsync(conn, dbName, "custom_armor_component", "gender_suffix"))
+                    await conn.ExecuteAsync("ALTER TABLE custom_armor_component ADD COLUMN gender_suffix VARCHAR(4) NOT NULL DEFAULT '_U' AFTER slot");
+                // Guard the PK change separately from the column add, so a half-applied migration
+                // (column present, old PK) is healed on the next boot instead of skipped.
+                var pkHasSuffix = await conn.ExecuteScalarAsync<int>(
+                    @"SELECT COUNT(*) FROM information_schema.STATISTICS
+                      WHERE TABLE_SCHEMA=@database AND TABLE_NAME='custom_armor_component' AND INDEX_NAME='PRIMARY' AND COLUMN_NAME='gender_suffix'",
+                    new { database = dbName });
+                if (pkHasSuffix == 0)
+                {
+                    await conn.ExecuteAsync("ALTER TABLE custom_armor_component DROP PRIMARY KEY, ADD PRIMARY KEY (display_id, slot, gender_suffix)");
+                    _logger.LogInformation("DbInitializationService: custom_armor_component keyed by (display_id, slot, gender_suffix)");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "DbInitializationService: Armor Forge migration failed (non-fatal)");
+        }
+    }
+
     private async Task MigrateColumnsAsync(MySqlConnection conn, string dbName)
     {
         // audit_log: change-graph columns. batch_id groups the rows a single tool run
@@ -504,7 +541,87 @@ public class DbInitializationService
         ("custom_weapon_display", Sql_CustomWeaponDisplay),
         ("custom_weapon_item_manifest", Sql_CustomWeaponItemManifest),
         ("weapon_forge_config", Sql_WeaponForgeConfig),
+        // Armor Forge shares the id allocator/reservation tables above (same 'item_entry' /
+        // 'item_display' kinds, plus an 'armor_set' kind); these hold the armor-specific state.
+        ("custom_armor_display", Sql_CustomArmorDisplay),
+        ("custom_armor_component", Sql_CustomArmorComponent),
+        ("custom_armor_model", Sql_CustomArmorModel),
+        ("custom_armor_set", Sql_CustomArmorSet),
     };
+
+    // Modelled armor (helm / shoulder): the emitted native-vanilla M2 members — 16 race/gender
+    // variants for a helm, an L/R pair for shoulders — plus any hardcoded effect BLPs. One row per
+    // MPQ member; rebuilt into patch-6 from here.
+    private const string Sql_CustomArmorModel = @"
+        CREATE TABLE custom_armor_model (
+            display_id   BIGINT UNSIGNED NOT NULL,
+            mpq_path     VARCHAR(255)    NOT NULL,
+            compiled_m2  LONGBLOB        NULL,
+            created_at   DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            PRIMARY KEY (display_id, mpq_path)
+        ) ENGINE=InnoDB;";
+
+    // One forged armor piece = one display + item_entry. Modelled pieces (helm/shoulder) carry a
+    // model name + a compiled skin BLP; painted pieces carry component BLPs in custom_armor_component
+    // instead and leave compiled_blp null. All the ItemDisplayInfo fields the piece needs are stored
+    // explicitly so patch-6 rebuilds deterministically from the DB.
+    private const string Sql_CustomArmorDisplay = @"
+        CREATE TABLE custom_armor_display (
+            display_id       BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+            item_entry       BIGINT UNSIGNED NOT NULL,
+            build_id         VARCHAR(64)     NULL,
+            set_id           INT             NOT NULL DEFAULT 0,
+            render_kind      VARCHAR(16)     NOT NULL,
+            armor_type_key   VARCHAR(24)     NOT NULL,
+            material         INT             NOT NULL DEFAULT 0,
+            inventory_type   INT             NOT NULL DEFAULT 0,
+            name             VARCHAR(255)    NOT NULL,
+            icon_stem        VARCHAR(128)    NULL,
+            model_name       VARCHAR(128)    NULL,
+            model_name2      VARCHAR(128)    NULL,
+            texture_name     VARCHAR(128)    NULL,
+            texture_mpq_path VARCHAR(255)    NULL,
+            compiled_blp     LONGBLOB        NULL,
+            geoset0          INT             NOT NULL DEFAULT 0,
+            geoset1          INT             NOT NULL DEFAULT 0,
+            geoset2          INT             NOT NULL DEFAULT 0,
+            helmet_vis0      INT UNSIGNED    NOT NULL DEFAULT 0,
+            helmet_vis1      INT UNSIGNED    NOT NULL DEFAULT 0,
+            group_sound      INT UNSIGNED    NOT NULL DEFAULT 0,
+            mirror_model     TINYINT         NOT NULL DEFAULT 0,
+            sql_text         LONGTEXT        NULL,
+            gameplay_json    LONGTEXT        NULL,
+            created_at       DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            INDEX idx_armor_entry (item_entry),
+            INDEX idx_armor_set (set_id)
+        ) ENGINE=InnoDB;";
+
+    // Painted armor: one row per body-atlas component slot (0..7 → ItemDisplayInfo m_texture[14..21])
+    // PER GENDER SUFFIX (_M/_F/_U) — the client resolves the bare DBC stem by appending a suffix, and
+    // male/female art differs, so each variant TBC ships is carried under its own suffix.
+    private const string Sql_CustomArmorComponent = @"
+        CREATE TABLE custom_armor_component (
+            display_id     BIGINT UNSIGNED NOT NULL,
+            slot           TINYINT UNSIGNED NOT NULL,
+            gender_suffix  VARCHAR(4)      NOT NULL DEFAULT '_U',
+            mpq_path       VARCHAR(255)    NOT NULL,
+            component_stem VARCHAR(128)    NOT NULL,
+            compiled_blp   LONGBLOB        NULL,
+            created_at     DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            PRIMARY KEY (display_id, slot, gender_suffix)
+        ) ENGINE=InnoDB;";
+
+    // Tier sets: the ItemSet.dbc row data. Member pieces are the custom_armor_display rows whose
+    // set_id matches; the bonus table (threshold → spell) is stored as JSON.
+    private const string Sql_CustomArmorSet = @"
+        CREATE TABLE custom_armor_set (
+            set_id         INT             NOT NULL PRIMARY KEY,
+            name           VARCHAR(255)    NOT NULL,
+            bonuses_json   LONGTEXT        NULL,
+            req_skill      INT             NOT NULL DEFAULT 0,
+            req_skill_rank INT             NOT NULL DEFAULT 0,
+            created_at     DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+        ) ENGINE=InnoDB;";
 
     // Durable key/value config for the Forge (e.g. the image→3D ComfyUI workflow JSON). DB-backed
     // because wwwroot and the app directory are wiped on publish.

@@ -103,6 +103,47 @@ public static class M2GeometryPatcher
         return outp;
     }
 
+    /// <summary>
+    /// Move the donor's attachment points (vanilla v256: header 0x104/0x108, 48-byte records, id at
+    /// +0, position at +8) to new WoW-space positions, keyed by attachment id. Offset-preserving —
+    /// only the 12 position bytes of matching records change. Weapon attachments 0..4 are where the
+    /// client hangs enchant/ItemVisual effects along the blade, so an imported model whose blade
+    /// runs somewhere else than the donor's gets its glow where its own geometry is.
+    /// </summary>
+    public static byte[] RewriteAttachmentPositions(byte[] input, IReadOnlyDictionary<uint, Vector3> positionsWoW)
+    {
+        if (positionsWoW.Count == 0) return input;
+        var outp = (byte[])input.Clone();
+        uint n = BinaryPrimitives.ReadUInt32LittleEndian(outp.AsSpan(0x104));
+        uint ofs = BinaryPrimitives.ReadUInt32LittleEndian(outp.AsSpan(0x108));
+        if (n == 0 || ofs == 0 || ofs + (long)n * 48 > outp.Length) return input;
+        for (uint i = 0; i < n; i++)
+        {
+            int o = (int)(ofs + i * 48);
+            uint id = BinaryPrimitives.ReadUInt32LittleEndian(outp.AsSpan(o));
+            if (positionsWoW.TryGetValue(id, out var p)) WriteVec3(outp, o + 8, p);
+        }
+        return outp;
+    }
+
+    /// <summary>Read the donor's attachment points (id → WoW position) — see <see cref="RewriteAttachmentPositions"/>.</summary>
+    public static Dictionary<uint, Vector3> ReadAttachmentPositions(byte[] m2)
+    {
+        var map = new Dictionary<uint, Vector3>();
+        if (m2.Length < 0x110) return map;
+        uint n = BinaryPrimitives.ReadUInt32LittleEndian(m2.AsSpan(0x104));
+        uint ofs = BinaryPrimitives.ReadUInt32LittleEndian(m2.AsSpan(0x108));
+        if (n == 0 || ofs == 0 || ofs + (long)n * 48 > m2.Length) return map;
+        for (uint i = 0; i < n; i++)
+        {
+            int o = (int)(ofs + i * 48);
+            uint id = BinaryPrimitives.ReadUInt32LittleEndian(m2.AsSpan(o));
+            map[id] = new Vector3(BinaryPrimitives.ReadSingleLittleEndian(m2.AsSpan(o + 8)),
+                BinaryPrimitives.ReadSingleLittleEndian(m2.AsSpan(o + 12)), BinaryPrimitives.ReadSingleLittleEndian(m2.AsSpan(o + 16)));
+        }
+        return map;
+    }
+
     private static (Vector3 min, Vector3 max, Vector3 center, float radius) ComputeBounds(IReadOnlyList<Vector3> pts)
     {
         var min = new Vector3(float.MaxValue);

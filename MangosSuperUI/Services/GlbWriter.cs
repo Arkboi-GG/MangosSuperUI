@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using SharpGLTF.Geometry;
 using SharpGLTF.Geometry.VertexTypes;
 using SharpGLTF.Materials;
@@ -107,8 +107,14 @@ public static class GlbWriter
     /// the M2 has problematic single-sided geometry. Attachments YES;
     /// weapons NO.
     /// </summary>
+    /// <param name="visualEffects">Separate effect models this item's <c>ItemVisual</c> mounts on it —
+    /// enchant glows, Thunderfury's lightning, a Warglaive's fire. None of that is in the item's own
+    /// bytes, so without this an item can be decoded perfectly and still render dead. Resolve them
+    /// with <see cref="M2Fx.ItemVisualEffects.Resolve"/>; their emitters are folded into this GLB's
+    /// manifest at their mount points and their sheets embedded alongside.</param>
     public static bool SaveGlb(M2Model m2, Dictionary<int, byte[]> textures, string outputPath,
-        bool doubleSided = false)
+        bool doubleSided = false,
+        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null)
     {
         if (!m2.IsValid) return false;
 
@@ -143,9 +149,15 @@ public static class GlbWriter
             // (mat_5_blend2_a19) is human-readable. Resolution at 1%
             // is well below perceptual threshold for the cases we care
             // about (faded lightning quads at 19%, etc.).
-            var matCache = new Dictionary<(int texIdx, int blendMode, int alphaBucket), MaterialBuilder>();
+            //
+            // Why the tint is in the key: the M2Color record's RGB rest sample is baked into
+            // baseColorFactor below, and two batches can agree on texture/blend/alpha while pointing
+            // at different colour records (a weapon whose blade glows orange and whose rune glows
+            // blue off one texture). Merging those would paint both the same.
+            var matCache = new Dictionary<(int texIdx, int blendMode, int alphaBucket, int tintBucket), MaterialBuilder>();
 
-            MaterialBuilder GetMaterial(int texIdx, int blendMode, bool wantDoubleSide, float alpha = 1.0f)
+            MaterialBuilder GetMaterial(int texIdx, int blendMode, bool wantDoubleSide, float alpha = 1.0f,
+                Vector3? tint = null)
             {
                 // Clamp + bucket the alpha. 0 stays 0 (we'd skip the submesh
                 // in some future world but right now we render it anyway —
@@ -153,8 +165,14 @@ public static class GlbWriter
                 if (alpha < 0f) alpha = 0f;
                 if (alpha > 1f) alpha = 1f;
                 int alphaBucket = (int)Math.Round(alpha * 100f);
+                var rgb = tint ?? Vector3.One;
+                if (!float.IsFinite(rgb.X) || !float.IsFinite(rgb.Y) || !float.IsFinite(rgb.Z)) rgb = Vector3.One;
+                rgb = Vector3.Clamp(rgb, Vector3.Zero, Vector3.One);
+                int tintBucket = ((int)MathF.Round(rgb.X * 255f) << 16)
+                               | ((int)MathF.Round(rgb.Y * 255f) << 8)
+                               | (int)MathF.Round(rgb.Z * 255f);
 
-                var key = (texIdx, blendMode, alphaBucket);
+                var key = (texIdx, blendMode, alphaBucket, tintBucket);
                 if (matCache.TryGetValue(key, out var existing)) return existing;
 
                 // Three-tier resolution (matches pre-Session-M behavior):
@@ -230,13 +248,20 @@ public static class GlbWriter
                 //   baseColorFactor[3] is the canonical place to put an
                 //   overall material alpha multiplier; three.js reads it
                 //   into Material.color.a automatically.
+                //
+                // The RGB half is the M2Color record's rest tint, which used to be dropped on the
+                // floor — GlbWriter never read ReachableRestColors at all. That is why an authored
+                // coloured glow (a fel-green rune, an orange blade) arrived in the previewer white:
+                // the geometry and the additive blend were right and the colour the artist put on
+                // the pass was simply not exported. Models with no colour record pass Vector3.One
+                // and are unchanged.
                 var mat = new MaterialBuilder(name)
                     .WithUnlitShader()
                     .WithBaseColor(img)
                     .WithChannelParam(
                         KnownChannel.BaseColor,
                         KnownProperty.RGBA,
-                        new Vector4(1f, 1f, 1f, alpha));
+                        new Vector4(rgb, alpha));
 
                 // M2 blend modes (vanilla):
                 //   0 = opaque         (default, no alpha)
@@ -309,6 +334,11 @@ public static class GlbWriter
             // would discard legitimately-faded effects that the M2 author
             // wanted visible-but-subtle in the default pose.
             var submeshVis = BuildSubmeshVisibilityMap(m2);
+            var submeshTint = BuildSubmeshTintMap(m2);
+
+            // Submesh index → the glTF mesh name it was written under. The animation manifest keys
+            // on these, so it has to be recorded as the meshes are built rather than reconstructed.
+            var meshNameForSubmesh = new Dictionary<int, string>();
 
             if (m2.Submeshes.Count > 1)
             {
@@ -337,9 +367,12 @@ public static class GlbWriter
 
                     int texIdx = submeshTexture.ContainsKey(subIdx) ? submeshTexture[subIdx] : subIdx;
                     int blendMode = submeshBlend.ContainsKey(subIdx) ? submeshBlend[subIdx] : 0;
-                    var mat = GetMaterial(texIdx, blendMode, doubleSided, vis);
+                    var tint = submeshTint.TryGetValue(subIdx, out var t) ? t : (Vector3?)null;
+                    var mat = GetMaterial(texIdx, blendMode, doubleSided, vis, tint);
 
-                    var meshBuilder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>($"Geoset{subIdx}");
+                    string meshName = $"Geoset{subIdx}";
+                    meshNameForSubmesh[subIdx] = meshName;
+                    var meshBuilder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(meshName);
                     var prim = meshBuilder.UsePrimitive(mat);
 
                     for (int i = submesh.IndexStart; i + 2 < submesh.IndexStart + submesh.IndexCount; i += 3)
@@ -388,9 +421,11 @@ public static class GlbWriter
                 int singleTexIdx = submeshTextureSingle.ContainsKey(0)
                     ? submeshTextureSingle[0]
                     : (pngByTexIdx.Count > 0 ? pngByTexIdx.Keys.First() : 0);
+                var singleTint = submeshTint.TryGetValue(0, out var st) ? st : (Vector3?)null;
                 var mat = pngByTexIdx.Count > 0
-                    ? GetMaterial(singleTexIdx, singleBlend, doubleSided, singleVis)
+                    ? GetMaterial(singleTexIdx, singleBlend, doubleSided, singleVis, singleTint)
                     : fallbackMat;
+                meshNameForSubmesh[0] = "mesh";
                 var meshBuilder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>("mesh");
                 var prim = meshBuilder.UsePrimitive(mat);
 
@@ -420,6 +455,48 @@ public static class GlbWriter
 
             // ── Save ──
             var model = scene.ToGltf2();
+
+            // ── Animation manifest (glTF extras) ──
+            // glTF cannot animate a material, so the colour / alpha / UV-scroll tracks ride out as a
+            // JSON blob on the root and character-viewer/m2fx.js replays them per frame. Best-effort
+            // and additive: a model with nothing animated writes no extras and the GLB is what it
+            // always was. See Services/M2Fx/M2FxManifest.cs.
+            try
+            {
+                // Particle-emitter sheets have to reach the browser somehow, and they are usually NOT
+                // bound to any batch, so the material loop above never emitted them. They go in as
+                // ordinary glTF images that no material references — verified to survive SharpGLTF's
+                // save and reload with their names intact — which puts them in the GLB's binary chunk
+                // where the client's own loader can resolve them, instead of a base64 blob in the JSON
+                // or a second request against an endpoint that does not exist.
+                var emitterTextureIndex = EmbedEmitterTextures(model, m2, pngByTexIdx);
+
+                var fx = M2Fx.M2FxReader.Build(m2.SourceBytes, m2,
+                    subIdx => meshNameForSubmesh.TryGetValue(subIdx, out var n) ? n : null,
+                    slot => emitterTextureIndex.TryGetValue(slot, out int gltfIndex) ? gltfIndex : null);
+
+                var mounted = EmbedVisualEffects(model, visualEffects);
+                if (mounted.Count > 0)
+                    fx = fx with { Emitters = fx.Emitters.Concat(mounted).ToList() };
+
+                // WotLK (v264) fallback. M2WotlkReader parses fine but leaves SourceBytes null on
+                // purpose (its raw emitter/track reader is v256-only), so M2FxReader.Build above found
+                // no emitters and the preview shipped with an empty suiFx — which is why WotLK armour
+                // (Worldbreaker's shoulder fire) rendered dead while the game showed it. Route the
+                // emitters the WotLK reader DID decode into the manifest, resolving each sheet by name
+                // against the already-embedded textures. Gated on SourceBytes==null so vanilla/TBC,
+                // which use the higher-fidelity binary path, are untouched.
+                if (fx.Emitters.Count == 0 && m2.SourceBytes is null && m2.ParticleEmitters.Count > 0)
+                {
+                    var wotlk = M2Fx.M2FxReader.BuildEmittersFromModel(m2,
+                        name => EmbedNamedEmitterTexture(model, m2, pngByTexIdx, name));
+                    if (wotlk.Count > 0) fx = fx with { Emitters = fx.Emitters.Concat(wotlk).ToList() };
+                }
+
+                if (fx.Any) model.Extras = fx.ToExtras();
+            }
+            catch { /* a manifest is an enhancement; never fail a GLB over one */ }
+
             var dir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             model.SaveGLB(outputPath);
@@ -429,6 +506,179 @@ public static class GlbWriter
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// Embed each emitter's texture sheet as a glTF image, returning M2 texture slot → glTF texture
+    /// index for the manifest to reference.
+    ///
+    /// Emitter sheets are already in <paramref name="pngByTexIdx"/> for free: every caller populates
+    /// the texture dictionary by walking the M2's whole texture table and pulling each type-0
+    /// filename out of the MPQ, and an emitter's sheet is exactly such an entry. It simply never got
+    /// used, because nothing binds it to a batch and the material loop only builds materials for
+    /// batches.
+    ///
+    /// A slot with no decoded PNG is left out of the map, which makes M2FxReader drop that emitter.
+    /// That is deliberate: an untextured additive quad is a white blob, and a white blob on a weapon
+    /// is worse than no effect at all.
+    /// </summary>
+    private static Dictionary<int, int> EmbedEmitterTextures(
+        SharpGLTF.Schema2.ModelRoot model, M2Model m2, IReadOnlyDictionary<int, byte[]> pngByTexIdx)
+    {
+        var map = new Dictionary<int, int>();
+
+        foreach (int slot in M2Fx.M2FxReader.EmitterTextureSlots(m2.SourceBytes))
+        {
+            if (map.ContainsKey(slot)) continue;
+            if (!pngByTexIdx.TryGetValue(slot, out var png) || png is not { Length: > 0 }) continue;
+
+            // An emitter's sheet is frequently the same image a batch already renders with — a
+            // flaming sword's blade texture IS its ember sheet — and the material loop has already
+            // embedded that one. Re-adding it would put a second copy of the same PNG in the binary
+            // chunk, which on a 128x128 sheet is tens of kilobytes per model for nothing. Match on
+            // content rather than on slot, because SceneBuilder does not expose which glTF texture
+            // came from which M2 slot.
+            var existing = model.LogicalTextures.FirstOrDefault(t => SameImage(t.PrimaryImage, png));
+            if (existing is not null) { map[slot] = existing.LogicalIndex; continue; }
+
+            var image = model.CreateImage();
+            image.Content = new SharpGLTF.Memory.MemoryImage(png);
+            image.Name = $"EmitterSheet_{slot}";
+
+            var texture = model.UseTexture(image);
+            texture.Name = image.Name;
+            map[slot] = texture.LogicalIndex;
+        }
+
+        return map;
+    }
+
+    /// <summary>
+    /// Embed a WotLK emitter's sheet by FILENAME and return its glTF texture index. The v264 lane
+    /// (<see cref="M2Handlers.M2WotlkReader"/>) exposes each emitter's sheet as a path on
+    /// <c>M2ParticleEmitterInfo.TextureName</c> rather than as a slot, so match the name against the M2
+    /// texture table to find the PNG the caller already decoded, then embed it exactly as
+    /// <see cref="EmbedEmitterTextures"/> does (deduped by content). Null when the sheet is not among the
+    /// decoded textures, which makes <see cref="M2Fx.M2FxReader.BuildEmittersFromModel"/> drop that
+    /// emitter — same rule as the slot path, since an untextured additive quad is a white blob.
+    /// </summary>
+    private static int? EmbedNamedEmitterTexture(SharpGLTF.Schema2.ModelRoot model, M2Model m2,
+        IReadOnlyDictionary<int, byte[]> pngByTexIdx, string? textureName)
+    {
+        if (string.IsNullOrEmpty(textureName)) return null;
+        string want = textureName.Replace('/', '\\');
+
+        for (int i = 0; i < m2.Textures.Count; i++)
+        {
+            if (!string.Equals(m2.Textures[i].Filename?.Replace('/', '\\'), want, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!pngByTexIdx.TryGetValue(i, out var png) || png is not { Length: > 0 }) return null;
+
+            var existing = model.LogicalTextures.FirstOrDefault(t => SameImage(t.PrimaryImage, png));
+            if (existing is not null) return existing.LogicalIndex;
+
+            var image = model.CreateImage();
+            image.Content = new SharpGLTF.Memory.MemoryImage(png);
+            image.Name = $"WotlkEmitterSheet_{i}";
+            var texture = model.UseTexture(image);
+            texture.Name = image.Name;
+            return texture.LogicalIndex;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Embed each mounted effect model's sheets and decode its emitters onto the host.
+    ///
+    /// The effect model's GEOMETRY is deliberately not merged. Vanilla enchant effects are emitters
+    /// hung off an essentially empty model — RedFlame_Low is 2.7 KB — so the emitters are the whole
+    /// visual, and pulling their geometry in would mean reconciling a second material/skin set for no
+    /// gain. Ribbon emitters are the exception and are not handled anywhere yet.
+    /// </summary>
+    internal static List<M2Fx.M2FxEmitter> EmbedVisualEffects(
+        SharpGLTF.Schema2.ModelRoot model, IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? effects)
+    {
+        var result = new List<M2Fx.M2FxEmitter>();
+        if (effects is null || effects.Count == 0) return result;
+
+        foreach (var effect in effects)
+        {
+            // Decode the effect's own textures, then embed the ones its emitters actually sample.
+            var pngBySlot = new Dictionary<int, byte[]>();
+            foreach (var (slot, blp) in effect.Textures)
+            {
+                var png = ConvertBlpToPngBytes(blp);
+                if (png is { Length: > 0 }) pngBySlot[slot] = png;
+            }
+
+            var indexBySlot = new Dictionary<int, int>();
+            foreach (int slot in M2Fx.M2FxReader.EmitterTextureSlots(effect.M2))
+            {
+                if (indexBySlot.ContainsKey(slot)) continue;
+                if (!pngBySlot.TryGetValue(slot, out var png)) continue;
+
+                var existing = model.LogicalTextures.FirstOrDefault(t => SameImage(t.PrimaryImage, png));
+                if (existing is not null) { indexBySlot[slot] = existing.LogicalIndex; continue; }
+
+                var image = model.CreateImage();
+                image.Content = new SharpGLTF.Memory.MemoryImage(png);
+                image.Name = $"VisualSheet_{Path.GetFileNameWithoutExtension(effect.ModelPath)}_{slot}";
+                var texture = model.UseTexture(image);
+                texture.Name = image.Name;
+                indexBySlot[slot] = texture.LogicalIndex;
+            }
+
+            result.AddRange(M2Fx.M2FxReader.ReadMountedEmitters(
+                effect.M2,
+                slot => indexBySlot.TryGetValue(slot, out int i) ? i : null,
+                effect.MountMesh));
+        }
+
+        return result;
+    }
+
+    /// <summary>Byte-identical image content? Encoding is deterministic here (both sides come out of
+    /// the same ConvertBlpToPngBytes call for the same slot), so equality is exact rather than
+    /// perceptual.</summary>
+    private static bool SameImage(SharpGLTF.Schema2.Image? image, byte[] png)
+    {
+        if (image is null) return false;
+        var content = image.Content.Content;
+        return content.Length == png.Length && content.Span.SequenceEqual(png);
+    }
+
+    /// <summary>
+    /// Build a mapping of submeshIndex → the M2Color record's rest RGB, via
+    ///   batch.SubmeshIndex → batch.ColorIndex → m2.ReachableRestColors[idx].Rgb.
+    ///
+    /// This is the tint the M2 author put on the material pass, and it was previously discarded:
+    /// nothing in this file ever read ReachableRestColors, so a pass authored as a coloured glow
+    /// exported white and the previewer showed white. Only the ~1% of batches that reference a
+    /// colour record are affected; everything else stays at (1,1,1) and renders identically.
+    ///
+    /// Values outside 0–1 are dropped rather than clamped here — an out-of-range tint means the
+    /// chain resolved to something that is not a colour, and a wrong tint is worse than none.
+    /// </summary>
+    private static Dictionary<int, Vector3> BuildSubmeshTintMap(M2Model m2)
+    {
+        var map = new Dictionary<int, Vector3>();
+
+        foreach (var batch in m2.Batches)
+        {
+            int subIdx = batch.SubmeshIndex;
+            if (map.ContainsKey(subIdx)) continue;
+            if (batch.ColorIndex < 0) continue;
+            if (!m2.ReachableRestColors.TryGetValue(batch.ColorIndex, out var rest)) continue;
+
+            var rgb = rest.Rgb;
+            if (!float.IsFinite(rgb.X) || !float.IsFinite(rgb.Y) || !float.IsFinite(rgb.Z)) continue;
+            if (rgb.X < 0f || rgb.Y < 0f || rgb.Z < 0f) continue;
+            if (rgb.X > 1f || rgb.Y > 1f || rgb.Z > 1f) continue;
+
+            map[subIdx] = rgb;
+        }
+
+        return map;
     }
 
     /// <summary>

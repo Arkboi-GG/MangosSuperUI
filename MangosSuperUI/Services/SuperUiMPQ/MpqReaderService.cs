@@ -119,8 +119,9 @@ public class MpqReaderService : IDisposable
     /// <summary>Custom patches SuperUI rebuilds at runtime ⇒ read fresh, never
     /// hold. Adjust this set if you add more writable patches.</summary>
     private static bool IsLivePatch(string name) =>
-        name.StartsWith("patch-4", StringComparison.OrdinalIgnoreCase) ||
-        name.StartsWith("patch-5", StringComparison.OrdinalIgnoreCase);
+        name.StartsWith("patch-4", StringComparison.OrdinalIgnoreCase) ||   // Retexture Engine
+        name.StartsWith("patch-5", StringComparison.OrdinalIgnoreCase) ||   // Weapon Forge
+        name.StartsWith("patch-6", StringComparison.OrdinalIgnoreCase);     // Armor Forge
 
     // ═══════════════════════════════════════════════════════════════════
     // INITIALIZATION (lazy, thread-safe)

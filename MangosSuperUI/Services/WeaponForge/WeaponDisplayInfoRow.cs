@@ -92,7 +92,7 @@ public static class WeaponDisplayInfoRow
             d.Error("dbc.texturename1.missing", "TextureName1 is empty.");
         if (row[F_Flags] != 0) d.Error("dbc.flags.nonzero", $"Field 9 (flags) must be 0 (got {row[F_Flags]}).");
         if (row[F_SpellVisualId] != 0) d.Info("dbc.spellvisual", $"Field 10 (SpellVisualID) = {row[F_SpellVisualId]} (ranged projectile visual inherited from the family donor).");
-        if (row[F_ItemVisual] != 0) d.Error("dbc.itemvisual.nonzero", $"ItemVisual must be 0 for v1 (got {row[F_ItemVisual]}).");
+        if (row[F_ItemVisual] != 0) d.Info("dbc.itemvisual", $"ItemVisual = {row[F_ItemVisual]} (vanilla enchant-style glow chosen for this weapon).");
         for (int i = F_Texture0; i < F_Texture0 + 8; i++)
             if (row[i] != 0) d.Warn("dbc.bodytexture.present", $"Body-atlas texture field {i} is non-zero; weapons should leave these empty.");
     }

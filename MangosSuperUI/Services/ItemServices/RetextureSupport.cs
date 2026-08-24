@@ -188,7 +188,7 @@ public partial class RetextureSupport
         uint displayId, int seed, string theory,
         (float kd, float ku, float m, float pop) shape,
         (float budget, float leash) policy,
-        ValueSettings value, string outSubdir, CancellationToken ct)
+        ValueSettings value, string outSubdir, CancellationToken ct, float? baseHue = null)
     {
         var atlas = await _bodyAtlas.EnsureAtlasTexturesAsync(displayId);
         if (atlas == null || atlas.SlotUrls.Count == 0) return null;
@@ -205,7 +205,7 @@ public partial class RetextureSupport
             string outPng = Path.Combine(outDir, outName);
             var ok = await _palette.RecolorSeededAsync(
                 srcDisk, outPng, seed, 1.0f, 0.0f, false, ct,
-                theory, shape.kd, shape.ku, shape.m, shape.pop, policy.budget, policy.leash, value);
+                theory, shape.kd, shape.ku, shape.m, shape.pop, policy.budget, policy.leash, value, baseHue);
             if (ok == null) continue;
             recolored[slot] = $"/item_textures_cache/{outSubdir}/{outName}";
         }
@@ -223,7 +223,7 @@ public partial class RetextureSupport
         uint displayId, int seed, string theory,
         (float kd, float ku, float m, float pop) shape,
         (float budget, float leash) policy,
-        ValueSettings value, string outSubdir, CancellationToken ct)
+        ValueSettings value, string outSubdir, CancellationToken ct, float? baseHue = null)
     {
         var (previewPath, _) = await ResolvePrimarySourceAsync(displayId, ct);
         if (previewPath == null || !System.IO.File.Exists(previewPath)) return null;
@@ -234,7 +234,7 @@ public partial class RetextureSupport
 
         var ok = await _palette.RecolorSeededAsync(
             previewPath, outPng, seed, 1.0f, 0.0f, false, ct,
-            theory, shape.kd, shape.ku, shape.m, shape.pop, policy.budget, policy.leash, value);
+            theory, shape.kd, shape.ku, shape.m, shape.pop, policy.budget, policy.leash, value, baseHue);
         if (ok == null) return null;
 
         return _itemTextures.BuildPreviewGlbs(displayId, outPng);

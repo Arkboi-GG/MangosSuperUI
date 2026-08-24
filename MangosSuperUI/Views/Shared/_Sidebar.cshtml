@@ -19,7 +19,7 @@
         "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" or "professiontuning" => "content",
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
-        "weaponforge" => "gamedev",
+        "weaponforge" or "armorforge" => "gamedev",
         "bots" or "chatsettings" => "bots",
         "wiki" => "wiki",
         "downloads" or "settings" => "superui",
@@ -399,7 +399,13 @@
                 <li class="sidebar-nav-item" data-nav-key="weaponforge">
                     <a asp-controller="WeaponForge" asp-action="Index" class="@NavClass("WeaponForge")">
                         <i class="fa-solid fa-hammer"></i>
-                        Item Assets
+                        Weapon Forge
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="armorforge">
+                    <a asp-controller="ArmorForge" asp-action="Index" class="@NavClass("ArmorForge")">
+                        <i class="fa-solid fa-shield-halved"></i>
+                        Armor Forge
                     </a>
                 </li>
             </ul>

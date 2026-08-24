@@ -1,4 +1,4 @@
-@{
+﻿@{
     ViewData["Title"] = "Item Assets";
 }
 
@@ -303,7 +303,7 @@
     <div class="main-content">
 <div class="wf-wrap">
     <div class="wf-header">
-        <h1><i class="fa-solid fa-hammer"></i> Item Assets — Weapon Forge</h1>
+        <h1><i class="fa-solid fa-hammer"></i> Weapon Forge</h1>
         <div class="wf-header-sub">
             The import station: bring a <strong>finished GLB</strong> (UVs + texture authored elsewhere), decimate it
             to a game budget, and forge it into the game. Forging inserts the item into the world database, reloads
@@ -316,6 +316,7 @@
             <span class="wf-pill" id="pillFixture">fixture …</span>
             <span class="wf-pill" id="pillDonor">donor …</span>
             <span class="wf-pill" id="pillContract">contract …</span>
+            <span class="wf-pill" id="pillDeploy" title="Is the patch-5.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
         </div>
     </div>
 
@@ -371,6 +372,16 @@
                             <label>Saturation</label>
                             <input type="range" id="impSat" min="-100" max="100" step="5" value="0">
                             <span class="val" id="impSatVal">0</span>
+                        </div>
+                    </div>
+                    <div class="wf-group" title="Hang one of vanilla's own enchant-style glows (ItemVisual) on the finished item, permanently — the same mechanism that makes Ashbringer glow. There is nothing to suggest from on a GLB, so this is your pick: it defaults to none.">
+                        <div class="wf-group-title"><span>Glow (ItemVisual)</span></div>
+                        <div class="wf-ctl">
+                            <label>Enchant glow</label>
+                            <select id="impVisual" style="flex:1;min-width:160px;"><option value="0" selected>None</option></select>
+                        </div>
+                        <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">
+                            Anchored evenly along the imported model, hilt to tip. Glows render in-game only — the Web preview does not show them.
                         </div>
                     </div>
                     </div>
@@ -452,7 +463,7 @@
                         <input type="range" id="impTarget" min="100" max="4000" step="50" value="800">
                         <span class="val" id="impTargetVal">800 tris</span>
                     </div>
-                    <label class="wf-check" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand zone on two-handers (animation-placed, approximate)"><input type="checkbox" id="impShowGrip" checked> grip markers</label>
+                    <label class="wf-check" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand on the handle behind the main hand on two-handers (animation-placed, approximate)"><input type="checkbox" id="impShowGrip" checked> grip markers</label>
                     <button class="wf-btn secondary" data-action="uploadGlb">Preview mesh</button>
                     <button class="wf-btn" data-action="forgeGlb"><i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
@@ -492,6 +503,20 @@
                     <button class="wf-btn secondary" data-action="tbcPreview" id="tbcPreviewBtn" disabled>Preview</button>
                     <button class="wf-btn" data-action="tbcForge" id="tbcForgeBtn" disabled><i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
+                <div class="wf-groups" style="margin-top:10px;">
+                    <div class="wf-group" title="Auto carries the source weapon's OWN glow across: TBC hangs most permanent glows on the display row (ItemDisplayInfo.ItemVisual) exactly as vanilla does, and 1.12 ships most of the same ids, so they copy over unchanged. Models that glow through particle emitters instead get the nearest vanilla match. Anchors are moved onto the TBC blade.">
+                        <div class="wf-group-title"><span>Glow (ItemVisual)</span></div>
+                        <div class="wf-ctl">
+                            <label>Enchant glow</label>
+                            <select id="tbcVisual" style="flex:1;min-width:160px;"><option value="-1">Auto (source glow, else suggest from effects)</option><option value="0">None</option></select>
+                        </div>
+                        <div class="wf-checks" style="margin-top:6px;">
+                            <label title="A vanilla glow visual fills all five anchor slots, so where anchors 0..4 sit is the whole look. Many source models bunch all five on the blade — spreading them evenly hilt-to-tip gives the vanilla enchant look instead of one lump."><input type="checkbox" id="tbcGlowSpread"> spread glow along weapon</label>
+                        </div>
+                        <div id="tbcVisualNote" style="font-size:11px;color:var(--text-muted);margin-top:4px;">Preview a weapon to see its source glow and the chosen one. Glows render in-game only.</div>
+                        <div id="tbcGlowCoverage" style="font-size:11px;color:var(--text-muted);margin-top:6px;padding-top:6px;border-top:1px dashed var(--border-light);">Checking TBC glow coverage…</div>
+                    </div>
+                </div>
                 <div class="wf-note">
                     The forged item gets the chosen family's vanilla stats/sounds while a named TBC item's authentic
                     equip slot, sheath, and swing delay are preserved. Enchant-glow attachment points come from the
@@ -500,6 +525,60 @@
                     data are preserved. Compatible global UV animation is transplanted into vanilla; the Web preview
                     shows its rest frame. Unsupported animated material tracks and TBC ribbon/particle emitters are
                     reported instead of being silently discarded.
+                </div>
+            </div>
+
+            <div class="wf-card">
+                <h3><span class="phase">WotLK</span> Import from WotLK client</h3>
+                <p>Browse the weapons of a <strong>WotLK (3.3.5a) client</strong> by item name and forge them into vanilla
+                   items — the same fidelity route as the TBC import. 3.3.5a models are v264 with external <code>.skin</code>
+                   profiles; the forge reads both, re-emits the geometry as a native vanilla M2 on the selected family's
+                   donor scaffold and packages compatible BLP2 textures byte-for-byte. Item names, quality, ilvl, slot,
+                   sheath and swing delay come from the shipped open-source 3.3.5a item catalog (no WotLK database needed).
+                   Set the <strong>WotLK Client Data Path</strong> on the <a href="/Settings">Settings page</a>.</p>
+                <div id="wotlkState" style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Checking WotLK mount…</div>
+                <div class="wf-row">
+                    <button class="wf-btn secondary" data-action="wotlkBrowse" id="wotlkBrowseBtn" disabled>
+                        <i class="fa-solid fa-magnifying-glass"></i> Browse WotLK weapons…</button>
+                    <div class="wf-field" style="flex:1;min-width:200px;"><label>Selected model</label>
+                        <input type="text" id="wotlkSelected" readonly placeholder="nothing selected" style="width:100%;"></div>
+                    <div class="wf-field" title="Chooses the vanilla weapon family and donor scaffold; a named WotLK item's own One-Hand/Main Hand/Off Hand slot is preserved separately">
+                        <label>Weapon family</label>
+                        <select id="wotlkType"><option value="sword1h" selected>1H Sword</option></select>
+                    </div>
+                    <div class="wf-field"><label>Name (optional)</label>
+                        <input type="text" id="wotlkName" placeholder="auto from model"></div>
+                </div>
+                <div class="wf-row" style="margin-top:10px;">
+                    <div class="wf-field" title="Fidelity mode preserves the complete source topology and render-pass structure">
+                        <label style="min-width:96px;">Geometry</label>
+                        <input type="hidden" id="wotlkTarget" value="0">
+                        <span class="val" id="wotlkTargetVal">exact source</span>
+                    </div>
+                    <button class="wf-btn secondary" data-action="wotlkPreview" id="wotlkPreviewBtn" disabled>Preview</button>
+                    <button class="wf-btn" data-action="wotlkForge" id="wotlkForgeBtn" disabled><i class="fa-solid fa-sliders"></i> Configure item…</button>
+                </div>
+                <div class="wf-groups" style="margin-top:10px;">
+                    <div class="wf-group" title="Auto carries the source weapon's OWN glow across: WotLK hangs most permanent glows on the display row (ItemDisplayInfo.ItemVisual) exactly as vanilla does, and 1.12 ships most of the same ids, so they copy over unchanged. Models that glow through particle emitters instead get the nearest vanilla match. Anchors are moved onto the WotLK blade.">
+                        <div class="wf-group-title"><span>Glow (ItemVisual)</span></div>
+                        <div class="wf-ctl">
+                            <label>Enchant glow</label>
+                            <select id="wotlkVisual" style="flex:1;min-width:160px;"><option value="-1">Auto (source glow, else suggest from effects)</option><option value="0">None</option></select>
+                        </div>
+                        <div class="wf-checks" style="margin-top:6px;">
+                            <label title="A vanilla glow visual fills all five anchor slots, so where anchors 0..4 sit is the whole look. Many source models bunch all five on the blade — spreading them evenly hilt-to-tip gives the vanilla enchant look instead of one lump."><input type="checkbox" id="wotlkGlowSpread"> spread glow along weapon</label>
+                        </div>
+                        <div id="wotlkVisualNote" style="font-size:11px;color:var(--text-muted);margin-top:4px;">Preview a weapon to see its source glow and the chosen one. Glows render in-game only.</div>
+                        <div id="wotlkGlowCoverage" style="font-size:11px;color:var(--text-muted);margin-top:6px;padding-top:6px;border-top:1px dashed var(--border-light);">Checking WotLK glow coverage…</div>
+                    </div>
+                </div>
+                <div class="wf-note">
+                    Same contract as the TBC import: the forged item gets the chosen family's vanilla stats/sounds while the
+                    WotLK item's authentic equip slot, sheath and swing delay are preserved — <strong>DPS is never carried</strong>,
+                    damage is yours to set in the item configuration. Source geometry, texture units, wrap flags, blend modes,
+                    overlay order (built-in glow passes included), UV0/UV1, rest-pose color/transparency/UV transforms and BLP2
+                    mip data are preserved; compatible global UV animation is transplanted. Unsupported animated material
+                    tracks and ribbon/particle emitters are reported, not silently discarded.
                 </div>
             </div>
 
@@ -547,6 +626,26 @@
             <span>
                 <button class="wf-btn secondary" id="tbcPrev" style="padding:4px 10px;font-size:12px;">‹ Prev</button>
                 <button class="wf-btn secondary" id="tbcNext" style="padding:4px 10px;font-size:12px;">Next ›</button>
+            </span>
+        </div>
+    </div>
+</div>
+
+<div class="wf-modal-backdrop" id="wotlkModal">
+    <div class="wf-modal">
+        <h3>Browse WotLK weapons
+            <button class="wf-close" id="wotlkModalClose" title="Close">✕</button></h3>
+        <div class="wf-row">
+            <div class="wf-field" style="flex:1;">
+                <input type="text" id="wotlkSearch" placeholder="Search by item name, model, or item ID (e.g. Shadowmourne, Val'anyr, sword_2h, Betrayer)…" style="width:100%;">
+            </div>
+        </div>
+        <div class="wf-modal-list" id="wotlkList"><div style="padding:14px;color:var(--text-muted);font-size:12px;">Loading…</div></div>
+        <div class="wf-modal-foot">
+            <span id="wotlkPageInfo">—</span>
+            <span>
+                <button class="wf-btn secondary" id="wotlkPrev" style="padding:4px 10px;font-size:12px;">‹ Prev</button>
+                <button class="wf-btn secondary" id="wotlkNext" style="padding:4px 10px;font-size:12px;">Next ›</button>
             </span>
         </div>
     </div>
@@ -810,12 +909,19 @@
         import * as THREE from 'three';
         import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-        import { applyBlendSuffix } from '/js/character-viewer/blend-suffix.js';
+        import { applyBlendSuffix, applyEnvMapping, applyMultiTexture } from '/js/character-viewer/blend-suffix.js';
+        import { installM2Fx } from '/js/character-viewer/m2fx.js';
 
         // ---------- 3D viewer ----------
         const host = document.getElementById('wfViewer');
         const hint = document.getElementById('wfHint');
         let renderer, scene, camera, controls, current = null;
+        // Material animation for the previewed weapon: colour / opacity / UV-scroll tracks the
+        // server ships as a `suiFx` manifest inside the GLB. A forged weapon that got a glow pulse
+        // written into its M2 renders frozen at the pulse's dimmest key without this.
+        let fx = null;
+        const fxClock = new THREE.Clock();
+        let fxElapsedMs = 0;
 
         function initViewer() {
             const w = host.clientWidth, h = host.clientHeight;
@@ -845,7 +951,18 @@
             const w = host.clientWidth, h = host.clientHeight;
             renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
         }
-        function animate() { requestAnimationFrame(animate); controls && controls.update(); renderer && renderer.render(scene, camera); }
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = fxClock.getDelta();
+            if (fx) {
+                const dtMs = dt * 1000;
+                fxElapsedMs += dtMs;
+                try { fx.update(fxElapsedMs, dtMs, camera); }
+                catch (err) { console.warn('[weaponforge] m2fx failed; dropping it', err); fx = null; }
+            }
+            controls && controls.update();
+            renderer && renderer.render(scene, camera);
+        }
 
         const loader = new GLTFLoader();
         function loadGlb(url) {
@@ -853,12 +970,18 @@
             hint.style.display = 'none';
             loader.load(url + '?t=' + Date.now(), (gltf) => {
                 if (current) { scene.remove(current); }
+                if (fx) { try { fx.dispose(); } catch { } fx = null; }
                 const model = gltf.scene;
                 // Keep the authored glTF material (including its sidedness and alpha mode), then
                 // restore the WoW-only blend/static-alpha state encoded in its material name.
                 // Replacing materials here used to turn every pass into an alpha-keyed,
                 // double-sided opaque surface, hiding culling errors and destroying glow layers.
                 applyBlendSuffix(model);
+                applyEnvMapping(model);   // WoW env-mapped passes → matcap (flowing blade reflections)
+                try { fx = installM2Fx(gltf); }
+                catch (err) { console.warn('[weaponforge] m2fx install failed', err); fx = null; }
+                applyMultiTexture(model); // multi-texture MODULATE passes → the undulating energy wave
+                                          // (after m2fx: it owns the material m2fx animates the scroll on)
                 current = model; scene.add(model);
                 frameObject(model);
                 drawGripMarkers();
@@ -1038,12 +1161,15 @@
                 name = document.getElementById('glbName').value.trim() || prettyFileName(file.name);
                 inventoryType = +(weaponTypeMeta.get(familyKey)?.inventoryType || (familyKey.includes('2h') || familyKey === 'staff' || familyKey === 'polearm' ? 17 : 13));
             } else {
-                if (!tbcSel) { setResult({ title: 'No TBC weapon selected', error: 'Browse and pick one first.' }); return; }
-                familyKey = document.getElementById('tbcType').value || 'sword1h';
-                familyLabel = document.getElementById('tbcType').selectedOptions[0]?.textContent || '1H Sword';
-                source = tbcSel.entry ? `${tbcSel.name} (TBC item ${tbcSel.entry})` : `${tbcSel.model} (display row ${tbcSel.displayRow})`;
-                name = document.getElementById('tbcName').value.trim() || tbcSel.name || prettyFileName(tbcSel.model);
-                inventoryType = tbcSel.inventoryType || +(weaponTypeMeta.get(familyKey)?.inventoryType || 13);
+                // 'tbc' / 'wotlk' — the later-client import lanes share one modal flow.
+                const lane = LEGACY[mode];
+                const sel = lane && lane.sel;
+                if (!sel) { setResult({ title: `No ${lane ? lane.label : 'import'} weapon selected`, error: 'Browse and pick one first.' }); return; }
+                familyKey = lane.el('Type').value || 'sword1h';
+                familyLabel = lane.el('Type').selectedOptions[0]?.textContent || '1H Sword';
+                source = sel.entry ? `${sel.name} (${lane.label} item ${sel.entry})` : `${sel.model} (display row ${sel.displayRow})`;
+                name = lane.el('Name').value.trim() || sel.name || prettyFileName(sel.model);
+                inventoryType = sel.inventoryType || +(weaponTypeMeta.get(familyKey)?.inventoryType || 13);
             }
 
             itemBuildState = {
@@ -1051,7 +1177,7 @@
                 lastFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null,
             };
             resetItemBuildForm({ source, familyKey, familyLabel, name, quality, itemLevel, inventoryType });
-            document.getElementById('ibSourceKind').textContent = mode === 'glb' ? 'GLB import' : 'TBC import';
+            document.getElementById('ibSourceKind').textContent = mode === 'glb' ? 'GLB import' : `${LEGACY[mode].label} import`;
             document.getElementById('ibHeadSource').textContent = source;
             document.getElementById('ibNavSource').textContent = source;
             document.getElementById('ibNavFamily').textContent = familyLabel;
@@ -1459,7 +1585,7 @@
             const raceCount = config.allowableRace === -1 ? 'All' : document.querySelectorAll('[data-mask="race"]:checked').length;
             return `<div class="wf-review-block"><h5>Identity</h5>
                 <div class="wf-review-line"><span>Name</span><b style="color:${QUALITY_COLORS[config.quality] || 'inherit'}">${esc(config.name || 'Name required')}</b></div>
-                <div class="wf-review-line"><span>Source</span><b>${esc(itemBuildState.mode === 'glb' ? 'GLB import' : 'TBC import')}</b></div>
+                <div class="wf-review-line"><span>Source</span><b>${esc(itemBuildState.mode === 'glb' ? 'GLB import' : `${LEGACY[itemBuildState.mode].label} import`)}</b></div>
                 <div class="wf-review-line"><span>Family</span><b>${esc(itemBuildState.familyLabel)}</b></div>
                 <div class="wf-review-line"><span>Quality / slot</span><b>${esc(ITEM_QUALITY_NAMES[config.quality] || '?')} · ${esc(ITEM_SLOT_NAMES[config.inventoryType] || '?')}</b></div></div>
                 <div class="wf-review-block"><h5>Power</h5>
@@ -1521,12 +1647,14 @@
                     importParams(fd);
                     fd.set('weaponType', familyKey);
                 } else {
-                    if (!tbcSel) throw new Error('The selected TBC weapon is no longer available.');
-                    fd.append('entry', tbcSel.entry);
-                    fd.append('model', tbcSel.model);
-                    fd.append('displayRow', tbcSel.displayRow);
+                    const lane = LEGACY[mode];
+                    if (!lane || !lane.sel) throw new Error(`The selected ${lane ? lane.label : 'import'} weapon is no longer available.`);
+                    fd.append('entry', lane.sel.entry);
+                    fd.append('model', lane.sel.model);
+                    fd.append('displayRow', lane.sel.displayRow);
                     fd.append('weaponType', familyKey);
-                    fd.append('targetTriangles', tbcTargetTris());
+                    fd.append('targetTriangles', lane.targetTris());
+                    laneGlowParams(lane, fd);
                 }
 
                 const spellErrors = await validateItemSpells(config);
@@ -1541,7 +1669,7 @@
                 status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Forging the final item…';
                 fd.append('name', config.name);
                 fd.append('itemConfig', JSON.stringify(config));
-                const url = mode === 'glb' ? '/WeaponForge/ForgeGlb' : '/WeaponForge/ForgeTbc';
+                const url = mode === 'glb' ? '/WeaponForge/ForgeGlb' : LEGACY[mode].urls.forge;
                 const response = await fetch(url, { method: 'POST', body: fd });
                 const d = await response.json().catch(() => null);
                 if (!response.ok || !d?.ok) {
@@ -1549,9 +1677,9 @@
                     return;
                 }
                 if (mode === 'glb') document.getElementById('glbName').value = config.name;
-                else document.getElementById('tbcName').value = config.name;
+                else LEGACY[mode].el('Name').value = config.name;
                 closeItemBuild(true);
-                forgeResult(d, mode === 'glb' ? 'GLB forged' : 'TBC weapon forged');
+                forgeResult(d, mode === 'glb' ? 'GLB forged' : `${LEGACY[mode].label} weapon forged`);
             } catch (e) {
                 showItemBuildErrors([String(e)]);
             } finally {
@@ -1630,6 +1758,9 @@
             fd.append('offsetSideCm', +document.getElementById('impSide').value || 0);
             fd.append('pitchDegrees', +document.getElementById('impPitch').value || 0);
             fd.append('yawDegrees', +document.getElementById('impYaw').value || 0);
+            // Enchant-style glow (ItemDisplayInfo field 22). A GLB has nothing to suggest from, so
+            // 0 = none is the default; the forge anchors whatever is picked along the imported mesh.
+            fd.append('itemVisual', +document.getElementById('impVisual').value || 0);
         }
         function schedulePreviewIfLive() {
             // After the first preview, orientation/budget changes re-preview automatically.
@@ -1722,57 +1853,12 @@
                 if (!f) return setResult({ title: 'No file', error: 'Choose a .glb first.' });
                 itemBuildOpen('glb');
             },
-            async tbcBrowse(btn) {
-                document.getElementById('tbcModal').classList.add('open');
-                document.getElementById('tbcSearch').focus();
-                await loadTbcPage(1);
-            },
-            async tbcPreview(btn) {
-                if (!tbcSel) return setResult({ title: 'No TBC weapon selected', error: 'Browse and pick one first.' });
-                const requestId = ++tbcPreviewSerial;
-                const selected = { ...tbcSel };
-                const weaponType = document.getElementById('tbcType').value || 'sword1h';
-                const targetTriangles = tbcTargetTris();
-                const configureButton = document.getElementById('tbcForgeBtn');
-                configureButton.disabled = true;
-                const q = new URLSearchParams({
-                    entry: selected.entry, model: selected.model, displayRow: selected.displayRow,
-                    weaponType,
-                    targetTriangles,
-                });
-                let d;
-                try {
-                    const response = await fetch('/WeaponForge/TbcPreviewWeapon?' + q);
-                    d = await response.json();
-                    if (!response.ok) throw new Error(d.error || 'TBC preview failed.');
-                } catch (error) {
-                    if (requestId !== tbcPreviewSerial) return;
-                    configureButton.disabled = true;
-                    setResult({ title: 'TBC preview failed', error: String(error) });
-                    return;
-                }
-                if (requestId !== tbcPreviewSerial) return;
-                lastGrip = d.grip || null;
-                configureButton.disabled = !d.ok || d.withinForgeBudget === false;
-                setResult({
-                    title: d.ok ? `TBC preview — ${d.itemName || selected.name}` : 'TBC preview failed',
-                    kv: d.ok ? {
-                        'Type': d.weaponTypeLabel || '1H Sword',
-                        'Equip slot': d.inventoryTypeLabel || (d.inventoryType != null ? `Inventory type ${d.inventoryType}` : '—'),
-                        'Model': d.model,
-                        'Triangles': (d.triangleCount ?? 0).toLocaleString() +
-                            (d.withinForgeBudget === false ? ' — OVER vanilla UInt16 limit' : ''),
-                        'Vertices': (d.vertexCount ?? 0).toLocaleString(),
-                        'Texture': d.hasTexture ? d.texture : 'MISSING — fidelity import stopped',
-                    } : undefined,
-                    diagnostics: d.diagnostics, note: d.grip && d.grip.note, error: d.error,
-                });
-                loadGlb(previewUrl(d));
-            },
-            async tbcForge(btn) {
-                if (!tbcSel) return setResult({ title: 'No TBC weapon selected', error: 'Browse and pick one first.' });
-                itemBuildOpen('tbc');
-            },
+            async tbcBrowse(btn) { await laneBrowse(LEGACY.tbc); },
+            async tbcPreview(btn) { await lanePreview(LEGACY.tbc); },
+            async tbcForge(btn) { laneForge(LEGACY.tbc); },
+            async wotlkBrowse(btn) { await laneBrowse(LEGACY.wotlk); },
+            async wotlkPreview(btn) { await lanePreview(LEGACY.wotlk); },
+            async wotlkForge(btn) { laneForge(LEGACY.wotlk); },
             async rebuildPatch(btn) {
                 const d = await (await fetch('/WeaponForge/RebuildPatch', { method: 'POST' })).json();
                 if (!d.ok) return setResult({ title: 'Rebuild failed', error: d.error });
@@ -1794,57 +1880,108 @@
             });
         });
 
-        // ---------- TBC import ----------
-        let tbcSel = null, tbcPage = 1, tbcSearchTimer = null, tbcPreviewSerial = 0, tbcPreviewTimer = null;
-        function invalidateTbcPreview() {
-            ++tbcPreviewSerial;
-            document.getElementById('tbcForgeBtn').disabled = true;
+        // ---------- Later-client import lanes: TBC + WotLK ----------
+        // Both lanes are the same UI and the same server contract; only element ids (`${key}Xxx`),
+        // endpoint urls and labels differ. The item-build modal receives the lane key as its mode.
+        function makeLane(key, label, urls) {
+            const lane = {
+                key, label, urls, sel: null, page: 1, searchTimer: null, previewSerial: 0, previewTimer: null,
+                el(suffix) { return document.getElementById(key + suffix); },
+                targetTris() { return +(lane.el('Target')?.value || 0); },
+                invalidatePreview() { ++lane.previewSerial; lane.el('ForgeBtn').disabled = true; },
+            };
+            return lane;
         }
-        function tbcTargetTris() { return +document.getElementById('tbcTarget').value || 0; }
-        const tbcTargetEl = document.getElementById('tbcTarget');
-        tbcTargetEl.addEventListener('input', () => {
-            document.getElementById('tbcTargetVal').textContent = tbcTargetTris() === 0 ? 'exact source' : tbcTargetTris() + ' tris';
-            if (tbcSel) {
-                invalidateTbcPreview();
-                clearTimeout(tbcPreviewTimer);
-                tbcPreviewTimer = setTimeout(() => actions.tbcPreview(null), 500);
-            }
-        });
-        document.getElementById('tbcType').addEventListener('change', () => {
-            if (!tbcSel) return;
-            invalidateTbcPreview();
-            actions.tbcPreview(null);
-        });
-
-        async function loadTbcStatus() {
-            const el = document.getElementById('tbcState');
+        // Glow controls of a lane → request fields (bind to itemVisual / glowSpread).
+        function laneGlowParams(lane, target) {
+            const add = (k, v) => target.append(k, v);
+            add('itemVisual', +lane.el('Visual').value);
+            add('glowSpread', lane.el('GlowSpread').checked);
+        }
+        function wireLaneGlow(lane) {
+            const schedule = () => { if (!lane.sel) return; lane.invalidatePreview(); clearTimeout(lane.previewTimer); lane.previewTimer = setTimeout(() => lanePreview(lane), 450); };
+            lane.el('Visual').addEventListener('change', schedule);
+            lane.el('GlowSpread').addEventListener('change', schedule);
+        }
+        async function loadItemVisuals() {
             try {
-                const s = await (await fetch('/WeaponForge/TbcStatus')).json();
+                const d = await (await fetch('/WeaponForge/ItemVisuals')).json();
+                if (!d.ok) return;
+                const selects = [...LEGACY_LANES.map(lane => lane.el('Visual')), document.getElementById('impVisual')];
+                for (const sel of selects) {
+                    if (!sel) continue;
+                    for (const v of d.visuals) {
+                        const o = document.createElement('option');
+                        o.value = v.id; o.textContent = `${v.label} (#${v.id})`;
+                        if (v.effects && v.effects.length) o.title = v.effects.join(' + ');
+                        sel.appendChild(o);
+                    }
+                }
+            } catch (e) { console.warn('ItemVisuals unavailable', e); }
+        }
+        const LEGACY = {
+            tbc: makeLane('tbc', 'TBC', {
+                status: '/WeaponForge/TbcStatus', weapons: '/WeaponForge/TbcWeapons',
+                preview: '/WeaponForge/TbcPreviewWeapon', forge: '/WeaponForge/ForgeTbc' }),
+            wotlk: makeLane('wotlk', 'WotLK', {
+                status: '/WeaponForge/WotlkStatus', weapons: '/WeaponForge/WotlkWeapons',
+                preview: '/WeaponForge/WotlkPreviewWeapon', forge: '/WeaponForge/ForgeWotlk' }),
+        };
+        const LEGACY_LANES = [LEGACY.tbc, LEGACY.wotlk];
+
+        function wireLane(lane) {
+            lane.el('Target').addEventListener('input', () => {
+                lane.el('TargetVal').textContent = lane.targetTris() === 0 ? 'exact source' : lane.targetTris() + ' tris';
+                if (lane.sel) {
+                    lane.invalidatePreview();
+                    clearTimeout(lane.previewTimer);
+                    lane.previewTimer = setTimeout(() => lanePreview(lane), 500);
+                }
+            });
+            lane.el('Type').addEventListener('change', () => {
+                if (!lane.sel) return;
+                lane.invalidatePreview();
+                lanePreview(lane);
+            });
+            lane.el('ModalClose').addEventListener('click', () => lane.el('Modal').classList.remove('open'));
+            lane.el('Modal').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('open'); });
+            lane.el('Prev').addEventListener('click', () => loadLanePage(lane, lane.page - 1));
+            lane.el('Next').addEventListener('click', () => loadLanePage(lane, lane.page + 1));
+            lane.el('Search').addEventListener('input', () => {
+                clearTimeout(lane.searchTimer);
+                lane.searchTimer = setTimeout(() => loadLanePage(lane, 1), 350);
+            });
+            wireLaneGlow(lane);
+        }
+
+        async function loadLaneStatus(lane) {
+            const el = lane.el('State');
+            try {
+                const s = await (await fetch(lane.urls.status)).json();
                 if (!s.configured) {
-                    el.innerHTML = 'No TBC Data path configured — set <b>TBC Client Data Path</b> on the Settings page.';
+                    el.innerHTML = `No ${lane.label} Data path configured — set <b>${lane.label} Client Data Path</b> on the Settings page.`;
                     return;
                 }
-                if (s.error) { el.innerHTML = `<span style="color:#b42318;">TBC mount problem: ${esc(s.error)}</span>`; return; }
+                if (s.error) { el.innerHTML = `<span style="color:#b42318;">${lane.label} mount problem: ${esc(s.error)}</span>`; return; }
                 el.innerHTML = `Mounted <b>${s.archiveCount}</b> archive(s) from <code>${esc(s.path)}</code> — ` +
                                (s.itemCount > 0
-                                   ? `<b>${s.itemCount.toLocaleString()}</b> named TBC weapons browsable ` +
+                                   ? `<b>${s.itemCount.toLocaleString()}</b> named ${lane.label} weapons browsable ` +
                                      `(${s.weaponCount.toLocaleString()} models).`
                                    : `<b>${s.weaponCount.toLocaleString()}</b> weapon models browsable (no item-name catalog).`);
-                const enable = s.weaponCount > 0;
-                for (const id of ['tbcBrowseBtn']) document.getElementById(id).disabled = !enable;
-            } catch (e) { el.textContent = 'TBC status unavailable: ' + e; }
+                lane.el('BrowseBtn').disabled = !(s.weaponCount > 0);
+            } catch (e) { el.textContent = `${lane.label} status unavailable: ` + e; }
         }
 
         // WoW quality colors (0 poor … 6 artifact).
         const QUALITY_COLORS = ['#9d9d9d', '#e6e8ea', '#1eff00', '#0070dd', '#a335ee', '#ff8000', '#e6cc80'];
 
-        async function loadTbcPage(page) {
-            tbcPage = page;
-            const list = document.getElementById('tbcList');
+        async function loadLanePage(lane, page) {
+            lane.page = page;
+            const list = lane.el('List');
             list.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:12px;">Loading…</div>';
-            const q = new URLSearchParams({ page, search: document.getElementById('tbcSearch').value.trim() });
+            const q = new URLSearchParams({ page, search: lane.el('Search').value.trim() });
             try {
-                const d = await (await fetch('/WeaponForge/TbcWeapons?' + q)).json();
+                const d = await (await fetch(lane.urls.weapons + '?' + q)).json();
                 if (!d.ok) { list.innerHTML = `<div style="padding:14px;font-size:12px;color:#b42318;">${esc(d.error || 'failed')}</div>`; return; }
                 if (!d.weapons.length) { list.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:12px;">No matches.</div>'; }
                 else {
@@ -1868,18 +2005,17 @@
                         }
                     }
                     list.innerHTML = html + '</table>';
-                    list.querySelectorAll('tr[data-model]').forEach(tr => tr.addEventListener('click', () => selectTbc(tr)));
+                    list.querySelectorAll('tr[data-model]').forEach(tr => tr.addEventListener('click', () => selectLane(lane, tr)));
                 }
-                document.getElementById('tbcPageInfo').textContent =
-                    `${d.total.toLocaleString()} weapon(s) — page ${d.page}/${d.pages}`;
-                document.getElementById('tbcPrev').disabled = d.page <= 1;
-                document.getElementById('tbcNext').disabled = d.page >= d.pages;
-                tbcPage = d.page;
+                lane.el('PageInfo').textContent = `${d.total.toLocaleString()} weapon(s) — page ${d.page}/${d.pages}`;
+                lane.el('Prev').disabled = d.page <= 1;
+                lane.el('Next').disabled = d.page >= d.pages;
+                lane.page = d.page;
             } catch (e) { list.innerHTML = `<div style="padding:14px;font-size:12px;color:#b42318;">${esc(String(e))}</div>`; }
         }
 
-        function selectTbc(tr) {
-            tbcSel = {
+        function selectLane(lane, tr) {
+            lane.sel = {
                 entry: +tr.dataset.entry || 0,
                 model: tr.dataset.model,
                 displayRow: +tr.dataset.row,
@@ -1888,29 +2024,105 @@
                 inventoryType: +(tr.dataset.inventoryType || 0),
                 inventoryTypeLabel: tr.dataset.slotLabel || '',
             };
-            document.getElementById('tbcSelected').value =
-                tbcSel.entry
-                    ? `${tbcSel.name} — ${tbcSel.inventoryTypeLabel || 'unknown slot'} (item ${tbcSel.entry})`
-                    : `${tbcSel.model} (row ${tbcSel.displayRow})`;
-            // Pre-select the family from the TBC subclass; the name field defaults to the item name.
-            const typeSel = document.getElementById('tbcType');
-            if (tbcSel.typeKey && [...typeSel.options].some(o => o.value === tbcSel.typeKey && !o.disabled))
-                typeSel.value = tbcSel.typeKey;
-            document.getElementById('tbcName').placeholder = tbcSel.name;
-            document.getElementById('tbcPreviewBtn').disabled = false;
-            invalidateTbcPreview();
-            document.getElementById('tbcModal').classList.remove('open');
-            actions.tbcPreview(null);
+            lane.el('Selected').value =
+                lane.sel.entry
+                    ? `${lane.sel.name} — ${lane.sel.inventoryTypeLabel || 'unknown slot'} (item ${lane.sel.entry})`
+                    : `${lane.sel.model} (row ${lane.sel.displayRow})`;
+            // Pre-select the family from the source subclass; the name field defaults to the item name.
+            const typeSel = lane.el('Type');
+            if (lane.sel.typeKey && [...typeSel.options].some(o => o.value === lane.sel.typeKey && !o.disabled))
+                typeSel.value = lane.sel.typeKey;
+            lane.el('Name').placeholder = lane.sel.name;
+            lane.el('PreviewBtn').disabled = false;
+            lane.el('Visual').value = '-1';
+            lane.invalidatePreview();
+            lane.el('Modal').classList.remove('open');
+            lanePreview(lane);
         }
 
-        document.getElementById('tbcModalClose').addEventListener('click', () => document.getElementById('tbcModal').classList.remove('open'));
-        document.getElementById('tbcModal').addEventListener('click', (e) => { if (e.target === e.currentTarget) e.currentTarget.classList.remove('open'); });
-        document.getElementById('tbcPrev').addEventListener('click', () => loadTbcPage(tbcPage - 1));
-        document.getElementById('tbcNext').addEventListener('click', () => loadTbcPage(tbcPage + 1));
-        document.getElementById('tbcSearch').addEventListener('input', () => {
-            clearTimeout(tbcSearchTimer);
-            tbcSearchTimer = setTimeout(() => loadTbcPage(1), 350);
-        });
+        async function laneBrowse(lane) {
+            lane.el('Modal').classList.add('open');
+            lane.el('Search').focus();
+            await loadLanePage(lane, 1);
+        }
+
+        async function lanePreview(lane) {
+            if (!lane.sel) return setResult({ title: `No ${lane.label} weapon selected`, error: 'Browse and pick one first.' });
+            const requestId = ++lane.previewSerial;
+            const selected = { ...lane.sel };
+            const weaponType = lane.el('Type').value || 'sword1h';
+            const targetTriangles = lane.targetTris();
+            const configureButton = lane.el('ForgeBtn');
+            configureButton.disabled = true;
+            const q = new URLSearchParams({
+                entry: selected.entry, model: selected.model, displayRow: selected.displayRow,
+                weaponType,
+                targetTriangles,
+            });
+            laneGlowParams(lane, q);
+            let d;
+            try {
+                const response = await fetch(lane.urls.preview + '?' + q);
+                d = await response.json();
+                if (!response.ok) throw new Error(d.error || `${lane.label} preview failed.`);
+            } catch (error) {
+                if (requestId !== lane.previewSerial) return;
+                configureButton.disabled = true;
+                setResult({ title: `${lane.label} preview failed`, error: String(error) });
+                return;
+            }
+            if (requestId !== lane.previewSerial) return;
+            lastGrip = d.grip || null;
+            configureButton.disabled = !d.ok || d.withinForgeBudget === false;
+            const p = d.particles || {};
+            const sug = d.suggestedItemVisual;
+            const autoOpt = lane.el('Visual').querySelector('option[value="-1"]');
+            if (autoOpt) autoOpt.textContent = sug && sug.id ? `Auto — ${sug.label} (#${sug.id})` : 'Auto (this model has no glow → none)';
+            // Two possible glow sources, reported separately so it is obvious which one this weapon
+            // actually uses: the display row's own ItemVisual (the common case), or model emitters.
+            const parts = [];
+            if (p.sourceVisual) {
+                parts.push(`The source display row carries <b>ItemVisual ${p.sourceVisual.id}</b>` +
+                    (p.sourceVisual.effects && p.sourceVisual.effects.length ? ` (${esc(p.sourceVisual.effects.join(' + '))})` : '') +
+                    ` \u2192 <b>${esc(p.sourceVisual.mappedLabel || 'no 1.12 equivalent')}</b>` +
+                    (p.sourceVisual.reason ? ` \u2014 ${esc(p.sourceVisual.reason)}` : '') + '.');
+            }
+            if (p.count) {
+                parts.push(`Model has <b>${p.count}</b> particle emitter(s)${p.textures && p.textures.length ? ' \u2014 ' + esc(p.textures.join(', ')) : ''}` +
+                    (p.colours && p.colours.length ? ' ' + p.colours.map(c => `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${esc(c)};border:1px solid #0006;vertical-align:middle;"></span>`).join('') : '') +
+                    (p.emitterSuggested ? `, nearest vanilla: <b>${esc(p.emitterSuggested.label)}</b>` : '') + '.');
+            }
+            if (!parts.length) parts.push('This model has no glow of its own \u2014 no ItemVisual on its display row, no particle emitters. Pick one anyway if you want one.');
+            // Where the glow will hang. Vanilla fills all five anchor slots, so a clustered source
+            // set is the difference between an enchant along the weapon and a lump on the blade.
+            if (p.anchorsSpread) parts.push('Anchors spread evenly hilt-to-tip.');
+            else if (p.anchorSpanPercent != null && p.anchorSpanPercent < 25)
+                parts.push(`The source's glow anchors span only <b>${p.anchorSpanPercent}%</b> of the weapon \u2014 tick <b>spread glow along weapon</b> for the hilt-to-tip look.`);
+            parts.push(`Forging with: <b>${esc(p.chosen ? p.chosen.label : 'none')}</b>. Glows render in-game only.`);
+            lane.el('VisualNote').innerHTML = parts.join(' ');
+            setResult({
+                title: d.ok ? `${lane.label} preview — ${d.itemName || selected.name}` : `${lane.label} preview failed`,
+                kv: d.ok ? {
+                    'Type': d.weaponTypeLabel || '1H Sword',
+                    'Equip slot': d.inventoryTypeLabel || (d.inventoryType != null ? `Inventory type ${d.inventoryType}` : '—'),
+                    'Model': d.model,
+                    'Triangles': (d.triangleCount ?? 0).toLocaleString() +
+                        (d.withinForgeBudget === false ? ' — OVER vanilla UInt16 limit' : ''),
+                    'Vertices': (d.vertexCount ?? 0).toLocaleString(),
+                    'Texture': d.hasTexture ? d.texture : 'MISSING — fidelity import stopped',
+                    'Glow': p.chosen ? p.chosen.label + (sug && sug.id === (p.chosen.id|0) ? ' (suggested)' : '') : 'none',
+                } : undefined,
+                diagnostics: d.diagnostics, note: d.grip && d.grip.note, error: d.error,
+            });
+            loadGlb(previewUrl(d));
+        }
+
+        function laneForge(lane) {
+            if (!lane.sel) return setResult({ title: `No ${lane.label} weapon selected`, error: 'Browse and pick one first.' });
+            itemBuildOpen(lane.key);
+        }
+
+        LEGACY_LANES.forEach(wireLane);
 
         // ---------- forged weapons registry ----------
         async function loadWeapons() {
@@ -1975,6 +2187,11 @@
                 pill('pillFixture', s.fixtureVerified, 'fixture verified', 'fixture FAILED');
                 pill('pillDonor', s.donorM2Found, `donor ${(s.donorM2Bytes || 0).toLocaleString()} B`, 'donor not mounted', true);
                 document.getElementById('pillContract').textContent = 'contract v' + s.coordinateContractVersion;
+                const dp = s.deployedPatch || {};
+                const dpEl = document.getElementById('pillDeploy');
+                dpEl.textContent = !dp.configured ? 'deploy: no client path' : dp.stale ? 'patch-5 STALE in client — close WoW, Rebuild patch' : (dp.deployedExists ? 'patch-5 deployed ✓' : 'patch-5 not deployed yet');
+                dpEl.className = 'wf-pill ' + (!dp.configured ? 'warn' : dp.stale ? 'bad' : 'ok');
+                dpEl.title = dp.message || dpEl.title;
                 fillWeaponTypes(s.weaponTypes || []);
             } catch { pill('pillFixture', false, '', 'status unavailable'); }
         }
@@ -1984,7 +2201,7 @@
             if (!types.length) return;
             weaponTypeMeta.clear();
             for (const t of types) weaponTypeMeta.set(t.key, t);
-            for (const id of ['impType', 'tbcType']) {
+            for (const id of ['impType', 'tbcType', 'wotlkType']) {
                 const sel = document.getElementById(id);
                 const keep = sel.value;
                 sel.innerHTML = '';
@@ -1992,11 +2209,11 @@
                     const o = document.createElement('option');
                     o.value = t.key;
                     // Families without an arbitrary-GLB route (shields: no long axis/grip to find)
-                    // are TBC-import only, so the GLB card lists them disabled with the reason.
+                    // are client-import only (TBC/WotLK), so the GLB card lists them disabled with the reason.
                     const glbBlocked = id === 'impType' && t.glbImport === false;
-                    o.textContent = !t.ok ? `${t.label} (no donor)` : glbBlocked ? `${t.label} (TBC import only)` : t.label;
+                    o.textContent = !t.ok ? `${t.label} (no donor)` : glbBlocked ? `${t.label} (TBC/WotLK import only)` : t.label;
                     o.disabled = !t.ok || glbBlocked;
-                    if (glbBlocked) o.title = 'Shields have no long axis or grip for the GLB heuristics — import them from the TBC browse instead.';
+                    if (glbBlocked) o.title = 'Shields have no long axis or grip for the GLB heuristics — import them from the TBC or WotLK browse instead.';
                     else if (t.ok && t.donorModel) o.title = `donor: ${t.donorModel} (row ${t.donorDisplayRow})`;
                     else if (!t.ok && t.error) o.title = t.error;
                     sel.appendChild(o);
@@ -2022,7 +2239,28 @@
 
         initViewer();
         loadStatus();
-        loadTbcStatus();
+        LEGACY_LANES.forEach(loadLaneStatus);
+        loadItemVisuals();
+        loadGlowCoverage();
+
+        // How much of the mounted client's weapon glow this lane can actually reproduce. DBC-only on
+        // the server, so it is instant; failures leave the line blank rather than shouting.
+        async function loadGlowCoverage() {
+            for (const lane of LEGACY_LANES) {
+                const el = document.getElementById(lane.key + 'GlowCoverage');
+                if (!el) continue;
+                try {
+                    const d = await (await fetch(`/WeaponForge/GlowCoverage?expansion=${lane.key}`)).json();
+                    if (!d.ok) { el.textContent = ''; continue; }
+                    const pct = d.weaponRows ? Math.round(d.withGlow * 1000 / d.weaponRows) / 10 : 0;
+                    el.innerHTML = `<b>Glow coverage:</b> ${d.withGlow.toLocaleString()} of ${d.weaponRows.toLocaleString()} ` +
+                        `${lane.label} weapon models (${pct}%) carry a permanent glow on their display row — ` +
+                        `${d.exact.toLocaleString()} copy across to 1.12 unchanged, ${d.mapped.toLocaleString()} map to the nearest vanilla glow, ` +
+                        `${d.unmatched.toLocaleString()} are cast animations with no equivalent.`;
+                    el.title = d.note || '';
+                } catch (e) { el.textContent = ''; }
+            }
+        }
         loadWeapons();
     </script>
 }

@@ -154,7 +154,9 @@ public sealed class WeaponAssetCompiler
         }
     }
 
-    private static string? ValidateBlp2Envelope(byte[] blp)
+    /// <summary>Null when <paramref name="blp"/> is a BLP2 the vanilla texture path accepts
+    /// byte-for-byte; otherwise the reason. Shared with the Armor Forge's TBC importer.</summary>
+    internal static string? ValidateBlp2Envelope(byte[] blp)
     {
         const int headerBytes = 148;
         const int paletteBytes = 1024;

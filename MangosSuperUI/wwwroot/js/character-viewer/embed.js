@@ -109,12 +109,18 @@ export async function mountCharacterViewer(opts) {
                 animationControl = null;
             }
 
+            // Drop the outgoing character's material animations before its
+            // geometry — a leftover handle keeps mutating materials on meshes
+            // that are no longer in the scene, and the Armor Forge swaps race
+            // on every dropdown change.
+            viewer.clearFx();
             viewer.scene.remove(character.root);
             disposeCharacter(character);
         }
 
         character = await loadCharacterGlb(glbUrl);
         viewer.scene.add(character.root);
+        viewer.addFx(character.fx);
         cacheOriginalState(character);
 
         if (character.animations.length > 0) {
@@ -174,6 +180,7 @@ export async function mountCharacterViewer(opts) {
             }
             const mixer = viewer.getMixer();
             if (mixer) mixer.stopAllAction();
+            viewer.clearFx();
             if (character) {
                 viewer.scene.remove(character.root);
                 disposeCharacter(character);

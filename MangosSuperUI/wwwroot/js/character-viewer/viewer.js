@@ -78,6 +78,20 @@ export function createViewer(canvas) {
     let mixer = null;
     const clock = new THREE.Clock();
 
+    // ── Material-animation handles (m2fx) ──
+    // The mixer covers skeletal motion and nothing else. An M2's colour, opacity
+    // and UV-scroll tracks have no glTF representation, so they arrive as a
+    // manifest in the GLB's extras and are replayed by m2fx.js — which needs a
+    // per-frame tick and cannot get one from the mixer, because attachments
+    // (weapons, helms, spaulders) are separate GLBs with no mixer of their own.
+    //
+    // They are driven off an accumulated elapsed time rather than a delta:
+    // every M2 material track is a loop of known period, so absolute time keeps
+    // two objects sharing a global sequence in phase with each other, which a
+    // per-handle delta accumulator would not.
+    const fxHandles = new Set();
+    let elapsedMs = 0;
+
     // ── Render loop ──
     function frame() {
         // Mixer update first so any bones/attachments the controls or
@@ -87,6 +101,23 @@ export function createViewer(canvas) {
         // diagnostic panel) reads them after this point in the frame.
         const dt = clock.getDelta();
         if (mixer) mixer.update(dt);
+
+        if (fxHandles.size > 0) {
+            const dtMs = dt * 1000;
+            elapsedMs += dtMs;
+            for (const fx of fxHandles) {
+                try {
+                    // Absolute time drives the material loops; the delta and the
+                    // camera drive the particle systems, which integrate motion
+                    // and need the camera basis to billboard against.
+                    fx.update(elapsedMs, dtMs, camera);
+                } catch (err) {
+                    // One bad manifest must not take the render loop with it.
+                    console.warn('[viewer] m2fx handle failed; dropping it', err);
+                    fxHandles.delete(fx);
+                }
+            }
+        }
 
         controls.update();
         renderer.render(scene, camera);
@@ -146,5 +177,32 @@ export function createViewer(canvas) {
 
     function getMixer() { return mixer; }
 
-    return { scene, camera, renderer, controls, fit, attachMixer, getMixer };
+    /**
+     * Register an fx handle (the object installM2Fx returns) to be ticked every
+     * frame with (elapsedMs, deltaMs, camera). Returns a function that unregisters it, so callers
+     * that own a transient object (an attachment being replaced) can drop it
+     * without knowing about the set.
+     *
+     * @param {{update: (ms:number)=>void}} handle
+     * @returns {() => void}
+     */
+    function addFx(handle) {
+        if (!handle || typeof handle.update !== 'function') return () => {};
+        fxHandles.add(handle);
+        return () => removeFx(handle);
+    }
+
+    /** Unregister a handle and dispose it if it knows how. */
+    function removeFx(handle) {
+        if (!handle) return;
+        fxHandles.delete(handle);
+        try { handle.dispose?.(); } catch { /* already gone */ }
+    }
+
+    /** Drop every registered handle — used when a viewer is torn down or reused. */
+    function clearFx() {
+        for (const handle of Array.from(fxHandles)) removeFx(handle);
+    }
+
+    return { scene, camera, renderer, controls, fit, attachMixer, getMixer, addFx, removeFx, clearFx };
 }

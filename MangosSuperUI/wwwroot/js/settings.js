@@ -55,9 +55,10 @@ $(function () {
             $('#cfgVmangosClientDataPath').val(s.vmangos.clientDataPath);
             $('#cfgVmapsDataPath').val(s.vmangos.vmapsDataPath || '');
 
-            // Weapon Forge (TBC import source)
+            // Weapon/Armor Forge import sources (TBC + WotLK client Data folders)
             if (s.weaponForge) {
                 $('#cfgTbcDataPath').val(s.weaponForge.tbcDataPath || '');
+                $('#cfgWotlkDataPath').val(s.weaponForge.wotlkDataPath || '');
             }
 
             // Kestrel
@@ -491,7 +492,8 @@ $(function () {
                 patchOutputPath: $('#cfgPatchOutputPath').val() || ''
             },
             weaponForge: {
-                tbcDataPath: $('#cfgTbcDataPath').val() || ''
+                tbcDataPath: $('#cfgTbcDataPath').val() || '',
+                wotlkDataPath: $('#cfgWotlkDataPath').val() || ''
             },
             wiki: {
                 root: $('#cfgWikiRoot').val() || ''

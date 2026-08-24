@@ -62,6 +62,7 @@
 
 import * as THREE from 'three';
 import * as dresser from './dresser.js';
+import { installM2Fx } from './m2fx.js';
 import * as compositor from './compositor.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { applyBlendSuffix } from './blend-suffix.js';
@@ -345,9 +346,33 @@ async function mountAttachmentsFromPayload(character, attachments, inventoryType
             console.warn(`[equip] mountAttachment(${job.attId}) returned false — attachment node missing on character`);
             continue;
         }
+        bindAttachmentFx(character, job.attId, r.value);
         mounted++;
     }
     return mounted;
+}
+
+/**
+ * Bind an attachment GLB's material-animation manifest, keyed by attachment id.
+ *
+ * This is where a glowing weapon or a flickering helm actually starts moving:
+ * the mixer only drives the character's skeleton, and an attachment is a
+ * separate GLB with no mixer of its own, so its colour / opacity / UV-scroll
+ * tracks need the character's fx registry (which page boot code ticks through
+ * viewer.addFx). Keying by attachment id means swapping the weapon in that slot
+ * disposes the previous binding rather than leaving it ticking against geometry
+ * that is no longer in the scene.
+ *
+ * Silently does nothing when the character predates the registry or the GLB
+ * carries no manifest — most items animate nothing and must stay free.
+ */
+function bindAttachmentFx(character, attId, gltf) {
+    if (!character?.fx) return;
+    try {
+        character.fx.set(attId, installM2Fx(gltf));
+    } catch (err) {
+        console.warn(`[equip] m2fx install failed for attachment ${attId}`, err);
+    }
 }
 
 /**
@@ -524,6 +549,9 @@ function clearAllAttachments(character) {
         const att = dresser.getAttachment(character, attId);
         if (!att) continue;
         while (att.children.length) att.remove(att.children[0]);
+        // Drop the slot's material animation with its geometry, or the handle
+        // keeps updating materials on an unparented scene every frame.
+        character.fx?.remove(attId);
     }
 }
 
@@ -711,9 +739,14 @@ export async function equipDisplay(character, displayId, itemId = 0, opts = {}) 
 export async function equipMultiple(character, equipment, opts = {}) {
     const identity = deriveCharacterIdentity(character);
 
-    // Fetch all dressing payloads in parallel.
+    // Fetch all dressing payloads in parallel. opts.fetchDressing(entry, identity) lets a
+    // caller supply dressing payloads from another source (the Armor Forge previews TBC pieces
+    // that have no vanilla displayId yet) — same payload shape as /Items/ItemDressing.
+    const fetchFn = opts.fetchDressing
+        ? (e => Promise.resolve(opts.fetchDressing(e, identity)))
+        : (e => fetchDressing(e.displayId, e.itemId ?? 0, identity));
     const dressings = await Promise.all(equipment.map(e =>
-        fetchDressing(e.displayId, e.itemId ?? 0, identity).then(d => ({ entry: e, d }))));
+        fetchFn(e).then(d => ({ entry: e, d }))));
 
     // Build a list of resolved items annotated with their effective
     // inventoryType (caller override > API). Filter out anything that

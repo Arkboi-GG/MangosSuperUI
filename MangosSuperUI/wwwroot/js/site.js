@@ -119,7 +119,7 @@
             bots: ['bots-dashboard', 'bots-fleet', 'bots-map', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
             devtools: [],
-            gamedev: ['weaponforge'],
+            gamedev: ['weaponforge', 'armorforge'],
             wiki: ['wiki-code', 'wiki-lua'],
             superui: ['downloads-page', 'settings']
         }
@@ -478,7 +478,8 @@
             craftinglootifier: { icon: 'fa-hammer', label: 'Crafting Lootifier' },
             professiontuning: { icon: 'fa-scale-balanced', label: 'Profession Tuning' },
             retextureengine: { icon: 'fa-palette', label: 'Retexture Engine' },
-            weaponforge: { icon: 'fa-hammer', label: 'Item Assets' },
+            weaponforge: { icon: 'fa-hammer', label: 'Weapon Forge' },
+            armorforge: { icon: 'fa-shield-halved', label: 'Armor Forge' },
             worldeditor: { icon: 'fa-mountain-sun', label: '3D World Editor' },
             'downloads-page': { icon: 'fa-download', label: 'Downloads' },
             settings: { icon: 'fa-gear', label: 'Settings' },

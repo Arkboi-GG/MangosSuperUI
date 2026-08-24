@@ -98,11 +98,20 @@ builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponPatchBuil
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponPreviewService>();
 // Per-family stock donor resolution (scaffold M2, DBC row, grip envelope) — cached for the app lifetime.
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponDonorResolver>();
-// Read-only TBC client archive mount (WeaponForge:TbcDataPath) for the TBC-import section.
+// Read-only later-client archive mounts for the import sections: TBC (WeaponForge:TbcDataPath)
+// and WotLK (WeaponForge:WotlkDataPath). Same managed reader; WotLK models are v264 + .skin.
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.TbcMpqSource>();
-// Shipped TBC item-name catalog (wwwroot/data/tbc-item-catalog.json) — names never live in MPQs.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WotlkMpqSource>();
+// Shipped item-name catalogs (wwwroot/data/tbc-item-catalog.json, wotlk-item-catalog.json) — names
+// never live in MPQs. LegacyImportSources pairs each mount with its catalog, keyed "tbc"/"wotlk".
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.TbcItemCatalog>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WotlkItemCatalog>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.LegacyImportSources>();
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.VanillaItemSpellCatalog>();
+// Shared typed-gameplay intake (itemConfig JSON → validated item_template overrides) for both forges.
+builder.Services.AddScoped<MangosSuperUI.Services.WeaponForge.ItemConfigurationParser>();
+// Curated tier/spec itemization generator (deterministic, DB-free) — starting-point stats for imports.
+builder.Services.AddSingleton<MangosSuperUI.Services.Itemization.ItemBudgetGenerator>();
 // Phase-3 donor-scaffold writer: emits real custom geometry on the donor scaffold (fixed topology).
 // Swap back to NullWeaponMeshWriter only to isolate the compiler from the writer during debugging.
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.IWeaponMeshWriter,
@@ -113,6 +122,18 @@ builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WeaponAssetComp
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService>();
 // Pre-textured GLB import; high-poly sources are decimated by the static UvPreservingDecimator.
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.GlbWeaponImporter>();
+
+// Armor Forge — patch-6 (painted body-atlas pieces, custom-skinned stock helm/shoulder models,
+// cloaks) + tier sets (ItemSet.dbc). Reuses the weapon id allocator + reservation tables.
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.ArmorPatchBuilder>();
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.CustomArmorBuildService>();
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.TbcArmorCatalog>();
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.TbcArmorImporter>();
+// WotLK lane: same catalog/importer over the WotLK mount + shipped WotLK catalog; ArmorImportSources
+// pairs the two lanes by key ("tbc"/"wotlk") for the controller and build service.
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.WotlkArmorCatalog>();
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.WotlkArmorImporter>();
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.ArmorImportSources>();
 
 // NPC dev window (spawn / pathing / aggro) commit + audit path.
 builder.Services.AddScoped<NpcDevApplyService>();
@@ -196,13 +217,26 @@ var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
 {
-    var retexService = scope.ServiceProvider.GetRequiredService<ItemRetextureService>();
-    retexService.LoadExistingRetexturesAsync().GetAwaiter().GetResult();
+    // These registrations need the admin DB. A DB that is down at boot must NOT take the whole
+    // panel down (DbInitializationService below already follows the same "never throws" rule) —
+    // the registrations are retried implicitly on the next forge/retexture action, and the
+    // dashboard surfaces the DB state. Log and continue.
+    var bootLog = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
+    try
+    {
+        var retexService = scope.ServiceProvider.GetRequiredService<ItemRetextureService>();
+        retexService.LoadExistingRetexturesAsync().GetAwaiter().GetResult();
+    }
+    catch (Exception ex) { bootLog.LogError(ex, "Startup: retexture registration skipped (DB unavailable?)"); }
 
     // Same in-memory DBC registration for forged weapons, so their custom displays resolve on the
     // Items page (icon + model/texture) after a restart — mirrors the retexture load above.
-    var weaponBuilder = scope.ServiceProvider.GetRequiredService<MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService>();
-    weaponBuilder.LoadExistingWeaponsAsync().GetAwaiter().GetResult();
+    try
+    {
+        var weaponBuilder = scope.ServiceProvider.GetRequiredService<MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService>();
+        weaponBuilder.LoadExistingWeaponsAsync().GetAwaiter().GetResult();
+    }
+    catch (Exception ex) { bootLog.LogError(ex, "Startup: forged-weapon registration skipped (DB unavailable?)"); }
 
     var registry = scope.ServiceProvider.GetRequiredService<CacheVersionRegistry>();
     registry.SweepAllOnStartup();

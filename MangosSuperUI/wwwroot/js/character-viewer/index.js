@@ -42,6 +42,13 @@ async function boot(canvasEl, glbUrl, statsEl) {
         const character = await loadCharacterGlb(glbUrl);
         viewer.scene.add(character.root);
 
+        // ── Material animation (m2fx) ────────────────────────────────────
+        // One registration for the whole character: the registry the loader
+        // hung on it collects the body's own handle plus one per mounted
+        // attachment, so equip.js can add and drop weapon/helm/spaulder
+        // animations later without ever seeing the viewer.
+        viewer.addFx(character.fx);
+
         // Cache load-time visibility and textures so "reset to default"
         // operations have a true baseline to return to. Has to happen here
         // (boot time) before anything has had a chance to mutate things.

@@ -37,6 +37,8 @@ server-config.json
 **/wwwroot/minimap/
 **/wwwroot/character_models/
 **/wwwroot/character_textures/
+**/wwwroot/armor_forge_cache/
+**/wwwroot/body_atlas_cache/
 
 # Keep the directories in the repo with .gitkeep so the folder structure exists
 !**/wwwroot/icons/.gitkeep

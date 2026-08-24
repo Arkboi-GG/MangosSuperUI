@@ -170,3 +170,126 @@ export function applyBlendMode(mat, blendMode, alpha = 1.0) {
     }
     mat.needsUpdate = true;
 }
+
+// Matches the `_env` marker WeaponPreviewService adds to an environment-mapped pass's
+// material name (e.g. "pass1_tex0_env_blend6_a100"). `_env` sits before the blend suffix so
+// applyBlendSuffix's end-anchored regex still resolves the blend mode.
+const _ENV_RE = /_env(?:_|$)/;
+
+/**
+ * Render WoW ENVIRONMENT-MAPPED passes as a matcap.
+ *
+ * WoW's EnvMap texture-coordinate mode samples the texture by the surface's view-space normal
+ * (a sphere map), NOT by the mesh UVs — which is what makes a weapon's reflective energy flow
+ * across the blade as it turns. glTF cannot express that, so the server flattens those passes to
+ * static UV0 and the effect FREEZES (the Warglaive's dead green blades). three.js's
+ * MeshMatcapMaterial does exactly the same view-normal sphere sampling, so swapping an `_env`
+ * pass to a matcap of its own texture restores the moving reflection.
+ *
+ * Run AFTER applyBlendSuffix so the blend/transparency state it resolved can be copied onto the
+ * matcap verbatim — only the sampling changes, not the compositing.
+ *
+ * @param {THREE.Object3D} sceneRoot
+ * @returns {number} number of materials converted (logged for verification).
+ */
+export function applyEnvMapping(sceneRoot) {
+    let converted = 0;
+    sceneRoot.traverse(node => {
+        if (!node.isMesh) return;
+        const mats = Array.isArray(node.material) ? node.material : [node.material];
+        for (let i = 0; i < mats.length; i++) {
+            const mat = mats[i];
+            if (!mat || !mat.name || !_ENV_RE.test(mat.name)) continue;
+
+            const env = new THREE.MeshMatcapMaterial({ matcap: mat.map || null });
+            env.name = mat.name;
+            // Carry over the exact blend/depth state applyBlendSuffix resolved — additive, mod2x,
+            // etc. The matcap only changes how the texture is SAMPLED (view normal, not UVs).
+            env.transparent = mat.transparent;
+            env.opacity = mat.opacity;
+            env.depthWrite = mat.depthWrite;
+            env.depthTest = mat.depthTest;
+            env.side = mat.side;
+            env.alphaTest = mat.alphaTest;
+            env.blending = mat.blending;
+            env.blendEquation = mat.blendEquation;
+            env.blendSrc = mat.blendSrc;
+            env.blendDst = mat.blendDst;
+            if (mat.color && env.color) env.color.copy(mat.color);
+            env.needsUpdate = true;
+
+            if (Array.isArray(node.material)) node.material[i] = env;
+            else node.material = env;
+            converted++;
+        }
+    });
+    if (converted > 0)
+        console.log(`[env-map] ${converted} environment-mapped pass(es) → matcap (WoW EnvMap reflection restored)`);
+    else
+        console.log('[env-map] no _env passes on this model — nothing to convert');
+    return converted;
+}
+
+// `_mod` marker WeaponPreviewService adds to a multi-texture MODULATE pass (e.g.
+// "pass3_tex1_mod_blend4_a100"). Sits before the blend suffix so applyBlendSuffix still parses it.
+const _MOD_RE = /_mod(?:_|$)/;
+
+/**
+ * Reconstruct a WoW multi-texture MODULATE pass — the "wave" combine.
+ *
+ * WoW combines a 2-texture batch by MULTIPLYING a static copy of the energy by a scrolling copy;
+ * the interference is a band that grows, shifts and shrinks along the blade over the loop. glTF/three
+ * can't express a two-sample multiply in one additive pass, so the exporter would otherwise split it
+ * into two additive layers — which can only ADD, lighting the whole area (the "full glow" bug).
+ *
+ * Here the pass carries TWO UV sets: TEXCOORD_0 (the scroll mapping, already animated by m2fx via
+ * map.matrix → vMapUv) and TEXCOORD_1 = 'uv1' (the static mapping). We sample the SAME map a second
+ * time at the static UV and multiply it into the base colour. Product = scrolled × static = the wave.
+ *
+ * Run AFTER installM2Fx so this lands on the material m2fx actually animates (installM2Fx clones and
+ * reassigns; Material.clone does not carry onBeforeCompile, so it must be set last).
+ *
+ * @param {THREE.Object3D} sceneRoot
+ * @returns {number} number of materials converted.
+ */
+export function applyMultiTexture(sceneRoot) {
+    let converted = 0;
+    sceneRoot.traverse(node => {
+        if (!node.isMesh) return;
+        const mats = Array.isArray(node.material) ? node.material : [node.material];
+        for (let i = 0; i < mats.length; i++) {
+            const mat = mats[i];
+            if (!mat || !mat.name || !_MOD_RE.test(mat.name) || !mat.map) continue;
+
+            // Route the SECOND (static) sample of the energy texture through the aoMap slot, which is the
+            // supported way to get a UV1-mapped varying (vAoMapUv) in this three.js — a bare
+            // `attribute vec2 uv1` is not bound unless a channel-1 texture activates it. aoMap is a
+            // static clone of the same texture on channel 1; aoMapIntensity 0 keeps its own AO term
+            // inert. mat.map stays on channel 0 and keeps the m2fx scroll (map.matrix).
+            const modTex = mat.map.clone();
+            modTex.matrixAutoUpdate = true;   // identity — the static copy must NOT scroll
+            modTex.channel = 1;
+            modTex.needsUpdate = true;
+            mat.aoMap = modTex;
+            mat.aoMapIntensity = 0;
+
+            mat.onBeforeCompile = (shader) => {
+                // map_fragment has just set diffuseColor from the SCROLLED sample (vMapUv). Multiply the
+                // STATIC sample (aoMap at vAoMapUv = UV1) to get the modulated, moving wave — the product
+                // WoW's fixed-function multi-texture stage produces and two additive passes cannot.
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    '#include <map_fragment>',
+                    '#include <map_fragment>\n\tdiffuseColor *= texture2D( aoMap, vAoMapUv );');
+            };
+            // Keep this program out of the shared cache so a plain additive material never reuses it.
+            mat.customProgramCacheKey = () => 'suiModCombine';
+            mat.needsUpdate = true;
+            converted++;
+        }
+    });
+    if (converted > 0)
+        console.log(`[multi-tex] ${converted} MODULATE pass(es) → two-sample multiply (wave restored)`);
+    else
+        console.log('[multi-tex] no _mod passes on this model');
+    return converted;
+}

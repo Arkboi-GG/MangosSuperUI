@@ -273,7 +273,27 @@ public partial class DbcService
                     // when the family mirrors ModelName2 (thrown weapons); null inherits.
                     ModelName2 = customModelName2 ?? sourceModel.ModelName2,
                     TextureName1 = customTextureName ?? sourceModel.TextureName1,
-                    TextureName2 = sourceModel.TextureName2,
+                    // TextureName2 must follow the model pair, never the donor.
+                    //
+                    // A caller that passes customModelName2 is stating the model pair explicitly —
+                    // it is a Forge writing its own row, not a retexture cloning a real display. In
+                    // that case the donor's TextureName2 is a stock skin for a completely different
+                    // item, and it is not cosmetic: ItemTextureService.EnsureShoulderGlb builds the
+                    // RIGHT spaulder from ModelName2 + TextureName2, so the forged right-hand mesh
+                    // gets skinned with the donor's BLP while the left gets the forged one. Sampled
+                    // through the forged material's alpha key that punches the pad into disconnected
+                    // islands — "fine in game, exploded in the previewer", because the patch DBC has
+                    // it right (ArmorDisplayInfoRow.BuildAndAdd writes TextureName2 == TextureName1
+                    // whenever ModelName2 is set) and only this in-memory row was wrong.
+                    //
+                    // Mirroring that patch rule exactly is what keeps the previewer and the client
+                    // showing the same thing. A null customModelName2 still inherits, which is right
+                    // for ItemRetextureService: there the donor row IS the item being retextured.
+                    TextureName2 = customModelName2 is null
+                        ? sourceModel.TextureName2
+                        : customModelName2.Length == 0
+                            ? ""
+                            : customTextureName ?? sourceModel.TextureName1,
                     // Session C: clone (don't share reference) the array
                     // fields so a future RegisterCustomDisplayEntry call
                     // can't accidentally mutate the source row.
@@ -300,6 +320,45 @@ public partial class DbcService
         _logger.LogInformation(
             "DbcService: Registered custom displayId {New} (cloned from {Source}, model={Model})",
             newDisplayId, sourceDisplayId, customModelName ?? "(same)");
+    }
+
+    /// <summary>
+    /// Register a custom ItemDisplayInfo entry from a row the caller states in full.
+    ///
+    /// This is the form a Forge should use. The clone-based overload exists for
+    /// <c>ItemRetextureService</c>, where the donor row genuinely IS the item being retextured, so
+    /// inheriting its unspecified fields is correct. A Forge has no such donor: it picks the first
+    /// stock row that merely LOOKS like the right shape (any <c>LShoulder*</c>, any <c>Helm_*</c>)
+    /// and everything it does not override — TextureName2, geoset groups, helmet visibility masks,
+    /// body-atlas stems, item visual — silently comes from an unrelated item. The previewer then
+    /// renders something the client never will, because the patch DBC was written correctly.
+    ///
+    /// Pass exactly what was written into the patch row so the two agree by construction.
+    /// </summary>
+    public void RegisterCustomDisplayEntry(uint newDisplayId, ItemModelDbc row, string? iconName = null)
+    {
+        if (ItemDisplayIcons is Dictionary<uint, string> iconDict && !string.IsNullOrEmpty(iconName))
+            iconDict[newDisplayId] = iconName;
+
+        if (ItemModelInfos is Dictionary<uint, ItemModelDbc> modelDict)
+        {
+            // Defensive copies of the array fields: the caller keeps its own instances, and a later
+            // registration must not be able to mutate a row already in the cache.
+            row.BodyTextures = row.BodyTextures is { Length: 8 } bt ? (string[])bt.Clone() : new string[8];
+            row.GeosetGroup = row.GeosetGroup is { Length: 3 } gg ? (int[])gg.Clone() : new int[3];
+            row.ModelName1 ??= "";
+            row.ModelName2 ??= "";
+            row.TextureName1 ??= "";
+            row.TextureName2 ??= "";
+            for (int i = 0; i < row.BodyTextures.Length; i++) row.BodyTextures[i] ??= "";
+            modelDict[newDisplayId] = row;
+        }
+
+        _iconToDisplayIds = null;
+
+        _logger.LogInformation(
+            "DbcService: Registered custom displayId {New} from an explicit row (model1={M1}, model2={M2}, tex1={T1}, tex2={T2})",
+            newDisplayId, row.ModelName1, row.ModelName2, row.TextureName1, row.TextureName2);
     }
 
     /// <summary>Re-read all DBC files (e.g., after path change in Settings).</summary>

@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 
 namespace MangosSuperUI.Services.WeaponForge;
 
@@ -9,7 +9,7 @@ namespace MangosSuperUI.Services.WeaponForge;
 /// once per referenced source submesh; every source batch can then draw that range with its own
 /// blend mode, flags, shader, texture units, UV source, and static transparency.
 /// </summary>
-public static class TbcWeaponMeshExtractor
+public static class LegacyWeaponMeshExtractor
 {
     private sealed record SourceTexture(string? Path, uint Flags, uint Type);
     private sealed record SourceBinding(
@@ -35,18 +35,21 @@ public static class TbcWeaponMeshExtractor
         List<SourceTexture> Textures,
         bool Fatal = false);
 
-    public static TbcExtractResult? Extract(M2Model m2, ForgeDiagnostics diag)
+    public static LegacyExtractResult? Extract(M2Model m2, ForgeDiagnostics diag, string sourceLabel = "TBC", bool bakeEmitters = true)
     {
         if (m2.RibbonEmitterCount > 0 || m2.ParticleEmitterCount > 0)
-            diag.Warn("tbc.emitters.unsupported",
+            diag.Warn("import.emitters.unsupported",
                 $"Source model contains {m2.RibbonEmitterCount} ribbon and {m2.ParticleEmitterCount} particle emitter(s). " +
-                "The 1.12 donor scaffold cannot transplant those TBC emitter graphs; fixed-function mesh passes are preserved independently.");
+                $"The 1.12 donor scaffold cannot transplant those {sourceLabel} emitter graphs; fixed-function mesh passes are preserved independently" +
+                (m2.ParticleEmitters.Count > 0 && bakeEmitters ? " — each emitter is baked as a static additive glow sprite instead." :
+                 m2.ParticleEmitters.Count > 0 ? " — the nearest vanilla enchant-style glow (ItemVisual) is suggested instead." : "."));
 
         var plan = PlanPasses(m2, diag);
         if (plan is null) return ExtractSinglePass(m2, diag);
         if (plan.Fatal) return null;
         var passes = plan.Passes;
         var textureSlots = plan.Textures;
+        var synthetic = bakeEmitters ? BakeEmitterSprites(m2, passes, textureSlots, diag) : new List<BakedSprite>();
 
         // One contiguous block per source submesh. Shared source vertices are deliberately copied
         // into each block because vanilla skin-section vertex/index spans are UInt16 ranges.
@@ -62,6 +65,19 @@ public static class TbcWeaponMeshExtractor
         foreach (var sp in passes)
         {
             if (slotBySrcSubmesh.ContainsKey(sp.SrcSubmesh)) continue;
+            if (sp.SrcSubmesh >= m2.Submeshes.Count)
+            {
+                // Baked emitter sprite: its geometry comes from the side table, not the source mesh.
+                int si = sp.SrcSubmesh - m2.Submeshes.Count;
+                if (synthetic is null || si < 0 || si >= synthetic.Count) continue;
+                var g = SpriteGeometry(synthetic[si]);
+                int vs = pos.Count, isx = indices.Count;
+                for (int k = 0; k < g.Pos.Length; k++) { pos.Add(g.Pos[k]); nrm.Add(g.Nrm[k]); uv0.Add(g.Uv[k]); uv1.Add(g.Uv[k]); }
+                foreach (var ix in g.Idx) indices.Add((uint)vs + ix);
+                slotBySrcSubmesh[sp.SrcSubmesh] = ranges.Count;
+                ranges.Add(new WeaponSubmeshRange { IndexStart = isx, IndexCount = indices.Count - isx, VertexStart = vs, VertexCount = pos.Count - vs });
+                continue;
+            }
             var sub = m2.Submeshes[sp.SrcSubmesh];
 
             int vertexStart = pos.Count, indexStart = indices.Count;
@@ -117,8 +133,8 @@ public static class TbcWeaponMeshExtractor
         }
 
         if (indices.Count == 0) return ExtractSinglePass(m2, diag);
-        if (dropped > 0) diag.Info("tbc.degenerate.dropped", $"{dropped} degenerate/invalid triangle(s) dropped.");
-        if (repairedUv > 0) diag.Warn("tbc.uv.nonfinite", $"{repairedUv} vertex UV pair(s) contained non-finite values and were replaced with zero.");
+        if (dropped > 0) diag.Info("import.degenerate.dropped", $"{dropped} degenerate/invalid triangle(s) dropped.");
+        if (repairedUv > 0) diag.Warn("import.uv.nonfinite", $"{repairedUv} vertex UV pair(s) contained non-finite values and were replaced with zero.");
 
         var textureIndex = textureSlots.Select((t, i) => (t, i)).ToDictionary(x => x.t, x => x.i);
         var weaponPasses = new List<WeaponPass>(passes.Count);
@@ -146,11 +162,16 @@ public static class TbcWeaponMeshExtractor
                 BatchFlags = sp.BatchFlags,
                 PriorityPlane = sp.PriorityPlane,
                 ShaderId = sp.ShaderId,
-                ColorIndex = sp.ColorIndex,
-                RestColor = sp.RestColor is null ? null : new WeaponRestColor(
-                    sp.RestColor.Rgb,
-                    sp.RestColor.Alpha,
-                    sp.RestColor.AnimationFrozen),
+                // An ADDITIVE pass with no colour track of its own gets a neutral one (white, full
+                // alpha — mathematically identity, so nothing renders differently). It exists so the
+                // glow has something to animate later: M2GlowPulseWriter turns a colour record's
+                // constant alpha into a global-sequence breath, and it can only do that to a record
+                // that exists. Measured need: Axe_2h_OutlandRaid_D_04's two additive glow passes both
+                // arrive with ColorIndex -1, so without this the axe's glow could never move.
+                ColorIndex = sp.RestColor is null && sp.BlendMode is 3 or 4 ? (short)0 : sp.ColorIndex,
+                RestColor = sp.RestColor is not null
+                    ? new WeaponRestColor(sp.RestColor.Rgb, sp.RestColor.Alpha, sp.RestColor.AnimationFrozen)
+                    : sp.BlendMode is 3 or 4 ? NeutralGlowColor : null,
                 TextureBindings = bindings,
             });
 
@@ -162,11 +183,11 @@ public static class TbcWeaponMeshExtractor
         int layered = weaponPasses.Count - weaponPasses.Select(p => p.SubmeshSlot).Distinct().Count();
         int multiTexture = weaponPasses.Count(p => p.TextureBindings is { Count: > 1 });
         int glow = weaponPasses.Count(p => p.BlendMode is 3 or 4);
-        diag.Info("tbc.passes.preserved",
+        diag.Info("import.passes.preserved",
             $"Preserved {weaponPasses.Count} source batch(es) over {ranges.Count} submesh(es) in source draw order " +
             $"({layered} overlay, {glow} additive, {multiTexture} multi-texture).");
 
-        return new TbcExtractResult
+        return new LegacyExtractResult
         {
             Mesh = new RigidWeaponMesh
             {
@@ -190,13 +211,91 @@ public static class TbcWeaponMeshExtractor
                     Method = "tbc-import passthrough — source geometry and render-batch order preserved",
                 },
             },
-            SourceTextures = textureSlots.Select(t => new TbcSourceTexture
+            SourceTextures = textureSlots.Select(t => new LegacySourceTexture
             {
                 SourcePath = t.Path,
                 Flags = t.Flags,
                 SourceType = t.Type,
             }).ToList(),
         };
+    }
+
+    /// <summary>Identity colour (white, opaque) handed to additive passes that carry no colour track
+    /// of their own, purely so a pulse has a record to animate. One shared instance: the writer
+    /// de-duplicates rest colours by value, so every glow pass on a model lands on ONE track and
+    /// breathes together rather than each drifting on its own phase.</summary>
+    private static readonly WeaponRestColor NeutralGlowColor = new(System.Numerics.Vector3.One, 1f, false);
+
+    // ── Emitter baking ───────────────────────────────────────────────────
+    // Vanilla's donor scaffold cannot host a later-client particle emitter graph, so the visible part of
+    // each emitter — "a glowing thing of this texture, this colour, this size, at this spot" — is
+    // baked into static geometry: a cross of three additive quads (XY/XZ/YZ planes) centred on the
+    // emitter position, sized from the particle scale, textured with the emitter's own (hardcoded)
+    // texture tile and tinted with its colour through a rest colour track. Static, not animated, but
+    // glowing eyes glow and shoulder braziers burn on every import, armor and weapons alike.
+    private static List<BakedSprite> BakeEmitterSprites(M2Model m2, List<SourcePass> passes, List<SourceTexture> textures, ForgeDiagnostics diag)
+    {
+        if (m2.ParticleEmitters.Count == 0 || m2.Submeshes.Count == 0) return new List<BakedSprite>();
+        int baked = 0, skipped = 0;
+        int colourBase = checked((int)m2.ColorTrackCount) + 1000;
+        var bakedSprites = new List<BakedSprite>();
+        foreach (var e in m2.ParticleEmitters)
+        {
+            if (string.IsNullOrWhiteSpace(e.TextureName)) { skipped++; continue; }     // replaceable / unnamed: nothing to sample
+            float half = MathF.Max(0.02f, MathF.Min(0.6f, e.Scale * 0.6f));
+            var tex = new SourceTexture(e.TextureName, 0, 0);
+            if (!textures.Contains(tex)) textures.Add(tex);
+            ushort blend = e.BlendMode <= 6 ? e.BlendMode : (ushort)4;
+            if (blend == 0) blend = 4;                                                  // opaque particles read as glows in practice
+            var rgb = e.ColorRgb is { } c ? new Vector3(Math.Clamp(c.X, 0, 255) / 255f, Math.Clamp(c.Y, 0, 255) / 255f, Math.Clamp(c.Z, 0, 255) / 255f) : Vector3.One;
+            bakedSprites.Add(new BakedSprite(e.Position, half, tex, blend, rgb, Math.Max(1, e.TileRows), Math.Max(1, e.TileCols), colourBase + baked));
+            baked++;
+        }
+        if (baked == 0) { if (skipped > 0) diag.Info("import.emitters.bake.skipped", $"{skipped} emitter(s) had no hardcoded texture to bake."); return bakedSprites; }
+
+        // Each sprite becomes its own synthetic source submesh (index beyond the real table) so the
+        // compaction loop below copies its vertices from this side table.
+        int firstSynthetic = m2.Submeshes.Count;
+        for (int i = 0; i < bakedSprites.Count; i++)
+        {
+            var sp = bakedSprites[i];
+            passes.Add(new SourcePass(
+                passes.Count + 100000 + i,           // after every real batch in draw order
+                firstSynthetic + i,
+                0x10, 0, 0,
+                (short)sp.ColourIndex,
+                new M2RestColor(sp.Rgb, 1f, false),
+                0x15,                                // unlit | two-sided | no depth write — a glow
+                sp.Blend,
+                0,
+                new[] { new SourceBinding(sp.Texture, 0, 1f, ushort.MaxValue, null) }));
+        }
+        diag.Info("import.emitters.baked", $"{baked} particle emitter(s) baked as static additive glow sprites (cross-quads at the emitter positions, emitter texture + colour)." + (skipped > 0 ? $" {skipped} skipped (no hardcoded texture)." : ""));
+        return bakedSprites;
+    }
+
+    private sealed record BakedSprite(Vector3 Position, float Half, SourceTexture Texture, ushort Blend, Vector3 Rgb, int TileRows, int TileCols, int ColourIndex);
+
+    /// <summary>Geometry of one baked sprite: three unit-square cross quads (XY, XZ, YZ) = 12 verts / 6 tris.</summary>
+    private static (Vector3[] Pos, Vector3[] Nrm, Vector2[] Uv, uint[] Idx) SpriteGeometry(BakedSprite sp)
+    {
+        float h = sp.Half; var c = sp.Position;
+        float u1 = 1f / sp.TileCols, v1 = 1f / sp.TileRows;           // first tile of an atlas, whole image otherwise
+        var pos = new List<Vector3>(12); var nrm = new List<Vector3>(12); var uv = new List<Vector2>(12); var idx = new List<uint>(18);
+        void Quad(Vector3 a, Vector3 b, Vector3 n)   // a,b = the two in-plane half axes
+        {
+            uint s = (uint)pos.Count;
+            pos.Add(c - a - b); uv.Add(new Vector2(0, v1));
+            pos.Add(c + a - b); uv.Add(new Vector2(u1, v1));
+            pos.Add(c + a + b); uv.Add(new Vector2(u1, 0));
+            pos.Add(c - a + b); uv.Add(new Vector2(0, 0));
+            for (int k = 0; k < 4; k++) nrm.Add(n);
+            idx.AddRange(new[] { s, s + 1, s + 2, s, s + 2, s + 3 });
+        }
+        Quad(new Vector3(h, 0, 0), new Vector3(0, h, 0), Vector3.UnitZ);
+        Quad(new Vector3(h, 0, 0), new Vector3(0, 0, h), Vector3.UnitY);
+        Quad(new Vector3(0, 0, h), new Vector3(0, h, 0), Vector3.UnitX);
+        return (pos.ToArray(), nrm.ToArray(), uv.ToArray(), idx.ToArray());
     }
 
     private static WeaponRestTextureTransform CopyTextureTransform(M2RestTextureTransform source) =>
@@ -236,7 +335,7 @@ public static class TbcWeaponMeshExtractor
     {
         if (m2.Batches.Count == 0 || m2.Submeshes.Count == 0)
         {
-            diag.Info("tbc.batches.none", "No batch/submesh tables — importing the whole triangle list as opaque.");
+            diag.Info("import.batches.none", "No batch/submesh tables — importing the whole triangle list as opaque.");
             return null;
         }
 
@@ -308,39 +407,39 @@ public static class TbcWeaponMeshExtractor
         {
             var batch = m2.Batches[sourceOrder];
             if (batch.SubmeshIndex >= m2.Submeshes.Count)
-                return Fatal("tbc.batch.submesh",
+                return Fatal("import.batch.submesh",
                     $"Batch {sourceOrder} references submesh {batch.SubmeshIndex}, outside the submesh table (count {m2.Submeshes.Count}).");
 
             if (batch.MaterialIndex >= m2.RenderFlags.Count)
-                return Fatal("tbc.batch.material",
+                return Fatal("import.batch.material",
                     $"Batch {sourceOrder} references render flag {batch.MaterialIndex}, outside the render-flag table (count {m2.RenderFlags.Count}).");
             M2RenderFlag rf = m2.RenderFlags[batch.MaterialIndex];
 
             M2RestColor? restColor = null;
             if (batch.ColorIndex < -1)
-                return Fatal("tbc.color.sentinel",
+                return Fatal("import.color.sentinel",
                     $"Batch {sourceOrder} has invalid color index {batch.ColorIndex}; only -1 denotes no color track.");
             if (batch.ColorIndex >= 0)
             {
                 int colorIndex = batch.ColorIndex;
                 if ((uint)colorIndex >= m2.ColorTrackCount)
-                    return Fatal("tbc.color.index",
+                    return Fatal("import.color.index",
                         $"Batch {sourceOrder} references color {colorIndex}, outside the color table (count {m2.ColorTrackCount}).");
                 if (m2.RestColorErrors.TryGetValue(colorIndex, out string? colorError))
-                    return Fatal("tbc.color.track",
+                    return Fatal("import.color.track",
                         $"Batch {sourceOrder} references malformed color {colorIndex}: {colorError}.");
                 if (!m2.ReachableRestColors.TryGetValue(colorIndex, out restColor))
-                    return Fatal("tbc.color.missing",
+                    return Fatal("import.color.missing",
                         $"Batch {sourceOrder} references color {colorIndex}, but no validated rest sample was decoded.");
             }
 
             int unitCount = batch.TextureCount;
             if (unitCount == 0)
-                return Fatal("tbc.texture.units.zero",
+                return Fatal("import.texture.units.zero",
                     $"Batch {sourceOrder} declares zero texture units; the fidelity writer cannot represent an untextured batch without fabricating a binding.");
 
             if ((long)batch.TextureIndex + unitCount > m2.TextureLookup.Count)
-                return Fatal("tbc.texture.span",
+                return Fatal("import.texture.span",
                     $"Batch {sourceOrder} declares {unitCount} texture unit(s) at texture-combo {batch.TextureIndex}, outside the texture lookup (count {m2.TextureLookup.Count}).");
             if (!HasDeclaredSpan(m2.TextureCoordinateLookup, batch.TextureCoordinateIndex, unitCount))
                 return Fatal("tbc.texture.coordinate-span",
@@ -360,14 +459,14 @@ public static class TbcWeaponMeshExtractor
             if (weight != ushort.MaxValue)
             {
                 if (weight >= m2.TransparencyStaticAlphas.Count)
-                    return Fatal("tbc.texture.weight",
+                    return Fatal("import.texture.weight",
                         $"Batch {sourceOrder}: transparency combo resolves track {weight}, outside the transparency table (count {m2.TransparencyStaticAlphas.Count}).");
                 if (m2.TransparencyStaticAlphaErrors.TryGetValue(weight, out string? alphaError))
                     return Fatal("tbc.texture.alpha-track",
                         $"Batch {sourceOrder}: transparency track {weight} is malformed: {alphaError}.");
                 batchStaticAlpha = m2.TransparencyStaticAlphas[weight];
                 if (!float.IsFinite(batchStaticAlpha))
-                    return Fatal("tbc.texture.alpha",
+                    return Fatal("import.texture.alpha",
                         $"Batch {sourceOrder}: transparency track {weight} has a non-finite static alpha.");
                 if (m2.FrozenTransparencyTracks.Contains(weight))
                     frozenTransparencyTracks.Add(weight);
@@ -377,7 +476,7 @@ public static class TbcWeaponMeshExtractor
             for (int unit = 0; unit < unitCount; unit++)
             {
                 if (!TryResolveTexture(batch, unit, out var texture, out string? textureError))
-                    return Fatal("tbc.texture.resolve",
+                    return Fatal("import.texture.resolve",
                         $"Batch {sourceOrder}, texture unit {unit}: {textureError}.");
 
                 ushort coordinate = ResolveOptionalLookup(
@@ -389,7 +488,7 @@ public static class TbcWeaponMeshExtractor
                 if (transform != ushort.MaxValue)
                 {
                     if (transform >= m2.TextureTransformCount)
-                        return Fatal("tbc.texture.transform",
+                        return Fatal("import.texture.transform",
                             $"Batch {sourceOrder}, texture unit {unit}: transform combo resolves record {transform}, outside the UV-transform table (count {m2.TextureTransformCount}).");
                     if (m2.RestTextureTransformErrors.TryGetValue(transform, out string? transformError))
                         return Fatal("tbc.texture.transform-track",
@@ -422,14 +521,14 @@ public static class TbcWeaponMeshExtractor
         }
 
         if (frozenTransparencyTracks.Count > 0)
-            diag.Warn("tbc.transparency.frozen",
+            diag.Warn("import.transparency.frozen",
                 $"{frozenTransparencyTracks.Count} animated transparency track(s) were frozen at their deterministic rest value for vanilla output.");
 
         // Slot zero is the image used by the largest ordinary surface, because ItemDisplayInfo can
         // provide exactly one replaceable weapon texture. Remaining distinct source images/flag
         // combinations become hardcoded Type-0 effect slots in first-use order.
         var dominant = passes
-            .Where(p => p.BlendMode <= 2 && p.Bindings.Count > 0)
+            .Where(p => p.BlendMode <= 2 && p.Bindings.Count > 0 && p.SrcSubmesh < m2.Submeshes.Count)
             .OrderByDescending(p => m2.Submeshes[p.SrcSubmesh].IndexCount)
             .ThenBy(p => p.SourceOrder)
             .Select(p => p.Bindings[0].Texture)
@@ -441,12 +540,12 @@ public static class TbcWeaponMeshExtractor
             if (!textures.Contains(binding.Texture)) textures.Add(binding.Texture);
 
         if (dominant.Path is not null)
-            diag.Info("tbc.texture.hardcoded", $"Dominant surface samples hardcoded texture '{dominant.Path}'; its pixels become the display texture.");
+            diag.Info("import.texture.hardcoded", $"Dominant surface samples hardcoded texture '{dominant.Path}'; its pixels become the display texture.");
         return new PassPlan(passes, textures);
     }
 
     /// <summary>Fallback for models with no batch table: whole triangle list, one opaque pass.</summary>
-    private static TbcExtractResult? ExtractSinglePass(M2Model m2, ForgeDiagnostics diag)
+    private static LegacyExtractResult? ExtractSinglePass(M2Model m2, ForgeDiagnostics diag)
     {
         int n = m2.Vertices.Count;
         var pos = new Vector3[n];
@@ -473,7 +572,7 @@ public static class TbcWeaponMeshExtractor
         }
         if (kept.Count == 0) return null;
 
-        return new TbcExtractResult
+        return new LegacyExtractResult
         {
             Mesh = new RigidWeaponMesh
             {
@@ -491,22 +590,22 @@ public static class TbcWeaponMeshExtractor
                     Method = "tbc-import fallback — no usable batch table",
                 },
             },
-            SourceTextures = [new TbcSourceTexture { SourcePath = null, Flags = 0, SourceType = 2 }],
+            SourceTextures = [new LegacySourceTexture { SourcePath = null, Flags = 0, SourceType = 2 }],
         };
     }
 }
 
 /// <summary>One source image used by an extracted TBC render graph. A null path means the item
 /// display's replaceable weapon texture; otherwise it is a hardcoded TBC MPQ member.</summary>
-public sealed record TbcSourceTexture
+public sealed record LegacySourceTexture
 {
     public required string? SourcePath { get; init; }
     public required uint Flags { get; init; }
     public required uint SourceType { get; init; }
 }
 
-public sealed record TbcExtractResult
+public sealed record LegacyExtractResult
 {
     public required RigidWeaponMesh Mesh { get; init; }
-    public required List<TbcSourceTexture> SourceTextures { get; init; }
+    public required List<LegacySourceTexture> SourceTextures { get; init; }
 }

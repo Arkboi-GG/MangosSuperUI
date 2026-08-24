@@ -606,7 +606,7 @@ public partial class PaletteSwapService
         CancellationToken ct = default, string theory = "fan",
         float tierKd = 0f, float tierKu = 0f, float tierM = 0f, float tierPop = 0f,
         float swapBudget = 1.01f, float hueLeash = 180f,
-        ValueSettings value = default)
+        ValueSettings value = default, float? baseHueOverride = null)
     {
         await Task.Yield();
 
@@ -633,7 +633,10 @@ public partial class PaletteSwapService
             }
 
             var rng = new Random(seed);
-            float baseHue = (float)(rng.NextDouble() * 360.0);
+            // The user-picked primary hue (the majority colour they chose) anchors the whole palette;
+            // BuildSeededTargets fans every other family around it. Falls back to the stable per-seed
+            // random hue when no primary is chosen (the original contact-sheet behaviour).
+            float baseHue = baseHueOverride is float h ? ((h % 360f) + 360f) % 360f : (float)(rng.NextDouble() * 360.0);
 
             var resolved = new List<(string Family, TargetColor Target)>();
             bool themed = !string.IsNullOrEmpty(theory) && theory != "fan";

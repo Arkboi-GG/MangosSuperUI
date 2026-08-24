@@ -1,4 +1,4 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -7,6 +7,7 @@ using SkiaSharp;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
 using MangosSuperUI.Services.WeaponForge;
+using MangosSuperUI.Services.WeaponForge.Motion;
 using MangosSuperUI.Services.WeaponForge.RawM2;
 using Microsoft.AspNetCore.Mvc;
 
@@ -35,8 +36,7 @@ public class WeaponForgeController : Controller
     private readonly CustomWeaponBuildService _builder;
     private readonly GlbWeaponImporter _glbImporter;
     private readonly WeaponDonorResolver _donors;
-    private readonly TbcMpqSource _tbc;
-    private readonly TbcItemCatalog _tbcItems;
+    private readonly LegacyImportSources _sources;
     private readonly ConnectionFactory _db;
     private readonly DbcService _dbc;
     private readonly VanillaItemSpellCatalog _itemSpells;
@@ -63,7 +63,7 @@ public class WeaponForgeController : Controller
 
     public WeaponForgeController(MpqReaderService mpq, WeaponPreviewService preview,
         CustomWeaponBuildService builder, GlbWeaponImporter glbImporter, WeaponDonorResolver donors,
-        TbcMpqSource tbc, TbcItemCatalog tbcItems, ConnectionFactory db, DbcService dbc,
+        LegacyImportSources sources, ConnectionFactory db, DbcService dbc,
         VanillaItemSpellCatalog itemSpells,
         ILogger<WeaponForgeController> logger)
     {
@@ -72,8 +72,7 @@ public class WeaponForgeController : Controller
         _builder = builder;
         _glbImporter = glbImporter;
         _donors = donors;
-        _tbc = tbc;
-        _tbcItems = tbcItems;
+        _sources = sources;
         _db = db;
         _dbc = dbc;
         _itemSpells = itemSpells;
@@ -273,7 +272,12 @@ public class WeaponForgeController : Controller
         object? secondHand = null;
         if (profile.SecondHandFraction is { } fraction)
         {
-            float x2 = fraction * len;
+            // The off-hand grips the handle BEHIND the main hand (toward the pommel/butt), i.e. at
+            // negative X in weapon space — never out on the guard or blade. Keep the band on the
+            // geometry that actually exists behind the palm (a model whose origin sits near its
+            // back end has almost no handle there; the band then hugs what little there is).
+            float behind = MathF.Max(0f, -minX);
+            float x2 = -MathF.Min(fraction * len, behind * 0.85f);
             secondHand = new { x = x2, radius = RadiusAt(x2) };
         }
 
@@ -293,8 +297,18 @@ public class WeaponForgeController : Controller
                        : profile.IsRanged
                        ? "Green band = hand on the weapon (model origin, exact) — bows grip at the centre of the limbs, guns/crossbows at the trigger grip, thrown/wands at the handle."
                        : "Green band = main-hand palm (model origin, exact).") +
-                   (secondHand is not null ? " Blue band ≈ off-hand zone (animation-placed, approximate)." : ""),
+                   (secondHand is not null ? " Blue band ≈ off-hand on the handle behind the main hand (the character animation places it; approximate)." : ""),
         };
+    }
+
+    private object DeployedPatchJson()
+    {
+        try
+        {
+            var (configured, canonicalExists, deployedExists, stale, message) = _builder.DeployedPatchStatus();
+            return new { configured, canonicalExists, deployedExists, stale, message };
+        }
+        catch (Exception ex) { return new { configured = false, canonicalExists = false, deployedExists = false, stale = false, message = ex.Message }; }
     }
 
     /// <summary>GET /WeaponForge — the Item Assets import page (Game Development).</summary>
@@ -377,6 +391,7 @@ public class WeaponForgeController : Controller
             fixtureVerified = DonorItemTemplateFixture.Verify(),
             fixtureSha = DonorItemTemplateFixture.ExpectedSha256,
             coordinateContractVersion = CoordinateContract.Version,
+            deployedPatch = DeployedPatchJson(),
             donorM2Found = donorM2 is not null,
             donorM2Bytes = donorM2?.Length ?? 0,
             donorBlpFound = donorBlp is not null,
@@ -668,7 +683,7 @@ public class WeaponForgeController : Controller
         bool reorient = true,
         int targetTriangles = 500, float rollDegrees = 0f, bool flipGripEnd = false, bool straightenBlade = false,
         int bladeProfile = 0, int brightness = 0, int saturation = 0, string? itemConfig = null,
-        GlbShapeControls? shape = null)
+        GlbShapeControls? shape = null, int itemVisual = 0)
     {
         var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
             itemConfig, HttpContext.RequestAborted);
@@ -713,6 +728,15 @@ public class WeaponForgeController : Controller
 
         try
         {
+            // A GLB carries no ItemVisual of its own, so the picker is the only source; 0 = no glow,
+            // which is the default. Anchors come from the imported geometry rather than the donor's
+            // (see SpreadGlowAnchors) so the glow lands on what was actually imported.
+            uint glow = itemVisual > 0 ? (uint)itemVisual : 0u;
+            if (glow != 0)
+                import.Diagnostics.Info("visual.chosen",
+                    $"Enchant-style glow: ItemVisual {glow} ({ItemVisualSuggester.Find(glow)?.Label ?? "custom"}), " +
+                    "anchored along the imported mesh. Glows render in-game only.");
+
             var result = await _builder.BuildAsync(new CustomWeaponBuildRequest
             {
                 Name = configuredItem?.Name ?? name,
@@ -724,10 +748,12 @@ public class WeaponForgeController : Controller
                 Topology = WeaponTopologyMode.Variable,
                 TexturePng = AdjustTexture(import.TexturePng, brightness, saturation),
                 SourceBlob = bytes,
+                ItemVisual = glow,
+                AttachmentPointsWoW = glow != 0 ? SpreadGlowAnchors(mesh) : null,
                 GeneratorParamsJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reorient, targetTriangles, rollDegrees, flipGripEnd, straightenBlade, bladeProfile,
-                    brightness, saturation,
+                    brightness, saturation, itemVisual = (int)glow,
                     shape = shape ?? new GlbShapeControls(),
                     donorDisplayRow = donor.DisplayRow,
                     donorExtent = donor.ExtentX,
@@ -753,8 +779,13 @@ public class WeaponForgeController : Controller
     {
         var (m2, blp, effects) = await LoadForgedBytesAsync(displayId);
         if (m2 is null) return NotFound(new { ok = false, error = $"No stored M2 for display id {displayId}." });
-        var preview = _preview.RenderFromBytes(m2, blp, effects);
-        return Json(new { ok = preview.Ok, preview, hasTexture = blp is { Length: > 0 }, displayId });
+
+        // The forged weapon's enchant glow is an ItemVisual on its display row, not anything in the
+        // stored M2 — resolve it so the preview shows what the client will.
+        var host = M2Reader.Parse(m2);
+        uint visualId = _dbc.GetItemModelInfo((uint)displayId)?.ItemVisualId ?? 0;
+        var preview = _preview.RenderFromBytes(m2, blp, effects, ResolveVisualEffects(visualId, host));
+        return Json(new { ok = preview.Ok, preview, hasTexture = blp is { Length: > 0 }, displayId, itemVisual = visualId });
     }
 
     /// <summary>Load a forged weapon's compiled M2 (+ BLP + effect textures) from the registry
@@ -815,75 +846,104 @@ public class WeaponForgeController : Controller
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // TBC IMPORT (WeaponForge:TbcDataPath — Settings page)
+    // LATER-CLIENT IMPORT — TBC (WeaponForge:TbcDataPath) and WotLK
+    // (WeaponForge:WotlkDataPath), both set on the Settings page.
     //
-    // A TBC weapon is NOT byte-compatible with the 1.12 client (M2 v260–263 vs
-    // the required v256), but it doesn't need a converter either: the lossy web
-    // M2Reader parses anything below v264, so the TBC model is read into a mesh
-    // (positions/normals/UV0/triangles, already palm-at-origin in WoW space) and
-    // fed through the exact pipeline a GLB import uses — re-emitted as a genuine
-    // vanilla v256 on the family donor scaffold, its TBC BLP decoded to PNG and
-    // re-encoded. Models are addressed by their stem and resolved through the
-    // server-built index — raw MPQ paths are never accepted from the client.
+    // A TBC/WotLK weapon is NOT byte-compatible with the 1.12 client (M2
+    // v260–263 / v264 + external .skin vs the required v256), but it doesn't
+    // need a converter either: LegacyMpqSource.LoadM2 parses either layout
+    // into the same M2Model (positions/normals/UV0/triangles, already
+    // palm-at-origin in WoW space, plus the rest-pose material graph), and the
+    // mesh is fed through the exact pipeline a GLB import uses — re-emitted as
+    // a genuine vanilla v256 on the family donor scaffold, its BLP2 textures
+    // carried byte-for-byte. Models are addressed by their stem and resolved
+    // through the server-built index — raw MPQ paths are never accepted from
+    // the client. Every public endpoint below exists per lane (Tbc* / Wotlk*)
+    // and as an `expansion=` form; all of them share one implementation.
     // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>GET /WeaponForge/TbcStatus — mount state of the configured TBC Data folder plus
     /// the shipped item-name catalog join.</summary>
     [HttpGet]
-    public IActionResult TbcStatus()
+    public IActionResult TbcStatus() => LegacyStatus(_sources.Tbc);
+
+    /// <summary>GET /WeaponForge/WotlkStatus — same for the WotLK (3.3.5a) Data folder.</summary>
+    [HttpGet]
+    public IActionResult WotlkStatus() => LegacyStatus(_sources.Wotlk);
+
+    /// <summary>GET /WeaponForge/ImportStatus?expansion=tbc|wotlk — lane-keyed form.</summary>
+    [HttpGet]
+    public IActionResult ImportStatus(string? expansion = null) => LegacyStatus(_sources.Get(expansion));
+
+    private IActionResult LegacyStatus(LegacyImportSource src)
     {
-        var (configured, path, archiveCount, error) = _tbc.Status();
+        var (configured, path, archiveCount, error) = src.Mpq.Status();
         int weaponCount = 0, itemCount = 0;
         if (configured && error is null)
         {
             try
             {
-                var index = _tbc.WeaponIndex();
+                var index = src.Mpq.WeaponIndex();
                 weaponCount = index.Count;
                 var rows = index.Select(w => w.DisplayRow).ToHashSet();
-                itemCount = _tbcItems.Items.Count(i => TbcItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass) is not null && rows.Contains(i.DisplayId));
+                itemCount = src.Items.Items.Count(i => LegacyItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass) is not null && rows.Contains(i.DisplayId));
             }
             catch (Exception ex) { error = ex.Message; }
         }
         return Json(new
         {
+            expansion = src.Key,
+            label = src.Label,
             configured,
             path,
             archiveCount,
             weaponCount,
             itemCount,
-            catalogItems = _tbcItems.Items.Count,
+            catalogItems = src.Items.Items.Count,
             error,
-            note = "Set the TBC client Data path on the Settings page (Weapon Forge section).",
+            note = $"Set the {src.Label} client Data path on the Settings page (Weapon Forge section).",
         });
     }
 
     /// <summary>GET /WeaponForge/TbcWeapons?search=&amp;page=&amp;pageSize= — paged browse. When the
-    /// shipped item catalog is present, rows are real TBC ITEMS (name/quality/ilvl, joined to the
-    /// mounted archives by display id, weapon type pre-mapped from the TBC subclass); without it,
+    /// shipped item catalog is present, rows are real ITEMS (name/quality/ilvl, joined to the
+    /// mounted archives by display id, weapon type pre-mapped from the subclass); without it,
     /// the browse degrades to raw model stems.</summary>
     [HttpGet]
-    public IActionResult TbcWeapons(string? search = null, int page = 1, int pageSize = 60)
+    public IActionResult TbcWeapons(string? search = null, int page = 1, int pageSize = 60) =>
+        LegacyWeapons(_sources.Tbc, search, page, pageSize);
+
+    /// <summary>GET /WeaponForge/WotlkWeapons — the WotLK browse (same shape as TbcWeapons).</summary>
+    [HttpGet]
+    public IActionResult WotlkWeapons(string? search = null, int page = 1, int pageSize = 60) =>
+        LegacyWeapons(_sources.Wotlk, search, page, pageSize);
+
+    /// <summary>GET /WeaponForge/ImportWeapons?expansion=tbc|wotlk&amp;search=… — lane-keyed form.</summary>
+    [HttpGet]
+    public IActionResult ImportWeapons(string? expansion = null, string? search = null, int page = 1, int pageSize = 60) =>
+        LegacyWeapons(_sources.Get(expansion), search, page, pageSize);
+
+    private IActionResult LegacyWeapons(LegacyImportSource src, string? search, int page, int pageSize)
     {
-        IReadOnlyList<TbcWeaponEntry> index;
-        try { index = _tbc.WeaponIndex(); }
-        catch (Exception ex) { return Json(new { ok = false, error = ex.Message }); }
+        IReadOnlyList<LegacyWeaponEntry> index;
+        try { index = src.Mpq.WeaponIndex(); }
+        catch (Exception ex) { return Json(new { ok = false, expansion = src.Key, error = ex.Message }); }
 
         pageSize = Math.Clamp(pageSize, 10, 200);
         string s = search?.Trim() ?? "";
 
         var byRow = index.ToDictionary(w => w.DisplayRow, w => w);
 
-        // Item mode: shipped names joined to the user's archives. Weapons only — armor/shields
-        // ship in the catalog for the future armor import; shields (class 4 / subclass 6) are the
-        // one armor family that is forgeable.
-        var items = _tbcItems.Items
-            .Where(i => TbcItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass) is not null &&
+        // Item mode: shipped names joined to the user's archives. Weapons only — armor ships in the
+        // catalog for the Armor Forge; shields (class 4 / subclass 6) are the one armor family that
+        // is forgeable here.
+        var items = src.Items.Items
+            .Where(i => LegacyItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass) is not null &&
                         byRow.ContainsKey(i.DisplayId))
             .ToList();
         if (items.Count > 0)
         {
-            IEnumerable<TbcItemInfo> filtered = items;
+            IEnumerable<LegacyItemInfo> filtered = items;
             if (s.Length > 0)
                 filtered = items.Where(i =>
                     i.Name.Contains(s, StringComparison.OrdinalIgnoreCase) ||
@@ -898,6 +958,8 @@ public class WeaponForgeController : Controller
             return Json(new
             {
                 ok = true,
+                expansion = src.Key,
+                label = src.Label,
                 mode = "items",
                 total,
                 page,
@@ -905,7 +967,7 @@ public class WeaponForgeController : Controller
                 weapons = list.Skip((page - 1) * pageSize).Take(pageSize).Select(i =>
                 {
                     var w = byRow[i.DisplayId];
-                    string typeKey = TbcItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass)!;
+                    string typeKey = LegacyItemCatalog.TypeKeyFor(i.ItemClass, i.Subclass)!;
                     return new
                     {
                         entry = i.Entry,
@@ -925,7 +987,7 @@ public class WeaponForgeController : Controller
         }
 
         // Model-stem fallback (catalog missing, or nothing joined).
-        IEnumerable<TbcWeaponEntry> mFiltered = index;
+        IEnumerable<LegacyWeaponEntry> mFiltered = index;
         if (s.Length > 0)
             mFiltered = index.Where(w =>
                 w.ModelStem.Contains(s, StringComparison.OrdinalIgnoreCase) ||
@@ -941,6 +1003,8 @@ public class WeaponForgeController : Controller
         return Json(new
         {
             ok = true,
+            expansion = src.Key,
+            label = src.Label,
             mode = "models",
             total = mTotal,
             page,
@@ -964,10 +1028,10 @@ public class WeaponForgeController : Controller
 
     /// <summary>Resolve a client-supplied model stem (+ optional display row when one model has
     /// several texture variants) through the server-built index. Never trusts a raw path.</summary>
-    private TbcWeaponEntry? ResolveTbcEntry(string? model, uint displayRow)
+    private static LegacyWeaponEntry? ResolveLegacyEntry(LegacyImportSource src, string? model, uint displayRow)
     {
         if (string.IsNullOrWhiteSpace(model)) return null;
-        var index = _tbc.WeaponIndex();
+        var index = src.Mpq.WeaponIndex();
         if (displayRow > 0)
         {
             var byRow = index.FirstOrDefault(w => w.DisplayRow == displayRow &&
@@ -979,48 +1043,120 @@ public class WeaponForgeController : Controller
 
     /// <summary>Resolve a browse selection: a catalog item entry (preferred — carries name, quality
     /// and the subclass-mapped weapon type) or a bare model stem/display row from the fallback mode.</summary>
-    private (TbcWeaponEntry? Entry, TbcItemInfo? Item) ResolveTbcSelection(uint itemEntry, string? model, uint displayRow)
+    private static (LegacyWeaponEntry? Entry, LegacyItemInfo? Item) ResolveLegacySelection(LegacyImportSource src, uint itemEntry, string? model, uint displayRow)
     {
-        TbcItemInfo? item = itemEntry > 0 ? _tbcItems.FindByEntry(itemEntry) : null;
+        LegacyItemInfo? item = itemEntry > 0 ? src.Items.FindByEntry(itemEntry) : null;
         if (item is not null)
         {
-            var byRow = _tbc.WeaponIndex().FirstOrDefault(w => w.DisplayRow == item.DisplayId);
+            var byRow = src.Mpq.WeaponIndex().FirstOrDefault(w => w.DisplayRow == item.DisplayId);
             if (byRow is not null) return (byRow, item);
         }
-        return (ResolveTbcEntry(model, displayRow), item);
+        return (ResolveLegacyEntry(src, model, displayRow), item);
     }
 
-    /// <summary>Shared TBC extract + parse + mesh-build front half. PNGs feed the web preview;
-    /// original BLP2 bytes feed the forge so the source texture/mips/compression are not altered.</summary>
-    private (RigidWeaponMesh? Mesh, byte[]? M2Bytes, byte[]? TexturePng, List<byte[]>? EffectPngs,
-        byte[]? TextureBlp, List<byte[]>? EffectBlps, ForgeDiagnostics Diag, string? Error)
-        LoadTbcWeapon(TbcWeaponEntry entry, int targetTriangles)
+    /// <summary>
+    /// Turn a motion plan into what the previewer needs to draw the same effect: each graft plus the
+    /// decoded sheet it samples, positioned back in the preview's Y-up mesh space.
+    ///
+    /// The import preview renders an intermediate mesh, not a packaged model, so there are no forged
+    /// bytes for the GLB writer's usual emitter path to read. Without this the browse-and-preview
+    /// surface is the one place a forged effect stays invisible — which is precisely where someone is
+    /// looking when they are deciding whether an import is worth forging.
+    ///
+    /// The plan's positions are WoW space (the planner works in the coordinate frame the M2 is
+    /// written in) and already carry the placement transform, so they only need converting back.
+    /// </summary>
+    /// <summary>
+    /// An item visual resolved to loaded effect models, mounted on the host's attachment points.
+    ///
+    /// The ItemVisual is a whole third channel: the item's own bytes say nothing about it, and it is
+    /// where enchant glows, Thunderfury's lightning and a Warglaive's fire actually live. The ids the
+    /// forge deals in are always VANILLA ids (the suggester only offers ones the 1.12 client has), so
+    /// the effect models come out of the vanilla mount regardless of which lane the item came from.
+    /// </summary>
+    private IReadOnlyList<MangosSuperUI.Services.M2Fx.ItemVisualEffects.Effect>? ResolveVisualEffects(uint itemVisualId, M2Model? host)
     {
-        var diag = new ForgeDiagnostics("tbc-import");
+        if (itemVisualId == 0) return null;
+        try
+        {
+            var effects = MangosSuperUI.Services.M2Fx.ItemVisualEffects.Resolve(itemVisualId, host,
+                path => _mpq.ExtractFile(path) ?? _mpq.ExtractFile(path.ToLowerInvariant()));
+            return effects.Count > 0 ? effects : null;
+        }
+        catch { return null; }
+    }
 
-        var m2Bytes = _tbc.ExtractFile(entry.M2Path);
-        if (m2Bytes is null)
-            return (null, null, null, null, null, null, diag, $"Could not extract {entry.M2Path} from the TBC archives.");
+    private List<WeaponPreviewService.PreviewEmitter>? BuildPreviewEmitters(
+        EffectMotionPlanner.Plan plan, IReadOnlyList<Vector3> positionsWoW)
+    {
+        if (!plan.Any) return null;
 
-        var m2 = M2Reader.Parse(m2Bytes);
+        var result = new List<WeaponPreviewService.PreviewEmitter>();
+        var pngCache = new Dictionary<string, byte[]?>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var graft in plan.Grafts)
+        {
+            string path = graft.TexturePath ?? "";
+            if (path.Length == 0) continue;
+            if (!pngCache.TryGetValue(path, out var png))
+            {
+                var blp = _mpq.ExtractFile(path) ?? _mpq.ExtractFile(path.ToLowerInvariant());
+                png = blp is { Length: > 0 } ? BlpToPng(blp) : null;
+                pngCache[path] = png;
+            }
+            if (png is not { Length: > 0 }) continue;
+
+            result.Add(new WeaponPreviewService.PreviewEmitter(
+                graft, CoordinateContract.WoWToMesh(graft.PositionWoW), png));
+        }
+
+        return result.Count > 0 ? result : null;
+    }
+
+    /// <summary>Plan the animated rebuild of a source model's particle effects (see
+    /// <see cref="EffectMotionPlanner"/>). Donors come out of the live 1.12 mount, so a client that
+    /// is missing one simply yields a smaller plan instead of failing the import.</summary>
+    private EffectMotionPlanner.Plan PlanMotion(M2Model? model, IReadOnlyList<Vector3> positionsWoW, string label)
+    {
+        var emitters = model?.ParticleEmitters ?? new List<M2ParticleEmitterInfo>();
+        if (emitters.Count == 0)
+            return new EffectMotionPlanner.Plan(Array.Empty<M2EmitterTransplanter.Graft>(), Array.Empty<string>(), 0);
+        return EffectMotionPlanner.Build(emitters, positionsWoW, path => _mpq.ExtractFile(path), null, label);
+    }
+
+    /// <summary>Shared extract + parse + mesh-build front half for both lanes. PNGs feed the web
+    /// preview; original BLP2 bytes feed the forge so the source texture/mips/compression are not
+    /// altered. Model parsing is version-aware (<see cref="LegacyMpqSource.LoadM2Detailed"/>).</summary>
+    private (RigidWeaponMesh? Mesh, byte[]? M2Bytes, byte[]? TexturePng, List<byte[]>? EffectPngs,
+        byte[]? TextureBlp, List<byte[]>? EffectBlps, ForgeDiagnostics Diag, string? Error, M2Model? Model)
+        LoadLegacyWeapon(LegacyImportSource src, LegacyWeaponEntry entry, int targetTriangles)
+    {
+        var diag = new ForgeDiagnostics(src.Key + "-import");
+
+        var (m2, m2Bytes, loadError) = src.Mpq.LoadM2Detailed(entry.M2Path);
         if (m2 is null)
-            return (null, m2Bytes, null, null, null, null, diag, "The TBC M2 could not be parsed (version ≥ 264 or malformed).");
-        diag.Info("tbc.source", $"{entry.ModelStem}: M2 v{m2.Version}, {m2.Vertices.Count} verts, {m2.Indices.Count / 3} tris.");
+            return (null, m2Bytes, null, null, null, null, diag, loadError ?? $"The {src.Label} M2 could not be parsed.", null);
+        diag.Info("import.source", $"{entry.ModelStem}: {src.Label} M2 v{m2.Version}, {m2.Vertices.Count} verts, {m2.Indices.Count / 3} tris.");
 
-        var extracted = TbcWeaponMeshExtractor.Extract(m2, diag);
+        // If the effects can be rebuilt as real, moving 1.12 emitters, do NOT also bake them into
+        // static sprites — that would draw the effect twice, once alive and once as a decal.
+        bool rebuildAsMotion = PlanMotion(m2, Array.Empty<Vector3>(), entry.ModelStem).Any;
+        var extracted = LegacyWeaponMeshExtractor.Extract(m2, diag, src.Label, bakeEmitters: !rebuildAsMotion);
+        if (rebuildAsMotion)
+            diag.Info("motion.plan", $"{m2.ParticleEmitters.Count} source particle emitter(s) will be rebuilt as animated 1.12 emitters instead of static sprites.");
         if (extracted is null)
-            return (null, m2Bytes, null, null, null, null, diag, "The TBC model has no usable triangles.");
+            return (null, m2Bytes, null, null, null, null, diag, $"The {src.Label} model has no usable triangles.", m2);
         var mesh = extracted.Mesh;
 
-        // Resolve each texture slot: a hardcoded TBC path, or null = the display row's Type-2 BLP.
+        // Resolve each texture slot: a hardcoded source path, or null = the display row's Type-2 BLP.
         (byte[]? Png, byte[]? Blp) SlotTexture(string? sourcePath, string slotName)
         {
             string? path = sourcePath ?? entry.BlpPath;
-            if (path is null) { diag.Warn("tbc.texture", $"No texture source for {slotName}."); return (null, null); }
-            var blp = _tbc.ExtractFile(path);
-            if (blp is not { Length: > 0 }) { diag.Warn("tbc.texture", $"TBC BLP {path} not found ({slotName})."); return (null, null); }
+            if (path is null) { diag.Warn("import.texture", $"No texture source for {slotName}."); return (null, null); }
+            var blp = src.Mpq.ExtractFile(path);
+            if (blp is not { Length: > 0 }) { diag.Warn("import.texture", $"{src.Label} BLP {path} not found ({slotName})."); return (null, null); }
             var png = BlpToPng(blp);
-            if (png is null) diag.Warn("tbc.texture", $"TBC BLP {path} could not be decoded ({slotName}).");
+            if (png is null) diag.Warn("import.texture", $"{src.Label} BLP {path} could not be decoded ({slotName}).");
             return (png, blp);
         }
 
@@ -1028,7 +1164,7 @@ public class WeaponForgeController : Controller
         byte[]? texturePng = baseTexture.Png;
         if (texturePng is null)
             return (null, m2Bytes, null, null, baseTexture.Blp, null, diag,
-                "The TBC weapon's required base texture is unavailable; fidelity mode will not substitute the donor texture.");
+                $"The {src.Label} weapon's required base texture is unavailable; fidelity mode will not substitute the donor texture.", m2);
         List<byte[]>? effectPngs = null;
         List<byte[]>? effectBlps = null;
         if (extracted.SourceTextures.Count > 1 && mesh.Passes is not null)
@@ -1040,38 +1176,307 @@ public class WeaponForgeController : Controller
                 var effect = SlotTexture(extracted.SourceTextures[s].SourcePath, $"effect slot {s}");
                 if (effect.Png is null || effect.Blp is null)
                     return (null, m2Bytes, texturePng, null, baseTexture.Blp, null, diag,
-                        $"The TBC weapon's required texture slot {s} is unavailable; fidelity mode will not drop its render pass.");
+                        $"The {src.Label} weapon's required texture slot {s} is unavailable; fidelity mode will not drop its render pass.", m2);
                 effectPngs.Add(effect.Png);
                 effectBlps.Add(effect.Blp);
             }
         }
 
-        // TBC imports are fidelity-first. Decimation merges submeshes and destroys the source
-        // batch/pass structure that carries cutouts, overlays and glow, so the legacy triangle
+        // Later-client imports are fidelity-first. Decimation merges submeshes and destroys the
+        // source batch/pass structure that carries cutouts, overlays and glow, so the legacy triangle
         // target is intentionally ignored on this route. Arbitrary GLB imports retain their
         // separate 1,000-triangle authoring policy.
         if (targetTriangles > 0)
             diag.Info("tbc.fidelity.target-ignored",
-                $"Triangle target {targetTriangles:N0} ignored in TBC fidelity mode; preserved all {mesh.TriangleCount:N0} source triangles and render passes.");
+                $"Triangle target {targetTriangles:N0} ignored in {src.Label} fidelity mode; preserved all {mesh.TriangleCount:N0} source triangles and render passes.");
 
-        return (mesh, m2Bytes, texturePng, effectPngs, baseTexture.Blp, effectBlps, diag, null);
+        return (mesh, m2Bytes, texturePng, effectPngs, baseTexture.Blp, effectBlps, diag, null, m2);
+    }
+
+    /// <summary>Five enchant/glow anchors (attachment ids 0..4) spread evenly along a mesh's long
+    /// axis, hilt to tip, inset a tenth of the length at each end so the outermost glows sit on the
+    /// weapon instead of floating past it. Laterally they ride the model's centreline.
+    ///
+    /// A vanilla glow visual fills all five ItemVisuals slots, so this is what decides whether the
+    /// glow reads as an enchant running the length of the weapon or as a lump in one place. GLB
+    /// imports have no anchors of their own and would otherwise inherit the donor scaffold's, which
+    /// sit on the donor's blade — a different length and shape from whatever was imported.</summary>
+    private static Dictionary<uint, Vector3> SpreadGlowAnchors(RigidWeaponMesh mesh)
+    {
+        float minX = mesh.Positions.Min(v => v.X), maxX = mesh.Positions.Max(v => v.X);
+        float span = MathF.Max(maxX - minX, 1e-4f);
+        float lo = minX + 0.10f * span, hi = maxX - 0.10f * span;
+        float cy = (mesh.Positions.Min(v => v.Y) + mesh.Positions.Max(v => v.Y)) * 0.5f;
+        float cz = (mesh.Positions.Min(v => v.Z) + mesh.Positions.Max(v => v.Z)) * 0.5f;
+        var points = new Dictionary<uint, Vector3>();
+        for (uint id = 0; id <= 4; id++)
+            points[id] = CoordinateContract.MeshToWoW(new Vector3(lo + (hi - lo) * (id / 4f), cy, cz));
+        return points;
+    }
+
+    /// <summary>Owner hand placement + enchant-glow decision shared by preview and forge. The source
+    /// geometry is exact by default (measured: later-client weapons are authored to the same palm
+    /// convention as vanilla); <see cref="LegacyPlacement"/> only moves things when the controls say so.
+    /// Source attachment points (enchant/glow anchors 0..4) ride along with the mesh.
+    ///
+    /// The glow itself comes from whichever source actually carries it, in this order when the owner
+    /// leaves the picker on Auto:
+    ///
+    ///   1. the source weapon's OWN <c>ItemDisplayInfo.ItemVisual</c>, mapped onto 1.12 by
+    ///      <see cref="ItemVisualSuggester.MapLaterClientVisual"/> — usually an exact copy, and by far
+    ///      the most common case (890 of 7,515 TBC weapon rows, 1,356 of 10,062 WotLK ones);
+    ///   2. failing that, the nearest vanilla glow for the model's particle emitters.
+    ///
+    /// <paramref name="spreadGlowAnchors"/> overrides where the glow hangs. Vanilla glow visuals fill
+    /// all five slots, so the look depends entirely on where anchors 0..4 sit — and plenty of source
+    /// models bunch all five in one spot (Axe_2h_OutlandRaid_D_04 puts them at X 0.773-0.982 of a
+    /// -0.560..1.200 model, i.e. all on the head). Spreading them evenly along the long axis gives the
+    /// vanilla hilt-to-tip enchant look instead of five blobs in one place.</summary>
+    private static (RigidWeaponMesh Mesh, Dictionary<uint, Vector3> AttachmentsWoW, float SourceGripPercent,
+        ItemVisualSuggester.Suggestion? Suggestion, uint ItemVisual, object ParticleInfo, List<Vector3> EmitterPositionsWoW)
+        PlaceLegacyWeapon(RigidWeaponMesh mesh, M2Model? model, GlbShapeControls? shape, bool flipGripEnd, int itemVisual,
+            ForgeDiagnostics diag, LegacyItemVisualIndex? sourceVisuals = null, uint sourceDisplayRow = 0,
+            bool spreadGlowAnchors = false)
+    {
+        float sourceGrip = LegacyPlacement.GripFraction(mesh) * 100f;
+        var srcAttachments = (model?.Attachments ?? new List<M2Attachment>())
+            .Where(a => a.Id <= 4)
+            .GroupBy(a => a.Id).Select(g => g.First())
+            .OrderBy(a => a.Id).ToList();
+        // Particle-emitter positions ride the SAME transform as the mesh and the glow anchors: an
+        // owner who resizes or re-grips the import must not leave its flames behind in mid-air.
+        var srcEmitters = model?.ParticleEmitters ?? new List<M2ParticleEmitterInfo>();
+        var toPlace = srcAttachments.Select(a => a.Position).Concat(srcEmitters.Select(e => e.Position)).ToList();
+        var (placed, pts) = LegacyPlacement.Apply(mesh, toPlace, shape, flipGripEnd, diag);
+        var attachments = new Dictionary<uint, Vector3>();
+        for (int i = 0; i < srcAttachments.Count; i++)
+            attachments[srcAttachments[i].Id] = CoordinateContract.MeshToWoW(pts[i]);
+        var emitterPositionsWoW = new List<Vector3>();
+        for (int i = 0; i < srcEmitters.Count; i++)
+            emitterPositionsWoW.Add(CoordinateContract.MeshToWoW(pts[srcAttachments.Count + i]));
+
+        // MeshToWoW keeps X, so the long axis is directly comparable across the two spaces.
+        float minX = placed.Positions.Min(p => p.X), maxX = placed.Positions.Max(p => p.X);
+        float modelSpan = MathF.Max(maxX - minX, 1e-4f);
+
+        // Missing anchors (some source models carry fewer than five) are spread along the placed
+        // model's long axis so a glow never hangs on the donor's old blade.
+        if (attachments.Count > 0 && attachments.Count < 5)
+        {
+            var known = attachments.Values.Select(v => v.X).ToList();
+            float lo = MathF.Max(minX, known.Min() - 0.25f * modelSpan), hi = MathF.Min(maxX, known.Max() + 0.25f * modelSpan);
+            var refPos = attachments.Values.First();
+            for (uint id = 0; id <= 4; id++)
+                if (!attachments.ContainsKey(id))
+                    attachments[id] = new Vector3(lo + (hi - lo) * (id / 4f), refPos.Y, refPos.Z);
+        }
+
+        // How far apart the source put its anchors, as a fraction of the weapon's length — the number
+        // that decides whether a glow reads as "along the weapon" or "a lump on the blade".
+        float anchorSpan = attachments.Count > 1
+            ? (attachments.Values.Max(v => v.X) - attachments.Values.Min(v => v.X)) / modelSpan
+            : 0f;
+        if (spreadGlowAnchors && attachments.Count > 0)
+        {
+            // Hilt to tip, inset a tenth of the length at each end so the outermost glows sit ON the
+            // weapon rather than floating off its ends.
+            float lo = minX + 0.10f * modelSpan, hi = maxX - 0.10f * modelSpan;
+            var refPos = attachments.Values.First();
+            for (uint id = 0; id <= 4; id++)
+                attachments[id] = new Vector3(lo + (hi - lo) * (id / 4f), refPos.Y, refPos.Z);
+            diag.Info("visual.anchors.spread",
+                $"Glow anchors 0..4 spread evenly from hilt to tip (the source's own anchors spanned {anchorSpan * 100f:F0}% of the weapon's length).");
+        }
+        else if (attachments.Count > 1 && anchorSpan < 0.25f)
+        {
+            diag.Info("visual.anchors.clustered",
+                $"The source's five glow anchors span only {anchorSpan * 100f:F0}% of the weapon's length, so any enchant glow bunches in one spot. " +
+                "Turn on 'spread glow along weapon' for the vanilla hilt-to-tip look.");
+        }
+
+        // Which glow? The source row's own ItemVisual first, emitters as the fallback.
+        var emitters = model?.ParticleEmitters ?? new List<M2ParticleEmitterInfo>();
+        var emitterSuggestion = ItemVisualSuggester.Suggest(emitters);
+        var (srcVisualId, srcVisualStems) = sourceVisuals?.ForDisplayRow(sourceDisplayRow) ?? (0u, (IReadOnlyList<string>)Array.Empty<string>());
+        var carried = ItemVisualSuggester.MapLaterClientVisual(srcVisualId, srcVisualStems);
+        var suggestion = carried is { ItemVisual: > 0 } ? carried : (emitterSuggestion ?? carried);
+        uint chosen = itemVisual < 0 ? (suggestion?.ItemVisual ?? 0) : (uint)itemVisual;
+
+        if (srcVisualId != 0)
+            diag.Info("visual.source",
+                $"The source display row carries ItemVisual {srcVisualId}" +
+                (srcVisualStems.Count > 0 ? $" ({string.Join(" + ", srcVisualStems.Take(3))})" : "") +
+                $" — {carried?.Reason ?? "no mapping"}.");
+        if (chosen != 0 && ItemVisualSuggester.Find(chosen) is null) { diag.Warn("visual.unknown", $"ItemVisual {chosen} is not a known 1.12 visual; using it anyway."); }
+        if (chosen != 0)
+            diag.Info("visual.chosen", $"Enchant-style glow: ItemVisual {chosen} ({ItemVisualSuggester.Find(chosen)?.Label ?? "custom"})" +
+                (itemVisual < 0 && suggestion is not null ? $" — {suggestion.Reason} ({suggestion.EmitterSummary})." : "."));
+        else if (suggestion is not null && itemVisual == 0)
+            diag.Info("visual.none", $"Source has {suggestion.EmitterSummary}; no glow chosen (suggested: {suggestion.Label}).");
+
+        object particleInfo = new
+        {
+            count = emitters.Count,
+            textures = emitters.Select(e => e.TextureName is null ? null : Path.GetFileNameWithoutExtension(e.TextureName)).Where(t => t is not null).Distinct().Take(6),
+            colours = emitters.Where(e => e.ColorRgb is not null).Select(e => $"#{(int)Math.Clamp(e.ColorRgb!.Value.X, 0, 255):X2}{(int)Math.Clamp(e.ColorRgb!.Value.Y, 0, 255):X2}{(int)Math.Clamp(e.ColorRgb!.Value.Z, 0, 255):X2}").Distinct().Take(6),
+            sourceVisual = srcVisualId == 0 ? null : new { id = srcVisualId, effects = srcVisualStems.Take(5), mapped = carried?.ItemVisual ?? 0, mappedLabel = carried?.Label, reason = carried?.Reason },
+            emitterSuggested = emitterSuggestion is null ? null : new { id = emitterSuggestion.ItemVisual, label = emitterSuggestion.Label, reason = emitterSuggestion.Reason },
+            anchorSpanPercent = MathF.Round(anchorSpan * 100f, 0),
+            anchorsSpread = spreadGlowAnchors,
+            suggested = suggestion is null ? null : new { id = suggestion.ItemVisual, label = suggestion.Label, reason = suggestion.Reason },
+            chosen = new { id = chosen, label = chosen == 0 ? "none" : (ItemVisualSuggester.Find(chosen)?.Label ?? $"visual {chosen}") },
+        };
+        return (placed, attachments, sourceGrip, suggestion, chosen, particleInfo, emitterPositionsWoW);
+    }
+
+    /// <summary>GET /WeaponForge/ItemVisuals — the vanilla enchant-style glows a forged weapon can
+    /// carry (ItemDisplayInfo field 22), for the import cards' glow picker. Labels come from the
+    /// suggester's catalog; the live 1.12 ItemVisuals.dbc is consulted so only ids the client has are
+    /// offered, and any stock rows the catalog doesn't name are listed by their effect model stems.</summary>
+    [HttpGet]
+    public IActionResult ItemVisuals()
+    {
+        var list = new List<object>();
+        try
+        {
+            var iv = _mpq.ExtractFile(@"DBFilesClient\ItemVisuals.dbc");
+            var ive = _mpq.ExtractFile(@"DBFilesClient\ItemVisualEffects.dbc");
+            var effName = new Dictionary<uint, string>();
+            if (ive is { Length: > 0 })
+            {
+                var eff = DbcWriterService.ReadDbc(ive, "ive");
+                foreach (var r in eff.GetAllRows()) if (r.Length > 1) effName[r[0]] = Path.GetFileNameWithoutExtension(eff.ReadString(r[1]));
+            }
+            if (iv is { Length: > 0 })
+            {
+                var vis = DbcWriterService.ReadDbc(iv, "iv");
+                foreach (var r in vis.GetAllRows())
+                {
+                    var effects = Enumerable.Range(1, vis.FieldCount - 1).Select(i => r[i]).Where(e => e != 0)
+                        .Select(e => effName.TryGetValue(e, out var n) ? n : $"#{e}").Distinct().ToList();
+                    var known = ItemVisualSuggester.Find(r[0]);
+                    list.Add(new { id = r[0], label = known?.Label ?? string.Join(" + ", effects), effects, curated = known is not null });
+                }
+            }
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "ItemVisuals: live DBC read failed; serving the curated catalog"); }
+        if (list.Count == 0)
+            list.AddRange(ItemVisualSuggester.Catalog.Select(v => new { id = v.Id, label = v.Label, effects = Array.Empty<string>(), curated = true }));
+        return Json(new { ok = true, visuals = list.OrderBy(v => ((dynamic)v).curated ? 0 : 1).ThenBy(v => (string)((dynamic)v).label).ToList() });
+    }
+
+    /// <summary>GET /WeaponForge/GlowCoverage?expansion=tbc|wotlk — how much of a mounted client's
+    /// weapon glow the forge can actually reproduce, answered from DBC data alone so it is instant.
+    ///
+    /// Every browsable weapon/shield display row is checked for a permanent glow
+    /// (<c>ItemDisplayInfo.ItemVisual</c>) and each one classified:
+    ///
+    ///   • <b>exact</b>  — 1.12 ships the same ItemVisuals row, so it copies across untouched;
+    ///   • <b>mapped</b> — a later-client-only row matched to the nearest vanilla glow;
+    ///   • <b>none</b>   — a cast/state animation with no permanent-glow equivalent.
+    ///
+    /// Particle-emitter glows are NOT counted here: they live inside the models, so counting them
+    /// means parsing every M2 (measured: 1,103 of 7,515 TBC weapons carry emitters, and the sweep
+    /// takes minutes). The per-weapon preview reports those individually.</summary>
+    [HttpGet]
+    public IActionResult GlowCoverage(string? expansion = null)
+    {
+        var src = _sources.Get(expansion);
+        var status = src.Mpq.Status();
+        if (!status.Configured || status.ArchiveCount == 0)
+            return Json(new { ok = false, expansion = src.Key, error = status.Error ?? $"No {src.Label} client is mounted." });
+
+        var visuals = src.Mpq.ItemVisuals();
+        var weaponRows = src.Mpq.WeaponIndex();
+        int exact = 0, mapped = 0, unmatched = 0;
+        var byVisual = new Dictionary<uint, int>();
+        foreach (var w in weaponRows)
+        {
+            var (id, stems) = visuals.ForDisplayRow(w.DisplayRow);
+            if (id == 0) continue;
+            byVisual[id] = byVisual.GetValueOrDefault(id) + 1;
+            var m = ItemVisualSuggester.MapLaterClientVisual(id, stems);
+            if (m is null || m.ItemVisual == 0) unmatched++;
+            else if (m.ItemVisual == id) exact++;
+            else mapped++;
+        }
+        int withGlow = exact + mapped + unmatched;
+
+        var top = byVisual.OrderByDescending(kv => kv.Value).Take(20).Select(kv =>
+        {
+            var stems = visuals.EffectStems(kv.Key);
+            var m = ItemVisualSuggester.MapLaterClientVisual(kv.Key, stems);
+            return new
+            {
+                sourceId = kv.Key,
+                weapons = kv.Value,
+                effects = stems.Take(3),
+                vanillaId = m?.ItemVisual ?? 0,
+                vanillaLabel = m is null || m.ItemVisual == 0 ? "no 1.12 equivalent" : m.Label,
+                kind = m is null || m.ItemVisual == 0 ? "none" : (m.ItemVisual == kv.Key ? "exact" : "mapped"),
+                reason = m?.Reason,
+            };
+        }).ToList();
+
+        return Json(new
+        {
+            ok = true,
+            expansion = src.Key,
+            expansionLabel = src.Label,
+            weaponRows = weaponRows.Count,
+            withGlow,
+            exact,
+            mapped,
+            unmatched,
+            distinctVisuals = byVisual.Count,
+            top,
+            note = $"{withGlow:N0} of {weaponRows.Count:N0} browsable {src.Label} weapon/shield models carry a permanent glow on their display row. " +
+                   $"{exact:N0} use an ItemVisual 1.12 already ships (copied across unchanged), {mapped:N0} are matched to the nearest vanilla glow, " +
+                   $"and {unmatched:N0} are spell-cast animations with no permanent-glow equivalent. Models that glow via particle emitters instead " +
+                   "are reported per weapon when you preview them.",
+        });
     }
 
     /// <summary>GET /WeaponForge/TbcPreviewWeapon — render one TBC weapon through the import
     /// pipeline (same mesh + texture the forge would package) without packaging anything.</summary>
     [HttpGet]
     public IActionResult TbcPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
-        string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0)
-    {
-        var (sel, item) = ResolveTbcSelection(entry, model, displayRow);
-        if (sel is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon (entry {entry}, model '{model}')." });
+        string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
+        LegacyPreviewWeapon(_sources.Tbc, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread);
 
-        var (mesh, _, texturePng, effectPngs, _, _, diag, err) = LoadTbcWeapon(sel, targetTriangles);
-        if (mesh is null)
-            return Json(new { ok = false, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
+    /// <summary>GET /WeaponForge/WotlkPreviewWeapon — the WotLK preview.</summary>
+    [HttpGet]
+    public IActionResult WotlkPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
+        string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
+        LegacyPreviewWeapon(_sources.Wotlk, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread);
+
+    /// <summary>GET /WeaponForge/ImportPreviewWeapon?expansion=tbc|wotlk&amp;… — lane-keyed form.</summary>
+    [HttpGet]
+    public IActionResult ImportPreviewWeapon(string? expansion = null, uint entry = 0, string? model = null, uint displayRow = 0,
+        string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
+        LegacyPreviewWeapon(_sources.Get(expansion), entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread);
+
+    private IActionResult LegacyPreviewWeapon(LegacyImportSource src, uint entry, string? model, uint displayRow,
+        string? weaponType, int targetTriangles, int brightness, int saturation,
+        GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread)
+    {
+        var (sel, item) = ResolveLegacySelection(src, entry, model, displayRow);
+        if (sel is null) return NotFound(new { ok = false, error = $"Unknown {src.Label} weapon (entry {entry}, model '{model}')." });
+
+        var (loadedMesh, _, texturePng, effectPngs, _, _, diag, err, sourceModel) = LoadLegacyWeapon(src, sel, targetTriangles);
+        if (loadedMesh is null)
+            return Json(new { ok = false, expansion = src.Key, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
+        var (mesh, _, sourceGripPercent, suggestion, chosenVisual, particleInfo, emitterPositions) =
+            PlaceLegacyWeapon(loadedMesh, sourceModel, shape, flipGripEnd, itemVisual, diag,
+                src.Mpq.ItemVisuals(), sel.DisplayRow, glowSpread);
+        var motionPlan = PlanMotion(sourceModel, emitterPositions, sel.ModelStem);
+        foreach (var note in motionPlan.Notes) diag.Info("motion.emitter", note);
 
         string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
-            ? TbcItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
+            ? LegacyItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
             : weaponType;
         var profile = WeaponTypeCatalog.Get(typeKey);
         int effectiveInventoryType = EffectiveTbcInventoryType(item, profile);
@@ -1079,13 +1484,17 @@ public class WeaponForgeController : Controller
         try { grip = BuildGripInfo(mesh, profile, _donors.Resolve(profile)); }
         catch { /* grip markers are optional for preview */ }
         if (profile.IsRanged)
-            diag.Warn("tbc.ranged.rigid",
-                $"{profile.Label} import is rigid on the family scaffold's root bone: the TBC model's limb/string/hammer animation is not carried; its projectile visual and ranged slot are.");
+            diag.Warn("import.ranged.rigid",
+                $"{profile.Label} import is rigid on the family scaffold's root bone: the {src.Label} model's limb/string/hammer animation is not carried; its projectile visual and ranged slot are.");
 
-        var preview = _preview.RenderMesh(mesh, AdjustTexture(texturePng, brightness, saturation), effectPngs);
+        var preview = _preview.RenderMesh(mesh, AdjustTexture(texturePng, brightness, saturation), effectPngs,
+            emitters: BuildPreviewEmitters(motionPlan, emitterPositions),
+            visualEffects: ResolveVisualEffects((uint)Math.Max(chosenVisual, 0), sourceModel));
         return Json(new
         {
             ok = preview.Ok,
+            expansion = src.Key,
+            expansionLabel = src.Label,
             itemEntry = item?.Entry ?? 0,
             itemName = item?.Name,
             model = sel.ModelStem,
@@ -1100,18 +1509,45 @@ public class WeaponForgeController : Controller
             hasTexture = texturePng is { Length: > 0 },
             withinForgeBudget = mesh.TriangleCount <= MaxTbcForgeTriangles,
             grip,
+            sourceGripPercent = MathF.Round(sourceGripPercent, 1),
+            placementApplied = !LegacyPlacement.IsIdentity(shape, flipGripEnd),
+            particles = particleInfo,
+            itemVisual = chosenVisual,
+            suggestedItemVisual = suggestion is null ? null : new { id = suggestion.ItemVisual, label = suggestion.Label, reason = suggestion.Reason },
             preview,
             diagnostics = diag.Items.Select(i => i.ToString()),
-            note = "Preview only — nothing was packaged. Geometry, sidedness and pass order match the forge; WebGL approximates WoW multi-texture combiners and shows UV animation at its rest frame, while the forged M2 retains supported global UV tracks.",
+            note = "Preview only — nothing was packaged. Geometry, sidedness and pass order match the forge; WebGL approximates WoW multi-texture combiners and shows UV animation at its rest frame, while the forged M2 retains supported global UV tracks. Enchant-style glows (ItemVisual) render in-game only.",
         });
     }
 
     /// <summary>POST /WeaponForge/ForgeTbc — package one TBC weapon for real: its render graph is
     /// emitted as vanilla v256 on the family donor scaffold and compatible BLP2 bytes stay intact.</summary>
     [HttpPost]
-    public async Task<IActionResult> ForgeTbc(uint entry = 0, string? model = null, uint displayRow = 0,
+    public Task<IActionResult> ForgeTbc(uint entry = 0, string? model = null, uint displayRow = 0,
         string? name = null, string? weaponType = null, int targetTriangles = 0,
-        int brightness = 0, int saturation = 0, string? itemConfig = null)
+        int brightness = 0, int saturation = 0, string? itemConfig = null,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
+        LegacyForge(_sources.Tbc, entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread);
+
+    /// <summary>POST /WeaponForge/ForgeWotlk — package one WotLK weapon (same contract as ForgeTbc).</summary>
+    [HttpPost]
+    public Task<IActionResult> ForgeWotlk(uint entry = 0, string? model = null, uint displayRow = 0,
+        string? name = null, string? weaponType = null, int targetTriangles = 0,
+        int brightness = 0, int saturation = 0, string? itemConfig = null,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
+        LegacyForge(_sources.Wotlk, entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread);
+
+    /// <summary>POST /WeaponForge/ForgeImport?expansion=tbc|wotlk — lane-keyed form.</summary>
+    [HttpPost]
+    public Task<IActionResult> ForgeImport(string? expansion = null, uint entry = 0, string? model = null, uint displayRow = 0,
+        string? name = null, string? weaponType = null, int targetTriangles = 0,
+        int brightness = 0, int saturation = 0, string? itemConfig = null,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
+        LegacyForge(_sources.Get(expansion), entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread);
+
+    private async Task<IActionResult> LegacyForge(LegacyImportSource src, uint entry, string? model, uint displayRow,
+        string? name, string? weaponType, int targetTriangles, int brightness, int saturation, string? itemConfig,
+        GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread)
     {
         var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
             itemConfig, HttpContext.RequestAborted);
@@ -1123,11 +1559,11 @@ public class WeaponForgeController : Controller
                 errors = configurationErrors,
             });
 
-        var (sel, item) = ResolveTbcSelection(entry, model, displayRow);
-        if (sel is null) return NotFound(new { ok = false, error = $"Unknown TBC weapon (entry {entry}, model '{model}')." });
+        var (sel, item) = ResolveLegacySelection(src, entry, model, displayRow);
+        if (sel is null) return NotFound(new { ok = false, error = $"Unknown {src.Label} weapon (entry {entry}, model '{model}')." });
 
         string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
-            ? TbcItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
+            ? LegacyItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
             : weaponType;
         var profile = WeaponTypeCatalog.Get(typeKey);
         var familyErrors = ValidateConfigurationForWeaponFamily(profile, configuredItem);
@@ -1138,9 +1574,14 @@ public class WeaponForgeController : Controller
         catch (Exception ex)
         { return Json(new { ok = false, error = $"No stock donor for {profile.Label}: {ex.Message}" }); }
 
-        var (mesh, m2Bytes, texturePng, effectPngs, textureBlp, effectBlps, diag, err) = LoadTbcWeapon(sel, targetTriangles);
-        if (mesh is null)
-            return Json(new { ok = false, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
+        var (loadedMesh, m2Bytes, texturePng, effectPngs, textureBlp, effectBlps, diag, err, sourceModel) = LoadLegacyWeapon(src, sel, targetTriangles);
+        if (loadedMesh is null)
+            return Json(new { ok = false, expansion = src.Key, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
+        var (mesh, attachmentsWoW, sourceGripPercent, suggestion, chosenVisual, _, emitterPositions) =
+            PlaceLegacyWeapon(loadedMesh, sourceModel, shape, flipGripEnd, itemVisual, diag,
+                src.Mpq.ItemVisuals(), sel.DisplayRow, glowSpread);
+        var motionPlan = PlanMotion(sourceModel, emitterPositions, sel.ModelStem);
+        foreach (var note in motionPlan.Notes) diag.Info("motion.emitter", note);
         if (mesh.TriangleCount > MaxTbcForgeTriangles)
             return Json(new
             {
@@ -1152,7 +1593,8 @@ public class WeaponForgeController : Controller
         // big one (Warglaives are 1H swords with the two-hander back-sheath value 1 — the crossed-
         // on-back look; the client picks back-LEFT for the main-hand slot and back-RIGHT for the
         // off-hand slot automatically), plus the authentic slot binding and swing delay. Damage
-        // stays donor-level on purpose — stats are made in vanilla terms, not imported TBC power.
+        // stays donor-level on purpose — stats are made in vanilla terms, not imported TBC/WotLK
+        // power (DPS is never carried).
         Dictionary<string, string>? itemOverrides = null;
         if (item is not null)
         {
@@ -1161,17 +1603,17 @@ public class WeaponForgeController : Controller
                 ["sheath"] = item.Sheath.ToString(),
                 ["delay"] = item.DelayMs.ToString(),
             };
-            // Melee families keep the TBC item's own slot binding; ranged families are bound to
+            // Melee families keep the source item's own slot binding; ranged families are bound to
             // exactly one vanilla slot (bows 15, guns/crossbows/wands 26, thrown 25), so the
-            // family contract wins even when the TBC row used a different ranged slot.
+            // family contract wins even when the source row used a different ranged slot.
             if (!profile.IsRanged && item.InventoryType is 13 or 17 or 21 or 22)
                 itemOverrides["inventory_type"] = item.InventoryType.ToString();
         }
         if (profile.IsRanged)
-            diag.Warn("tbc.ranged.rigid",
-                $"{profile.Label} import is rigid on the family scaffold's root bone: the TBC model's limb/string/hammer animation is not carried; its projectile visual ({donor.SpellVisualId}) and ranged slot are.");
+            diag.Warn("import.ranged.rigid",
+                $"{profile.Label} import is rigid on the family scaffold's root bone: the {src.Label} model's limb/string/hammer animation is not carried; its projectile visual ({donor.SpellVisualId}) and ranged slot are.");
         // Explicit modal values layer over both the family defaults (inside the builder) and the
-        // source TBC presentation values above. Omitted values preserve those existing contracts.
+        // source presentation values above. Omitted values preserve those existing contracts.
         itemOverrides = MergeItemOverrides(itemOverrides, configuredItem);
 
         try
@@ -1185,7 +1627,7 @@ public class WeaponForgeController : Controller
                      : !string.IsNullOrWhiteSpace(name) ? name
                      : item is not null ? item.Name
                      : PrettyTbcName(sel.ModelStem),
-                SourceKind = "tbc_import",
+                SourceKind = src.Key + "_import",   // "tbc_import" / "wotlk_import"
                 WeaponTypeKey = profile.Key,
                 ItemOverrides = itemOverrides,
                 Mesh = mesh,
@@ -1196,8 +1638,15 @@ public class WeaponForgeController : Controller
                 EffectTexturesPng = effectPngs,
                 EffectTexturesBlp = effectBlps,
                 SourceBlob = m2Bytes,
+                ItemVisual = chosenVisual,
+                MotionGrafts = motionPlan.Grafts.Count > 0 ? motionPlan.Grafts : null,
+                AttachmentPointsWoW = attachmentsWoW.Count > 0 ? attachmentsWoW : null,
+                // The tbc* keys are the lane-neutral names the builder reads back (e.g.
+                // tbcInventoryType recovers the slot on rebuild); sourceExpansion says which lane.
                 GeneratorParamsJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
+                    sourceExpansion = src.Key,
+                    sourceExpansionLabel = src.Label,
                     tbcItemEntry = item?.Entry ?? 0,
                     tbcItemName = item?.Name,
                     tbcModel = sel.ModelStem,
@@ -1207,6 +1656,17 @@ public class WeaponForgeController : Controller
                     tbcInventoryType = item?.InventoryType,
                     tbcGlowPasses = mesh.Passes?.Count(p => p.BlendMode >= 3) ?? 0,
                     targetTriangles,
+                    sourceGripPercent = MathF.Round(sourceGripPercent, 1),
+                    placement = LegacyPlacement.IsIdentity(shape, flipGripEnd) ? null : new
+                    {
+                        gripPercent = shape?.GripPercent, offsetUpCm = shape?.OffsetUpCm, offsetSideCm = shape?.OffsetSideCm,
+                        pitchDegrees = shape?.PitchDegrees, yawDegrees = shape?.YawDegrees, sizePercent = shape?.SizePercent,
+                        lengthPercent = shape?.LengthPercent, flipGripEnd, flipUpsideDown = shape?.FlipUpsideDown, mirrorSide = shape?.MirrorSide,
+                    },
+                    itemVisual = chosenVisual,
+                    itemVisualSuggested = suggestion?.ItemVisual,
+                    sourceParticleEmitters = sourceModel?.ParticleEmitters.Count ?? 0,
+                    attachmentsCarried = attachmentsWoW.Count,
                 }),
                 WriterVersion = "tbc-rendergraph-v2",
             });
@@ -1214,7 +1674,7 @@ public class WeaponForgeController : Controller
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "WeaponForge: ForgeTbc {Model} failed", sel.ModelStem);
+            _logger.LogError(ex, "WeaponForge: Forge{Lane} {Model} failed", src.Key, sel.ModelStem);
             return Json(new { ok = false, error = ex.Message });
         }
     }
@@ -1222,7 +1682,7 @@ public class WeaponForgeController : Controller
     /// <summary>"Sword_2H_Blood_D_02" → "Sword 2H Blood D 02" — a readable default item name.</summary>
     private static string PrettyTbcName(string stem) => stem.Replace('_', ' ');
 
-    private static int EffectiveTbcInventoryType(TbcItemInfo? item, WeaponTypeProfile profile) =>
+    private static int EffectiveTbcInventoryType(LegacyItemInfo? item, WeaponTypeProfile profile) =>
         !profile.IsRanged && item?.InventoryType is 13 or 17 or 21 or 22 ? item.InventoryType : profile.InventoryType;
 
     /// <summary>Decode a TBC BLP2's base mip to PNG for the texture pipeline. Null on failure.</summary>

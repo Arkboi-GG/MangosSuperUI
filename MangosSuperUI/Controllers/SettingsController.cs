@@ -83,7 +83,8 @@ public class SettingsController : Controller
             SpellCreator = BuildSpellCreatorConfig(),
             WeaponForge = new WeaponForgeConfig
             {
-                TbcDataPath = _config["WeaponForge:TbcDataPath"] ?? ""
+                TbcDataPath = _config["WeaponForge:TbcDataPath"] ?? "",
+                WotlkDataPath = _config["WeaponForge:WotlkDataPath"] ?? ""
             },
             Wiki = new WikiConfig
             {
@@ -289,9 +290,11 @@ public class ServerConfig
 
 public class WeaponForgeConfig
 {
-    /// <summary>TBC (2.4.3) client Data folder — enables the Forge's TBC-import section.
+    /// <summary>TBC (2.4.3) client Data folder — enables the Forges' TBC-import sections.
     /// (WeaponForge:ArtifactRoot stays a config-file-only advanced override.)</summary>
     public string TbcDataPath { get; set; } = "";
+    /// <summary>WotLK (3.3.5a) client Data folder — enables the Forges' WotLK-import sections.</summary>
+    public string WotlkDataPath { get; set; } = "";
 }
 
 public class ConnectionStringsConfig

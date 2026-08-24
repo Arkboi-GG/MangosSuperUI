@@ -1,4 +1,4 @@
-using Dapper;
+﻿using Dapper;
 using MangosSuperUI.Models;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
@@ -269,7 +269,8 @@ public class ItemTextureService
 
             Directory.CreateDirectory(glbDir);
             if (!WriteGlbCacheAtomically(
-                    m2Model, textures, glbPath, sourcePath, sourceFingerprint))
+                    m2Model, textures, glbPath, sourcePath, sourceFingerprint,
+                    ResolveVisualEffects(displayId, m2Model)))
             {
                 _logger.LogWarning("ItemTexture: GlbWriter failed for displayId {Id}", displayId);
                 return null;
@@ -299,7 +300,8 @@ public class ItemTextureService
 
         // Domain/version marker makes future changes to the fingerprint framing
         // an intentional cache invalidation rather than an accidental collision.
-        AppendFingerprintString(hash, "ItemTextureService.EnsureGlb/source-v1");
+        AppendFingerprintString(hash, "ItemTextureService.EnsureGlb/source-v2");
+        AppendFingerprintUInt32(hash, modelInfo.ItemVisualId);
         AppendFingerprintUInt32(hash, displayId);
         AppendFingerprintUInt32(hash, resolvedDisplayId);
         AppendFingerprintString(hash, selectedModelName);
@@ -348,6 +350,42 @@ public class ItemTextureService
         hash.AppendData(bytes);
     }
 
+    /// <summary>
+    /// The item's <c>ItemVisual</c>, resolved to loaded effect models mounted on its attachments.
+    ///
+    /// This is the channel that carries most of the effects anyone can name — enchant glows,
+    /// Thunderfury's lightning, a Warglaive's fire — and none of it is in the item's own bytes, so
+    /// without this an item decodes perfectly and still renders dead. Best-effort by design: an item
+    /// with no visual, or a visual whose models are missing, simply gets no extra emitters.
+    /// </summary>
+    private IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? ResolveVisualEffects(uint displayId, M2Model host)
+    {
+        try
+        {
+            var info = _dbc.GetItemModelInfo(displayId);
+            uint visualId = info?.ItemVisualId ?? 0;
+            if (visualId == 0) return null;
+
+            var effects = M2Fx.ItemVisualEffects.Resolve(visualId, host,
+                path => _mpq.ExtractFile(path) ?? _mpq.ExtractFile(path.ToLowerInvariant()));
+            if (effects.Count == 0)
+            {
+                _logger.LogDebug("ItemTexture: displayId {Id} itemVisual {Visual} resolved to no usable effect model",
+                    displayId, visualId);
+                return null;
+            }
+
+            _logger.LogInformation("ItemTexture: displayId {Id} itemVisual {Visual} → {Count} effect model(s): {Models}",
+                displayId, visualId, effects.Count, string.Join(", ", effects.Select(e => e.ModelPath)));
+            return effects;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ItemTexture: item-visual resolution failed for displayId {Id}", displayId);
+            return null;
+        }
+    }
+
     private static bool GlbCacheMatchesSource(
         string glbPath, string sourcePath, string expectedFingerprint)
     {
@@ -369,7 +407,8 @@ public class ItemTextureService
         Dictionary<int, byte[]> textures,
         string glbPath,
         string sourcePath,
-        string sourceFingerprint)
+        string sourceFingerprint,
+        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null)
     {
         string nonce = Guid.NewGuid().ToString("N");
         string tempGlbPath = $"{glbPath}.{nonce}.tmp";
@@ -377,7 +416,7 @@ public class ItemTextureService
 
         try
         {
-            if (!GlbWriter.SaveGlb(m2Model, textures, tempGlbPath))
+            if (!GlbWriter.SaveGlb(m2Model, textures, tempGlbPath, doubleSided: false, visualEffects))
                 return false;
 
             File.WriteAllText(tempSourcePath, sourceFingerprint, new UTF8Encoding(false));
@@ -907,10 +946,6 @@ public class ItemTextureService
         var versionedFilename = CacheVersionRegistry.MakeVersioned(
             naturalFilename, CacheVersionRegistry.RigidGlbVersion);
         var glbPath = Path.Combine(glbDir, versionedFilename);
-        var webPath = $"/item_models/{versionedFilename}";
-
-        if (File.Exists(glbPath))
-            return webPath;
 
         var modelInfo = _dbc.GetItemModelInfo(displayId);
         if (modelInfo == null) return null;
@@ -925,13 +960,13 @@ public class ItemTextureService
         var resolvedModelName = withoutExt + suffix + ".m2";
 
         Directory.CreateDirectory(glbDir);
-        bool ok = BuildAttachmentGlb(
+        return BuildAttachmentGlb(
             displayId,
             resolvedModelName,
             modelInfo.Value.TextureName1,
             glbPath,
+            versionedFilename,
             $"helm{suffix}");
-        return ok ? webPath : null;
     }
 
     /// <summary>
@@ -953,10 +988,6 @@ public class ItemTextureService
         var versionedFilename = CacheVersionRegistry.MakeVersioned(
             naturalFilename, CacheVersionRegistry.RigidGlbVersion);
         var glbPath = Path.Combine(glbDir, versionedFilename);
-        var webPath = $"/item_models/{versionedFilename}";
-
-        if (File.Exists(glbPath))
-            return webPath;
 
         var modelInfo = _dbc.GetItemModelInfo(displayId);
         if (modelInfo == null) return null;
@@ -979,25 +1010,36 @@ public class ItemTextureService
         }
 
         Directory.CreateDirectory(glbDir);
-        bool ok = BuildAttachmentGlb(
-            displayId, modelName, textureName, glbPath, sideSuffix);
-        return ok ? webPath : null;
+        return BuildAttachmentGlb(
+            displayId, modelName, textureName, glbPath, versionedFilename, sideSuffix);
     }
 
     /// <summary>
     /// Shared helm/shoulder GLB builder. Extracts the M2, applies any
     /// embedded textures, swaps in the DBC-supplied skin texture, writes
-    /// the GLB via the rigid writer.
+    /// the GLB via the rigid writer. Returns the web URL, or null on any
+    /// step failing. All errors are logged with context so the callers in
+    /// EnsureHelmGlb / EnsureShoulderGlb stay terse.
     ///
-    /// Returns false on any step failing — caller maps that to a null URL.
-    /// All errors are logged with context so the loop in EnsureHelmGlb /
-    /// EnsureShoulderGlb stays terse.
+    /// === Cache discipline (same as EnsureGlb, which weapons already had) ===
+    /// The filename carries RigidGlbVersion, which only moves when the assembly
+    /// is rebuilt. That is enough for a writer change and NOT enough for a
+    /// content change: a forged SUI_A_#### model keeps its name across a
+    /// re-import, so a bare File.Exists check kept serving the GLB built from
+    /// the previous patch's bytes for the life of the process — which reads as
+    /// "the fix did nothing" while iterating in the Armor Forge.
+    ///
+    /// So: refresh the live patch mounts, resolve the real bytes, fingerprint
+    /// them, and rebuild whenever the fingerprint moves. The URL carries the
+    /// fingerprint so a browser cannot reuse an older same-display response
+    /// either.
     /// </summary>
-    private bool BuildAttachmentGlb(
+    private string? BuildAttachmentGlb(
         uint displayId,
         string? modelName,
         string? textureName,
         string glbPath,
+        string versionedFilename,
         string kindLabel)
     {
         if (string.IsNullOrEmpty(modelName))
@@ -1005,11 +1047,13 @@ public class ItemTextureService
             _logger.LogDebug(
                 "ItemTexture/Attachment: displayId {Id} {Kind} — empty modelName",
                 displayId, kindLabel);
-            return false;
+            return null;
         }
 
         try
         {
+            // The MPQ singleton may have mounted before patch-5/patch-6 existed.
+            _mpq.RefreshLivePatches();
             // Same path search as weapons — Item\ObjectComponents\{Head,Shoulder,...}
             // is in ItemModelPrefixes, so a bare "Helm_..." or "LShoulder_..."
             // filename resolves correctly.
@@ -1019,7 +1063,7 @@ public class ItemTextureService
                 _logger.LogWarning(
                     "ItemTexture/Attachment: M2 not found in MPQ for displayId {Id} {Kind} — modelName='{Name}'",
                     displayId, kindLabel, modelName);
-                return false;
+                return null;
             }
 
             var m2Model = M2Reader.Parse(m2Data);
@@ -1028,7 +1072,7 @@ public class ItemTextureService
                 _logger.LogWarning(
                     "ItemTexture/Attachment: M2 parse failed for displayId {Id} {Kind} — modelName='{Name}'",
                     displayId, kindLabel, modelName);
-                return false;
+                return null;
             }
 
             // ── Texture collection ──
@@ -1068,33 +1112,111 @@ public class ItemTextureService
                 }
             }
 
+            var visualEffects = ResolveVisualEffects(displayId, m2Model);
+            string fingerprint = ComputeAttachmentSourceFingerprint(
+                displayId, kindLabel, modelName, textureName, m2Data, textures,
+                _dbc.GetItemModelInfo(displayId)?.ItemVisualId ?? 0);
+            string webPath = $"/item_models/{versionedFilename}?source={fingerprint}";
+            string sourcePath = Path.ChangeExtension(glbPath, ".source");
+
+            if (GlbCacheMatchesSource(glbPath, sourcePath, fingerprint))
+                return webPath;
+
             // Attachment GLBs go in with doubleSided=true. Vanilla helm
             // and shoulder M2s frequently include single-sided thin
             // features (spaulder hanging flap, helm wings/horns) whose
             // authored winding faces the wrong way after our coordinate
             // flip — backface culling then makes them disappear. See the
             // doubleSided docstring on GlbWriter.SaveGlb.
-            bool ok = GlbWriter.SaveGlb(m2Model, textures, glbPath, doubleSided: true);
-            if (ok)
+            if (WriteAttachmentGlbAtomically(m2Model, textures, glbPath, sourcePath, fingerprint,
+                    visualEffects))
             {
                 _logger.LogInformation(
                     "ItemTexture/Attachment: Generated displayId {Id} {Kind} GLB ({Model}, {Size}KB)",
                     displayId, kindLabel, modelName,
                     new FileInfo(glbPath).Length / 1024);
-                return true;
+                return webPath;
             }
 
             _logger.LogWarning(
                 "ItemTexture/Attachment: GlbWriter failed for displayId {Id} {Kind} (model='{Model}')",
                 displayId, kindLabel, modelName);
-            return false;
+            return null;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex,
                 "ItemTexture/Attachment: Exception generating displayId {Id} {Kind}",
                 displayId, kindLabel);
-            return false;
+            return null;
+        }
+    }
+
+    /// <summary>Fingerprint over everything that decides what an attachment GLB looks like: the
+    /// resolved names, the raw M2, and every bound texture blob. Same framing as
+    /// <see cref="ComputeGlbSourceFingerprint"/>, with its own domain marker so the two cannot
+    /// collide.</summary>
+    private static string ComputeAttachmentSourceFingerprint(
+        uint displayId,
+        string kindLabel,
+        string modelName,
+        string? textureName,
+        byte[] m2Data,
+        IReadOnlyDictionary<int, byte[]> textures,
+        uint itemVisualId)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+        AppendFingerprintString(hash, "ItemTextureService.BuildAttachmentGlb/source-v2");
+        AppendFingerprintUInt32(hash, displayId);
+        AppendFingerprintUInt32(hash, itemVisualId);
+        AppendFingerprintString(hash, kindLabel);
+        AppendFingerprintString(hash, modelName);
+        AppendFingerprintString(hash, textureName);
+        AppendFingerprintBytes(hash, m2Data);
+
+        AppendFingerprintUInt32(hash, checked((uint)textures.Count));
+        foreach (var texture in textures.OrderBy(pair => pair.Key))
+        {
+            AppendFingerprintInt32(hash, texture.Key);
+            AppendFingerprintBytes(hash, texture.Value);
+        }
+
+        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+    }
+
+    /// <summary>Write the GLB and its stamp so every interruption point leaves a MISSING stamp
+    /// rather than a new GLB blessed by the old fingerprint. Mirrors
+    /// <see cref="WriteGlbCacheAtomically"/>, which cannot be reused directly because attachments
+    /// need doubleSided=true.</summary>
+    private static bool WriteAttachmentGlbAtomically(
+        M2Model m2Model,
+        Dictionary<int, byte[]> textures,
+        string glbPath,
+        string sourcePath,
+        string sourceFingerprint,
+        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null)
+    {
+        string nonce = Guid.NewGuid().ToString("N");
+        string tempGlbPath = $"{glbPath}.{nonce}.tmp";
+        string tempSourcePath = $"{sourcePath}.{nonce}.tmp";
+
+        try
+        {
+            if (!GlbWriter.SaveGlb(m2Model, textures, tempGlbPath, doubleSided: true, visualEffects))
+                return false;
+
+            File.WriteAllText(tempSourcePath, sourceFingerprint, new UTF8Encoding(false));
+
+            if (File.Exists(sourcePath)) File.Delete(sourcePath);
+            File.Move(tempGlbPath, glbPath, overwrite: true);
+            File.Move(tempSourcePath, sourcePath, overwrite: true);
+            return true;
+        }
+        finally
+        {
+            try { if (File.Exists(tempGlbPath)) File.Delete(tempGlbPath); } catch { }
+            try { if (File.Exists(tempSourcePath)) File.Delete(tempSourcePath); } catch { }
         }
     }
 

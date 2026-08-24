@@ -33,6 +33,8 @@ public sealed class WeaponIdReservationService
 
     public const string KindItemEntry = "item_entry";
     public const string KindItemDisplay = "item_display";
+    /// <summary>Armor Forge tier-set id namespace (ItemSet.dbc ids). Shares this allocator.</summary>
+    public const string KindArmorSet = "armor_set";
 
     /// <summary>Configured custom-entry floor (mirrors ItemsController.CUSTOM_RANGE_START).</summary>
     public const long ItemEntryFloor = 900_000;
@@ -58,7 +60,7 @@ public sealed class WeaponIdReservationService
     /// </summary>
     public async Task<ReservationResult> ReserveAsync(string kind, long floor, string buildId, string slot)
     {
-        if (kind != KindItemEntry && kind != KindItemDisplay)
+        if (kind != KindItemEntry && kind != KindItemDisplay && kind != KindArmorSet)
             throw new ArgumentException($"Unknown reservation kind '{kind}'.", nameof(kind));
         if (string.IsNullOrWhiteSpace(buildId)) throw new ArgumentException("buildId required.", nameof(buildId));
         if (string.IsNullOrWhiteSpace(slot)) throw new ArgumentException("slot required.", nameof(slot));
@@ -215,6 +217,7 @@ public sealed class WeaponIdReservationService
                     SELECT MAX(new_display_id) AS m FROM custom_item_retexture
                     UNION ALL SELECT MAX(new_display_id) FROM custom_item_retexture_atlas
                     UNION ALL SELECT MAX(display_id) FROM custom_weapon_display
+                    UNION ALL SELECT MAX(display_id) FROM custom_armor_display
                   ) t");
             if (retexMax is { } m) floor = Math.Max(floor, m + 1);
         }

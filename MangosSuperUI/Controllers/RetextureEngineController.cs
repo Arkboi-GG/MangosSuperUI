@@ -89,7 +89,7 @@ public class RetextureEngineController : Controller
         uint displayId, string theory = "fan", string tier = "improved", bool ladder = false,
         string? value = null, float? vSigma = null, float? vDetail = null,
         float? vKnee = null, float? vFloor = null, float? vBlend = null,
-        int? vAlpha = null, bool? vScale = null)
+        int? vAlpha = null, bool? vScale = null, float? hue = null)
     {
         var ct = HttpContext.RequestAborted;
         var (srcPng, err) = await _support.ResolvePrimarySourceAsync(displayId, ct);
@@ -105,12 +105,14 @@ public class RetextureEngineController : Controller
         var outDir = Path.Combine(_env.WebRootPath, "item_textures_cache", CacheDir);
         Directory.CreateDirectory(outDir);
         string vTag = vset.IsInvert ? "inv" : "keep";
-        string file = $"prev_{displayId}_{theory}_{tier}_{(ladder ? "L" : "R")}_{vTag}.png";
+        // A user-picked primary hue must be part of the cache key, or two hues share one file.
+        string hueTag = hue.HasValue ? $"_h{((int)Math.Round(hue.Value) % 360 + 360) % 360}" : "";
+        string file = $"prev_{displayId}_{theory}_{tier}_{(ladder ? "L" : "R")}_{vTag}{hueTag}.png";
         string outPng = Path.Combine(outDir, file);
 
         var ok = await _palette.RecolorSeededAsync(
             srcPng, outPng, seed, 1.0f, 0.0f, false, ct,
-            theory, kd, ku, m, pop, budget, leash, vset);
+            theory, kd, ku, m, pop, budget, leash, vset, hue);
         if (ok == null) return Json(new { success = false, error = "recolor failed" });
 
         return Json(new
@@ -121,7 +123,62 @@ public class RetextureEngineController : Controller
             tier,
             ladder,
             value = vTag,
+            hue,
         });
+    }
+
+    /// <summary>
+    /// GET /RetextureEngine/Primary?displayId= — the item's detected colour families (dominant first)
+    /// so a colour picker can seed itself with the majority colour. Returns { success, primaryHue,
+    /// primaryHex, families:[{family, hue, hex, percent, sat, light}] }.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> Primary(uint displayId)
+    {
+        var ct = HttpContext.RequestAborted;
+        var (srcPng, err) = await _support.ResolvePrimarySourceAsync(displayId, ct);
+        if (srcPng == null) return Json(new { success = false, error = err });
+
+        var families = _palette.DetectFamilies(srcPng);
+        if (families.Count == 0) return Json(new { success = false, error = "no colour families detected" });
+
+        // Prefer the dominant CHROMATIC family for the primary; fall back to the overall dominant.
+        var chromatic = families.Where(f => f.Family is not ("white" or "black" or "grey")).ToList();
+        var primary = (chromatic.Count > 0 ? chromatic : families).OrderByDescending(f => f.Percent).First();
+
+        return Json(new
+        {
+            success = true,
+            primaryHue = primary.MeanHue,
+            primaryHex = HueToHex(primary.MeanHue, Math.Max(0.5f, primary.MeanSat), 0.5f),
+            families = families.OrderByDescending(f => f.Percent).Select(f => new
+            {
+                family = f.Family,
+                hue = f.MeanHue,
+                hex = HueToHex(f.MeanHue, Math.Max(0.35f, f.MeanSat), Math.Clamp(f.MeanLightness, 0.25f, 0.7f)),
+                percent = f.Percent,
+                sat = f.MeanSat,
+                light = f.MeanLightness,
+            }),
+        });
+    }
+
+    // HSL (h in degrees, s/l in 0..1) → #rrggbb, for the picker swatches.
+    private static string HueToHex(float h, float s, float l)
+    {
+        h = ((h % 360f) + 360f) % 360f;
+        float c = (1 - Math.Abs(2 * l - 1)) * s;
+        float x = c * (1 - Math.Abs((h / 60f) % 2 - 1));
+        float m = l - c / 2;
+        float r = 0, g = 0, b = 0;
+        if (h < 60) { r = c; g = x; }
+        else if (h < 120) { r = x; g = c; }
+        else if (h < 180) { g = c; b = x; }
+        else if (h < 240) { g = x; b = c; }
+        else if (h < 300) { r = x; b = c; }
+        else { r = c; b = x; }
+        int R = (int)Math.Round((r + m) * 255), G = (int)Math.Round((g + m) * 255), B = (int)Math.Round((b + m) * 255);
+        return $"#{R:x2}{G:x2}{B:x2}";
     }
 
     /// <summary>
@@ -237,7 +294,7 @@ public class RetextureEngineController : Controller
         uint displayId, string theory = "fan", string tier = "improved", bool ladder = false,
         string? value = null, float? vSigma = null, float? vDetail = null,
         float? vKnee = null, float? vFloor = null, float? vBlend = null,
-        int? vAlpha = null, bool? vScale = null)
+        int? vAlpha = null, bool? vScale = null, float? hue = null)
     {
         var ct = HttpContext.RequestAborted;
         if (Array.IndexOf(PaletteSwapService.RecolorTheories, theory) < 0) theory = "fan";
@@ -250,13 +307,13 @@ public class RetextureEngineController : Controller
 
         // Painted armor: recolor every atlas slot with one seed (coherent piece).
         var slots = await _support.RecolorAtlasSlotsAsync(
-            displayId, seed, theory, shape, policy, vset, "retexture_engine_model", ct);
+            displayId, seed, theory, shape, policy, vset, "retexture_engine_model", ct, hue);
         if (slots != null)
             return Json(new { success = true, kind = "atlas", slotUrls = slots, value = vTag });
 
         // Weapon / model item: recolor the DBC texture and bake its preview GLB assets.
         var assets = await _support.RecolorModelGlbAsync(
-            displayId, seed, theory, shape, policy, vset, "retexture_engine_model", ct);
+            displayId, seed, theory, shape, policy, vset, "retexture_engine_model", ct, hue);
         if (assets != null)
             return Json(new
             {

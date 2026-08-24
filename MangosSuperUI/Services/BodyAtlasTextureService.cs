@@ -283,6 +283,21 @@ public class BodyAtlasTextureService
                   WHERE new_display_id = @Id
                   ORDER BY slot",
                 new { Id = displayId })).ToList();
+
+            // Armor Forge painted pieces store their component BLPs in custom_armor_component
+            // (aliased to the same columns) — check there too so a forged chest/legs/etc. previews
+            // on the character viewer exactly like a retexture does.
+            if (rows.Count == 0)
+            {
+                // One row per gender suffix; ordered so the unisex/male art wins the preview slot
+                // (last write wins below): _F, _M, _U.
+                rows = (await conn.QueryAsync(
+                    @"SELECT slot, compiled_blp AS custom_blp, mpq_path AS custom_blp_mpq_path
+                      FROM custom_armor_component
+                      WHERE display_id = @Id
+                      ORDER BY slot, gender_suffix",
+                    new { Id = displayId })).ToList();
+            }
         }
         catch (Exception ex)
         {

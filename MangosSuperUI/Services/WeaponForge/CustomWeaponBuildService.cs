@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Dapper;
@@ -50,16 +50,37 @@ public sealed class CustomWeaponBuildService
     private readonly IWebHostEnvironment _env;
     private readonly IConfiguration _config;
     private readonly ILogger<CustomWeaponBuildService> _logger;
+    private readonly IServiceProvider _services;
 
     public CustomWeaponBuildService(MpqReaderService mpq, WeaponIdReservationService ids,
         WeaponPatchBuilder patch, WeaponAssetCompiler compiler, WeaponPreviewService preview,
         WeaponDonorResolver donors, DbcService dbc, AuditService audit, RaService ra,
         ConnectionFactory db, IWebHostEnvironment env,
-        IConfiguration config, ILogger<CustomWeaponBuildService> logger)
+        IConfiguration config, ILogger<CustomWeaponBuildService> logger,
+        IServiceProvider services)
     {
         _mpq = mpq; _ids = ids; _patch = patch; _compiler = compiler; _preview = preview;
         _donors = donors; _dbc = dbc; _audit = audit; _ra = ra; _db = db; _env = env;
-        _config = config; _logger = logger;
+        _config = config; _logger = logger; _services = services;
+    }
+
+    /// <summary>Rebuild the Armor Forge's patch-6 after patch-5 changes. patch-6 sits ABOVE patch-5
+    /// and carries its own full ItemDisplayInfo.dbc, so a fresh weapon row would be shadowed by a
+    /// stale patch-6 until it repackages. Resolved lazily to avoid a construction-order coupling; a
+    /// no-op when no armor exists. Best-effort — never fails the weapon flow.</summary>
+    private async Task RebuildArmorPatchAsync(string reason)
+    {
+        try
+        {
+            var armor = _services.GetService(typeof(MangosSuperUI.Services.ArmorForge.CustomArmorBuildService))
+                as MangosSuperUI.Services.ArmorForge.CustomArmorBuildService;
+            if (armor is null) return;
+            await armor.RebuildPatchAsync(reason);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: armor patch-6 re-union after '{Reason}' failed — rebuild it from the Armor Forge page", reason);
+        }
     }
 
     /// <summary>The client Data directory the app deploys patches into — same config the Retexture
@@ -201,6 +222,53 @@ public sealed class CustomWeaponBuildService
                 throw new InvalidOperationException("Mesh compilation failed: " + string.Join("; ",
                     compiled.Diagnostics.Items.Where(i => i.Severity == ForgeSeverity.Error).Select(i => i.Message)));
             m2 = compiled.M2;
+            // Later-client imports carry their own enchant/glow attachment points (0..4 along the
+            // blade); move the donor's onto them so an ItemVisual (or a real enchant) sits on the
+            // imported geometry, not where the donor's blade used to be.
+            if (request.AttachmentPointsWoW is { Count: > 0 } attachments)
+            {
+                m2 = RawM2.M2GeometryPatcher.RewriteAttachmentPositions(m2, attachments);
+                diag.Info("attachments.carried", $"{attachments.Count} attachment point(s) moved onto the imported geometry.");
+            }
+            // Motion: a source effect that moved is rebuilt from a stock 1.12 emitter rather than
+            // photographed into a static sprite. Never fatal — a failed graft leaves the model as-is.
+            if (request.MotionGrafts is { Count: > 0 } grafts)
+            {
+                try
+                {
+                    var motion = RawM2.M2EmitterTransplanter.Apply(m2, grafts);
+                    foreach (var note in motion.Notes) diag.Info("motion.emitter", note);
+                    if (motion.Grafted > 0)
+                    {
+                        m2 = motion.M2;
+                        diag.Info("motion.invented",
+                            $"{motion.Grafted} animated particle emitter(s) rebuilt from stock 1.12 donors — an invented conversion: " +
+                            "1.12 cannot host the source emitter graph, so its position, colour and size were rebuilt on Blizzard's own emission behaviour.");
+                    }
+                }
+                catch (Exception ex) { diag.Warn("motion.failed", $"Emitter graft skipped: {ex.Message}"); }
+            }
+            // Motion, part two: a glow baked in as an additive PASS (rather than an emitter) still
+            // sits dead. 1.12 animates exactly this with a colour track on a global sequence — the
+            // same thing Sparkle_A does — so give every additive pass a slow breath.
+            try
+            {
+                var parsedForPulse = M2Reader.Parse(m2);
+                if (parsedForPulse is not null)
+                {
+                    var glowColors = RawM2.M2GlowPulseWriter.AdditiveColorIndices(parsedForPulse);
+                    if (glowColors.Count > 0)
+                    {
+                        var pulse = RawM2.M2GlowPulseWriter.Apply(m2, glowColors);
+                        if (pulse.Pulsed > 0)
+                        {
+                            m2 = pulse.M2;
+                            foreach (var note in pulse.Notes) diag.Info("motion.pulse", note);
+                        }
+                    }
+                }
+            }
+            catch (Exception pex) { diag.Warn("motion.pulse.failed", $"Glow pulse skipped: {pex.Message}"); }
             blp = compiled.Blp ?? ExtractDonorBlp(donor);
             for (int i = 0; i < compiled.EffectBlps.Count && effectPaths is not null; i++)
                 effectBlps.Add((effectPaths[i], compiled.EffectBlps[i]));
@@ -300,6 +368,10 @@ public sealed class CustomWeaponBuildService
                     "Undo via the Forged Weapons list on the Item Assets page.",
         });
 
+        // patch-6 (armor) sits above patch-5 and carries a full ItemDisplayInfo.dbc, so it must
+        // re-union this fresh weapon row or it would shadow it in-client. No-op when no armor exists.
+        await RebuildArmorPatchAsync("weapon forged: " + buildId);
+
         return new CustomWeaponBuildResult
         {
             BuildId = buildId,
@@ -352,6 +424,7 @@ public sealed class CustomWeaponBuildService
             var removal = RemoveDeployedPatch();
             _logger.LogInformation("WeaponForge: rebuild ({Reason}) — no weapons in DB; {Patch} removed ({Client})",
                 reason, PatchFileName, removal.Message);
+            await RebuildArmorPatchAsync("weapon patch-5 rebuilt: " + reason);
             return new WeaponPatchRebuildSummary
             {
                 WeaponCount = 0,
@@ -367,6 +440,7 @@ public sealed class CustomWeaponBuildService
         var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
         _logger.LogInformation("WeaponForge: rebuild ({Reason}) — {Patch} repackaged with {Count} weapon(s); deploy={Deploy}",
             reason, PatchFileName, assembly.PackagedCount, deploy.Ok);
+        await RebuildArmorPatchAsync("weapon patch-5 rebuilt: " + reason);
 
         return new WeaponPatchRebuildSummary
         {
@@ -618,6 +692,31 @@ public sealed class CustomWeaponBuildService
         {
             return (false, $"deploy failed ({ex.Message}) — the client is probably running; close it and click Rebuild patch");
         }
+    }
+
+    /// <summary>Is the patch in the client Data folder the one we last built? The game client holds
+    /// its MPQs open while running, so a deploy over an existing patch fails and the client keeps
+    /// showing yesterday's file (error cubes for anything forged since). Surfaced on the page so the
+    /// operator knows to close the client and click Rebuild patch.</summary>
+    public (bool Configured, bool CanonicalExists, bool DeployedExists, bool Stale, string Message) DeployedPatchStatus()
+    {
+        var dataPath = ClientDataPath;
+        string canonicalPath = Path.Combine(ArtifactRoot, PatchFileName);
+        string? canonical = File.Exists(canonicalPath) ? canonicalPath : null;
+        if (dataPath is null) return (false, canonical is not null, false, false, "no client Data path configured");
+        string target = Path.Combine(dataPath, PatchFileName);
+        bool deployed = File.Exists(target);
+        if (canonical is null) return (true, false, deployed, false, deployed ? "deployed patch present; nothing built in this install yet" : "no patch built or deployed");
+        if (!deployed) return (true, true, false, true, $"{PatchFileName} is not in the client Data folder — click Rebuild patch");
+        try
+        {
+            var a = new FileInfo(canonical); var b = new FileInfo(target);
+            bool same = a.Length == b.Length && Sha256(File.ReadAllBytes(canonical)) == Sha256(File.ReadAllBytes(target));
+            return (true, true, true, !same, same
+                ? $"deployed {PatchFileName} matches the last build ({b.LastWriteTime:yyyy-MM-dd HH:mm})"
+                : $"deployed {PatchFileName} is STALE ({b.LastWriteTime:yyyy-MM-dd HH:mm}, built {a.LastWriteTime:yyyy-MM-dd HH:mm}) — the client was probably running during the last deploy; close it and click Rebuild patch");
+        }
+        catch (Exception ex) { return (true, true, deployed, false, $"could not compare deployed patch: {ex.Message}"); }
     }
 
     private (bool Ok, string Message) RemoveDeployedPatch()
@@ -893,14 +992,15 @@ public sealed class CustomWeaponBuildService
             @"INSERT INTO custom_weapon_display
                 (display_id, model_id, texture_mpq_path, compiled_blp, blp_sha256, source_texture,
                  icon_stem, item_visual, donor_display_id, dbc_fields_json, validation_state)
-              VALUES (@display, @model_id, @tex, @blp, @blpsha, @srctex, @icon, 0, @donor, @fields, 'built')
+              VALUES (@display, @model_id, @tex, @blp, @blpsha, @srctex, @icon, @itemVisual, @donor, @fields, 'built')
               ON DUPLICATE KEY UPDATE
                 compiled_blp = VALUES(compiled_blp), blp_sha256 = VALUES(blp_sha256),
-                source_texture = VALUES(source_texture), icon_stem = VALUES(icon_stem),
+                source_texture = VALUES(source_texture), icon_stem = VALUES(icon_stem), item_visual = VALUES(item_visual),
                 dbc_fields_json = VALUES(dbc_fields_json), validation_state = VALUES(validation_state)",
             new
             {
                 display,
+                itemVisual = (int)request.ItemVisual,
                 model_id = display,
                 tex = WeaponNaming.TextureMpqPath(modelIndex, 1, profile.ComponentDir),
                 blp,
@@ -1283,6 +1383,18 @@ public sealed class CustomWeaponBuildRequest
     public byte[]? SourceBlob { get; init; }
     public string? GeneratorParamsJson { get; init; }
     public string? WriterVersion { get; init; }
+    /// <summary>ItemDisplayInfo field 22: a vanilla ItemVisuals.dbc id (enchant-style glow the client
+    /// renders permanently on the weapon's attachment points), 0 = none. Used by the later-client
+    /// imports to approximate source particle effects the 1.12 scaffold cannot host.</summary>
+    public uint ItemVisual { get; init; }
+    /// <summary>Attachment id → WoW-space position to write over the donor's attachment records after
+    /// compilation (weapon ids 0..4 = where enchant/ItemVisual effects hang). Null keeps the donor's.</summary>
+    public IReadOnlyDictionary<uint, System.Numerics.Vector3>? AttachmentPointsWoW { get; init; }
+
+    /// <summary>Stock-1.12 particle emitters to graft onto the compiled model so a source effect that
+    /// MOVED still moves — see <see cref="RawM2.M2EmitterTransplanter"/> and
+    /// <see cref="Motion.EffectMotionPlanner"/>. Null/empty leaves the model as compiled.</summary>
+    public IReadOnlyList<RawM2.M2EmitterTransplanter.Graft>? MotionGrafts { get; init; }
 
     /// <summary>Debug lever: keep the donor's internal M2 name instead of the canonical
     /// SUI_W_#### rename, to isolate the EOF name-append in the reference client.</summary>

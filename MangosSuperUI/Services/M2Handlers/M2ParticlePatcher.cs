@@ -1,9 +1,15 @@
-using System.Text;
+﻿using System.Text;
 
 namespace MangosSuperUI.Services;
 
 /// <summary>
 /// Surgically patches particle emitter parameters in existing M2 model files.
+///
+/// SCOPE: this patches emitters a model ALREADY HAS (spell/item visuals). To give a model an emitter
+/// it does not have — which is what the Weapon/Armor Forge needs, since the vanilla donor scaffolds
+/// ship with none — see <c>Services/WeaponForge/RawM2/M2EmitterTransplanter</c>, which transplants a
+/// whole emitter block out of a stock 1.12 model. The two agree on the 504-byte record layout
+/// (its track starts + 20 are this file's property offsets); keep them in step.
 /// 
 /// VERIFIED OFFSETS (empirically confirmed via hex scan of 8 vanilla spell M2 files):
 ///

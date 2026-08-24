@@ -111,13 +111,22 @@ public static class VanillaItemBuildConfigurationTranslator
     /// these a given family accepts is enforced per family by the controller.</summary>
     private static readonly HashSet<int> WeaponInventoryTypes = [13, 14, 15, 17, 21, 22, 25, 26];
 
+    /// <summary>Wearable vanilla armor slots the Armor Forge itemizes: 1 head, 3 shoulder,
+    /// 5 chest, 6 waist, 7 legs, 8 feet, 9 wrists, 10 hands, 16 back (cloak), 20 robe (long
+    /// chest), 23 held-in-off-hand. Shields (14) stay on the weapon side. Passed by the armor
+    /// caller as <paramref name="allowedInventoryTypes"/> so this one translator serves both forges.</summary>
+    public static readonly IReadOnlySet<int> ArmorInventoryTypes =
+        new HashSet<int> { 1, 3, 5, 6, 7, 8, 9, 10, 16, 20, 23 };
+
     public static bool TryTranslate(
         VanillaItemBuildConfiguration configuration,
         Func<uint, bool>? installedSpellExists,
         Func<int, bool>? requiredSkillExists,
         Func<int, bool>? reputationFactionExists,
         out ValidatedVanillaItemBuildConfiguration? validated,
-        out IReadOnlyList<string> errors)
+        out IReadOnlyList<string> errors,
+        IReadOnlySet<int>? allowedInventoryTypes = null,
+        string? inventoryTypeError = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
@@ -144,10 +153,12 @@ public static class VanillaItemBuildConfigurationTranslator
 
         AddInt(configuration.Quality, "quality", 0, 6, "quality", overrides, problems);
 
+        var inventoryTypes = allowedInventoryTypes ?? WeaponInventoryTypes;
         if (configuration.InventoryType is int inventoryType)
         {
-            if (!WeaponInventoryTypes.Contains(inventoryType))
-                problems.Add("inventoryType must be a supported Vanilla weapon slot: 13, 17, 21, 22 (melee) or 15, 25, 26 (ranged).");
+            if (!inventoryTypes.Contains(inventoryType))
+                problems.Add(inventoryTypeError
+                    ?? "inventoryType must be a supported Vanilla weapon slot: 13, 17, 21, 22 (melee) or 15, 25, 26 (ranged).");
             else
                 overrides["inventory_type"] = IntLiteral(inventoryType);
         }

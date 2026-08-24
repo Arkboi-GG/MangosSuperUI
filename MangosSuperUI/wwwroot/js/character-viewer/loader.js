@@ -12,15 +12,21 @@
 //   geoset      mesh.name === "Geoset_<id>_c<category>_v<variant>_s<submeshIndex>"
 //                            (e.g. "Geoset_1300_c13_v0_s4")
 //
-// glTF `extras` would be the obvious place for geoset metadata, but
-// SharpGLTF.Toolkit 1.0.6 doesn't expose a portable way to set them. So the
-// metadata is encoded in the mesh name; this loader parses it and writes the
-// fields back to SkinnedMesh.userData so Session C reads userData.geosetId
-// exactly as if extras had been used. The contract from Session C's
-// perspective is unchanged.
+// glTF `extras` would be the obvious place for geoset metadata. This file used
+// to record that SharpGLTF.Toolkit 1.0.6 "doesn't expose a portable way to set
+// them", which is why the metadata is encoded in the mesh name instead; the
+// parse below writes the fields back to SkinnedMesh.userData so callers read
+// userData.geosetId exactly as if extras had been used.
+//
+// That belief turned out to be wrong — extras round-trip fine through 1.0.6 on
+// ModelRoot, Mesh and Material, and the material-animation manifest (m2fx.js)
+// now rides out that way. The name encoding is kept because it works and every
+// consumer speaks it; the note stays so nobody re-derives the old conclusion and
+// builds the next feature around a name suffix that cannot hold keyframes.
 
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { applyBlendSuffix } from './blend-suffix.js';
+import { installM2Fx, createFxRegistry } from './m2fx.js';
 
 const _loader = new GLTFLoader();
 
@@ -51,7 +57,17 @@ export function loadCharacterGlb(url) {
                     // the loader honest with the writer's contract.
                     applyBlendSuffix(gltf.scene);
 
-                    resolve(indexCharacter(gltf));
+                    const character = indexCharacter(gltf);
+
+                    // Material animation (m2fx). The character's own body rarely
+                    // animates its materials — the eye-glow geosets are the usual
+                    // case — but the registry has to exist regardless, because
+                    // equip.js hangs every attachment's handle off it and boot
+                    // code registers the whole thing with the viewer in one call.
+                    character.fx = createFxRegistry();
+                    character.fx.set('body', installM2Fx(gltf));
+
+                    resolve(character);
                 } catch (err) {
                     reject(err);
                 }

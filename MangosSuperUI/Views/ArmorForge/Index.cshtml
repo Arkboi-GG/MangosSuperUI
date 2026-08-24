@@ -1,0 +1,1519 @@
+﻿@{
+    ViewData["Title"] = "Armor Forge";
+}
+
+@section Styles {
+    <style>
+        .af-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .af-header { padding: 16px 28px 10px; border-bottom: 1px solid var(--border-light); }
+        .af-header h1 { font-size: 20px; font-weight: 700; color: var(--text-primary); margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+        .af-sub { font-size: 12.5px; color: var(--text-muted); max-width: 900px; line-height: 1.5; }
+        .af-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+        .af-pill { font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border-light); color: var(--text-muted); background: var(--bg-card); }
+        .af-pill.ok { color: #14804a; border-color: #14804a55; background: #14804a14; }
+        .af-pill.bad { color: #b42318; border-color: #b4231855; background: #b4231814; }
+        .af-pill.warn { color: #b54708; border-color: #b5470855; background: #b5470814; }
+
+        .af-body { flex: 1; display: grid; grid-template-columns: 1fr minmax(380px, 42%); gap: 18px; padding: 16px 28px; overflow: hidden; }
+        @@media (max-width: 1100px) { .af-body { grid-template-columns: 1fr; overflow-y: auto; } }
+        .af-controls { overflow-y: auto; padding-right: 6px; display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+        .af-card { background: var(--bg-card); border: 1px solid var(--border-light); border-radius: 10px; padding: 15px 17px; }
+        .af-card > h3 { font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0 0 4px; display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+        .af-card > h3::before { content: '▾'; font-size: 10px; color: var(--text-muted); }
+        .af-card.collapsed > h3 { margin-bottom: 0; } .af-card.collapsed > h3::before { content: '▸'; }
+        .af-card.collapsed > :not(h3) { display: none !important; }
+        .af-card .phase { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); border: 1px solid var(--border-light); border-radius: 4px; padding: 1px 6px; }
+        .af-card p { font-size: 12px; color: var(--text-muted); margin: 0 0 10px; line-height: 1.5; }
+        .af-btn { padding: 7px 13px; font-size: 12.5px; font-weight: 600; border-radius: 7px; cursor: pointer; border: 1px solid var(--accent, #2563eb); background: var(--accent, #2563eb); color: #fff; white-space: nowrap; }
+        .af-btn.secondary { background: transparent; color: var(--text-primary); border-color: var(--border-light); }
+        .af-btn.small { padding: 3px 9px; font-size: 11.5px; }
+        .af-other-btn.on { background: var(--accent, #2563eb); color: #fff; border-color: var(--accent, #2563eb); }
+        .af-btn:disabled { opacity: .55; cursor: default; }
+        .af-input { width: 100%; padding: 8px 10px; font-size: 13px; border-radius: 7px; box-sizing: border-box; border: 1px solid var(--border-light); background: var(--bg-input, var(--bg-card)); color: var(--text-primary); }
+        select.af-input { width: auto; }
+
+        /* TBC search + grouped results */
+        .af-search { display: flex; gap: 8px; align-items: center; }
+        /* flex-shrink:0 — with 60 sets in a max-height column flexbox, default shrink crushed each set to a hairline. */
+        .af-results { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; max-height: 62vh; overflow-y: auto; padding-right: 4px; }
+        .af-results > * { flex-shrink: 0; }
+        .af-set { border: 1px solid var(--border-light); border-radius: 9px; overflow: hidden; }
+        .af-set-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; background: #ffffff05; }
+        .af-set-head:hover { background: #ffffff0b; }
+        .af-set-head .nm { font-weight: 700; color: var(--text-primary); font-size: 13px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .af-set-head .cnt { font-size: 11px; color: var(--text-muted); }
+        .af-set-head .chev { font-size: 10px; color: var(--text-muted); width: 10px; }
+        .af-set-body { display: none; border-top: 1px dashed var(--border-light); }
+        .af-set.open .af-set-body { display: block; }
+        .af-piece { display: grid; grid-template-columns: 20px 1fr auto auto; align-items: center; gap: 8px; padding: 5px 12px; font-size: 12px; border-bottom: 1px dashed var(--border-light); color: var(--text-primary); }
+        .af-piece:last-child { border-bottom: 0; }
+        .af-piece .slot { font-size: 10.5px; color: var(--text-muted); min-width: 110px; text-align: right; }
+        .af-piece .q0 { color: #9d9d9d; } .af-piece .q1 { color: var(--text-primary); } .af-piece .q2 { color: #1eff00; } .af-piece .q3 { color: #0070dd; } .af-piece .q4 { color: #a335ee; } .af-piece .q5 { color: #ff8000; }
+        .af-piece .ico { font-size: 11px; color: var(--text-muted); }
+        .af-loose-h { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); margin: 6px 0 2px; }
+        .af-empty { font-size: 12px; color: var(--text-muted); padding: 10px 2px; }
+
+        /* registry */
+        .af-list table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .af-list th { text-align: left; color: var(--text-muted); font-weight: 600; font-size: 11px; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border-light); }
+        .af-list td { padding: 5px 8px 5px 0; color: var(--text-primary); border-bottom: 1px dashed var(--border-light); }
+        .af-list td.muted { color: var(--text-muted); }
+        .af-del { padding: 3px 9px; font-size: 11.5px; font-weight: 600; border-radius: 6px; cursor: pointer; border: 1px solid #b4231855; background: #b4231814; color: #b42318; }
+        .af-grp { background: #ffffff06; font-weight: 700; }
+
+        /* right panel */
+        .af-right { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: hidden; }
+        .af-viewer-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px; color: var(--text-muted); font-weight: 600; }
+        .af-viewer-toolbar select { padding: 5px 8px; font-size: 12px; border-radius: 6px; border: 1px solid var(--border-light); background: var(--bg-input, var(--bg-card)); color: var(--text-primary); }
+        .cv-canvas-wrap { position: relative; flex: 1; min-height: 340px; border: 1px solid var(--border-light); border-radius: 10px; overflow: hidden; background: linear-gradient(180deg, #1a1d24, #0f1115); }
+        #char-preview-canvas { width: 100%; height: 100%; display: block; }
+        .af-viewer-hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #8a93a6; font-size: 12px; text-align: center; padding: 0 20px; pointer-events: none; }
+        .af-result { border: 1px solid var(--border-light); border-radius: 10px; padding: 12px 14px; background: var(--bg-card); font-size: 12px; overflow-y: auto; max-height: 36%; flex-shrink: 0; }
+        .af-result .title { font-weight: 700; color: var(--text-primary); margin-bottom: 6px; }
+        .af-result .ok { color: #46b77a; } .af-result .bad { color: #d46a64; } .af-result .muted { color: var(--text-muted); }
+        .af-kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; }
+        .af-kv b { color: var(--text-primary); font-weight: 600; }
+        .af-diag { margin-top: 8px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10.5px; line-height: 1.45; color: var(--text-muted); white-space: pre-wrap; max-height: 120px; overflow-y: auto; }
+
+        /* bonus editor */
+        .af-bonus-row { display: grid; grid-template-columns: 70px 1fr 32px; gap: 7px; align-items: center; margin-top: 6px; }
+        .af-members { max-height: 150px; overflow-y: auto; border: 1px solid var(--border-light); border-radius: 7px; padding: 6px 8px; margin-top: 6px; }
+        .af-member { display: flex; align-items: center; gap: 7px; font-size: 12px; padding: 2px 0; color: var(--text-primary); }
+
+        /* Configure-item modal (gameplay parity with the weapon forge) */
+        .af-modal { position: fixed; inset: 0; background: #000a; display: none; align-items: center; justify-content: center; z-index: 1000; }
+        .af-modal.open { display: flex; }
+        .af-modal-box { background: var(--bg-card); border: 1px solid var(--border-light); border-radius: 12px; width: min(760px, 94vw); max-height: 92vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px #000a; }
+        .af-modal-head { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--border-light); }
+        .af-modal-head .t { font-weight: 700; font-size: 15px; color: var(--text-primary); flex: 1; }
+        .af-modal-x { background: transparent; border: 0; color: var(--text-muted); font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px; }
+        .af-modal-body { padding: 14px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+        .af-modal-foot { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 18px; border-top: 1px solid var(--border-light); }
+        .cfg-sec { border: 1px solid var(--border-light); border-radius: 9px; padding: 11px 13px; }
+        .cfg-sec-h { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+        .cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 9px 12px; }
+        .cfg-grid label, .cfg-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--text-muted); font-weight: 600; }
+        .cfg-grid label input, .cfg-grid label select { margin-top: 2px; }
+        .cfg-coins { display: flex; gap: 5px; align-items: center; }
+        .cfg-coins input { width: 62px; }
+        .cfg-stat-row, .cfg-spell-row { display: grid; grid-template-columns: 1fr 90px 28px; gap: 7px; align-items: center; margin-top: 6px; }
+        .cfg-spell-row { grid-template-columns: 1fr 28px; }
+        .cfg-hints { margin-top: 8px; font-size: 11.5px; color: var(--text-muted); line-height: 1.5; }
+        .cfg-hints ul { margin: 4px 0 0; padding-left: 18px; }
+        .cfg-summary { font-size: 11.5px; color: var(--accent, #2563eb); font-weight: 600; }
+        .cfg-search-results { max-height: 180px; overflow-y: auto; border: 1px solid var(--border-light); border-radius: 7px; margin-top: 6px; }
+        .cfg-search-item { padding: 6px 9px; font-size: 12px; cursor: pointer; border-bottom: 1px dashed var(--border-light); color: var(--text-primary); }
+        .cfg-search-item:hover { background: #ffffff0b; }
+        .cfg-search-item:last-child { border-bottom: 0; }
+        .cfg-chip { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 8px; border: 1px solid var(--border-light); border-radius: 7px; margin-top: 6px; color: var(--text-primary); }
+        .cfg-chip .x { margin-left: auto; cursor: pointer; color: #b42318; font-weight: 700; }
+        .cfg-err { color: #d46a64; font-size: 12px; white-space: pre-wrap; margin-top: 6px; }
+        #apTheories .af-btn.on { background: var(--accent, #2563eb); color: #fff; border-color: var(--accent, #2563eb); }
+        #cfgModal { z-index: 1100; } /* per-piece editor stacks above the set modal */
+    </style>
+}
+
+<div class="app-shell">
+    <partial name="_Sidebar" />
+    <div class="main-content">
+<div class="af-wrap">
+    <div class="af-header">
+        <h1><i class="fa-solid fa-shield-halved"></i> Armor Forge</h1>
+        <div class="af-sub">
+            Import armor from a <strong>TBC (2.4.3)</strong> or <strong>WotLK (3.3.5a) client</strong> into the live vanilla server — whole <strong>sets</strong> at once
+            (they're grouped from the client's own set data so the pieces that belong together come across together), or a single piece.
+            Painted pieces carry their body textures; helms &amp; shoulders are re-emitted as native vanilla models (all 16 race/gender
+            variants, L/R shoulders); cloaks carry their cape texture. Ships in <code>patch-6.MPQ</code> — restart the client, then <code>.additem</code>.
+            Vanilla set bonuses are yours to define (optional) — nothing is imported.
+        </div>
+        <div class="af-pills">
+            <span class="af-pill" id="pillFixture">fixture …</span>
+            <span class="af-pill" id="pillTbc">TBC …</span>
+            <span class="af-pill" id="pillWotlk">WotLK …</span>
+            <span class="af-pill" id="pillVanilla">Vanilla …</span>
+            <span class="af-pill" id="pillPatch">patch …</span>
+            <span class="af-pill" id="pillDeploy" title="Is the patch-6.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
+            <span class="af-pill" id="pillItemSet" title="Set membership and n-piece bonuses need ItemSet.dbc in the SERVER's dbc directory, not just in the client patch. The core reads it once at startup and zeroes item_template.set_id for any set it cannot find — so a freshly deployed file does nothing until mangosd restarts.">sets …</span>
+        </div>
+    </div>
+
+    <div class="af-body">
+        <div class="af-controls">
+
+            <div class="af-card collapsed">
+                <h3><span class="phase">Import</span> TBC armor &amp; sets</h3>
+                <p id="tbcState">Checking TBC mount…</p>
+                <div class="af-search">
+                    <input type="text" id="tbcSearch" class="af-input" placeholder="Search sets or pieces — e.g. Netherblade, Tier 4, Cyclone, Warbringer…" disabled>
+                    <select id="tbcFamily" class="af-input" title="Filter loose pieces by slot">
+                        <option value="">All slots</option>
+                    </select>
+                    <button type="button" class="af-btn secondary small af-other-btn" id="tbcOtherBtn"
+                            title="Levelling greens, dungeon blues, crafted sets and the earlier expansions' tiers — the client's ItemSet.dbc ships them all. Hidden by default so the tier and arena sets are readable.">Other sets</button>
+                </div>
+                <div class="af-results" id="tbcResults"><div class="af-empty">Set the TBC Data Path on <a href="/Settings">Settings</a> to browse.</div></div>
+            </div>
+
+            <div class="af-card collapsed">
+                <h3><span class="phase">Import</span> WotLK armor &amp; sets</h3>
+                <p id="wotlkState">Checking WotLK mount…</p>
+                <div class="af-search">
+                    <input type="text" id="wotlkSearch" class="af-input" placeholder="Search WotLK sets or pieces — e.g. Sanctified, Tier 10, Deathbringer, Valorous, Aegis…" disabled>
+                    <select id="wotlkFamily" class="af-input" title="Filter loose pieces by slot">
+                        <option value="">All slots</option>
+                    </select>
+                    <button type="button" class="af-btn secondary small af-other-btn" id="wotlkOtherBtn"
+                            title="Levelling greens, dungeon blues, crafted sets and the earlier expansions' tiers — the client's ItemSet.dbc ships them all. Hidden by default so the tier and arena sets are readable.">Other sets</button>
+                </div>
+                <div class="af-results" id="wotlkResults"><div class="af-empty">Set the WotLK Data Path on <a href="/Settings">Settings</a> to browse.</div></div>
+            </div>
+
+            <div class="af-card collapsed">
+                <h3><span class="phase">Clone</span> Vanilla armor</h3>
+                <p id="vanillaState">Clone an existing vanilla armor piece into a new custom item — it reuses the source's own model/textures (already in your client) and lets you re-itemize it (value, stats, effects). Usable via <code>.additem</code> after a reload; no patch needed unless you recolor.</p>
+                <div class="af-search">
+                    <input type="text" id="vanillaSearch" class="af-input" placeholder="Search vanilla armor by name or item id — e.g. Cenarion, Robe of the Archmage, 16795…">
+                    <select id="vanillaFamily" class="af-input" title="Filter by slot">
+                        <option value="">All slots</option>
+                    </select>
+                    <button type="button" class="af-btn secondary small af-other-btn" id="vanillaOtherBtn" style="display:none;">Other sets</button>
+                </div>
+                <div class="af-results" id="vanillaResults"><div class="af-empty">Search to browse vanilla armor.</div></div>
+            </div>
+
+            <div class="af-card collapsed">
+                <h3><span class="phase">Registry</span> Forged Armor</h3>
+                <p>The exact contents of <code>patch-6.MPQ</code>, grouped by set. <strong>View</strong> shows a piece on the character.
+                   Delete removes it from the world DB and the patch; ids return to the pool.</p>
+                <div id="afList" class="af-list"><span class="muted" style="font-size:12px;">Loading…</span></div>
+                <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+                    <button class="af-btn secondary" data-action="rebuildPatch">Rebuild patch</button>
+                    <a class="af-btn secondary" href="/ArmorForge/DownloadPatch" style="text-decoration:none;"><i class="fa-solid fa-download"></i> Download patch-6.MPQ</a>
+                    <button class="af-btn secondary" id="btnRestartMangosd" data-action="restartMangosd" style="display:none;"
+                            title="ItemSet.dbc has been written to the server's dbc directory but mangosd has not restarted since. The core only reads DBCs at startup, so forged sets stay inert until it does.">
+                        <i class="fa-solid fa-rotate"></i> Restart mangosd (sets pending)</button>
+                </div>
+            </div>
+
+            <div class="af-card collapsed">
+                <h3><span class="phase">Optional</span> Vanilla set bonuses</h3>
+                <p>Imported sets come across with <em>no</em> bonuses — this is vanilla. If you want a set to do something, pick it and add
+                   bonuses (piece count → effect). They write into <code>ItemSet.dbc</code>, which is deployed to the server's own dbc
+                   directory automatically; the core reads it at startup, so <strong>bonuses apply after a mangosd restart</strong>.
+                   Watch the <strong>sets</strong> pill above — it turns red when a restart is owed.</p>
+                <select id="setPick" class="af-input"><option value="0">— pick a forged set —</option></select>
+                <input type="text" id="setName" class="af-input" placeholder="Set name" style="margin-top:8px;">
+                <label style="font-size:11px;color:var(--text-muted);font-weight:600;display:block;margin-top:10px;">Member pieces</label>
+                <div class="af-members" id="setMembers"><span class="muted" style="font-size:11px;">Pick a set.</span></div>
+                <label style="font-size:11px;color:var(--text-muted);font-weight:600;display:block;margin-top:10px;">Bonuses</label>
+                <div id="setBonuses"></div>
+                <div style="display:flex;gap:8px;margin-top:10px;">
+                    <button class="af-btn secondary small" id="addBonus">+ Add bonus</button>
+                    <button class="af-btn" data-action="saveSet"><i class="fa-solid fa-floppy-disk"></i> Save set</button>
+                </div>
+            </div>
+
+            <div class="af-card collapsed">
+                <h3><span class="phase">Appearance</span> Recolor preview</h3>
+                <p id="apHint">Preview a piece <strong>or a whole set</strong>, then pick a <strong>primary colour</strong> — the palette engine shifts the rest to match and recolors every previewed piece together. Cycle the theories to compare. Tick <strong>Recolor glow</strong> to tint the animated flame/particle effects.</p>
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted);font-weight:600;">Primary
+                        <input type="color" id="apColor" value="#3b6fd4" style="width:44px;height:28px;padding:0;border:1px solid var(--border-light);border-radius:6px;background:none;">
+                    </label>
+                    <button class="af-btn secondary small" id="apDetect" type="button">Detect from item</button>
+                    <label style="font-size:12px;color:var(--text-muted);font-weight:600;">Tier
+                        <select id="apTier" class="af-input" style="width:auto;">
+                            <option value="subtle">Subtle</option>
+                            <option value="improved" selected>Improved</option>
+                            <option value="bold">Bold</option>
+                            <option value="extreme">Extreme</option>
+                        </select>
+                    </label>
+                </div>
+                <div id="apTheories" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;"></div>
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px dashed var(--border-light);">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted);font-weight:600;">
+                        <input type="checkbox" id="apGlowOn"> Recolor glow / flame effects
+                    </label>
+                    <input type="color" id="apGlowColor" value="#33aaff" style="width:44px;height:28px;padding:0;border:1px solid var(--border-light);border-radius:6px;background:none;">
+                    <span id="apGlowNote" class="muted" style="font-size:11px;">Tints animated glow/particle effects on the previewed piece(s).</span>
+                </div>
+                <div id="apStatus" class="muted" style="font-size:11px;margin-top:8px;"></div>
+            </div>
+
+        </div>
+
+        <div class="af-right">
+            <div class="af-viewer-toolbar">
+                <span>Preview on</span>
+                <select id="cvRace"><option>Human</option><option>Dwarf</option><option>NightElf</option><option>Gnome</option><option>Orc</option><option>Tauren</option><option>Troll</option><option>Scourge</option></select>
+                <select id="cvGender"><option>Male</option><option>Female</option></select>
+                <button class="af-btn secondary small" id="cvStrip">Reset</button>
+                <span style="flex:1"></span>
+                <span id="cvEquipped" class="muted" style="font-weight:500;"></span>
+            </div>
+            <div class="cv-canvas-wrap">
+                <canvas id="char-preview-canvas" data-glb-url="" data-skin-url=""></canvas>
+                <div class="af-viewer-hint" id="afViewerHint">Loading character…</div>
+            </div>
+            <div class="af-result" id="afResult">
+                <div class="title">Ready</div>
+                <div class="muted">Hover a set or piece to preview it on the character (painted pieces preview before import; helms/shoulders after).
+                    Import results and ids appear here.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Configure-item modal: full gameplay parity with the Weapon Forge (value, stats, effects,
+     resistances, requirements) plus a tier/spec starting-point generator. Shared by all lanes. -->
+<div class="af-modal" id="cfgModal" aria-hidden="true">
+  <div class="af-modal-box">
+    <div class="af-modal-head">
+      <span class="t" id="cfgTitle">Configure item</span>
+      <button class="af-modal-x" id="cfgClose" title="Close">&times;</button>
+    </div>
+    <div class="af-modal-body">
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Starting stats — tier &amp; spec</div>
+        <p style="margin:0 0 8px;">Generate a starting point nestled into the vanilla curve, then edit anything below. Leave Tier blank for a plain level-based budget.</p>
+        <div class="cfg-grid">
+          <label>Level<input type="number" id="cfgGenLevel" class="af-input" min="1" max="60" value="60"></label>
+          <label>Tier (level 60)<input type="number" id="cfgGenTier" class="af-input" step="0.5" min="0" placeholder="e.g. 1.5, 3.5"></label>
+          <label>Class<select id="cfgGenClass" class="af-input"></select></label>
+          <label>Spec / role<select id="cfgGenSpec" class="af-input"></select></label>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:9px;flex-wrap:wrap;">
+          <button class="af-btn secondary small" id="cfgGenBtn" type="button">Generate stats</button>
+          <span class="cfg-summary" id="cfgGenSummary"></span>
+        </div>
+        <div class="cfg-hints" id="cfgGenHints"></div>
+      </div>
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Identity</div>
+        <div class="cfg-grid">
+          <label>Name<input type="text" id="cfgName" class="af-input" placeholder="keep source name"></label>
+          <label>Quality
+            <select id="cfgQuality" class="af-input">
+              <option value="0">Poor</option><option value="1">Common</option><option value="2">Uncommon</option>
+              <option value="3">Rare</option><option value="4" selected>Epic</option><option value="5">Legendary</option><option value="6">Artifact</option>
+            </select>
+          </label>
+          <label>Item level<input type="number" id="cfgItemLevel" class="af-input" min="1" max="255" placeholder="source"></label>
+          <label>Required level<input type="number" id="cfgReqLevel" class="af-input" min="0" max="60" value="60"></label>
+          <label title="Writes item_template.allowable_class. Anyone else gets &quot;You can never use that item&quot; on equip. Applies on the next .reload item_template — no server restart needed.">Class restriction
+            <select id="cfgClassRestrict" class="af-input"><option value="">Any class</option></select>
+          </label>
+        </div>
+      </div>
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Value</div>
+        <div class="cfg-grid">
+          <div class="cfg-field">Buy price
+            <span class="cfg-coins"><input type="number" id="cfgBuyG" class="af-input" min="0" placeholder="g"><input type="number" id="cfgBuyS" class="af-input" min="0" max="99" placeholder="s"><input type="number" id="cfgBuyC" class="af-input" min="0" max="99" placeholder="c"></span>
+          </div>
+          <div class="cfg-field">Sell price
+            <span class="cfg-coins"><input type="number" id="cfgSellG" class="af-input" min="0" placeholder="g"><input type="number" id="cfgSellS" class="af-input" min="0" max="99" placeholder="s"><input type="number" id="cfgSellC" class="af-input" min="0" max="99" placeholder="c"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Stats <button class="af-btn secondary small" id="cfgAddStat" type="button" style="margin-left:auto;">+ stat</button></div>
+        <div id="cfgStats"></div>
+      </div>
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Resistances &amp; durability</div>
+        <div class="cfg-grid">
+          <label>Armor<input type="number" id="cfgArmor" class="af-input" min="0" placeholder="forge default"></label>
+          <label>Holy res<input type="number" id="cfgHolyRes" class="af-input" min="0"></label>
+          <label>Fire res<input type="number" id="cfgFireRes" class="af-input" min="0"></label>
+          <label>Nature res<input type="number" id="cfgNatureRes" class="af-input" min="0"></label>
+          <label>Frost res<input type="number" id="cfgFrostRes" class="af-input" min="0"></label>
+          <label>Shadow res<input type="number" id="cfgShadowRes" class="af-input" min="0"></label>
+          <label>Arcane res<input type="number" id="cfgArcaneRes" class="af-input" min="0"></label>
+          <label>Durability<input type="number" id="cfgDurability" class="af-input" min="0" max="65535"></label>
+          <label>Bonding
+            <select id="cfgBonding" class="af-input">
+              <option value="">—</option><option value="0">No bind</option><option value="1">Bind on Pickup</option>
+              <option value="2">Bind on Equip</option><option value="3">Bind on Use</option><option value="4">Quest item</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">On-equip / use effects</div>
+        <p style="margin:0 0 6px;">Effects come from real stock-item spell slots (validated) — search and add. Suggestions above hint at what fits the tier/spec.</p>
+        <div style="display:flex;gap:7px;align-items:center;">
+          <select id="cfgSpellTrigger" class="af-input" style="width:auto;">
+            <option value="1">On Equip</option><option value="0">Use</option><option value="2">Chance on Hit</option>
+          </select>
+          <input type="text" id="cfgSpellSearch" class="af-input" placeholder="Search effects — name or spell id…" style="flex:1;">
+        </div>
+        <div class="cfg-search-results" id="cfgSpellResults" style="display:none;"></div>
+        <div id="cfgSpells"></div>
+      </div>
+
+      <div class="cfg-err" id="cfgError" style="display:none;"></div>
+    </div>
+    <div class="af-modal-foot">
+      <button class="af-btn secondary" id="cfgCancel" type="button">Cancel</button>
+      <button class="af-btn" id="cfgSubmit" type="button">Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- Set Configure modal: configure a whole set as a unit — per-piece stats (generated by tier/spec,
+     editable per piece) plus the set bonus table — then import it all at once. -->
+<div class="af-modal" id="setModal" aria-hidden="true">
+  <div class="af-modal-box">
+    <div class="af-modal-head">
+      <span class="t" id="setTitle">Configure set</span>
+      <button class="af-modal-x" id="setClose" title="Close">&times;</button>
+    </div>
+    <div class="af-modal-body">
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Set identity &amp; tier</div>
+        <p style="margin:0 0 8px;">Set a tier/spec to generate every piece's stats from its own slot, then fine-tune each piece below. Leave Tier blank for a level-based budget.</p>
+        <div class="cfg-grid">
+          <label>Set name<input type="text" id="setNameInput" class="af-input"></label>
+          <label>Level<input type="number" id="setGenLevel" class="af-input" min="1" max="60" value="60"></label>
+          <label>Tier (level 60)<input type="number" id="setGenTier" class="af-input" step="0.5" min="0" placeholder="e.g. 2.5, 3.5"></label>
+          <label>Class<select id="setGenClass" class="af-input"></select></label>
+          <label>Spec / role<select id="setGenSpec" class="af-input"></select></label>
+          <label title="Applied to EVERY piece in the set as item_template.allowable_class. This is what makes a tier set class-locked; anyone else gets &quot;You can never use that item&quot;.">Class restriction
+            <select id="setClassRestrict" class="af-input"><option value="">Any class</option></select>
+          </label>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:9px;flex-wrap:wrap;">
+          <button class="af-btn secondary small" id="setGenBtn" type="button">Generate all pieces</button>
+          <span class="cfg-summary" id="setGenSummary"></span>
+        </div>
+      </div>
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Pieces</div>
+        <div id="setPieces"></div>
+      </div>
+
+      <div class="cfg-sec">
+        <div class="cfg-sec-h">Set bonuses (pieces worn → spell)</div>
+        <p style="margin:0 0 6px;">When N set pieces are worn, apply an effect. Writes <code>ItemSet.dbc</code> to both the client patch and the
+           server's dbc directory — the core reads it at startup, so <strong>bonuses go live after a mangosd restart</strong>
+           (the <strong>sets</strong> pill at the top turns red until then). Pick an effect from the list: a typed name with nothing
+           selected is not a bonus.</p>
+        <div id="setBonusRows"></div>
+        <button class="af-btn secondary small" id="setAddBonus" type="button" style="margin-top:6px;">+ Add bonus</button>
+      </div>
+
+      <div class="cfg-err" id="setError" style="display:none;"></div>
+    </div>
+    <div class="af-modal-foot">
+      <button class="af-btn secondary" id="setCancel" type="button">Cancel</button>
+      <button class="af-btn" id="setSubmit" type="button">Import set</button>
+    </div>
+  </div>
+</div>
+
+    </div>
+</div>
+
+@section Scripts {
+<script type="importmap">
+{ "imports": { "three": "/lib/three/build/three.module.js", "three/addons/": "/lib/three/examples/jsm/" } }
+</script>
+<script type="module">
+    import { mountCharacterViewer } from '/js/character-viewer/embed.js';
+    // Starter clothes so the preview character isn't naked (Apprentice's Robe — validated by the viewer's geoset rules).
+    var DEFAULT_OUTFIT = [{ displayId: 12647, itemId: 56 }];
+    var handle = null, curRace = 'Human', curGender = 'Male', pending = null;
+
+    async function mount() {
+        var hint = document.getElementById('afViewerHint');
+        try {
+            var res = await fetch('/Items/CharacterPreview?race=' + curRace + '&gender=' + curGender, { credentials: 'same-origin' });
+            var html = await res.text();
+            var glbUrl = (/data-glb-url="([^"]+)"/.exec(html) || [])[1];
+            var skinUrl = (/data-skin-url="([^"]+)"/.exec(html) || [])[1];
+            if (!glbUrl) { if (hint) { hint.style.display = 'flex'; hint.textContent = 'Character preview unavailable — client data not mounted.'; } return; }
+            if (handle) { try { handle.dispose(); } catch (e) { } handle = null; }
+            if (hint) { hint.style.display = 'flex'; hint.textContent = 'Loading character…'; }
+            handle = await mountCharacterViewer({ canvas: document.getElementById('char-preview-canvas'), glbUrl: glbUrl, skinUrl: skinUrl });
+            window.afViewerHandle = handle; // debug/diagnostic access (same shape as the Items page's window.cv)
+            if (hint) hint.style.display = 'none';
+            try { if (DEFAULT_OUTFIT.length) await handle.cv.equip.equipMultiple(handle.character, DEFAULT_OUTFIT); } catch (e) { console.warn('default outfit failed', e); }
+            if (pending) { var p = pending; pending = null; p(); }
+        } catch (e) {
+            if (hint) { hint.style.display = 'flex'; hint.textContent = 'Character preview failed to load.'; }
+            console.warn('armor viewer mount failed', e);
+        }
+    }
+
+    // Live glow/flame recolor: walk the whole character (body + every equipped attachment), tint
+    // additive-glow materials and M2Emitter particle materials, and re-apply each frame so the m2fx
+    // engine's per-frame colour writes don't clobber it. Works for a whole SET, not just one piece.
+    var _glow = { color: null, mats: [], raf: null };
+    function _collectGlowMats() {
+        _glow.mats = [];
+        if (!handle || !handle.character || !handle.character.root) return;
+        handle.character.root.traverse(function (node) {
+            if (!node.isMesh || !node.material) return;
+            var mats = Array.isArray(node.material) ? node.material : [node.material];
+            var isEmitter = node.name === 'M2Emitter';
+            mats.forEach(function (mat) {
+                if (!mat || !mat.color) return;
+                // THREE.AdditiveBlending === 2; blend-3/4 name suffix marks additive glow shells.
+                var isAdditive = mat.blending === 2 || /_blend[34]/.test(mat.name || '');
+                if (isAdditive || isEmitter) _glow.mats.push(mat);
+            });
+        });
+    }
+    function _glowTick() {
+        if (!_glow.color) { _glow.raf = null; return; }
+        for (var i = 0; i < _glow.mats.length; i++) {
+            _glow.mats[i].color.setRGB(_glow.color[0], _glow.color[1], _glow.color[2]);
+            _glow.mats[i].needsUpdate = true;
+        }
+        _glow.raf = requestAnimationFrame(_glowTick);
+    }
+
+    window.afViewer = {
+        // Forged piece (has a vanilla display row): composites/attaches via /Items/ItemDressing.
+        equip: async function (displayId, itemId) {
+            if (!handle || !handle.character) { pending = function () { window.afViewer.equip(displayId, itemId); }; return; }
+            try { await handle.cv.equip.equipDisplay(handle.character, displayId, itemId || undefined); } catch (e) { console.warn('equip failed', e); }
+        },
+        // Pre-import later-client preview: dress EXACTLY like the Items page (geosets, paint order,
+        // cape) by feeding equipMultiple dressing payloads from /ArmorForge/{Tbc|Wotlk}Dressing for
+        // source entries (tbc:true + expansion) and the normal /Items/ItemDressing for vanilla ones
+        // (the default outfit and forged pieces).
+        dressTbc: async function (items) {
+            if (!handle || !handle.character) { pending = function () { window.afViewer.dressTbc(items); }; return; }
+            var fetchFn = function (e, identity) {
+                var q = '&race=' + encodeURIComponent(curRace) + '&gender=' + encodeURIComponent(curGender);
+                var lanePrefix = e.expansion === 'wotlk' ? 'Wotlk' : 'Tbc';
+                var url = e.tbc ? '/ArmorForge/' + lanePrefix + 'Dressing?entry=' + e.entry + q
+                                : '/Items/ItemDressing?displayId=' + e.displayId + (e.itemId ? '&itemId=' + e.itemId : '') + q;
+                return fetch(url).then(function (r) { return r.ok ? r.json() : null; });
+            };
+            try { await handle.cv.equip.equipMultiple(handle.character, items, { fetchDressing: fetchFn }); }
+            catch (e) { console.warn('tbc dress failed', e); }
+        },
+        // Live recolor of the currently-previewed piece: fetch retextured assets at the chosen
+        // primary hue + palette theory and swap them onto the model without a reload (painted armor
+        // repaints its atlas; a model item re-mounts its recolored attachment GLB).
+        applyRecolor: async function (displayId, opts) {
+            if (!handle || !handle.character) return false;
+            opts = opts || {};
+            // Foreign (not-yet-imported) TBC/WotLK pieces recolor their extracted source atlas via the
+            // Armor Forge; vanilla/forged pieces resolve their vanilla display via the retexture engine.
+            var foreign = (opts.expansion === 'tbc' || opts.expansion === 'wotlk') && opts.entry;
+            var q = new URLSearchParams({ theory: opts.theory || 'fan', tier: opts.tier || 'improved' });
+            if (opts.hue != null) q.append('hue', Math.round(opts.hue));
+            var url;
+            if (foreign) { q.append('expansion', opts.expansion); q.append('entry', opts.entry); url = '/ArmorForge/RecolorDressing?' + q; }
+            else { q.append('displayId', displayId); url = '/RetextureEngine/PreviewOnModel?' + q; }
+            try {
+                var d = await (await fetch(url)).json();
+                if (!d.success) return false;
+                if (d.kind === 'atlas') await handle.cv.equip.equipBodyAtlasRetextureDirect(handle.character, d.slotUrls, {});
+                else if (d.kind === 'weapon') await handle.cv.equip.equipWeaponGlbDirect(handle.character, d.glbUrl, opts.inventoryType || 0, d.attachments);
+                return true;
+            } catch (e) { console.warn('recolor apply failed', e); return false; }
+        },
+        // Re-dress the previewed items with RECOLORED textures in ONE layered pass (equipMultiple) — no
+        // per-piece flicker, and it recolors body + cape + helm/shoulder together. Only tbc/wotlk pieces
+        // are recolored; vanilla/default-outfit items dress normally so they stay their own colour.
+        dressRecolor: async function (items, opts) {
+            if (!handle || !handle.character) return false;
+            opts = opts || {};
+            var gq = '&race=' + encodeURIComponent(curRace) + '&gender=' + encodeURIComponent(curGender);
+            var rq = '&hue=' + Math.round(opts.hue || 0) + '&theory=' + (opts.theory || 'fan') + '&tier=' + (opts.tier || 'improved') + gq;
+            var fetchFn = function (e) {
+                var url = e.tbc
+                    ? '/ArmorForge/RecolorDressing?expansion=' + e.expansion + '&entry=' + e.entry + rq
+                    : '/Items/ItemDressing?displayId=' + e.displayId + (e.itemId ? '&itemId=' + e.itemId : '') + gq;
+                return fetch(url).then(function (r) { return r.ok ? r.json() : null; });
+            };
+            try { await handle.cv.equip.equipMultiple(handle.character, items, { fetchDressing: fetchFn }); return true; }
+            catch (e) { console.warn('recolor dress failed', e); return false; }
+        },
+        // Glow recolor. rgb = [r,g,b] 0..1. Returns count of glow materials found (0 = item has no glow).
+        tintGlow: function (rgb) { _collectGlowMats(); _glow.color = rgb; if (!_glow.raf) _glowTick(); return _glow.mats.length; },
+        clearGlow: function () { _glow.color = null; },
+        hasGlow: function () { _collectGlowMats(); return _glow.mats.length; },
+        defaultOutfit: DEFAULT_OUTFIT,
+        setChar: async function (race, gender) { curRace = race; curGender = gender; await mount(); },
+        reset: async function () { await mount(); }
+    };
+    mount();
+</script>
+<script>
+(function () {
+    var $ = function (id) { return document.getElementById(id); };
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); }
+    function result(html) { $('afResult').innerHTML = html; }
+    function post(url, body, isForm) {
+        var opt = { method: 'POST' };
+        if (isForm) opt.body = body; else { opt.headers = { 'Content-Type': 'application/json' }; opt.body = JSON.stringify(body); }
+        return fetch(url, opt).then(function (r) { return r.text().then(function (t) { return { ok: r.ok, body: t }; }); });
+    }
+    document.querySelectorAll('.af-card > h3').forEach(function (h) { h.addEventListener('click', function () { h.parentElement.classList.toggle('collapsed'); }); });
+
+    var FAMILIES = { helm: 'Head', shoulder: 'Shoulder', cloak: 'Back', chest: 'Chest', robe: 'Robe', shirt: 'Shirt', tabard: 'Tabard', bracers: 'Wrist', gloves: 'Hands', belt: 'Waist', legs: 'Legs', boots: 'Feet' };
+    Object.keys(FAMILIES).forEach(function (k) { $('tbcFamily').add(new Option(FAMILIES[k], k)); $('wotlkFamily').add(new Option(FAMILIES[k], k)); $('vanillaFamily').add(new Option(FAMILIES[k], k)); });
+
+    // The import lanes share one UI; only ids (`${key}Search` …), labels and the expansion key differ.
+    // The vanilla lane CLONEs from the live world DB (not a client archive) but drives the same UI.
+    var LANES = {
+        tbc: { key: 'tbc', label: 'TBC', pill: 'pillTbc', state: 'tbcState', search: 'tbcSearch', family: 'tbcFamily', results: 'tbcResults', other: 'tbcOtherBtn', showOther: false },
+        wotlk: { key: 'wotlk', label: 'WotLK', pill: 'pillWotlk', state: 'wotlkState', search: 'wotlkSearch', family: 'wotlkFamily', results: 'wotlkResults', other: 'wotlkOtherBtn', showOther: false },
+        vanilla: { key: 'vanilla', label: 'Vanilla', pill: 'pillVanilla', state: 'vanillaState', search: 'vanillaSearch', family: 'vanillaFamily', results: 'vanillaResults', other: 'vanillaOtherBtn', showOther: false }
+    };
+    var KIND_ICON = { Painted: 'fa-brush', Modelled: 'fa-cube', Cloak: 'fa-wind' };
+
+    // ── Status ──
+    fetch('/ArmorForge/Status').then(function (r) { return r.json(); }).then(function (s) {
+        var f = $('pillFixture'); f.textContent = s.fixtureOk ? 'fixture ✓' : 'fixture ✗'; f.className = 'af-pill ' + (s.fixtureOk ? 'ok' : 'bad');
+        [LANES.tbc, LANES.wotlk].forEach(function (lane) {
+            var ls = s[lane.key] || {};
+            var t = $(lane.pill), st = $(lane.state);
+            if (ls.configured && ls.archiveCount > 0) {
+                t.textContent = lane.label + ': ' + ls.pieces + ' pieces · ' + ls.sets + ' sets'; t.className = 'af-pill ok';
+                st.textContent = lane.label + ' mounted (' + ls.archiveCount + ' archives): ' + ls.pieces + ' armor pieces, ' + ls.sets + ' sets. Search below — sets come first.';
+                $(lane.search).disabled = false; if (lane.key === 'tbc') $(lane.search).focus(); laneSearch(lane, '');
+            } else {
+                t.textContent = ls.configured ? lane.label + ': no archives' : lane.label + ' not set'; t.className = 'af-pill warn';
+                st.innerHTML = ls.error ? lane.label + ': ' + esc(ls.error) : 'Set the <strong>' + lane.label + ' Data Path</strong> on the <a href="/Settings">Settings page</a> to enable import.';
+            }
+        });
+        // Vanilla clone reads the live world DB — always available, no client mount required.
+        var vp = $('pillVanilla'); vp.textContent = 'Vanilla: clone'; vp.className = 'af-pill ok';
+        $('vanillaSearch').disabled = false;
+        applyDeployPills(s);
+    });
+
+    // The patch / deploy / server-set pills are the ones that change when the operator rebuilds or
+    // restarts, so they live in their own function that can be re-run without disturbing the lane
+    // searches (re-running the whole Status handler would reset every search box).
+    function applyDeployPills(s) {
+        var p = $('pillPatch'); p.textContent = s.patchPresent ? 'patch-6 built' : 'no patch yet'; p.className = 'af-pill ' + (s.patchPresent ? 'ok' : '');
+        var dp = s.deployedPatch || {}, dpEl = $('pillDeploy');
+        dpEl.textContent = !dp.configured ? 'deploy: no client path' : dp.stale ? 'patch-6 STALE in client — close WoW, Rebuild patch' : 'patch-6 deployed ✓';
+        dpEl.className = 'af-pill ' + (!dp.configured ? 'warn' : dp.stale ? 'bad' : 'ok');
+        if (dp.message) dpEl.title = dp.message;
+        // Server-side sets: the client patch alone is not enough — the core needs ItemSet.dbc in its own
+        // dbc dir, and only picks it up at startup.
+        var si = s.serverItemSet || {}, siEl = $('pillItemSet');
+        siEl.textContent = !si.configured ? 'sets: no server dbc dir'
+            : si.stale ? 'server sets STALE — Rebuild patch'
+            : si.restartRequired ? 'sets deployed — RESTART mangosd'
+            : 'server sets ✓';
+        siEl.className = 'af-pill ' + (!si.configured ? 'warn' : (si.stale || si.restartRequired) ? 'bad' : 'ok');
+        if (si.message) siEl.title = si.message + (si.restartRequired ? '\n\nItemSet.dbc was written after mangosd started (' + (si.serverStarted || '?') + '), so the running core is still reading the old copy.' : '');
+        $('btnRestartMangosd').style.display = si.restartRequired ? '' : 'none';
+    }
+    function refreshStatus() {
+        return fetch('/ArmorForge/Status').then(function (r) { return r.json(); })
+            .then(applyDeployPills).catch(function (e) { console.warn('status refresh', e); });
+    }
+
+    // mangosd reads DBCs only at startup, so a deployed ItemSet.dbc is inert until this runs.
+    function restartMangosd(btn) {
+        if (!confirm('Restart the world server (mangosd) now?\n\nEveryone online is disconnected. This is what makes newly deployed set data live — the core only reads ItemSet.dbc at startup.')) return;
+        btn.disabled = true;
+        result('<div class="title">Restarting mangosd…</div><div class="muted">The core re-reads ItemSet.dbc on startup; forged sets become live once it is back up.</div>');
+        fetch('/Home/ProcessAction', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: 'mangosd', action: 'restart' })
+        }).then(function (r) { return r.json(); }).then(function (d) {
+            btn.disabled = false;
+            var ok = d && d.success !== false;
+            result('<div class="title ' + (ok ? 'ok' : 'bad') + '">' + (ok ? 'mangosd restart issued' : 'Restart failed') + '</div><div class="muted">' + esc((d && (d.message || d.error)) || '') + '</div>' +
+                (ok ? '<div class="muted" style="margin-top:6px;">Give it a few seconds, then reload this page — the <strong>sets</strong> pill should go green.</div>' : ''));
+            setTimeout(refreshStatus, 6000);
+        }).catch(function (e) { btn.disabled = false; result('<div class="title bad">Restart failed</div><div class="muted">' + esc(String(e)) + '</div>'); });
+    }
+
+    // ── Search (grouped), one handler per lane ──
+    [LANES.tbc, LANES.wotlk, LANES.vanilla].forEach(function (lane) {
+        var timer;
+        $(lane.search).addEventListener('input', function () { clearTimeout(timer); var v = this.value; timer = setTimeout(function () { laneSearch(lane, v); }, 220); });
+        $(lane.family).addEventListener('change', function () { laneSearch(lane, $(lane.search).value); });
+        // The drawer is a pure view toggle over the payload already in hand — no refetch, so it
+        // stays instant and keeps its state across searches within the session.
+        $(lane.other).addEventListener('click', function () { lane.showOther = !lane.showOther; applyOther(lane); });
+    });
+
+    // Show/hide a lane's "other sets" drawer and keep the button's label + pressed look in sync.
+    function applyOther(lane) {
+        var btn = $(lane.other), box = document.getElementById(lane.results + 'Other');
+        var n = lane.otherCount || 0;
+        btn.textContent = (lane.showOther ? 'Hide other sets' : 'Other sets') + (n ? ' (' + n + ')' : '');
+        btn.classList.toggle('on', lane.showOther);
+        btn.disabled = !n;
+        if (box) box.style.display = lane.showOther ? '' : 'none';
+    }
+
+    function laneSearch(lane, q) {
+        var host = $(lane.results); host.innerHTML = '<div class="af-empty">Searching…</div>';
+        fetch('/ArmorForge/ImportBrowse?expansion=' + lane.key + '&search=' + encodeURIComponent(q) + '&family=' + encodeURIComponent($(lane.family).value))
+            .then(function (r) { return r.json(); }).then(function (d) {
+                host.innerHTML = '';
+                var other = d.otherSets || [];
+                lane.otherCount = d.otherSetCount || other.length;
+                if (!d.sets.length && !other.length && !d.loose.length) { host.innerHTML = '<div class="af-empty">No matches.</div>'; applyOther(lane); return; }
+
+                if (d.sets.length) {
+                    var fh = document.createElement('div'); fh.className = 'af-loose-h';
+                    fh.textContent = 'Tier & arena sets (' + d.sets.length + (d.featuredSetCount > d.sets.length ? ' of ' + d.featuredSetCount : '') + ')';
+                    fh.title = 'Epic sets at item level ' + d.featuredMinItemLevel + ' or above — the tier and arena sets of this expansion.';
+                    host.appendChild(fh);
+                    d.sets.forEach(function (s) { host.appendChild(renderSet(s)); });
+                } else if (other.length) {
+                    var none = document.createElement('div'); none.className = 'af-empty';
+                    none.textContent = 'No tier or arena sets match — ' + other.length + ' other set(s) did. Use "Other sets".';
+                    host.appendChild(none);
+                }
+
+                // Everything that is not a current-expansion tier/arena set lives here, rendered but
+                // hidden: a click flips it open with no round-trip.
+                if (other.length) {
+                    var drawer = document.createElement('div'); drawer.id = lane.results + 'Other';
+                    var oh = document.createElement('div'); oh.className = 'af-loose-h';
+                    oh.textContent = 'Other sets (' + other.length + (d.otherSetCount > other.length ? ' of ' + d.otherSetCount : '') + ')';
+                    drawer.appendChild(oh);
+                    other.forEach(function (s) { drawer.appendChild(renderSet(s)); });
+                    host.appendChild(drawer);
+                }
+
+                if (d.loose.length) {
+                    var h = document.createElement('div'); h.className = 'af-loose-h'; h.textContent = 'Pieces not in a set (' + d.loose.length + (d.total > d.loose.length + d.sets.length ? '+' : '') + ')'; host.appendChild(h);
+                    var box = document.createElement('div'); box.className = 'af-set';
+                    var body = document.createElement('div'); body.className = 'af-set-body';
+                    d.loose.forEach(function (p) { body.appendChild(renderPiece(p, null)); });
+                    box.appendChild(body); host.appendChild(box);
+                    // Collapsed like every other group: the loose list is the longest thing on the
+                    // card (thousands of pieces) and used to open straight into a wall of rows.
+                    h.style.cursor = 'pointer';
+                    h.title = 'Show / hide the pieces that belong to no set';
+                    var looseLabel = h.textContent;
+                    h.textContent = '▸ ' + looseLabel;
+                    h.addEventListener('click', function () {
+                        box.classList.toggle('open');
+                        h.textContent = (box.classList.contains('open') ? '▾ ' : '▸ ') + looseLabel;
+                    });
+                }
+                applyOther(lane);
+            });
+    }
+
+    function renderSet(s) {
+        var box = document.createElement('div'); box.className = 'af-set';
+        var head = document.createElement('div'); head.className = 'af-set-head';
+        head.innerHTML = '<span class="chev">▸</span><span class="nm">' + esc(s.name) + '</span><span class="cnt">' + (s.maxItemLevel ? 'ilvl ' + s.maxItemLevel + ' · ' : '') + s.pieces.length + ' pieces</span>';
+        var imp = document.createElement('button'); imp.className = 'af-btn small'; imp.innerHTML = '<i class="fa-solid fa-download"></i> Import set';
+        imp.title = 'Import every piece of this set as one forged set'; imp.addEventListener('click', function (e) { e.stopPropagation(); importSet(s, imp); });
+        var prev = document.createElement('button'); prev.className = 'af-btn secondary small'; prev.textContent = 'Preview'; prev.title = 'Dress the character in this whole set (pre-import preview)';
+        prev.addEventListener('click', function (e) { e.stopPropagation(); previewSet(s); });
+        head.appendChild(prev); head.appendChild(imp);
+        head.addEventListener('click', function () { box.classList.toggle('open'); head.querySelector('.chev').textContent = box.classList.contains('open') ? '▾' : '▸'; });
+        var body = document.createElement('div'); body.className = 'af-set-body';
+        s.pieces.forEach(function (p) { body.appendChild(renderPiece(p, s)); });
+        box.appendChild(head); box.appendChild(body);
+        return box;
+    }
+
+    function renderPiece(p, set) {
+        var row = document.createElement('div'); row.className = 'af-piece';
+        var note = p.renderKind === 'Modelled' ? (p.family === 'helm' ? '16 variants' : 'L/R model') : (p.renderKind === 'Cloak' ? 'cape texture' : 'painted');
+        row.innerHTML = '<i class="fa-solid ' + (KIND_ICON[p.renderKind] || 'fa-circle') + ' ico" title="' + esc(p.renderKind) + '"></i>' +
+            '<span class="q' + p.quality + '">' + esc(p.name) + ' <span class="muted" style="font-size:10px;color:var(--text-muted)">· ilvl ' + p.itemLevel + ' · ' + note + '</span></span>' +
+            '<span class="slot">' + esc(p.familyLabel) + '</span>';
+        var btn = document.createElement('button'); btn.className = 'af-btn secondary small'; btn.textContent = p.expansion === 'vanilla' ? 'Clone' : (set ? 'Import piece' : 'Import');
+        btn.addEventListener('click', function (e) { e.stopPropagation(); importPiece(p, btn); });
+        row.appendChild(btn);
+        // Click the name to preview this piece (default outfit + piece). No hover previews: a
+        // hover fired while the pointer crossed the rows after a set Preview and re-dressed the
+        // character with just one piece — that was the "loads, then drops off" bug.
+        var nameEl = row.children[1]; nameEl.style.cursor = 'pointer'; nameEl.title = 'Preview this piece on the character';
+        nameEl.addEventListener('click', function (e) { e.stopPropagation(); previewPainted(p); });
+        return row;
+    }
+
+    // Preview a single piece: default outfit + that piece (so it's in context, not on a naked body).
+    // Vanilla pieces already have a real display, so they dress via the normal /Items/ItemDressing path
+    // (no tbc flag); TBC/WotLK pieces dress from their client archive.
+    function previewPainted(p) {
+        if (!window.afViewer) return;
+        var items = window.afViewer.defaultOutfit.map(function (d) { return { displayId: d.displayId, itemId: d.itemId }; });
+        if (p.expansion === 'vanilla')
+            items.push({ displayId: p.displayId, itemId: p.entry });
+        else
+            items.push({ tbc: true, expansion: p.expansion, entry: p.entry, displayId: p.displayId, inventoryType: p.inventoryType });
+        window.afViewer.dressTbc(items);
+        $('cvEquipped').textContent = 'preview: ' + p.name;
+        apSetTarget({ pieces: [{ displayId: p.displayId, inventoryType: p.inventoryType, entry: p.entry, expansion: p.expansion }], items: items, name: p.name });
+    }
+    // Preview a whole set: the set's pieces alone (they cover the body; helm/shoulder geometry comes after import).
+    function previewSet(s) {
+        if (!window.afViewer) return;
+        var items = s.pieces.map(function (p) { return { tbc: true, expansion: p.expansion, entry: p.entry, displayId: p.displayId, inventoryType: p.inventoryType }; });
+        window.afViewer.dressTbc(items);
+        $('cvEquipped').textContent = 'preview: ' + s.name;
+        apSetTarget({ pieces: s.pieces.map(function (p) { return { displayId: p.displayId, inventoryType: p.inventoryType, entry: p.entry, expansion: p.expansion }; }), items: items, name: s.name });
+    }
+
+    // ── Import ──
+    // A piece is now configured first (value/stats/effects/tier), then imported (or cloned, for vanilla).
+    function importPiece(p, btn) { openConfigure(p); }
+
+    function doImport(p, itemConfigJson) {
+        var laneLabel = (LANES[p.expansion] || LANES.tbc).label;
+        var verbing = p.expansion === 'vanilla' ? 'Cloning ' : 'Importing ';
+        result('<div class="title">' + verbing + esc(p.name) + '…</div><div class="muted">' + (p.renderKind === 'Modelled' ? 'Re-emitting ' + laneLabel + ' model(s) as native vanilla, packaging patch-6…' : 'Packaging textures into patch-6…') + '</div>');
+        var fd = new FormData(); fd.append('expansion', p.expansion || 'tbc'); fd.append('entry', p.entry);
+        if (itemConfigJson) fd.append('itemConfig', itemConfigJson);
+        if (apActive) { fd.append('recolorHue', apActive.hue); fd.append('recolorTheory', apActive.theory); fd.append('recolorTier', apActive.tier); }
+        if ($('apGlowOn').checked) fd.append('glowColor', $('apGlowColor').value); // bake flame/glow colour
+        return post('/ArmorForge/Import', fd, true).then(function (r) { showPiece(r); return r; });
+    }
+    // Import set now opens the Set Configure modal (per-piece stats + set bonuses) first.
+    function importSet(s, btn) { openSetConfigure(s); }
+    function showPiece(r) {
+        if (!r.ok) { result('<div class="title bad">Import failed</div><div class="bad" style="white-space:pre-wrap;">' + esc(r.body) + '</div>'); return; }
+        var d = JSON.parse(r.body), a = d.apply || {};
+        function line(o, label) { return o ? ('<b>' + label + '</b><span class="' + (o.ok ? 'ok' : 'bad') + '">' + esc(o.msg) + '</span>') : ''; }
+        result('<div class="title ok">Imported: ' + esc(d.name) + '</div><div class="af-kv"><b>Item entry</b><span>' + d.itemEntry + '</span><b>Display id</b><span>' + d.displayId + '</span>' +
+            '<b>Piece</b><span>' + esc(d.family) + ' (' + esc(d.renderKind) + ')' + (d.models ? ' · ' + d.models + ' model file(s)' : '') + (d.components ? ' · ' + d.components + ' texture(s)' : '') + '</span>' +
+            line(a.sql, 'World DB') + line(a.reload, 'Reload') + line(a.deploy, 'Deploy') + line(a.serverSets, 'Server sets') + '</div>' +
+            (d.diagnostics && d.diagnostics.length ? '<div class="af-diag">' + esc(d.diagnostics.slice(0, 20).join('\n')) + '</div>' : '') +
+            '<div class="muted" style="margin-top:6px;">Restart the client, then <code>.additem ' + d.itemEntry + '</code>.</div>');
+        loadList();
+        if (window.afViewer) {
+            var items = window.afViewer.defaultOutfit.map(function (o) { return { displayId: o.displayId, itemId: o.itemId }; });
+            items.push({ displayId: d.displayId, itemId: d.itemEntry });
+            window.afViewer.dressTbc(items);
+        }
+    }
+
+    // ── Configure-item modal (gameplay parity + tier/spec generator) ──
+    var cfg = { piece: null, specCatalog: null, spells: [] };
+
+    function openConfigure(p, opts) {
+        opts = opts || {};
+        cfg.piece = p; cfg.spells = []; cfg.allowableClass = null; cfg.onSubmit = opts.onSubmit || defaultConfigureImport;
+        $('cfgTitle').textContent = opts.title || ('Configure — ' + p.name);
+        $('cfgSubmit').textContent = opts.verb || (p.expansion === 'vanilla' ? 'Clone' : 'Import');
+        $('cfgName').value = ''; $('cfgName').placeholder = 'keep source name (' + p.name + ')';
+        $('cfgQuality').value = String(p.quality != null ? p.quality : 4);
+        $('cfgItemLevel').value = ''; $('cfgItemLevel').placeholder = 'source (' + (p.itemLevel || '') + ')';
+        $('cfgReqLevel').value = '';
+        ['cfgBuyG', 'cfgBuyS', 'cfgBuyC', 'cfgSellG', 'cfgSellS', 'cfgSellC'].forEach(function (id) { $(id).value = ''; });
+        ['cfgArmor', 'cfgHolyRes', 'cfgFireRes', 'cfgNatureRes', 'cfgFrostRes', 'cfgShadowRes', 'cfgArcaneRes', 'cfgDurability'].forEach(function (id) { $(id).value = ''; });
+        $('cfgBonding').value = ''; $('cfgStats').innerHTML = ''; $('cfgSpells').innerHTML = '';
+        $('cfgSpellResults').style.display = 'none'; $('cfgSpellResults').innerHTML = ''; $('cfgSpellSearch').value = '';
+        $('cfgError').style.display = 'none'; $('cfgGenSummary').textContent = ''; $('cfgGenHints').innerHTML = '';
+        $('cfgGenLevel').value = 60; $('cfgGenTier').value = '';
+        $('cfgClassRestrict').value = '';
+        // The catalog arrives async; re-apply the prefill's class once the options exist, otherwise a
+        // restricted piece would open showing "Any class".
+        ensureSpecCatalog().then(function () {
+            fillClassSelect('cfgGenClass', 'cfgGenSpec');
+            classMaskOptions('cfgClassRestrict');
+            if (cfg.allowableClass != null) {
+                setClassSelect('cfgClassRestrict', cfg.allowableClass);
+                syncGenClassFromMask(cfg.allowableClass);
+            }
+        });
+        if (p.expansion === 'vanilla') prefillFromSource(p);
+        if (opts.prefill) fillModalFromConfig(opts.prefill);
+        $('cfgModal').classList.add('open');
+    }
+    function closeConfigure() { $('cfgModal').classList.remove('open'); cfg.piece = null; cfg.onSubmit = null; }
+
+    // Default submit handler: import/clone the single piece.
+    function defaultConfigureImport(obj) {
+        var p = cfg.piece; if (!p) return;
+        $('cfgError').style.display = 'none'; $('cfgSubmit').disabled = true;
+        doImport(p, JSON.stringify(obj)).then(function (r) {
+            $('cfgSubmit').disabled = false;
+            if (r && !r.ok) { $('cfgError').textContent = r.body; $('cfgError').style.display = 'block'; return; }
+            closeConfigure();
+        });
+    }
+
+    // Fill the modal fields from a stored itemConfig object (used when editing a set piece).
+    function fillModalFromConfig(o) {
+        o = o || {};
+        if (o.name) $('cfgName').value = o.name;
+        if (o.quality != null) $('cfgQuality').value = String(o.quality);
+        $('cfgItemLevel').value = o.itemLevel != null ? o.itemLevel : '';
+        $('cfgReqLevel').value = o.requiredLevel != null ? o.requiredLevel : '';
+        setCoins('cfgBuy', o.buyPrice || 0); setCoins('cfgSell', o.sellPrice || 0);
+        $('cfgArmor').value = o.armor != null ? o.armor : '';
+        [['cfgHolyRes', 'holyRes'], ['cfgFireRes', 'fireRes'], ['cfgNatureRes', 'natureRes'], ['cfgFrostRes', 'frostRes'], ['cfgShadowRes', 'shadowRes'], ['cfgArcaneRes', 'arcaneRes'], ['cfgDurability', 'maxDurability']].forEach(function (m) { $(m[0]).value = o[m[1]] != null ? o[m[1]] : ''; });
+        $('cfgBonding').value = o.bonding != null ? String(o.bonding) : '';
+        $('cfgStats').innerHTML = ''; (o.stats || []).forEach(function (s) { addStatRow(s.type, s.value); });
+        cfg.spells = (o.spells || []).slice(); renderSpells();
+        cfg.allowableClass = o.allowableClass != null ? o.allowableClass : null;
+        // Show the restriction the piece actually carries, and point the generator's class at the same
+        // class. Without the second half, one click on "Generate stats" here sent classId 0 and quietly
+        // stripped the restriction the operator was looking at.
+        setClassSelect('cfgClassRestrict', cfg.allowableClass);
+        syncGenClassFromMask(cfg.allowableClass);
+    }
+
+    // Point the generator's class select at a single-bit mask (no-op for multi-class masks, which no
+    // single generator class can represent).
+    function syncGenClassFromMask(mask) {
+        var sel = $('cfgGenClass'); if (!sel || !(mask > 0)) return;
+        var hit = (cfg.specCatalog || []).filter(function (c) { return (1 << (c.classId - 1)) === mask; })[0];
+        if (!hit) return;
+        sel.value = String(hit.classId);
+        fillSpecSelect('cfgGenClass', 'cfgGenSpec');
+    }
+
+    // Vanilla clones start from the source item's real gameplay (already on the vanilla curve).
+    function prefillFromSource(p) {
+        fetch('/ArmorForge/VanillaSource?entry=' + p.entry).then(function (r) { return r.json(); }).then(function (d) {
+            if (!d.ok || cfg.piece !== p) return;
+            $('cfgQuality').value = String(d.quality);
+            $('cfgItemLevel').value = d.itemLevel || '';
+            $('cfgReqLevel').value = d.requiredLevel || '';
+            setCoins('cfgBuy', d.buyPrice); setCoins('cfgSell', d.sellPrice);
+            if (d.armor) $('cfgArmor').value = d.armor;
+            [['cfgHolyRes', 'holyRes'], ['cfgFireRes', 'fireRes'], ['cfgNatureRes', 'natureRes'], ['cfgFrostRes', 'frostRes'], ['cfgShadowRes', 'shadowRes'], ['cfgArcaneRes', 'arcaneRes'], ['cfgDurability', 'maxDurability']].forEach(function (m) { if (d[m[1]]) $(m[0]).value = d[m[1]]; });
+            if (d.bonding != null) $('cfgBonding').value = String(d.bonding);
+            // Carry the source's own class lock. A clone copies the whole item_template row, so without
+            // showing it here the modal would send "Any class" and silently unlock a class-only item.
+            cfg.allowableClass = (d.allowableClass != null && d.allowableClass !== -1) ? d.allowableClass : null;
+            setClassSelect('cfgClassRestrict', cfg.allowableClass);
+            syncGenClassFromMask(cfg.allowableClass);
+            $('cfgStats').innerHTML = ''; (d.stats || []).forEach(function (s) { addStatRow(s.type, s.value); });
+            cfg.spells = (d.spells || []).map(function (s) { return { spellId: s.spellId, trigger: s.trigger, charges: s.charges, ppmRate: s.ppmRate, cooldownMs: s.cooldownMs, category: s.category, categoryCooldownMs: s.categoryCooldownMs }; });
+            renderSpells();
+            $('cfgGenSummary').textContent = 'Pre-filled from vanilla source #' + p.entry + '. Edit freely, or Generate to re-roll on the tier curve.';
+        }).catch(function (e) { console.warn('vanilla source prefill', e); });
+    }
+
+    function ensureSpecCatalog() {
+        if (cfg.specCatalog) return Promise.resolve(cfg.specCatalog);
+        return fetch('/ArmorForge/SpecCatalog').then(function (r) { return r.json(); }).then(function (d) {
+            if (d.ok) cfg.specCatalog = d.classes;
+            return cfg.specCatalog;
+        }).catch(function (e) { console.warn('spec catalog', e); return null; });
+    }
+    function fillClassSelect(classSelId, specSelId) {
+        var cs = $(classSelId); cs.innerHTML = '<option value="0">— none / generic —</option>';
+        (cfg.specCatalog || []).forEach(function (c) { cs.add(new Option(c.className, c.classId)); });
+        cs.onchange = function () { fillSpecSelect(classSelId, specSelId); };
+        fillSpecSelect(classSelId, specSelId);
+    }
+
+    // ── Class restriction (item_template.allowable_class) ──
+    // This used to exist ONLY as a hidden side effect of clicking "Generate stats": picking a class and
+    // importing without generating silently produced an unrestricted item, and re-opening a restricted
+    // piece showed no sign of the restriction. It is now a real control that always round-trips.
+    function classMaskOptions(selId) {
+        var sel = $(selId); if (!sel) return;
+        var keep = sel.value;
+        sel.innerHTML = '<option value="">Any class</option>';
+        (cfg.specCatalog || []).forEach(function (c) { sel.add(new Option(c.className + ' only', String(1 << (c.classId - 1)))); });
+        if (keep && !Array.prototype.some.call(sel.options, function (o) { return o.value === keep; }))
+            sel.add(new Option(maskLabel(+keep), keep));
+        sel.value = keep;
+    }
+    function maskLabel(mask) {
+        if (!(mask > 0)) return 'Any class';
+        var names = (cfg.specCatalog || []).filter(function (c) { return (mask & (1 << (c.classId - 1))) !== 0; })
+            .map(function (c) { return c.className; });
+        return names.length ? names.join(' + ') : ('mask ' + mask);
+    }
+    // A mask the select cannot represent (multi-class, e.g. from a vanilla clone) is preserved as its
+    // own option rather than being silently flattened to one class or to "any".
+    function setClassSelect(selId, mask) {
+        var sel = $(selId); if (!sel) return;
+        classMaskOptions(selId);
+        if (mask == null || mask === -1 || mask === 0) { sel.value = ''; return; }
+        var v = String(mask);
+        if (!Array.prototype.some.call(sel.options, function (o) { return o.value === v; }))
+            sel.add(new Option(maskLabel(mask), v));
+        sel.value = v;
+    }
+    function readClassSelect(selId) {
+        var sel = $(selId); if (!sel) return null;
+        var v = sel.value; return v === '' ? null : (+v || null);
+    }
+    // classId (1..9) → single-bit vanilla mask, matching ItemBudgetGenerator's 1 << (classId - 1).
+    function classIdToMask(classId) { return classId > 0 ? (1 << (classId - 1)) : null; }
+    function fillSpecSelect(classSelId, specSelId) {
+        var cid = +$(classSelId).value; var ss = $(specSelId); ss.innerHTML = '';
+        var cls = (cfg.specCatalog || []).filter(function (c) { return c.classId === cid; })[0];
+        if (!cls) { ss.add(new Option('Generic (balanced)', '')); return; }
+        cls.archetypes.forEach(function (a) { ss.add(new Option(a.label, a.key)); });
+    }
+
+    function cfgGenerate() {
+        var p = cfg.piece; if (!p) return;
+        var q = new URLSearchParams({ inventoryType: p.inventoryType || 0, classId: $('cfgGenClass').value || 0, archetype: $('cfgGenSpec').value || '', level: $('cfgGenLevel').value || 60 });
+        var tier = $('cfgGenTier').value; if (tier !== '') q.append('tier', tier);
+        fetch('/ArmorForge/Itemize?' + q).then(function (r) { return r.json(); }).then(function (d) {
+            if (!d.ok) return;
+            $('cfgQuality').value = String(d.quality);
+            $('cfgItemLevel').value = d.itemLevel;
+            $('cfgReqLevel').value = d.requiredLevel;
+            setCoins('cfgBuy', d.buyPrice); setCoins('cfgSell', d.sellPrice);
+            // Generating with a class picked SETS the restriction; generating with "none" clears it —
+            // but either way the operator now sees it in the Class restriction control and can override.
+            cfg.allowableClass = d.allowableClass != null ? d.allowableClass : null;
+            setClassSelect('cfgClassRestrict', cfg.allowableClass);
+            $('cfgStats').innerHTML = ''; (d.stats || []).forEach(function (s) { addStatRow(s.type, s.value); });
+            var clsName = ($('cfgGenClass').selectedOptions[0] || {}).textContent || '';
+            $('cfgGenSummary').textContent = (d.summary || '') + (cfg.allowableClass ? ' Restricted to ' + clsName + '.' : '');
+            var hints = d.effectSuggestions || [];
+            $('cfgGenHints').innerHTML = hints.length ? 'Suggested effects: <ul>' + hints.map(function (h) { return '<li>' + esc(h) + '</li>'; }).join('') + '</ul>' : '';
+        }).catch(function (e) { console.warn('itemize', e); });
+    }
+
+    var STAT_TYPES = [[7, 'Stamina'], [4, 'Strength'], [3, 'Agility'], [5, 'Intellect'], [6, 'Spirit']];
+    function addStatRow(type, value) {
+        var row = document.createElement('div'); row.className = 'cfg-stat-row';
+        var sel = document.createElement('select'); sel.className = 'af-input';
+        STAT_TYPES.forEach(function (t) { var o = new Option(t[1], t[0]); if (t[0] === type) o.selected = true; sel.add(o); });
+        var val = document.createElement('input'); val.type = 'number'; val.className = 'af-input'; val.min = '1'; val.value = value || '';
+        var x = document.createElement('button'); x.className = 'af-del'; x.textContent = '×'; x.type = 'button';
+        x.onclick = function () { row.remove(); };
+        row.appendChild(sel); row.appendChild(val); row.appendChild(x);
+        $('cfgStats').appendChild(row);
+    }
+
+    function setCoins(prefix, copper) {
+        copper = +copper || 0;
+        $(prefix + 'G').value = Math.floor(copper / 10000) || ''; copper %= 10000;
+        $(prefix + 'S').value = Math.floor(copper / 100) || ''; $(prefix + 'C').value = copper % 100 || '';
+    }
+    function coins(prefix) {
+        var g = +$(prefix + 'G').value || 0, s = +$(prefix + 'S').value || 0, c = +$(prefix + 'C').value || 0;
+        var total = g * 10000 + s * 100 + c; return total > 0 ? total : null;
+    }
+    function numOrNull(id) { var v = $(id).value; return v === '' ? null : (+v); }
+
+    var spellTimer = null;
+    function runSpellSearch(term) {
+        var trig = $('cfgSpellTrigger').value;
+        fetch('/WeaponForge/ItemSpellEffects?q=' + encodeURIComponent(term) + '&trigger=' + trig + '&limit=30').then(function (r) { return r.json(); }).then(function (d) {
+            var box = $('cfgSpellResults'); box.innerHTML = '';
+            if (!d.ok || !d.results || !d.results.length) { box.innerHTML = '<div class="cfg-search-item muted">No matching stock-item effects.</div>'; box.style.display = 'block'; return; }
+            d.results.forEach(function (s) {
+                var el = document.createElement('div'); el.className = 'cfg-search-item';
+                el.innerHTML = '<b>' + esc(s.name) + '</b> <span class="muted">#' + s.id + ' · ' + esc(s.triggerLabel) + (s.usedByCount ? ' · ' + s.usedByCount + ' items' : '') + '</span>';
+                el.onclick = function () { addSpell(s); box.style.display = 'none'; $('cfgSpellSearch').value = ''; };
+                box.appendChild(el);
+            });
+            box.style.display = 'block';
+        }).catch(function (e) { console.warn('spell search', e); });
+    }
+    function addSpell(s) {
+        cfg.spells.push({ spellId: s.id, trigger: s.trigger, charges: s.charges, ppmRate: s.ppmRate, cooldownMs: s.cooldownMs, category: s.category, categoryCooldownMs: s.categoryCooldownMs });
+        renderSpells();
+    }
+    function renderSpells() {
+        var box = $('cfgSpells'); box.innerHTML = '';
+        cfg.spells.forEach(function (sp, i) {
+            var chip = document.createElement('div'); chip.className = 'cfg-chip';
+            chip.innerHTML = '<span>#' + sp.spellId + ' · ' + ({ 0: 'Use', 1: 'On Equip', 2: 'Chance on Hit' }[sp.trigger] || sp.trigger) + '</span><span class="x">×</span>';
+            chip.querySelector('.x').onclick = function () { cfg.spells.splice(i, 1); renderSpells(); };
+            box.appendChild(chip);
+        });
+    }
+
+    function collectItemConfig() {
+        var o = {};
+        var name = $('cfgName').value.trim(); if (name) o.name = name;
+        o.quality = +$('cfgQuality').value;
+        var il = numOrNull('cfgItemLevel'); if (il != null) o.itemLevel = il;
+        var rl = numOrNull('cfgReqLevel'); if (rl != null) o.requiredLevel = rl;
+        var buy = coins('cfgBuy'); if (buy != null) o.buyPrice = buy;
+        var sell = coins('cfgSell'); if (sell != null) o.sellPrice = sell;
+        var ar = numOrNull('cfgArmor'); if (ar != null) o.armor = ar;
+        [['cfgHolyRes', 'holyRes'], ['cfgFireRes', 'fireRes'], ['cfgNatureRes', 'natureRes'], ['cfgFrostRes', 'frostRes'], ['cfgShadowRes', 'shadowRes'], ['cfgArcaneRes', 'arcaneRes'], ['cfgDurability', 'maxDurability']].forEach(function (m) { var v = numOrNull(m[0]); if (v != null) o[m[1]] = v; });
+        var b = $('cfgBonding').value; if (b !== '') o.bonding = +b;
+        // The visible control is authoritative — "Any class" sends -1 rather than omitting the field, so
+        // clearing a restriction actually clears the column instead of leaving the previous value.
+        var mask = readClassSelect('cfgClassRestrict');
+        o.allowableClass = mask != null ? mask : -1;
+        // Stats + spells are always sent (even empty) so the modal is authoritative: an empty list
+        // clears the slot rather than leaving the source/donor values in place.
+        var stats = [];
+        $('cfgStats').querySelectorAll('.cfg-stat-row').forEach(function (row) { var t = +row.children[0].value, v = +row.children[1].value; if (v > 0) stats.push({ type: t, value: v }); });
+        o.stats = stats;
+        o.spells = cfg.spells;
+        return o;
+    }
+
+    function submitConfigure() {
+        if (!cfg.piece) return;
+        (cfg.onSubmit || defaultConfigureImport)(collectItemConfig());
+    }
+
+    function wireConfigure() {
+        $('cfgClose').addEventListener('click', closeConfigure);
+        $('cfgCancel').addEventListener('click', closeConfigure);
+        $('cfgModal').addEventListener('click', function (e) { if (e.target === e.currentTarget) closeConfigure(); });
+        $('cfgGenBtn').addEventListener('click', cfgGenerate);
+        $('cfgAddStat').addEventListener('click', function () { addStatRow(7, ''); });
+        $('cfgSubmit').addEventListener('click', submitConfigure);
+        $('cfgSpellSearch').addEventListener('input', function () {
+            clearTimeout(spellTimer); var term = this.value.trim();
+            if (!term) { $('cfgSpellResults').style.display = 'none'; return; }
+            spellTimer = setTimeout(function () { runSpellSearch(term); }, 300);
+        });
+    }
+    wireConfigure();
+
+    // ── Set Configure modal (per-piece stats via tier/spec + set bonuses) ──
+    var setState = { set: null, pieces: [], configs: {} };
+
+    function openSetConfigure(s) {
+        // Re-opening the SAME set keeps whatever was already configured. Cancel-then-reopen used to wipe
+        // every per-piece edit, the bonus rows and the class restriction with no warning, which is how a
+        // set got imported with no gameplay config at all.
+        var same = setState.set && setState.set.setId === s.setId && setState.set.expansion === s.expansion;
+        setState = { set: s, pieces: (s.pieces || []).slice(), configs: same ? setState.configs : {} };
+        $('setTitle').textContent = 'Configure set — ' + s.name;
+        if (!same) {
+            $('setNameInput').value = s.name || '';
+            $('setGenLevel').value = 60; $('setGenTier').value = ''; $('setGenSummary').textContent = '';
+            $('setClassRestrict').value = '';
+            $('setBonusRows').innerHTML = ''; addSetBonusRow();
+        }
+        $('setError').style.display = 'none';
+        ensureSpecCatalog().then(function () {
+            fillClassSelect('setGenClass', 'setGenSpec');
+            classMaskOptions('setClassRestrict');
+        });
+        renderSetPieces();
+        $('setModal').classList.add('open');
+    }
+    function closeSetConfigure() { $('setModal').classList.remove('open'); }
+
+    function STAT_LABEL(t) { var m = { 3: 'Agi', 4: 'Str', 5: 'Int', 6: 'Spi', 7: 'Sta' }; return m[t] || ('#' + t); }
+    function renderSetPieces() {
+        var host = $('setPieces'); host.innerHTML = '';
+        setState.pieces.forEach(function (p) {
+            var row = document.createElement('div'); row.className = 'cfg-chip'; row.style.marginTop = '5px';
+            var c = setState.configs[p.entry];
+            var summary = c && c.stats && c.stats.length ? c.stats.map(function (st) { return st.value + ' ' + STAT_LABEL(st.type); }).join(', ') : 'no stats yet';
+            if (c && c.allowableClass > 0) summary += ' · ' + maskLabel(c.allowableClass);
+            row.innerHTML = '<span style="flex:1;"><b>' + esc(p.name) + '</b> <span class="muted">· ' + esc(p.familyLabel || '') + ' · ' + esc(summary) + '</span></span>';
+            var edit = document.createElement('button'); edit.className = 'af-btn secondary small'; edit.type = 'button'; edit.textContent = 'Edit';
+            edit.onclick = function () { editSetPiece(p); };
+            row.appendChild(edit); host.appendChild(row);
+        });
+    }
+    function editSetPiece(p) {
+        openConfigure(p, {
+            title: 'Piece — ' + p.name, verb: 'Save piece', prefill: setState.configs[p.entry],
+            onSubmit: function (obj) { setState.configs[p.entry] = obj; closeConfigure(); renderSetPieces(); }
+        });
+    }
+    function draftToConfig(d) {
+        return { quality: d.quality, itemLevel: d.itemLevel, requiredLevel: d.requiredLevel, buyPrice: d.buyPrice, sellPrice: d.sellPrice, allowableClass: d.allowableClass, stats: (d.stats || []).map(function (s) { return { type: s.type, value: s.value }; }) };
+    }
+    function setGenerate() {
+        var level = $('setGenLevel').value || 60, tier = $('setGenTier').value, classId = +$('setGenClass').value || 0, spec = $('setGenSpec').value || '';
+        // Choosing a generator class is also a statement about who may wear the set, so mirror it into
+        // the restriction control unless the operator already set one explicitly.
+        if (classId > 0 && readClassSelect('setClassRestrict') == null)
+            setClassSelect('setClassRestrict', classIdToMask(classId));
+        $('setGenSummary').textContent = 'Generating…';
+        var reqs = setState.pieces.map(function (p) {
+            var q = new URLSearchParams({ inventoryType: p.inventoryType || 0, classId: classId, archetype: spec, level: level });
+            if (tier !== '') q.append('tier', tier);
+            return fetch('/ArmorForge/Itemize?' + q).then(function (r) { return r.json(); }).then(function (d) {
+                // MERGE over any hand edits. Replacing outright discarded name, armor, all six
+                // resistances, durability, bonding and every effect the operator had already set.
+                if (d.ok) setState.configs[p.entry] = Object.assign({}, setState.configs[p.entry] || {}, draftToConfig(d));
+            });
+        });
+        return Promise.all(reqs).then(function () {
+            $('setGenSummary').textContent = 'Generated ' + setState.pieces.length + ' pieces on the tier curve — edit any to fine-tune.';
+            renderSetPieces();
+        });
+    }
+    // A set-bonus row: how many pieces + a SEARCHABLE named effect (no raw spell ids). The effect list
+    // is real stock on-equip auras (name + description) from the installed Spell.dbc, so bonuses read
+    // like "+X spell damage" / "+Y attack power" instead of a number.
+    function addSetBonusRow(threshold, spellId, spellLabel) {
+        var row = document.createElement('div'); row.className = 'cfg-bonus'; row.style.marginTop = '8px';
+        var top = document.createElement('div'); top.style.cssText = 'display:grid;grid-template-columns:110px 1fr 28px;gap:7px;align-items:center;';
+        var th = document.createElement('input'); th.type = 'number'; th.className = 'af-input bThr'; th.min = '1'; th.max = '8'; th.placeholder = '# pieces'; th.value = threshold || '';
+        var search = document.createElement('input'); search.type = 'text'; search.className = 'af-input bSearch'; search.placeholder = 'Search effect — e.g. spell hit, attack power, healing…';
+        if (spellLabel) search.value = spellLabel;
+        var x = document.createElement('button'); x.className = 'af-del'; x.type = 'button'; x.textContent = '×'; x.onclick = function () { row.remove(); };
+        top.appendChild(th); top.appendChild(search); top.appendChild(x);
+        var results = document.createElement('div'); results.className = 'cfg-search-results'; results.style.display = 'none';
+        var picked = document.createElement('div'); picked.className = 'cfg-picked'; picked.dataset.spellid = spellId || '';
+        picked.style.cssText = 'font-size:11px;color:#46b77a;margin-top:3px;min-height:14px;';
+        picked.textContent = spellLabel ? ('✓ ' + spellLabel) : '';
+        row.appendChild(top); row.appendChild(results); row.appendChild(picked);
+
+        var timer = null;
+        search.addEventListener('input', function () {
+            clearTimeout(timer); var term = this.value.trim();
+            // Editing the text invalidates any previous pick, or the green "✓ name" can disagree with
+            // the spell id actually submitted.
+            picked.dataset.spellid = ''; row.dataset.topspell = '';
+            if (!term) { results.style.display = 'none'; picked.textContent = ''; return; }
+            timer = setTimeout(function () {
+                fetch('/WeaponForge/ItemSpellEffects?q=' + encodeURIComponent(term) + '&trigger=1&limit=25').then(function (r) { return r.json(); }).then(function (d) {
+                    results.innerHTML = '';
+                    if (!d.ok || !d.results || !d.results.length) { results.innerHTML = '<div class="cfg-search-item muted">No matching effects. Try “spell power”, “hit”, “crit”, “stamina”, “resistance”…</div>'; results.style.display = 'block'; row.dataset.topspell = ''; return; }
+                    // Remember the top match so a bonus still lands even if the user doesn't click a row.
+                    row.dataset.topspell = d.results[0].id;
+                    if (!(+picked.dataset.spellid > 0)) picked.textContent = 'Top match: ' + esc(d.results[0].name) + ' (#' + d.results[0].id + ') — click to confirm.';
+                    d.results.forEach(function (s) {
+                        var el = document.createElement('div'); el.className = 'cfg-search-item';
+                        el.innerHTML = '<b>' + esc(s.name) + '</b>' + (s.description ? ' <span class="muted">— ' + esc(s.description) + '</span>' : '') + ' <span class="muted">#' + s.id + '</span>';
+                        el.onclick = function () { search.value = s.name; picked.dataset.spellid = s.id; picked.textContent = '✓ ' + s.name + ' (#' + s.id + ')'; results.style.display = 'none'; };
+                        results.appendChild(el);
+                    });
+                    results.style.display = 'block';
+                }).catch(function () { results.style.display = 'none'; });
+            }, 300);
+        });
+        $('setBonusRows').appendChild(row);
+    }
+    // Returns the usable bonuses AND how many rows the operator actually typed into, so the caller can
+    // tell "no bonuses wanted" from "bonuses wanted but silently dropped" — the reason every forged set
+    // on the live server ended up with an empty bonus table.
+    function collectBonuses() {
+        var out = [], attempted = 0;
+        $('setBonusRows').querySelectorAll('.cfg-bonus').forEach(function (row) {
+            var thrRaw = row.querySelector('.bThr').value.trim();
+            var searchRaw = row.querySelector('.bSearch').value.trim();
+            if (thrRaw !== '' || searchRaw !== '') attempted++;
+            var t = +thrRaw;
+            var s = +row.querySelector('.cfg-picked').dataset.spellid;
+            if (!(s > 0)) {
+                // Fall back to a typed numeric spell id, else the last top search match.
+                var typed = +searchRaw;
+                if (typed > 0) s = typed;
+                else if (+row.dataset.topspell > 0) s = +row.dataset.topspell;
+            }
+            if (t > 0 && s > 0) out.push({ threshold: t, spellId: s });
+        });
+        out.attempted = attempted;
+        return out;
+    }
+    function submitSetConfigure() {
+        var s = setState.set; if (!s) return;
+
+        // A set with no per-piece config imports as art with donor gameplay: no stats and, critically,
+        // allowable_class left at the -1 default. That used to happen silently — the operator saw
+        // "5/5 pieces imported" and only found out in game. Generate first when we can, then confirm.
+        var missing = setState.pieces.filter(function (p) { return !setState.configs[p.entry]; });
+        var classId = +$('setGenClass').value || 0, tier = $('setGenTier').value;
+        // One attempt only — if Itemize is failing, fall through to the confirm instead of looping.
+        if (missing.length && (classId > 0 || tier !== '') && !setState.autoGenerated) {
+            setState.autoGenerated = true;
+            $('setGenSummary').textContent = 'Generating the unconfigured pieces first…';
+            setGenerate().then(function () { submitSetConfigure(); }, function () { submitSetConfigure(); });
+            return;
+        }
+        var setMask = readClassSelect('setClassRestrict');
+        missing = setState.pieces.filter(function (p) { return !setState.configs[p.entry]; });
+        if (missing.length) {
+            var warn = missing.length + ' of ' + setState.pieces.length + ' pieces have no gameplay config'
+                + (setMask != null ? '' : ' and no class restriction')
+                + '.\n\nThey import with donor defaults'
+                + (setMask != null ? ' (the class restriction still applies).' : ' and ANY class will be able to wear them (allowable_class = -1).')
+                + '\n\nImport anyway?';
+            if (!confirm(warn)) return;
+        }
+
+        var bonuses = collectBonuses();
+        if (bonuses.attempted > bonuses.length) {
+            if (!confirm((bonuses.attempted - bonuses.length) + ' bonus row(s) are incomplete and will be DROPPED.\n\nA bonus needs both a piece count and an effect picked from the search list. Import with only ' + bonuses.length + ' bonus(es)?')) return;
+        }
+
+        var pieces = setState.pieces.map(function (p) {
+            var c = setState.configs[p.entry];
+            // The set-level restriction wins for every piece — a tier set is class-locked as a unit.
+            if (setMask != null) c = Object.assign({}, c || {}, { allowableClass: setMask });
+            return { entry: p.entry, itemConfig: c ? JSON.stringify(c) : null };
+        });
+        var body = { expansion: s.expansion || 'tbc', sourceSetId: s.setId, name: $('setNameInput').value.trim() || s.name, pieces: pieces, bonuses: bonuses.slice(), requiredSkill: 0, requiredSkillRank: 0 };
+        if (apActive) { body.recolorHue = apActive.hue; body.recolorTheory = apActive.theory; body.recolorTier = apActive.tier; }
+        if ($('apGlowOn').checked) body.glowColor = $('apGlowColor').value; // bake flame/glow colour
+        $('setError').style.display = 'none'; $('setSubmit').disabled = true;
+        result('<div class="title">Importing set ' + esc(s.name) + ' (' + s.pieces.length + ' pieces)…</div><div class="muted">Each piece is configured, reserved and persisted; patch-6 is rebuilt once.</div>');
+        fetch('/ArmorForge/ImportSet', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+            .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, body: t }; }); })
+            .then(function (r) {
+                $('setSubmit').disabled = false;
+                if (!r.ok) { $('setError').textContent = r.body; $('setError').style.display = 'block'; return; }
+                closeSetConfigure(); showSetResult(JSON.parse(r.body)); refreshStatus();
+            });
+    }
+    function showSetResult(d) {
+        var h = '<div class="title ok">Set ' + d.setId + ' — ' + esc(d.name) + '</div><div class="muted">' + esc(d.message) + '</div><div class="af-kv" style="margin-top:6px;">';
+        (d.pieces || []).forEach(function (p) { h += '<b class="' + (p.ok ? 'ok' : 'bad') + '">' + (p.ok ? '✓' : '✗') + ' ' + esc(p.name || p.tbcEntry) + '</b><span>' + (p.ok ? 'entry ' + p.itemEntry + ' · display ' + p.displayId : esc(p.message)) + '</span>'; });
+        h += '<b class="' + (d.serverItemSetDeployed ? 'ok' : 'bad') + '">Server sets</b><span class="' + (d.serverItemSetDeployed ? 'ok' : 'bad') + '">' + esc(d.serverItemSetMessage || '') + '</span>';
+        h += '</div>';
+        // Set membership and bonuses are BOTH gated on the core re-reading ItemSet.dbc.
+        if (d.serverItemSetDeployed)
+            h += '<div class="muted" style="margin-top:6px;"><strong>Restart mangosd</strong> to activate this set'
+                + (d.bonusCount > 0 ? ' and its ' + d.bonusCount + ' bonus(es)' : ' — until then the core zeroes its set_id, so the tooltip shows no set block')
+                + '. Use the <strong>Restart mangosd</strong> button in the Registry card.</div>';
+        result(h); loadList();
+        var okPieces = (d.pieces || []).filter(function (p) { return p.ok; });
+        if (okPieces.length && window.afViewer) window.afViewer.dressTbc(okPieces.map(function (p) { return { displayId: p.displayId, itemId: p.itemEntry }; }));
+    }
+    function wireSet() {
+        $('setClose').addEventListener('click', closeSetConfigure);
+        $('setCancel').addEventListener('click', closeSetConfigure);
+        $('setModal').addEventListener('click', function (e) { if (e.target === e.currentTarget) closeSetConfigure(); });
+        $('setGenBtn').addEventListener('click', setGenerate);
+        $('setAddBonus').addEventListener('click', function () { addSetBonusRow(); });
+        $('setSubmit').addEventListener('click', submitSetConfigure);
+    }
+    wireSet();
+
+    // ── Appearance (live recolor of the previewed piece) ──
+    var apCurrent = null, apTheory = 'fan', apActive = null; // apActive = the recolor to BAKE on import
+    var AP_THEORIES = [['fan', 'Fan'], ['identity', 'Shift'], ['analogous', 'Analogous'], ['accent', 'Accent'], ['luminance', 'Luminance'], ['bank', 'Palette']];
+    // Body-atlas (painted) slots — colour detection must sample one of these, not a helm/shoulder model.
+    var PAINTED_INV = [5, 20, 7, 10, 6, 9, 8, 16]; // chest, robe, legs, hands, waist, wrists, feet, back
+    function apPickDetectPiece(pieces) {
+        for (var i = 0; i < pieces.length; i++) if (PAINTED_INV.indexOf(pieces[i].inventoryType) >= 0) return pieces[i];
+        return pieces[0];
+    }
+
+    function apSetTarget(t) {
+        apCurrent = t; apActive = null; // a fresh preview clears any pending bake
+        var s = $('apStatus');
+        if (!t || !t.pieces || !t.pieces.length) { if (s) s.textContent = ''; return; }
+        if (s) s.textContent = 'Reading ' + (t.name || 'piece') + '’s colours…';
+        // Seed the primary-colour picker from the item's own majority colour. Foreign (pre-import)
+        // pieces sample their extracted source atlas; vanilla/forged pieces use the retexture engine.
+        var pc0 = apPickDetectPiece(t.pieces);
+        var foreign = (pc0.expansion === 'tbc' || pc0.expansion === 'wotlk') && pc0.entry;
+        var url = foreign ? ('/ArmorForge/PrimaryColor?expansion=' + pc0.expansion + '&entry=' + pc0.entry) : ('/RetextureEngine/Primary?displayId=' + pc0.displayId);
+        fetch(url).then(function (r) { return r.json(); }).then(function (d) {
+            if (apCurrent !== t) return;
+            if (d.success && d.primaryHex) { $('apColor').value = d.primaryHex; if (s) s.textContent = 'Primary colour of ' + (t.name || 'piece') + ' loaded. Pick a colour or theory to recolor.'; }
+            else if (s) s.textContent = 'Ready to recolor ' + (t.name || 'piece') + '.';
+        }).catch(function () { if (apCurrent === t && s) s.textContent = 'Ready to recolor ' + (t.name || 'piece') + '.'; });
+    }
+    function hexToHue(hex) {
+        var m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex); if (!m) return 0;
+        var r = parseInt(m[1], 16) / 255, g = parseInt(m[2], 16) / 255, b = parseInt(m[3], 16) / 255;
+        var mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, h = 0;
+        if (d === 0) h = 0; else if (mx === r) h = ((g - b) / d) % 6; else if (mx === g) h = (b - r) / d + 2; else h = (r - g) / d + 4;
+        h *= 60; if (h < 0) h += 360; return h;
+    }
+    function hexToRgb01(hex) {
+        var m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex); if (!m) return [1, 1, 1];
+        return [parseInt(m[1], 16) / 255, parseInt(m[2], 16) / 255, parseInt(m[3], 16) / 255];
+    }
+    // Recolor every previewed piece (a single piece OR a whole set) coherently with one primary hue.
+    // Single-flight + trailing coalesce: only ONE recolor runs at a time; rapid colour drags set a
+    // pending flag and re-run once at the end, so the latest colour always wins and calls never
+    // interleave (the interleave was the green↔red flicker — overlapping atlas repaints finishing
+    // out of order and settling on a stale colour).
+    var apBusy = false, apPending = false;
+    function apApply() {
+        if (!apCurrent || !apCurrent.pieces || !apCurrent.pieces.length || !window.afViewer) { $('apStatus').textContent = 'Preview a piece or set first.'; return; }
+        if (apBusy) { apPending = true; return; }
+        apBusy = true; apPending = false;
+        var hue = hexToHue($('apColor').value), tier = $('apTier').value;
+        var foreign = apCurrent.pieces.some(function (p) { return (p.expansion === 'tbc' || p.expansion === 'wotlk') && p.entry; });
+        $('apStatus').textContent = 'Recoloring…';
+        function done(ok, n) {
+            apBusy = false;
+            if (ok) apActive = { hue: Math.round(hue), theory: apTheory, tier: tier }; // remember to bake on import
+            if (apPending) { apApply(); return; } // a newer colour/theory arrived mid-run — apply it once
+            $('apStatus').textContent = ok ? ('Applied ' + apTheory + ' at ' + Math.round(hue) + '°' + (n != null ? ' to ' + n + ' piece(s)' : '') + ' — will bake on import.') : 'No recolorable textures on this item.';
+            if ($('apGlowOn').checked) apGlowApply(); // re-tint glow after a re-equip reset materials
+        }
+        if (foreign && apCurrent.items && apCurrent.items.length) {
+            // Foreign (pre-import): ONE layered re-dress with recolored body + cape + helm/shoulder — no flicker.
+            window.afViewer.dressRecolor(apCurrent.items, { hue: hue, theory: apTheory, tier: tier }).then(function (ok) { done(ok, null); });
+        } else {
+            // Vanilla / forged: recolor each piece via the retexture engine (resolves its vanilla display).
+            var okCount = 0;
+            apCurrent.pieces.reduce(function (chain, pc) {
+                return chain.then(function () {
+                    return window.afViewer.applyRecolor(pc.displayId, { theory: apTheory, tier: tier, hue: hue, inventoryType: pc.inventoryType, entry: pc.entry, expansion: pc.expansion }).then(function (ok) { if (ok) okCount++; });
+                });
+            }, Promise.resolve()).then(function () { done(okCount > 0, okCount); });
+        }
+    }
+    function apDetect() {
+        if (!apCurrent || !apCurrent.pieces || !apCurrent.pieces.length) { $('apStatus').textContent = 'Preview a piece or set first.'; return; }
+        $('apStatus').textContent = 'Detecting primary colour…';
+        fetch('/RetextureEngine/Primary?displayId=' + apCurrent.pieces[0].displayId).then(function (r) { return r.json(); }).then(function (d) {
+            if (d.success && d.primaryHex) { $('apColor').value = d.primaryHex; apApply(); }
+            else $('apStatus').textContent = 'Could not detect a primary colour.';
+        }).catch(function () { $('apStatus').textContent = 'Detect failed.'; });
+    }
+    function apGlowApply() {
+        if (!window.afViewer) return;
+        if (!$('apGlowOn').checked) { window.afViewer.clearGlow(); $('apGlowNote').textContent = 'Glow recolor off.'; return; }
+        var n = window.afViewer.tintGlow(hexToRgb01($('apGlowColor').value));
+        $('apGlowNote').textContent = n ? (n + ' glow material(s) tinted.') : 'This item has no glow/particle effect to recolor.';
+    }
+    function wireAppearance() {
+        var host = $('apTheories');
+        AP_THEORIES.forEach(function (t) {
+            var b = document.createElement('button'); b.className = 'af-btn secondary small'; b.textContent = t[1]; b.type = 'button';
+            b.onclick = function () { apTheory = t[0]; host.querySelectorAll('button').forEach(function (x) { x.classList.remove('on'); }); b.classList.add('on'); apApply(); };
+            if (t[0] === apTheory) b.classList.add('on');
+            host.appendChild(b);
+        });
+        var colorTimer = null;
+        $('apColor').addEventListener('input', function () { clearTimeout(colorTimer); colorTimer = setTimeout(apApply, 130); });
+        $('apTier').addEventListener('change', apApply);
+        $('apDetect').addEventListener('click', apDetect);
+        $('apGlowOn').addEventListener('change', apGlowApply);
+        $('apGlowColor').addEventListener('input', apGlowApply);
+    }
+    wireAppearance();
+
+    // ── Registry ──
+    function loadList() {
+        fetch('/ArmorForge/ListArmor').then(function (r) { return r.json(); }).then(function (d) {
+            var pieces = d.pieces || [], sets = d.sets || [];
+            if (!pieces.length) { $('afList').innerHTML = '<span class="muted" style="font-size:12px;">No forged armor yet.</span>'; fillSetPicker(sets, pieces); return; }
+            var bySet = {}; pieces.forEach(function (p) { (bySet[p.setId || 0] = bySet[p.setId || 0] || []).push(p); });
+            var h = '<table><thead><tr><th>Name</th><th>Piece</th><th>Entry</th><th></th></tr></thead><tbody>';
+            function rows(list) {
+                list.forEach(function (r) {
+                    h += '<tr><td>' + esc(r.name) + '</td><td class="muted">' + esc(r.family) + (r.models ? ' · ' + r.models + ' m2' : '') + '</td><td class="muted">' + r.itemEntry + '</td>' +
+                        '<td style="white-space:nowrap;"><button class="af-btn secondary small" data-view="' + r.displayId + '" data-entry="' + r.itemEntry + '" style="margin-right:5px;">View</button><button class="af-del" data-del="' + r.displayId + '">Delete</button></td></tr>';
+                });
+            }
+            sets.forEach(function (s) {
+                var list = bySet[s.setId] || []; if (!list.length) return;
+                h += '<tr class="af-grp"><td colspan="3">' + esc(s.name) + ' <span class="muted" style="font-weight:500;">· set ' + s.setId + ' · ' + list.length + ' pieces' + (s.bonusCount ? ' · ' + s.bonusCount + ' bonus(es)' : '') + '</span></td>' +
+                    '<td style="white-space:nowrap;"><button class="af-btn secondary small" data-viewset="' + s.setId + '" style="margin-right:5px;">View set</button><button class="af-del" data-delset="' + s.setId + '">Delete set</button></td></tr>';
+                rows(list); delete bySet[s.setId];
+            });
+            var loose = Object.keys(bySet).reduce(function (acc, k) { return acc.concat(bySet[k]); }, []);
+            if (loose.length) { h += '<tr class="af-grp"><td colspan="4">Single pieces</td></tr>'; rows(loose); }
+            h += '</tbody></table>'; $('afList').innerHTML = h;
+            $('afList').querySelectorAll('[data-view]').forEach(function (b) { b.addEventListener('click', function () {
+                if (!window.afViewer) return;
+                // Default outfit + this piece, dressed together so geosets/paint order resolve like the Items page.
+                var items = window.afViewer.defaultOutfit.map(function (d) { return { displayId: d.displayId, itemId: d.itemId }; });
+                items.push({ displayId: +b.getAttribute('data-view'), itemId: +b.getAttribute('data-entry') });
+                window.afViewer.dressTbc(items);
+            }); });
+            $('afList').querySelectorAll('[data-viewset]').forEach(function (b) { b.addEventListener('click', function () {
+                var sid = +b.getAttribute('data-viewset'); var list = pieces.filter(function (p) { return p.setId === sid; });
+                if (window.afViewer) window.afViewer.dressTbc(list.map(function (p) { return { displayId: p.displayId, itemId: p.itemEntry }; }));
+            }); });
+            $('afList').querySelectorAll('[data-del]').forEach(function (b) { b.addEventListener('click', function () {
+                if (!confirm('Delete this armor piece from the game?')) return;
+                var fd = new FormData(); fd.append('displayId', b.getAttribute('data-del'));
+                post('/ArmorForge/Delete', fd, true).then(function (res) { showDeleteResult(res, 'piece'); loadList(); });
+            }); });
+            $('afList').querySelectorAll('[data-delset]').forEach(function (b) { b.addEventListener('click', function () {
+                if (!confirm('Delete this whole set from the game?')) return;
+                var fd = new FormData(); fd.append('setId', b.getAttribute('data-delset'));
+                post('/ArmorForge/DeleteSet', fd, true).then(function (res) { showDeleteResult(res, 'set'); loadList(); });
+            }); });
+            fillSetPicker(sets, pieces);
+        });
+    }
+
+    // Delete results report what actually happened. A set delete can come back ok:false when some
+    // pieces survived — in that case the set row is deliberately KEPT so the delete can be retried,
+    // and saying "Deleted" would be a lie.
+    function showDeleteResult(res, what) {
+        var d = null;
+        try { d = JSON.parse(res.body); } catch (e) { }
+        if (!d) { result('<div class="title bad">Delete ' + what + ' failed</div><div class="bad" style="white-space:pre-wrap;">' + esc(res.body) + '</div>'); return; }
+        var ok = d.ok !== false;
+        result('<div class="title ' + (ok ? 'ok' : 'bad') + '">' + (ok ? 'Deleted ' + what : 'Delete ' + what + ' incomplete') + '</div>' +
+            '<div class="' + (ok ? 'muted' : 'bad') + '" style="white-space:pre-wrap;">' + esc(d.message || '') + '</div>' +
+            (ok ? '' : '<div class="muted" style="margin-top:6px;">The set was left in place so you can try again once the cause is cleared (a running game client locks patch-6).</div>'));
+    }
+
+    // ── Optional vanilla set bonuses ──
+    var curSets = [], curPieces = [];
+    function fillSetPicker(sets, pieces) {
+        curSets = sets; curPieces = pieces;
+        var sel = $('setPick'); var cur = sel.value;
+        sel.innerHTML = '<option value="0">— pick a forged set —</option>';
+        sets.forEach(function (s) { sel.add(new Option(s.name + ' (' + s.memberCount + 'pc)', s.setId)); });
+        sel.value = cur; renderSetEditor();
+    }
+    $('setPick').addEventListener('change', renderSetEditor);
+    function renderSetEditor() {
+        var sid = +$('setPick').value; var s = curSets.filter(function (x) { return x.setId === sid; })[0];
+        $('setBonuses').innerHTML = ''; $('setMembers').innerHTML = '';
+        if (!s) { $('setName').value = ''; $('setMembers').innerHTML = '<span class="muted" style="font-size:11px;">Pick a set.</span>'; return; }
+        $('setName').value = s.name;
+        curPieces.forEach(function (p) {
+            var d = document.createElement('label'); d.className = 'af-member';
+            d.innerHTML = '<input type="checkbox" value="' + p.itemEntry + '"' + (p.setId === sid ? ' checked' : '') + '> ' + esc(p.name) + ' <span class="muted" style="font-size:10px;">(' + esc(p.family) + ')</span>';
+            $('setMembers').appendChild(d);
+        });
+        (s.bonuses || []).forEach(function (b) { addBonusRow(b.threshold, b.spellId); });
+    }
+    $('addBonus').addEventListener('click', function () { addBonusRow(2, 0); });
+    function addBonusRow(t, sp) {
+        var d = document.createElement('div'); d.className = 'af-bonus-row';
+        d.innerHTML = '<input type="number" min="1" max="8" value="' + t + '" class="af-input bThr" placeholder="pc"><input type="number" min="0" value="' + sp + '" class="af-input bSpell" placeholder="spell id"><button class="af-del bRm">✕</button>';
+        d.querySelector('.bRm').addEventListener('click', function () { d.remove(); });
+        $('setBonuses').appendChild(d);
+    }
+    function saveSet(btn) {
+        var sid = +$('setPick').value;
+        var members = Array.prototype.slice.call($('setMembers').querySelectorAll('input:checked')).map(function (c) { return parseInt(c.value, 10); });
+        if (!sid && !members.length) { result('<div class="title bad">Pick a set</div>'); return; }
+        // Same silent-drop guard as the set modal's collector: this card is a SEPARATE control (raw
+        // numeric spell id), so the check has to exist here too.
+        var rows = Array.prototype.slice.call($('setBonuses').querySelectorAll('.af-bonus-row'));
+        var attempted = rows.filter(function (row) {
+            return row.querySelector('.bThr').value.trim() !== '' || row.querySelector('.bSpell').value.trim() !== '';
+        }).length;
+        var bonuses = rows.map(function (row) { return { threshold: +row.querySelector('.bThr').value || 0, spellId: +row.querySelector('.bSpell').value || 0 }; }).filter(function (b) { return b.threshold > 0 && b.spellId > 0; });
+        if (attempted > bonuses.length &&
+            !confirm((attempted - bonuses.length) + ' bonus row(s) are incomplete and will be DROPPED.\n\nEach bonus needs both a piece count and a spell id. Save with only ' + bonuses.length + ' bonus(es)?')) return;
+        btn.disabled = true;
+        post('/ArmorForge/SaveSet', { setId: sid, name: $('setName').value, memberEntries: members, bonuses: bonuses }, false).then(function (r) {
+            btn.disabled = false;
+            if (!r.ok) { result('<div class="title bad">Set save failed</div><div class="bad">' + esc(r.body) + '</div>'); return; }
+            var d = JSON.parse(r.body);
+            result('<div class="title ok">Set ' + d.setId + ' saved</div><div class="muted">' + esc(d.message) + '</div>' +
+                (d.serverDbcDeployed ? '<div class="muted" style="margin-top:6px;"><strong>Restart mangosd</strong> for this to take effect — the core only reads ItemSet.dbc at startup.</div>' : ''));
+            loadList(); refreshStatus();
+        });
+    }
+
+    document.querySelectorAll('[data-action]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            var a = btn.getAttribute('data-action');
+            if (a === 'rebuildPatch') { btn.disabled = true; post('/ArmorForge/RebuildPatch', new FormData(), true).then(function (r) { btn.disabled = false; var d = JSON.parse(r.body); result('<div class="title ok">Patch rebuilt</div><div class="muted">' + esc(d.message) + '</div>'); refreshStatus(); }); }
+            else if (a === 'saveSet') saveSet(btn);
+            else if (a === 'restartMangosd') restartMangosd(btn);
+        });
+    });
+
+    function setChar() { if (window.afViewer) window.afViewer.setChar($('cvRace').value, $('cvGender').value); }
+    $('cvRace').addEventListener('change', setChar); $('cvGender').addEventListener('change', setChar);
+    $('cvStrip').addEventListener('click', function () { $('cvEquipped').textContent = ''; if (window.afViewer) window.afViewer.reset(); });
+
+    loadList();
+})();
+</script>
+}

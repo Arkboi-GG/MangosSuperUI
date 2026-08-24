@@ -72,6 +72,7 @@ public static class M2BinaryValidator
 
         ValidateTransparencyTracks(m2, doc, d);
         ValidateMaterialTracks(m2, doc, d);
+        ValidateParticleEmitters(m2, doc, d);
 
         // One Type-2 texture (empty embedded filename is expected; not enforced here).
         var tex = doc.FindArray("textures");
@@ -268,6 +269,104 @@ public static class M2BinaryValidator
                     d.Error("m2.transparency.array-oob",
                         $"{label} {name} array count={count}, offset=0x{offset:X} is out of bounds.");
                 return valid;
+            }
+        }
+
+        ushort U16At(int offset) => BinaryPrimitives.ReadUInt16LittleEndian(m2.AsSpan(offset, 2));
+        short I16At(int offset) => BinaryPrimitives.ReadInt16LittleEndian(m2.AsSpan(offset, 2));
+        uint U32At(int offset) => BinaryPrimitives.ReadUInt32LittleEndian(m2.AsSpan(offset, 4));
+    }
+
+    /// <summary>Deep-validate the eleven nested v256 tracks inside each particle emitter.
+    ///
+    /// Emitters reach a forged model only by transplant (<see cref="M2EmitterTransplanter"/>), which
+    /// lifts a 504-byte record out of a DIFFERENT model and shifts its array offsets by a constant.
+    /// Two things do not travel with those offsets and were, until this check existed, never looked
+    /// at again:
+    ///
+    ///   • <b>global sequence indices.</b> A track's <c>int16 globalSequence</c> indexes the model's
+    ///     own globalLoops array. The donor's index means nothing in the target, and an out-of-range
+    ///     one sends the client to read a duration that is not there — a track timed against garbage
+    ///     loops absurdly fast, which on the "enabled" track is an emitter that strobes on and off.
+    ///   • <b>per-sequence ranges.</b> With <c>globalSequence == -1</c> the ranges array is indexed
+    ///     by ANIMATION index, so a donor with fewer ranges than the target has sequences is an
+    ///     out-of-bounds read on any animation past the donor's count.
+    ///
+    /// Both are cheap to check and neither was covered: the transparency and material/UV validators
+    /// above check exactly these invariants for their own track kinds, and emitters were the one
+    /// track-bearing structure the forge writes that nothing re-read. Reported as warnings rather
+    /// than errors — motion is an enhancement and must never block a build (the transplanter's own
+    /// contract), so a suspect emitter should be visible in diagnostics without failing the piece.</summary>
+    private static void ValidateParticleEmitters(byte[] m2, RawM2Document doc, ForgeDiagnostics d)
+    {
+        var emitters = doc.FindArray("particleEmitters");
+        if (emitters is null || emitters.Count == 0) return;
+
+        const int stride = M2EmitterTransplanter.EmitterStride;
+        if (emitters.Offset == 0 || emitters.Offset + (long)emitters.Count * stride > m2.Length)
+        {
+            d.Warn("m2.particle.records-oob",
+                $"Particle emitter array count={emitters.Count}, offset=0x{emitters.Offset:X} is out of bounds.");
+            return;
+        }
+
+        uint sequenceCount = doc.FindArray("sequences")?.Count ?? 0;
+        uint globalSequenceCount = doc.FindArray("globalLoops")?.Count ?? 0;
+        uint textureCount = doc.FindArray("textures")?.Count ?? 0;
+
+        for (int e = 0; e < emitters.Count; e++)
+        {
+            int record = checked((int)emitters.Offset + e * stride);
+            string what = $"Particle emitter {e}";
+
+            ushort texture = U16At(record + 22);
+            if (textureCount > 0 && texture >= textureCount)
+                d.Warn("m2.particle.texture",
+                    $"{what} references texture {texture}, count {textureCount}.");
+
+            for (int t = 0; t < M2EmitterTransplanter.TrackStarts.Length; t++)
+            {
+                int track = record + M2EmitterTransplanter.TrackStarts[t];
+                short globalSequence = I16At(track + 2);
+                uint rangeCount = U32At(track + 4), rangeOffset = U32At(track + 8);
+                uint timeCount = U32At(track + 12), timeOffset = U32At(track + 16);
+                uint keyCount = U32At(track + 20), keyOffset = U32At(track + 24);
+                string label = $"{what} track {t}";
+
+                if (globalSequence < -1 || globalSequence >= 0 && globalSequence >= globalSequenceCount)
+                    d.Warn("m2.particle.global-sequence",
+                        $"{label} references global sequence {globalSequence}, count {globalSequenceCount}.");
+
+                bool ok = CheckArray(rangeCount, rangeOffset, 8, "ranges")
+                        & CheckArray(timeCount, timeOffset, 4, "timestamps")
+                        & CheckArray(keyCount, keyOffset, 4, "keys");
+                if (!ok) continue;
+
+                if (timeCount != keyCount)
+                    d.Warn("m2.particle.key-count",
+                        $"{label} has {timeCount} timestamp(s) but {keyCount} key(s).");
+                if (globalSequence == -1 && sequenceCount > 0 && rangeCount > 0 && rangeCount < sequenceCount)
+                    d.Warn("m2.particle.range-count",
+                        $"{label} has {rangeCount} range(s) for {sequenceCount} animation sequence(s) — " +
+                        "the client reads past the end on any sequence beyond that.");
+
+                for (int ri = 0; ri < rangeCount; ri++)
+                {
+                    int range = checked((int)rangeOffset + ri * 8);
+                    uint start = U32At(range), end = U32At(range + 4);
+                    if (start > end || end >= timeCount || end >= keyCount)
+                        d.Warn("m2.particle.range",
+                            $"{label} range {ri} [{start},{end}] is invalid for {timeCount} timestamp(s) and {keyCount} key(s).");
+                }
+
+                bool CheckArray(uint count, uint offset, int elementSize, string name)
+                {
+                    bool valid = count == 0 || offset > 0 && offset + (long)count * elementSize <= m2.Length;
+                    if (!valid)
+                        d.Warn("m2.particle.array-oob",
+                            $"{label} {name} array count={count}, offset=0x{offset:X} is out of bounds.");
+                    return valid;
+                }
             }
         }
 
