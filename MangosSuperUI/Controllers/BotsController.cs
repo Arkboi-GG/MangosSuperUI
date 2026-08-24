@@ -17,9 +17,9 @@ public partial class BotsController : Controller
     private readonly BotFlightRecorder _recorder;
     private readonly BotLogBuffer _log;
     private readonly RaService _ra;
-    private readonly IWebHostEnvironment _env;
+    private readonly BotSpawnService _spawner;
 
-    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra, IWebHostEnvironment env)
+    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra, BotSpawnService spawner)
     {
         _bridge = bridge;
         _brain = brain;
@@ -28,7 +28,7 @@ public partial class BotsController : Controller
         _recorder = recorder;
         _log = log;
         _ra = ra;
-        _env = env;
+        _spawner = spawner;
     }
 
     public IActionResult Index()
@@ -36,9 +36,11 @@ public partial class BotsController : Controller
         return View();
     }
 
-    // ==================== Add bots (RA console: .bot addai <class>) ====================
-    // Quick-spawn helper for reruns. The Bot Monitor "Add Bots" modal POSTs a flat class
-    // list; we fire `.bot addai <class>` once per entry over RA (serialized inside RaService).
+    // ==================== Add bots (RA console: .bot addai <class> <race> <name>) ====================
+    // Quick-spawn helper for reruns. The Bot Monitor "Add Bots" modal POSTs per-(race, class)
+    // counts; we expand them here and hand the batch to BotSpawnService, which draws unique names
+    // and fires `.bot addai <class> <race> <name>` once per bot over RA (serialized inside
+    // RaService) on a background task, streaming SpawnProgress over the BotBridge hub.
     // Classes are STRICTLY whitelisted — these tokens are concatenated into a live console
     // command, so an unknown token is rejected up front rather than passed through.
     private static readonly HashSet<string> _addBotClasses = new(StringComparer.OrdinalIgnoreCase)
@@ -80,7 +82,7 @@ public partial class BotsController : Controller
         // Expand the request into a flat (race, class) spawn list.
         // Preferred shape: Spawns = [{ race, cls, count }]. Legacy shape: Classes = ["mage", ...]
         // (class-only, default race per class) is still accepted so old callers don't break.
-        var spawns = new List<(string race, string cls)>();
+        var spawns = new List<BotSpawnService.SpawnRequest>();
 
         if (req?.Spawns != null && req.Spawns.Length > 0)
         {
@@ -91,7 +93,7 @@ public partial class BotsController : Controller
                 if (s.Count <= 0) continue;
                 if (!_raceClasses.TryGetValue(race, out var validClasses) || !validClasses.Contains(cls))
                     return Json(new { success = false, error = $"Invalid race/class combination: {race} {cls}" });
-                for (int i = 0; i < s.Count; i++) spawns.Add((race, cls));
+                for (int i = 0; i < s.Count; i++) spawns.Add(new(race, cls));
             }
         }
         else if (req?.Classes != null && req.Classes.Length > 0)
@@ -101,46 +103,64 @@ public partial class BotsController : Controller
                 var cls = (raw ?? "").Trim().ToLowerInvariant();
                 if (!_addBotClasses.Contains(cls))
                     return Json(new { success = false, error = "Unknown class: " + cls });
-                spawns.Add((_classDefaultRace[cls], cls));
+                spawns.Add(new(_classDefaultRace[cls], cls));
             }
         }
 
         if (spawns.Count == 0)
             return Json(new { success = false, error = "Nothing to spawn" });
-        if (spawns.Count > 200)
-            return Json(new { success = false, error = "Too many at once (max 200)" });
 
-        // Draw that many unique names from the list (wwwroot/data), minus names already taken.
-        List<string> names;
+        // The per-batch ceiling (BotSpawn:MaxPerRequest) and the unused-name pool are checked in
+        // StartAsync. The batch itself runs in the background: poll /Bots/AddBotsStatus or listen
+        // for SpawnProgress on /hubs/botbridge for its progress.
+        var (job, error) = await _spawner.StartAsync(spawns);
+        if (error != null)
+            return Json(new { success = false, error, job });
+
+        return Json(new { success = true, job, requested = spawns.Count });
+    }
+
+    // What the Add Bots modal shows up front so the UI and the server can't disagree: the configured
+    // per-batch ceiling, how many unused names are left (the real lifetime ceiling), how many bots the
+    // bridge currently sees, and mangosd's PlayerLimit (bot sessions count against it — once bots +
+    // players exceed it, non-GM players land in the login queue). Also returns the current/last batch.
+    [HttpGet]
+    public async Task<IActionResult> AddBotsLimits()
+    {
+        int? namesAvailable = null;
+        string? namesError = null;
         try
         {
-            names = await BuildNamePoolAsync(spawns.Count);
+            namesAvailable = (await _spawner.LoadAvailableNamesAsync()).Count;
         }
         catch (Exception ex)
         {
-            return Json(new { success = false, error = ex.Message });
+            namesError = ex.Message;
         }
 
-        // Fire `.bot addai <class> <race> <name>` per bot over RA (serialized inside RaService).
-        // The updated C++ command resolves each race's real starting location and applies the name;
-        // persistence is handled by the existing bot code, exactly as it is today.
-        int sent = 0;
-        for (int i = 0; i < spawns.Count; i++)
+        return Json(new
         {
-            var (race, cls) = spawns[i];
-            var name = names[i];
-            try
-            {
-                await _ra.SendCommandAsync($".bot addai {cls} {race} {name}");
-                sent++;
-            }
-            catch (Exception ex)
-            {
-                return Json(new { success = false, error = $"RA send failed after {sent}: {ex.Message}", sent, requested = spawns.Count });
-            }
-        }
+            maxPerRequest = _spawner.MaxPerRequest,
+            namesAvailable,
+            namesError,
+            botsOnline = _bridge.ConnectedCount,
+            playerLimit = await _spawner.ReadPlayerLimitAsync(),
+            job = _spawner.Snapshot()
+        });
+    }
 
-        return Json(new { success = true, sent, requested = spawns.Count });
+    // Polling fallback for the SpawnProgress hub event: the running batch, or the last finished one.
+    [HttpGet]
+    public IActionResult AddBotsStatus()
+    {
+        return Json(new { job = _spawner.Snapshot() });
+    }
+
+    // Stops the running batch after its in-flight command completes.
+    [HttpPost]
+    public IActionResult AddBotsCancel()
+    {
+        return Json(new { success = _spawner.Cancel(), job = _spawner.Snapshot() });
     }
 
     // ==================== Load all persisted SuperUI bots (RA console: .bot add_all) ====================
@@ -160,42 +180,6 @@ public partial class BotsController : Controller
         {
             return Json(new { success = false, error = ex.Message });
         }
-    }
-
-    // Reads the era name list from wwwroot/data, filters to valid 1.12 names (2-12 letters),
-    // drops any already used by an existing character (the name column is unique), shuffles,
-    // and returns `need` of them. Throws if the file is missing or the pool is too small.
-    private async Task<List<string>> BuildNamePoolAsync(int need)
-    {
-        var root = _env.WebRootPath;
-        if (string.IsNullOrEmpty(root))
-            root = System.IO.Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
-        var path = System.IO.Path.Combine(root, "data", "wow_era_5000_names.txt");
-        if (!System.IO.File.Exists(path))
-            throw new Exception("Name list not found at wwwroot/data/wow_era_5000_names.txt");
-
-        var all = (await System.IO.File.ReadAllLinesAsync(path))
-            .Select(l => l.Trim())
-            .Where(l => l.Length >= 2 && l.Length <= 12 && l.All(char.IsLetter))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        using var charConn = _db.Characters();
-        var taken = (await charConn.QueryAsync<string>("SELECT name FROM characters"))
-            .Where(n => !string.IsNullOrEmpty(n))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var avail = all.Where(n => !taken.Contains(n)).ToList();
-        if (avail.Count < need)
-            throw new Exception($"Only {avail.Count} unused names available (need {need}). Add more names to the list.");
-
-        var rng = Random.Shared;
-        for (int i = avail.Count - 1; i > 0; i--)
-        {
-            int j = rng.Next(i + 1);
-            (avail[i], avail[j]) = (avail[j], avail[i]);
-        }
-        return avail.Take(need).ToList();
     }
 
     // ==================== REST API ====================
@@ -316,6 +300,18 @@ public partial class BotsController : Controller
         if (summary == null)
             return Json(new { guid, error = "No brain data for this bot" });
         return Json(summary);
+    }
+
+    // Bulk form of BrainState. The Bot Monitor used to fire one /Bots/BrainState/<guid> request
+    // PER BOT on connect — at fleet scale that is thousands of XHRs draining through the browser's
+    // 6-per-origin connection limit, each holding a pending deferred. One request returns the lot.
+    [HttpGet]
+    public IActionResult BrainStates()
+    {
+        var summaries = _brain.AllBots.Keys
+            .Select(guid => _brain.GetBotBrainSummary(guid))
+            .Where(s => s != null);
+        return Json(new { bots = summaries });
     }
 
     [HttpGet]

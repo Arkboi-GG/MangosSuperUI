@@ -33,6 +33,7 @@ builder.Configuration.AddJsonFile("server-config.json", optional: true, reloadOn
 builder.Services.Configure<VmangosSettings>(builder.Configuration.GetSection("Vmangos"));
 builder.Services.Configure<RemoteAccessSettings>(builder.Configuration.GetSection("RemoteAccess"));
 builder.Services.Configure<BotChatSettings>(builder.Configuration.GetSection("BotChat"));
+builder.Services.Configure<BotSpawnSettings>(builder.Configuration.GetSection("BotSpawn"));
 
 // ---------- Data ----------
 builder.Services.AddSingleton<ConnectionFactory>();
@@ -52,6 +53,7 @@ builder.Services.AddSingleton<DbcService>();
 builder.Services.AddSingleton<HeightMapService>();
 builder.Services.AddSingleton<BotBridgeService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BotBridgeService>());
+builder.Services.AddSingleton<BotSpawnService>();   // Add Bots batches: background RA loop + SpawnProgress over the bridge hub
 builder.Services.AddSingleton<OllamaChatService>();
 builder.Services.AddSingleton<SourceIndexerService>();
 builder.Services.AddSingleton<ZoneSafetyMap>();

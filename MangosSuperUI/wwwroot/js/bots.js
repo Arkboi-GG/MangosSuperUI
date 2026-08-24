@@ -135,6 +135,16 @@ $(function () {
     var liveFleet = {};             // guid -> live spine projection
     var fleetPollTimer = null;
     var rosterDirty = false;        // in-place card updates set this; the re-sort runs on a timer
+    var dirtyCards = {};            // guid -> true; STATE packets queue here, flushDirtyCards repaints
+    // Roster virtualization: only the rows in view exist in the DOM. Without this a fleet-sized
+    // roster puts hundreds of thousands of nodes on the page, and every re-sort rebuilds them all.
+    var rosterRows = [];            // flat display list: {t:'c',guid} | {t:'h',label,count}
+    var rosterOffsets = [];         // rosterOffsets[i] = pixel offset of row i (len = rows+1)
+    var rosterCardH = 58;           // measured from the first rendered card
+    var rosterHeadH = 30;           // measured from the first rendered group header
+    var rosterMeasured = false;
+    var rosterWinTick = false;      // rAF throttle for scroll
+    var ROSTER_OVERSCAN = 6;        // rows rendered beyond the viewport on each side
     var rosterSort = localStorage.getItem('msui_bots_sort') || 'level_desc';
     var rosterGroupBy = localStorage.getItem('msui_bots_group') || 'none';
     var rosterSearch = '';
@@ -199,9 +209,10 @@ $(function () {
 
         connection.on('BotConnected', function (state) {
             botStates[state.guid] = state;
-            renderRoster();
-            updateStats();
-            updateBotDropdown();
+            // NOT renderRoster() — during a mass spawn this fires once per bot, and a full
+            // rebuild per arrival is quadratic. rosterResortIfNeeded picks the new bot up on
+            // its next tick; updateStats has its own 5s timer.
+            rosterDirty = true;
             tlAppend(state.guid, 'Connected: ' + state.name + ' L' + state.level + ' ' + (CLASS_NAMES[state.classId] || ''), 'bt-tl-event');
         });
 
@@ -209,8 +220,7 @@ $(function () {
         connection.on('BotDisconnected', function (guid) {
             if (botStates[guid]) {
                 botStates[guid].taskState = 'DISCONNECTED';
-                renderRosterCard(guid);
-                updateStats();
+                dirtyCards[guid] = true;
                 tlAppend(guid, 'Disconnected', 'bt-tl-error');
 
                 // Auto-remove after 30s if still disconnected (nuke/shutdown)
@@ -221,8 +231,7 @@ $(function () {
                         delete decisionLog[guid];
                         delete inventoryCache[guid];
                         $('#roster-' + guid).remove();
-                        updateStats();
-                        updateBotDropdown();
+                        rosterDirty = true;
 
                         if (selectedGuid === parseInt(guid)) {
                             selectedGuid = null;
@@ -238,10 +247,13 @@ $(function () {
 
         connection.on('BotStateUpdate', function (state) {
             botStates[state.guid] = state;
-            renderRosterCard(state.guid);
-            // Live-update economy strip if this bot is selected
+            // Card repaint is coalesced (see flushDirtyCards): a bot reports every
+            // BRIDGE_STATE_INTERVAL, so at fleet scale this fires hundreds of times a second and
+            // must not touch the DOM inline. updateStats() is NOT called here on purpose — it
+            // scans the whole fleet and already runs on its own 5s timer.
+            dirtyCards[state.guid] = true;
+            // The selected bot is a single row, so keep it live.
             if (selectedGuid === state.guid) updateEconomyStrip(state);
-            updateStats();
         });
 
         connection.on('BotEvent', function (evt) {
@@ -298,6 +310,9 @@ $(function () {
 
         connection.on('CommandAck', function () { /* silent */ });
 
+        // Add Bots batch progress (BotSpawnService) — the handler lives with the Add Bots modal below.
+        connection.on('SpawnProgress', function (job) { abOnSpawnProgress(job); });
+
         // --- Lifecycle ---
         connection.onreconnecting(function () { setStatus('offline'); });
         connection.onreconnected(function () {
@@ -323,15 +338,19 @@ $(function () {
                     updateGroupingUI(data);
                 }
 
-                if (data.bots) {
-                    data.bots.forEach(function (b) {
-                        $.getJSON('/Bots/BrainState/' + b.guid, function (bs) {
-                            if (bs && bs.personality) {
-                                botBrains[bs.guid] = bs;
-                                renderRosterCard(bs.guid);
-                                if (selectedGuid === bs.guid) renderDetail();
-                            }
-                        });
+                // One request for the whole fleet. This used to be a $.getJSON PER BOT, which at
+                // fleet scale queues thousands of XHRs behind the browser's per-origin connection
+                // limit and can wedge the tab before the page is even usable.
+                if (data.bots && data.bots.length) {
+                    $.getJSON('/Bots/BrainStates', function (all) {
+                        var list = (all && all.bots) || [];
+                        for (var i = 0; i < list.length; i++) {
+                            var bs = list[i];
+                            if (!bs || !bs.personality) continue;
+                            botBrains[bs.guid] = bs;
+                            dirtyCards[bs.guid] = true;
+                            if (selectedGuid === bs.guid) renderDetail();
+                        }
                     });
                 }
             });
@@ -553,9 +572,9 @@ $(function () {
         var guids = rosterVisibleGuids();
         $('#rosterCount').text(guids.length === total ? String(total) : (guids.length + ' / ' + total));
 
-        var html = '';
+        rosterRows = [];
         if (rosterGroupBy === 'none') {
-            for (var i = 0; i < guids.length; i++) html += rosterCardHtml(guids[i]);
+            for (var i = 0; i < guids.length; i++) rosterRows.push({ t: 'c', guid: guids[i] });
         } else {
             var buckets = {}, order = [];
             for (var j = 0; j < guids.length; j++) {
@@ -570,18 +589,91 @@ $(function () {
             });
             for (var k = 0; k < order.length; k++) {
                 var bk = buckets[order[k]];
-                html += '<div class="bt-roster-ghead">' + esc(bk.meta.label) +
-                    '<span class="bt-roster-gcount">' + bk.guids.length + '</span></div>';
-                for (var m = 0; m < bk.guids.length; m++) html += rosterCardHtml(bk.guids[m]);
+                rosterRows.push({ t: 'h', label: bk.meta.label, count: bk.guids.length });
+                for (var m = 0; m < bk.guids.length; m++) rosterRows.push({ t: 'c', guid: bk.guids[m] });
             }
         }
+        rosterRebuildOffsets();
 
-        $r.find('.bt-roster-card, .bt-roster-ghead').remove();
-        $r.append(html);
+        renderRosterWindow();
         rosterSig = rosterSignature(guids);
         rosterDirty = false;
         updateBotDropdown();
         renderCockpit();
+    }
+
+    // Pixel offset of every row, so the window can be located without measuring the DOM.
+    function rosterRebuildOffsets() {
+        rosterOffsets = new Array(rosterRows.length + 1);
+        var acc = 0;
+        for (var i = 0; i < rosterRows.length; i++) {
+            rosterOffsets[i] = acc;
+            acc += rosterRows[i].t === 'c' ? rosterCardH : rosterHeadH;
+        }
+        rosterOffsets[rosterRows.length] = acc;
+    }
+
+    // First row whose bottom edge is past y.
+    function rosterRowAt(y) {
+        var lo = 0, hi = rosterRows.length - 1, best = 0;
+        while (lo <= hi) {
+            var mid = (lo + hi) >> 1;
+            if (rosterOffsets[mid] <= y) { best = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        return best;
+    }
+
+    function rosterEnsurePads($r) {
+        if (!$r.find('#rosterPadTop').length) $r.append('<div id="rosterPadTop" style="height:0"></div>');
+        if (!$r.find('#rosterPadBot').length) $r.append('<div id="rosterPadBot" style="height:0"></div>');
+    }
+
+    // Cards are uniform, so one real measurement calibrates the whole list.
+    function rosterMeasure($r) {
+        if (rosterMeasured) return false;
+        var $c = $r.find('.bt-roster-card').first();
+        if (!$c.length) return false;
+        var h = $c.outerHeight(true);
+        if (!h) return false;
+        var $h = $r.find('.bt-roster-ghead').first();
+        var hh = $h.length ? $h.outerHeight(true) : rosterHeadH;
+        rosterMeasured = true;
+        if (Math.abs(h - rosterCardH) > 1 || (hh && Math.abs(hh - rosterHeadH) > 1)) {
+            rosterCardH = h; if (hh) rosterHeadH = hh;
+            rosterRebuildOffsets();
+            return true;   // caller re-renders once with correct geometry
+        }
+        return false;
+    }
+
+    // Renders only the rows intersecting the viewport; two spacer divs preserve scroll geometry.
+    function renderRosterWindow() {
+        var $r = $('#botRoster');
+        if ($r.length === 0) return;
+        var el = $r[0];
+        rosterEnsurePads($r);
+
+        var total = rosterOffsets[rosterRows.length] || 0;
+        var view = el.clientHeight || 600;
+        var over = ROSTER_OVERSCAN * rosterCardH;
+        var start = rosterRows.length ? rosterRowAt(Math.max(0, el.scrollTop - over)) : 0;
+        var end = rosterRows.length ? rosterRowAt(el.scrollTop + view + over) + 1 : 0;
+        if (end > rosterRows.length) end = rosterRows.length;
+
+        var html = '';
+        for (var i = start; i < end; i++) {
+            var r = rosterRows[i];
+            html += r.t === 'c'
+                ? rosterCardHtml(r.guid)
+                : '<div class="bt-roster-ghead">' + esc(r.label) +
+                  '<span class="bt-roster-gcount">' + r.count + '</span></div>';
+        }
+
+        $r.find('.bt-roster-card, .bt-roster-ghead').remove();
+        $('#rosterPadTop').css('height', (rosterOffsets[start] || 0) + 'px').after(html);
+        $('#rosterPadBot').css('height', Math.max(0, total - (rosterOffsets[end] || 0)) + 'px');
+
+        if (rosterMeasure($r)) renderRosterWindow();   // once, with real heights
     }
 
     function rosterCardHtml(guid) {
@@ -630,6 +722,15 @@ $(function () {
     // In-place refresh of one card. Called from every state / brain / decision event, so it must
     // stay cheap and must NOT re-sort — reordering on every STATE packet makes the list unusable.
     // It flags the roster dirty instead; the 3s tick below re-sorts once.
+    // Repaints only the cards that actually changed since the last tick, and only those currently
+    // in the DOM. Bounded work per tick no matter how large the fleet is.
+    function flushDirtyCards() {
+        var guids = Object.keys(dirtyCards);
+        if (guids.length === 0) return;
+        dirtyCards = {};
+        for (var i = 0; i < guids.length; i++) renderRosterCard(parseInt(guids[i], 10));
+    }
+
     function renderRosterCard(guid) {
         var s = botStates[guid];
         if (!s) return;
@@ -2021,20 +2122,21 @@ $(function () {
         if (rosterPollTimer) clearInterval(rosterPollTimer);
         rosterPollTimer = setInterval(function () {
             if (!connected) return;
-            var guids = Object.keys(botStates);
-            for (var i = 0; i < guids.length; i++) {
-                (function (g) {
-                    $.getJSON('/Bots/BrainState/' + g, function (data) {
-                        if (data && data.guid) {
-                            var existing = botBrains[data.guid] || {};
-                            var prevDecision = existing.lastDecision;
-                            botBrains[data.guid] = data;
-                            if (prevDecision) botBrains[data.guid].lastDecision = prevDecision;
-                            renderRosterCard(data.guid);
-                        }
-                    });
-                })(guids[i]);
-            }
+            // ONE request for the fleet. This was a $.getJSON per bot every 10s — at fleet scale
+            // that is thousands of requests per poll, which exhausts the browser's socket pool
+            // (net::ERR_INSUFFICIENT_RESOURCES) and keeps the tab permanently saturated.
+            $.getJSON('/Bots/BrainStates', function (all) {
+                var list = (all && all.bots) || [];
+                for (var i = 0; i < list.length; i++) {
+                    var data = list[i];
+                    if (!data || !data.guid) continue;
+                    var existing = botBrains[data.guid] || {};
+                    var prevDecision = existing.lastDecision;
+                    botBrains[data.guid] = data;
+                    if (prevDecision) botBrains[data.guid].lastDecision = prevDecision;
+                    dirtyCards[data.guid] = true;   // coalesced repaint
+                }
+            });
         }, 10000);
     }
 
@@ -2325,9 +2427,17 @@ $(function () {
     $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#botReportModal').removeClass('active'); });
 
     // ===================== ADD BOTS MODAL (race-aware .bot addai spawner) =====================
-    // Pick counts per race x class. Posts { spawns:[{race,cls,count}] } to /Bots/AddBots, which
-    // draws unique names from wwwroot/data and fires `.bot addai <class> <race> <name>` per bot.
-    // The C++ command spawns each at that race's real starting zone.
+    // Pick counts per race x class — type a number straight into a cell, use the +/- steppers, or
+    // set "N each" for one race or for everything. Posts { spawns:[{race,cls,count}] } to
+    // /Bots/AddBots, which draws unique names from wwwroot/data and hands the batch to
+    // BotSpawnService: the `.bot addai <class> <race> <name>` RA loop runs in the background there
+    // and streams SpawnProgress over /hubs/botbridge (polled from /Bots/AddBotsStatus as a
+    // fallback), so the request returns at once and a batch can be watched, closed over, or
+    // cancelled. The C++ command spawns each bot at that race's real starting zone.
+    //
+    // Limits come from /Bots/AddBotsLimits so the modal and the server can't drift: the configured
+    // per-batch ceiling (BotSpawn:MaxPerRequest), the unused-name pool (the real lifetime ceiling),
+    // bots online, and mangosd's PlayerLimit (bot sessions count against it).
     var AB_RACES = [
         { key: 'human', name: 'Human', side: 'alliance' },
         { key: 'dwarf', name: 'Dwarf', side: 'alliance' },
@@ -2363,6 +2473,10 @@ $(function () {
     // abCounts[race][cls] = n
     var abCounts = {};
     AB_RACES.forEach(function (r) { abCounts[r.key] = {}; AB_RACE_CLASSES[r.key].forEach(function (c) { abCounts[r.key][c] = 0; }); });
+    var abLimits = { maxPerRequest: 0, namesAvailable: null, namesError: null, botsOnline: 0, playerLimit: null };
+    var abJob = null;            // latest SpawnProgress snapshot (running or finished)
+    var abToastedJobId = null;   // batch whose completion toast has already been shown
+    var abPollTimer = null;      // 1s /Bots/AddBotsStatus poll while a batch runs (SignalR fallback)
 
     $('head').append(
         '<style>' +
@@ -2380,12 +2494,38 @@ $(function () {
         '.ab-close{background:none;border:none;color:var(--text-muted,#787c99);cursor:pointer;font-size:17px;line-height:1;padding:4px 6px;border-radius:6px;transition:all .12s;}' +
         '.ab-close:hover{color:var(--text-secondary,#c0caf5);background:rgba(255,255,255,0.06);}' +
         '.ab-body{padding:14px 18px;overflow-y:auto;}' +
+        '.ab-meta{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:11px;color:var(--text-muted,#787c99);margin:0 0 12px 2px;}' +
+        '.ab-meta b{color:var(--text-secondary,#c0caf5);font-weight:600;font-variant-numeric:tabular-nums;}' +
+        '.ab-meta .ab-limit{opacity:.8;}' +
+        '.ab-meta .ab-bad{color:#e0af68;}' +
+        '.ab-warn{display:none;font-size:11px;line-height:1.4;color:#e0af68;background:rgba(224,175,104,0.08);border:1px solid rgba(224,175,104,0.35);border-radius:8px;padding:7px 10px;margin:0 0 12px;}' +
+        '.ab-warn.show{display:block;}' +
         '.ab-race{margin-bottom:15px;}' +
         '.ab-race:last-child{margin-bottom:2px;}' +
         '.ab-rhead{display:flex;align-items:center;gap:8px;margin:0 0 8px 2px;font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--text-secondary,#c0caf5);}' +
         '.ab-rdot{width:8px;height:8px;border-radius:50%;flex:none;}' +
         '.ab-rdot.alliance{background:#4a86ff;}' +
         '.ab-rdot.horde{background:#e0503a;}' +
+        '.ab-rand{border:1px solid var(--border-light,#414868);border-radius:10px;background:var(--bg-card-alt,#24283b);padding:10px 12px;margin:0 0 13px;}' +
+        '.ab-rand-row{display:flex;align-items:center;gap:11px;flex-wrap:wrap;}' +
+        '.ab-rand-t{display:inline-flex;align-items:center;gap:7px;font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--text-secondary,#c0caf5);}' +
+        '.ab-rand-t i{color:var(--accent,#7aa2f7);font-size:12px;}' +
+        '.ab-rand label{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--text-muted,#787c99);}' +
+        '.ab-rand input{width:62px;height:26px;padding:0 6px;text-align:center;font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;border:1px solid var(--border-light,#414868);border-radius:7px;background:var(--bg-card,#1a1b26);color:var(--text-secondary,#c0caf5);outline:none;-moz-appearance:textfield;appearance:textfield;transition:border-color .12s;}' +
+        '.ab-rand input::-webkit-outer-spin-button,.ab-rand input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}' +
+        '.ab-rand input:focus{border-color:var(--accent,#7aa2f7);}' +
+        '.ab-rand input.ab-fa:focus{border-color:#4a86ff;}' +
+        '.ab-rand input.ab-fh:focus{border-color:#e0503a;}' +
+        '.ab-rand-go{margin-left:auto;font-size:11.5px;font-weight:600;padding:6px 13px;cursor:pointer;border-radius:7px;border:1px solid var(--accent,#7aa2f7);background:rgba(122,162,247,0.14);color:var(--text-secondary,#c0caf5);display:inline-flex;align-items:center;gap:6px;transition:all .12s;white-space:nowrap;}' +
+        '.ab-rand-go:hover{background:rgba(122,162,247,0.26);color:#fff;}' +
+        '.ab-split{display:flex;height:6px;border-radius:4px;overflow:hidden;margin-top:10px;background:rgba(255,255,255,0.06);}' +
+        '.ab-split i{display:block;height:100%;transition:width .18s;}' +
+        '.ab-split .sa{background:#4a86ff;}' +
+        '.ab-split .sh{background:#e0503a;}' +
+        '.ab-split-txt{display:flex;justify-content:space-between;font-size:10.5px;color:var(--text-muted,#787c99);margin-top:5px;font-variant-numeric:tabular-nums;}' +
+        '.ab-split-txt b{font-weight:700;}' +
+        '.ab-split-txt .a b{color:#6f9dff;}' +
+        '.ab-split-txt .h b{color:#ec6a52;}' +
         '.ab-rtot{margin-left:auto;font-size:11px;font-weight:600;color:var(--text-muted,#787c99);font-variant-numeric:tabular-nums;}' +
         '.ab-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px;}' +
         '.ab-card{position:relative;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px 9px 14px;border-radius:10px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);overflow:hidden;transition:opacity .14s,box-shadow .14s,border-color .14s;}' +
@@ -2393,22 +2533,41 @@ $(function () {
         '.ab-card.on{box-shadow:0 2px 14px rgba(0,0,0,0.28);}' +
         '.ab-card.on::before{opacity:1;}' +
         '.ab-card.off{opacity:.48;}' +
+        '.ab-card.off:focus-within{opacity:1;}' +
         '.ab-cname{display:flex;align-items:center;gap:8px;min-width:0;}' +
         '.ab-cname i{font-size:13px;width:17px;text-align:center;}' +
         '.ab-cname b{font-size:12.5px;font-weight:600;text-transform:capitalize;letter-spacing:.2px;}' +
-        '.ab-step{display:inline-flex;align-items:center;gap:6px;flex:none;}' +
+        '.ab-step{display:inline-flex;align-items:center;gap:5px;flex:none;}' +
         '.ab-step button{width:23px;height:23px;border-radius:6px;border:1px solid var(--border-light,#414868);background:var(--bg-card,#1a1b26);color:var(--text-secondary,#c0caf5);cursor:pointer;font-size:14px;line-height:1;display:flex;align-items:center;justify-content:center;transition:all .12s;}' +
         '.ab-step button:hover{border-color:var(--cc,#7aa2f7);color:#fff;}' +
-        '.ab-step .ab-cnt{min-width:18px;text-align:center;font-weight:700;font-size:13px;font-variant-numeric:tabular-nums;}' +
+        '.ab-step input.ab-cnt{width:50px;height:23px;padding:0 4px;text-align:center;font-weight:700;font-size:13px;font-variant-numeric:tabular-nums;border:1px solid var(--border-light,#414868);border-radius:6px;background:var(--bg-card,#1a1b26);color:var(--text-secondary,#c0caf5);outline:none;-moz-appearance:textfield;appearance:textfield;transition:border-color .12s;}' +
+        '.ab-step input.ab-cnt::-webkit-outer-spin-button,.ab-step input.ab-cnt::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}' +
+        '.ab-step input.ab-cnt:focus{border-color:var(--cc,#7aa2f7);}' +
+        '.ab-prog{display:none;padding:12px 18px;border-top:1px solid var(--border-light,#414868);background:rgba(0,0,0,0.12);}' +
+        '.ab-prog.show{display:block;}' +
+        '.ab-prog-h{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;margin-bottom:8px;}' +
+        '.ab-prog-h b{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
+        '.ab-prog-h span{color:var(--text-muted,#787c99);font-variant-numeric:tabular-nums;white-space:nowrap;}' +
+        '.ab-bar{height:8px;border-radius:5px;background:rgba(255,255,255,0.07);overflow:hidden;}' +
+        '.ab-bar i{display:block;height:100%;width:0;border-radius:5px;background:linear-gradient(90deg,var(--accent,#7aa2f7),#bb9af7);transition:width .25s;}' +
+        '.ab-bar.done i{background:#9ece6a;}' +
+        '.ab-bar.cancelled i,.ab-bar.failed i{background:#e0af68;}' +
+        '.ab-prog-f{display:flex;align-items:center;gap:10px;margin-top:9px;font-size:11px;color:var(--text-muted,#787c99);}' +
+        '.ab-prog-f span{flex:1;min-width:0;line-height:1.4;}' +
         '.ab-foot{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-top:1px solid var(--border-light,#414868);gap:10px;background:rgba(0,0,0,0.12);}' +
-        '.ab-presets{display:flex;gap:6px;}' +
+        '.ab-presets{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}' +
         '.ab-preset{font-size:11px;padding:5px 10px;cursor:pointer;background:transparent;border:1px solid var(--border-light,#414868);border-radius:7px;color:var(--text-muted,#787c99);transition:all .12s;}' +
         '.ab-preset:hover{color:var(--text-secondary,#c0caf5);border-color:var(--accent,#7aa2f7);}' +
-        '.ab-spawn{font-size:13px;font-weight:600;padding:9px 18px;border:none;border-radius:9px;cursor:pointer;color:#fff;display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,var(--accent,#7aa2f7),#bb9af7);box-shadow:0 4px 14px rgba(122,162,247,0.35);transition:transform .12s,box-shadow .12s,filter .12s;}' +
+        '.ab-preset:disabled{opacity:.5;cursor:default;}' +
+        '.ab-spawn{font-size:13px;font-weight:600;padding:9px 18px;border:none;border-radius:9px;cursor:pointer;color:#fff;display:inline-flex;align-items:center;gap:7px;background:linear-gradient(135deg,var(--accent,#7aa2f7),#bb9af7);box-shadow:0 4px 14px rgba(122,162,247,0.35);transition:transform .12s,box-shadow .12s,filter .12s;white-space:nowrap;}' +
         '.ab-spawn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(122,162,247,0.45);}' +
         '.ab-spawn:active{transform:translateY(0);}' +
         '.ab-spawn:disabled{filter:grayscale(.4) brightness(.78);cursor:default;transform:none;box-shadow:none;}' +
         '.ab-tot{font-weight:700;font-variant-numeric:tabular-nums;}' +
+        '.ab-tot.over{color:#f7768e;}' +
+        '.ab-pill{display:none;align-items:center;gap:6px;font-size:11px;height:26px;padding:0 10px;border-radius:999px;border:1px solid var(--border-light,#414868);color:var(--text-secondary,#c0caf5);cursor:pointer;white-space:nowrap;font-variant-numeric:tabular-nums;}' +
+        '.ab-pill.show{display:inline-flex;}' +
+        '.ab-pill i{color:var(--accent,#7aa2f7);}' +
         '</style>'
     );
 
@@ -2417,46 +2576,176 @@ $(function () {
         '<div class="ab-modal">' +
         '<div class="ab-header">' +
         '<div class="ab-hleft"><div class="ab-hicon"><i class="fa-solid fa-user-plus"></i></div>' +
-        '<div class="ab-htxt"><b>Add Bots</b><span>Pick counts per race - each spawns at its own start with a real name</span></div></div>' +
+        '<div class="ab-htxt"><b>Add Bots</b><span>Randomize a population by faction, or type counts per class — each spawns at its own start with a real name</span></div></div>' +
         '<button class="ab-close" id="abClose"><i class="fa-solid fa-xmark"></i></button></div>' +
-        '<div class="ab-body"><div id="abRows"></div></div>' +
+        '<div class="ab-body">' +
+        '<div class="ab-meta" id="abMeta"></div>' +
+        '<div class="ab-rand">' +
+        '<div class="ab-rand-row">' +
+        '<span class="ab-rand-t"><i class="fa-solid fa-dice"></i> Randomize</span>' +
+        '<label>Total <input type="number" id="abRandTotal" min="0" inputmode="numeric" value="100" title="How many bots to spread across every race and class" /></label>' +
+        '<label>Alliance <input type="number" class="ab-fa" id="abRandA" min="0" max="100" inputmode="numeric" value="50" />%</label>' +
+        '<label>Horde <input type="number" class="ab-fh" id="abRandH" min="0" max="100" inputmode="numeric" value="50" />%</label>' +
+        '<button class="ab-rand-go" id="abRandGo"><i class="fa-solid fa-shuffle"></i> Fill</button>' +
+        '</div>' +
+        '<div class="ab-split"><i class="sa" id="abSplitA"></i><i class="sh" id="abSplitH"></i></div>' +
+        '<div class="ab-split-txt"><span class="a">Alliance <b id="abSplitAN">0</b></span><span class="h"><b id="abSplitHN">0</b> Horde</span></div>' +
+        '</div>' +
+        '<div class="ab-warn" id="abWarn"></div>' +
+        '<div id="abRows"></div></div>' +
+        '<div class="ab-prog" id="abProg">' +
+        '<div class="ab-prog-h"><b id="abProgTitle"></b><span id="abProgCount"></span></div>' +
+        '<div class="ab-bar" id="abBar"><i></i></div>' +
+        '<div class="ab-prog-f"><span id="abProgInfo"></span>' +
+        '<button class="ab-preset" id="abCancel"><i class="fa-solid fa-stop"></i> Cancel</button>' +
+        '<button class="ab-preset" id="abDismiss">Dismiss</button></div></div>' +
         '<div class="ab-foot">' +
         '<div class="ab-presets">' +
-        '<button class="ab-preset" data-ab-preset="0">Clear</button>' +
-        '<button class="ab-preset" data-ab-preset="1">1x each</button>' +
-        '<button class="ab-preset" data-ab-preset="2">2x each</button>' +
+        '<button class="ab-preset" id="abClear">Clear</button>' +
         '</div>' +
         '<button class="ab-spawn" id="abSpawn"><i class="fa-solid fa-bolt"></i> Spawn <span class="ab-tot" id="abTotal">0</span></button>' +
         '</div></div></div>'
     );
 
+    // Toolbar pill: visible while a batch runs (even with the modal closed); click to reopen it.
+    $('#btnAddBots').after('<span class="ab-pill" id="abPill" title="Spawn batch in progress — click to view"><i class="fa-solid fa-spinner fa-spin"></i> Spawning <span>0/0</span></span>');
+
+    function abFmt(n) { return Number(n || 0).toLocaleString(); }
+    function abParseKey(k) { var p = (k || '').split(':'); return { race: p[0], cls: p[1] }; }
+
+    // Largest count a batch may carry: the configured ceiling (0 = unlimited) capped by unused names.
+    function abEffectiveMax() {
+        var m = abLimits.maxPerRequest > 0 ? abLimits.maxPerRequest : Infinity;
+        if (abLimits.namesAvailable != null) m = Math.min(m, abLimits.namesAvailable);
+        return m;
+    }
+    function abClamp(v) {
+        v = parseInt(v, 10);
+        if (isNaN(v) || v < 0) v = 0;
+        var m = abEffectiveMax();
+        if (isFinite(m) && v > m) v = m;
+        return v;
+    }
+    function abTotal() {
+        var t = 0;
+        AB_RACES.forEach(function (r) { AB_RACE_CLASSES[r.key].forEach(function (c) { t += abCounts[r.key][c] || 0; }); });
+        return t;
+    }
+    function abRunning() { return !!(abJob && abJob.phase === 'running'); }
+
+    // Full grid build — on open and after a bulk set. Typing and +/- update in place (abUpdateTotals)
+    // so the focused input survives.
     function renderAddBots() {
-        var html = '', total = 0;
+        var html = '';
         for (var ri = 0; ri < AB_RACES.length; ri++) {
-            var r = AB_RACES[ri], rtot = 0, cards = '';
+            var r = AB_RACES[ri], cards = '';
             var clss = AB_RACE_CLASSES[r.key];
             for (var ci = 0; ci < clss.length; ci++) {
-                var c = clss[ci], n = (abCounts[r.key][c] || 0), m = ADD_BOT_META[c];
-                rtot += n; total += n;
-                cards += '<div class="ab-card ' + (n > 0 ? 'on' : 'off') + '" style="--cc:' + m.color + ';">' +
+                var c = clss[ci], n = (abCounts[r.key][c] || 0), m = ADD_BOT_META[c], k = r.key + ':' + c;
+                cards += '<div class="ab-card ' + (n > 0 ? 'on' : 'off') + '" style="--cc:' + m.color + ';" data-ab-card="' + k + '">' +
                     '<span class="ab-cname"><i class="fa-solid ' + m.icon + '" style="color:' + m.color + ';"></i><b>' + c + '</b></span>' +
                     '<span class="ab-step">' +
-                    '<button data-ab-dec="' + r.key + ':' + c + '">-</button>' +
-                    '<span class="ab-cnt">' + n + '</span>' +
-                    '<button data-ab-inc="' + r.key + ':' + c + '">+</button>' +
+                    '<button data-ab-dec="' + k + '" tabindex="-1" title="-1">-</button>' +
+                    '<input class="ab-cnt" type="number" min="0" inputmode="numeric" value="' + n + '" data-ab-key="' + k + '" aria-label="' + r.name + ' ' + c + ' count" />' +
+                    '<button data-ab-inc="' + k + '" tabindex="-1" title="+1">+</button>' +
                     '</span></div>';
             }
             html += '<div class="ab-race">' +
                 '<div class="ab-rhead"><span class="ab-rdot ' + r.side + '"></span>' + r.name +
-                '<span class="ab-rtot">' + rtot + '</span></div>' +
+                '<span class="ab-rtot" id="abRtot-' + r.key + '">0</span></div>' +
                 '<div class="ab-grid">' + cards + '</div></div>';
         }
         $('#abRows').html(html);
-        $('#abTotal').text(total);
-        $('#abSpawn').prop('disabled', total === 0);
+        abUpdateTotals();
     }
 
-    $('#btnAddBots').on('click', function () { renderAddBots(); $('#addBotsModal').addClass('active'); });
+    // In-place refresh of race totals, the grand total vs. limit, card on/off state, the PlayerLimit
+    // heads-up, and whether Spawn is allowed.
+    function abUpdateTotals() {
+        var total = 0;
+        AB_RACES.forEach(function (r) {
+            var rt = 0;
+            AB_RACE_CLASSES[r.key].forEach(function (c) {
+                var n = abCounts[r.key][c] || 0;
+                rt += n;
+                $('[data-ab-card="' + r.key + ':' + c + '"]').toggleClass('on', n > 0).toggleClass('off', n === 0);
+            });
+            $('#abRtot-' + r.key).text(abFmt(rt));
+            total += rt;
+        });
+        var max = abEffectiveMax(), over = isFinite(max) && total > max;
+        $('#abTotal').toggleClass('over', over).text(over ? abFmt(total) + ' / ' + abFmt(max) : abFmt(total));
+        $('#abSpawn').prop('disabled', total === 0 || over || abRunning())
+            .attr('title', over ? 'Over the limit — max ' + abFmt(max) + ' per batch' : (abRunning() ? 'A batch is already running' : ''));
+        var pl = abLimits.playerLimit;
+        if (pl && total > 0 && (abLimits.botsOnline + total) > pl) {
+            $('#abWarn').html('<b>Heads-up:</b> ' + abFmt(abLimits.botsOnline) + ' bots online + ' + abFmt(total) + ' new exceeds mangosd\'s PlayerLimit (' + abFmt(pl) +
+                '). Bots count as player sessions, so non-GM players will be put in the login queue. Raise PlayerLimit in mangosd.conf if that matters.').addClass('show');
+        } else {
+            $('#abWarn').removeClass('show');
+        }
+    }
+
+    function abSetCell(race, cls, v, $input) {
+        v = abClamp(v);
+        abCounts[race][cls] = v;
+        if ($input && $input.length && String($input.val()) !== String(v)) $input.val(v);
+        abUpdateTotals();
+    }
+    function abClearAll() {
+        AB_RACES.forEach(function (r) { AB_RACE_CLASSES[r.key].forEach(function (c) { abCounts[r.key][c] = 0; }); });
+        renderAddBots();
+    }
+
+    function abRenderMeta() {
+        var parts = [];
+        parts.push('Max per batch <b>' + (abLimits.maxPerRequest > 0 ? abFmt(abLimits.maxPerRequest) : 'unlimited') + '</b>');
+        if (abLimits.namesError) parts.push('<span class="ab-bad">' + abLimits.namesError + '</span>');
+        else if (abLimits.namesAvailable != null) parts.push('Unused names <b>' + abFmt(abLimits.namesAvailable) + '</b>');
+        parts.push('Bots online <b>' + abFmt(abLimits.botsOnline) + '</b>' +
+            (abLimits.playerLimit ? ' <span class="ab-limit">(PlayerLimit ' + abFmt(abLimits.playerLimit) + ')</span>' : ''));
+        $('#abMeta').html(parts.map(function (p) { return '<span>' + p + '</span>'; }).join(''));
+    }
+
+    function abLoadLimits() {
+        $('#abMeta').html('<span>Loading limits…</span>');
+        $.getJSON('/Bots/AddBotsLimits')
+            .done(function (d) {
+                abLimits = {
+                    maxPerRequest: d.maxPerRequest || 0,
+                    namesAvailable: d.namesAvailable != null ? d.namesAvailable : null,
+                    namesError: d.namesError || null,
+                    botsOnline: d.botsOnline || 0,
+                    playerLimit: d.playerLimit || null
+                };
+                abRenderMeta();
+                // Re-clamp anything already typed against the real ceiling.
+                var changed = false;
+                AB_RACES.forEach(function (r) {
+                    AB_RACE_CLASSES[r.key].forEach(function (c) {
+                        var v = abClamp(abCounts[r.key][c]);
+                        if (v !== abCounts[r.key][c]) { abCounts[r.key][c] = v; changed = true; }
+                    });
+                });
+                if (changed) renderAddBots(); else abUpdateTotals();
+                $('#abRandTotal').val(abClamp($('#abRandTotal').val()));
+                abRandPreview();
+                if (d.job) abAdoptJob(d.job);
+            })
+            .fail(function () {
+                $('#abMeta').html('<span class="ab-bad">Limits unavailable — the server still enforces them</span>');
+                abUpdateTotals();
+            });
+    }
+
+    function abOpen() {
+        renderAddBots();
+        abRandPreview();
+        $('#addBotsModal').addClass('active');
+        abLoadLimits();
+    }
+    $('#btnAddBots').on('click', abOpen);
+    $('#abPill').on('click', abOpen);
 
     // Load SuperUI Bots — fire `.bot add_all` over RA to re-add every persisted bot to the
     // world (the standard recovery step after a server reset). Same command as the server
@@ -2481,21 +2770,97 @@ $(function () {
     $('#addBotsModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
     $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#addBotsModal').removeClass('active'); });
 
-    function abParseKey(k) { var p = (k || '').split(':'); return { race: p[0], cls: p[1] }; }
+    // --- Per-cell editing: type, +/-, Enter to commit ---
+    $(document).on('focus', '.ab-cnt', function () { var el = this; setTimeout(function () { el.select(); }, 0); });
+    $(document).on('input', '.ab-cnt', function () {
+        var kv = abParseKey($(this).attr('data-ab-key'));
+        if ($(this).val() === '') { abCounts[kv.race][kv.cls] = 0; abUpdateTotals(); return; }   // mid-edit blank: don't fight the caret
+        abSetCell(kv.race, kv.cls, $(this).val(), $(this));
+    });
+    $(document).on('change blur', '.ab-cnt', function () {
+        var kv = abParseKey($(this).attr('data-ab-key'));
+        abSetCell(kv.race, kv.cls, $(this).val(), $(this));
+        $(this).val(abCounts[kv.race][kv.cls]);   // normalise "", "007", etc.
+    });
+    $(document).on('keydown', '.ab-cnt', function (e) { if (e.key === 'Enter') { e.preventDefault(); this.blur(); } });
     $(document).on('click', '[data-ab-inc]', function () {
-        var kv = abParseKey($(this).attr('data-ab-inc'));
-        abCounts[kv.race][kv.cls] = Math.min(50, (abCounts[kv.race][kv.cls] || 0) + 1); renderAddBots();
+        var k = $(this).attr('data-ab-inc'), kv = abParseKey(k);
+        abSetCell(kv.race, kv.cls, (abCounts[kv.race][kv.cls] || 0) + 1, $('.ab-cnt[data-ab-key="' + k + '"]'));
     });
     $(document).on('click', '[data-ab-dec]', function () {
-        var kv = abParseKey($(this).attr('data-ab-dec'));
-        abCounts[kv.race][kv.cls] = Math.max(0, (abCounts[kv.race][kv.cls] || 0) - 1); renderAddBots();
-    });
-    $(document).on('click', '[data-ab-preset]', function () {
-        var v = parseInt($(this).attr('data-ab-preset'), 10) || 0;
-        AB_RACES.forEach(function (r) { AB_RACE_CLASSES[r.key].forEach(function (c) { abCounts[r.key][c] = v; }); });
-        renderAddBots();
+        var k = $(this).attr('data-ab-dec'), kv = abParseKey(k);
+        abSetCell(kv.race, kv.cls, Math.max(0, (abCounts[kv.race][kv.cls] || 0) - 1), $('.ab-cnt[data-ab-key="' + k + '"]'));
     });
 
+    $('#abClear').on('click', abClearAll);
+
+    // --- Randomize: spread a target population over every race/class, split by faction ---
+    // The two percent boxes are two views of one number, so they always total 100.
+    function abRandAlliancePct() {
+        var a = parseInt($('#abRandA').val(), 10);
+        if (isNaN(a) || a < 0) a = 0;
+        if (a > 100) a = 100;
+        return a;
+    }
+
+    // Live preview of what Fill would produce — drives the split bar and the two counts.
+    function abRandPreview() {
+        var total = abClamp($('#abRandTotal').val()), pct = abRandAlliancePct();
+        var alliance = Math.min(total, Math.round(total * pct / 100)), horde = total - alliance;
+        var pa = total ? (alliance / total * 100) : pct;
+        $('#abSplitA').css('width', pa + '%');
+        $('#abSplitH').css('width', (100 - pa) + '%');
+        $('#abSplitAN').text(abFmt(alliance));
+        $('#abSplitHN').text(abFmt(horde));
+        return { total: total, alliance: alliance, horde: horde };
+    }
+
+    // Give every race/class of one faction a random weight, hand out n bots in proportion, then
+    // settle the leftover by largest remainder — so the faction total lands EXACTLY on target
+    // instead of drifting by however many of the 20 cells happened to round down.
+    function abSpread(side, n) {
+        var cells = [];
+        AB_RACES.forEach(function (r) {
+            if (r.side !== side) return;
+            AB_RACE_CLASSES[r.key].forEach(function (c) { cells.push({ race: r.key, cls: c, w: 0.35 + Math.random() }); });
+        });
+        if (!cells.length || n <= 0) return;
+        var sum = 0, assigned = 0;
+        cells.forEach(function (c) { sum += c.w; });
+        cells.forEach(function (c) { var exact = n * c.w / sum; c.n = Math.floor(exact); c.rem = exact - c.n; assigned += c.n; });
+        cells.sort(function (x, y) { return y.rem - x.rem; });
+        for (var i = 0; assigned < n; i++, assigned++) cells[i % cells.length].n++;
+        cells.forEach(function (c) { abCounts[c.race][c.cls] = c.n; });
+    }
+
+    function abRandomize() {
+        var p = abRandPreview();
+        AB_RACES.forEach(function (r) { AB_RACE_CLASSES[r.key].forEach(function (c) { abCounts[r.key][c] = 0; }); });
+        abSpread('alliance', p.alliance);
+        abSpread('horde', p.horde);
+        renderAddBots();
+        if (p.total > 0) showToast('Randomized ' + abFmt(p.total) + ' — ' + abFmt(p.alliance) + ' Alliance / ' + abFmt(p.horde) + ' Horde');
+    }
+
+    $('#abRandGo').on('click', abRandomize);
+    $('#abRandTotal').on('input', abRandPreview);
+    $('#abRandTotal').on('change blur', function () { $(this).val(abClamp($(this).val())); abRandPreview(); });
+    $('#abRandA').on('input', function () { $('#abRandH').val(100 - abRandAlliancePct()); abRandPreview(); });
+    $('#abRandH').on('input', function () {
+        var h = parseInt($(this).val(), 10);
+        if (isNaN(h) || h < 0) h = 0;
+        if (h > 100) h = 100;
+        $('#abRandA').val(100 - h);
+        abRandPreview();
+    });
+    $('#abRandA, #abRandH').on('change blur', function () {
+        var a = abRandAlliancePct();
+        $('#abRandA').val(a); $('#abRandH').val(100 - a);
+        abRandPreview();
+    });
+    $('#abRandTotal, #abRandA, #abRandH').on('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); abRandomize(); } });
+
+    // --- Spawn: the request returns as soon as the batch is queued; progress streams in after ---
     $('#abSpawn').on('click', function () {
         var spawns = [], total = 0;
         AB_RACES.forEach(function (r) {
@@ -2508,13 +2873,83 @@ $(function () {
         var $btn = $(this).prop('disabled', true);
         $.ajax({ url: '/Bots/AddBots', method: 'POST', contentType: 'application/json', data: JSON.stringify({ spawns: spawns }) })
             .done(function (res) {
-                if (res && res.success) showToast('Spawning ' + total + ' bot(s) - ' + (res.sent != null ? res.sent : total) + ' command(s) sent');
-                else showToast('Add bots failed: ' + ((res && res.error) || 'unknown'), true);
-                $('#addBotsModal').removeClass('active');
+                if (res && res.success && res.job) {
+                    showToast('Spawning ' + abFmt(total) + ' bot(s) in the background');
+                    abOnSpawnProgress(res.job);
+                } else {
+                    showToast('Add bots failed: ' + ((res && res.error) || 'unknown'), true);
+                    if (res && res.job) abAdoptJob(res.job);   // e.g. "already running" — show that batch
+                    abUpdateTotals();
+                }
             })
-            .fail(function (xhr) { showToast('Add Bots failed (' + xhr.status + ')', true); })
-            .always(function () { $btn.prop('disabled', false); });
+            .fail(function (xhr) { showToast('Add Bots failed (' + xhr.status + ')', true); abUpdateTotals(); });
     });
+
+    // Adopt a snapshot that arrived out of band (page load, modal open, refused Spawn): only a
+    // running batch, or the one we were already following — never resurrect a stale finished one.
+    function abAdoptJob(job) {
+        if (!job) return;
+        if (job.phase === 'running' || (abJob && abJob.id === job.id)) abOnSpawnProgress(job);
+    }
+
+    // SpawnProgress handler — also wired to the hub event in initConnection().
+    function abOnSpawnProgress(job) {
+        if (!job) return;
+        if (abJob && abJob.id === job.id && abJob.phase !== 'running' && job.phase !== 'running') return;   // duplicate final
+        var prev = abJob;
+        abJob = job;
+        var running = job.phase === 'running';
+        var done = (job.sent || 0) + (job.failed || 0);
+        var pct = job.requested ? Math.min(100, Math.round(done / job.requested * 100)) : 0;
+        var secs = Math.round((job.elapsedMs || 0) / 1000);
+        var rate = job.elapsedMs > 0 ? done / (job.elapsedMs / 1000) : 0;
+        var eta = running && rate > 0 ? Math.round((job.requested - done) / rate) : 0;
+        var title = running ? 'Spawning' : job.phase === 'done' ? 'Batch complete' : job.phase === 'cancelled' ? 'Batch cancelled' : 'Batch failed';
+
+        $('#abProg').addClass('show');
+        $('#abProgTitle').text(title + (running && job.current ? ' — ' + job.current : ''));
+        $('#abProgCount').text(abFmt(done) + ' / ' + abFmt(job.requested) + (job.failed ? ' · ' + abFmt(job.failed) + ' failed' : ''));
+        $('#abBar').removeClass('done cancelled failed').addClass(running ? '' : job.phase).find('i').css('width', pct + '%');
+
+        var info = secs + 's';
+        if (rate) info += ' · ' + rate.toFixed(1) + ' bots/s';
+        if (running && eta) info += ' · ~' + eta + 's left';
+        if (job.error) info += ' · ' + job.error;
+        if (!running && job.failedNames && job.failedNames.length) {
+            info += ' · failed: ' + job.failedNames.slice(0, 8).join(', ') + (job.failedNames.length > 8 ? ' +' + (job.failedNames.length - 8) + ' more' : '');
+        }
+        $('#abProgInfo').text(info);
+        $('#abCancel').toggle(running).prop('disabled', false);
+        $('#abDismiss').toggle(!running);
+
+        $('#abPill').toggleClass('show', running).find('span').text(abFmt(done) + '/' + abFmt(job.requested));
+        if (running) abStartPoll(); else abStopPoll();
+
+        // One completion toast per batch we watched run.
+        if (!running && prev && prev.id === job.id && prev.phase === 'running' && abToastedJobId !== job.id) {
+            abToastedJobId = job.id;
+            var summary = abFmt(job.sent) + ' / ' + abFmt(job.requested) + ' spawned' + (job.failed ? ' (' + abFmt(job.failed) + ' failed)' : '');
+            showToast(job.phase === 'done' ? summary : title + ' — ' + summary, job.phase !== 'done');
+            if ($('#addBotsModal').hasClass('active')) abLoadLimits();   // names / bots online moved
+        }
+        abUpdateTotals();
+    }
+    function abStartPoll() {
+        if (abPollTimer) return;
+        abPollTimer = setInterval(function () {
+            $.getJSON('/Bots/AddBotsStatus').done(function (d) { if (d && d.job) abOnSpawnProgress(d.job); });
+        }, 1000);
+    }
+    function abStopPoll() { if (abPollTimer) { clearInterval(abPollTimer); abPollTimer = null; } }
+
+    $('#abCancel').on('click', function () {
+        $(this).prop('disabled', true);
+        $.post('/Bots/AddBotsCancel').done(function (d) { if (d && d.job) abOnSpawnProgress(d.job); });
+    });
+    $('#abDismiss').on('click', function () { $('#abProg').removeClass('show'); });
+
+    // A batch may already be running from before this page load — pick it up.
+    $.getJSON('/Bots/AddBotsStatus').done(function (d) { if (d && d.job) abAdoptJob(d.job); });
 
     // ==================== Manage Bot Groups modal ====================
     // Header button → overlay listing every active group (BrainStatus), filterable by member
@@ -3087,6 +3522,12 @@ $(function () {
 
     // --- cockpit boot -------------------------------------------------------------------
     startFleetPoll();                                             // zone/goal enrichment
+    $('#botRoster').on('scroll', function () {
+        if (rosterWinTick) return;
+        rosterWinTick = true;
+        requestAnimationFrame(function () { rosterWinTick = false; renderRosterWindow(); });
+    });
+    setInterval(flushDirtyCards, 250);                            // coalesced card repaints
     setInterval(rosterResortIfNeeded, 3000);                      // debounced re-sort + census
     setInterval(refreshGroupingStatus, 15000);                    // keeps group badges + census live
     $('#rosterSort').val(rosterSort);
