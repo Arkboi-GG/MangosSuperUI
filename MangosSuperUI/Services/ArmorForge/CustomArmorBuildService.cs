@@ -817,6 +817,67 @@ public sealed class CustomArmorBuildService
         }
     }
 
+    /// <summary>
+    /// Re-register every forged armor display into DbcService's in-memory caches at startup, so the
+    /// web UI resolves their icon / model / texture after an app restart.
+    ///
+    /// <see cref="RegisterDisplayWithDbc"/> runs at FORGE time and writes to an in-memory cache that
+    /// does NOT survive a restart — the same durability gap the Retexture Engine closes with
+    /// LoadExistingRetexturesAsync and the Weapon Forge closes with LoadExistingWeaponsAsync. Armor
+    /// had no equivalent, so every imported piece reverted to the red "?" icon and vanished from the
+    /// 3D viewer the first time the app was restarted after importing it.
+    ///
+    /// Rebuilt from the registry rather than from an ArmorImportSource, because the import-time
+    /// source object is long gone by then; custom_armor_display persists every field the entry needs.
+    /// </summary>
+    public async Task LoadExistingArmorAsync()
+    {
+        try
+        {
+            // Blobs are megabytes of compiled M2/BLP and nothing here reads them.
+            var rows = await LoadArmorRowsAsync(includeBlobs: false);
+            int registered = 0;
+            foreach (var r in rows)
+            {
+                // Painted pieces have no display model — BodyAtlasTextureService serves them from
+                // custom_armor_component instead. Same skip RegisterDisplayWithDbc applies.
+                if (string.Equals(r.RenderKind, nameof(ArmorRenderKind.Painted), StringComparison.OrdinalIgnoreCase))
+                    continue;
+                try
+                {
+                    string model1 = r.ModelName ?? "";
+                    string model2 = r.ModelName2 ?? "";
+                    string texture1 = r.TextureName ?? "";
+                    _dbc.RegisterCustomDisplayEntry((uint)r.DisplayId, new ItemModelDbc
+                    {
+                        ModelName1 = model1,
+                        ModelName2 = model2,
+                        TextureName1 = texture1,
+                        // Shoulders are an L/R pair sharing one skin; a single-model piece has no
+                        // second texture. Same rule as RegisterDisplayWithDbc and ArmorDisplayInfoRow.
+                        TextureName2 = model2.Length == 0 ? "" : texture1,
+                        GeosetGroup = new[] { r.Geoset0, r.Geoset1, r.Geoset2 },
+                        HelmetGeosetVis1 = (uint)r.HelmetVis0,
+                        HelmetGeosetVis2 = (uint)r.HelmetVis1,
+                        BodyTextures = new string[8],
+                        ItemVisualId = 0,
+                    }, iconName: string.IsNullOrEmpty(r.IconStem) ? null : r.IconStem);
+                    registered++;
+                }
+                catch (Exception inner)
+                {
+                    _logger.LogDebug(inner, "ArmorForge: re-registration skipped for display {Id}", r.DisplayId);
+                }
+            }
+            if (registered > 0)
+                _logger.LogInformation("ArmorForge: registered {Count} forged armor display(s) into the DBC cache", registered);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ArmorForge: LoadExistingArmorAsync failed (forged armor may render as red '?' until a rebuild)");
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════
     // UNIFIED PATCH-6 ASSEMBLY
     // ═══════════════════════════════════════════════════════════════════
@@ -849,9 +910,29 @@ public sealed class CustomArmorBuildService
             }
             if (r.ModelTextureBlp is { Length: > 0 } && !string.IsNullOrEmpty(r.TextureMpqPath) && seen.Add(r.TextureMpqPath!))
                 textures.Add(new MpqMember { MpqPath = r.TextureMpqPath!, Data = r.ModelTextureBlp });
+            int modelBytesPacked = 0;
             foreach (var m in r.Models)
-                if (m.M2 is { Length: > 0 } && seen.Add(m.MpqPath))
-                    (m.MpqPath.EndsWith(".m2", StringComparison.OrdinalIgnoreCase) ? models : textures).Add(new MpqMember { MpqPath = m.MpqPath, Data = m.M2 });
+                if (m.M2 is { Length: > 0 })
+                {
+                    modelBytesPacked++;
+                    if (seen.Add(m.MpqPath))
+                        (m.MpqPath.EndsWith(".m2", StringComparison.OrdinalIgnoreCase) ? models : textures).Add(new MpqMember { MpqPath = m.MpqPath, Data = m.M2 });
+                }
+
+            // A Modelled piece (helm/shoulder) whose model bytes are all missing must not get a
+            // display row: the row would name an .mdx this archive does not contain, and because
+            // patch-6 owns the table the client reads, that publishes a guaranteed error model. The
+            // weapon lane already splits these into a skipped bucket; do the same here rather than
+            // shipping art-less rows. Modelled ONLY — Painted pieces paint the body atlas and Cloak
+            // rides the built-in cape geoset, so neither has a model and neither is affected.
+            if (kind == ArmorRenderKind.Modelled && modelBytesPacked == 0)
+            {
+                _logger.LogWarning(
+                    "ArmorForge: display {DisplayId} is a {Kind} piece with no stored model bytes — omitted from " +
+                    "{Patch} entirely (no member, no display row). Delete it from the Forged Armor list and re-import it.",
+                    r.DisplayId, kind, PatchFileName);
+                continue;
+            }
 
             displays.Add(new ArmorDisplayEntry
             {
@@ -1385,15 +1466,20 @@ public sealed class CustomArmorBuildService
         catch (Exception ex) { return (true, false, null, $"could not compare the server ItemSet.dbc: {ex.Message}"); }
     }
 
-    /// <summary>The base ItemDisplayInfo.dbc: the mounted copy EXCLUDING patch-6 itself, so patch-6
-    /// re-unions patch-4 (retextures) + patch-5 (weapons) instead of shadowing them.</summary>
+    /// <summary>The base ItemDisplayInfo.dbc: the mounted copy from strictly BENEATH patch-6, so
+    /// patch-6 re-unions patch-4 (retextures) + patch-5 (weapons) instead of shadowing them.
+    /// patch-6 sits at the top of the mount, so its table is the only one the client ever reads —
+    /// it MUST carry every custom row from every lane, which is why weapon rows legitimately appear
+    /// here. Skipping by RANK rather than by name keeps that a one-way chain (patch-4 → patch-5 →
+    /// patch-6); see the note on WeaponForge's ResolveBaseDbc for the cycle this replaced.</summary>
     private byte[] ResolveBaseDbc()
     {
         // ONLY the armor key — never inherit WeaponForge:CleanDbcPath: that is the state WITHOUT
         // patch-5, and patch-6 (top of the mount) built on it would shadow every forged weapon.
         var cfgPath = _config["ArmorForge:CleanDbcPath"];
         if (!string.IsNullOrWhiteSpace(cfgPath) && File.Exists(cfgPath)) return File.ReadAllBytes(cfgPath);
-        return _mpq.ExtractFile(ArmorNaming.ItemDisplayInfoMember, skipArchive: n => n.StartsWith("patch-6", StringComparison.OrdinalIgnoreCase))
+        int myRank = Mpq.MpqPatchOrder.Rank(PatchFileName);
+        return _mpq.ExtractFile(ArmorNaming.ItemDisplayInfoMember, skipArchive: n => Mpq.MpqPatchOrder.Rank(n) >= myRank)
             ?? throw new InvalidOperationException("Could not extract a base ItemDisplayInfo.dbc from the mounted archives.");
     }
 }

@@ -309,10 +309,13 @@ public sealed class CustomWeaponBuildService
             throw new InvalidOperationException("Unified patch assembly produced no weapons — the just-persisted weapon should have been included.");
 
         // 6) Preview the freshly packaged bytes (effect textures bound by their hardcoded paths).
+        // The chosen enchant glow (ItemVisual) is resolved against the built M2's own attachment
+        // points so the post-forge preview shows it exactly like the registry View does.
         var preview = _preview.RenderFromBytes(m2, blp,
             effectBlps.Count > 0
                 ? effectBlps.ToDictionary(e => e.MpqPath, e => e.Blp, StringComparer.OrdinalIgnoreCase)
-                : null);
+                : null,
+            ResolvePreviewVisualEffects(request.ItemVisual, m2));
 
         // 7) Write the build directory: straight patch-5.MPQ + item_template.sql (+ reports). No ZIP.
         var manifest = BuildManifest(request, profile, donor, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
@@ -472,7 +475,10 @@ public sealed class CustomWeaponBuildService
                      ma.gameplay_json   AS GameplayJson,
                      mo.generator_params_json AS GeneratorParamsJson
               FROM custom_weapon_display d
-              JOIN custom_weapon_model mo ON mo.model_id = d.model_id
+              -- LEFT so a weapon whose model row is missing still LISTS. It cannot be packaged, but
+              -- it must remain visible and deletable — an INNER join hid exactly the broken weapons
+              -- the operator needs to delete and re-forge.
+              LEFT JOIN custom_weapon_model mo ON mo.model_id = d.model_id
               LEFT JOIN custom_weapon_item_manifest ma ON ma.display_id = d.display_id
               ORDER BY d.display_id");
 
@@ -503,8 +509,9 @@ public sealed class CustomWeaponBuildService
                 WeaponType = weaponType,
                 InventoryType = inventoryType,
                 InventoryTypeLabel = inventoryTypeLabel,
-                SourceKind = (string)r.SourceKind,
-                ModelMpqPath = (string)r.ModelMpqPath,
+                SourceKind = (string?)r.SourceKind ?? "unknown",
+                // Empty when the model row is gone — the row still lists so it can be deleted.
+                ModelMpqPath = (string?)r.ModelMpqPath ?? "",
                 DonorDisplayRow = r.DonorDisplayRow is null ? 0L : (long)Convert.ToInt64(r.DonorDisplayRow),
                 BuildId = (string?)r.BuildId,
                 CreatedAt = (DateTime)r.CreatedAt,
@@ -756,11 +763,21 @@ public sealed class CustomWeaponBuildService
         string donorIcon = ReadDonorIconStem(baseReader);
 
         var installed = await LoadPackagedWeaponsAsync();
-        var skipped = installed.Where(w => w.M2 is null || w.Blp is null).ToList();
-        var packaged = installed.Where(w => w.M2 is not null && w.Blp is not null).ToList();
+        var skipped = installed.Where(w => w.M2 is null || w.Blp is null || w.ModelMpqPath is null).ToList();
+        var packaged = installed.Where(w => w.M2 is not null && w.Blp is not null && w.ModelMpqPath is not null).ToList();
         foreach (var s in skipped)
+        {
+            // Name WHICH half is missing: a null model path means the custom_weapon_model row is
+            // gone outright (the case that used to disappear silently through an INNER join), while
+            // null bytes mean the row exists but was never compiled into it.
+            string what = s.ModelMpqPath is null ? "has no custom_weapon_model row at all"
+                        : s.M2 is null && s.Blp is null ? "has neither compiled M2 nor BLP bytes"
+                        : s.M2 is null ? "has no compiled M2 bytes"
+                        : "has no compiled BLP bytes";
             diag.Warn("package.skipped",
-                $"display {s.DisplayId} has no stored compiled bytes (built before unified packaging) — rebuild it to re-include it");
+                $"display {s.DisplayId} {what} — it is NOT in this patch and will render as the error model in-game; " +
+                "delete it from the Forged Weapons list and re-forge it to restore its art");
+        }
 
         if (packaged.Count == 0)
             return new UnifiedAssembly { Patch = null, PackagedCount = 0, SkippedCount = skipped.Count, ReplacedInBase = 0 };
@@ -790,7 +807,7 @@ public sealed class CustomWeaponBuildService
                 MirrorModelName2 = w.MirrorModelName2,
                 ItemVisual = (uint)w.ItemVisual,
             }).ToArray(),
-            Models = packaged.GroupBy(w => w.ModelMpqPath, StringComparer.OrdinalIgnoreCase)
+            Models = packaged.GroupBy(w => w.ModelMpqPath!, StringComparer.OrdinalIgnoreCase)
                 .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().M2! }).ToArray(),
             Textures = packaged.GroupBy(w => w.TextureMpqPath, StringComparer.OrdinalIgnoreCase)
                 .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().Blp! })
@@ -809,18 +826,43 @@ public sealed class CustomWeaponBuildService
         };
     }
 
-    /// <summary>The base ItemDisplayInfo.dbc to union onto: the effective mounted copy EXCLUDING
-    /// patch-5 itself — the Forge must never read its own installed output back as input, or rows
-    /// added to lower patches (the Retexture Engine's patch-4) after the last forge build would be
-    /// frozen out forever. An explicit clean copy can be pointed at via WeaponForge:CleanDbcPath.</summary>
+    /// <summary>The chosen enchant glow (ItemVisual) resolved into effect models mounted on the
+    /// built M2's own attachment points, for the post-forge preview. Degrades to null — a visual is
+    /// an enhancement and must never fail a build's preview step.</summary>
+    private IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? ResolvePreviewVisualEffects(uint itemVisualId, byte[] m2)
+    {
+        if (itemVisualId == 0) return null;
+        try
+        {
+            var host = M2Reader.Parse(m2);
+            var effects = M2Fx.ItemVisualEffects.Resolve(itemVisualId, host,
+                path => _mpq.ExtractFile(path) ?? _mpq.ExtractFile(path.ToLowerInvariant()));
+            return effects.Count > 0 ? effects : null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>The base ItemDisplayInfo.dbc to union onto: the effective mounted copy from strictly
+    /// BENEATH patch-5 — so the Forge never reads its own installed output back as input, and rows
+    /// added to lower patches (the Retexture Engine's patch-4) are always re-unioned.
+    /// An explicit clean copy can be pointed at via WeaponForge:CleanDbcPath.
+    ///
+    /// Skipping by RANK, not by name, is load-bearing. Skipping only "patch-5" left patch-6 (armor,
+    /// which ranks ABOVE us) as the first archive to answer, so patch-5's base was patch-6 — whose
+    /// own base was patch-5. The two archives recycled one row set forever: patch-4's retexture rows
+    /// could never re-enter the table (measured: 1,625 ids in the 67249–68876 band went missing from
+    /// the client-effective DBC), and a row whose art had been deleted became immortal, ping-ponging
+    /// between the two with no members behind it. Ranking turns that cycle into a strict downward
+    /// chain — patch-4 → patch-5 → patch-6 — which is what the layering always intended.</summary>
     private byte[] ResolveBaseDbc()
     {
         var cfgPath = _config["WeaponForge:CleanDbcPath"];
         if (!string.IsNullOrWhiteSpace(cfgPath) && File.Exists(cfgPath))
             return File.ReadAllBytes(cfgPath);
 
+        int myRank = Mpq.MpqPatchOrder.Rank(PatchFileName);
         return _mpq.ExtractFile(WeaponNaming.ItemDisplayInfoMember,
-                skipArchive: name => name.StartsWith("patch-5", StringComparison.OrdinalIgnoreCase))
+                skipArchive: name => Mpq.MpqPatchOrder.Rank(name) >= myRank)
             ?? throw new InvalidOperationException("Could not extract a base ItemDisplayInfo.dbc from the mounted archives.");
     }
 
@@ -1050,7 +1092,9 @@ public sealed class CustomWeaponBuildService
         public string? IconStem { get; set; }
         public int ItemVisual { get; set; }
         public string? DbcFieldsJson { get; set; }
-        public string ModelMpqPath { get; set; } = "";
+        /// <summary>Null when the LEFT join found no custom_weapon_model row for this display —
+        /// the weapon is unpackageable and is reported as skipped rather than silently dropped.</summary>
+        public string? ModelMpqPath { get; set; }
         public byte[]? M2 { get; set; }
 
         public uint? GroupSoundIndex => ReadUInt("groupSoundIndex");
@@ -1121,7 +1165,11 @@ public sealed class CustomWeaponBuildService
                      m.model_mpq_path  AS ModelMpqPath,
                      m.compiled_m2     AS M2
               FROM custom_weapon_display d
-              JOIN custom_weapon_model m ON m.model_id = d.model_id
+              -- LEFT, not INNER: an INNER join made a display whose custom_weapon_model row is
+              -- missing vanish from the rebuild entirely — no member, no DBC row, and (because it
+              -- never reached the null-bytes check) no diagnostic either. It is now surfaced as a
+              -- skipped weapon like any other missing-bytes case.
+              LEFT JOIN custom_weapon_model m ON m.model_id = d.model_id
               ORDER BY d.display_id");
         return rows.ToList();
     }

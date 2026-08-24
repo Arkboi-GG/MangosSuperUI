@@ -449,26 +449,73 @@ public class HomeController : Controller
                     : "Point 'Client Data Path' in Settings at the client's Data folder itself (e.g. .../wowclient/Data), not the client root."
             });
 
-            // Live probe: decode the fallback questionmark icon through the real
-            // loader path. If this works, every icon/model request can work.
+            // Live probe: run the fallback questionmark icon through the WHOLE
+            // pipeline /Icon/Get uses — MPQ extract, then BlpDecoder.ToPngBytes
+            // (managed decode + SkiaSharp PNG encode). Probing only the extract
+            // half reports "ok" while every icon 404s, because the native
+            // SkiaSharp library can be missing on a box whose MPQs are perfect.
+            // The two halves are reported separately so the detail names the
+            // stage that actually broke.
+            const string probeIcon = "Interface\\Icons\\INV_Misc_QuestionMark.blp";
+
             byte[]? probe = null;
-            try { probe = _mpq.ExtractFile("Interface\\Icons\\INV_Misc_QuestionMark.blp"); }
+            string? extractError = null;
+            try { probe = _mpq.ExtractFile(probeIcon); }
             catch (Exception ex)
             {
+                extractError = $"{ex.GetType().Name}: {ex.Message}";
                 _logger.LogWarning(ex, "Diagnostics: MPQ icon probe threw");
             }
 
-            checks.Add(new DiagnosticCheck
+            if (probe is not { Length: > 0 })
             {
-                Category = "assets",
-                Name = "Icon Loader (on-demand)",
-                Status = probe is { Length: > 0 } ? "ok" : "error",
-                Detail = probe is { Length: > 0 }
-                    ? $"Icons decode from client MPQs on demand ({_mpq.ArchiveCount} archives mounted)."
-                    : "Could not read Interface\\Icons\\INV_Misc_QuestionMark.blp from the mounted MPQ archives. Icons and models will not display.",
-                Fix = probe is { Length: > 0 } ? null
-                    : "Verify the client Data directory is a complete WoW 1.12.1 install (dbc/model/texture/interface MPQs present) and restart the app."
-            });
+                checks.Add(new DiagnosticCheck
+                {
+                    Category = "assets",
+                    Name = "Icon Loader (on-demand)",
+                    Status = "error",
+                    Detail = extractError is null
+                        ? $"Could not read {probeIcon} from the mounted MPQ archives ({_mpq.ArchiveCount} mounted). Icons and models will not display."
+                        : $"Reading {probeIcon} from the mounted MPQ archives threw — {extractError}",
+                    Fix = "Verify the client Data directory is a complete WoW 1.12.1 install (dbc/model/texture/interface MPQs present) and restart the app."
+                });
+            }
+            else
+            {
+                // Extract succeeded — now the half that used to go untested.
+                byte[]? png = null;
+                string? decodeError = null;
+                try { png = BlpDecoder.ToPngBytes(probe); }
+                catch (Exception ex)
+                {
+                    // The interesting message is on the INNERMOST exception: a
+                    // missing native lib surfaces as TypeInitializationException
+                    // wrapping DllNotFoundException, and only the inner text
+                    // names the .so that failed to load (e.g. libfontconfig.so.1).
+                    var root = ex;
+                    while (root.InnerException is not null) root = root.InnerException;
+                    decodeError = $"{root.GetType().Name}: {root.Message.Split('\n')[0].Trim()}";
+                    _logger.LogWarning(ex, "Diagnostics: BLP->PNG probe threw");
+                }
+
+                var decoded = png is { Length: > 0 };
+                checks.Add(new DiagnosticCheck
+                {
+                    Category = "assets",
+                    Name = "Icon Loader (on-demand)",
+                    Status = decoded ? "ok" : "error",
+                    Detail = decoded
+                        ? $"Icons decode from client MPQs on demand ({_mpq.ArchiveCount} archives mounted, {png!.Length:N0}-byte PNG probe)."
+                        : decodeError is null
+                            ? "The icon BLP read from the MPQs but produced an empty PNG. Icons and models will not display."
+                            : $"The icon BLP read fine from the MPQs, but BLP→PNG conversion failed — {decodeError}. Icons and models will not display.",
+                    Fix = decoded ? null
+                        : decodeError?.Contains("libSkiaSharp", StringComparison.OrdinalIgnoreCase) == true
+                          || decodeError?.Contains("fontconfig", StringComparison.OrdinalIgnoreCase) == true
+                            ? "SkiaSharp's native library could not load. On Debian/Ubuntu install its dependency with 'sudo apt install -y libfontconfig1', then RESTART the app — .NET caches the failed type initializer for the life of the process, so the fix does not take effect until a restart."
+                            : "Image conversion failed after a successful MPQ read — check the app log for the full exception under 'Diagnostics: BLP->PNG probe threw'."
+                });
+            }
         }
 
         // ── Summary ──

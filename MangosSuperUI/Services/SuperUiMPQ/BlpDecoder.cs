@@ -11,8 +11,16 @@
 // The DXT block math (565 expansion, 2-bit color indices, DXT3 alpha nibbles,
 // DXT5 alpha ramp + 3-bit indices) was validated in a Python prototype before
 // this was written.
+//
+// ToPngBytes() is the full BLP -> PNG pipeline (managed decode + SkiaSharp
+// encode) that /Icon/Get serves. It lives here, next to the decode, so the
+// startup diagnostic can run the EXACT code the endpoint runs. A diagnostic
+// that re-implements the pipeline can pass while the endpoint fails — which is
+// precisely how a missing libSkiaSharp dependency once read as "ok" while every
+// icon 404'd.
 
 using System.Buffers.Binary;
+using SkiaSharp;
 
 namespace MangosSuperUI.Services;
 
@@ -206,5 +214,25 @@ public static class BlpDecoder
         r = (r5 << 3) | (r5 >> 2);
         g = (g6 << 2) | (g6 >> 4);
         b = (b5 << 3) | (b5 >> 2);
+    }
+
+    /// <summary>
+    /// BLP bytes -> PNG bytes: managed decode of mip 0, then SkiaSharp PNG
+    /// encode. Throws rather than returning empty so callers can report WHY —
+    /// the SkiaSharp failure mode is a TypeInitializationException wrapping a
+    /// DllNotFoundException, and that inner message names the missing .so.
+    /// </summary>
+    public static byte[] ToPngBytes(byte[] blpData)
+    {
+        var pixels = GetPixels(blpData, 0, out int w, out int h);
+
+        using var bitmap = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+        var dst = bitmap.GetPixels();
+        System.Runtime.InteropServices.Marshal.Copy(pixels, 0, dst, pixels.Length);
+        bitmap.NotifyPixelsChanged();
+
+        using var outMs = new MemoryStream();
+        bitmap.Encode(outMs, SKEncodedImageFormat.Png, 100);
+        return outMs.ToArray();
     }
 }

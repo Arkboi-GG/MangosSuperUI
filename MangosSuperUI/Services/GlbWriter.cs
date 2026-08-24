@@ -8,6 +8,7 @@ using SkiaSharp;
 namespace MangosSuperUI.Services;
 
 using VERTEX = VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>;
+using VERTEX2 = VertexBuilder<VertexPositionNormal, VertexTexture2, VertexEmpty>;
 
 /// <summary>
 /// Converts a parsed M2Model + BLP textures into a GLB (glTF Binary) file.
@@ -154,10 +155,24 @@ public static class GlbWriter
             // baseColorFactor below, and two batches can agree on texture/blend/alpha while pointing
             // at different colour records (a weapon whose blade glows orange and whose rune glows
             // blue off one texture). Merging those would paint both the same.
-            var matCache = new Dictionary<(int texIdx, int blendMode, int alphaBucket, int tintBucket), MaterialBuilder>();
+            // env/mod are per-PASS properties that are not derivable from (texture, blend, alpha,
+            // tint), so they belong in the key. Two passes on one energy sheet — an env-mapped shell
+            // and a plain additive shell, same slot, same blend, same alpha, no colour record — are
+            // exactly the Warglaive shape, and would otherwise collide with the second silently
+            // inheriting the first's marker. wantDoubleSide is in the key because a fused _mod
+            // primitive forces it on regardless of what the caller asked for.
+            var matCache = new Dictionary<(int texIdx, int blendMode, int alphaBucket, int tintBucket,
+                bool env, bool mod, bool dbl), MaterialBuilder>();
 
-            MaterialBuilder GetMaterial(int texIdx, int blendMode, bool wantDoubleSide, float alpha = 1.0f,
-                Vector3? tint = null)
+            // exactOnly: an overlay or fused pass must resolve its OWN texture. The three-tier
+            // fallback below is load-bearing for a BASE pass (losing tier 2 is what made Thunderfury
+            // render all-grey) but for an overlay it silently retargets to the preferred Type-2
+            // diffuse and emits a second full copy of the submesh painted with the base skin.
+            // unique: bypass the cache and mint a distinctly-named material, used for every pass
+            // that carries an animation so the manifest's material-name key is unambiguous.
+            MaterialBuilder? GetMaterial(int texIdx, int blendMode, bool wantDoubleSide, float alpha = 1.0f,
+                Vector3? tint = null, bool env = false, bool mod = false,
+                bool exactOnly = false, string? unique = null)
             {
                 // Clamp + bucket the alpha. 0 stays 0 (we'd skip the submesh
                 // in some future world but right now we render it anyway —
@@ -172,8 +187,8 @@ public static class GlbWriter
                                | ((int)MathF.Round(rgb.Y * 255f) << 8)
                                | (int)MathF.Round(rgb.Z * 255f);
 
-                var key = (texIdx, blendMode, alphaBucket, tintBucket);
-                if (matCache.TryGetValue(key, out var existing)) return existing;
+                var key = (texIdx, blendMode, alphaBucket, tintBucket, env, mod, wantDoubleSide);
+                if (unique is null && matCache.TryGetValue(key, out var existing)) return existing;
 
                 // Three-tier resolution (matches pre-Session-M behavior):
                 //   1. Exact texture match for this submesh's texIdx
@@ -196,7 +211,7 @@ public static class GlbWriter
                 {
                     pngBytes = exact;
                 }
-                else if (pngByTexIdx.Count > 0)
+                else if (!exactOnly && pngByTexIdx.Count > 0)
                 {
                     // Prefer the lowest-index type=2 slot (the DBC-supplied
                     // diffuse) over any type=0 slot (embedded reflection
@@ -226,7 +241,12 @@ public static class GlbWriter
                     }
                 }
 
-                if (pngBytes == null) return fallbackMat;
+                if (pngBytes == null) return exactOnly ? null : fallbackMat;
+
+                // An `_env` marker is only honest when the pass sampled its OWN texture.
+                // applyEnvMapping matcaps whatever mat.map holds, so a tier-2 substitution here
+                // would matcap the armour DIFFUSE — a chrome blob smeared with its own skin.
+                if (env && resolvedTexIdx != texIdx) env = false;
 
                 var img = new SharpGLTF.Memory.MemoryImage(pngBytes);
                 // Name suffix _blendN tells the client to set three.js blending
@@ -237,7 +257,14 @@ public static class GlbWriter
                 // so three.js already sees the correct alpha at the standard
                 // glTF level — the name suffix is purely diagnostic.
                 var alphaSuffix = alphaBucket < 100 ? $"_a{alphaBucket:D2}" : "";
-                var name = $"mat_{resolvedTexIdx}_blend{blendMode}{alphaSuffix}";
+                // `_env` and `_mod` sit BEFORE the blend suffix: blend-suffix.js's blend regex is
+                // END-anchored while its _env/_mod regexes match anywhere — the same composition
+                // WeaponPreviewService uses. The ad-hoc /_blend[34]/ glow-tint tests on the Forge
+                // pages still match because the alpha suffix stays last.
+                var marker = $"{(env ? "_env" : "")}{(mod ? "_mod" : "")}";
+                var name = unique is null
+                    ? $"mat_{resolvedTexIdx}{marker}_blend{blendMode}{alphaSuffix}"
+                    : $"{unique}_{resolvedTexIdx}{marker}_blend{blendMode}{alphaSuffix}";
 
                 // Session N: bake static alpha into baseColorFactor.
                 //
@@ -295,7 +322,9 @@ public static class GlbWriter
                 // alphaBucket). A future call with the same triple gets
                 // the same MaterialBuilder, even though internally we
                 // resolved to a different texture for tier-2 fallback.
-                matCache[key] = mat;
+                // A `unique` material is deliberately NOT cached — it exists so one animated pass
+                // owns one material name that the manifest can key on.
+                if (unique is null) matCache[key] = mat;
                 return mat;
             }
 
@@ -336,121 +365,253 @@ public static class GlbWriter
             var submeshVis = BuildSubmeshVisibilityMap(m2);
             var submeshTint = BuildSubmeshTintMap(m2);
 
-            // Submesh index → the glTF mesh name it was written under. The animation manifest keys
-            // on these, so it has to be recorded as the meshes are built rather than reconstructed.
-            var meshNameForSubmesh = new Dictionary<int, string>();
+            // Declared before the emit helpers below, which capture it.
+            var submeshTexture = BuildSubmeshTextureMap(m2);
+
+            // Batches for one submesh, in SOURCE ORDER. Batch 0 is the base material; later batches
+            // are additional material LAYERS the client composites over it. This writer historically
+            // kept only batch 0 (the first-wins guards in the Build*Map helpers), which is why a
+            // Warglaive renders dead here while the Weapon Forge shows it alive: its blade energy is
+            // entirely in the dropped layers.
+            var batchesBySubmesh = new Dictionary<int, List<M2Batch>>();
+            foreach (var b in m2.Batches)
+            {
+                if (!batchesBySubmesh.TryGetValue(b.SubmeshIndex, out var list))
+                    batchesBySubmesh[b.SubmeshIndex] = list = new List<M2Batch>();
+                list.Add(b);
+            }
+
+            // A pass may only add a SECOND primitive over geometry the base already covers when its
+            // blend mode COMPOSITES. blend-suffix.js gives blend 3/4 additive, 5 multiply and 6 a
+            // mod2x equation, all with depthWrite = false — such an overlay can neither z-fight with
+            // the base nor replace it.
+            //
+            // Blend 0/1/2 layers stay dropped, deliberately. Two coincident depth-WRITING primitives
+            // resolve by three.js's opaque sort (ascending material.id), so the overlay — created
+            // second — would simply erase the base diffuse. That is the Might-helm grey bug with
+            // extra steps. This one predicate is also what keeps this change off every plate helm,
+            // spaulder and GameObject in the catalogue: the effects this exists for are blend 6
+            // (env-mapped) and blend 4 (modulate).
+            const int OVERLAY_MIN_BLEND = 3;
+
+            // TEXCOORD_1 is only real if the model authored a second UV set.
+            bool hasUv2 = false;
+            for (int vi = 0; vi < vertices.Count && !hasUv2; vi++)
+                if (vertices[vi].TexU2 != 0f || vertices[vi].TexV2 != 0f) hasUv2 = true;
+
+            // Every primitive actually emitted, with the glTF names it landed under — this is what
+            // the animation manifest keys on now, instead of re-deriving "first batch per submesh".
+            var emittedPasses = new List<M2Fx.M2FxPass>();
+
+            // ── Fusion test ─────────────────────────────────────────────────────────────────────
+            // A batch with TWO texture units that resolve to the SAME M2 texture slot is WoW's
+            // multi-texture combine of one sheet against itself at two mappings: a static copy times
+            // a scrolling copy, whose interference is the wave that travels along the blade. That is
+            // the ONLY two-unit shape we act on, and requiring the two units to actually differ
+            // (different coordinate set OR different UV transform) is what makes the multiply mean
+            // something rather than square one sample.
+            //
+            // The blend gate is what makes this safe on DIFFERENT slots. A two-unit batch at blend
+            // 0/1/2 is a base diffuse plus a hardcoded reflect/spec overlay, and which combiner
+            // applies is named by M2Batch.ShaderId, which nothing here decodes — fusing one of those
+            // is how a helm loses its DBC skin and renders its reflect map squared. Those never
+            // reach this function. At blend >= 3 the batch is already a compositing overlay, so
+            // fusing it cannot erase a base.
+            //
+            // Approximation, stated plainly: applyMultiTexture (blend-suffix.js) clones the material's
+            // ONE map and samples it twice, so a two-DIFFERENT-texture combine cannot be expressed —
+            // it renders as unit 1's sheet scrolled against itself. WeaponPreviewService makes the
+            // identical trade (it picks b1's png and falls back to b0's), and matching it is the
+            // point of this change: the Weapon Forge and the Items page must agree on the same model.
+            bool TryFuse(M2Batch b, int blend, out int slot, out bool scrollUv1, out bool staticUv1)
+            {
+                slot = -1; scrollUv1 = false; staticUv1 = false;
+                if (b.TextureCount < 2 || blend < OVERLAY_MIN_BLEND) return false;
+
+                ushort c0 = ResolveCoordCombo(m2, b, 0), c1 = ResolveCoordCombo(m2, b, 1);
+                ushort t0 = ResolveTransformCombo(m2, b, 0), t1 = ResolveTransformCombo(m2, b, 1);
+                if (c0 == c1 && t0 == t1) return false;   // identical samples: multiply = square
+
+                // An env-mapped unit is sampled by view normal, not by a UV set, so there is no
+                // second UV to multiply against — that shape belongs on the _env path instead.
+                if ((c0 & 0x8000) != 0 || (c1 & 0x8000) != 0) return false;
+
+                // Unit 1 carries the scroll, so it is the sheet worth showing; unit 0 is the fallback.
+                int s1 = ResolveTextureSlot(m2, b, 1), s0 = ResolveTextureSlot(m2, b, 0);
+                slot = s1 >= 0 && pngByTexIdx.ContainsKey(s1) ? s1
+                     : s0 >= 0 && pngByTexIdx.ContainsKey(s0) ? s0 : -1;
+                if (slot < 0) return false;
+
+                scrollUv1 = (c1 & 0x7fff) == 1 && hasUv2;
+                staticUv1 = (c0 & 0x7fff) == 1 && hasUv2;
+                // Both samples on the same UV set with no differing transform would square one
+                // sample; the transform check above already caught the no-UV1 case for us, but be
+                // explicit rather than emitting a _mod the client will multiply into mush.
+                if (scrollUv1 == staticUv1 && t0 == t1) return false;
+                return true;
+            }
+
+            void AddTris(PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture1, VertexEmpty> prim,
+                         int indexStart, int indexCount)
+            {
+                for (int i = indexStart; i + 2 < indexStart + indexCount; i += 3)
+                {
+                    if (i + 2 >= indices.Count) break;
+                    int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+                    if (i0 >= vertices.Count || i1 >= vertices.Count || i2 >= vertices.Count) continue;
+                    prim.AddTriangle(MakeVertex(vertices[i0]), MakeVertex(vertices[i1]), MakeVertex(vertices[i2]));
+                }
+            }
+
+            void AddTris2(PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture2, VertexEmpty> prim,
+                          int indexStart, int indexCount, bool scrollUv1, bool staticUv1)
+            {
+                for (int i = indexStart; i + 2 < indexStart + indexCount; i += 3)
+                {
+                    if (i + 2 >= indices.Count) break;
+                    int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+                    if (i0 >= vertices.Count || i1 >= vertices.Count || i2 >= vertices.Count) continue;
+                    prim.AddTriangle(
+                        MakeVertex2(vertices[i0], scrollUv1, staticUv1),
+                        MakeVertex2(vertices[i1], scrollUv1, staticUv1),
+                        MakeVertex2(vertices[i2], scrollUv1, staticUv1));
+                }
+            }
+
+            // One primitive per glTF MESH — never two primitives inside one mesh.
+            //
+            // A glTF mesh with two primitives arrives in three.js as a Group whose children were
+            // renamed by the loader's uniquifier, and m2fx.js only traverses nodes where isMesh is
+            // true — so the Group is skipped and the children no longer match the manifest. With one
+            // primitive the loader returns the mesh directly, name intact, and every mesh-name key
+            // still resolves. (The manifest also carries a material-name key as a second belt.)
+            void EmitPass(string meshName, int indexStart, int indexCount, MaterialBuilder mat,
+                          bool fused, bool scrollUv1, bool staticUv1, M2Fx.M2FxMesh? fx)
+            {
+                if (fused)
+                {
+                    var mb2 = new MeshBuilder<VertexPositionNormal, VertexTexture2, VertexEmpty>(meshName);
+                    AddTris2(mb2.UsePrimitive(mat), indexStart, indexCount, scrollUv1, staticUv1);
+                    scene.AddRigidMesh(mb2, rootMatrix);
+                }
+                else
+                {
+                    var mb = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(meshName);
+                    AddTris(mb.UsePrimitive(mat), indexStart, indexCount);
+                    scene.AddRigidMesh(mb, rootMatrix);
+                }
+                if (fx is not null)
+                    emittedPasses.Add(new M2Fx.M2FxPass(meshName, mat.Name, fx));
+            }
+
+            // Layers 1..n — the passes this writer used to drop on the floor.
+            void EmitOverlays(int subIdx, string baseMeshName, int indexStart, int indexCount,
+                              List<M2Batch> batches)
+            {
+                for (int bi = 1; bi < batches.Count; bi++)
+                {
+                    var b = batches[bi];
+                    int blendO = b.MaterialIndex < m2.RenderFlags.Count
+                        ? m2.RenderFlags[b.MaterialIndex].BlendingMode : 0;
+                    if (blendO < OVERLAY_MIN_BLEND) continue;
+
+                    float visO = m2.GetStaticAlphaForBatch(b);
+                    var tintO = RestTintForBatch(m2, b);
+                    string meshNameO = $"{baseMeshName}_ov{bi}";
+
+                    if (TryFuse(b, blendO, out int fSlot, out bool fScroll, out bool fStatic))
+                    {
+                        var fxF = M2Fx.M2FxReader.ReadPassFx(m2.SourceBytes, m2, b, 1);
+                        var matF = GetMaterial(fSlot, blendO, wantDoubleSide: true, visO, tintO,
+                            env: false, mod: true, exactOnly: true,
+                            unique: fxF is null ? null : $"p{subIdx}_{bi}_1");
+                        if (matF is null) continue;
+                        EmitPass(meshNameO, indexStart, indexCount, matF, fused: true, fScroll, fStatic, fxF);
+                        continue;
+                    }
+
+                    // Unit 0 only, and it must resolve its OWN texture (exactOnly): a substituted
+                    // one would draw a second full copy of the submesh in the base skin.
+                    int slotO = ResolveTextureSlot(m2, b, 0);
+                    if (slotO < 0 || !pngByTexIdx.ContainsKey(slotO)) continue;
+                    bool envO = b.TextureCount < 2 && (ResolveCoordCombo(m2, b, 0) & 0x8000) != 0;
+                    var fx0 = M2Fx.M2FxReader.ReadPassFx(m2.SourceBytes, m2, b, 0);
+                    var matO = GetMaterial(slotO, blendO, doubleSided, visO, tintO,
+                        env: envO, mod: false, exactOnly: true,
+                        unique: fx0 is null ? null : $"p{subIdx}_{bi}_0");
+                    if (matO is null) continue;
+                    EmitPass(meshNameO, indexStart, indexCount, matO, fused: false, false, false, fx0);
+                }
+            }
+
+            // Emit a submesh: its base primitive, then any compositing overlay layers.
+            void EmitSubmesh(int subIdx, string meshName, int indexStart, int indexCount)
+            {
+                var batches = batchesBySubmesh.TryGetValue(subIdx, out var bl) ? bl : new List<M2Batch>();
+                var baseBatch = batches.Count > 0 ? batches[0] : null;
+
+                float vis = submeshVis.TryGetValue(subIdx, out var v) ? v : 1.0f;
+                int blend = submeshBlend.TryGetValue(subIdx, out var bm) ? bm : 0;
+                int texIdx = submeshTexture.TryGetValue(subIdx, out var ti) ? ti
+                           : (pngByTexIdx.Count > 0 ? pngByTexIdx.Keys.First() : subIdx);
+                var tint = submeshTint.TryGetValue(subIdx, out var t) ? t : (Vector3?)null;
+
+                // ── Base ────────────────────────────────────────────────────────────────────────
+                if (baseBatch is not null && TryFuse(baseBatch, blend, out int fSlot, out bool fScroll, out bool fStatic))
+                {
+                    // Unit 1 owns the animated transform, so its fx and its mapping drive channel 0.
+                    // Forced double-sided: an additive energy submesh is wound to be seen from both
+                    // faces, and single-sided culling drops it entirely — which is why only the base
+                    // blade would show.
+                    var fxF = M2Fx.M2FxReader.ReadPassFx(m2.SourceBytes, m2, baseBatch, 1);
+                    var matF = GetMaterial(fSlot, blend, wantDoubleSide: true, vis, tint,
+                        // env + mod cannot coexist: applyEnvMapping replaces the material with a
+                        // matcap, which has no .map, and applyMultiTexture's !mat.map guard then
+                        // skips it. Decide here rather than leaving it to client call order.
+                        env: false, mod: true, exactOnly: true,
+                        unique: fxF is null ? null : $"p{subIdx}_0_1");
+                    if (matF is not null)
+                    {
+                        EmitPass(meshName, indexStart, indexCount, matF, fused: true, fScroll, fStatic, fxF);
+                        EmitOverlays(subIdx, meshName, indexStart, indexCount, batches);
+                        return;
+                    }
+                    // else fall through to the ordinary single-UV base
+                }
+
+                bool env = baseBatch is not null
+                        && blend >= OVERLAY_MIN_BLEND
+                        && baseBatch.TextureCount < 2
+                        && (ResolveCoordCombo(m2, baseBatch, 0) & 0x8000) != 0
+                        && pngByTexIdx.ContainsKey(texIdx);
+
+                var baseFx = baseBatch is null ? null
+                           : M2Fx.M2FxReader.ReadPassFx(m2.SourceBytes, m2, baseBatch, 0);
+                var baseMat = GetMaterial(texIdx, blend, doubleSided, vis, tint, env: env,
+                                  unique: baseFx is null ? null : $"p{subIdx}_0_0")
+                              ?? fallbackMat;
+                EmitPass(meshName, indexStart, indexCount, baseMat, fused: false, false, false, baseFx);
+
+                EmitOverlays(subIdx, meshName, indexStart, indexCount, batches);
+            }
 
             if (m2.Submeshes.Count > 1)
             {
-                // ── Multi-submesh: build a SEPARATE MeshBuilder per submesh ──
-                var submeshTexture = BuildSubmeshTextureMap(m2);
-
                 for (int subIdx = 0; subIdx < m2.Submeshes.Count; subIdx++)
                 {
                     var submesh = m2.Submeshes[subIdx];
                     if (submesh.IndexCount == 0 || submesh.IndexCount % 3 != 0) continue;
-
-                    // Session N: per-batch static alpha from the M2's
-                    // transparency tracks. Submeshes 0-6 of Thunderfury
-                    // (the lightning fins) come back with alpha ~0.19 here;
-                    // hilt + blade come back 1.0. The alpha gets baked into
-                    // the GLB material's baseColor.A and the material is
-                    // flagged AlphaMode.BLEND when below 1, so the renderer
-                    // applies it instead of treating the geometry as opaque.
-                    //
-                    // We do NOT skip the submesh even when alpha is low —
-                    // we render it with the computed alpha (which is then multiplied by the blend
-                    // mode behavior). Dropping the geometry would also drop
-                    // the "barely-visible faded lightning halo" that's
-                    // supposed to be there in the static pose.
-                    float vis = submeshVis.ContainsKey(subIdx) ? submeshVis[subIdx] : 1.0f;
-
-                    int texIdx = submeshTexture.ContainsKey(subIdx) ? submeshTexture[subIdx] : subIdx;
-                    int blendMode = submeshBlend.ContainsKey(subIdx) ? submeshBlend[subIdx] : 0;
-                    var tint = submeshTint.TryGetValue(subIdx, out var t) ? t : (Vector3?)null;
-                    var mat = GetMaterial(texIdx, blendMode, doubleSided, vis, tint);
-
-                    string meshName = $"Geoset{subIdx}";
-                    meshNameForSubmesh[subIdx] = meshName;
-                    var meshBuilder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(meshName);
-                    var prim = meshBuilder.UsePrimitive(mat);
-
-                    for (int i = submesh.IndexStart; i + 2 < submesh.IndexStart + submesh.IndexCount; i += 3)
-                    {
-                        if (i + 2 >= indices.Count) break;
-                        int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
-                        if (i0 >= vertices.Count || i1 >= vertices.Count || i2 >= vertices.Count) continue;
-                        prim.AddTriangle(MakeVertex(vertices[i0]), MakeVertex(vertices[i1]), MakeVertex(vertices[i2]));
-                    }
-
-                    scene.AddRigidMesh(meshBuilder, rootMatrix);
+                    EmitSubmesh(subIdx, $"Geoset{subIdx}", submesh.IndexStart, submesh.IndexCount);
                 }
+            }
+            else if (m2.Submeshes.Count == 1)
+            {
+                var sub = m2.Submeshes[0];
+                EmitSubmesh(0, "mesh", sub.IndexStart, sub.IndexCount);
             }
             else
             {
-                // ── Single submesh or no submesh info: one mesh ──
-                // Blend lookup still applies: a single-submesh M2 may carry an
-                // additive material (rare for weapons, common for spell M2s).
-                int singleBlend = submeshBlend.ContainsKey(0) ? submeshBlend[0] : 0;
-                float singleVis = submeshVis.ContainsKey(0) ? submeshVis[0] : 1.0f;
-
-                // Texture selection MUST follow the same batch chain the
-                // multi-submesh branch uses:
-                //   batch[0].SubmeshIndex(=0)
-                //     → batch[0].TextureIndex
-                //     → TextureLookup[ ... ]
-                //     → texIdx into m2.Textures
-                //
-                // Why this matters even though there's only one submesh:
-                // when an M2 has multiple textures (e.g. type=2 DBC diffuse
-                // at slot 0 + type=0 embedded reflection at slot 1) and only
-                // one submesh, `pngByTexIdx.Keys.First()` returns whichever
-                // slot got inserted into the dictionary first — which is a
-                // function of the texture-collection loop order in
-                // ItemTextureService, NOT what the M2's batch actually wants
-                // rendered as the diffuse.
-                //
-                // Empirical: Helm of Might (displayId 31260) and Pauldrons of
-                // Might (31024) both have textureCount=2, submeshCount=1, and
-                // both came out grey (the type=0 ShoulderReflect01.blp was
-                // baked as the material) until this branch was rewritten to
-                // consult the batch chain. The fully-correct sister items
-                // (Helm/Pauldrons of Wrath) have multiple submeshes and went
-                // through the multi-submesh branch, hiding the bug.
-                var submeshTextureSingle = BuildSubmeshTextureMap(m2);
-                int singleTexIdx = submeshTextureSingle.ContainsKey(0)
-                    ? submeshTextureSingle[0]
-                    : (pngByTexIdx.Count > 0 ? pngByTexIdx.Keys.First() : 0);
-                var singleTint = submeshTint.TryGetValue(0, out var st) ? st : (Vector3?)null;
-                var mat = pngByTexIdx.Count > 0
-                    ? GetMaterial(singleTexIdx, singleBlend, doubleSided, singleVis, singleTint)
-                    : fallbackMat;
-                meshNameForSubmesh[0] = "mesh";
-                var meshBuilder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>("mesh");
-                var prim = meshBuilder.UsePrimitive(mat);
-
-                if (m2.Submeshes.Count == 1)
-                {
-                    var sub = m2.Submeshes[0];
-                    for (int i = sub.IndexStart; i + 2 < sub.IndexStart + sub.IndexCount; i += 3)
-                    {
-                        if (i + 2 >= indices.Count) break;
-                        int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
-                        if (i0 >= vertices.Count || i1 >= vertices.Count || i2 >= vertices.Count) continue;
-                        prim.AddTriangle(MakeVertex(vertices[i0]), MakeVertex(vertices[i1]), MakeVertex(vertices[i2]));
-                    }
-                }
-                else
-                {
-                    for (int i = 0; i + 2 < indices.Count; i += 3)
-                    {
-                        int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
-                        if (i0 >= vertices.Count || i1 >= vertices.Count || i2 >= vertices.Count) continue;
-                        prim.AddTriangle(MakeVertex(vertices[i0]), MakeVertex(vertices[i1]), MakeVertex(vertices[i2]));
-                    }
-                }
-
-                scene.AddRigidMesh(meshBuilder, rootMatrix);
+                EmitSubmesh(0, "mesh", 0, indices.Count - (indices.Count % 3));
             }
 
             // ── Save ──
@@ -471,8 +632,7 @@ public static class GlbWriter
                 // or a second request against an endpoint that does not exist.
                 var emitterTextureIndex = EmbedEmitterTextures(model, m2, pngByTexIdx);
 
-                var fx = M2Fx.M2FxReader.Build(m2.SourceBytes, m2,
-                    subIdx => meshNameForSubmesh.TryGetValue(subIdx, out var n) ? n : null,
+                var fx = M2Fx.M2FxReader.Build(m2.SourceBytes, m2, emittedPasses,
                     slot => emitterTextureIndex.TryGetValue(slot, out int gltfIndex) ? gltfIndex : null);
 
                 var mounted = EmbedVisualEffects(model, visualEffects);
@@ -736,6 +896,59 @@ public static class GlbWriter
     }
 
     /// <summary>
+    /// The texture-coordinate combo VALUE for one unit of a batch.
+    ///
+    /// 0xFFFF as a VALUE means environment-mapped: the client samples by view normal, not by UV.
+    /// 0 / 1 select UV0 / UV1.
+    ///
+    /// The 0xFFFF START INDEX is an unrelated thing — the old-format sentinel for "this batch
+    /// declares no coordinate combo at all". Masking that with 0x8000 without checking reports every
+    /// such batch as environment-mapped, because 0xFFFF &amp; 0x8000 != 0. Guard the start index first,
+    /// then read the table.
+    /// </summary>
+    private static ushort ResolveCoordCombo(M2Model m2, M2Batch batch, int unit)
+    {
+        if (batch.TextureCoordinateIndex == ushort.MaxValue) return 0;   // no combo → UV0, not env
+        long combo = (long)batch.TextureCoordinateIndex + unit;
+        if (combo < 0 || combo >= m2.TextureCoordinateLookup.Count) return 0;
+        return m2.TextureCoordinateLookup[(int)combo];
+    }
+
+    /// <summary>Transform-combo value for one unit — used only to tell the two units of a fused
+    /// pass apart. 0xFFFF means "no transform".</summary>
+    private static ushort ResolveTransformCombo(M2Model m2, M2Batch batch, int unit)
+    {
+        if (batch.TextureTransformIndex == ushort.MaxValue) return ushort.MaxValue;
+        long combo = (long)batch.TextureTransformIndex + unit;
+        if (combo < 0 || combo >= m2.TextureTransformLookup.Count) return ushort.MaxValue;
+        return m2.TextureTransformLookup[(int)combo];
+    }
+
+    /// <summary>M2 texture slot for one unit of a batch: batch.TextureIndex + unit → TextureLookup.
+    /// −1 when the combo is out of range. Callers must SKIP that unit rather than substitute
+    /// anything: an overlay drawn with a substituted texture is a second full copy of the submesh
+    /// composited over itself in the base skin.</summary>
+    private static int ResolveTextureSlot(M2Model m2, M2Batch batch, int unit)
+    {
+        long combo = (long)batch.TextureIndex + unit;
+        if (combo < 0 || combo >= m2.TextureLookup.Count) return -1;
+        return m2.TextureLookup[(int)combo];
+    }
+
+    /// <summary>Rest tint for ONE batch — the same validation BuildSubmeshTintMap applies, but per
+    /// batch rather than first-batch-wins, because an overlay layer carries its own colour record.</summary>
+    private static Vector3? RestTintForBatch(M2Model m2, M2Batch batch)
+    {
+        if (batch.ColorIndex < 0) return null;
+        if (!m2.ReachableRestColors.TryGetValue(batch.ColorIndex, out var rest)) return null;
+        var rgb = rest.Rgb;
+        if (!float.IsFinite(rgb.X) || !float.IsFinite(rgb.Y) || !float.IsFinite(rgb.Z)) return null;
+        if (rgb.X < 0f || rgb.Y < 0f || rgb.Z < 0f) return null;
+        if (rgb.X > 1f || rgb.Y > 1f || rgb.Z > 1f) return null;
+        return rgb;
+    }
+
+    /// <summary>
     /// The distinct texture indices the geometry actually samples, resolved via the
     /// same batch → TextureLookup → Textures chain the material builder uses. Anything
     /// baking a recolor into the GLB must target one of THESE indices, not a Type
@@ -784,6 +997,26 @@ public static class GlbWriter
         return new VERTEX(
             new VertexPositionNormal(new Vector3(v.PosX, v.PosY, v.PosZ), new Vector3(v.NormX, v.NormY, v.NormZ)),
             new VertexTexture1(new Vector2(v.TexU, v.TexV))
+        );
+    }
+
+    /// <summary>Vertex for a fused multi-texture MODULATE primitive.
+    ///
+    /// TEXCOORD_0 carries the SCROLLING unit's mapping — m2fx.js drives map.matrix, which is
+    /// channel 0. TEXCOORD_1 carries the STATIC unit's mapping; blend-suffix.js applyMultiTexture
+    /// reads it through the aoMap slot (vAoMapUv) and multiplies it into diffuseColor. The product
+    /// of the two samples is the travelling wave. Two separate additive passes could only ADD,
+    /// which lights the whole area instead — the "full glow" bug.
+    ///
+    /// M2Vertex.TexU2/TexV2 are parsed on both the vanilla and WotLK lanes and were discarded here
+    /// and nowhere else.</summary>
+    private static VERTEX2 MakeVertex2(M2Vertex v, bool scrollUsesUv1, bool staticUsesUv1)
+    {
+        var uv0 = scrollUsesUv1 ? new Vector2(v.TexU2, v.TexV2) : new Vector2(v.TexU, v.TexV);
+        var uv1 = staticUsesUv1 ? new Vector2(v.TexU2, v.TexV2) : new Vector2(v.TexU, v.TexV);
+        return new VERTEX2(
+            new VertexPositionNormal(new Vector3(v.PosX, v.PosY, v.PosZ), new Vector3(v.NormX, v.NormY, v.NormZ)),
+            new VertexTexture2(uv0, uv1)
         );
     }
 

@@ -4,6 +4,7 @@ using MangosSuperUI.Services;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Tracking;
 using Dapper;
+using Microsoft.Extensions.Options;
 using System.Text.RegularExpressions;
 
 namespace MangosSuperUI.Controllers;
@@ -18,8 +19,9 @@ public partial class BotsController : Controller
     private readonly BotLogBuffer _log;
     private readonly RaService _ra;
     private readonly IWebHostEnvironment _env;
+    private readonly VmangosSettings _vmangos;
 
-    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra, IWebHostEnvironment env)
+    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra, IWebHostEnvironment env, IOptions<VmangosSettings> vmangos)
     {
         _bridge = bridge;
         _brain = brain;
@@ -29,6 +31,7 @@ public partial class BotsController : Controller
         _log = log;
         _ra = ra;
         _env = env;
+        _vmangos = vmangos.Value;
     }
 
     public IActionResult Index()
@@ -74,6 +77,12 @@ public partial class BotsController : Controller
         ["druid"] = "nightelf",
     };
 
+    // Ceiling on a SINGLE AddBots request. This is NOT how many bots the server can hold - see
+    // SpawnCapacity() for the limits that actually exist. Every spawn is one serialised
+    // `.bot addai` round-trip over RA, so an unbounded request would monopolise the RA queue for
+    // minutes with no feedback. Large fleets are batched by the caller.
+    private const int MaxSpawnsPerRequest = 200;
+
     [HttpPost]
     public async Task<IActionResult> AddBots([FromBody] AddBotsRequest req)
     {
@@ -107,8 +116,14 @@ public partial class BotsController : Controller
 
         if (spawns.Count == 0)
             return Json(new { success = false, error = "Nothing to spawn" });
-        if (spawns.Count > 200)
-            return Json(new { success = false, error = "Too many at once (max 200)" });
+        if (spawns.Count > MaxSpawnsPerRequest)
+            return Json(new
+            {
+                success = false,
+                error = $"Request too large ({spawns.Count}). This is an RA throughput guard, not a server "
+                      + $"population cap - each bot is one serialised console command. Send at most "
+                      + $"{MaxSpawnsPerRequest} per request and batch the rest. See /Bots/SpawnCapacity for the real limits."
+            });
 
         // Draw that many unique names from the list (wwwroot/data), minus names already taken.
         List<string> names;
@@ -162,10 +177,210 @@ public partial class BotsController : Controller
         }
     }
 
-    // Reads the era name list from wwwroot/data, filters to valid 1.12 names (2-12 letters),
-    // drops any already used by an existing character (the name column is unique), shuffles,
-    // and returns `need` of them. Throws if the file is missing or the pool is too small.
-    private async Task<List<string>> BuildNamePoolAsync(int need)
+    // ==================== Spawn capacity (what actually limits a spawn) ====================
+    // The Add Bots modal calls this before you pick numbers, so the picker can show real headroom
+    // instead of a ceiling we invented. Every value here is READ from the live server or its config.
+    // Anything that cannot be read comes back null and the UI renders "unknown" - a plausible-looking
+    // wrong number is worse than no number, because it is the one people plan around.
+    //
+    //   PlayerLimit (mangosd.conf)        max sessions; 0 = unlimited, negative = staff only. Bots hold
+    //                                     sessions the same way players do, so this is the value that
+    //                                     decides whether a real player can still get in after a spawn.
+    //   RandomBot.MaxBots (mangosd.conf)  cached core-side as PlayerBotStats.confMaxOnline. 0 = unlimited.
+    //   .bot info (RA)                    live bot counters straight from PlayerBotMgr::GetStats().
+    //   .server info (RA)                 live "Players online" (sessions) and the session peak.
+    //   free names (wwwroot/data)         unused names left after subtracting every existing character.
+    //                                     On a long-lived realm this is usually what runs out first, and
+    //                                     it is already a hard failure inside BuildNamePoolAsync.
+    [HttpGet]
+    public async Task<IActionResult> SpawnCapacity()
+    {
+        var notes = new List<string>();
+
+        // ---- mangosd.conf --------------------------------------------------------------
+        int? playerLimit = null, randomBotMax = null;
+        var confPath = GetMangosdConfPath();
+        if (System.IO.File.Exists(confPath))
+        {
+            MangosdConfigDocument? conf = null;
+            try { conf = await MangosdConfigDocument.LoadAsync(confPath); }
+            catch (Exception ex) { notes.Add($"Could not read mangosd.conf: {ex.Message}"); }
+
+            if (conf != null)
+            {
+                // Get()/GetInt() throw on duplicate or non-numeric entries, so each key is read
+                // independently - one malformed setting must not blank out the others.
+                try { playerLimit = conf.GetInt("PlayerLimit"); }
+                catch (Exception ex) { notes.Add($"PlayerLimit unreadable: {ex.Message}"); }
+                try { randomBotMax = conf.GetInt("RandomBot.MaxBots"); }
+                catch (Exception ex) { notes.Add($"RandomBot.MaxBots unreadable: {ex.Message}"); }
+
+                if (playerLimit == null)
+                    notes.Add("PlayerLimit is not set in mangosd.conf, so the core default applies - session headroom is unknown.");
+            }
+        }
+        else
+        {
+            notes.Add($"mangosd.conf not found at {confPath} - session limit unknown.");
+        }
+
+        // ---- live server ---------------------------------------------------------------
+        string? serverInfoRaw = null, botInfoRaw = null;
+        int? sessionsOnline = null, sessionPeak = null;
+
+        try { serverInfoRaw = await _ra.SendCommandAsync(".server info"); }
+        catch (Exception ex) { notes.Add($".server info failed: {ex.Message}"); }
+
+        if (!string.IsNullOrWhiteSpace(serverInfoRaw))
+        {
+            // "Players online: 34 (Max online: 51)" - the second figure is the session PEAK, not a
+            // cap. It travels as `sessionPeak` so nothing downstream can mistake it for a limit.
+            var m = Regex.Match(serverInfoRaw, @"Players online:\s*(\d+).*?Max online:\s*(\d+)", RegexOptions.Singleline);
+            if (m.Success)
+            {
+                if (int.TryParse(m.Groups[1].Value, out var po)) sessionsOnline = po;
+                if (int.TryParse(m.Groups[2].Value, out var mo)) sessionPeak = mo;
+            }
+            else
+            {
+                notes.Add("Could not parse 'Players online' out of .server info.");
+            }
+        }
+
+        try { botInfoRaw = await _ra.SendCommandAsync(".bot info"); }
+        catch (Exception ex) { notes.Add($".bot info failed: {ex.Message}"); }
+        var bots = ParseBotInfo(botInfoRaw);
+        if (!string.IsNullOrWhiteSpace(botInfoRaw) && bots.Online == null)
+            notes.Add("Could not parse a bot count out of .bot info - the raw reply is shown instead.");
+
+        // ---- name stock ----------------------------------------------------------------
+        int? freeNames = null, totalNames = null;
+        try
+        {
+            var stock = await LoadNameStockAsync();
+            freeNames = stock.Available.Count;
+            totalNames = stock.Total;
+        }
+        catch (Exception ex) { notes.Add($"Name pool unreadable: {ex.Message}"); }
+
+        // ---- what actually binds -------------------------------------------------------
+        // A constraint only counts if both sides of it are readable. A limit of 0 means unlimited in
+        // mangosd.conf, so that does not bind either.
+        int? sessionHeadroom = null;
+        if (playerLimit is > 0 && sessionsOnline.HasValue)
+            sessionHeadroom = Math.Max(0, playerLimit.Value - sessionsOnline.Value);
+
+        int? botHeadroom = null;
+        if (randomBotMax is > 0 && bots.Online.HasValue)
+            botHeadroom = Math.Max(0, randomBotMax.Value - bots.Online.Value);
+
+        var binding = new List<(string Reason, int Value)>();
+        if (sessionHeadroom.HasValue)
+            binding.Add(($"PlayerLimit {playerLimit} with {sessionsOnline} session(s) in use", sessionHeadroom.Value));
+        if (botHeadroom.HasValue)
+            binding.Add(($"RandomBot.MaxBots {randomBotMax} with {bots.Online} bot(s) online", botHeadroom.Value));
+        if (freeNames.HasValue)
+            binding.Add(($"{freeNames} unused name(s) left in the name list", freeNames.Value));
+
+        int? max = null;
+        string? reason = null;
+        if (binding.Count > 0)
+        {
+            var tightest = binding.OrderBy(b => b.Value).First();
+            max = tightest.Value;
+            reason = tightest.Reason;
+        }
+
+        // Advisory only. Filling every session slot with bots is exactly how a realm ends up with
+        // real players stuck in the login queue, so the picker warns before you spawn into the last
+        // few. It never blocks a spawn the server itself would accept.
+        int? recommended = max;
+        if (sessionHeadroom.HasValue)
+            recommended = Math.Max(0, Math.Min(max ?? int.MaxValue, sessionHeadroom.Value - PlayerSlotReserve));
+
+        return Json(new
+        {
+            success = true,
+            fleet = new
+            {
+                connected = _bridge.ConnectedCount,   // bots talking to this app over the bridge
+                tracked = _bridge.TotalTracked,
+                botsOnline = bots.Online,             // core-side truth, from .bot info
+                botsLoading = bots.Loading,
+                botsTotal = bots.Total
+            },
+            sessions = new
+            {
+                inUse = sessionsOnline,
+                peak = sessionPeak,                   // high-water mark, NOT a cap
+                limit = playerLimit,                  // 0 = unlimited, <0 = staff only, null = unset
+                headroom = sessionHeadroom,
+                reserve = PlayerSlotReserve
+            },
+            botCap = new { limit = randomBotMax, headroom = botHeadroom },
+            names = new { free = freeNames, total = totalNames },
+            max,                                      // null = nothing readable binds
+            recommended,
+            reason,
+            batchMax = MaxSpawnsPerRequest,
+            notes,
+            raw = new { serverInfo = serverInfoRaw, botInfo = botInfoRaw }
+        });
+    }
+
+    // How many player slots to keep clear of bots when advising a maximum. Advisory, not enforced.
+    private const int PlayerSlotReserve = 5;
+
+    private string GetMangosdConfPath()
+    {
+        var path = _vmangos.MangosdConfPath;
+        if (string.IsNullOrWhiteSpace(path))
+            path = "/home/wowvmangos/vmangos/run/etc/mangosd.conf";
+        return path;
+    }
+
+    private sealed class BotInfoStats
+    {
+        public int? Online, Loading, Total, Chat;
+    }
+
+    // `.bot info` prints PlayerBotMgr's counters, but the wording is core-specific and this app runs
+    // against more than one core. So it reads tolerantly and returns null for anything it cannot pin
+    // down; the raw reply travels with the response so the page can show ground truth either way.
+    private static BotInfoStats ParseBotInfo(string? raw)
+    {
+        var stats = new BotInfoStats();
+        if (string.IsNullOrWhiteSpace(raw)) return stats;
+
+        // Blank out any "max ... <n>" phrase first. It carries a number that the plain "online"
+        // pattern below would otherwise report as the live count.
+        var text = Regex.Replace(raw, @"max(?:imum)?[^\d\n]{0,24}\d+", " ", RegexOptions.IgnoreCase);
+
+        stats.Online = FindCount(text, "online");
+        stats.Loading = FindCount(text, "loading");
+        stats.Total = FindCount(text, "total");
+        stats.Chat = FindCount(text, "chat");
+        return stats;
+    }
+
+    // Reads one labelled count. Handles "12 online" and "Total bots: 40"; deliberately refuses
+    // anything looser, because "Bots: 12 online, 3 loading" must not report 3 as the online count.
+    private static int? FindCount(string text, string label)
+    {
+        // "<n> label" - a short gap only, so "3 loading" cannot be read as a total.
+        var m = Regex.Match(text, @"(\d+)[^\d\n]{0,8}?\b" + label + @"\b", RegexOptions.IgnoreCase);
+        // "label: <n>" - requires a colon or equals inside the gap, so a comma-separated neighbour
+        // cannot be picked up by accident.
+        if (!m.Success)
+            m = Regex.Match(text, @"\b" + label + @"\b[^\d\n]{0,12}?[:=][^\d\n]{0,4}(\d+)", RegexOptions.IgnoreCase);
+        return m.Success && int.TryParse(m.Groups[1].Value, out var v) ? v : null;
+    }
+
+    // Reads the era name list from wwwroot/data, filters to valid 1.12 names (2-12 letters) and
+    // drops any already used by an existing character (the name column is unique). Returns the usable
+    // names alongside the raw list size, so SpawnCapacity can report how much stock is left before
+    // anyone commits to a spawn - running this pool dry is a hard failure, not a soft one.
+    private async Task<(List<string> Available, int Total)> LoadNameStockAsync()
     {
         var root = _env.WebRootPath;
         if (string.IsNullOrEmpty(root))
@@ -185,7 +400,14 @@ public partial class BotsController : Controller
             .Where(n => !string.IsNullOrEmpty(n))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var avail = all.Where(n => !taken.Contains(n)).ToList();
+        return (all.Where(n => !taken.Contains(n)).ToList(), all.Count);
+    }
+
+    // Draws `need` unique unused names. Still throws if the pool is short, but SpawnCapacity now
+    // surfaces the same figure up front so the picker stops you well before you reach this.
+    private async Task<List<string>> BuildNamePoolAsync(int need)
+    {
+        var (avail, _) = await LoadNameStockAsync();
         if (avail.Count < need)
             throw new Exception($"Only {avail.Count} unused names available (need {need}). Add more names to the list.");
 

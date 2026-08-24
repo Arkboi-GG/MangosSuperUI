@@ -34,6 +34,15 @@ namespace MangosSuperUI.Services.M2Fx;
 /// These are the same offsets <c>M2BinaryValidator.ValidateMaterialTracks</c> asserts, which is the
 /// independent second opinion on them.
 /// </summary>
+/// <summary>One primitive the writer actually emitted, with the glTF names it landed under and the
+/// already-decoded animation for the (batch, texture unit) it came from.
+///
+/// The writer is the only component that knows which batches survived its own filtering, which
+/// texture unit it sampled, and what it called the result. Handing that to the manifest builder
+/// beats re-deriving it there: the old "first batch per submesh" reconstruction could only ever
+/// describe the base layer, so every compositing overlay shipped without its animation.</summary>
+public readonly record struct M2FxPass(string MeshName, string MaterialName, M2FxMesh Fx);
+
 public static class M2FxReader
 {
     private const int HdrColors = 0x054;
@@ -78,39 +87,49 @@ public static class M2FxReader
     /// </summary>
     /// <param name="m2Data">The raw M2 bytes the model was parsed from.</param>
     /// <param name="model">The parsed model — for the batch chain and the lookup tables.</param>
-    /// <param name="meshNameForSubmesh">Submesh index → the glTF mesh name the writer used. Return
-    /// null to skip a submesh.</param>
+    /// <param name="emitted">Every primitive the writer actually put in the scene, with the glTF
+    /// names it landed under. See <see cref="M2FxPass"/> — the writer is the only thing that knows
+    /// which batches survived, which texture unit it sampled and what it named the result, so it
+    /// hands that in rather than having this method re-derive it. The previous version reconstructed
+    /// "first batch per submesh", which silently gave every overlay layer's animation away.</param>
     /// <param name="resolveTexture">M2 texture slot to the glTF texture index the writer embedded the
     /// sheet under, or null when it has no image for that slot. An emitter whose sheet is unavailable
     /// is dropped rather than drawn untextured, because an untextured additive quad is a white blob.</param>
-    public static M2FxManifest Build(byte[]? m2Data, M2Model? model, Func<int, string?> meshNameForSubmesh,
-        Func<int, int?>? resolveTexture = null)
+    public static M2FxManifest Build(byte[]? m2Data, M2Model? model,
+        IReadOnlyList<M2FxPass> emitted, Func<int, int?>? resolveTexture = null)
     {
         var meshes = new Dictionary<string, M2FxMesh>(StringComparer.Ordinal);
         var emitters = new List<M2FxEmitter>();
         var loops = model?.GlobalSequenceDurations ?? new List<uint>();
-        if (m2Data is null || m2Data.Length < 0x148 || model is null)
-            return new M2FxManifest(loops, meshes, emitters);
 
-        // Batch per submesh. Later batches for the same submesh are extra material layers; the
-        // writers only ever render the first, so the manifest describes the first too.
-        var batchForSubmesh = new Dictionary<int, M2Batch>();
-        foreach (var batch in model.Batches)
-            if (!batchForSubmesh.ContainsKey(batch.SubmeshIndex))
-                batchForSubmesh[batch.SubmeshIndex] = batch;
-
-        foreach (var (submeshIndex, batch) in batchForSubmesh)
+        foreach (var pass in emitted)
         {
-            string? name = meshNameForSubmesh(submeshIndex);
-            if (string.IsNullOrEmpty(name) || meshes.ContainsKey(name)) continue;
-
-            var fx = ReadBatchFx(m2Data, model, batch);
-            if (fx is { Any: true }) meshes[name] = fx;
+            // TWO keys per primitive. GLTFLoader runs MESH names through createUniqueName (a second
+            // mesh called Geoset3 becomes Geoset3_1) but copies MATERIAL names verbatim, and
+            // m2fx.js accepts either: manifest.meshes[node.name] || manifest.meshes[mat.name].
+            // Emitting both means a pass keeps its animation even if the loader renames its mesh.
+            // First-wins is safe because the writer mints a UNIQUE material name for every pass that
+            // carries an animation, precisely so these cannot collide.
+            if (!string.IsNullOrEmpty(pass.MeshName)) meshes.TryAdd(pass.MeshName, pass.Fx);
+            if (!string.IsNullOrEmpty(pass.MaterialName)) meshes.TryAdd(pass.MaterialName, pass.Fx);
         }
 
-        if (resolveTexture is not null) emitters.AddRange(ReadEmitters(m2Data, resolveTexture));
+        if (m2Data is not null && m2Data.Length >= 0x148 && resolveTexture is not null)
+            emitters.AddRange(ReadEmitters(m2Data, resolveTexture));
 
         return new M2FxManifest(loops, meshes, emitters);
+    }
+
+    /// <summary>Decode one emitted primitive's material animation, or null when it holds still.
+    ///
+    /// Exception-safe by contract: the writer calls this DURING geometry emission, outside the
+    /// try/catch that wraps manifest construction, and a manifest must never fail a GLB. Returns
+    /// null on the WotLK lane, where <see cref="M2Model.SourceBytes"/> is null by design.</summary>
+    public static M2FxMesh? ReadPassFx(byte[]? m2Data, M2Model? model, M2Batch batch, int unit)
+    {
+        if (m2Data is null || m2Data.Length < 0x148 || model is null) return null;
+        try { return ReadBatchFx(m2Data, model, batch, unit); }
+        catch { return null; }
     }
 
     /// <summary>
@@ -403,7 +422,7 @@ public static class M2FxReader
     }
 
     /// <summary>Everything animated about one batch's material.</summary>
-    private static M2FxMesh? ReadBatchFx(byte[] data, M2Model model, M2Batch batch)
+    private static M2FxMesh? ReadBatchFx(byte[] data, M2Model model, M2Batch batch, int unit)
     {
         M2FxTrack? rgb = null, alpha = null;
         float[]? baseRgb = null;
@@ -440,18 +459,25 @@ public static class M2FxReader
             }
         }
 
-        var uv = ReadUvFx(data, model, batch);
+        var uv = ReadUvFx(data, model, batch, unit);
 
         var fx = new M2FxMesh(rgb, alpha, weight, uv, baseRgb, baseAlpha, baseWeight);
         return fx.Any ? fx : null;
     }
 
-    private static M2FxUv? ReadUvFx(byte[] data, M2Model model, M2Batch batch)
+    /// <param name="unit">Texture UNIT within the batch. TextureCount spans the transform-combo
+    /// table exactly as it spans the texture and coordinate tables, so unit 1's transform lives at
+    /// TextureTransformIndex + 1. Reading unit 0 for every unit is what froze the Warglaive's wave:
+    /// its scroll is authored on unit 1, and a MODULATE pass whose scrolling half does not move is
+    /// a stationary dark band — visibly worse than the un-composited render it replaces.</param>
+    private static M2FxUv? ReadUvFx(byte[] data, M2Model model, M2Batch batch, int unit)
     {
         if (batch.TextureTransformIndex == ushort.MaxValue) return null;
-        if (batch.TextureTransformIndex >= model.TextureTransformLookup.Count) return null;
+        if (unit < 0 || unit >= Math.Max(1, (int)batch.TextureCount)) return null;
+        long combo = (long)batch.TextureTransformIndex + unit;
+        if (combo < 0 || combo >= model.TextureTransformLookup.Count) return null;
 
-        ushort transform = model.TextureTransformLookup[batch.TextureTransformIndex];
+        ushort transform = model.TextureTransformLookup[(int)combo];
         if (transform == ushort.MaxValue || transform >= model.TextureTransformCount) return null;
 
         long record = (long)ReadU32(data, HdrUvAnimations + 4) + transform * UvRecordStride;

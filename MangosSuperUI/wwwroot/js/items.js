@@ -525,9 +525,13 @@ $(function () {
                 '</div>' +
                 '</div>';
 
-            // 3D model preview (if available)
+            // 3D model preview (if available). Mounted by /js/character-viewer/item-preview.js
+            // rather than <model-viewer>: the GLB carries WoW blend modes in its material names plus
+            // a `suiFx` manifest (material animation + particle emitters + ItemVisual enchant
+            // glows), and a stock glTF viewer decodes none of it — enchant effects in particular are
+            // emitter-only, so they render as nothing at all.
             if (data.modelPath) {
-                html += '<div class="model-preview-container"><model-viewer src="' + esc(data.modelPath) + '" auto-rotate camera-controls shadow-intensity="0.5" exposure="1.2" style="width:100%;height:100%;--poster-color:transparent;"></model-viewer></div>';
+                html += '<div class="model-preview-container" data-sui-glb="' + escAttr(data.modelPath) + '"></div>';
             }
 
             if (item.bonding > 0)
@@ -601,6 +605,8 @@ $(function () {
                 html += '<div style="font-size: 12px; color: #ffd100; font-style: italic; margin-top: 10px;">"' + esc(item.description) + '"</div>';
 
             $('#detailContent').html(html);
+            // #detailContent is visible here, so the preview sizes correctly on its first frame.
+            window.suiItemPreview?.mountPending(document.getElementById('detailContent'));
 
             // Show action buttons
             $('#detailActions').show();
@@ -1757,6 +1763,14 @@ $(function () {
         $('#colDetail').hide();
         $('#colEdit').show();
 
+        // Mount the 3D preview only now that #colEdit is visible — renderEditForm builds its markup
+        // while the column is still hidden, so mounting any earlier would size the canvas to 0x0.
+        window.suiItemPreview?.mountPending(document.getElementById('editItemModelPreview'));
+
+        // The detail panel's own preview is now off-screen; drop its GL context rather than leaving
+        // it rendering behind a hidden column.
+        window.suiItemPreview?.unmount(document.getElementById('detailContent'));
+
         // If a retexture open was requested from the detail view, fulfill it
         // now that #colEdit (which hosts the slide-in retexture panel) is
         // visible. Defer a tick so the column's layout is committed first.
@@ -1782,6 +1796,10 @@ $(function () {
         if (stagedRetexture) cleanupStagedPreviewGlbs(null);
         stagedRetexture = null;
 
+        // Tear the preview down before the column is hidden — an orphaned canvas keeps its WebGL
+        // context and its rAF loop alive, and browsers cap live contexts at roughly 8–16.
+        window.suiItemPreview?.unmount(document.getElementById('editItemModelPreview'));
+
         $('#colEdit').hide();
         $('#colDetail').show();
     }
@@ -1799,7 +1817,10 @@ $(function () {
         h += '<div class="edit-field"><label>3D Model <button type="button" class="btn-sm btn-outline-subtle" id="btnCheckItemModel" title="Check for 3D model" style="padding:1px 6px;font-size:10px;margin-left:6px;"><i class="fa-solid fa-cube"></i></button></label>';
         h += '<div id="editItemModelPreview">';
         if (modelPath) {
-            h += '<div class="model-preview-container" style="height:180px;"><model-viewer src="' + esc(modelPath) + '" auto-rotate camera-controls shadow-intensity="0.5" exposure="1.2" style="width:100%;height:100%;--poster-color:transparent;"></model-viewer></div>';
+            // Mounted after showEditPanel() — see openEditPanel. The container is inside #colEdit,
+            // which is still display:none while this markup is built, so mounting here would
+            // initialize into a 0x0 box.
+            h += '<div class="model-preview-container" style="height:180px;" data-sui-glb="' + escAttr(modelPath) + '"></div>';
         }
         h += '</div></div>';
 
@@ -2390,6 +2411,10 @@ $(function () {
     }
 
     function checkItemModel(displayId) {
+        var host = document.getElementById('editItemModelPreview');
+        // Dispose BEFORE replacing the markup: this function wholesale-replaces the container the
+        // preview mounted into, and an orphaned canvas keeps its WebGL context and rAF loop alive.
+        window.suiItemPreview?.unmount(host);
         if (!displayId || displayId <= 0) {
             $('#editItemModelPreview').html('');
             return;
@@ -2397,8 +2422,9 @@ $(function () {
         $.getJSON('/Items/ModelExists', { displayId: displayId }, function (data) {
             if (data.exists) {
                 $('#editItemModelPreview').html(
-                    '<div class="model-preview-container" style="height:180px;"><model-viewer src="' + esc(data.path) + '" auto-rotate camera-controls shadow-intensity="0.5" exposure="1.2" style="width:100%;height:100%;--poster-color:transparent;"></model-viewer></div>'
+                    '<div class="model-preview-container" style="height:180px;" data-sui-glb="' + escAttr(data.path) + '"></div>'
                 );
+                window.suiItemPreview?.mountPending(host);
             } else {
                 $('#editItemModelPreview').html('');
             }

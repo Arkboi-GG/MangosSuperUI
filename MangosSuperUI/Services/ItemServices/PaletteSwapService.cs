@@ -119,7 +119,7 @@ public partial class PaletteSwapService
                 return null;
             }
 
-            using var source = SKBitmap.Decode(sourcePngPath);
+            using var source = DecodeStraightAlpha(sourcePngPath);
             if (source == null)
             {
                 _logger.LogWarning("PaletteSwap: Failed to decode source PNG");
@@ -180,6 +180,7 @@ public partial class PaletteSwapService
             }
 
             using var remapped = ApplyPerPixel(source, resolved, resolvedBoxes);
+            BleedIntoTransparent(remapped);
 
             using var outStream = File.Create(outputPath);
             remapped.Encode(outStream, SKEncodedImageFormat.Png, 100);
@@ -263,7 +264,7 @@ public partial class PaletteSwapService
     // ═══════════════════════════════════════════════════════════════════
 
     public static readonly string[] RecolorTheories =
-        { "fan", "identity", "analogous", "accent", "luminance", "bank" };
+        { "primary", "fan", "identity", "analogous", "accent", "luminance", "bank" };
 
     /// <summary>Canonical hue centres per detected family — used by theories that
     /// preserve family identity. Grey has no meaningful hue; callers substitute
@@ -348,6 +349,37 @@ public partial class PaletteSwapService
 
         switch (theory)
         {
+            case "primary":
+                {
+                    // The Forge's "recolor the whole item" contract. Fan is a palette
+                    // GENERATOR — it hands the picked hue to the dominant material and
+                    // spreads every other material by the golden angle, so on a
+                    // two-material item (red blade + bronze hilt) the second material
+                    // lands ~137° away, which can be right back at its source colour —
+                    // measured on red_sword.glb: pick blue, hilt goes blue, the 36%
+                    // red blade family "recolors" to 337° and reads untouched.
+                    //
+                    // Primary instead moves the WHOLE colourway: the dominant material
+                    // takes the pick exactly, and every other family keeps its source
+                    // offset from the dominant re-anchored around the pick, compressed
+                    // ×0.5 so everything clearly reads as the picked colour while the
+                    // materials stay distinguishable. (A genuinely two-tone source,
+                    // ≥60° span, gets its contrast restored by the span guard below —
+                    // deliberate two-tone identity outranks the compression.)
+                    // Near-neutral families have a noise hue; they take the pick at
+                    // their own whisper saturation so steel stays steel.
+                    float domHue = chromatic[0].MeanHue;
+                    foreach (var f in chromatic)
+                    {
+                        var (b, o) = Expand(f);
+                        float hue = f.MeanSat < 0.12f
+                            ? baseHue
+                            : Wrap(baseHue + CircSigned(f.MeanHue, domHue) * 0.5f);
+                        outp.Add((f.Family, new TargetColor(hue, Sat(f, 0f), b, o)));
+                    }
+                    break;
+                }
+
             case "identity":
                 {
                     // Same colour story, told better. Seeded shift is shared across
@@ -618,7 +650,7 @@ public partial class PaletteSwapService
                 return null;
             }
 
-            using var source = SKBitmap.Decode(sourcePngPath);
+            using var source = DecodeStraightAlpha(sourcePngPath);
             if (source == null)
             {
                 _logger.LogWarning("PaletteSwap[seed]: failed to decode source PNG");
@@ -776,6 +808,7 @@ public partial class PaletteSwapService
 
             using var remapped = ApplyPerPixel(source, resolved, null,
                 tierKd, tierKu, tierM, tierPop, value);
+            BleedIntoTransparent(remapped);
 
             using var outStream = File.Create(outputPath);
             remapped.Encode(outStream, SKEncodedImageFormat.Png, 100);
@@ -798,7 +831,7 @@ public partial class PaletteSwapService
     {
         var result = new List<DetectedFamily>();
         if (!File.Exists(sourcePngPath)) return result;
-        using var source = SKBitmap.Decode(sourcePngPath);
+        using var source = DecodeStraightAlpha(sourcePngPath);
         if (source == null) return result;
 
         var counts = new Dictionary<string, int>();
@@ -1830,6 +1863,130 @@ public partial class PaletteSwapService
     //   predicate — the function just asks "is this pixel of this family?"
     //   Order is set by the user's instruction (first match wins).
     // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Decode a PNG keeping STRAIGHT (un-premultiplied) alpha.
+    ///
+    /// SKBitmap.Decode uses Skia's default, which is PREMULTIPLIED. Premultiplying by alpha 0 zeroes
+    /// RGB, so every fully-transparent texel arrives black — and this engine then LOCKS transparent
+    /// texels to the colour it read, writing that black straight back out.
+    ///
+    /// That destroys the texture's alpha BLEED: WoW’s art carries real colour underneath its
+    /// transparent texels precisely so the GPU’s bilinear filter has something sane to
+    /// interpolate toward at an alpha edge. Measured on the TBC Warglaive
+    /// (Glave_1H_DualBlade_D_02): the source has 4,487 transparent texels and ALL of them carry bled
+    /// colour; decoding premultiplied destroyed it on 2,748 of them, which renders as black
+    /// speckling along every rune and blade edge. Imports that ship their source BLP byte-for-byte
+    /// never hit this, which is why only RECOLORED imports showed the defect.
+    /// </summary>
+    private static SKBitmap? DecodeStraightAlpha(string path)
+    {
+        try
+        {
+            using var codec = SKCodec.Create(path);
+            if (codec is null) return SKBitmap.Decode(path);
+            var info = new SKImageInfo(codec.Info.Width, codec.Info.Height,
+                SKColorType.Rgba8888, SKAlphaType.Unpremul);
+            var bitmap = new SKBitmap(info);
+            if (codec.GetPixels(info, bitmap.GetPixels()) != SKCodecResult.Success)
+            {
+                bitmap.Dispose();
+                return SKBitmap.Decode(path);   // last resort: better premultiplied than nothing
+            }
+            return bitmap;
+        }
+        catch { return SKBitmap.Decode(path); }
+    }
+
+    /// <summary>
+    /// Rebuild the texture's ALPHA BLEED: give every fully-transparent texel the colour of its
+    /// nearest visible neighbours, leaving alpha untouched.
+    ///
+    /// WHY THIS IS NOT OPTIONAL. Skia's PNG encoder zeroes RGB wherever alpha == 0 — measured on
+    /// every encode path it offers (bitmap.Encode, SKImage.Encode, pixmap.Encode all produce
+    /// rgb(0,0,0) from rgb(200,180,60) at alpha 0; alpha 8 survives intact). So a recolor cannot
+    /// carry the source's bleed through its PNG round trip no matter how it decodes.
+    ///
+    /// That matters because the GPU samples a texture with BILINEAR filtering: at an alpha edge it
+    /// interpolates the RGB of neighbouring texels including the invisible ones. WoW's art is
+    /// authored with real colour under its transparent texels precisely so that blend stays sane.
+    /// Lose it and every edge blends toward black — which is the speckling seen along the runes and
+    /// blade of a recolored TBC import. Measured on Glave_1H_DualBlade_D_02: 4,487 transparent
+    /// texels, all bled in the source, 2,669 reduced to black by the round trip.
+    ///
+    /// Imports that ship their source BLP byte-for-byte never re-encode, which is exactly why only
+    /// RECOLORED imports showed the defect.
+    /// </summary>
+    private static void BleedIntoTransparent(SKBitmap bitmap, int passes = 4)
+    {
+        const byte VisibleAlpha = 16;
+        int w = bitmap.Width, h = bitmap.Height;
+        if (w == 0 || h == 0) return;
+
+        // Seed: which texels already carry usable colour.
+        var has = new bool[w * h];
+        var r = new byte[w * h]; var g = new byte[w * h]; var b = new byte[w * h];
+        var alpha = new byte[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int i = y * w + x;
+                var c = bitmap.GetPixel(x, y);
+                alpha[i] = c.Alpha; r[i] = c.Red; g[i] = c.Green; b[i] = c.Blue;
+                has[i] = c.Alpha >= VisibleAlpha;
+            }
+
+        // Iterative dilate. A few passes reach far enough for a filtered edge; going further would
+        // just smear colour across the whole transparent field for no visual gain.
+        for (int pass = 0; pass < passes; pass++)
+        {
+            var addedIdx = new List<int>();
+            var addedR = new List<int>(); var addedG = new List<int>(); var addedB = new List<int>();
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    int i = y * w + x;
+                    if (has[i]) continue;
+                    int sr = 0, sg = 0, sb = 0, n = 0;
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dx = -1; dx <= 1; dx++)
+                        {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = x + dx, ny = y + dy;
+                            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                            int j = ny * w + nx;
+                            if (!has[j]) continue;
+                            sr += r[j]; sg += g[j]; sb += b[j]; n++;
+                        }
+                    if (n == 0) continue;
+                    addedIdx.Add(i); addedR.Add(sr / n); addedG.Add(sg / n); addedB.Add(sb / n);
+                }
+            if (addedIdx.Count == 0) break;
+            for (int k = 0; k < addedIdx.Count; k++)
+            {
+                int i = addedIdx[k];
+                r[i] = (byte)addedR[k]; g[i] = (byte)addedG[k]; b[i] = (byte)addedB[k];
+                has[i] = true;   // becomes a source for the next pass
+            }
+        }
+
+        // Write back ONLY the transparent texels; visible pixels are untouched.
+        //
+        // Alpha 0 is nudged to 1 for any texel that actually received bled colour. Skia's PNG
+        // encoder zeroes RGB at alpha EXACTLY 0 and preserves it from alpha 1 upward (verified
+        // across bitmap/SKImage/pixmap encodes), so without this nudge the dilate above is undone
+        // the moment the file is written. 1/255 is 0.4% opacity: invisible to the eye, far below any
+        // alpha-test cutoff, and negligible in an additive pass — but it is what lets the colour
+        // survive to the GPU, which is the entire point of a bleed.
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int i = y * w + x;
+                if (alpha[i] >= VisibleAlpha) continue;
+                byte outAlpha = alpha[i] == 0 && has[i] ? (byte)1 : alpha[i];
+                bitmap.SetPixel(x, y, new SKColor(r[i], g[i], b[i], outAlpha));
+            }
+    }
 
     private static bool MatchesFamily(string family, float h, float s, float l)
     {

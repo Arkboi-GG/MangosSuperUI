@@ -774,7 +774,13 @@ public sealed class WeaponPreviewService
             // suiFx material-animation manifest. This cache is keyed on the INPUT bytes only, so a
             // writer change is invisible to it — without the salt bump every already-previewed
             // weapon would keep serving its pre-change GLB and the fix would look like a no-op.
-            writer.Write("WeaponPreviewBytes/v3");
+            // v4: GlbWriter now emits compositing overlay LAYERS (blend >= 3), `_env` / `_mod`
+            // material markers and a TEXCOORD_1 set for fused MODULATE passes. This cache is keyed
+            // on the INPUT bytes only and weapon_forge_cache is NOT swept by CacheVersionRegistry,
+            // so without the salt bump the Forge keeps serving pre-change GLBs while the Items page
+            // (which IS MVID-swept) regenerates — the same weapon rendering two different ways on
+            // two pages, which is exactly the divergence this work exists to remove.
+            writer.Write("WeaponPreviewBytes/v4");
             WriteSegment(m2);
             WriteSegment(blp);
             writer.Write(extras?.Count ?? -1);

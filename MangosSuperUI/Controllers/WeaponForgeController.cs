@@ -6,6 +6,7 @@ using Dapper;
 using SkiaSharp;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
+using MangosSuperUI.Services.Itemization;
 using MangosSuperUI.Services.WeaponForge;
 using MangosSuperUI.Services.WeaponForge.Motion;
 using MangosSuperUI.Services.WeaponForge.RawM2;
@@ -40,6 +41,8 @@ public class WeaponForgeController : Controller
     private readonly ConnectionFactory _db;
     private readonly DbcService _dbc;
     private readonly VanillaItemSpellCatalog _itemSpells;
+    private readonly ItemBudgetGenerator _itemize;
+    private readonly PaletteSwapService _palette;
     private readonly ILogger<WeaponForgeController> _logger;
 
     // High-poly sources are welcome — they are decimated to budget before forging.
@@ -64,7 +67,7 @@ public class WeaponForgeController : Controller
     public WeaponForgeController(MpqReaderService mpq, WeaponPreviewService preview,
         CustomWeaponBuildService builder, GlbWeaponImporter glbImporter, WeaponDonorResolver donors,
         LegacyImportSources sources, ConnectionFactory db, DbcService dbc,
-        VanillaItemSpellCatalog itemSpells,
+        VanillaItemSpellCatalog itemSpells, ItemBudgetGenerator itemize, PaletteSwapService palette,
         ILogger<WeaponForgeController> logger)
     {
         _mpq = mpq;
@@ -76,6 +79,8 @@ public class WeaponForgeController : Controller
         _db = db;
         _dbc = dbc;
         _itemSpells = itemSpells;
+        _itemize = itemize;
+        _palette = palette;
         _logger = logger;
     }
 
@@ -630,7 +635,9 @@ public class WeaponForgeController : Controller
     [RequestSizeLimit(MaxGlbBytes)]
     public async Task<IActionResult> UploadGlb(IFormFile? file, string? weaponType = null, bool reorient = true,
         int targetTriangles = 500, float rollDegrees = 0f, bool flipGripEnd = false, bool straightenBlade = false,
-        int bladeProfile = 0, int brightness = 0, int saturation = 0, GlbShapeControls? shape = null)
+        int bladeProfile = 0, int brightness = 0, int saturation = 0, GlbShapeControls? shape = null,
+        int itemVisual = 0, int glowStartPercent = 10, int glowEndPercent = 90,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved")
     {
         var (bytes, err) = await ReadBounded(file, MaxGlbBytes);
         if (err is not null) return BadRequest(new { ok = false, error = err });
@@ -653,7 +660,24 @@ public class WeaponForgeController : Controller
                 diagnostics = import.Diagnostics.Items.Select(i => i.ToString()),
             });
 
-        var preview = _preview.RenderMesh(mesh, AdjustTexture(import.TexturePng, brightness, saturation));
+        // Pre-import recolor preview — same palette engine as the lanes, seeded off the source
+        // GLB's sha so the forge bakes the identical result.
+        byte[]? texturePng = import.TexturePng;
+        bool recolorApplied = false;
+        if (recolorHue.HasValue && texturePng is { Length: > 0 })
+        {
+            int rseed = RetextureSupport.SeedFor(GlbRecolorSeed(import.SourceSha256), recolorTier);
+            var rp = await RecolorTexturePngAsync(texturePng, rseed, recolorHue.Value, recolorTheory, recolorTier, HttpContext.RequestAborted);
+            if (rp is not null) { texturePng = rp; recolorApplied = true; }
+            else import.Diagnostics.Warn("recolor.preview", "The embedded texture has no recolorable colour families; showing the original.");
+        }
+
+        // The chosen enchant glow (ItemVisual) previews on the same anchor stations the forge
+        // writes — spread across the operator's chosen span — so the GLB route shows its glow
+        // exactly like the TBC/WotLK lanes do.
+        var (glowLo, glowHi) = GlowRange(glowStartPercent, glowEndPercent);
+        var preview = _preview.RenderMesh(mesh, AdjustTexture(texturePng, brightness, saturation),
+            visualEffects: ResolveVisualEffectsForMesh((uint)Math.Max(itemVisual, 0), mesh, glowLo, glowHi));
         return Json(new
         {
             ok = preview.Ok,
@@ -667,6 +691,7 @@ public class WeaponForgeController : Controller
             hasTexture = import.TexturePng is { Length: > 0 },
             withinForgeBudget = mesh.TriangleCount <= MaxForgeTriangles,
             normalization = mesh.Normalization,
+            recolorApplied,
             grip = BuildGripInfo(mesh, profile, donor),
             preview,
             diagnostics = import.Diagnostics.Items.Select(i => i.ToString()),
@@ -683,7 +708,8 @@ public class WeaponForgeController : Controller
         bool reorient = true,
         int targetTriangles = 500, float rollDegrees = 0f, bool flipGripEnd = false, bool straightenBlade = false,
         int bladeProfile = 0, int brightness = 0, int saturation = 0, string? itemConfig = null,
-        GlbShapeControls? shape = null, int itemVisual = 0)
+        GlbShapeControls? shape = null, int itemVisual = 0, int glowStartPercent = 10, int glowEndPercent = 90,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved")
     {
         var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
             itemConfig, HttpContext.RequestAborted);
@@ -728,14 +754,27 @@ public class WeaponForgeController : Controller
 
         try
         {
+            // Bake the previewed recolor into the shipped texture — same engine and sha-derived
+            // seed the preview used, so what was on screen is what ships.
+            byte[]? texturePng = import.TexturePng;
+            bool recolorBaked = false;
+            if (recolorHue.HasValue && texturePng is { Length: > 0 })
+            {
+                int rseed = RetextureSupport.SeedFor(GlbRecolorSeed(import.SourceSha256), recolorTier);
+                var rp = await RecolorTexturePngAsync(texturePng, rseed, recolorHue.Value, recolorTheory, recolorTier, HttpContext.RequestAborted);
+                if (rp is not null) { texturePng = rp; recolorBaked = true; }
+                else import.Diagnostics.Warn("recolor.bake", "The embedded texture has no recolorable colour families; forging the original.");
+            }
+
             // A GLB carries no ItemVisual of its own, so the picker is the only source; 0 = no glow,
             // which is the default. Anchors come from the imported geometry rather than the donor's
             // (see SpreadGlowAnchors) so the glow lands on what was actually imported.
             uint glow = itemVisual > 0 ? (uint)itemVisual : 0u;
+            var (glowLo, glowHi) = GlowRange(glowStartPercent, glowEndPercent);
             if (glow != 0)
                 import.Diagnostics.Info("visual.chosen",
                     $"Enchant-style glow: ItemVisual {glow} ({ItemVisualSuggester.Find(glow)?.Label ?? "custom"}), " +
-                    "anchored along the imported mesh. Glows render in-game only.");
+                    $"anchored along the imported mesh from {glowLo:P0} to {glowHi:P0} of its length.");
 
             var result = await _builder.BuildAsync(new CustomWeaponBuildRequest
             {
@@ -746,18 +785,20 @@ public class WeaponForgeController : Controller
                 ItemOverrides = MergeItemOverrides(null, configuredItem),
                 Mesh = mesh,
                 Topology = WeaponTopologyMode.Variable,
-                TexturePng = AdjustTexture(import.TexturePng, brightness, saturation),
+                TexturePng = AdjustTexture(texturePng, brightness, saturation),
                 SourceBlob = bytes,
                 ItemVisual = glow,
-                AttachmentPointsWoW = glow != 0 ? SpreadGlowAnchors(mesh) : null,
+                AttachmentPointsWoW = glow != 0 ? SpreadGlowAnchors(mesh, glowLo, glowHi) : null,
                 GeneratorParamsJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reorient, targetTriangles, rollDegrees, flipGripEnd, straightenBlade, bladeProfile,
-                    brightness, saturation, itemVisual = (int)glow,
+                    brightness, saturation, itemVisual = (int)glow, glowStartPercent, glowEndPercent,
                     shape = shape ?? new GlbShapeControls(),
                     donorDisplayRow = donor.DisplayRow,
                     donorExtent = donor.ExtentX,
                     donorPalmBackFraction = donor.PalmBackFraction,
+                    // Provenance of the baked recolor (the registry blobs already carry it).
+                    recolor = recolorBaked ? (object?)new { hue = recolorHue, theory = recolorTheory, tier = recolorTier } : null,
                 }),
                 WriterVersion = "variable-topology-v1",
             });
@@ -1201,17 +1242,53 @@ public class WeaponForgeController : Controller
     /// glow reads as an enchant running the length of the weapon or as a lump in one place. GLB
     /// imports have no anchors of their own and would otherwise inherit the donor scaffold's, which
     /// sit on the donor's blade — a different length and shape from whatever was imported.</summary>
-    private static Dictionary<uint, Vector3> SpreadGlowAnchors(RigidWeaponMesh mesh)
+    /// <summary>Normalize the operator's glow placement range: percent along the weapon's length
+    /// (0 = pommel/butt end, 100 = tip), clamped and ordered. Start == end is legal — all five
+    /// anchor stations pile onto one point, a single glow spot instead of a hilt-to-tip run.</summary>
+    private static (float Lo, float Hi) GlowRange(int startPercent, int endPercent)
+    {
+        float a = Math.Clamp(startPercent, 0, 100) / 100f;
+        float b = Math.Clamp(endPercent, 0, 100) / 100f;
+        return a <= b ? (a, b) : (b, a);
+    }
+
+    /// <summary>One of the five glow anchor stations spread evenly across the chosen fraction of
+    /// the placed mesh's length, in the mesh's own Y-up space. The forge converts these same
+    /// stations to WoW space (<see cref="SpreadGlowAnchors"/>); the GLB preview mounts effect
+    /// models on them directly, so what the viewer shows is where the forged glow will hang.</summary>
+    private static Vector3 GlowAnchorMesh(RigidWeaponMesh mesh, int slot, float loFrac, float hiFrac)
     {
         float minX = mesh.Positions.Min(v => v.X), maxX = mesh.Positions.Max(v => v.X);
         float span = MathF.Max(maxX - minX, 1e-4f);
-        float lo = minX + 0.10f * span, hi = maxX - 0.10f * span;
+        float lo = minX + loFrac * span, hi = minX + hiFrac * span;
         float cy = (mesh.Positions.Min(v => v.Y) + mesh.Positions.Max(v => v.Y)) * 0.5f;
         float cz = (mesh.Positions.Min(v => v.Z) + mesh.Positions.Max(v => v.Z)) * 0.5f;
+        return new Vector3(lo + (hi - lo) * (Math.Clamp(slot, 0, 4) / 4f), cy, cz);
+    }
+
+    private static Dictionary<uint, Vector3> SpreadGlowAnchors(RigidWeaponMesh mesh, float loFrac, float hiFrac)
+    {
         var points = new Dictionary<uint, Vector3>();
         for (uint id = 0; id <= 4; id++)
-            points[id] = CoordinateContract.MeshToWoW(new Vector3(lo + (hi - lo) * (id / 4f), cy, cz));
+            points[id] = CoordinateContract.MeshToWoW(GlowAnchorMesh(mesh, (int)id, loFrac, hiFrac));
         return points;
+    }
+
+    /// <summary>ItemVisual effects for the GLB route's preview: a GLB has no host M2 to read
+    /// attachments from, so the chosen enchant glow mounts on the same anchor stations the forge
+    /// writes (<see cref="SpreadGlowAnchors"/>) across the operator's chosen span.</summary>
+    private IReadOnlyList<MangosSuperUI.Services.M2Fx.ItemVisualEffects.Effect>? ResolveVisualEffectsForMesh(
+        uint itemVisualId, RigidWeaponMesh mesh, float loFrac, float hiFrac)
+    {
+        if (itemVisualId == 0) return null;
+        try
+        {
+            var effects = MangosSuperUI.Services.M2Fx.ItemVisualEffects.Resolve(itemVisualId, null,
+                path => _mpq.ExtractFile(path) ?? _mpq.ExtractFile(path.ToLowerInvariant()),
+                slot => GlowAnchorMesh(mesh, slot, loFrac, hiFrac));
+            return effects.Count > 0 ? effects : null;
+        }
+        catch { return null; }
     }
 
     /// <summary>Owner hand placement + enchant-glow decision shared by preview and forge. The source
@@ -1440,28 +1517,32 @@ public class WeaponForgeController : Controller
     /// <summary>GET /WeaponForge/TbcPreviewWeapon — render one TBC weapon through the import
     /// pipeline (same mesh + texture the forge would package) without packaging anything.</summary>
     [HttpGet]
-    public IActionResult TbcPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
+    public Task<IActionResult> TbcPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
         string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
-        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
-        LegacyPreviewWeapon(_sources.Tbc, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread);
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved") =>
+        LegacyPreviewWeapon(_sources.Tbc, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier);
 
     /// <summary>GET /WeaponForge/WotlkPreviewWeapon — the WotLK preview.</summary>
     [HttpGet]
-    public IActionResult WotlkPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
+    public Task<IActionResult> WotlkPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
         string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
-        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
-        LegacyPreviewWeapon(_sources.Wotlk, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread);
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved") =>
+        LegacyPreviewWeapon(_sources.Wotlk, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier);
 
     /// <summary>GET /WeaponForge/ImportPreviewWeapon?expansion=tbc|wotlk&amp;… — lane-keyed form.</summary>
     [HttpGet]
-    public IActionResult ImportPreviewWeapon(string? expansion = null, uint entry = 0, string? model = null, uint displayRow = 0,
+    public Task<IActionResult> ImportPreviewWeapon(string? expansion = null, uint entry = 0, string? model = null, uint displayRow = 0,
         string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
-        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
-        LegacyPreviewWeapon(_sources.Get(expansion), entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread);
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved") =>
+        LegacyPreviewWeapon(_sources.Get(expansion), entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier);
 
-    private IActionResult LegacyPreviewWeapon(LegacyImportSource src, uint entry, string? model, uint displayRow,
+    private async Task<IActionResult> LegacyPreviewWeapon(LegacyImportSource src, uint entry, string? model, uint displayRow,
         string? weaponType, int targetTriangles, int brightness, int saturation,
-        GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread)
+        GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved")
     {
         var (sel, item) = ResolveLegacySelection(src, entry, model, displayRow);
         if (sel is null) return NotFound(new { ok = false, error = $"Unknown {src.Label} weapon (entry {entry}, model '{model}')." });
@@ -1469,6 +1550,17 @@ public class WeaponForgeController : Controller
         var (loadedMesh, _, texturePng, effectPngs, _, _, diag, err, sourceModel) = LoadLegacyWeapon(src, sel, targetTriangles);
         if (loadedMesh is null)
             return Json(new { ok = false, expansion = src.Key, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
+
+        // Pre-import recolor preview: shift the source skin to the chosen primary hue with the same
+        // palette engine the Armor Forge uses, so the viewer shows exactly what a forge would bake.
+        bool recolorApplied = false;
+        if (recolorHue.HasValue && texturePng is { Length: > 0 })
+        {
+            int rseed = RetextureSupport.SeedFor((int)sel.DisplayRow, recolorTier);
+            var rp = await RecolorTexturePngAsync(texturePng, rseed, recolorHue.Value, recolorTheory, recolorTier, HttpContext.RequestAborted);
+            if (rp is not null) { texturePng = rp; recolorApplied = true; }
+            else diag.Warn("recolor.preview", "The skin has no recolorable colour families; showing the original texture.");
+        }
         var (mesh, _, sourceGripPercent, suggestion, chosenVisual, particleInfo, emitterPositions) =
             PlaceLegacyWeapon(loadedMesh, sourceModel, shape, flipGripEnd, itemVisual, diag,
                 src.Mpq.ItemVisuals(), sel.DisplayRow, glowSpread);
@@ -1511,6 +1603,7 @@ public class WeaponForgeController : Controller
             grip,
             sourceGripPercent = MathF.Round(sourceGripPercent, 1),
             placementApplied = !LegacyPlacement.IsIdentity(shape, flipGripEnd),
+            recolorApplied,
             particles = particleInfo,
             itemVisual = chosenVisual,
             suggestedItemVisual = suggestion is null ? null : new { id = suggestion.ItemVisual, label = suggestion.Label, reason = suggestion.Reason },
@@ -1526,28 +1619,32 @@ public class WeaponForgeController : Controller
     public Task<IActionResult> ForgeTbc(uint entry = 0, string? model = null, uint displayRow = 0,
         string? name = null, string? weaponType = null, int targetTriangles = 0,
         int brightness = 0, int saturation = 0, string? itemConfig = null,
-        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
-        LegacyForge(_sources.Tbc, entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread);
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved", string? glowColor = null) =>
+        LegacyForge(_sources.Tbc, entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
 
     /// <summary>POST /WeaponForge/ForgeWotlk — package one WotLK weapon (same contract as ForgeTbc).</summary>
     [HttpPost]
     public Task<IActionResult> ForgeWotlk(uint entry = 0, string? model = null, uint displayRow = 0,
         string? name = null, string? weaponType = null, int targetTriangles = 0,
         int brightness = 0, int saturation = 0, string? itemConfig = null,
-        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
-        LegacyForge(_sources.Wotlk, entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread);
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved", string? glowColor = null) =>
+        LegacyForge(_sources.Wotlk, entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
 
     /// <summary>POST /WeaponForge/ForgeImport?expansion=tbc|wotlk — lane-keyed form.</summary>
     [HttpPost]
     public Task<IActionResult> ForgeImport(string? expansion = null, uint entry = 0, string? model = null, uint displayRow = 0,
         string? name = null, string? weaponType = null, int targetTriangles = 0,
         int brightness = 0, int saturation = 0, string? itemConfig = null,
-        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false) =>
-        LegacyForge(_sources.Get(expansion), entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread);
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved", string? glowColor = null) =>
+        LegacyForge(_sources.Get(expansion), entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
 
     private async Task<IActionResult> LegacyForge(LegacyImportSource src, uint entry, string? model, uint displayRow,
         string? name, string? weaponType, int targetTriangles, int brightness, int saturation, string? itemConfig,
-        GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread)
+        GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved", string? glowColor = null)
     {
         var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
             itemConfig, HttpContext.RequestAborted);
@@ -1577,11 +1674,35 @@ public class WeaponForgeController : Controller
         var (loadedMesh, m2Bytes, texturePng, effectPngs, textureBlp, effectBlps, diag, err, sourceModel) = LoadLegacyWeapon(src, sel, targetTriangles);
         if (loadedMesh is null)
             return Json(new { ok = false, expansion = src.Key, error = err, diagnostics = diag.Items.Select(i => i.ToString()) });
+
+        // Bake the previewed recolor into the shipped skin — same palette engine and seed the
+        // preview used, so what was on screen is what ships. A successful recolor is new art, so
+        // the source BLP2 bytes are dropped and the builder re-encodes from the recolored PNG.
+        bool recolorBaked = false;
+        if (recolorHue.HasValue && texturePng is { Length: > 0 })
+        {
+            int rseed = RetextureSupport.SeedFor((int)sel.DisplayRow, recolorTier);
+            var rp = await RecolorTexturePngAsync(texturePng, rseed, recolorHue.Value, recolorTheory, recolorTier, HttpContext.RequestAborted);
+            if (rp is not null) { texturePng = rp; recolorBaked = true; }
+            else diag.Warn("recolor.bake", "The skin has no recolorable colour families; forging the original texture.");
+        }
+
         var (mesh, attachmentsWoW, sourceGripPercent, suggestion, chosenVisual, _, emitterPositions) =
             PlaceLegacyWeapon(loadedMesh, sourceModel, shape, flipGripEnd, itemVisual, diag,
                 src.Mpq.ItemVisuals(), sel.DisplayRow, glowSpread);
         var motionPlan = PlanMotion(sourceModel, emitterPositions, sel.ModelStem);
         foreach (var note in motionPlan.Notes) diag.Info("motion.emitter", note);
+
+        // Operator glow tint: the in-game flame/glow colour lives in the M2 emitter colour track,
+        // so override every planned graft's colour (ColorRamp=null so the flat ColorRgb wins).
+        // Null keeps the source's own colours — exactly the Armor Forge contract.
+        IReadOnlyList<M2EmitterTransplanter.Graft> motionGrafts = motionPlan.Grafts;
+        Vector3? glowRgb = HexToRgb255(glowColor);
+        if (glowRgb is Vector3 gc && motionGrafts.Count > 0)
+        {
+            motionGrafts = motionGrafts.Select(g => g with { ColorRgb = gc, ColorRamp = null }).ToList();
+            diag.Info("motion.tint", $"{motionGrafts.Count} rebuilt emitter(s) tinted to the chosen glow colour.");
+        }
         if (mesh.TriangleCount > MaxTbcForgeTriangles)
             return Json(new
             {
@@ -1619,8 +1740,9 @@ public class WeaponForgeController : Controller
         try
         {
             byte[]? adjustedTexturePng = AdjustTexture(texturePng, brightness, saturation);
-            bool sourceGradeUnchanged = brightness == 0 && saturation == 0 ||
-                ReferenceEquals(adjustedTexturePng, texturePng);
+            // A baked recolor is new art: never ship the original BLP2 bytes underneath it.
+            bool sourceGradeUnchanged = !recolorBaked && (brightness == 0 && saturation == 0 ||
+                ReferenceEquals(adjustedTexturePng, texturePng));
             var result = await _builder.BuildAsync(new CustomWeaponBuildRequest
             {
                 Name = !string.IsNullOrWhiteSpace(configuredItem?.Name) ? configuredItem.Name
@@ -1639,7 +1761,7 @@ public class WeaponForgeController : Controller
                 EffectTexturesBlp = effectBlps,
                 SourceBlob = m2Bytes,
                 ItemVisual = chosenVisual,
-                MotionGrafts = motionPlan.Grafts.Count > 0 ? motionPlan.Grafts : null,
+                MotionGrafts = motionGrafts.Count > 0 ? motionGrafts : null,
                 AttachmentPointsWoW = attachmentsWoW.Count > 0 ? attachmentsWoW : null,
                 // The tbc* keys are the lane-neutral names the builder reads back (e.g.
                 // tbcInventoryType recovers the slot on rebuild); sourceExpansion says which lane.
@@ -1667,6 +1789,9 @@ public class WeaponForgeController : Controller
                     itemVisualSuggested = suggestion?.ItemVisual,
                     sourceParticleEmitters = sourceModel?.ParticleEmitters.Count ?? 0,
                     attachmentsCarried = attachmentsWoW.Count,
+                    // Provenance of the baked appearance edits (the registry blobs already carry them).
+                    recolor = recolorBaked ? (object?)new { hue = recolorHue, theory = recolorTheory, tier = recolorTier } : null,
+                    glowColor = glowRgb is null ? null : glowColor,
                 }),
                 WriterVersion = "tbc-rendergraph-v2",
             });
@@ -1893,6 +2018,135 @@ public class WeaponForgeController : Controller
     /// IDENTICALLY for preview and forge so what you see is what packages. Brightness is
     /// multiplicative (+100 ≈ ×2, −100 ≈ ×½ — blacks stay black); saturation blends toward
     /// (−) or away from (+) luminance grey. Zero/zero returns the input untouched.</summary>
+    // ── Pre-import recolor (Armor Forge parity) ─────────────────────────
+    // The retexture engine resolves textures from the VANILLA client by displayId, so it can't touch
+    // a not-yet-imported foreign weapon. These paths recolor the SOURCE skin the import pipeline
+    // already decoded, so a TBC/WotLK weapon recolors live in the preview and bakes on forge.
+
+    /// <summary>Recolor a decoded skin PNG at the chosen primary hue via the palette engine (the
+    /// engine is file-path based, so this round-trips through a temp dir). Null when the skin has no
+    /// detectable colour families, so callers fall back to the original texture.</summary>
+    private async Task<byte[]?> RecolorTexturePngAsync(byte[] png, int seed, float hue, string theory, string tier, CancellationToken ct)
+    {
+        if (Array.IndexOf(PaletteSwapService.RecolorTheories, theory) < 0) theory = "primary";
+        var (kd, ku, mm, pop) = RetextureSupport.TierShape(tier);
+        string tmpDir = Path.Combine(Path.GetTempPath(), "weaponbake", Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            string basePng = Path.Combine(tmpDir, "skin.png");
+            await System.IO.File.WriteAllBytesAsync(basePng, png, ct);
+            string outPng = Path.Combine(tmpDir, "skin_r.png");
+            // Forge recolor = the WHOLE skin shifts to the chosen primary: full swap budget (1.01),
+            // unleashed hue (180°) — matching the Armor Forge, unlike the retexture engine's tiered
+            // budget which pins dominant/dark regions to their source colour.
+            var ok = await _palette.RecolorSeededAsync(basePng, outPng, seed, 1f, 0f, tintStructural: true, ct,
+                theory, kd, ku, mm, pop, swapBudget: 1.01f, hueLeash: 180f, value: ValueSettings.Keep, baseHueOverride: hue);
+            return ok is null ? null : await System.IO.File.ReadAllBytesAsync(outPng, ct);
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "WeaponForge: recolor failed"); return null; }
+        finally { try { Directory.Delete(tmpDir, true); } catch { } }
+    }
+
+    /// <summary>Stable palette seed for the GLB route, which has no display row: the source GLB's
+    /// own sha (same file → same recolor in preview and forge; different files roll differently).</summary>
+    private static int GlbRecolorSeed(string? sourceSha256) =>
+        sourceSha256 is { Length: >= 8 } &&
+        uint.TryParse(sourceSha256.AsSpan(0, 8), System.Globalization.NumberStyles.HexNumber, null, out uint h)
+            ? unchecked((int)h) : 0;
+
+    /// <summary>GET /WeaponForge/PrimaryColor?expansion=&amp;entry=&amp;model=&amp;displayRow= — the foreign
+    /// weapon skin's majority colour, so the recolor picker can seed itself. { success, primaryHex }.</summary>
+    [HttpGet]
+    public async Task<IActionResult> PrimaryColor(string? expansion, uint entry = 0, string? model = null, uint displayRow = 0)
+    {
+        var src = _sources.Get(expansion);
+        var (sel, _) = ResolveLegacySelection(src, entry, model, displayRow);
+        if (sel is null) return Json(new { success = false, error = $"Unknown {src.Label} weapon." });
+        if (sel.BlpPath is null) return Json(new { success = false, error = "No display texture to sample." });
+        var blp = src.Mpq.ExtractFile(sel.BlpPath);
+        var png = blp is { Length: > 0 } ? BlpToPng(blp) : null;
+        if (png is null) return Json(new { success = false, error = "The skin could not be decoded." });
+
+        string tmpDir = Path.Combine(Path.GetTempPath(), "weaponbake", Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(tmpDir);
+        try
+        {
+            string disk = Path.Combine(tmpDir, "skin.png");
+            await System.IO.File.WriteAllBytesAsync(disk, png, HttpContext.RequestAborted);
+            var families = _palette.DetectFamilies(disk);
+            if (families.Count == 0) return Json(new { success = false, error = "no colour families detected" });
+            var chromatic = families.Where(f => f.Family is not ("white" or "black" or "grey")).ToList();
+            var primary = (chromatic.Count > 0 ? chromatic : families).OrderByDescending(f => f.Percent).First();
+            return Json(new { success = true, primaryHex = HslToHex(primary.MeanHue, Math.Max(0.5f, primary.MeanSat), 0.5f) });
+        }
+        finally { try { Directory.Delete(tmpDir, true); } catch { } }
+    }
+
+    // HSL (h degrees, s/l 0..1) → #rrggbb, for the colour picker (Armor Forge parity).
+    private static string HslToHex(float h, float s, float l)
+    {
+        h = ((h % 360f) + 360f) % 360f;
+        float c = (1 - Math.Abs(2 * l - 1)) * s;
+        float x = c * (1 - Math.Abs((h / 60f) % 2 - 1));
+        float mm = l - c / 2;
+        float r = 0, g = 0, b = 0;
+        if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; } else if (h < 180) { g = c; b = x; }
+        else if (h < 240) { g = x; b = c; } else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+        int R = (int)Math.Round((r + mm) * 255), G = (int)Math.Round((g + mm) * 255), B = (int)Math.Round((b + mm) * 255);
+        return $"#{R:x2}{G:x2}{B:x2}";
+    }
+
+    // "#rrggbb" → RGB 0..255 vector for the emitter colour track; null when unset/malformed.
+    private static Vector3? HexToRgb255(string? hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex)) return null;
+        hex = hex.TrimStart('#');
+        if (hex.Length != 6) return null;
+        const System.Globalization.NumberStyles H = System.Globalization.NumberStyles.HexNumber;
+        return int.TryParse(hex.AsSpan(0, 2), H, null, out int r)
+            && int.TryParse(hex.AsSpan(2, 2), H, null, out int g)
+            && int.TryParse(hex.AsSpan(4, 2), H, null, out int b)
+            ? new Vector3(r, g, b) : null;
+    }
+
+    // ── Itemization (tier/spec starting-point stats — Armor Forge parity) ─
+
+    /// <summary>The class → archetype catalog for the spec picker in the Configure-item modal.</summary>
+    [HttpGet]
+    public IActionResult SpecCatalog() => Json(new { ok = true, classes = SpecProfileCatalog.ForUi() });
+
+    /// <summary>Generate a curated starting-point gameplay draft for one weapon slot/family, nestled
+    /// into the vanilla tier curve (DPS + stat budget) and shaped to the chosen class/archetype.
+    /// Read-only; the client fills the Configure-item modal and the operator edits before forging.</summary>
+    [HttpGet]
+    public IActionResult Itemize(int inventoryType, string? familyKey = null, int classId = 0,
+        string? archetype = null, int? level = null, double? tier = null, int? delayMs = null)
+    {
+        var d = _itemize.GenerateWeapon(new WeaponBudgetRequest(inventoryType, familyKey, classId, archetype, level, tier, delayMs));
+        return Json(new
+        {
+            ok = true,
+            summary = d.Summary,
+            quality = d.Quality,
+            itemLevel = d.ItemLevel,
+            requiredLevel = d.RequiredLevel,
+            buyPrice = d.BuyPrice,
+            sellPrice = d.SellPrice,
+            allowableClass = d.AllowableClass,
+            dps = d.Dps,
+            damageMin = d.DamageMin,
+            damageMax = d.DamageMax,
+            damageType = d.DamageType,
+            delayMs = d.DelayMs,
+            armor = d.Armor,
+            block = d.Block,
+            maxDurability = d.MaxDurability,
+            stats = d.Stats.Select(s => new { type = s.Type, label = s.Label, value = s.Value }),
+            effectSuggestions = d.EffectSuggestions,
+        });
+    }
+
     private static byte[]? AdjustTexture(byte[]? png, int brightness, int saturation)
     {
         if (png is null || (brightness == 0 && saturation == 0)) return png;

@@ -374,14 +374,42 @@
                             <span class="val" id="impSatVal">0</span>
                         </div>
                     </div>
-                    <div class="wf-group" title="Hang one of vanilla's own enchant-style glows (ItemVisual) on the finished item, permanently — the same mechanism that makes Ashbringer glow. There is nothing to suggest from on a GLB, so this is your pick: it defaults to none.">
+                    <div class="wf-group" title="Pre-import recolor: tick 'recolor texture' and pick a primary colour — the palette engine shifts the embedded texture to match (applied before brightness/saturation), live in the preview and baked into the BLP when you forge. Cycle the theories to compare.">
+                        <div class="wf-group-title"><span>Recolor</span></div>
+                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                            <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="impRcOn"> recolor texture</label>
+                            <input type="color" id="impRcColor" value="#3b6fd4" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
+                            <label style="display:flex;align-items:center;gap:5px;font-size:12px;">Tier
+                                <select id="impRcTier">
+                                    <option value="subtle">Subtle</option>
+                                    <option value="improved" selected>Improved</option>
+                                    <option value="bold">Bold</option>
+                                    <option value="extreme">Extreme</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div id="impRcTheories" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+                        <div id="impRcStatus" style="font-size:11px;color:var(--text-muted);margin-top:6px;"></div>
+                    </div>
+                    <div class="wf-group" title="Hang one of vanilla's own enchant-style glows (ItemVisual) on the finished item, permanently — the same mechanism that makes Ashbringer glow. There is nothing to suggest from on a GLB, so this is your pick: it defaults to none. A vanilla visual fills up to FIVE anchor slots (one effect copy per anchor); the start/end sliders place those five stations along the weapon — 0% = pommel end, 100% = tip. Set start = end to pile the whole glow at one point (a pommel gem, a blade rune).">
                         <div class="wf-group-title"><span>Glow (ItemVisual)</span></div>
                         <div class="wf-ctl">
                             <label>Enchant glow</label>
                             <select id="impVisual" style="flex:1;min-width:160px;"><option value="0" selected>None</option></select>
                         </div>
+                        <div class="wf-ctl" style="margin-top:6px;" title="Where the FIRST of the five glow anchors sits along the weapon's length — 0% = pommel/butt end">
+                            <label>Glow start</label>
+                            <input type="range" id="impGlowFrom" min="0" max="100" step="5" value="10">
+                            <span class="val" id="impGlowFromVal">10%</span>
+                        </div>
+                        <div class="wf-ctl" title="Where the LAST of the five glow anchors sits — 100% = tip. Equal to start = all five anchors on one point">
+                            <label>Glow end</label>
+                            <input type="range" id="impGlowTo" min="0" max="100" step="5" value="90">
+                            <span class="val" id="impGlowToVal">90%</span>
+                        </div>
                         <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">
-                            Anchored evenly along the imported model, hilt to tip. Glows render in-game only — the Web preview does not show them.
+                            Five anchor stations spread evenly between start and end (vanilla visuals hang one effect copy per anchor) —
+                            previewed here on those same anchors after the first mesh preview.
                         </div>
                     </div>
                     </div>
@@ -516,6 +544,29 @@
                         <div id="tbcVisualNote" style="font-size:11px;color:var(--text-muted);margin-top:4px;">Preview a weapon to see its source glow and the chosen one. Glows render in-game only.</div>
                         <div id="tbcGlowCoverage" style="font-size:11px;color:var(--text-muted);margin-top:6px;padding-top:6px;border-top:1px dashed var(--border-light);">Checking TBC glow coverage…</div>
                     </div>
+                    <div class="wf-group" title="Pre-import recolor: tick 'recolor skin' and pick a primary colour — the palette engine shifts the rest of the skin to match, live in the preview, and bakes it into the shipped BLP when you forge. Cycle the theories to compare. 'Tint glow / flame' recolors the animated glow/particle effects: live in the preview, baked into the M2 emitter colour on forge.">
+                        <div class="wf-group-title"><span>Recolor (pre-import)</span></div>
+                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                            <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="tbcRcOn"> recolor skin</label>
+                            <input type="color" id="tbcRcColor" value="#3b6fd4" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
+                            <button type="button" class="wf-btn secondary" id="tbcRcDetect" style="padding:4px 10px;font-size:12px;">Detect from item</button>
+                            <label style="display:flex;align-items:center;gap:5px;font-size:12px;">Tier
+                                <select id="tbcRcTier">
+                                    <option value="subtle">Subtle</option>
+                                    <option value="improved" selected>Improved</option>
+                                    <option value="bold">Bold</option>
+                                    <option value="extreme">Extreme</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div id="tbcRcTheories" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-light);">
+                            <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="tbcRcGlowOn"> tint glow / flame effects</label>
+                            <input type="color" id="tbcRcGlowColor" value="#33aaff" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
+                            <span id="tbcRcGlowNote" style="font-size:11px;color:var(--text-muted);">Live in the preview; baked into the emitter colour on forge.</span>
+                        </div>
+                        <div id="tbcRcStatus" style="font-size:11px;color:var(--text-muted);margin-top:6px;"></div>
+                    </div>
                 </div>
                 <div class="wf-note">
                     The forged item gets the chosen family's vanilla stats/sounds while a named TBC item's authentic
@@ -570,6 +621,29 @@
                         </div>
                         <div id="wotlkVisualNote" style="font-size:11px;color:var(--text-muted);margin-top:4px;">Preview a weapon to see its source glow and the chosen one. Glows render in-game only.</div>
                         <div id="wotlkGlowCoverage" style="font-size:11px;color:var(--text-muted);margin-top:6px;padding-top:6px;border-top:1px dashed var(--border-light);">Checking WotLK glow coverage…</div>
+                    </div>
+                    <div class="wf-group" title="Pre-import recolor: tick 'recolor skin' and pick a primary colour — the palette engine shifts the rest of the skin to match, live in the preview, and bakes it into the shipped BLP when you forge. Cycle the theories to compare. 'Tint glow / flame' recolors the animated glow/particle effects: live in the preview, baked into the M2 emitter colour on forge.">
+                        <div class="wf-group-title"><span>Recolor (pre-import)</span></div>
+                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                            <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="wotlkRcOn"> recolor skin</label>
+                            <input type="color" id="wotlkRcColor" value="#3b6fd4" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
+                            <button type="button" class="wf-btn secondary" id="wotlkRcDetect" style="padding:4px 10px;font-size:12px;">Detect from item</button>
+                            <label style="display:flex;align-items:center;gap:5px;font-size:12px;">Tier
+                                <select id="wotlkRcTier">
+                                    <option value="subtle">Subtle</option>
+                                    <option value="improved" selected>Improved</option>
+                                    <option value="bold">Bold</option>
+                                    <option value="extreme">Extreme</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div id="wotlkRcTheories" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+                        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-light);">
+                            <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="wotlkRcGlowOn"> tint glow / flame effects</label>
+                            <input type="color" id="wotlkRcGlowColor" value="#33aaff" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
+                            <span id="wotlkRcGlowNote" style="font-size:11px;color:var(--text-muted);">Live in the preview; baked into the emitter colour on forge.</span>
+                        </div>
+                        <div id="wotlkRcStatus" style="font-size:11px;color:var(--text-muted);margin-top:6px;"></div>
                     </div>
                 </div>
                 <div class="wf-note">
@@ -739,6 +813,21 @@
                     <div class="wf-build-pane-title">
                         <h3>Power & direct stats</h3>
                         <p>Direct stat rows are flat vanilla points. Percentage bonuses and special combat effects belong in Spell Effects.</p>
+                    </div>
+                    <div class="wf-build-card" id="ibGenCard">
+                        <h4>Starting stats — tier &amp; spec <span>Vanilla curve generator</span></h4>
+                        <div class="wf-build-help" style="margin-top:0;">Generate a starting point nestled into the vanilla curve — damage on the real DPS progression, stats shaped to the spec — then edit anything. Leave Tier blank for a plain level-based budget.</div>
+                        <div class="wf-build-grid" style="margin-top:10px;">
+                            <div class="wf-build-field"><label>Level</label><input type="number" id="ibGenLevel" min="1" max="60" step="1" value="60"></div>
+                            <div class="wf-build-field"><label>Tier (level 60)</label><input type="number" id="ibGenTier" min="0" step="any" placeholder="e.g. 1.5, 3.5"></div>
+                            <div class="wf-build-field"><label>Class</label><select id="ibGenClass"><option value="0">Any class (generic)</option></select></div>
+                            <div class="wf-build-field"><label>Spec / role</label><select id="ibGenSpec"><option value="">Generic (balanced)</option></select></div>
+                        </div>
+                        <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;">
+                            <button type="button" class="wf-build-add" id="ibGenBtn"><i class="fa-solid fa-wand-magic-sparkles"></i> Generate starting point</button>
+                            <span class="wf-build-help" id="ibGenSummary" style="margin:0;"></span>
+                        </div>
+                        <div class="wf-build-help" id="ibGenHints" style="margin-top:6px;"></div>
                     </div>
                     <div class="wf-build-card">
                         <h4>Weapon damage <span>Primary damage row</span></h4>
@@ -985,8 +1074,40 @@
                 current = model; scene.add(model);
                 frameObject(model);
                 drawGripMarkers();
+                wfGlowRefresh(); // re-apply the recolor group's glow tint to the fresh materials
             }, undefined, (err) => setResult({ title: 'Preview failed', error: String(err) }));
         }
+
+        // ---------- live glow/flame tint (Recolor group) ----------
+        // Walk the previewed model, tint additive-glow materials and M2Emitter particle materials,
+        // and re-apply each frame so the m2fx engine's per-frame colour writes don't clobber it —
+        // the same approach the Armor Forge character viewer uses. The baked equivalent on forge is
+        // the M2 emitter colour-track override (glowColor).
+        const wfGlow = { color: null, mats: [], raf: null };
+        let wfGlowWanted = null; // [r,g,b] 0..1 from the previewing lane's controls, or null
+        function wfCollectGlowMats() {
+            wfGlow.mats = [];
+            if (!current) return;
+            current.traverse(node => {
+                if (!node.isMesh || !node.material) return;
+                const mats = Array.isArray(node.material) ? node.material : [node.material];
+                const isEmitter = node.name === 'M2Emitter';
+                for (const mat of mats) {
+                    if (!mat || !mat.color) continue;
+                    // Blend-3/4 name suffix marks WoW additive glow shells; emitters are the flames.
+                    const isAdditive = mat.blending === THREE.AdditiveBlending || /_blend[34]/.test(mat.name || '');
+                    if (isAdditive || isEmitter) wfGlow.mats.push(mat);
+                }
+            });
+        }
+        function wfGlowTick() {
+            if (!wfGlow.color) { wfGlow.raf = null; return; }
+            for (const mat of wfGlow.mats) { mat.color.setRGB(wfGlow.color[0], wfGlow.color[1], wfGlow.color[2]); mat.needsUpdate = true; }
+            wfGlow.raf = requestAnimationFrame(wfGlowTick);
+        }
+        function wfTintGlow(rgb) { wfCollectGlowMats(); wfGlow.color = rgb; if (!wfGlow.raf) wfGlowTick(); return wfGlow.mats.length; }
+        function wfClearGlow() { wfGlow.color = null; }
+        function wfGlowRefresh() { if (wfGlowWanted) wfTintGlow(wfGlowWanted); else wfClearGlow(); }
 
         // ---------- grip markers ----------
         // The weapon mounts to the character's hand bone AT ITS ORIGIN, so the green band at x=0 is
@@ -1049,6 +1170,20 @@
 
         // ---------- helpers ----------
         function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+        function hexToHue(hex) {
+            const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex); if (!m) return 0;
+            const r = parseInt(m[1], 16) / 255, g = parseInt(m[2], 16) / 255, b = parseInt(m[3], 16) / 255;
+            const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+            let h = 0;
+            if (d === 0) h = 0; else if (mx === r) h = ((g - b) / d) % 6; else if (mx === g) h = (b - r) / d + 2; else h = (r - g) / d + 4;
+            h *= 60; if (h < 0) h += 360; return h;
+        }
+        function hexToRgb01(hex) {
+            const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex); if (!m) return [1, 1, 1];
+            return [parseInt(m[1], 16) / 255, parseInt(m[2], 16) / 255, parseInt(m[3], 16) / 255];
+        }
+        // Palette theories shared by every recolor group (GLB card + import lanes).
+        const RC_THEORIES = [['primary', 'Primary'], ['fan', 'Fan'], ['identity', 'Shift'], ['analogous', 'Analogous'], ['accent', 'Accent'], ['luminance', 'Luminance'], ['bank', 'Palette']];
         function setResult({ title, kv, diagnostics, downloads, note, error }) {
             const r = document.getElementById('wfResult');
             let html = `<div class="title">${esc(title || 'Result')}</div>`;
@@ -1184,6 +1319,12 @@
             document.getElementById('itemBuildModal').classList.add('open');
             document.getElementById('itemBuildModal').setAttribute('aria-hidden', 'false');
             document.body.classList.add('wf-build-open');
+            // Fresh generator state per item; the spec catalog loads once, lazily.
+            document.getElementById('ibGenLevel').value = 60;
+            document.getElementById('ibGenTier').value = '';
+            document.getElementById('ibGenSummary').textContent = '';
+            document.getElementById('ibGenHints').innerHTML = '';
+            ibLoadSpecCatalog();
             setItemBuildTab('basics');
             updateItemBuildReview();
             setTimeout(() => document.getElementById('ibName').focus(), 30);
@@ -1460,6 +1601,88 @@
             const g = inputNumber(`ib${prefix}Gold`) || 0, s = inputNumber(`ib${prefix}Silver`) || 0, c = inputNumber(`ib${prefix}Copper`) || 0;
             return g * 10000 + s * 100 + c;
         }
+        // ---------- tier/spec starting-point generator (Armor Forge parity) ----------
+        let ibSpecCatalog = null;
+        async function ibLoadSpecCatalog() {
+            if (ibSpecCatalog) return;
+            try {
+                const d = await (await fetch('/WeaponForge/SpecCatalog')).json();
+                if (d.ok) ibSpecCatalog = d.classes || [];
+            } catch (e) { console.warn('SpecCatalog unavailable', e); }
+            ibSpecCatalog = ibSpecCatalog || [];
+            const cls = document.getElementById('ibGenClass');
+            cls.innerHTML = '<option value="0">Any class (generic)</option>';
+            for (const c of ibSpecCatalog) cls.add(new Option(c.className, c.classId));
+            ibFillGenSpecs();
+        }
+        function ibFillGenSpecs() {
+            const cid = +document.getElementById('ibGenClass').value || 0;
+            const ss = document.getElementById('ibGenSpec'); ss.innerHTML = '';
+            const cls = (ibSpecCatalog || []).find(c => c.classId === cid);
+            if (!cls) { ss.add(new Option('Generic (balanced)', '')); return; }
+            for (const a of cls.archetypes) ss.add(new Option(a.label, a.key));
+        }
+        function ibSetCoins(prefix, copper) {
+            copper = Math.max(0, Math.round(+copper || 0));
+            document.getElementById('ib' + prefix + 'Gold').value = Math.floor(copper / 10000); copper %= 10000;
+            document.getElementById('ib' + prefix + 'Silver').value = Math.floor(copper / 100);
+            document.getElementById('ib' + prefix + 'Copper').value = copper % 100;
+        }
+        async function ibGenerate() {
+            const btn = document.getElementById('ibGenBtn');
+            const summary = document.getElementById('ibGenSummary');
+            const q = new URLSearchParams({
+                inventoryType: +document.getElementById('ibInventoryType').value || 13,
+                familyKey: itemBuildState.familyKey || '',
+                classId: +document.getElementById('ibGenClass').value || 0,
+                archetype: document.getElementById('ibGenSpec').value || '',
+                level: Math.max(1, Math.min(60, +document.getElementById('ibGenLevel').value || 60)),
+            });
+            const tier = document.getElementById('ibGenTier').value;
+            if (tier !== '') q.append('tier', tier);
+            const speed = document.getElementById('ibSpeed').value;
+            if (speed !== '') q.append('delayMs', Math.round(+speed * 1000));
+            btn.disabled = true;
+            try {
+                const d = await (await fetch('/WeaponForge/Itemize?' + q)).json();
+                if (!d.ok) { summary.textContent = d.error || 'Generate failed.'; return; }
+                const set = (id, v) => { document.getElementById(id).value = v; };
+                set('ibQuality', String(d.quality));
+                set('ibItemLevel', d.itemLevel); set('ibRequiredLevel', d.requiredLevel);
+                const meta = weaponTypeMeta.get(itemBuildState.familyKey);
+                if (meta && meta.isShield) {
+                    set('ibDamageMin', 0); set('ibDamageMax', 0);
+                    set('ibArmor', d.armor || 0); set('ibBlock', d.block || 0);
+                } else {
+                    set('ibDamageMin', d.damageMin); set('ibDamageMax', d.damageMax);
+                    set('ibDamageType', String(d.damageType || 0));
+                    // The generated roll is budgeted AT this swing speed — carry it so the DPS ships as generated.
+                    set('ibSpeed', (d.delayMs / 1000).toFixed(1));
+                }
+                set('ibMaxDurability', d.maxDurability);
+                ibSetCoins('Buy', d.buyPrice); ibSetCoins('Sell', d.sellPrice);
+                // Generating with a class picked SETS the class restriction; "Any class" clears it —
+                // either way the operator sees the result in the Allowed-classes card and can override.
+                const bits = [...document.querySelectorAll('[data-mask="class"]')];
+                if (d.allowableClass != null) bits.forEach(x => { x.checked = ((d.allowableClass >> +x.dataset.bit) & 1) === 1; });
+                else bits.forEach(x => { x.checked = true; });
+                document.querySelector('[data-mask-all="class"]').checked = bits.every(b => b.checked);
+                // Stats: replace with the generated distribution.
+                document.querySelectorAll('#ibStats .wf-stat-row').forEach(r => r.remove());
+                for (const s of d.stats || []) addItemStat(s.type, s.value);
+                renderItemBuildEmptyStates();
+                summary.textContent = d.summary || '';
+                const hints = d.effectSuggestions || [];
+                document.getElementById('ibGenHints').innerHTML = hints.length
+                    ? 'Suggested effects (add them under Spell effects): <ul style="margin:4px 0 0 16px;padding:0;">' + hints.map(h => `<li>${esc(h)}</li>`).join('') + '</ul>'
+                    : '';
+                updateItemBuildReview();
+            } catch (e) { summary.textContent = 'Generate failed: ' + e; }
+            finally { btn.disabled = false; }
+        }
+        document.getElementById('ibGenClass').addEventListener('change', ibFillGenSpecs);
+        document.getElementById('ibGenBtn').addEventListener('click', ibGenerate);
+
         function collectItemConfig() {
             const config = {
                 name: document.getElementById('ibName').value.trim(),
@@ -1502,7 +1725,8 @@
         function validateItemConfig(config) {
             const errors = [];
             const modal = document.getElementById('itemBuildModal');
-            const invalid = [...modal.querySelectorAll('input, select, textarea')].find(x => !x.disabled && !x.checkValidity());
+            // Generator inputs (#ibGenCard) are not part of the item config — never let them block a forge.
+            const invalid = [...modal.querySelectorAll('input, select, textarea')].find(x => !x.disabled && !x.closest('#ibGenCard') && !x.checkValidity());
             if (invalid) {
                 errors.push('One or more fields are missing or outside the allowed range.');
                 const pane = invalid.closest('[data-build-pane]');
@@ -1655,6 +1879,9 @@
                     fd.append('weaponType', familyKey);
                     fd.append('targetTriangles', lane.targetTris());
                     laneGlowParams(lane, fd);
+                    laneRecolorParams(lane, fd);           // bake the previewed skin recolor
+                    const glowTint = laneGlowTint(lane);   // bake the flame/glow colour
+                    if (glowTint) fd.append('glowColor', glowTint);
                 }
 
                 const spellErrors = await validateItemSpells(config);
@@ -1759,8 +1986,18 @@
             fd.append('pitchDegrees', +document.getElementById('impPitch').value || 0);
             fd.append('yawDegrees', +document.getElementById('impYaw').value || 0);
             // Enchant-style glow (ItemDisplayInfo field 22). A GLB has nothing to suggest from, so
-            // 0 = none is the default; the forge anchors whatever is picked along the imported mesh.
+            // 0 = none is the default; the forge anchors whatever is picked along the imported mesh
+            // (and the preview mounts the effect models on those same anchors).
             fd.append('itemVisual', +document.getElementById('impVisual').value || 0);
+            fd.append('glowStartPercent', +document.getElementById('impGlowFrom').value);
+            fd.append('glowEndPercent', +document.getElementById('impGlowTo').value);
+            // Pre-import recolor of the embedded texture — same fields the lanes send; preview and
+            // forge share the sha-seeded palette roll so what previews is what bakes.
+            if (document.getElementById('impRcOn').checked) {
+                fd.append('recolorHue', Math.round(hexToHue(document.getElementById('impRcColor').value)));
+                fd.append('recolorTheory', impRcTheory);
+                fd.append('recolorTier', document.getElementById('impRcTier').value || 'improved');
+            }
         }
         function schedulePreviewIfLive() {
             // After the first preview, orientation/budget changes re-preview automatically.
@@ -1775,6 +2012,42 @@
         document.getElementById('impFlip').addEventListener('change', schedulePreviewIfLive);
         document.getElementById('impStraighten').addEventListener('change', schedulePreviewIfLive);
         document.getElementById('impType').addEventListener('change', schedulePreviewIfLive);
+        // The enchant glow now renders in the preview — re-preview when the pick or placement changes.
+        document.getElementById('impVisual').addEventListener('change', schedulePreviewIfLive);
+        bindGrade('impGlowFrom', 'impGlowFromVal', v => v + '%');
+        bindGrade('impGlowTo', 'impGlowToVal', v => v + '%');
+        // GLB recolor controls: theory chips + live re-preview, mirroring the import lanes.
+        let impRcTheory = 'primary';
+        {
+            const host = document.getElementById('impRcTheories');
+            const schedule = () => {
+                document.getElementById('impRcStatus').textContent = document.getElementById('impRcOn').checked
+                    ? 'Recolor will apply on the next preview.' : 'Recolor off.';
+                schedulePreviewIfLive();
+            };
+            for (const [key, label] of RC_THEORIES) {
+                const b = document.createElement('button');
+                b.type = 'button'; b.className = 'wf-btn secondary';
+                b.style.cssText = 'padding:3px 10px;font-size:12px;';
+                b.textContent = label;
+                if (key === impRcTheory) b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
+                b.addEventListener('click', () => {
+                    impRcTheory = key;
+                    host.querySelectorAll('button').forEach(x => x.style.outline = '');
+                    b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
+                    if (!document.getElementById('impRcOn').checked) document.getElementById('impRcOn').checked = true;
+                    schedule();
+                });
+                host.appendChild(b);
+            }
+            let impRcColorTimer = null;
+            document.getElementById('impRcColor').addEventListener('input', () => {
+                if (!document.getElementById('impRcOn').checked) document.getElementById('impRcOn').checked = true;
+                clearTimeout(impRcColorTimer); impRcColorTimer = setTimeout(schedule, 200);
+            });
+            document.getElementById('impRcOn').addEventListener('change', schedule);
+            document.getElementById('impRcTier').addEventListener('change', () => { if (document.getElementById('impRcOn').checked) schedule(); });
+        }
         function bindGrade(id, valId, fmt) {
             const el = document.getElementById(id), lab = document.getElementById(valId);
             el.addEventListener('input', () => { lab.textContent = fmt(+el.value); schedulePreviewIfLive(); });
@@ -1832,6 +2105,11 @@
                 importParams(fd);
                 const d = await (await fetch('/WeaponForge/UploadGlb', { method: 'POST', body: fd })).json();
                 lastGrip = d.grip || null;
+                wfGlowWanted = null; // the GLB route has no live glow tint — drop any lane leftover
+                if (document.getElementById('impRcOn').checked)
+                    document.getElementById('impRcStatus').textContent = d.recolorApplied
+                        ? `Recolored at ${Math.round(hexToHue(document.getElementById('impRcColor').value))}° (${impRcTheory}, ${document.getElementById('impRcTier').value}) — will bake on forge.`
+                        : 'No recolorable colour families in the embedded texture — showing the original.';
                 setResult({
                     title: d.ok ? 'Imported & decimated (preview only)' : 'Import finished with issues',
                     kv: {
@@ -1903,6 +2181,76 @@
             lane.el('Visual').addEventListener('change', schedule);
             lane.el('GlowSpread').addEventListener('change', schedule);
         }
+        // Recolor controls of a lane → request fields (recolorHue/recolorTheory/recolorTier). Used
+        // by both the preview (live server-side recolor of the source skin) and the forge (bake).
+        function laneRecolorParams(lane, target) {
+            if (!lane.el('RcOn').checked) return;
+            target.append('recolorHue', Math.round(hexToHue(lane.el('RcColor').value)));
+            target.append('recolorTheory', lane.rcTheory || 'primary');
+            target.append('recolorTier', lane.el('RcTier').value || 'improved');
+        }
+        // Glow tint is client-side in the preview (wfTintGlow) and a forge-only field (glowColor).
+        function laneGlowTint(lane) { return lane.el('RcGlowOn').checked ? lane.el('RcGlowColor').value : null; }
+        function laneApplyGlowTint(lane) {
+            wfGlowWanted = lane.el('RcGlowOn').checked ? hexToRgb01(lane.el('RcGlowColor').value) : null;
+            let n = 0;
+            if (wfGlowWanted) n = wfTintGlow(wfGlowWanted); else wfClearGlow();
+            lane.el('RcGlowNote').textContent = !lane.el('RcGlowOn').checked
+                ? 'Live in the preview; baked into the emitter colour on forge.'
+                : (n ? `${n} glow material(s) tinted — bakes into the M2 emitter colour on forge.`
+                     : 'No glow/particle material in the current preview to tint (rebuilt emitters are still tinted on forge).');
+        }
+        function wireLaneRecolor(lane) {
+            lane.rcTheory = 'primary';
+            const schedule = () => {
+                if (!lane.sel) { lane.el('RcStatus').textContent = 'Browse and pick a weapon first.'; return; }
+                lane.el('RcStatus').textContent = lane.el('RcOn').checked ? 'Recoloring preview…' : 'Recolor off — previewing the original skin.';
+                lane.invalidatePreview();
+                clearTimeout(lane.previewTimer);
+                lane.previewTimer = setTimeout(() => lanePreview(lane), 350);
+            };
+            const host = lane.el('RcTheories');
+            for (const [key, label] of RC_THEORIES) {
+                const b = document.createElement('button');
+                b.type = 'button'; b.className = 'wf-btn secondary'; b.dataset.theory = key;
+                b.style.cssText = 'padding:3px 10px;font-size:12px;';
+                b.textContent = label;
+                if (key === lane.rcTheory) b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
+                b.addEventListener('click', () => {
+                    lane.rcTheory = key;
+                    host.querySelectorAll('button').forEach(x => x.style.outline = '');
+                    b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
+                    if (!lane.el('RcOn').checked) lane.el('RcOn').checked = true;
+                    schedule();
+                });
+                host.appendChild(b);
+            }
+            let colorTimer = null;
+            lane.el('RcColor').addEventListener('input', () => {
+                if (!lane.el('RcOn').checked) lane.el('RcOn').checked = true;
+                clearTimeout(colorTimer); colorTimer = setTimeout(schedule, 200);
+            });
+            lane.el('RcOn').addEventListener('change', schedule);
+            lane.el('RcTier').addEventListener('change', () => { if (lane.el('RcOn').checked) schedule(); });
+            lane.el('RcDetect').addEventListener('click', async () => {
+                if (!lane.sel) { lane.el('RcStatus').textContent = 'Browse and pick a weapon first.'; return; }
+                lane.el('RcStatus').textContent = 'Detecting primary colour…';
+                try {
+                    const q = new URLSearchParams({ expansion: lane.key, entry: lane.sel.entry, model: lane.sel.model, displayRow: lane.sel.displayRow });
+                    const d = await (await fetch('/WeaponForge/PrimaryColor?' + q)).json();
+                    if (d.success && d.primaryHex) {
+                        lane.el('RcColor').value = d.primaryHex;
+                        if (lane.el('RcOn').checked) schedule();
+                        else lane.el('RcStatus').textContent = 'Primary colour loaded — tick "recolor skin" or pick a theory to recolor.';
+                    } else lane.el('RcStatus').textContent = d.error || 'Could not detect a primary colour.';
+                } catch (e) { lane.el('RcStatus').textContent = 'Detect failed: ' + e; }
+            });
+            lane.el('RcGlowOn').addEventListener('change', () => laneApplyGlowTint(lane));
+            lane.el('RcGlowColor').addEventListener('input', () => {
+                if (!lane.el('RcGlowOn').checked) lane.el('RcGlowOn').checked = true;
+                laneApplyGlowTint(lane);
+            });
+        }
         async function loadItemVisuals() {
             try {
                 const d = await (await fetch('/WeaponForge/ItemVisuals')).json();
@@ -1952,6 +2300,7 @@
                 lane.searchTimer = setTimeout(() => loadLanePage(lane, 1), 350);
             });
             wireLaneGlow(lane);
+            wireLaneRecolor(lane);
         }
 
         async function loadLaneStatus(lane) {
@@ -2060,6 +2409,9 @@
                 targetTriangles,
             });
             laneGlowParams(lane, q);
+            laneRecolorParams(lane, q);
+            // The glow tint follows THIS lane's controls; loadGlb re-applies it to the new model.
+            wfGlowWanted = lane.el('RcGlowOn').checked ? hexToRgb01(lane.el('RcGlowColor').value) : null;
             let d;
             try {
                 const response = await fetch(lane.urls.preview + '?' + q);
@@ -2074,6 +2426,10 @@
             if (requestId !== lane.previewSerial) return;
             lastGrip = d.grip || null;
             configureButton.disabled = !d.ok || d.withinForgeBudget === false;
+            if (lane.el('RcOn').checked)
+                lane.el('RcStatus').textContent = d.recolorApplied
+                    ? `Recolored at ${Math.round(hexToHue(lane.el('RcColor').value))}° (${lane.rcTheory}, ${lane.el('RcTier').value}) — will bake on forge.`
+                    : 'No recolorable colour families on this skin — previewing the original.';
             const p = d.particles || {};
             const sug = d.suggestedItemVisual;
             const autoOpt = lane.el('Visual').querySelector('option[value="-1"]');
@@ -2153,6 +2509,7 @@
                 const d = await (await fetch(`/WeaponForge/PreviewForged?displayId=${encodeURIComponent(id)}`)).json();
                 if (!d.ok) return setResult({ title: 'Could not load weapon', error: d.error });
                 lastGrip = null; // stored-bytes view has no grip payload
+                wfGlowWanted = null; // a stored weapon shows its own baked colours, not the lane's live tint
                 loadGlb(previewUrl(d));
                 setResult({ title: `Viewing ${name}`, kv: { 'Display': id, 'Texture': d.hasTexture ? 'yes' : 'no' },
                     note: 'Rendered from the stored M2+BLP in the registry.' });

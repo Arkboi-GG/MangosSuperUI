@@ -65,7 +65,7 @@ import * as dresser from './dresser.js';
 import { installM2Fx } from './m2fx.js';
 import * as compositor from './compositor.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { applyBlendSuffix } from './blend-suffix.js';
+import { applyBlendSuffix, applyEnvMapping, applyMultiTexture } from './blend-suffix.js';
 
 const ENDPOINT = '/Items/ItemDressing';
 
@@ -152,6 +152,14 @@ function loadGlb(url) {
     return new Promise((resolve, reject) => {
         _gltfLoader.load(url, gltf => {
             applyBlendSuffix(gltf.scene);
+            // Env-mapped passes → matcap, so a WoW EnvMap reflection moves as the model turns
+            // instead of freezing at its rest UVs. MUST run after applyBlendSuffix: it copies the
+            // blend/transparency state that call resolved onto the matcap it builds.
+            //
+            // applyMultiTexture is deliberately NOT here — installM2Fx runs later (bindAttachmentFx)
+            // and clones the material, and Material.clone() drops onBeforeCompile, which is exactly
+            // what applyMultiTexture installs. It runs after the fx bind instead; see the mount loop.
+            applyEnvMapping(gltf.scene);
             resolve(gltf);
         }, undefined, err => reject(err));
     });
@@ -347,6 +355,14 @@ async function mountAttachmentsFromPayload(character, attachments, inventoryType
             continue;
         }
         bindAttachmentFx(character, job.attId, r.value);
+        // Multi-texture MODULATE passes, LAST — installM2Fx (inside bindAttachmentFx) clones and
+        // reassigns the material, and Material.clone() carries neither onBeforeCompile nor
+        // customProgramCacheKey, the two fields applyMultiTexture sets. Placed here rather than
+        // inside bindAttachmentFx because that function early-returns when the character has no fx
+        // registry, which would silently skip this pass. dresser.mountAttachment adds the subtree
+        // without cloning, so r.value.scene is the live mounted material graph.
+        try { applyMultiTexture(r.value.scene); }
+        catch (err) { console.warn('[equip] multi-texture pass failed', err); }
         mounted++;
     }
     return mounted;

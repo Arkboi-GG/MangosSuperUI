@@ -714,7 +714,14 @@ public class ItemTextureService
             string fileName = $"preview_{displayId}_{assetLabel}_{Guid.NewGuid():N}.glb";
             string glbPath = Path.Combine(previewDir, fileName);
 
-            bool ok = GlbWriter.SaveGlb(m2Model, textures, glbPath, doubleSided);
+            // Mount the item's own ItemVisual (enchant glow) effect models, exactly as the committed
+            // cache path does. Without this a staged recolor previewed WITHOUT its glow and then
+            // gained one on save — the preview has to be what gets persisted. Resolved AFTER the
+            // recolor BLP injection because effect models carry their own sheets and are unaffected
+            // by the injected skin. Degrades to null (today's behaviour) when the item has no visual.
+            var visualEffects = ResolveVisualEffects(displayId, m2Model);
+
+            bool ok = GlbWriter.SaveGlb(m2Model, textures, glbPath, doubleSided, visualEffects);
             if (!ok)
             {
                 _logger.LogWarning(

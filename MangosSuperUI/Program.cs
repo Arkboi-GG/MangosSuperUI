@@ -238,6 +238,16 @@ using (var scope = app.Services.CreateScope())
     }
     catch (Exception ex) { bootLog.LogError(ex, "Startup: forged-weapon registration skipped (DB unavailable?)"); }
 
+    // And the same for forged ARMOR. Without this every imported piece reverts to the red "?" icon
+    // and disappears from the 3D viewer on the first restart after import, because the forge-time
+    // registration lives only in memory.
+    try
+    {
+        var armorBuilder = scope.ServiceProvider.GetRequiredService<MangosSuperUI.Services.ArmorForge.CustomArmorBuildService>();
+        armorBuilder.LoadExistingArmorAsync().GetAwaiter().GetResult();
+    }
+    catch (Exception ex) { bootLog.LogError(ex, "Startup: forged-armor registration skipped (DB unavailable?)"); }
+
     var registry = scope.ServiceProvider.GetRequiredService<CacheVersionRegistry>();
     registry.SweepAllOnStartup();
 }

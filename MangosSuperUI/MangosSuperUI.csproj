@@ -19,7 +19,18 @@
 		<PackageReference Include="MySqlConnector" Version="2.5.0" />
 		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
 		<PackageReference Include="SkiaSharp" Version="3.119.2" />
-		<PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="3.119.2" />
+		<!-- NoDependencies, deliberately: the plain SkiaSharp.NativeAssets.Linux build
+		     links libfontconfig.so.1, which is absent on a headless server install. When
+		     it is missing, libSkiaSharp fails to dlopen and EVERY BLP->PNG conversion
+		     throws TypeInitializationException — icons and 3D models all silently 404
+		     while the MPQ layer reports perfectly healthy. This variant carries no such
+		     host dependency, so the deploy works on a bare box with no apt step.
+		     Tradeoff: no system font access. SKPaint text draws nothing (it does not
+		     throw), which affects only the ItemsController / RetextureEngineController
+		     "theory lab" contact-sheet labels. If those labels are ever needed again,
+		     bundle a .ttf and load it with SKTypeface.FromFile rather than reinstating
+		     the fontconfig-linked package. -->
+		<PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="3.119.2" />
 	</ItemGroup>
 
 	<!-- Native StormLib binaries. Auto-discovered by .NET 8's DllImport

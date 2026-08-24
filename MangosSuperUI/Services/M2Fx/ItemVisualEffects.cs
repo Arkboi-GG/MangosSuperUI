@@ -46,9 +46,13 @@ public static class ItemVisualEffects
     /// <param name="itemVisualId">ItemDisplayInfo.itemVisual. Zero means the item has no visual.</param>
     /// <param name="host">The item's own parsed model — for its attachment points.</param>
     /// <param name="read">MPQ reader. Effect models and their textures both come through it.</param>
+    /// <param name="mountForSlot">Optional mount override: slot → position in the preview's Y-up
+    /// mesh space (null skips the slot). Used when there is no host M2 to read attachments from —
+    /// the GLB import route mounts on the same evenly-spread anchors its forge writes.</param>
     /// <returns>Empty whenever anything is missing. A visual that cannot be resolved must degrade to
     /// "no extra effect", never to an exception on a preview path.</returns>
-    public static List<Effect> Resolve(uint itemVisualId, M2Model? host, Func<string, byte[]?> read)
+    public static List<Effect> Resolve(uint itemVisualId, M2Model? host, Func<string, byte[]?> read,
+        Func<int, Vector3?>? mountForSlot = null)
     {
         var result = new List<Effect>();
         if (itemVisualId == 0) return result;
@@ -73,7 +77,8 @@ public static class ItemVisualEffects
                 if (System.Text.Encoding.ASCII.GetString(bytes, 0, 4) != "MD20") continue;
                 if (BitConverter.ToUInt32(bytes, 4) >= 264) continue;   // v264+ has a different layout
 
-                if (MountFor(host, slot) is not { } mount) continue;
+                var mountAt = mountForSlot is not null ? mountForSlot(slot) : MountFor(host, slot);
+                if (mountAt is not { } mount) continue;
 
                 var textures = ReadTextureTable(bytes, read);
                 result.Add(new Effect(modelPath, bytes, textures, mount));

@@ -16,14 +16,13 @@
 // The DBC-miss questionmark is itself just another name served from the MPQ
 // (/Icon/Get?name=inv_misc_questionmark), so even the fallback stays MPQ-sourced.
 //
-// Decode mirrors BodyAtlasTextureService.DecodeBlpToPng (War3Net BlpFile +
-// SkiaSharp) but returns PNG bytes instead of writing a file. War3Net decodes
-// both palettized (comp=1) and DXT (comp=2) BLP2, which is every format vanilla
-// icons use — so decode is not a limiting factor here.
+// Decode + PNG encode live in BlpDecoder.ToPngBytes, shared with the /Home/Diagnose
+// icon check so the diagnostic exercises this exact pipeline rather than a copy of
+// it. BlpDecoder handles both palettized (comp=1) and DXT (comp=2) BLP2, which is
+// every format vanilla icons use — so decode is not a limiting factor here.
 
 using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Mvc;
-using SkiaSharp;
 using MangosSuperUI.Services;
 
 namespace MangosSuperUI.Controllers;
@@ -95,7 +94,7 @@ public class IconController : Controller
         byte[] png;
         try
         {
-            png = DecodeBlpToPngBytes(blp);
+            png = BlpDecoder.ToPngBytes(blp);
         }
         catch (Exception ex)
         {
@@ -116,21 +115,5 @@ public class IconController : Controller
         // hide a change. Swap to a long immutable cache once verified.
         Response.Headers["Cache-Control"] = "no-store";
         return File(bytes, "image/png");
-    }
-
-    // BLP bytes -> PNG bytes. Mirrors BodyAtlasTextureService.DecodeBlpToPng but
-    // encodes to a MemoryStream instead of writing to disk.
-    private static byte[] DecodeBlpToPngBytes(byte[] blpData)
-    {
-        var pixels = BlpDecoder.GetPixels(blpData, 0, out int w, out int h);
-
-        using var bitmap = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);
-        var dst = bitmap.GetPixels();
-        System.Runtime.InteropServices.Marshal.Copy(pixels, 0, dst, pixels.Length);
-        bitmap.NotifyPixelsChanged();
-
-        using var outMs = new MemoryStream();
-        bitmap.Encode(outMs, SKEncodedImageFormat.Png, 100);
-        return outMs.ToArray();
     }
 }

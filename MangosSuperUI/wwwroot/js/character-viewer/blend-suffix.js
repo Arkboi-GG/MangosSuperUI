@@ -200,6 +200,11 @@ export function applyEnvMapping(sceneRoot) {
         for (let i = 0; i < mats.length; i++) {
             const mat = mats[i];
             if (!mat || !mat.name || !_ENV_RE.test(mat.name)) continue;
+            // Already converted. The matcap keeps the original `_env` name (callers match on it),
+            // and a MeshMatcapMaterial has `.matcap`, not `.map` — so a second pass would read
+            // undefined and rebuild the material with a null matcap, i.e. render it black. Now that
+            // more than one call site runs this, guard rather than rely on being called once.
+            if (mat.isMeshMatcapMaterial) continue;
 
             const env = new THREE.MeshMatcapMaterial({ matcap: mat.map || null });
             env.name = mat.name;
@@ -260,6 +265,16 @@ export function applyMultiTexture(sceneRoot) {
         for (let i = 0; i < mats.length; i++) {
             const mat = mats[i];
             if (!mat || !mat.name || !_MOD_RE.test(mat.name) || !mat.map) continue;
+            // The second sample reads vAoMapUv, which only exists if the geometry actually carries a
+            // uv1 attribute. Without it three.js supplies a constant, so the multiply collapses to
+            // one fixed (usually near-black) texel and the whole pass goes dark — a worse and much
+            // harder-to-spot failure than the flat additive it replaces. Degrade instead.
+            if (!node.geometry?.attributes?.uv1) {
+                console.warn(`[multi-tex] '${mat.name}' is marked _mod but its geometry has no uv1; ` +
+                             'leaving it as a plain additive pass');
+                continue;
+            }
+            if (mat.aoMap) continue;   // already converted — do not clone a second time
 
             // Route the SECOND (static) sample of the energy texture through the aoMap slot, which is the
             // supported way to get a UV1-mapped varying (vAoMapUv) in this three.js — a bare

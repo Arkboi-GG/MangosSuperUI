@@ -205,6 +205,31 @@ public static class TierAnchorTable
     public static double ChestPoints(double tier) => Interpolate(PointAnchors, tier);
     public static int ItemLevel(double tier) => (int)Math.Round(Interpolate(IlvlAnchors, tier));
 
+    // ── Weapon anchors (Weapon Forge itemization) ───────────────────────
+
+    // (tier, two-hand melee DPS). The reference weapon kind (multiplier 1.0). Anchored on the real
+    // endgame drops: dungeon-blue 2H ≈ 51, MC ≈ 61 (Obsidian Edged Blade), BWL ≈ 68 (Drake Talon
+    // Cleaver), AQ40 ≈ 78, Naxx ≈ 91 (Might of Menethil). Other kinds scale via WeaponKindDpsFactor.
+    private static readonly (double Tier, double Dps)[] Dps2HAnchors =
+    {
+        (0.0, 51), (0.5, 55), (1.0, 61), (2.0, 68), (2.5, 78), (3.0, 91),
+    };
+
+    // (tier, shield armor) and (tier, shield block) — Drillborer Disk (MC) 2121/42 through
+    // Elementium Reinforced Bulwark (BWL) 2893/76 and the Naxx wall shields.
+    private static readonly (double Tier, double Armor)[] ShieldArmorAnchors =
+    {
+        (0.0, 1700), (0.5, 1900), (1.0, 2250), (2.0, 2900), (2.5, 3300), (3.0, 3800),
+    };
+    private static readonly (double Tier, double Block)[] ShieldBlockAnchors =
+    {
+        (0.0, 30), (0.5, 34), (1.0, 41), (2.0, 57), (2.5, 70), (3.0, 85),
+    };
+
+    public static double TwoHandDps(double tier) => Interpolate(Dps2HAnchors, tier);
+    public static int ShieldArmor(double tier) => (int)Math.Round(Interpolate(ShieldArmorAnchors, tier));
+    public static int ShieldBlock(double tier) => (int)Math.Round(Interpolate(ShieldBlockAnchors, tier));
+
     /// <summary>Piecewise-linear over the anchors; extrapolates the first/last segment beyond range.</summary>
     private static double Interpolate((double X, double Y)[] anchors, double x)
     {
