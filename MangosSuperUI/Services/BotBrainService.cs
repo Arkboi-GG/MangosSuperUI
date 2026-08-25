@@ -58,6 +58,7 @@ public class BotBrainService : BackgroundService
     private readonly ConcurrentDictionary<int, BotContext> _contexts = new();
 
     private readonly HashSet<int> _initializedGuids = new();
+    private readonly object _initializedGuidsLock = new();
     private readonly ConcurrentDictionary<int, DateTime> _disconnectedAt = new();
 
     private volatile bool _brainEnabled = false;
@@ -122,7 +123,7 @@ public class BotBrainService : BackgroundService
                 var count = _contexts.Count;
                 _bots.Clear();
                 _contexts.Clear();
-                _initializedGuids.Clear();
+                lock (_initializedGuidsLock) { _initializedGuids.Clear(); }
                 _disconnectedAt.Clear();
                 _logger.LogInformation("BotBrain: cleared {Count} bot entries on disable — next sync starts clean", count);
             }
@@ -136,6 +137,22 @@ public class BotBrainService : BackgroundService
         _bots.TryGetValue(guid, out var bot) ? bot : null;
 
     public int ActiveBotCount => _contexts.Count;
+
+    /// <summary>
+    /// Drop a bot from every in-memory roster mirror immediately, mirroring the stale-bot
+    /// eviction path in SyncBotRosterAsync. Called after a DB-level bot delete so the
+    /// dashboard forgets it right away instead of needing a mangossuperui restart.
+    /// </summary>
+    public void EvictBot(int guid)
+    {
+        _groupManager.RemoveFromGroup(guid);
+        _bots.TryRemove(guid, out _);
+        _contexts.TryRemove(guid, out _);
+        lock (_initializedGuidsLock) { _initializedGuids.Remove(guid); }
+        _disconnectedAt.TryRemove(guid, out _);
+        _tracker.Remove(guid);
+        _fallRecorder.Forget(guid);
+    }
 
     /// <summary>
     /// Story-rider toggle (demoted: superseded by FleetReport, kept for the dashboard).
@@ -674,10 +691,13 @@ public class BotBrainService : BackgroundService
 
             if (bs.TaskState == "DISCONNECTED") continue;
 
-            if (!_initializedGuids.Contains(guid))
+            bool alreadyInit;
+            lock (_initializedGuidsLock) { alreadyInit = _initializedGuids.Contains(guid); }
+
+            if (!alreadyInit)
             {
                 await InitializeBotAsync(guid, bs);
-                _initializedGuids.Add(guid);
+                lock (_initializedGuidsLock) { _initializedGuids.Add(guid); }
             }
             else if (_bots.TryGetValue(guid, out var bot))
             {
@@ -687,9 +707,13 @@ public class BotBrainService : BackgroundService
         }
 
         // Evict bots that have been gone for the grace window.
-        var disconnected = _initializedGuids
-            .Where(g => !bridgeStates.ContainsKey(g) || bridgeStates[g].TaskState == "DISCONNECTED")
-            .ToList();
+        List<int> disconnected;
+        lock (_initializedGuidsLock)
+        {
+            disconnected = _initializedGuids
+                .Where(g => !bridgeStates.ContainsKey(g) || bridgeStates[g].TaskState == "DISCONNECTED")
+                .ToList();
+        }
 
         foreach (var guid in disconnected)
         {
@@ -701,7 +725,7 @@ public class BotBrainService : BackgroundService
                 _groupManager.RemoveFromGroup(guid);
                 _bots.TryRemove(guid, out _);
                 _contexts.TryRemove(guid, out _);
-                _initializedGuids.Remove(guid);
+                lock (_initializedGuidsLock) { _initializedGuids.Remove(guid); }
                 _disconnectedAt.TryRemove(guid, out _);
                 _tracker.Remove(guid);
                 _fallRecorder.Forget(guid);   // drop the bot's fall-ring so evicted guids don't leak memory
