@@ -43,6 +43,7 @@ builder.Services.AddSingleton<DbInitializationService>();
 builder.Services.AddSingleton<RaService>();
 builder.Services.AddSingleton<ProcessManagerService>();
 builder.Services.AddSingleton<StateCaptureService>();
+builder.Services.AddHttpContextAccessor();            // lets AuditService stamp the caller's ip on rows written deep in a service
 builder.Services.AddSingleton<AuditService>();
 builder.Services.AddSingleton<WorldArtifactService>();
 builder.Services.AddSingleton<RtsWorldCreationService>();
@@ -129,6 +130,9 @@ builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.GlbWeaponImport
 // cloaks) + tier sets (ItemSet.dbc). Reuses the weapon id allocator + reservation tables.
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.ArmorPatchBuilder>();
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.CustomArmorBuildService>();
+// SCOPED, not singleton: it depends on ItemRetextureService, which is scoped. A singleton
+// capturing a scoped dependency fails DI validation at startup.
+builder.Services.AddScoped<CustomDisplayRegistrar>();
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.TbcArmorCatalog>();
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.TbcArmorImporter>();
 // WotLK lane: same catalog/importer over the WotLK mount + shipped WotLK catalog; ArmorImportSources
@@ -219,36 +223,17 @@ var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
 {
-    // These registrations need the admin DB. A DB that is down at boot must NOT take the whole
-    // panel down (DbInitializationService below already follows the same "never throws" rule) —
-    // the registrations are retried implicitly on the next forge/retexture action, and the
-    // dashboard surfaces the DB state. Log and continue.
+    // Custom display registration (retexture -> weapon -> armor). These caches are in-memory only,
+    // so this has to run at every boot; the SAME sequence also has to run after DbcService.Reload(),
+    // which is why it lives in one shared type. A DB that is down at boot must NOT take the panel
+    // down — the registrar swallows and logs per lane.
     var bootLog = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
     try
     {
-        var retexService = scope.ServiceProvider.GetRequiredService<ItemRetextureService>();
-        retexService.LoadExistingRetexturesAsync().GetAwaiter().GetResult();
+        scope.ServiceProvider.GetRequiredService<CustomDisplayRegistrar>()
+            .RegisterAllAsync("startup").GetAwaiter().GetResult();
     }
-    catch (Exception ex) { bootLog.LogError(ex, "Startup: retexture registration skipped (DB unavailable?)"); }
-
-    // Same in-memory DBC registration for forged weapons, so their custom displays resolve on the
-    // Items page (icon + model/texture) after a restart — mirrors the retexture load above.
-    try
-    {
-        var weaponBuilder = scope.ServiceProvider.GetRequiredService<MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService>();
-        weaponBuilder.LoadExistingWeaponsAsync().GetAwaiter().GetResult();
-    }
-    catch (Exception ex) { bootLog.LogError(ex, "Startup: forged-weapon registration skipped (DB unavailable?)"); }
-
-    // And the same for forged ARMOR. Without this every imported piece reverts to the red "?" icon
-    // and disappears from the 3D viewer on the first restart after import, because the forge-time
-    // registration lives only in memory.
-    try
-    {
-        var armorBuilder = scope.ServiceProvider.GetRequiredService<MangosSuperUI.Services.ArmorForge.CustomArmorBuildService>();
-        armorBuilder.LoadExistingArmorAsync().GetAwaiter().GetResult();
-    }
-    catch (Exception ex) { bootLog.LogError(ex, "Startup: forged-armor registration skipped (DB unavailable?)"); }
+    catch (Exception ex) { bootLog.LogError(ex, "Startup: custom display registration failed"); }
 
     var registry = scope.ServiceProvider.GetRequiredService<CacheVersionRegistry>();
     registry.SweepAllOnStartup();

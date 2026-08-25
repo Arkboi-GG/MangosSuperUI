@@ -85,6 +85,11 @@ public static class VanillaItemBuildConfigurationTranslator
     public const int MaxStatSlots = 10;
     public const int MaxSpellSlots = 5;
 
+    /// <summary>item_template carries dmg_min1..5 / dmg_max1..5 / dmg_type1..5. Only slot 1 is
+    /// configurable; the rest are cleared whenever damage is written so an inherited second damage
+    /// line cannot stack on top of a fresh roll.</summary>
+    public const int DamageSlots = 5;
+
     // Vanilla class masks use (class id - 1), and class ids 6 and 10 do not exist.
     // Warrior, Paladin, Hunter, Rogue, Priest, Shaman, Mage, Warlock, Druid.
     public const int VanillaPlayableClassMask =
@@ -185,6 +190,18 @@ public static class VanillaItemBuildConfigurationTranslator
             {
                 overrides["dmg_min1"] = FloatLiteral(damageMin);
                 overrides["dmg_max1"] = FloatLiteral(damageMax);
+
+                // Slots 2..5 are cleared for the same reason TranslateStats and TranslateSpells clear
+                // theirs: the row this lands on is a CLONE of something, and whatever it carried in
+                // the higher slots survives an override that only writes slot 1. A vanilla weapon with
+                // a second (elemental) damage line, re-rolled here, would keep that line stacked on
+                // top of the new roll and hit for more than the budget it was generated against.
+                for (int slot = 2; slot <= DamageSlots; slot++)
+                {
+                    overrides[$"dmg_min{slot}"] = "0";
+                    overrides[$"dmg_max{slot}"] = "0";
+                    overrides[$"dmg_type{slot}"] = "0";
+                }
             }
         }
 

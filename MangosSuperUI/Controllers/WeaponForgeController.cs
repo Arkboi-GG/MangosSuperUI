@@ -1570,7 +1570,19 @@ public class WeaponForgeController : Controller
         string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
             ? LegacyItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
             : weaponType;
-        var profile = WeaponTypeCatalog.Get(typeKey);
+        // Same fail-closed rule as the forge path — previewing as a sword what cannot be forged as
+        // one is how the silent fallback stayed invisible.
+        var previewProfile = WeaponTypeCatalog.Find(typeKey);
+        if (previewProfile is null)
+            return Json(new
+            {
+                ok = false,
+                expansion = src.Key,
+                error = string.IsNullOrWhiteSpace(typeKey)
+                    ? $"{src.Label} item {entry} is a weapon subclass the Forge has no family for (fist weapon, spear and fishing pole are not importable). Pick a family explicitly to preview it as that family."
+                    : $"Unknown weapon family '{typeKey}'.",
+            });
+        WeaponTypeProfile profile = previewProfile;
         int effectiveInventoryType = EffectiveTbcInventoryType(item, profile);
         object? grip = null;
         try { grip = BuildGripInfo(mesh, profile, _donors.Resolve(profile)); }
@@ -1662,7 +1674,18 @@ public class WeaponForgeController : Controller
         string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
             ? LegacyItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
             : weaponType;
-        var profile = WeaponTypeCatalog.Get(typeKey);
+        // Fail closed. Get()'s fallback would forge a 1H SWORD for any family it does not know —
+        // including the subclasses the catalog deliberately declines (fist weapon, spear, fishing
+        // pole) — and nothing downstream would say so.
+        var profile = WeaponTypeCatalog.Find(typeKey);
+        if (profile is null)
+            return BadRequest(new
+            {
+                ok = false,
+                error = string.IsNullOrWhiteSpace(typeKey)
+                    ? $"{src.Label} item {entry} is a weapon subclass the Forge has no family for (fist weapon, spear and fishing pole are not importable). Pick a family explicitly to forge it as that family instead."
+                    : $"Unknown weapon family '{typeKey}'.",
+            });
         var familyErrors = ValidateConfigurationForWeaponFamily(profile, configuredItem);
         if (familyErrors.Count > 0)
             return BadRequest(new { ok = false, error = "The item configuration does not match the weapon family.", errors = familyErrors });
@@ -1737,6 +1760,33 @@ public class WeaponForgeController : Controller
         // source presentation values above. Omitted values preserve those existing contracts.
         itemOverrides = MergeItemOverrides(itemOverrides, configuredItem);
 
+        // ── Authentic source icon ───────────────────────────────────────────────────────────────
+        // The import used to ship the family DONOR's icon, so a forged Warglaive showed a plain
+        // sword. The source display row names its own icon; use it, and carry the BLP across only
+        // when the vanilla client has no file by that name (most TBC icon names already exist in
+        // 1.12 — an icon shared with a vanilla item resolves for free).
+        string? iconStem = string.IsNullOrWhiteSpace(sel.IconStem) ? null : sel.IconStem;
+        byte[]? iconBlp = null;
+        if (iconStem is not null)
+        {
+            string member = $@"Interface\Icons\{iconStem}.blp";
+            bool inVanilla = _mpq.ExtractFile(member) is { Length: > 0 }
+                          || _mpq.ExtractFile(member.ToLowerInvariant()) is { Length: > 0 };
+            if (!inVanilla)
+            {
+                iconBlp = src.Mpq.ExtractFile(member) ?? src.Mpq.ExtractFile(member.ToLowerInvariant());
+                if (iconBlp is not { Length: > 0 })
+                {
+                    // Neither client has it (measured: 11 of 585, mostly consumable icons sitting on
+                    // weapon rows). Fall back to the donor rather than ship a name nothing resolves.
+                    diag.Warn("icon.unavailable",
+                        $"Source icon '{iconStem}' is in neither the vanilla nor the {src.Label} client; using the family donor's icon instead.");
+                    iconStem = null;
+                    iconBlp = null;
+                }
+            }
+        }
+
         try
         {
             byte[]? adjustedTexturePng = AdjustTexture(texturePng, brightness, saturation);
@@ -1750,6 +1800,11 @@ public class WeaponForgeController : Controller
                      : item is not null ? item.Name
                      : PrettyTbcName(sel.ModelStem),
                 SourceKind = src.Key + "_import",   // "tbc_import" / "wotlk_import"
+                // The source item's OWN inventory icon, and its bytes only when 1.12 lacks a file by
+                // that name. Measured across the TBC weapon set: 472 of 585 icon names already exist
+                // in vanilla, so most imports package nothing and simply reference the name.
+                IconStem = iconStem,
+                IconBlp = iconBlp,
                 WeaponTypeKey = profile.Key,
                 ItemOverrides = itemOverrides,
                 Mesh = mesh,
@@ -2113,6 +2168,103 @@ public class WeaponForgeController : Controller
     // ── Itemization (tier/spec starting-point stats — Armor Forge parity) ─
 
     /// <summary>The class → archetype catalog for the spec picker in the Configure-item modal.</summary>
+    // ── Vanilla lane (clone an existing 1.12 weapon) ────────────────────
+    //
+    // The third lane. It reads the LIVE world DB rather than a mounted client archive, so unlike
+    // TBC/WotLK it is always available and needs no Settings path. Nothing is packaged: the clone
+    // keeps the source's display, so its model, texture, sheath and grip are already in the client.
+
+    /// <summary>GET /WeaponForge/VanillaWeapons?search=&amp;family=&amp;limit= — browse stock weapons
+    /// (and shields) in the world DB as clone sources.</summary>
+    [HttpGet]
+    public async Task<IActionResult> VanillaWeapons(string? search = null, string? family = null, int limit = 60)
+    {
+        try
+        {
+            var weapons = await _builder.BrowseVanillaWeaponsAsync(search, family, limit);
+            return Json(new
+            {
+                ok = true,
+                total = weapons.Count,
+                weapons = weapons.Select(w => new
+                {
+                    entry = w.Entry, name = w.Name, quality = w.Quality, itemLevel = w.ItemLevel,
+                    displayId = w.DisplayId, itemClass = w.ItemClass, subclass = w.Subclass,
+                    inventoryType = w.InventoryType, inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(w.InventoryType),
+                    delayMs = w.DelayMs, damageMin = w.DamageMin, damageMax = w.DamageMax,
+                    family = w.Family, familyLabel = w.FamilyLabel, expansion = "vanilla",
+                }),
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: vanilla weapon browse failed");
+            return Json(new { ok = false, total = 0, weapons = Array.Empty<object>(), error = ex.Message });
+        }
+    }
+
+    /// <summary>GET /WeaponForge/VanillaWeaponSource?entry= — the source weapon's real gameplay, to
+    /// pre-fill the Configure modal. NOT optional for weapons: the modal always submits a full
+    /// override set and its defaults are a 2–4 damage trinket, so a clone without this pre-fill
+    /// silently re-rolls the source into junk.</summary>
+    [HttpGet]
+    public async Task<IActionResult> VanillaWeaponSource(uint entry)
+    {
+        var s = await _builder.ReadVanillaWeaponSourceAsync(entry);
+        if (s is null) return NotFound(new { ok = false, error = $"Item {entry} is not a stock weapon or shield." });
+        return Json(new
+        {
+            ok = true,
+            name = s.Name, quality = s.Quality, itemLevel = s.ItemLevel, requiredLevel = s.RequiredLevel,
+            buyPrice = s.BuyPrice, sellPrice = s.SellPrice,
+            itemClass = s.ItemClass, subclass = s.Subclass,
+            inventoryType = s.InventoryType, inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(s.InventoryType),
+            family = s.Family, familyLabel = s.FamilyLabel,
+            damageMin = s.DamageMin, damageMax = s.DamageMax, damageType = s.DamageType, delayMs = s.DelayMs,
+            sheath = s.Sheath, ammoType = s.AmmoType, rangeMod = s.RangeModPercent,
+            armor = s.Armor, block = s.Block, maxDurability = s.MaxDurability, bonding = s.Bonding,
+            allowableClass = s.AllowableClass,
+            holyRes = s.HolyRes, fireRes = s.FireRes, natureRes = s.NatureRes,
+            frostRes = s.FrostRes, shadowRes = s.ShadowRes, arcaneRes = s.ArcaneRes,
+            stats = s.Stats.Select(t => new { type = t.Type, value = t.Value }),
+            spells = s.Spells.Select(sp => new
+            {
+                spellId = sp.SpellId, trigger = sp.Trigger, charges = sp.Charges, ppmRate = sp.PpmRate,
+                cooldownMs = sp.CooldownMs, category = sp.Category, categoryCooldownMs = sp.CategoryCooldownMs,
+            }),
+        });
+    }
+
+    /// <summary>POST /WeaponForge/CloneVanilla — clone a stock weapon into a new custom entry and
+    /// re-itemize it. No patch, no display id, no client restart.</summary>
+    [HttpPost]
+    public async Task<IActionResult> CloneVanilla(uint entry, string? name = null, string? itemConfig = null)
+    {
+        var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
+            itemConfig, HttpContext.RequestAborted);
+        if (configurationErrors.Count > 0)
+            return BadRequest(new { ok = false, error = "The Vanilla item configuration is invalid.", errors = configurationErrors });
+
+        var result = await _builder.CloneVanillaWeaponAsync(entry, name, configuredItem);
+        if (!result.Ok) return BadRequest(new { ok = false, error = result.Message });
+        return Json(new
+        {
+            ok = true,
+            sourceEntry = result.SourceEntry,
+            itemEntry = result.ItemEntry,
+            displayId = result.DisplayId,
+            name = result.Name,
+            family = result.Family,
+            inventoryType = result.InventoryType,
+            inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(result.InventoryType),
+            reloaded = result.Reloaded,
+            reloadMessage = result.ReloadMessage,
+            message = result.Message,
+            note = "The clone reuses the source's display, so nothing is packaged and no client restart is needed. " +
+                   "It is not in the Forged Weapons list (that list is keyed on custom displays) — manage it from the Items page.",
+        });
+    }
+
     [HttpGet]
     public IActionResult SpecCatalog() => Json(new { ok = true, classes = SpecProfileCatalog.ForUi() });
 

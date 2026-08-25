@@ -2526,6 +2526,15 @@ $(function () {
         '.ab-split-txt b{font-weight:700;}' +
         '.ab-split-txt .a b{color:#6f9dff;}' +
         '.ab-split-txt .h b{color:#ec6a52;}' +
+        '.ab-quick{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:9px;}' +
+        '.ab-qlabel{font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:var(--text-muted,#787c99);}' +
+        '.ab-q{font-size:11px;height:22px;padding:0 9px;cursor:pointer;border-radius:6px;border:1px solid var(--border-light,#414868);background:transparent;color:var(--text-muted,#787c99);font-variant-numeric:tabular-nums;transition:all .12s;}' +
+        '.ab-q:hover{color:var(--text-secondary,#c0caf5);border-color:var(--accent,#7aa2f7);}' +
+        '.ab-q.on{background:rgba(122,162,247,0.16);border-color:var(--accent,#7aa2f7);color:var(--text-secondary,#c0caf5);font-weight:600;}' +
+        '.ab-q.sa:hover,.ab-q.sa.on{border-color:#4a86ff;color:#8fb4ff;}' +
+        '.ab-q.sh:hover,.ab-q.sh.on{border-color:#e0503a;color:#f08a76;}' +
+        '.ab-q:disabled{opacity:.4;cursor:default;border-color:var(--border-light,#414868);color:var(--text-muted,#787c99);}' +
+        '.ab-qsep{width:1px;height:15px;background:var(--border-light,#414868);margin:0 4px;}' +
         '.ab-rtot{margin-left:auto;font-size:11px;font-weight:600;color:var(--text-muted,#787c99);font-variant-numeric:tabular-nums;}' +
         '.ab-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px;}' +
         '.ab-card{position:relative;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px 9px 14px;border-radius:10px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);overflow:hidden;transition:opacity .14s,box-shadow .14s,border-color .14s;}' +
@@ -2587,6 +2596,19 @@ $(function () {
         '<label>Alliance <input type="number" class="ab-fa" id="abRandA" min="0" max="100" inputmode="numeric" value="50" />%</label>' +
         '<label>Horde <input type="number" class="ab-fh" id="abRandH" min="0" max="100" inputmode="numeric" value="50" />%</label>' +
         '<button class="ab-rand-go" id="abRandGo"><i class="fa-solid fa-shuffle"></i> Fill</button>' +
+        '</div>' +
+        '<div class="ab-quick">' +
+        '<span class="ab-qlabel">Total</span>' +
+        '<button class="ab-q" data-ab-qty="25">25</button>' +
+        '<button class="ab-q" data-ab-qty="50">50</button>' +
+        '<button class="ab-q" data-ab-qty="100">100</button>' +
+        '<button class="ab-q" data-ab-qty="250">250</button>' +
+        '<button class="ab-q" data-ab-qty="max" id="abQtyMax">Max</button>' +
+        '<span class="ab-qsep"></span>' +
+        '<span class="ab-qlabel">Split</span>' +
+        '<button class="ab-q" data-ab-split="50">50 / 50</button>' +
+        '<button class="ab-q sa" data-ab-split="100">All Alliance</button>' +
+        '<button class="ab-q sh" data-ab-split="0">All Horde</button>' +
         '</div>' +
         '<div class="ab-split"><i class="sa" id="abSplitA"></i><i class="sh" id="abSplitH"></i></div>' +
         '<div class="ab-split-txt"><span class="a">Alliance <b id="abSplitAN">0</b></span><span class="h"><b id="abSplitHN">0</b> Horde</span></div>' +
@@ -2771,7 +2793,10 @@ $(function () {
     $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#addBotsModal').removeClass('active'); });
 
     // --- Per-cell editing: type, +/-, Enter to commit ---
-    $(document).on('focus', '.ab-cnt', function () { var el = this; setTimeout(function () { el.select(); }, 0); });
+    $(document).on('focus', '.ab-cnt, .ab-rand input', function () { var el = this; setTimeout(function () { el.select(); }, 0); });
+    // A focused type="number" consumes the wheel: scrolling this (scrollable) modal with the cursor
+    // over one silently changes the number. Dropping focus first lets the scroll through untouched.
+    $(document).on('wheel', '.ab-cnt, .ab-rand input', function () { if (this === document.activeElement) this.blur(); });
     $(document).on('input', '.ab-cnt', function () {
         var kv = abParseKey($(this).attr('data-ab-key'));
         if ($(this).val() === '') { abCounts[kv.race][kv.cls] = 0; abUpdateTotals(); return; }   // mid-edit blank: don't fight the caret
@@ -2812,6 +2837,7 @@ $(function () {
         $('#abSplitH').css('width', (100 - pa) + '%');
         $('#abSplitAN').text(abFmt(alliance));
         $('#abSplitHN').text(abFmt(horde));
+        abSyncQuick();
         return { total: total, alliance: alliance, horde: horde };
     }
 
@@ -2841,6 +2867,40 @@ $(function () {
         renderAddBots();
         if (p.total > 0) showToast('Randomized ' + abFmt(p.total) + ' — ' + abFmt(p.alliance) + ' Alliance / ' + abFmt(p.horde) + ' Horde');
     }
+
+    // Quick-set chips: the common answers, without typing. They set the boxes and refresh the
+    // preview - Fill stays an explicit second step, same as it is for a hand-typed total.
+    function abSyncQuick() {
+        var cur = parseInt($('#abRandTotal').val(), 10);
+        $('[data-ab-qty]').each(function () {
+            var v = $(this).attr('data-ab-qty');
+            $(this).toggleClass('on', v !== 'max' && parseInt(v, 10) === cur);
+        });
+        var max = abEffectiveMax(), known = isFinite(max);
+        $('#abQtyMax').prop('disabled', !known)
+            .toggleClass('on', known && cur === max)
+            .text(known ? 'Max ' + abFmt(max) : 'Max')
+            .attr('title', known
+                ? 'The lower of the per-batch ceiling and the unused-name pool'
+                : 'No readable ceiling yet - type a total');
+        var pct = abRandAlliancePct();
+        $('[data-ab-split]').each(function () {
+            $(this).toggleClass('on', parseInt($(this).attr('data-ab-split'), 10) === pct);
+        });
+    }
+    $(document).on('click', '[data-ab-qty]', function () {
+        var v = $(this).attr('data-ab-qty');
+        var n = v === 'max' ? abEffectiveMax() : parseInt(v, 10);
+        if (!isFinite(n)) return;
+        $('#abRandTotal').val(abClamp(n));
+        abRandPreview();
+    });
+    $(document).on('click', '[data-ab-split]', function () {
+        var a = parseInt($(this).attr('data-ab-split'), 10);
+        $('#abRandA').val(a);
+        $('#abRandH').val(100 - a);
+        abRandPreview();
+    });
 
     $('#abRandGo').on('click', abRandomize);
     $('#abRandTotal').on('input', abRandPreview);
@@ -2875,6 +2935,11 @@ $(function () {
             .done(function (res) {
                 if (res && res.success && res.job) {
                     showToast('Spawning ' + abFmt(total) + ' bot(s) in the background');
+                    // The batch belongs to the server now, so unload the picker. Left staged, the
+                    // same counts sit there through the run and Spawn re-enables itself the moment
+                    // the batch finishes - one stray click from silently doubling the fleet. The
+                    // modal stays open because it is where the progress lives; it just isn't loaded.
+                    abClearAll();
                     abOnSpawnProgress(res.job);
                 } else {
                     showToast('Add bots failed: ' + ((res && res.error) || 'unknown'), true);

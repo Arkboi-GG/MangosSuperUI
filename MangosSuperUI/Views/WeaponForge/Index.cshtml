@@ -657,6 +657,46 @@
             </div>
 
             <div class="wf-card">
+                <h3><span class="phase">Clone</span> Vanilla weapon</h3>
+                <p id="vanillaState">Clone an existing <strong>vanilla weapon or shield</strong> into a new custom item and
+                   re-itemize it (name, quality, damage, speed, stats, effects, price). It reuses the source's own
+                   display — model, texture, icon, sheath, grip and sound are already in your client — so
+                   <strong>nothing is packaged</strong>: no patch, no download, no client restart. Usable via
+                   <code>.additem</code> as soon as the core reloads. Reads the live world database, so unlike the
+                   TBC and WotLK lanes it needs no client path in Settings.</p>
+                <div class="wf-row">
+                    <div class="wf-field" style="flex:1;min-width:220px;">
+                        <label>Search vanilla weapons</label>
+                        <input type="text" id="vanillaSearch" placeholder="Search by name or item id — e.g. Thunderfury, Quel'Serrar, 17182…" style="width:100%;">
+                    </div>
+                    <div class="wf-field" title="Filter by weapon family">
+                        <label>Family</label>
+                        <select id="vanillaFamily"><option value="">All families</option></select>
+                    </div>
+                </div>
+                <div id="vanillaResults" class="wf-modal-list" style="max-height:260px;margin-top:8px;">
+                    <div style="padding:14px;color:var(--text-muted);font-size:12px;">Search to browse vanilla weapons.</div>
+                </div>
+                <div class="wf-row" style="margin-top:10px;">
+                    <div class="wf-field" style="flex:1;min-width:200px;">
+                        <label>Selected</label>
+                        <input type="text" id="vanillaSelected" readonly placeholder="nothing selected" style="width:100%;">
+                    </div>
+                    <button class="wf-btn" data-action="vanillaClone" id="vanillaCloneBtn" disabled>
+                        <i class="fa-solid fa-sliders"></i> Configure item…</button>
+                </div>
+                <div class="wf-note">
+                    The clone keeps the source's <strong>equip slot and weapon subclass</strong> — a stock display cannot be
+                    re-scaffolded for a different family, so slot changes belong to the import lanes, which build a model for
+                    the family they claim. Everything the config modal does not express (sheath, sound, ammo type, range)
+                    rides across from the source verbatim. The Configure modal is <em>pre-filled from the source item</em>, so
+                    what you edit starts from its real values rather than from blank defaults. Clones do not appear in the
+                    Forged Weapons list below — that list is keyed on custom displays and a clone has none — manage them from
+                    the <a href="/Items">Items page</a>, or undo one from the <a href="/Changes">Change Graph</a>.
+                </div>
+            </div>
+
+            <div class="wf-card">
                 <h3><span class="phase">Registry</span> Forged Weapons</h3>
                 <p>The weapons currently in the registry — the exact contents of <code>patch-5.MPQ</code>.
                    <strong>View</strong> renders a weapon's stored M2+BLP in the viewer. <strong>Delete</strong>
@@ -1284,10 +1324,33 @@
         function prettyFileName(name) {
             return String(name || '').replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
         }
-        function itemBuildOpen(mode) {
+        async function itemBuildOpen(mode) {
             if (itemBuildSubmitting) return;
             let source, familyKey, familyLabel, name, quality = 1, itemLevel = 3, inventoryType = 13;
-            if (mode === 'glb') {
+            // The vanilla lane pre-fills from the source item, so its config is fetched BEFORE the
+            // modal opens: the form's defaults are a 2–4 damage, 20-durability, 54-copper trinket,
+            // and every one of those fields is submitted whether or not it was touched. Opening on
+            // those defaults and filling in afterwards would show the operator junk values first.
+            let vanillaSource = null;
+            if (mode === 'vanilla') {
+                const w = VANILLA.sel;
+                if (!w) { setResult({ title: 'No weapon selected', error: 'Search and pick a vanilla weapon first.' }); return; }
+                try {
+                    const r = await fetch('/WeaponForge/VanillaWeaponSource?entry=' + w.entry);
+                    vanillaSource = await r.json();
+                    if (!r.ok || !vanillaSource?.ok) throw new Error(vanillaSource?.error || 'could not read the source item');
+                } catch (e) {
+                    setResult({ title: 'Clone unavailable', error: `Could not read vanilla item ${w.entry}: ${e}` });
+                    return;
+                }
+                familyKey = w.family || '';
+                familyLabel = w.familyLabel || 'Weapon';
+                source = `${w.name} (vanilla item ${w.entry})`;
+                name = vanillaSource.name || w.name;
+                quality = vanillaSource.quality ?? 1;
+                itemLevel = vanillaSource.itemLevel || 1;
+                inventoryType = vanillaSource.inventoryType || w.inventoryType || 13;
+            } else if (mode === 'glb') {
                 const file = document.getElementById('glbFile').files[0];
                 if (!file) { setResult({ title: 'No file', error: 'Choose a .glb first.' }); return; }
                 familyKey = document.getElementById('impType').value || 'sword1h';
@@ -1312,7 +1375,9 @@
                 lastFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null,
             };
             resetItemBuildForm({ source, familyKey, familyLabel, name, quality, itemLevel, inventoryType });
-            document.getElementById('ibSourceKind').textContent = mode === 'glb' ? 'GLB import' : `${LEGACY[mode].label} import`;
+            if (mode === 'vanilla') prefillFromVanillaWeapon(vanillaSource, inventoryType);
+            document.getElementById('ibSourceKind').textContent =
+                mode === 'glb' ? 'GLB import' : mode === 'vanilla' ? 'Vanilla clone' : `${LEGACY[mode].label} import`;
             document.getElementById('ibHeadSource').textContent = source;
             document.getElementById('ibNavSource').textContent = source;
             document.getElementById('ibNavFamily').textContent = familyLabel;
@@ -1364,6 +1429,71 @@
             renderItemBuildEmptyStates();
             updateQualityReadout();
             hideItemBuildErrors();
+        }
+        // Overwrite the reset form with the SOURCE item's real values. Without this a clone submits
+        // the form defaults for every field the operator did not visit, which for Thunderfury means
+        // shipping a 2–4 damage, 20-durability, 54-copper, any-class copy of it.
+        function prefillFromVanillaWeapon(src, sourceInventoryType) {
+            if (!src) return;
+            const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v ?? ''; };
+
+            // The slot is not editable on this lane: the clone reuses a STOCK display, which cannot
+            // be re-scaffolded for another family, and the server drops any inventory_type override
+            // it is sent. Present it as the single, locked option so the form matches the contract.
+            const slot = document.getElementById('ibInventoryType');
+            slot.innerHTML = `<option value="${sourceInventoryType}">${ITEM_SLOT_NAMES[sourceInventoryType] || `Inventory type ${sourceInventoryType}`}</option>`;
+            slot.value = String(sourceInventoryType);
+            slot.title = 'A vanilla clone keeps the source weapon’s equip slot — it reuses the source display, ' +
+                         'which is built for that slot. Use the TBC/WotLK or GLB lanes to forge into a different family.';
+
+            set('ibQuality', String(src.quality ?? 1));
+            set('ibItemLevel', src.itemLevel || 1);
+            set('ibRequiredLevel', src.requiredLevel || 0);
+            set('ibDamageMin', src.damageMin || 0);
+            set('ibDamageMax', src.damageMax || 0);
+            set('ibDamageType', String(src.damageType || 0));
+            // Blank means "leave the cloned delay alone"; a real delay is carried so the modal's
+            // generator budgets against the weapon's actual swing speed.
+            set('ibSpeed', src.delayMs > 0 ? (src.delayMs / 1000).toFixed(1) : '');
+            set('ibArmor', src.armor || 0); set('ibBlock', src.block || 0);
+            set('ibHolyRes', src.holyRes || 0); set('ibFireRes', src.fireRes || 0); set('ibNatureRes', src.natureRes || 0);
+            set('ibFrostRes', src.frostRes || 0); set('ibShadowRes', src.shadowRes || 0); set('ibArcaneRes', src.arcaneRes || 0);
+            set('ibMaxDurability', src.maxDurability || 0);
+            set('ibBonding', String(src.bonding || 0));
+            ibSetCoins('Buy', src.buyPrice || 0);
+            ibSetCoins('Sell', src.sellPrice || 0);
+
+            // allowable_class: -1 (or 0) is "no restriction" and stays all-checked.
+            const bits = [...document.querySelectorAll('[data-mask="class"]')];
+            const mask = src.allowableClass;
+            if (Number.isInteger(mask) && mask > 0) {
+                bits.forEach(x => { x.checked = ((mask >> +x.dataset.bit) & 1) === 1; });
+                document.querySelector('[data-mask-all="class"]').checked = bits.every(b => b.checked);
+            }
+
+            document.querySelectorAll('#ibStats .wf-stat-row').forEach(r => r.remove());
+            for (const s of src.stats || []) addItemStat(s.type, s.value);
+
+            // The source's own effects are by definition native stock item slots, which is exactly
+            // what the server-side re-check requires — so they survive the round trip unedited.
+            document.querySelectorAll('#ibSpells .wf-spell-card').forEach(c => c.remove());
+            for (const sp of src.spells || []) {
+                addItemSpell(sp.trigger);
+                const card = document.querySelector('#ibSpells .wf-spell-card:last-child');
+                if (!card) break;
+                card.querySelector('.ib-spell-id').value = sp.spellId;
+                card.querySelector('.ib-spell-trigger').value = String(sp.trigger);
+                card.querySelector('.ib-spell-charges').value = sp.charges || 0;
+                card.querySelector('.ib-spell-ppm').value = sp.trigger === 2 ? (sp.ppmRate || 0) : 0;
+                card.querySelector('.ib-spell-cooldown').value = sp.cooldownMs >= 0 ? (sp.cooldownMs / 1000) : '';
+                card.querySelector('.ib-spell-category').value = sp.category || 0;
+                card.querySelector('.ib-spell-category-cooldown').value = sp.categoryCooldownMs >= 0 ? (sp.categoryCooldownMs / 1000) : '';
+                configurePpmField(card);
+            }
+
+            renderItemBuildEmptyStates();
+            updateQualityReadout();
+            updateItemBuildReview();
         }
         function configureItemInventoryTypes(familyKey, preferred) {
             const meta = weaponTypeMeta.get(familyKey);
@@ -1809,7 +1939,7 @@
             const raceCount = config.allowableRace === -1 ? 'All' : document.querySelectorAll('[data-mask="race"]:checked').length;
             return `<div class="wf-review-block"><h5>Identity</h5>
                 <div class="wf-review-line"><span>Name</span><b style="color:${QUALITY_COLORS[config.quality] || 'inherit'}">${esc(config.name || 'Name required')}</b></div>
-                <div class="wf-review-line"><span>Source</span><b>${esc(itemBuildState.mode === 'glb' ? 'GLB import' : `${LEGACY[itemBuildState.mode].label} import`)}</b></div>
+                <div class="wf-review-line"><span>Source</span><b>${esc(itemBuildSourceKindLabel())}</b></div>
                 <div class="wf-review-line"><span>Family</span><b>${esc(itemBuildState.familyLabel)}</b></div>
                 <div class="wf-review-line"><span>Quality / slot</span><b>${esc(ITEM_QUALITY_NAMES[config.quality] || '?')} · ${esc(ITEM_SLOT_NAMES[config.inventoryType] || '?')}</b></div></div>
                 <div class="wf-review-block"><h5>Power</h5>
@@ -1835,6 +1965,12 @@
             const html = itemReviewHtml(collectItemConfig());
             document.getElementById('ibReviewSide').innerHTML = html;
             document.getElementById('ibReviewFull').innerHTML = html;
+        }
+        function itemBuildSourceKindLabel() {
+            const mode = itemBuildState.mode;
+            if (mode === 'glb') return 'GLB import';
+            if (mode === 'vanilla') return 'Vanilla clone';
+            return `${LEGACY[mode].label} import`;
         }
         async function submitItemBuild() {
             if (itemBuildSubmitting) return;
@@ -1864,7 +2000,12 @@
                 const mode = itemBuildState.mode;
                 const familyKey = itemBuildState.familyKey;
                 const fd = new FormData();
-                if (mode === 'glb') {
+                if (mode === 'vanilla') {
+                    // Nothing to package: no file, no mesh controls, no glow or recolor bake. Just
+                    // which stock weapon to copy and what the new item should be.
+                    if (!VANILLA.sel) throw new Error('The selected vanilla weapon is no longer available.');
+                    fd.append('entry', VANILLA.sel.entry);
+                } else if (mode === 'glb') {
                     const file = document.getElementById('glbFile').files[0];
                     if (!file) throw new Error('The selected GLB is no longer available.');
                     fd.append('file', file);
@@ -1892,21 +2033,41 @@
                 const resolvedErrors = validateItemConfig(config);
                 if (resolvedErrors.length) { showItemBuildErrors(resolvedErrors); return; }
 
-                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Forging…';
-                status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Forging the final item…';
+                const cloning = mode === 'vanilla';
+                btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${cloning ? 'Cloning…' : 'Forging…'}`;
+                status.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${cloning ? 'Cloning the item…' : 'Forging the final item…'}`;
                 fd.append('name', config.name);
                 fd.append('itemConfig', JSON.stringify(config));
-                const url = mode === 'glb' ? '/WeaponForge/ForgeGlb' : LEGACY[mode].urls.forge;
+                const url = cloning ? '/WeaponForge/CloneVanilla'
+                    : mode === 'glb' ? '/WeaponForge/ForgeGlb'
+                    : LEGACY[mode].urls.forge;
                 const response = await fetch(url, { method: 'POST', body: fd });
                 const d = await response.json().catch(() => null);
                 if (!response.ok || !d?.ok) {
-                    showItemBuildErrors([d?.error || d?.message || 'Forge failed.', ...(d?.errors || []), ...(d?.diagnostics || [])]);
+                    showItemBuildErrors([d?.error || d?.message || (cloning ? 'Clone failed.' : 'Forge failed.'), ...(d?.errors || []), ...(d?.diagnostics || [])]);
                     return;
                 }
-                if (mode === 'glb') document.getElementById('glbName').value = config.name;
+                if (cloning) { /* no lane name field to write back — the source list is unchanged */ }
+                else if (mode === 'glb') document.getElementById('glbName').value = config.name;
                 else LEGACY[mode].el('Name').value = config.name;
                 closeItemBuild(true);
-                forgeResult(d, mode === 'glb' ? 'GLB forged' : `${LEGACY[mode].label} weapon forged`);
+                if (cloning) {
+                    setResult({
+                        title: 'Vanilla weapon cloned',
+                        kv: {
+                            'Item entry': d.itemEntry,
+                            'Name': d.name,
+                            'Cloned from': `${VANILLA.sel.name} (${d.sourceEntry})`,
+                            'Display': `${d.displayId} (source's own — nothing packaged)`,
+                            'Slot': d.inventoryTypeLabel || d.inventoryType,
+                            'Add in game': `.additem ${d.itemEntry}`,
+                        },
+                        diagnostics: [applyLine(d.reloaded, 'Reload', d.reloadMessage || '')],
+                        note: d.note,
+                    });
+                } else {
+                    forgeResult(d, mode === 'glb' ? 'GLB forged' : `${LEGACY[mode].label} weapon forged`);
+                }
             } catch (e) {
                 showItemBuildErrors([String(e)]);
             } finally {
@@ -2137,6 +2298,10 @@
             async wotlkBrowse(btn) { await laneBrowse(LEGACY.wotlk); },
             async wotlkPreview(btn) { await lanePreview(LEGACY.wotlk); },
             async wotlkForge(btn) { laneForge(LEGACY.wotlk); },
+            async vanillaClone(btn) {
+                if (!VANILLA.sel) return setResult({ title: 'No weapon selected', error: 'Search and pick a vanilla weapon first.' });
+                await itemBuildOpen('vanilla');
+            },
             async rebuildPatch(btn) {
                 const d = await (await fetch('/WeaponForge/RebuildPatch', { method: 'POST' })).json();
                 if (!d.ok) return setResult({ title: 'Rebuild failed', error: d.error });
@@ -2276,6 +2441,85 @@
                 preview: '/WeaponForge/WotlkPreviewWeapon', forge: '/WeaponForge/ForgeWotlk' }),
         };
         const LEGACY_LANES = [LEGACY.tbc, LEGACY.wotlk];
+
+        // ---------- vanilla clone lane ----------
+        // Deliberately NOT a makeLane(): that abstraction is built around a mounted client archive
+        // (status probe, paged MPQ browse, mesh preview, triangle budget, glow and recolor bakes).
+        // The vanilla lane has none of those — it reads the live world DB and packages nothing — so
+        // it gets its own small block rather than a lane object with most fields unused.
+        const VANILLA = { sel: null, searchTimer: null, rows: [] };
+
+        function vanillaSetSelection(w) {
+            VANILLA.sel = w;
+            document.getElementById('vanillaSelected').value = w
+                ? `${w.name} — ${w.familyLabel}, ${w.inventoryTypeLabel} (item ${w.entry}, display ${w.displayId})`
+                : '';
+            document.getElementById('vanillaCloneBtn').disabled = !w;
+            document.querySelectorAll('#vanillaResults tr[data-entry]').forEach(tr =>
+                tr.style.background = (w && +tr.dataset.entry === +w.entry) ? '#ffffff14' : '');
+        }
+
+        function vanillaRenderResults(rows, note) {
+            const host = document.getElementById('vanillaResults');
+            VANILLA.rows = rows || [];
+            vanillaSetSelection(null);
+            if (!VANILLA.rows.length) {
+                host.innerHTML = `<div style="padding:14px;color:var(--text-muted);font-size:12px;">${esc(note || 'No vanilla weapons matched.')}</div>`;
+                return;
+            }
+            let html = '<table><tr><th>Name</th><th>ilvl</th><th>Family</th><th>Slot</th><th>DPS</th><th>ID</th></tr>';
+            for (const w of VANILLA.rows) {
+                // Shields have no damage or delay, so no dps line — the same shape the item modal uses.
+                const dps = w.delayMs > 0 && w.damageMax > 0
+                    ? (((w.damageMin + w.damageMax) / 2) / (w.delayMs / 1000)).toFixed(1)
+                    : '—';
+                const col = QUALITY_COLORS[w.quality] || QUALITY_COLORS[1];
+                html += `<tr data-entry="${w.entry}" title="display ${w.displayId}">` +
+                        `<td style="color:${col};font-weight:600;">${esc(w.name)}</td>` +
+                        `<td class="muted">${w.itemLevel || '—'}</td>` +
+                        `<td class="muted">${esc(w.familyLabel || '—')}</td>` +
+                        `<td class="muted">${esc(w.inventoryTypeLabel || '—')}</td>` +
+                        `<td class="muted">${dps}</td><td class="muted">${w.entry}</td></tr>`;
+            }
+            host.innerHTML = html + '</table>';
+            host.querySelectorAll('tr[data-entry]').forEach(tr => tr.addEventListener('click', () =>
+                vanillaSetSelection(VANILLA.rows.find(x => +x.entry === +tr.dataset.entry) || null)));
+        }
+
+        async function vanillaSearch() {
+            const host = document.getElementById('vanillaResults');
+            const q = new URLSearchParams({
+                search: document.getElementById('vanillaSearch').value.trim(),
+                family: document.getElementById('vanillaFamily').value || '',
+                limit: 60,
+            });
+            host.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:12px;">Searching…</div>';
+            try {
+                const d = await (await fetch('/WeaponForge/VanillaWeapons?' + q)).json();
+                if (!d.ok) return vanillaRenderResults([], d.error || 'Vanilla browse failed.');
+                vanillaRenderResults(d.weapons || [], 'No vanilla weapons matched.');
+            } catch (e) {
+                vanillaRenderResults([], 'Vanilla browse failed: ' + e);
+            }
+        }
+
+        // The family filter lists only the families the catalog knows. A clone needs no donor
+        // scaffold, so the browse also returns the subclasses the import lanes decline (fist
+        // weapons, spears, fishing poles) — they are reachable through "All families".
+        function vanillaFillFamilies() {
+            const sel = document.getElementById('vanillaFamily');
+            if (sel.options.length > 1 || !weaponTypeMeta.size) return;
+            for (const [key, meta] of weaponTypeMeta) sel.add(new Option(meta.label || key, key));
+        }
+
+        document.getElementById('vanillaSearch').addEventListener('input', () => {
+            clearTimeout(VANILLA.searchTimer);
+            VANILLA.searchTimer = setTimeout(vanillaSearch, 350);
+        });
+        document.getElementById('vanillaFamily').addEventListener('change', vanillaSearch);
+        const seedVanillaFamilies = setInterval(() => {
+            if (weaponTypeMeta.size) { clearInterval(seedVanillaFamilies); vanillaFillFamilies(); }
+        }, 250);
 
         function wireLane(lane) {
             lane.el('Target').addEventListener('input', () => {

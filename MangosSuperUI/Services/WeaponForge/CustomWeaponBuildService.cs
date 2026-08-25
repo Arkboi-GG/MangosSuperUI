@@ -110,7 +110,61 @@ public sealed class CustomWeaponBuildService
     // BUILD (one new weapon → persist → unified patch)
     // ═══════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// What a forge attempt had done to the world by the time it threw. A build reserves ids,
+    /// writes registry rows and inserts a world-DB row before anything can still fail, so a throw
+    /// leaves real state behind; without this the audit log's only record of the attempt would be
+    /// its absence. Filled in as the build passes each boundary and read by the failure entry.
+    /// </summary>
+    private sealed class ForgeAttemptTrace
+    {
+        public string? BuildId;
+        public long ItemEntry;
+        public long DisplayId;
+        public string? Name;
+        public string Stage = "start";
+    }
+
     public async Task<CustomWeaponBuildResult> BuildAsync(CustomWeaponBuildRequest request)
+    {
+        var trace = new ForgeAttemptTrace();
+        try
+        {
+            return await BuildCoreAsync(request, trace);
+        }
+        catch (Exception ex)
+        {
+            // The forge's success row is the last statement of the happy path, so a throw used to
+            // produce no row at all — reserved ids, persisted registry rows and a possibly-inserted
+            // world row with nothing in the log to find them by. Same entry shape, Success=false.
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "weaponforge",
+                Action = "forge_" + request.SourceKind,
+                TargetType = "item",
+                TargetName = trace.Name,
+                TargetId = trace.ItemEntry is > 0 and <= int.MaxValue ? (int)trace.ItemEntry : null,
+                StateAfter = JsonSerializer.Serialize(new
+                {
+                    buildId = trace.BuildId,
+                    failedAtStage = trace.Stage,
+                    itemEntry = trace.ItemEntry,
+                    displayId = trace.DisplayId,
+                    weaponType = request.WeaponTypeKey,
+                }),
+                IsReversible = false,
+                RevertKind = RevertKind.None,
+                Success = false,
+                Notes = $"Forge FAILED at stage '{trace.Stage}': {ex.Message}" +
+                        (trace.ItemEntry > 0
+                            ? $" Ids {trace.ItemEntry}/{trace.DisplayId} were reserved and may be orphaned — check the Forged Weapons list and the id registry."
+                            : " No ids were reserved."),
+            });
+            throw;
+        }
+    }
+
+    private async Task<CustomWeaponBuildResult> BuildCoreAsync(CustomWeaponBuildRequest request, ForgeAttemptTrace trace)
     {
         bool hasMesh = request.Mesh is not null;
         bool hasPrecompiled = request.PrecompiledM2 is { Length: > 0 };
@@ -136,13 +190,19 @@ public sealed class CustomWeaponBuildService
         string buildId = (request.SourceKind == "donor_patch" ? "gold-" : "wpn-") + Guid.NewGuid().ToString("N")[..12];
         long entryFloor = await _ids.ComputeItemEntryFloorAsync();
         long displayFloor = await _ids.ComputeDisplayIdFloorAsync(dbcMax);
+        trace.BuildId = buildId;
+        trace.Stage = "reserve";
         var entryRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemEntry, entryFloor, buildId, "item");
         var dispRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemDisplay, displayFloor, buildId, "display");
+        trace.ItemEntry = entryRes.Id;
+        trace.DisplayId = dispRes.Id;
 
         int modelIndex = checked((int)dispRes.Id); // 1 model ↔ 1 display; ties SUI_W names to the display id
         string weaponName = string.IsNullOrWhiteSpace(request.Name)
             ? $"Forged {profile.DefaultNoun} {dispRes.Id}"
             : request.Name.Trim();
+        trace.Name = weaponName;
+        trace.Stage = "compile";
 
         // 3) Compile (or accept precompiled donor bytes). BLP falls back to the donor texture so a
         //    textureless mesh still ships something valid to sample.
@@ -290,7 +350,26 @@ public sealed class CustomWeaponBuildService
                 overrides[col] = val;
         int effectiveInventoryType = ResolveEffectiveInventoryType(profile, overrides);
         var sql = WeaponItemTemplateSql.Build(entryRes.Id, weaponName, dispRes.Id, buildId, overrides);
-        string iconStem = donor.IconStem.Length > 0 ? donor.IconStem : ReadDonorIconStem(baseReader);
+        // The source item's own icon wins; the donor's is the fallback for GLB imports (which have
+        // no icon of their own) and for sources whose display row names no icon.
+        string iconStem = !string.IsNullOrWhiteSpace(request.IconStem) ? request.IconStem!
+                        : donor.IconStem.Length > 0 ? donor.IconStem
+                        : ReadDonorIconStem(baseReader);
+
+        // An icon the vanilla client does not have must ship with the patch, or the name in the DBC
+        // row resolves to nothing and the item shows the red "?". Rides custom_weapon_model_texture,
+        // which LoadEffectTextureMembersAsync packages by mpq_path alone — no schema change.
+        // Capture to a local: the compiler does not carry a property's null-narrowing across
+        // statements, and the tuple element is non-nullable.
+        if (request.IconBlp is { Length: > 0 } iconBytes && !string.IsNullOrWhiteSpace(iconStem))
+        {
+            string iconMember = $@"Interface\Icons\{iconStem}.blp";
+            if (!effectBlps.Any(e => string.Equals(e.MpqPath, iconMember, StringComparison.OrdinalIgnoreCase)))
+                effectBlps.Add((iconMember, iconBytes));
+            diag.Info("icon.packaged",
+                $"Packaging the source icon '{iconStem}' ({iconBytes.Length:N0} bytes) — the vanilla client has no icon by that name.");
+        }
+        trace.Stage = "persist";
         await PersistRecordsAsync(request, profile, donor, buildId, modelIndex, entryRes.Id, dispRes.Id,
             weaponName, effectiveInventoryType, m2, blp, effectBlps, sql, donorGroupSound, iconStem);
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
@@ -301,9 +380,14 @@ public sealed class CustomWeaponBuildService
         // the Retexture Engine does for its custom displays. Without this the forged weapon's display
         // id is absent from the statically-loaded server DBC and renders as the red "?" with no
         // texture. Cloned from the family's donor row, then overridden with the weapon's own SUI_W names.
-        RegisterDisplayWithDbc(dispRes.Id, modelIndex, donor.DisplayRow, donor.MirrorModelName2);
+        RegisterDisplayWithDbc(dispRes.Id, modelIndex, donor.DisplayRow, donor.MirrorModelName2,
+            itemVisual: request.ItemVisual);
+        // The donor-clone above copies the DONOR's icon. Override with the one actually written into
+        // the patch row, or the Items page and the client disagree about how the item looks.
+        if (!string.IsNullOrWhiteSpace(iconStem)) _dbc.RegisterCustomDisplayIcon((uint)dispRes.Id, iconStem);
 
         // 5) Unified rebuild: every custom weapon with stored bytes, this one included.
+        trace.Stage = "assemble";
         var assembly = await AssembleUnifiedPatchAsync(diag, buildId);
         if (assembly.Patch is null)
             throw new InvalidOperationException("Unified patch assembly produced no weapons — the just-persisted weapon should have been included.");
@@ -325,6 +409,7 @@ public sealed class CustomWeaponBuildService
 
         // 8) Apply — like the app's other tools: world DB row, core reload, client patch deploy.
         //    Each step is best-effort and individually reported; failures leave that step manual.
+        trace.Stage = "apply";
         var sqlApply = await ApplyItemSqlAsync(sql, entryRes.Id);
         var reload = sqlApply.Ok ? await ReloadItemTemplateAsync() : (Ok: false, Message: "skipped — SQL was not applied");
         var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
@@ -365,7 +450,11 @@ public sealed class CustomWeaponBuildService
             }),
             IsReversible = true,
             RevertKind = RevertKind.Registry,
-            Success = true,
+            // The world-DB insert is what makes the weapon exist to the core. Registry rows and the
+            // patch are durable either way (and the Forged Weapons list can still delete it), but a
+            // forge whose row never landed is a half-applied change and the log should say so
+            // rather than report a flat success the operator has to read the Notes to disbelieve.
+            Success = sqlApply.Ok,
             Notes = $"{PatchFileName} rebuilt with {assembly.PackagedCount} weapon(s). " +
                     $"SQL: {sqlApply.Message}. Reload: {reload.Message}. Deploy: {deploy.Message}. " +
                     "Undo via the Forged Weapons list on the Item Assets page.",
@@ -418,43 +507,102 @@ public sealed class CustomWeaponBuildService
     /// </summary>
     public async Task<WeaponPatchRebuildSummary> RebuildPatchAsync(string reason)
     {
-        var diag = new ForgeDiagnostics("rebuild");
-        var assembly = await AssembleUnifiedPatchAsync(diag, "rebuild-" + Guid.NewGuid().ToString("N")[..8]);
-
-        if (assembly.Patch is null)
+        try
         {
-            RemoveCanonicalPatches();
-            var removal = RemoveDeployedPatch();
-            _logger.LogInformation("WeaponForge: rebuild ({Reason}) — no weapons in DB; {Patch} removed ({Client})",
-                reason, PatchFileName, removal.Message);
+            var diag = new ForgeDiagnostics("rebuild");
+            var assembly = await AssembleUnifiedPatchAsync(diag, "rebuild-" + Guid.NewGuid().ToString("N")[..8]);
+
+            if (assembly.Patch is null)
+            {
+                RemoveCanonicalPatches();
+                var removal = RemoveDeployedPatch();
+                _logger.LogInformation("WeaponForge: rebuild ({Reason}) — no weapons in DB; {Patch} removed ({Client})",
+                    reason, PatchFileName, removal.Message);
+
+                // This branch DELETES the patch out of the live client's Data folder — the most
+                // destructive thing the Forge does that isn't called "delete", reached from a plain
+                // Rebuild click, from the last weapon being removed, and from the retexture engine's
+                // own rebuilds. It gets its own row rather than hiding inside whatever triggered it,
+                // but only when a file actually moved: with no weapons forged this branch runs on
+                // every retexture rebuild, and a row per no-op would bury the real removals.
+                if (removal.Changed)
+                    await LogPatchAuditAsync("patch_remove", reason, weaponCount: 0, mpqSha256: null,
+                        ok: removal.Ok, message: removal.Message,
+                        notes: $"No weapons left in the registry, so {PatchFileName} was removed from the artifact root and " +
+                               $"from the client Data folder ({removal.Message}). Triggered by: {reason}. " +
+                               "The armor patch-6 re-union runs next and will restore the server's stock ItemSet.dbc if no armor remains either.");
+
+                await RebuildArmorPatchAsync("weapon patch-5 rebuilt: " + reason);
+                return new WeaponPatchRebuildSummary
+                {
+                    WeaponCount = 0,
+                    PatchRemoved = true,
+                    MpqSha256 = null,
+                    PatchDeployed = false,
+                    PatchDeployMessage = removal.Message,
+                    Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
+                };
+            }
+
+            WriteCanonicalPatch(assembly.Patch.MpqBytes);
+            var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
+            _logger.LogInformation("WeaponForge: rebuild ({Reason}) — {Patch} repackaged with {Count} weapon(s); deploy={Deploy}",
+                reason, PatchFileName, assembly.PackagedCount, deploy.Ok);
+
+            await LogPatchAuditAsync("patch_rebuild", reason, assembly.PackagedCount, assembly.Patch.MpqSha256,
+                ok: deploy.Ok, message: deploy.Message,
+                notes: $"{PatchFileName} repackaged with {assembly.PackagedCount} weapon(s)" +
+                       (assembly.SkippedCount > 0 ? $" ({assembly.SkippedCount} skipped — no compiled bytes)" : "") +
+                       $". Deploy: {deploy.Message}. Triggered by: {reason}.");
+
             await RebuildArmorPatchAsync("weapon patch-5 rebuilt: " + reason);
+
             return new WeaponPatchRebuildSummary
             {
-                WeaponCount = 0,
-                PatchRemoved = true,
-                MpqSha256 = null,
-                PatchDeployed = false,
-                PatchDeployMessage = removal.Message,
+                WeaponCount = assembly.PackagedCount,
+                PatchRemoved = false,
+                MpqSha256 = assembly.Patch.MpqSha256,
+                PatchDeployed = deploy.Ok,
+                PatchDeployMessage = deploy.Message,
                 Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
             };
         }
-
-        WriteCanonicalPatch(assembly.Patch.MpqBytes);
-        var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
-        _logger.LogInformation("WeaponForge: rebuild ({Reason}) — {Patch} repackaged with {Count} weapon(s); deploy={Deploy}",
-            reason, PatchFileName, assembly.PackagedCount, deploy.Ok);
-        await RebuildArmorPatchAsync("weapon patch-5 rebuilt: " + reason);
-
-        return new WeaponPatchRebuildSummary
+        catch (Exception ex)
         {
-            WeaponCount = assembly.PackagedCount,
-            PatchRemoved = false,
-            MpqSha256 = assembly.Patch.MpqSha256,
-            PatchDeployed = deploy.Ok,
-            PatchDeployMessage = deploy.Message,
-            Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
-        };
+            await LogPatchAuditAsync("patch_rebuild", reason, weaponCount: 0, mpqSha256: null,
+                ok: false, message: ex.Message,
+                notes: $"{PatchFileName} rebuild FAILED: {ex.Message}. Triggered by: {reason}. " +
+                       "The deployed patch is whatever the previous build left there.");
+            throw;
+        }
     }
+
+    /// <summary>One row per patch write/removal. The patch is not a build artifact — it is a file in
+    /// the running client's Data folder, and the armor re-union it cascades into rewrites a DBC in
+    /// the running server's dbc folder — so every one of them belongs in the trail, whether it came
+    /// from a forge, a delete, a Rebuild click or the retexture engine.</summary>
+    private Task LogPatchAuditAsync(string action, string reason, int weaponCount, string? mpqSha256,
+        bool ok, string message, string notes) =>
+        _audit.LogAsync(new AuditEntry
+        {
+            Category = "weaponforge",
+            Action = action,
+            TargetType = "patch",
+            TargetName = PatchFileName,
+            StateAfter = JsonSerializer.Serialize(new
+            {
+                reason,
+                patch = PatchFileName,
+                weaponCount,
+                mpqSha256,
+                clientDataPath = ClientDataPath,
+                deployMessage = message,
+            }),
+            IsReversible = false,
+            RevertKind = RevertKind.None,
+            Success = ok,
+            Notes = notes,
+        });
 
     // ═══════════════════════════════════════════════════════════════════
     // LIST / DELETE (the Forge's inventory + undo)
@@ -468,6 +616,7 @@ public sealed class CustomWeaponBuildService
             @"SELECT d.display_id       AS DisplayId,
                      d.created_at       AS CreatedAt,
                      d.donor_display_id AS DonorDisplayRow,
+                     d.item_visual      AS ItemVisual,
                      mo.source_kind     AS SourceKind,
                      mo.model_mpq_path  AS ModelMpqPath,
                      ma.item_entry      AS ItemEntry,
@@ -513,6 +662,7 @@ public sealed class CustomWeaponBuildService
                 // Empty when the model row is gone — the row still lists so it can be deleted.
                 ModelMpqPath = (string?)r.ModelMpqPath ?? "",
                 DonorDisplayRow = r.DonorDisplayRow is null ? 0L : (long)Convert.ToInt64(r.DonorDisplayRow),
+                ItemVisual = r.ItemVisual is null ? 0u : (uint)Convert.ToUInt32(r.ItemVisual),
                 BuildId = (string?)r.BuildId,
                 CreatedAt = (DateTime)r.CreatedAt,
             });
@@ -533,7 +683,8 @@ public sealed class CustomWeaponBuildService
             var weapons = await ListWeaponsAsync();
             foreach (var w in weapons)
                 RegisterDisplayWithDbc(w.DisplayId, checked((int)w.DisplayId), // modelIndex == displayId
-                    w.DonorDisplayRow > 0 ? (uint)w.DonorDisplayRow : DonorDisplayRow);
+                    w.DonorDisplayRow > 0 ? (uint)w.DonorDisplayRow : DonorDisplayRow,
+                    itemVisual: w.ItemVisual);
             if (weapons.Count > 0)
                 _logger.LogInformation("WeaponForge: registered {Count} forged weapon display(s) into the DBC cache", weapons.Count);
         }
@@ -546,7 +697,8 @@ public sealed class CustomWeaponBuildService
     /// <summary>Clone the family donor's ItemDisplayInfo row into the in-memory DBC under the forged
     /// display id, overriding the model/texture with the weapon's own SUI_W names. Best-effort: a
     /// failure here only costs the web preview, never the build.</summary>
-    private void RegisterDisplayWithDbc(long displayId, int modelIndex, uint donorDisplayRow, bool mirrorModelName2 = false)
+    private void RegisterDisplayWithDbc(long displayId, int modelIndex, uint donorDisplayRow,
+        bool mirrorModelName2 = false, uint itemVisual = 0)
     {
         try
         {
@@ -554,7 +706,9 @@ public sealed class CustomWeaponBuildService
             _dbc.RegisterCustomDisplayEntry((uint)displayId, donorDisplayRow,
                 model,
                 WeaponNaming.DbcTextureName(modelIndex),
-                customModelName2: mirrorModelName2 ? model : "");
+                customModelName2: mirrorModelName2 ? model : "",
+                // The weapon's OWN glow, not the donor's — see the overload's remarks.
+                itemVisual: itemVisual);
         }
         catch (Exception ex)
         {
@@ -572,6 +726,41 @@ public sealed class CustomWeaponBuildService
         ForgedWeaponInfo? victim = (await ListWeaponsAsync()).FirstOrDefault(w => w.DisplayId == displayId);
         if (victim is null)
             throw new KeyNotFoundException($"No forged weapon with display id {displayId}.");
+
+        // One delete writes several rows — the delete itself plus the patch rebuild it forces and
+        // the armor re-union that cascades off that. Grouped, they read as one operation in the
+        // Change Graph instead of three unrelated events a minute apart.
+        using var batch = AuditBatch.Begin($"Weapon Forge — delete '{victim.Name}' (display {displayId})");
+        try
+        {
+            return await DeleteWeaponCoreAsync(displayId, victim);
+        }
+        catch (Exception ex)
+        {
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "weaponforge",
+                Action = "forge_delete",
+                TargetType = "item",
+                TargetName = victim.Name,
+                TargetId = victim.ItemEntry is > 0 and <= int.MaxValue ? (int)victim.ItemEntry : null,
+                StateBefore = JsonSerializer.Serialize(victim),
+                IsReversible = false,
+                RevertKind = RevertKind.None,
+                Success = false,
+                Notes = $"Delete FAILED: {ex.Message} — the weapon may be partly removed (registry rows go first, " +
+                        "then the ids, then the world row, then the patch). Re-run the delete or check the Forged Weapons list.",
+            });
+            throw;
+        }
+    }
+
+    private async Task<WeaponDeleteResult> DeleteWeaponCoreAsync(long displayId, ForgedWeaponInfo victim)
+    {
+        // Snapshot the world row BEFORE it is destroyed. The ForgedWeaponInfo summary the delete row
+        // used to carry names the weapon but not its stats, so a delete of the wrong item left
+        // nothing to rebuild it from. RevertKind stays None — this is forensics, not an undo path.
+        var itemRowSnapshot = victim.ItemEntry > 0 ? await ReadItemRowAsync(victim.ItemEntry) : null;
 
         await using (var conn = _db.Admin())
         {
@@ -610,13 +799,16 @@ public sealed class CustomWeaponBuildService
             TargetId = victim.ItemEntry is > 0 and <= int.MaxValue ? (int)victim.ItemEntry : null,
             RaCommand = itemRow.Ok ? ".reload item_template" : null,
             RaResponse = itemRow.Ok ? reload.Message : null,
-            StateBefore = JsonSerializer.Serialize(victim),
+            StateBefore = JsonSerializer.Serialize(new { registry = victim, itemTemplate = itemRowSnapshot }),
             IsReversible = false,
             RevertKind = RevertKind.None,
-            Success = true,
+            Success = itemRow.Ok,
             Notes = $"Deleted everywhere. World row: {itemRow.Message}. Reload: {reload.Message}. " +
                     $"Patch: {(rebuild.PatchRemoved ? "removed (no weapons left)" : $"repackaged with {rebuild.WeaponCount} weapon(s)")}, " +
-                    $"{rebuild.PatchDeployMessage}. Ids released for reuse.",
+                    $"{rebuild.PatchDeployMessage}. Ids released for reuse. " +
+                    (itemRowSnapshot is null
+                        ? "No item_template row was found to snapshot."
+                        : "The destroyed item_template row is captured in state_before."),
         });
 
         _logger.LogInformation("WeaponForge: deleted weapon display {Display} (entry {Entry}, '{Name}') everywhere",
@@ -632,6 +824,339 @@ public sealed class CustomWeaponBuildService
             ReloadMessage = reload.Message,
         };
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // VANILLA LANE (clone an existing 1.12 weapon, re-itemize it)
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // The third lane, alongside GLB and the TBC/WotLK imports, and the odd one out: it packages
+    // NOTHING. The source is a weapon already in the live world DB, so its ItemDisplayInfo row, its
+    // M2 and its BLP are all already in the operator's client. Cloning copies the item_template row
+    // to a fresh custom entry, keeps the SOURCE display id, applies the operator's gameplay edits
+    // and reloads the core. No id reservation for a display, no compile, no patch-5, no deploy, no
+    // client restart — the sheath, attachment, two-hand grip and sound all ride along because the
+    // display never changed.
+    //
+    // The clone is deliberately NOT written into custom_weapon_display. That table is keyed by
+    // display_id and LoadExistingWeaponsAsync re-registers every row in it into DbcService at
+    // startup and on every DBC reload, overriding the display's model/texture with this Forge's
+    // SUI_W names. A clone carries a STOCK display id, so registering it would repoint that stock
+    // display — breaking the source weapon and every other stock item that shares it, everywhere in
+    // the web UI — and AssembleUnifiedPatchAsync would list it as permanently "skipped" for having
+    // no compiled bytes. Clones therefore do not appear in the Forged Weapons list and are managed
+    // from the Items page; the audit row carries RevertKind.DeleteCustom so the Change Graph can
+    // undo one directly, which is more than a forged weapon offers.
+
+    /// <summary>One row of the vanilla weapon browse.</summary>
+    public sealed record VanillaWeaponDto(uint Entry, string Name, int Quality, int ItemLevel,
+        int DisplayId, int ItemClass, int Subclass, int InventoryType, int DelayMs, float DamageMin, float DamageMax,
+        string? Family, string FamilyLabel);
+
+    /// <summary>The source weapon's real gameplay, for pre-filling the Configure-item modal. Unlike
+    /// armor's equivalent this has to carry the weapon columns — damage, speed, subclass, sheath,
+    /// block, ammo, range — because the weapon modal always sends a FULL override set and its
+    /// defaults are a 2–4 damage, 20-durability trinket. Without the pre-fill, cloning Thunderfury
+    /// would produce exactly that.</summary>
+    public sealed record VanillaWeaponSourceDto(string Name, int Quality, int ItemLevel, int RequiredLevel,
+        long BuyPrice, long SellPrice, int ItemClass, int Subclass, int InventoryType, string? Family, string FamilyLabel,
+        float DamageMin, float DamageMax, int DamageType, int DelayMs, int Sheath, int AmmoType, int RangeModPercent,
+        int Armor, int Block, int MaxDurability, int Bonding, int AllowableClass,
+        int HolyRes, int FireRes, int NatureRes, int FrostRes, int ShadowRes, int ArcaneRes,
+        IReadOnlyList<(int Type, int Value)> Stats,
+        IReadOnlyList<(int SpellId, int Trigger, int Charges, float PpmRate, int CooldownMs, int Category, int CategoryCooldownMs)> Spells);
+
+    /// <summary>Result of a vanilla clone. Deliberately not <see cref="CustomWeaponBuildResult"/> —
+    /// there is no build id, no model, no patch and no packaged member count to report.</summary>
+    public sealed class VanillaCloneResult
+    {
+        public bool Ok { get; set; }
+        public string Message { get; set; } = "";
+        public uint SourceEntry { get; set; }
+        public long ItemEntry { get; set; }
+        public long DisplayId { get; set; }
+        public string Name { get; set; } = "";
+        public string? Family { get; set; }
+        public int InventoryType { get; set; }
+        public bool Reloaded { get; set; }
+        public string? ReloadMessage { get; set; }
+    }
+
+    /// <summary>Class-2 weapons plus class-4/subclass-6 shields (the Weapon Forge owns the shield
+    /// family), from the LIVE world DB — no client mount needed, unlike the TBC/WotLK lanes.</summary>
+    public async Task<IReadOnlyList<VanillaWeaponDto>> BrowseVanillaWeaponsAsync(string? search, string? family, int limit = 60)
+    {
+        limit = Math.Clamp(limit, 1, 200);
+        string like = "%" + (search ?? "").Trim() + "%";
+        uint entryExact = uint.TryParse((search ?? "").Trim(), out var ee) ? ee : 0;
+        bool hasSearch = !string.IsNullOrWhiteSpace(search);
+
+        await using var conn = _db.Mangos();
+        await conn.OpenAsync();
+        var rows = await conn.QueryAsync(
+            // Two things armor's browse does not do, and should:
+            //   • max-patch scoping (the same predicate /Items/Search uses) — item_template is
+            //     keyed (entry, patch), so without it a weapon appears once per patch row it has.
+            //   • excluding the custom range, or every weapon already cloned or forged by this app
+            //     comes back as a clone source.
+            @"SELECT entry, name, quality, item_level AS ItemLevel, display_id AS DisplayId,
+                     class AS ItemClass, subclass AS Subclass, inventory_type AS InventoryType,
+                     delay AS DelayMs, dmg_min1 AS DamageMin, dmg_max1 AS DamageMax
+              FROM item_template
+              WHERE patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)
+                AND (class = 2 OR (class = 4 AND subclass = 6))
+                AND display_id > 0
+                AND entry < @customFloor
+                AND (@noSearch = 1 OR name LIKE @like OR entry = @entryExact)
+              ORDER BY item_level DESC, quality DESC, name
+              LIMIT @fetch",
+            new
+            {
+                like, entryExact, noSearch = hasSearch ? 0 : 1,
+                customFloor = WeaponIdReservationService.ItemEntryFloor,
+                // Over-fetch: the family filter below cannot be pushed into SQL (it is a
+                // subclass→family mapping, not a column), so trim after mapping.
+                fetch = string.IsNullOrWhiteSpace(family) ? limit : limit * 4,
+            });
+
+        var list = new List<VanillaWeaponDto>();
+        foreach (var r in rows)
+        {
+            int cls = Convert.ToInt32(r.ItemClass), sub = Convert.ToInt32(r.Subclass);
+            string? famKey = LegacyItemCatalog.TypeKeyFor(cls, sub);
+            if (!string.IsNullOrWhiteSpace(family) && !string.Equals(famKey, family, StringComparison.OrdinalIgnoreCase))
+                continue;
+            list.Add(new VanillaWeaponDto(
+                Convert.ToUInt32(r.entry), (string)r.name, Convert.ToInt32(r.quality), Convert.ToInt32(r.ItemLevel),
+                Convert.ToInt32(r.DisplayId), cls, sub, Convert.ToInt32(r.InventoryType),
+                Convert.ToInt32(r.DelayMs), Convert.ToSingle(r.DamageMin), Convert.ToSingle(r.DamageMax),
+                famKey, FamilyLabel(famKey, sub)));
+            if (list.Count >= limit) break;
+        }
+        return list;
+    }
+
+    /// <summary>The source weapon's gameplay for the Configure modal's pre-fill. Null when the entry
+    /// is missing or is not a weapon/shield.</summary>
+    public async Task<VanillaWeaponSourceDto?> ReadVanillaWeaponSourceAsync(uint entry)
+    {
+        var d = await ReadItemRowAsync(entry);
+        if (d is null) return null;
+
+        int I(string k) => d.TryGetValue(k, out var v) && v != null ? Convert.ToInt32(v) : 0;
+        long L(string k) => d.TryGetValue(k, out var v) && v != null ? Convert.ToInt64(v) : 0;
+        float F(string k) => d.TryGetValue(k, out var v) && v != null ? Convert.ToSingle(v) : 0f;
+        string S(string k) => d.TryGetValue(k, out var v) && v != null ? v.ToString() ?? "" : "";
+
+        int cls = I("class"), sub = I("subclass");
+        if (!IsForgeableWeapon(cls, sub)) return null;
+
+        var stats = new List<(int, int)>();
+        for (int i = 1; i <= 10; i++)
+        {
+            int t = I($"stat_type{i}"), v = I($"stat_value{i}");
+            if (v != 0) stats.Add((t, v));
+        }
+        var spells = new List<(int, int, int, float, int, int, int)>();
+        for (int i = 1; i <= 5; i++)
+        {
+            int sid = I($"spellid_{i}");
+            if (sid != 0)
+                spells.Add((sid, I($"spelltrigger_{i}"), I($"spellcharges_{i}"), F($"spellppmrate_{i}"),
+                    I($"spellcooldown_{i}"), I($"spellcategory_{i}"), I($"spellcategorycooldown_{i}")));
+        }
+
+        string? famKey = LegacyItemCatalog.TypeKeyFor(cls, sub);
+        return new VanillaWeaponSourceDto(
+            S("name"), I("quality"), I("item_level"), I("required_level"),
+            L("buy_price"), L("sell_price"), cls, sub, I("inventory_type"), famKey, FamilyLabel(famKey, sub),
+            F("dmg_min1"), F("dmg_max1"), I("dmg_type1"), I("delay"), I("sheath"), I("ammo_type"), I("range_mod"),
+            I("armor"), I("block"), I("max_durability"), I("bonding"), I("allowable_class"),
+            I("holy_res"), I("fire_res"), I("nature_res"), I("frost_res"), I("shadow_res"), I("arcane_res"),
+            stats, spells);
+    }
+
+    /// <summary>
+    /// Clone an existing vanilla weapon into a new custom entry, reusing its display, then apply the
+    /// operator's gameplay edits. Usable via <c>.additem</c> after the reload; nothing is packaged.
+    /// </summary>
+    public async Task<VanillaCloneResult> CloneVanillaWeaponAsync(uint sourceEntry, string? nameOverride,
+        ValidatedVanillaItemBuildConfiguration? gameplay)
+    {
+        var result = new VanillaCloneResult { SourceEntry = sourceEntry };
+
+        await using var conn = _db.Mangos();
+        await conn.OpenAsync();
+
+        var srcRow = await conn.QueryFirstOrDefaultAsync(
+            @"SELECT entry, name, class AS ItemClass, subclass AS Subclass,
+                     display_id AS DisplayId, inventory_type AS InventoryType
+              FROM item_template
+              WHERE entry=@e
+              ORDER BY patch DESC LIMIT 1",
+            new { e = sourceEntry });
+        if (srcRow is null) { result.Message = $"Vanilla item {sourceEntry} not found."; return result; }
+
+        int cls = Convert.ToInt32(srcRow.ItemClass), sub = Convert.ToInt32(srcRow.Subclass);
+        if (!IsForgeableWeapon(cls, sub))
+        {
+            result.Message = cls == 4
+                ? $"Item {sourceEntry} is armor — clone it from the Armor Forge's Vanilla lane."
+                : $"Item {sourceEntry} is not a weapon (class 2) or shield (class 4 / subclass 6).";
+            return result;
+        }
+        if (sourceEntry >= WeaponIdReservationService.ItemEntryFloor)
+        {
+            result.Message = $"Item {sourceEntry} is already a custom item — clone from a stock weapon instead.";
+            return result;
+        }
+
+        string sourceName = (string)srcRow.name;
+        int displayId = Convert.ToInt32(srcRow.DisplayId);
+        int inv = Convert.ToInt32(srcRow.InventoryType);
+        string? famKey = LegacyItemCatalog.TypeKeyFor(cls, sub);
+
+        string buildId = "wpn-clone-" + Guid.NewGuid().ToString("N")[..12];
+        long entryFloor = await _ids.ComputeItemEntryFloorAsync();
+        var entryRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemEntry, entryFloor, buildId, "item");
+        long newEntry = entryRes.Id;
+
+        string name = !string.IsNullOrWhiteSpace(nameOverride) ? nameOverride!.Trim()
+            : !string.IsNullOrWhiteSpace(gameplay?.Name) ? gameplay!.Name!.Trim()
+            : sourceName;
+
+        try
+        {
+            // Schema-agnostic column list so this keeps working on forks that add item_template
+            // columns. Every column but the entry rides across verbatim — including subclass,
+            // sheath, sound_override_subclass, ammo_type, range_mod and stackable, none of which the
+            // config modal can express and all of which must match the display the clone reuses.
+            var cols = (await conn.QueryAsync<string>(
+                @"SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item_template' ORDER BY ORDINAL_POSITION")).ToList();
+            if (cols.Count == 0) throw new InvalidOperationException("item_template schema could not be read.");
+
+            string colList = string.Join(",", cols.Select(c => $"`{c}`"));
+            string selList = string.Join(",", cols.Select(c =>
+                c.Equals("entry", StringComparison.OrdinalIgnoreCase) ? "@newEntry" : $"`{c}`"));
+            // ORDER BY patch DESC LIMIT 1: a multi-patch source would otherwise insert once per
+            // patch row and collide on the new entry's key.
+            await conn.ExecuteAsync(
+                $"INSERT INTO item_template ({colList}) SELECT {selList} FROM item_template WHERE entry=@src ORDER BY patch DESC LIMIT 1",
+                new { newEntry, src = sourceEntry });
+
+            // Name + the validated gameplay overrides on top of the cloned row.
+            var sets = new List<string> { "name=@nm" };
+            var dp = new DynamicParameters();
+            dp.Add("e", newEntry);
+            dp.Add("nm", name);
+            if (gameplay?.Overrides is { Count: > 0 })
+            {
+                foreach (var (col, literal) in gameplay.Overrides)
+                {
+                    // The clone keeps the SOURCE's slot. The modal always sends inventory_type, and
+                    // honouring it would let a 1H sword (subclass 7) be moved into the two-hand slot,
+                    // or a fishing pole into a slot its own subclass forbids — with a stock display
+                    // that cannot be re-scaffolded to match. Slot changes belong to the import lanes,
+                    // which build a model for the family they claim.
+                    if (col.Equals("inventory_type", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (col.Equals("description", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sets.Add("description=@desc");
+                        dp.Add("desc", literal); // raw string value, parameterized
+                    }
+                    else
+                    {
+                        // The translator emits safe numeric/CONVERT literals for every other column.
+                        sets.Add($"`{col}`={literal}");
+                    }
+                }
+            }
+            await conn.ExecuteAsync($"UPDATE item_template SET {string.Join(",", sets)} WHERE entry=@e", dp);
+        }
+        catch (Exception ex)
+        {
+            await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id);
+            result.Ok = false;
+            result.Message = "clone failed: " + ex.Message;
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "weaponforge", Action = "clone_vanilla", TargetType = "item_custom", TargetName = name,
+                TargetId = newEntry is > 0 and <= int.MaxValue ? (int)newEntry : null,
+                StateAfter = JsonSerializer.Serialize(new { buildId, sourceEntry, itemEntry = newEntry, displayId, family = famKey }),
+                IsReversible = false, RevertKind = RevertKind.None, Success = false,
+                Notes = $"Vanilla weapon clone {sourceEntry} → {newEntry} FAILED: {ex.Message} — the id was released, but the " +
+                        $"INSERT and the override UPDATE are separate statements, so if the first one landed the row is still " +
+                        $"there as an unedited copy of {sourceEntry}. Check with: SELECT * FROM item_template WHERE entry = {newEntry};",
+            });
+            return result;
+        }
+
+        await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
+
+        var reload = await ReloadItemTemplateAsync();
+
+        result.Ok = true;
+        result.ItemEntry = newEntry;
+        result.DisplayId = displayId;
+        result.Name = name;
+        result.Family = famKey;
+        result.InventoryType = inv;
+        result.Reloaded = reload.Ok;
+        result.ReloadMessage = reload.Message;
+        result.Message = $"Cloned vanilla {sourceEntry} → {newEntry} (reuses display {displayId}). No patch needed.";
+
+        await _audit.LogAsync(new AuditEntry
+        {
+            Category = "weaponforge",
+            Action = "clone_vanilla",
+            // "item_custom" (not "item", which the forge rows use) is deliberate: it is the target
+            // type ChangeGraphService.RevertByDeletingAsync keys on, and it puts the row in the
+            // Change Graph's items domain and the drift tracker's items surface — none of which
+            // "item" gets. A clone is the one forge output the graph can genuinely undo, because
+            // there is no registry row and no patch left behind by deleting the item.
+            TargetType = "item_custom",
+            TargetName = name,
+            TargetId = checked((int)newEntry),
+            RaCommand = ".reload item_template",
+            RaResponse = reload.Message,
+            StateAfter = JsonSerializer.Serialize(new
+            {
+                buildId, sourceEntry, sourceName, itemEntry = newEntry, displayId,
+                family = famKey, itemClass = cls, subclass = sub, inventoryType = inv,
+                overrides = gameplay?.Overrides,
+            }),
+            IsReversible = true,
+            RevertKind = RevertKind.DeleteCustom,
+            Success = true,
+            Notes = $"Vanilla clone {sourceEntry} ('{sourceName}') → {newEntry}, reuses display {displayId}. " +
+                    $"Reload: {reload.Message}. No patch — the model and texture are already in the client. " +
+                    "Undo from the Change Graph, or delete the item on the Items page.",
+        });
+
+        _logger.LogInformation("WeaponForge: cloned vanilla weapon {Source} → {Entry} '{Name}' (display {Display})",
+            sourceEntry, newEntry, name, displayId);
+        return result;
+    }
+
+    /// <summary>Class-2 weapons and class-4/subclass-6 shields. Everything else belongs to the
+    /// Armor Forge (or to no forge at all).</summary>
+    private static bool IsForgeableWeapon(int itemClass, int subclass) =>
+        itemClass == 2 || (itemClass == 4 && subclass == 6);
+
+    /// <summary>A display label for the browse. Families the import lanes decline still get a name
+    /// here — a clone needs no donor scaffold, so a fist weapon or fishing pole clones fine.</summary>
+    private static string FamilyLabel(string? famKey, int subclass) =>
+        famKey is not null ? WeaponTypeCatalog.Get(famKey).Label
+        : subclass switch
+        {
+            9 => "Warglaive",
+            11 or 12 => "Exotic",
+            13 => "Fist Weapon",
+            17 => "Spear",
+            20 => "Fishing Pole",
+            _ => "Other",
+        };
 
     // ═══════════════════════════════════════════════════════════════════
     // SERVER APPLY (world DB + RA reload + client patch deploy)
@@ -650,6 +1175,29 @@ public sealed class CustomWeaponBuildService
         {
             _logger.LogWarning(ex, "WeaponForge: item_template insert for entry {Entry} failed", entry);
             return (false, $"world DB insert failed: {ex.Message} — item_template.sql is in the build folder for manual apply");
+        }
+    }
+
+    /// <summary>The whole item_template row, for the audit trail's state_before. Schema-agnostic
+    /// (SELECT *), so it keeps working across core forks that add columns. Best-effort: a delete is
+    /// never blocked by a snapshot that could not be taken, it just loses the forensics.</summary>
+    private async Task<IDictionary<string, object>?> ReadItemRowAsync(long entry)
+    {
+        try
+        {
+            await using var conn = _db.Mangos();
+            await conn.OpenAsync();
+            // ORDER BY patch DESC: item_template is keyed (entry, patch), so an unordered read of a
+            // multi-patch stock weapon returns an arbitrary older row — wrong for the clone pre-fill
+            // and misleading in a delete snapshot.
+            var row = await conn.QueryFirstOrDefaultAsync(
+                "SELECT * FROM item_template WHERE entry = @entry ORDER BY patch DESC LIMIT 1", new { entry });
+            return row is null ? null : (IDictionary<string, object>)row;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: snapshot of item_template {Entry} failed (delete continues)", entry);
+            return null;
         }
     }
 
@@ -726,19 +1274,19 @@ public sealed class CustomWeaponBuildService
         catch (Exception ex) { return (true, true, deployed, false, $"could not compare deployed patch: {ex.Message}"); }
     }
 
-    private (bool Ok, string Message) RemoveDeployedPatch()
+    private (bool Ok, bool Changed, string Message) RemoveDeployedPatch()
     {
         var dataPath = ClientDataPath;
-        if (dataPath is null) return (true, "no client Data path configured");
+        if (dataPath is null) return (true, false, "no client Data path configured");
         try
         {
             string target = Path.Combine(dataPath, PatchFileName);
-            if (File.Exists(target)) { File.Delete(target); return (true, $"removed {target}"); }
-            return (true, "no deployed patch to remove");
+            if (File.Exists(target)) { File.Delete(target); return (true, true, $"removed {target}"); }
+            return (true, false, "no deployed patch to remove");
         }
         catch (Exception ex)
         {
-            return (false, $"could not remove deployed patch ({ex.Message}) — the client is probably running; delete it after closing");
+            return (false, true, $"could not remove deployed patch ({ex.Message}) — the client is probably running; delete it after closing");
         }
     }
 
@@ -1387,6 +1935,17 @@ public sealed class CustomWeaponBuildRequest
 {
     public string? Name { get; init; }
 
+    /// <summary>The SOURCE item's own inventory icon stem (TBC/WotLK ItemDisplayInfo field 5), e.g.
+    /// "INV_Weapon_Glaive_01". Null falls back to the family donor's icon, which is what every
+    /// import used to do — a forged Warglaive shipped the donor sword's INV_Sword_04.</summary>
+    public string? IconStem { get; init; }
+
+    /// <summary>The icon's BLP bytes, supplied ONLY when the vanilla client does not already have
+    /// an icon by that name (measured: 472 of the 585 icon names TBC weapons use already exist in
+    /// 1.12, so this is null ~81% of the time). Packaged into the patch as
+    /// <c>Interface\Icons\{IconStem}.blp</c> so the client can resolve the name.</summary>
+    public byte[]? IconBlp { get; init; }
+
     /// <summary>'donor_patch' | 'parametric' | 'glb_import' | 'sketch3d' — recorded as provenance.</summary>
     public required string SourceKind { get; init; }
 
@@ -1515,6 +2074,10 @@ public sealed class ForgedWeaponInfo
     public required string ModelMpqPath { get; init; }
     /// <summary>Stock ItemDisplayInfo row the display was cloned from (0 when unrecorded).</summary>
     public long DonorDisplayRow { get; init; }
+    /// <summary>The forged weapon's own enchant glow (ItemDisplayInfo field 22). Carried so the
+    /// startup re-registration can restore it into the DBC cache; inheriting the donor's left the
+    /// Items page unable to resolve any forged weapon's glow.</summary>
+    public uint ItemVisual { get; init; }
     public string? BuildId { get; init; }
     public required DateTime CreatedAt { get; init; }
 }

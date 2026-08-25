@@ -12,11 +12,14 @@ public class AuditService
     private readonly ConnectionFactory _db;
     private readonly ILogger<AuditService> _logger;
     private readonly StateCaptureService _stateCapture;
+    private readonly IHttpContextAccessor _http;
 
-    public AuditService(ConnectionFactory db, StateCaptureService stateCapture, ILogger<AuditService> logger)
+    public AuditService(ConnectionFactory db, StateCaptureService stateCapture,
+        IHttpContextAccessor http, ILogger<AuditService> logger)
     {
         _db = db;
         _stateCapture = stateCapture;
+        _http = http;
         _logger = logger;
     }
 
@@ -101,6 +104,13 @@ public class AuditService
             // call site — the ambient scope fills it in.
             entry.BatchId ??= AuditBatch.CurrentId;
             entry.BatchLabel ??= AuditBatch.CurrentLabel;
+
+            // Same idea for the actor. A service buried under a controller (the forges write their
+            // rows from inside the build service, not the controller) has no HttpContext to read,
+            // and threading an ip through every signature to reach it is churn for nothing. Rows
+            // written outside a request — startup registration, the retexture queue — legitimately
+            // have no ip and stay null; a caller that already set one keeps it.
+            entry.OperatorIp ??= _http.HttpContext?.Connection.RemoteIpAddress?.ToString();
 
             using var conn = _db.Admin();
             var id = await conn.ExecuteScalarAsync<long>(

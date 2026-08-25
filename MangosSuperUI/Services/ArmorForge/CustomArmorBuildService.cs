@@ -132,6 +132,67 @@ public sealed class CustomArmorBuildService
         int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
         float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null)
     {
+        var trace = new ArmorAttemptTrace();
+        try
+        {
+            return await ImportCoreAsync(lane, entry, trace, nameOverride, vanillaSetId, rebuild, gameplay,
+                recolorHue, recolorTheory, recolorTier, glowColor);
+        }
+        catch (Exception ex)
+        {
+            // An import that throws past the reservation leaves ids — and possibly registry rows and
+            // a world row — behind. The success row is written last, so without this the trail shows
+            // nothing at all for the attempt.
+            await LogImportFailureAsync(lane, entry, trace, ex.Message);
+            throw;
+        }
+    }
+
+    /// <summary>What an import had done by the time it failed — see the weapon forge's equivalent.
+    /// Read by the failure audit row so orphaned ids are findable.</summary>
+    private sealed class ArmorAttemptTrace
+    {
+        public string? BuildId;
+        public long ItemEntry;
+        public long DisplayId;
+        public string? Name;
+        public string Stage = "start";
+    }
+
+    /// <summary>The failure twin of the import row at the end of <see cref="ImportCoreAsync"/>. Import
+    /// fails two ways — a graceful Ok=false return (resolve/persist) and a throw — and both used to be
+    /// silent.</summary>
+    private Task LogImportFailureAsync(ArmorImportLane lane, uint entry, ArmorAttemptTrace trace, string message) =>
+        _audit.LogAsync(new AuditEntry
+        {
+            Category = "armorforge",
+            Action = $"import_{lane.Key}",
+            TargetType = "item",
+            TargetName = trace.Name,
+            TargetId = trace.ItemEntry is > 0 and <= int.MaxValue ? (int)trace.ItemEntry : null,
+            StateAfter = JsonSerializer.Serialize(new
+            {
+                buildId = trace.BuildId,
+                failedAtStage = trace.Stage,
+                sourceEntry = entry,
+                sourceExpansion = lane.Key,
+                itemEntry = trace.ItemEntry,
+                displayId = trace.DisplayId,
+            }),
+            IsReversible = false,
+            RevertKind = RevertKind.None,
+            Success = false,
+            Notes = $"{lane.Label} import of source {entry} FAILED at stage '{trace.Stage}': {message}" +
+                    (trace.ItemEntry > 0
+                        ? $" Ids {trace.ItemEntry}/{trace.DisplayId} were reserved — released on the graceful paths, possibly orphaned on a throw."
+                        : " No ids were reserved."),
+        });
+
+    private async Task<CustomArmorBuildResult> ImportCoreAsync(ArmorImportLane lane, uint entry, ArmorAttemptTrace trace,
+        string? nameOverride = null,
+        int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
+        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null)
+    {
         if (!DonorItemTemplateFixture.Verify())
             throw new InvalidOperationException("Donor item_template fixture failed hash verification.");
 
@@ -146,9 +207,14 @@ public sealed class CustomArmorBuildService
         string buildId = "arm-" + Guid.NewGuid().ToString("N")[..12];
         long entryFloor = await _ids.ComputeItemEntryFloorAsync();
         long displayFloor = await _ids.ComputeDisplayIdFloorAsync(dbcMax);
+        trace.BuildId = buildId;
+        trace.Stage = "reserve";
         var entryRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemEntry, entryFloor, buildId, "item");
         var dispRes = await _ids.ReserveAsync(WeaponIdReservationService.KindItemDisplay, displayFloor, buildId, "display");
         int displayIndex = checked((int)dispRes.Id);
+        trace.ItemEntry = entryRes.Id;
+        trace.DisplayId = dispRes.Id;
+        trace.Stage = "resolve";
 
         // 3) Resolve + emit the source. Any failure before persistence releases the reserved ids.
         ArmorImportSource? src;
@@ -168,6 +234,7 @@ public sealed class CustomArmorBuildService
             result.Ok = false;
             result.Diagnostics = diag.Items.Select(i => i.ToString()).ToArray();
             result.Message = string.Join("; ", diag.Items.Where(i => i.Severity == ForgeSeverity.Error).Select(i => i.Message));
+            await LogImportFailureAsync(lane, entry, trace, result.Message);
             return result;
         }
 
@@ -204,6 +271,8 @@ public sealed class CustomArmorBuildService
 
         // 5) Persist (fail-closed — without this the piece can't be repackaged). A persistence
         //    failure releases the ids too; nothing else has been written yet.
+        trace.Name = name;
+        trace.Stage = "persist";
         try
         {
         await PersistAsync(new ArmorPersistRow
@@ -226,6 +295,7 @@ public sealed class CustomArmorBuildService
             result.Ok = false;
             result.Message = "persist failed: " + ex.Message;
             result.Diagnostics = diag.Items.Select(i => i.ToString()).ToArray();
+            await LogImportFailureAsync(lane, entry, trace, result.Message);
             return result;
         }
 
@@ -237,6 +307,7 @@ public sealed class CustomArmorBuildService
         RegisterDisplayWithDbc(dispRes.Id, profile, src);
 
         // 7) Apply: world SQL + reload always; patch rebuild/deploy unless batched by a set import.
+        trace.Stage = "apply";
         var apply = new ServerApplyStatus();
         var sqlRes = await ApplyItemSqlAsync(sql, entryRes.Id);
         apply.SqlApplied = sqlRes.Ok; apply.SqlMessage = sqlRes.Message;
@@ -262,7 +333,10 @@ public sealed class CustomArmorBuildService
             TargetType = "item", TargetName = name, TargetId = checked((int)entryRes.Id),
             RaCommand = apply.SqlApplied ? ".reload item_template" : null, RaResponse = apply.ReloadMessage,
             StateAfter = JsonSerializer.Serialize(new { buildId, itemEntry = entryRes.Id, displayId = dispRes.Id, src.FamilyKey, tbcEntry = entry, sourceExpansion = lane.Key, setId = vanillaSetId, models = src.ModelMembers.Count, components = src.Components.Count }),
-            IsReversible = true, RevertKind = RevertKind.Registry, Success = true,
+            IsReversible = true, RevertKind = RevertKind.Registry,
+            // The world-DB row is what makes the piece exist to the core — see the weapon forge's
+            // matching note. Registry rows and the patch are durable either way.
+            Success = apply.SqlApplied,
             Notes = $"{lane.Label} {entry} → {src.FamilyKey}. SQL: {apply.SqlMessage}. " + (rebuild ? $"Deploy: {apply.PatchDeployMessage}." : "(patch rebuilt by set import)"),
         });
         return result;
@@ -304,60 +378,89 @@ public sealed class CustomArmorBuildService
         var validBonuses = (bonuses ?? new List<ArmorSetBonus>())
             .Where(b => b.Threshold > 0 && b.SpellId > 0).OrderBy(b => b.Threshold).Take(ArmorItemSetDbc.MaxBonuses).ToList();
 
+        // A set import is N+1 audit rows — one per member from ImportAsync, plus the set row below.
+        // Unbatched they arrived as N+1 unrelated events; the ambient scope groups them into one
+        // named run in the Change Graph without any of the per-piece call sites knowing about it.
+        using var batch = AuditBatch.Begin($"Armor Forge — import {lane.Label} set '{setName}'");
+
         string buildId = "armset-" + Guid.NewGuid().ToString("N")[..12];
-        long floor = await ComputeSetIdFloorAsync();
-        var res = await _ids.ReserveAsync(KindSet, floor, buildId, "set");
-        int setId = checked((int)res.Id);
-        await _ids.MarkStateAsync(KindSet, res.Id, "committed");
-
-        await using (var conn = _db.Admin())
+        int setId = 0;
+        try
         {
-            await conn.OpenAsync();
-            await conn.ExecuteAsync(
-                @"INSERT INTO custom_armor_set (set_id, name, bonuses_json, req_skill, req_skill_rank, created_at)
-                  VALUES (@setId, @name, @bonuses, @skill, @rank, NOW())",
-                new { setId, name = setName, bonuses = JsonSerializer.Serialize(validBonuses), skill = reqSkill, rank = reqSkillRank });
-        }
+            long floor = await ComputeSetIdFloorAsync();
+            var res = await _ids.ReserveAsync(KindSet, floor, buildId, "set");
+            setId = checked((int)res.Id);
+            await _ids.MarkStateAsync(KindSet, res.Id, "committed");
 
-        var result = new ArmorSetImportResult { SetId = setId, Name = setName };
-        foreach (var entry in members)
-        {
-            try
+            await using (var conn = _db.Admin())
             {
-                ValidatedVanillaItemBuildConfiguration? pieceGameplay = null;
-                perPieceGameplay?.TryGetValue(entry, out pieceGameplay);
-                var piece = await ImportAsync(lane, entry, null, setId, rebuild: false, gameplay: pieceGameplay,
-                    recolorHue: recolorHue, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor);
-                result.Pieces.Add(piece);
+                await conn.OpenAsync();
+                await conn.ExecuteAsync(
+                    @"INSERT INTO custom_armor_set (set_id, name, bonuses_json, req_skill, req_skill_rank, created_at)
+                      VALUES (@setId, @name, @bonuses, @skill, @rank, NOW())",
+                    new { setId, name = setName, bonuses = JsonSerializer.Serialize(validBonuses), skill = reqSkill, rank = reqSkillRank });
             }
-            catch (Exception ex)
+
+            var result = new ArmorSetImportResult { SetId = setId, Name = setName };
+            foreach (var entry in members)
             {
-                _logger.LogWarning(ex, "ArmorForge: {Lane} set {Set} member {Entry} failed", lane.Key, tbcSetId, entry);
-                result.Pieces.Add(new CustomArmorBuildResult { TbcEntry = entry, SourceExpansion = lane.Key, Ok = false, Message = ex.Message });
+                try
+                {
+                    ValidatedVanillaItemBuildConfiguration? pieceGameplay = null;
+                    perPieceGameplay?.TryGetValue(entry, out pieceGameplay);
+                    var piece = await ImportAsync(lane, entry, null, setId, rebuild: false, gameplay: pieceGameplay,
+                        recolorHue: recolorHue, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor);
+                    result.Pieces.Add(piece);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "ArmorForge: {Lane} set {Set} member {Entry} failed", lane.Key, tbcSetId, entry);
+                    result.Pieces.Add(new CustomArmorBuildResult { TbcEntry = entry, SourceExpansion = lane.Key, Ok = false, Message = ex.Message });
+                }
             }
+
+            // One rebuild + deploy for the whole set.
+            var patch = await AssembleUnifiedPatchAsync();
+            WriteOutputs(buildId, patch, null);
+            var dep = DeployPatch(patch);
+            var serverDeploy = DeployItemSetToServer(patch);
+            result.PatchDeployed = dep.Ok;
+            result.ServerItemSetDeployed = serverDeploy.State == ItemSetDeployState.Deployed;
+            result.ServerItemSetMessage = serverDeploy.Message;
+            // The server DBC line is NOT conditional on bonuses: without it the core zeroes set_id and the
+            // set loses its tooltip block and its membership, bonuses or not.
+            result.Message = $"{result.Pieces.Count(p => p.Ok)}/{members.Count} pieces imported as set {setId} '{setName}'"
+                + (validBonuses.Count > 0 ? $" with {validBonuses.Count} bonus(es)" : " (no bonuses)") + $". {dep.Message}"
+                + $" Server sets: {serverDeploy.Message}";
+
+            int okPieces = result.Pieces.Count(p => p.Ok);
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = $"import_{lane.Key}_set", TargetType = "itemset", TargetName = setName, TargetId = setId,
+                StateAfter = JsonSerializer.Serialize(new { setId, tbcSetId, sourceExpansion = lane.Key, pieces = result.Pieces.Select(p => new { p.TbcEntry, p.Ok, p.ItemEntry, p.DisplayId }) }),
+                IsReversible = true, RevertKind = RevertKind.Registry,
+                // A set that imported zero of its members is not a success just because the set row
+                // was created. Partial imports stay true — the set exists and the piece rows say which.
+                Success = okPieces > 0,
+                Notes = result.Message,
+            });
+            return result;
         }
-
-        // One rebuild + deploy for the whole set.
-        var patch = await AssembleUnifiedPatchAsync();
-        WriteOutputs(buildId, patch, null);
-        var dep = DeployPatch(patch);
-        var serverDeploy = DeployItemSetToServer(patch);
-        result.PatchDeployed = dep.Ok;
-        result.ServerItemSetDeployed = serverDeploy.State == ItemSetDeployState.Deployed;
-        result.ServerItemSetMessage = serverDeploy.Message;
-        // The server DBC line is NOT conditional on bonuses: without it the core zeroes set_id and the
-        // set loses its tooltip block and its membership, bonuses or not.
-        result.Message = $"{result.Pieces.Count(p => p.Ok)}/{members.Count} pieces imported as set {setId} '{setName}'"
-            + (validBonuses.Count > 0 ? $" with {validBonuses.Count} bonus(es)" : " (no bonuses)") + $". {dep.Message}"
-            + $" Server sets: {serverDeploy.Message}";
-
-        await _audit.LogAsync(new AuditEntry
+        catch (Exception ex)
         {
-            Category = "armorforge", Action = $"import_{lane.Key}_set", TargetType = "itemset", TargetName = setName, TargetId = setId,
-            StateAfter = JsonSerializer.Serialize(new { setId, tbcSetId, sourceExpansion = lane.Key, pieces = result.Pieces.Select(p => new { p.TbcEntry, p.Ok, p.ItemEntry, p.DisplayId }) }),
-            IsReversible = true, RevertKind = RevertKind.Registry, Success = true, Notes = result.Message,
-        });
-        return result;
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = $"import_{lane.Key}_set", TargetType = "itemset",
+                TargetName = setName, TargetId = setId > 0 ? setId : null,
+                StateAfter = JsonSerializer.Serialize(new { buildId, setId, tbcSetId, sourceExpansion = lane.Key, memberCount = members.Count }),
+                IsReversible = false, RevertKind = RevertKind.None, Success = false,
+                Notes = $"{lane.Label} set import FAILED: {ex.Message}" +
+                        (setId > 0
+                            ? $" Set {setId} was already created and any members imported before the failure are still there — delete the set to unwind."
+                            : " No set id was allocated."),
+            });
+            throw;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -371,54 +474,78 @@ public sealed class CustomArmorBuildService
 
         int setId = request.SetId;
         string buildId = "armset-" + Guid.NewGuid().ToString("N")[..12];
-        if (setId <= 0)
+        string setName = request.Name.Trim();
+        try
         {
-            long floor = await ComputeSetIdFloorAsync();
-            var res = await _ids.ReserveAsync(KindSet, floor, buildId, "set");
-            setId = checked((int)res.Id);
-            await _ids.MarkStateAsync(KindSet, res.Id, "committed");
+            if (setId <= 0)
+            {
+                long floor = await ComputeSetIdFloorAsync();
+                var res = await _ids.ReserveAsync(KindSet, floor, buildId, "set");
+                setId = checked((int)res.Id);
+                await _ids.MarkStateAsync(KindSet, res.Id, "committed");
+            }
+
+            var bonuses = (request.Bonuses ?? new List<ArmorSetBonus>())
+                .Where(b => b.Threshold > 0 && b.SpellId > 0).OrderBy(b => b.Threshold).Take(ArmorItemSetDbc.MaxBonuses).ToList();
+
+            await using (var conn = _db.Admin())
+            {
+                await conn.OpenAsync();
+                await using var tx = await conn.BeginTransactionAsync();
+                await conn.ExecuteAsync(
+                    @"INSERT INTO custom_armor_set (set_id, name, bonuses_json, req_skill, req_skill_rank, created_at)
+                      VALUES (@setId, @name, @bonuses, @skill, @rank, NOW())
+                      ON DUPLICATE KEY UPDATE name=@name, bonuses_json=@bonuses, req_skill=@skill, req_skill_rank=@rank",
+                    new { setId, name = setName, bonuses = JsonSerializer.Serialize(bonuses), skill = request.RequiredSkill, rank = request.RequiredSkillRank }, tx);
+                await conn.ExecuteAsync("UPDATE custom_armor_display SET set_id=0 WHERE set_id=@setId", new { setId }, tx);
+                await conn.ExecuteAsync("UPDATE custom_armor_display SET set_id=@setId WHERE item_entry IN @entries", new { setId, entries = request.MemberEntries }, tx);
+                await tx.CommitAsync();
+            }
+
+            // Everything below is after the commit — an audit row written inside that transaction
+            // would survive its rollback, because AuditService writes on its own connection.
+            var stamp = await StampItemSetAsync(setId, request.MemberEntries);
+            var patch = await AssembleUnifiedPatchAsync();
+            WriteOutputs(buildId, patch, null);
+            var deploy = DeployPatch(patch);
+            var serverDeploy = DeployItemSetToServer(patch);
+            var reload = await ReloadItemTemplateAsync();
+
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "save_set", TargetType = "itemset", TargetName = setName, TargetId = setId,
+                // This row issues a reload but never recorded it, unlike every other apply path here.
+                RaCommand = ".reload item_template", RaResponse = reload.Message,
+                StateAfter = JsonSerializer.Serialize(new { setId, members = request.MemberEntries, bonuses }),
+                IsReversible = true, RevertKind = RevertKind.Registry,
+                // The registry write is committed by here; the item_template stamp is what the core
+                // actually reads for set membership, so a failed stamp is a failed save.
+                Success = stamp.Ok,
+                Notes = $"Set {setId} saved with {request.MemberEntries.Count} member(s). Stamp: {stamp.Message}. Deploy: {deploy.Message}. Server DBC: {serverDeploy.Message}. Reload: {reload.Message}.",
+            });
+
+            return new ArmorSetResult
+            {
+                SetId = setId, MemberCount = request.MemberEntries.Count, BonusCount = bonuses.Count,
+                PatchDeployed = deploy.Ok,
+                ServerDbcDeployed = serverDeploy.State == ItemSetDeployState.Deployed,
+                ItemTemplateStamped = stamp.Ok,
+                Message = $"Set {setId}: {deploy.Message}; server sets: {serverDeploy.Message}",
+            };
         }
-
-        var bonuses = (request.Bonuses ?? new List<ArmorSetBonus>())
-            .Where(b => b.Threshold > 0 && b.SpellId > 0).OrderBy(b => b.Threshold).Take(ArmorItemSetDbc.MaxBonuses).ToList();
-
-        await using (var conn = _db.Admin())
+        catch (Exception ex)
         {
-            await conn.OpenAsync();
-            await using var tx = await conn.BeginTransactionAsync();
-            await conn.ExecuteAsync(
-                @"INSERT INTO custom_armor_set (set_id, name, bonuses_json, req_skill, req_skill_rank, created_at)
-                  VALUES (@setId, @name, @bonuses, @skill, @rank, NOW())
-                  ON DUPLICATE KEY UPDATE name=@name, bonuses_json=@bonuses, req_skill=@skill, req_skill_rank=@rank",
-                new { setId, name = request.Name.Trim(), bonuses = JsonSerializer.Serialize(bonuses), skill = request.RequiredSkill, rank = request.RequiredSkillRank }, tx);
-            await conn.ExecuteAsync("UPDATE custom_armor_display SET set_id=0 WHERE set_id=@setId", new { setId }, tx);
-            await conn.ExecuteAsync("UPDATE custom_armor_display SET set_id=@setId WHERE item_entry IN @entries", new { setId, entries = request.MemberEntries }, tx);
-            await tx.CommitAsync();
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "save_set", TargetType = "itemset",
+                TargetName = setName, TargetId = setId > 0 ? setId : null,
+                StateAfter = JsonSerializer.Serialize(new { buildId, setId, members = request.MemberEntries }),
+                IsReversible = false, RevertKind = RevertKind.None, Success = false,
+                Notes = $"Set save FAILED: {ex.Message} — membership and bonuses are written in one transaction, " +
+                        "but the item_template stamp, the patch and the server DBC that follow it are not.",
+            });
+            throw;
         }
-
-        var stamp = await StampItemSetAsync(setId, request.MemberEntries);
-        var patch = await AssembleUnifiedPatchAsync();
-        WriteOutputs(buildId, patch, null);
-        var deploy = DeployPatch(patch);
-        var serverDeploy = DeployItemSetToServer(patch);
-        var reload = await ReloadItemTemplateAsync();
-
-        await _audit.LogAsync(new AuditEntry
-        {
-            Category = "armorforge", Action = "save_set", TargetType = "itemset", TargetName = request.Name.Trim(), TargetId = setId,
-            StateAfter = JsonSerializer.Serialize(new { setId, members = request.MemberEntries, bonuses }),
-            IsReversible = true, RevertKind = RevertKind.Registry, Success = true,
-            Notes = $"Set {setId} saved with {request.MemberEntries.Count} member(s). Stamp: {stamp.Message}. Deploy: {deploy.Message}. Server DBC: {serverDeploy.Message}. Reload: {reload.Message}.",
-        });
-
-        return new ArmorSetResult
-        {
-            SetId = setId, MemberCount = request.MemberEntries.Count, BonusCount = bonuses.Count,
-            PatchDeployed = deploy.Ok,
-            ServerDbcDeployed = serverDeploy.State == ItemSetDeployState.Deployed,
-            ItemTemplateStamped = stamp.Ok,
-            Message = $"Set {setId}: {deploy.Message}; server sets: {serverDeploy.Message}",
-        };
     }
 
     private async Task<(bool Ok, string Message)> StampItemSetAsync(int setId, IReadOnlyList<long> entries)
@@ -640,10 +767,22 @@ public sealed class CustomArmorBuildService
         await conn.OpenAsync();
 
         var srcRow = await conn.QueryFirstOrDefaultAsync(
-            "SELECT entry, name, class AS ItemClass, display_id AS DisplayId, inventory_type AS InventoryType FROM item_template WHERE entry=@e",
+            @"SELECT entry, name, class AS ItemClass, subclass AS Subclass,
+                     display_id AS DisplayId, inventory_type AS InventoryType
+              FROM item_template WHERE entry=@e",
             new { e = sourceEntry });
         if (srcRow is null) { result.Ok = false; result.Message = $"Vanilla item {sourceEntry} not found."; return result; }
         if (Convert.ToInt32(srcRow.ItemClass) != 4) { result.Ok = false; result.Message = $"Item {sourceEntry} is not armor (class 4)."; return result; }
+        // Shields are class-4 armor but they live in the Weapon Forge (WeaponTypeCatalog's "shield"
+        // family, slot 14 — deliberately absent from VanillaArmorSlots). The browse never offers
+        // them, but this method is reachable by entry id, and a shield that got through landed on
+        // family "other" and then failed modal validation with nothing explaining why.
+        if (Convert.ToInt32(srcRow.Subclass) == 6)
+        {
+            result.Ok = false;
+            result.Message = $"Item {sourceEntry} is a shield — clone it from the Weapon Forge's Vanilla lane, which owns the shield family.";
+            return result;
+        }
 
         string sourceName = (string)srcRow.name;
         int displayId = Convert.ToInt32(srcRow.DisplayId);
@@ -702,6 +841,20 @@ public sealed class CustomArmorBuildService
             await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id);
             result.Ok = false;
             result.Message = "clone failed: " + ex.Message;
+
+            // The INSERT and the override UPDATE are not in one transaction, so a failure in the
+            // second leaves a live row carrying the SOURCE item's name and stats under a new entry.
+            // Releasing the id does not remove it. Without this row nothing records that it exists.
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "clone_vanilla", TargetType = "item", TargetName = name,
+                TargetId = newEntry is > 0 and <= int.MaxValue ? (int)newEntry : null,
+                StateAfter = JsonSerializer.Serialize(new { buildId, sourceEntry, itemEntry = newEntry, displayId, family = fam.Key }),
+                IsReversible = false, RevertKind = RevertKind.None, Success = false,
+                Notes = $"Vanilla clone {sourceEntry} → {newEntry} FAILED: {ex.Message} — the id was released, but if the row " +
+                        $"was already inserted it is still in item_template as an unedited copy of {sourceEntry}. " +
+                        $"Check with: SELECT * FROM item_template WHERE entry = {newEntry};",
+            });
             return result;
         }
 
@@ -786,7 +939,34 @@ public sealed class CustomArmorBuildService
     {
         try
         {
-            if (src.RenderKind == ArmorRenderKind.Painted) return; // served from custom_armor_component by BodyAtlasTextureService
+            if (src.RenderKind == ArmorRenderKind.Painted)
+            {
+                // A Painted piece has no model, but it is NOT exempt from registration.
+                //   * Its icon lives in ItemDisplayIcons, and returning early here meant
+                //     chest/gloves/legs/waist/wrists/feet never entered it and showed the red "?".
+                //   * ItemsController.ItemDressing 404s outright when GetItemModelInfo returns null,
+                //     and BodyAtlasTextureService reads the eight component stems out of
+                //     ItemModelInfos[displayId].BodyTextures — so with no row the piece can never be
+                //     dressed onto the 3D character either.
+                // Register a MODEL-LESS row: empty model/texture names (there is no .mdx to
+                // advertise) carrying the component stems, exactly what the patch DBC row writes.
+                var painted = new string[8];
+                foreach (var c in src.Components)
+                    if (c.Slot >= 0 && c.Slot < 8)
+                        painted[c.Slot] = ArmorNaming.ComponentStem((int)displayId, c.Slot);
+
+                _dbc.RegisterCustomDisplayEntry((uint)displayId, new ItemModelDbc
+                {
+                    ModelName1 = "", ModelName2 = "", TextureName1 = "", TextureName2 = "",
+                    // Geosets are load-bearing even with no model: they are what makes a robe render
+                    // its skirt. Zeroing them paints the texture onto a piece with the wrong shape.
+                    GeosetGroup = src.GeosetGroup is { Length: 3 } gg ? (int[])gg.Clone() : new int[3],
+                    HelmetGeosetVis1 = 0, HelmetGeosetVis2 = 0,
+                    BodyTextures = painted,
+                    ItemVisualId = 0,
+                }, iconName: string.IsNullOrEmpty(src.IconStem) ? null : src.IconStem);
+                return;
+            }
 
             string model1 = src.ModelName ?? "";
             string model2 = src.ModelName2 ?? "";
@@ -842,7 +1022,33 @@ public sealed class CustomArmorBuildService
                 // Painted pieces have no display model — BodyAtlasTextureService serves them from
                 // custom_armor_component instead. Same skip RegisterDisplayWithDbc applies.
                 if (string.Equals(r.RenderKind, nameof(ArmorRenderKind.Painted), StringComparison.OrdinalIgnoreCase))
+                {
+                    // Model-less row + icon — see RegisterDisplayWithDbc for why a Painted piece
+                    // still needs a row: ItemDressing 404s without one and the body atlas is keyed
+                    // off BodyTextures. The stems come from the persisted component rows.
+                    try
+                    {
+                        var painted = new string[8];
+                        foreach (var c in r.Components)
+                            if (c.Slot >= 0 && c.Slot < 8)
+                                painted[c.Slot] = string.IsNullOrEmpty(c.ComponentStem)
+                                    ? ArmorNaming.ComponentStem((int)r.DisplayId, c.Slot)
+                                    : c.ComponentStem;
+                        _dbc.RegisterCustomDisplayEntry((uint)r.DisplayId, new ItemModelDbc
+                        {
+                            ModelName1 = "", ModelName2 = "", TextureName1 = "", TextureName2 = "",
+                            // See the forge-time branch: a robe without its geosets renders skirtless.
+                            GeosetGroup = new[] { r.Geoset0, r.Geoset1, r.Geoset2 },
+                            HelmetGeosetVis1 = 0, HelmetGeosetVis2 = 0,
+                            BodyTextures = painted,
+                            ItemVisualId = 0,
+                        }, iconName: string.IsNullOrEmpty(r.IconStem) ? null : r.IconStem);
+                        registered++;
+                    }
+                    catch (Exception iex)
+                    { _logger.LogDebug(iex, "ArmorForge: painted re-registration skipped for display {Id}", r.DisplayId); }
                     continue;
+                }
                 try
                 {
                     string model1 = r.ModelName ?? "";
@@ -977,23 +1183,86 @@ public sealed class CustomArmorBuildService
 
     public async Task<string> RebuildPatchAsync(string reason)
     {
-        var patch = await AssembleUnifiedPatchAsync();
-        if (patch is null)
+        try
         {
-            RemoveDeployedPatch();
-            RestoreServerItemSetIfEmpty();
-            return "no armor in registry — patch-6 removed";
+            var patch = await AssembleUnifiedPatchAsync();
+            if (patch is null)
+            {
+                var removal = RemoveDeployedPatch();
+                var restore = RestoreServerItemSetIfEmpty();
+
+                // This is the most consequential unlogged path in either forge. With no armor left in
+                // the registry it deletes patch-6 out of the live client AND copies the .vanilla
+                // sidecar back over the RUNNING SERVER's ItemSet.dbc — and it is reached not only from
+                // the Armor Forge but from every weapon forge, weapon delete and retexture rebuild,
+                // which all cascade into here. The server keeps the old DBC in memory until it is
+                // restarted, so the change is invisible until it very suddenly is not.
+                //
+                // Logged only when a file actually moved: on an armor-less install this branch runs
+                // on every one of those cascades, and a row per no-op would bury the one that did.
+                if (removal.Changed || restore.Changed)
+                    await LogPatchAuditAsync("patch_remove", reason,
+                        ok: removal.Ok,
+                        notes: "No armor left in the registry, so patch-6 was removed from the client " +
+                               $"({removal.Message}) and the live server's ItemSet.dbc was RESTORED to stock from the .vanilla sidecar ({restore.Message}). " +
+                               $"Triggered by: {reason}. The server keeps the previous ItemSet.dbc in memory until mangosd is restarted.",
+                        extra: new { patchRemoved = removal.Changed, clientRemoval = removal.Message, serverItemSetRestore = restore.Message });
+
+                return "no armor in registry — patch-6 removed";
+            }
+            WriteCanonicalPatch(patch);
+            var deploy = DeployPatch(patch);
+            var setDeploy = DeployItemSetToServer(patch);
+            if (setDeploy.State == ItemSetDeployState.Failed)
+                _logger.LogWarning("ArmorForge: server ItemSet.dbc NOT deployed — {Msg}", setDeploy.Message);
+            _logger.LogInformation("ArmorForge: rebuilt patch-6 ({Reason}) — {Msg}", reason, deploy.Message);
+
+            await LogPatchAuditAsync("patch_rebuild", reason,
+                ok: deploy.Ok && setDeploy.State != ItemSetDeployState.Failed,
+                notes: $"patch-6 repackaged and deployed ({deploy.Message}). " +
+                       $"Server ItemSet.dbc: {setDeploy.State} — {setDeploy.Message}. Triggered by: {reason}." +
+                       (setDeploy.State == ItemSetDeployState.Deployed
+                           ? " mangosd must be restarted before it reads the new ItemSet.dbc."
+                           : ""),
+                extra: new { patchRemoved = false, clientDeploy = deploy.Message, serverItemSetState = setDeploy.State.ToString(), serverItemSetMessage = setDeploy.Message });
+
+            return setDeploy.State == ItemSetDeployState.NotNeeded
+                ? deploy.Message
+                : $"{deploy.Message}. Server sets: {setDeploy.Message}";
         }
-        WriteCanonicalPatch(patch);
-        var deploy = DeployPatch(patch);
-        var setDeploy = DeployItemSetToServer(patch);
-        if (setDeploy.State == ItemSetDeployState.Failed)
-            _logger.LogWarning("ArmorForge: server ItemSet.dbc NOT deployed — {Msg}", setDeploy.Message);
-        _logger.LogInformation("ArmorForge: rebuilt patch-6 ({Reason}) — {Msg}", reason, deploy.Message);
-        return setDeploy.State == ItemSetDeployState.NotNeeded
-            ? deploy.Message
-            : $"{deploy.Message}. Server sets: {setDeploy.Message}";
+        catch (Exception ex)
+        {
+            await LogPatchAuditAsync("patch_rebuild", reason, ok: false,
+                notes: $"patch-6 rebuild FAILED: {ex.Message}. Triggered by: {reason}. " +
+                       "The deployed patch and the server's ItemSet.dbc are whatever the previous build left.",
+                extra: new { error = ex.Message });
+            throw;
+        }
     }
+
+    /// <summary>One row per patch-6 write or removal. patch-6 is a file in the running client's Data
+    /// folder and its ItemSet.dbc is a file in the running server's dbc folder, so every write —
+    /// whoever triggered it — belongs in the trail.</summary>
+    private Task LogPatchAuditAsync(string action, string reason, bool ok, string notes, object extra) =>
+        _audit.LogAsync(new AuditEntry
+        {
+            Category = "armorforge",
+            Action = action,
+            TargetType = "patch",
+            TargetName = "patch-6.MPQ",
+            StateAfter = JsonSerializer.Serialize(new
+            {
+                reason,
+                patch = "patch-6.MPQ",
+                clientDataPath = ClientDataPath,
+                serverDbcPath = ServerDbcPath,
+                detail = extra,
+            }),
+            IsReversible = false,
+            RevertKind = RevertKind.None,
+            Success = ok,
+            Notes = notes,
+        });
 
     // ═══════════════════════════════════════════════════════════════════
     // DELETE
@@ -1008,31 +1277,95 @@ public sealed class CustomArmorBuildService
     public async Task<ArmorDeleteResult> DeleteAsync(long displayId, bool rebuild)
     {
         long? entry;
-        await using (var conn = _db.Admin())
+        string? pieceName = null;
+        IDictionary<string, object>? registrySnapshot = null;
+        try
         {
+            await using (var conn = _db.Admin())
+            {
+                await conn.OpenAsync();
+                // Read the whole registry row, not just the entry id. These four DELETEs destroy the
+                // only copy of the compiled M2/BLP bytes, so what the row said is the only record
+                // there will ever be of what was deleted.
+                var reg = await conn.QueryFirstOrDefaultAsync(
+                    "SELECT * FROM custom_armor_display WHERE display_id=@displayId", new { displayId });
+                if (reg is null) return new ArmorDeleteResult { Ok = false, NotFound = true, Message = $"no forged armor with display {displayId}" };
+                registrySnapshot = StripBlobs((IDictionary<string, object>)reg);
+                entry = registrySnapshot.TryGetValue("item_entry", out var e) && e is not null ? (long?)Convert.ToInt64(e) : null;
+                pieceName = registrySnapshot.TryGetValue("name", out var n) ? n as string : null;
+                if (entry is null) return new ArmorDeleteResult { Ok = false, NotFound = true, Message = $"no forged armor with display {displayId}" };
+
+                await conn.ExecuteAsync("DELETE FROM custom_armor_component WHERE display_id=@displayId", new { displayId });
+                await conn.ExecuteAsync("DELETE FROM custom_armor_model WHERE display_id=@displayId", new { displayId });
+                await conn.ExecuteAsync("DELETE FROM custom_armor_display WHERE display_id=@displayId", new { displayId });
+            }
+
+            // The world row goes next, so snapshot it while it still exists.
+            var itemRowSnapshot = await ReadItemRowAsync(entry.Value);
+
+            await _ids.ReleaseAsync(WeaponIdReservationService.KindItemDisplay, displayId);
+            await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, entry.Value);
+            var del = await DeleteItemRowAsync(entry.Value);
+            string reloadMessage = "(deferred to the set delete)", patchMessage = "(deferred to the set delete)";
+            if (rebuild)
+            {
+                reloadMessage = (await ReloadItemTemplateAsync()).Message;
+                patchMessage = await RebuildPatchAsync("delete");
+            }
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "delete", TargetType = "item",
+                TargetName = pieceName, TargetId = checked((int)entry.Value), Success = del.Ok,
+                RaCommand = rebuild ? ".reload item_template" : null,
+                RaResponse = rebuild ? reloadMessage : null,
+                StateBefore = JsonSerializer.Serialize(new { registry = registrySnapshot, itemTemplate = itemRowSnapshot }),
+                Notes = $"Deleted forged armor display {displayId} / entry {entry}. World: {del.Message}. Reload: {reloadMessage}. Patch: {patchMessage}. " +
+                        (itemRowSnapshot is null
+                            ? "No item_template row was found to snapshot."
+                            : "The destroyed registry and item_template rows are captured in state_before (compiled bytes excluded)."),
+                IsReversible = false,
+            });
+            return new ArmorDeleteResult { Ok = true, Message = $"deleted display {displayId} / entry {entry}." + (rebuild ? $" {patchMessage}" : "") };
+        }
+        catch (Exception ex)
+        {
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "delete", TargetType = "item",
+                TargetName = pieceName, Success = false, IsReversible = false, RevertKind = RevertKind.None,
+                StateBefore = registrySnapshot is null ? null : JsonSerializer.Serialize(new { registry = registrySnapshot }),
+                Notes = $"Delete of forged armor display {displayId} FAILED: {ex.Message} — registry rows go first, " +
+                        "then the ids, then the world row, then the patch, so the piece may be partly removed.",
+            });
+            throw;
+        }
+    }
+
+    /// <summary>Drop the compiled-bytes columns before a registry row goes into an audit snapshot.
+    /// A single forged piece carries multi-megabyte BLP/M2 blobs; state_before is for reading, and
+    /// the blobs are gone with the row either way.</summary>
+    private static IDictionary<string, object> StripBlobs(IDictionary<string, object> row) =>
+        row.Where(kv => kv.Value is not byte[])
+           .ToDictionary(kv => kv.Key, kv => kv.Value);
+
+    /// <summary>The whole item_template row, for the audit trail's state_before — schema-agnostic, and
+    /// best-effort so a delete is never blocked by a snapshot that could not be taken.</summary>
+    private async Task<IDictionary<string, object>?> ReadItemRowAsync(long entry)
+    {
+        try
+        {
+            await using var conn = _db.Mangos();
             await conn.OpenAsync();
-            entry = await conn.ExecuteScalarAsync<long?>("SELECT item_entry FROM custom_armor_display WHERE display_id=@displayId", new { displayId });
-            if (entry is null) return new ArmorDeleteResult { Ok = false, NotFound = true, Message = $"no forged armor with display {displayId}" };
-            await conn.ExecuteAsync("DELETE FROM custom_armor_component WHERE display_id=@displayId", new { displayId });
-            await conn.ExecuteAsync("DELETE FROM custom_armor_model WHERE display_id=@displayId", new { displayId });
-            await conn.ExecuteAsync("DELETE FROM custom_armor_display WHERE display_id=@displayId", new { displayId });
+            // ORDER BY patch DESC — item_template is keyed (entry, patch); see the weapon forge's twin.
+            var row = await conn.QueryFirstOrDefaultAsync(
+                "SELECT * FROM item_template WHERE entry = @entry ORDER BY patch DESC LIMIT 1", new { entry });
+            return row is null ? null : (IDictionary<string, object>)row;
         }
-        await _ids.ReleaseAsync(WeaponIdReservationService.KindItemDisplay, displayId);
-        await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, entry.Value);
-        var del = await DeleteItemRowAsync(entry.Value);
-        string reloadMessage = "(deferred to the set delete)", patchMessage = "(deferred to the set delete)";
-        if (rebuild)
+        catch (Exception ex)
         {
-            reloadMessage = (await ReloadItemTemplateAsync()).Message;
-            patchMessage = await RebuildPatchAsync("delete");
+            _logger.LogWarning(ex, "ArmorForge: snapshot of item_template {Entry} failed (delete continues)", entry);
+            return null;
         }
-        await _audit.LogAsync(new AuditEntry
-        {
-            Category = "armorforge", Action = "delete", TargetType = "item", TargetId = checked((int)entry.Value), Success = del.Ok,
-            Notes = $"Deleted forged armor display {displayId} / entry {entry}. World: {del.Message}. Reload: {reloadMessage}. Patch: {patchMessage}.",
-            IsReversible = false,
-        });
-        return new ArmorDeleteResult { Ok = true, Message = $"deleted display {displayId} / entry {entry}." + (rebuild ? $" {patchMessage}" : "") };
     }
 
     /// <summary>
@@ -1065,51 +1398,75 @@ public sealed class CustomArmorBuildService
             setName = await conn.ExecuteScalarAsync<string?>("SELECT name FROM custom_armor_set WHERE set_id=@setId", new { setId });
         }
 
+        // Each piece writes its own delete row, and the patch rebuild at the end writes another.
+        // The scope makes the whole unwind read as one run instead of a dozen loose deletions.
+        using var batch = AuditBatch.Begin(
+            $"Armor Forge — delete {(string.IsNullOrWhiteSpace(setName) ? $"set {setId}" : $"set {setId} '{setName}'")}");
+
         int deleted = 0;
         var failures = new List<string>();
-        foreach (var d in displays)
+        try
         {
-            try
+            foreach (var d in displays)
             {
-                var piece = await DeleteAsync(d, rebuild: false);
-                if (piece.Ok) deleted++;
-                else if (piece.NotFound) deleted++;   // already gone — the goal, not a failure
-                else failures.Add($"display {d}: {piece.Message}");
+                try
+                {
+                    var piece = await DeleteAsync(d, rebuild: false);
+                    if (piece.Ok) deleted++;
+                    else if (piece.NotFound) deleted++;   // already gone — the goal, not a failure
+                    else failures.Add($"display {d}: {piece.Message}");
+                }
+                catch (Exception ex)
+                {
+                    // One bad piece must not strand the rest half-deleted with no set row to regroup them.
+                    _logger.LogError(ex, "ArmorForge: deleting display {DisplayId} of set {SetId} failed", d, setId);
+                    failures.Add($"display {d}: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+
+            bool complete = failures.Count == 0;
+            if (complete)
             {
-                // One bad piece must not strand the rest half-deleted with no set row to regroup them.
-                _logger.LogError(ex, "ArmorForge: deleting display {DisplayId} of set {SetId} failed", d, setId);
-                failures.Add($"display {d}: {ex.Message}");
+                await using var conn = _db.Admin();
+                await conn.OpenAsync();
+                await conn.ExecuteAsync("DELETE FROM custom_armor_set WHERE set_id=@setId", new { setId });
+                await _ids.ReleaseAsync(KindSet, setId);
             }
+
+            // Now, once, for the whole set.
+            var reload = await ReloadItemTemplateAsync();
+            string rebuild = await RebuildPatchAsync($"delete set {setId}");
+
+            string label = string.IsNullOrWhiteSpace(setName) ? $"set {setId}" : $"set {setId} '{setName}'";
+            string message = complete
+                ? $"deleted {label} and all {deleted} piece(s). {rebuild}"
+                : $"deleted {deleted}/{displays.Count} piece(s) of {label}; {failures.Count} failed, so the set was KEPT so you can retry: {string.Join("; ", failures.Take(4))}. {rebuild}";
+
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "delete_set", TargetType = "itemset", TargetId = setId,
+                TargetName = setName, Success = complete,
+                RaCommand = ".reload item_template", RaResponse = reload.Message,
+                StateBefore = JsonSerializer.Serialize(new { setId, setName, memberDisplayIds = displays }),
+                StateAfter = JsonSerializer.Serialize(new { setRowDeleted = complete, piecesDeleted = deleted, failures }),
+                Notes = $"{message} Reload: {reload.Message}.",
+                IsReversible = false,
+            });
+            return new ArmorDeleteResult { Ok = complete, Message = message };
         }
-
-        bool complete = failures.Count == 0;
-        if (complete)
+        catch (Exception ex)
         {
-            await using var conn = _db.Admin();
-            await conn.OpenAsync();
-            await conn.ExecuteAsync("DELETE FROM custom_armor_set WHERE set_id=@setId", new { setId });
-            await _ids.ReleaseAsync(KindSet, setId);
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "delete_set", TargetType = "itemset", TargetId = setId,
+                TargetName = setName, Success = false, IsReversible = false, RevertKind = RevertKind.None,
+                StateBefore = JsonSerializer.Serialize(new { setId, setName, memberDisplayIds = displays }),
+                StateAfter = JsonSerializer.Serialize(new { piecesDeleted = deleted, failures }),
+                Notes = $"Set delete FAILED after {deleted}/{displays.Count} piece(s): {ex.Message} — " +
+                        "the set row is kept when anything fails, so the delete can be retried.",
+            });
+            throw;
         }
-
-        // Now, once, for the whole set.
-        var reload = await ReloadItemTemplateAsync();
-        string rebuild = await RebuildPatchAsync($"delete set {setId}");
-
-        string label = string.IsNullOrWhiteSpace(setName) ? $"set {setId}" : $"set {setId} '{setName}'";
-        string message = complete
-            ? $"deleted {label} and all {deleted} piece(s). {rebuild}"
-            : $"deleted {deleted}/{displays.Count} piece(s) of {label}; {failures.Count} failed, so the set was KEPT so you can retry: {string.Join("; ", failures.Take(4))}. {rebuild}";
-
-        await _audit.LogAsync(new AuditEntry
-        {
-            Category = "armorforge", Action = "delete_set", TargetType = "itemset", TargetId = setId,
-            TargetName = setName, Success = complete,
-            Notes = $"{message} Reload: {reload.Message}.",
-            IsReversible = false,
-        });
-        return new ArmorDeleteResult { Ok = complete, Message = message };
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1349,31 +1706,54 @@ public sealed class CustomArmorBuildService
     }
 
     /// <summary>Put the stock ItemSet.dbc back when the registry no longer has any forged set, so the
-    /// server stops carrying orphan custom rows. Best-effort: never fails a rebuild.</summary>
-    private void RestoreServerItemSetIfEmpty()
+    /// server stops carrying orphan custom rows. Best-effort: never fails a rebuild. Returns what it
+    /// did, because this overwrites a file in the RUNNING server and the audit row has to say so.</summary>
+    private (bool Changed, string Message) RestoreServerItemSetIfEmpty()
     {
         var (dir, _) = ResolveServerDbcDir();
-        if (dir is null) return;
+        if (dir is null) return (false, "no server dbc path configured — nothing restored");
         try
         {
             string target = Path.Combine(dir, "ItemSet.dbc");
             string vanilla = target + ".vanilla";
-            if (File.Exists(vanilla)) File.Copy(vanilla, target, overwrite: true);
+            if (!File.Exists(vanilla)) return (false, $"no stock sidecar at {vanilla} — {target} left as-is");
+            // Only write when it would actually change something. This runs on every weapon forge and
+            // every retexture rebuild through the cascade, and re-copying a byte-identical file over a
+            // path the server holds open buys nothing but risk — and an audit row that cried wolf.
+            if (File.Exists(target) && FilesMatch(target, vanilla))
+                return (false, "server ItemSet.dbc is already stock — left alone");
+            File.Copy(vanilla, target, overwrite: true);
+            return (true, $"restored stock {target} from {Path.GetFileName(vanilla)}");
         }
-        catch (Exception ex) { _logger.LogWarning(ex, "ArmorForge: could not restore the stock server ItemSet.dbc"); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ArmorForge: could not restore the stock server ItemSet.dbc");
+            return (true, $"restore FAILED: {ex.Message}");
+        }
     }
 
-    private (bool Ok, string Message) RemoveDeployedPatch()
+    private static bool FilesMatch(string a, string b)
+    {
+        try
+        {
+            var fa = new FileInfo(a); var fb = new FileInfo(b);
+            if (fa.Length != fb.Length) return false;
+            return File.ReadAllBytes(a).AsSpan().SequenceEqual(File.ReadAllBytes(b));
+        }
+        catch { return false; }   // unreadable ⇒ treat as different and let the copy decide
+    }
+
+    private (bool Ok, bool Changed, string Message) RemoveDeployedPatch()
     {
         var dataPath = ClientDataPath;
-        if (dataPath is null) return (true, "no client Data path configured");
+        if (dataPath is null) return (true, false, "no client Data path configured");
         try
         {
             string target = Path.Combine(dataPath, PatchFileName);
-            if (File.Exists(target)) { File.Delete(target); return (true, $"removed {target}"); }
-            return (true, "no deployed patch to remove");
+            if (File.Exists(target)) { File.Delete(target); return (true, true, $"removed {target}"); }
+            return (true, false, "no deployed patch to remove");
         }
-        catch (Exception ex) { return (false, $"could not remove deployed patch ({ex.Message})"); }
+        catch (Exception ex) { return (false, true, $"could not remove deployed patch ({ex.Message})"); }
     }
 
     private void WriteOutputs(string buildId, ArmorPatchResult? patch, string? sql)

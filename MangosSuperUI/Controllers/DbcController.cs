@@ -11,10 +11,12 @@ namespace MangosSuperUI.Controllers;
 public class DbcController : Controller
 {
     private readonly DbcService _dbc;
+    private readonly CustomDisplayRegistrar _customDisplays;
 
-    public DbcController(DbcService dbc)
+    public DbcController(DbcService dbc, CustomDisplayRegistrar customDisplays)
     {
         _dbc = dbc;
+        _customDisplays = customDisplays;
     }
 
     // ── Status ────────────────────────────────────────────────────────────
@@ -136,9 +138,18 @@ public class DbcController : Controller
 
     /// <summary>POST /Dbc/Reload — re-read all DBC files (after path change in Settings).</summary>
     [HttpPost]
-    public IActionResult Reload()
+    public async Task<IActionResult> Reload()
     {
         _dbc.Reload();
+
+        // Reload() reassigns ItemDisplayIcons and ItemModelInfos wholesale from the extracted DBC
+        // directory, which has never held forged rows — so it discards every custom display the
+        // forges and the retexture engine registered. Without re-registering here, one click on the
+        // Settings page's "Reload DBC" button silently reverted every forged weapon to no glow and
+        // every forged item to the red "?" for the rest of the process lifetime, while still
+        // reporting success.
+        await _customDisplays.RegisterAllAsync("dbc reload");
+
         return Json(new
         {
             success = _dbc.IsLoaded,

@@ -251,8 +251,16 @@ public partial class DbcService
     /// GLB generation) without requiring a restart or DBC reload.
     /// Called by ItemRetextureService after creating a retexture.
     /// </summary>
+    /// <param name="itemVisual">The custom display's OWN ItemVisual (enchant glow). Null inherits the
+    /// donor's, which is right for a retexture cloning a real display but WRONG for a Forge writing
+    /// its own row: a forged weapon's chosen glow lives in custom_weapon_display.item_visual, and
+    /// inheriting the donor's 0 meant every web-side glow lookup
+    /// (ItemTextureService.ResolveVisualEffects, WeaponForgeController.PreviewForged) resolved
+    /// nothing — the Items page rendered forged weapons with no enchant effect while the Forge's own
+    /// preview, which reads the build state rather than this cache, showed it correctly.</param>
     public void RegisterCustomDisplayEntry(uint newDisplayId, uint sourceDisplayId,
-        string? customModelName = null, string? customTextureName = null, string? customModelName2 = null)
+        string? customModelName = null, string? customTextureName = null, string? customModelName2 = null,
+        uint? itemVisual = null)
     {
         // Clone icon from source
         if (ItemDisplayIcons is Dictionary<uint, string> iconDict)
@@ -308,7 +316,7 @@ public partial class DbcService
                     HelmetGeosetVis2 = sourceModel.HelmetGeosetVis2,
                     // Session N: inherit the source's item visual so a
                     // retextured Thunderfury still produces lightning.
-                    ItemVisualId = sourceModel.ItemVisualId,
+                    ItemVisualId = itemVisual ?? sourceModel.ItemVisualId,
                 };
                 modelDict[newDisplayId] = custom;
             }
@@ -335,10 +343,31 @@ public partial class DbcService
     ///
     /// Pass exactly what was written into the patch row so the two agree by construction.
     /// </summary>
+    /// <summary>
+    /// Register ONLY an inventory icon for a custom display id, with no model row.
+    ///
+    /// For pieces that genuinely have no model: PAINTED armour (chest, gloves, legs, waist, wrists,
+    /// feet, shirt, tabard) paints the shared character body atlas and is served from
+    /// custom_armor_component by BodyAtlasTextureService. Those displays still need an icon, and
+    /// registering a model row for them would advertise an .mdx that does not exist.
+    /// </summary>
+    public void RegisterCustomDisplayIcon(uint displayId, string iconName)
+    {
+        if (string.IsNullOrEmpty(iconName)) return;
+        if (ItemDisplayIcons is Dictionary<uint, string> iconDict)
+        {
+            // Lowercase to match the base loader's contract (the dictionary is documented as
+            // "icon filename (lowercase, no extension, no path)"). IconSearch does an ordinal
+            // Contains against a lowercased query, so a mixed-case custom entry is unfindable.
+            iconDict[displayId] = iconName.ToLowerInvariant();
+            _iconToDisplayIds = null;   // the reverse map is memoised; a new icon invalidates it
+        }
+    }
+
     public void RegisterCustomDisplayEntry(uint newDisplayId, ItemModelDbc row, string? iconName = null)
     {
         if (ItemDisplayIcons is Dictionary<uint, string> iconDict && !string.IsNullOrEmpty(iconName))
-            iconDict[newDisplayId] = iconName;
+            iconDict[newDisplayId] = iconName.ToLowerInvariant();   // see RegisterCustomDisplayIcon
 
         if (ItemModelInfos is Dictionary<uint, ItemModelDbc> modelDict)
         {

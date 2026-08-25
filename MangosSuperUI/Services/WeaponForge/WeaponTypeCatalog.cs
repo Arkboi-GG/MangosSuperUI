@@ -294,13 +294,22 @@ public static class WeaponTypeCatalog
         },
     ];
 
-    /// <summary>Lookup by key; unknown/empty falls back to the proven 1H sword.</summary>
-    public static WeaponTypeProfile Get(string? key)
+    /// <summary>Lookup by key, or null when the key names no family (including null/empty).
+    /// Callers that would otherwise forge the WRONG weapon use this: <see cref="Get"/>'s fallback
+    /// silently turns an unmapped subclass — fist weapon, spear, fishing pole, all of which
+    /// <see cref="LegacyItemCatalog.TypeKeyForSubclass"/> deliberately returns null for — into a
+    /// 1H sword, and the operator only finds out when the item is in-game.</summary>
+    public static WeaponTypeProfile? Find(string? key)
     {
-        if (!string.IsNullOrWhiteSpace(key))
-            foreach (var p in All)
-                if (string.Equals(p.Key, key.Trim(), StringComparison.OrdinalIgnoreCase))
-                    return p;
-        return All[0];
+        if (string.IsNullOrWhiteSpace(key)) return null;
+        foreach (var p in All)
+            if (string.Equals(p.Key, key.Trim(), StringComparison.OrdinalIgnoreCase))
+                return p;
+        return null;
     }
+
+    /// <summary>Lookup by key; unknown/empty falls back to the proven 1H sword. Fine where a
+    /// default is genuinely wanted (preview scaffolding, the GLB route's "no preference" case) —
+    /// use <see cref="Find"/> anywhere the family decides what actually gets written.</summary>
+    public static WeaponTypeProfile Get(string? key) => Find(key) ?? All[0];
 }
