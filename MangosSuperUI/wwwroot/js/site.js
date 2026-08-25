@@ -8,7 +8,52 @@
     'use strict';
 
     // =========================================================
-    //  1. THEME OVERRIDES — runs first, before DOM is interactive
+    //  1. THEME MODE (light/dark) — runs first, before first paint
+    // =========================================================
+
+    var THEME_MODE_KEY = 'msui_theme_mode';
+
+    function getStoredThemeMode() {
+        var stored = localStorage.getItem(THEME_MODE_KEY);
+        if (stored === 'light' || stored === 'dark') return stored;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+
+    function applyThemeMode(mode) {
+        document.documentElement.setAttribute('data-theme', mode);
+    }
+
+    function setThemeMode(mode) {
+        localStorage.setItem(THEME_MODE_KEY, mode);
+        applyThemeMode(mode);
+        updateThemeToggleIcon(mode);
+    }
+
+    function updateThemeToggleIcon(mode) {
+        var btn = document.getElementById('btnThemeToggle');
+        if (!btn) return;
+        var icon = btn.querySelector('i');
+        if (!icon) return;
+        icon.classList.toggle('fa-sun', mode === 'dark');
+        icon.classList.toggle('fa-moon', mode === 'light');
+        btn.title = mode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+    }
+
+    // Apply immediately (before DOMContentLoaded) so there's no flash
+    applyThemeMode(getStoredThemeMode());
+
+    function initThemeToggle() {
+        updateThemeToggleIcon(getStoredThemeMode());
+        var toggleBtn = document.getElementById('btnThemeToggle');
+        if (toggleBtn) {
+            toggleBtn.addEventListener('click', function () {
+                setThemeMode(getStoredThemeMode() === 'dark' ? 'light' : 'dark');
+            });
+        }
+    }
+
+    // =========================================================
+    //  2. THEME OVERRIDES — runs first, before DOM is interactive
     // =========================================================
 
     const THEME_STORAGE_KEY = 'msui_theme_overrides';
@@ -67,7 +112,7 @@
 
 
     // =========================================================
-    //  2. SIDEBAR ORDER — read from localStorage, reorder DOM
+    //  3. SIDEBAR ORDER — read from localStorage, reorder DOM
     // =========================================================
 
     var ORDER_STORAGE_KEY = 'msui_sidebar_order';
@@ -279,7 +324,7 @@
 
 
     // =========================================================
-    //  3. SIDEBAR COLLAPSE/EXPAND
+    //  4. SIDEBAR COLLAPSE/EXPAND
     // =========================================================
 
     var COLLAPSE_STORAGE_KEY = 'msui_sidebar_expanded';
@@ -395,7 +440,7 @@
 
 
     // =========================================================
-    //  4. CUSTOMIZE MODAL — Order Tab
+    //  5. CUSTOMIZE MODAL — Order Tab
     // =========================================================
 
     function initCustomizeModal() {
@@ -726,7 +771,7 @@
 
 
     // =========================================================
-    //  5. CUSTOMIZE MODAL — Theme Tab
+    //  6. CUSTOMIZE MODAL — Theme Tab
     // =========================================================
 
     function populateThemePickers() {
@@ -763,10 +808,11 @@
 
 
     // =========================================================
-    //  6. INIT — on DOMContentLoaded
+    //  7. INIT — on DOMContentLoaded
     // =========================================================
 
     document.addEventListener('DOMContentLoaded', function () {
+        initThemeToggle();
         applySidebarOrder();
         initSidebarCollapse();
         initCustomizeModal();

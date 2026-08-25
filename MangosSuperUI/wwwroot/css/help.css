@@ -93,7 +93,7 @@ body.help-mode .pa-tele {
 
 .help-section-panel {
     display: none;
-    background: linear-gradient(135deg, #f0f6ff, var(--accent-subtle));
+    background: linear-gradient(135deg, var(--accent-light), var(--accent-subtle));
     border: 1px solid var(--accent-light);
     border-left: 3px solid var(--accent);
     border-radius: var(--radius-md);
