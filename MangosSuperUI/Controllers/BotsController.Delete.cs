@@ -51,6 +51,7 @@ public partial class BotsController
 
         await DeleteBotRowsAsync(conn, req.Guid);
         _brain.EvictBot((int)req.Guid);
+        _bridge.RemoveBotState((int)req.Guid);
 
         return Json(new { success = true });
     }
@@ -80,6 +81,7 @@ public partial class BotsController
         {
             await DeleteBotRowsAsync(conn, guid);
             _brain.EvictBot((int)guid);
+            _bridge.RemoveBotState((int)guid);
         }
 
         return Json(new { success = true, deleted = guids.Count });
