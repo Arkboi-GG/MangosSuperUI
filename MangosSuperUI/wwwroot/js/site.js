@@ -78,7 +78,7 @@
             styleEl.textContent = '';
             return;
         }
-        var css = ':root {\n';
+        var css = ':root[data-theme] {\n';
         keys.forEach(function (k) {
             css += '  ' + k + ': ' + overrides[k] + ';\n';
         });
