@@ -964,6 +964,23 @@ html, body {
         border-radius: 2px;
     }
 
+.theme-mode-select {
+    background: var(--bg-input);
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    padding: 5px 10px;
+    font-size: 12.5px;
+    font-family: inherit;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+    .theme-mode-select:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-light);
+    }
+
 .theme-actions {
     padding-top: 12px;
     border-top: 1px solid var(--border-light);
@@ -995,20 +1012,3 @@ html, body {
         background: var(--bg-sidebar-hover);
         color: #d1d9e6;
     }
-
-.sidebar-footer-nav {
-    display: flex;
-    gap: 8px;
-}
-
-.sidebar-nav-item-grow {
-    flex: 1;
-    min-width: 0;
-}
-
-.sidebar-theme-toggle-btn {
-    width: 38px;
-    flex-shrink: 0;
-    justify-content: center;
-    padding: 9px 0;
-}

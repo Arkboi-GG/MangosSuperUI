@@ -463,16 +463,11 @@
 
     <!-- Footer -->
     <div class="sidebar-footer">
-        <ul class="sidebar-nav sidebar-footer-nav">
-            <li class="sidebar-nav-item sidebar-nav-item-grow">
+        <ul class="sidebar-nav">
+            <li class="sidebar-nav-item">
                 <button class="sidebar-customize-btn" id="btnOpenCustomize" title="Customize sidebar order & theme">
                     <i class="fa-solid fa-palette"></i>
                     Customize
-                </button>
-            </li>
-            <li class="sidebar-nav-item">
-                <button class="sidebar-customize-btn sidebar-theme-toggle-btn" id="btnThemeToggle" title="Switch to dark mode">
-                    <i class="fa-solid fa-moon"></i>
                 </button>
             </li>
         </ul>
@@ -512,7 +507,17 @@
 
         <!-- Tab: Theme -->
         <div class="customize-body customize-tab-content" data-tab-content="theme">
-            <p class="customize-hint">Pick colors to override the default theme. Changes preview live.</p>
+            <p class="customize-hint">Pick a theme and change any color options to your liking. Changes preview live.</p>
+
+            <div class="theme-section">
+                <div class="theme-row">
+                    <label>Theme</label>
+                    <select class="theme-mode-select" id="themeModeSelect">
+                        <option value="light">Light</option>
+                        <option value="dark">Dark</option>
+                    </select>
+                </div>
+            </div>
 
             <div class="theme-section">
                 <div class="theme-section-label">Sidebar &amp; Top Bar</div>

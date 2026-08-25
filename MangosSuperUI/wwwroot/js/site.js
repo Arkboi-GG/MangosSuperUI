@@ -16,7 +16,7 @@
     function getStoredThemeMode() {
         var stored = localStorage.getItem(THEME_MODE_KEY);
         if (stored === 'light' || stored === 'dark') return stored;
-        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        return 'light';
     }
 
     function applyThemeMode(mode) {
@@ -26,31 +26,10 @@
     function setThemeMode(mode) {
         localStorage.setItem(THEME_MODE_KEY, mode);
         applyThemeMode(mode);
-        updateThemeToggleIcon(mode);
-    }
-
-    function updateThemeToggleIcon(mode) {
-        var btn = document.getElementById('btnThemeToggle');
-        if (!btn) return;
-        var icon = btn.querySelector('i');
-        if (!icon) return;
-        icon.classList.toggle('fa-sun', mode === 'dark');
-        icon.classList.toggle('fa-moon', mode === 'light');
-        btn.title = mode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
     }
 
     // Apply immediately (before DOMContentLoaded) so there's no flash
     applyThemeMode(getStoredThemeMode());
-
-    function initThemeToggle() {
-        updateThemeToggleIcon(getStoredThemeMode());
-        var toggleBtn = document.getElementById('btnThemeToggle');
-        if (toggleBtn) {
-            toggleBtn.addEventListener('click', function () {
-                setThemeMode(getStoredThemeMode() === 'dark' ? 'light' : 'dark');
-            });
-        }
-    }
 
     // =========================================================
     //  2. THEME OVERRIDES — runs first, before DOM is interactive
@@ -475,6 +454,14 @@
             });
         });
 
+        // Theme mode select (light/dark)
+        var themeModeSelect = document.getElementById('themeModeSelect');
+        if (themeModeSelect) {
+            themeModeSelect.addEventListener('change', function () {
+                setThemeMode(this.value);
+            });
+        }
+
         // Theme reset button
         var btnResetTheme = document.getElementById('btnResetTheme');
         if (btnResetTheme) {
@@ -775,6 +762,11 @@
     // =========================================================
 
     function populateThemePickers() {
+        var themeModeSelect = document.getElementById('themeModeSelect');
+        if (themeModeSelect) {
+            themeModeSelect.value = getStoredThemeMode();
+        }
+
         var overrides = getThemeOverrides();
         document.querySelectorAll('.theme-color-input').forEach(function (input) {
             var varName = input.getAttribute('data-var');
@@ -812,7 +804,6 @@
     // =========================================================
 
     document.addEventListener('DOMContentLoaded', function () {
-        initThemeToggle();
         applySidebarOrder();
         initSidebarCollapse();
         initCustomizeModal();
