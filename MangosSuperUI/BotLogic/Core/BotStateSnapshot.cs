@@ -53,6 +53,12 @@ public class BotStateSnapshot
     // groups the god-bot formed).
     public bool InPlayerParty { get; set; } = false;
 
+    // [CONSCRIPTED] Enlisted in a player's RTS army (C++ conscripted on STATE, 2026-08-24).
+    // The client assigned this bot to a control group; the C++ core fences brain commands
+    // and stands the bot at attention. C# stands down like the player-party hold but
+    // PRESERVES the held objective, so a dismissal resumes questing in place.
+    public bool Conscripted { get; set; } = false;
+
     // Computed
     public float HealthPercent => MaxHealth > 0 ? Health / (float)MaxHealth : 1f;
     public float ManaPercent => MaxMana > 0 ? Mana / (float)MaxMana : 1f;
@@ -116,6 +122,7 @@ public class BotStateSnapshot
             Copper = bs.Copper,
             Durability = bs.Durability,
             InPlayerParty = bs.InPlayerParty,   // [PLAYERPARTY] pparty on STATE — needs the BotState parse in BotBridgeService
+            Conscripted = bs.Conscripted,       // [CONSCRIPTED] conscripted on STATE — the RTS-army stand-down
             HubErrandUntil = bs.HubErrandUntil, // [HUB-ERRAND] run token — stamped by the CHAT_RECV recognizer, persists on conn.State
             PartyBossDist = bs.PartyBossDist,   // [HUB-ERRAND] ppdist on STATE — the boss-range abort guard
             ServerQuestId = bs.QuestId,

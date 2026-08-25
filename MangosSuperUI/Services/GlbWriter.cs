@@ -118,9 +118,14 @@ public static class GlbWriter
     /// bytes, so without this an item can be decoded perfectly and still render dead. Resolve them
     /// with <see cref="M2Fx.ItemVisualEffects.Resolve"/>; their emitters are folded into this GLB's
     /// manifest at their mount points and their sheets embedded alongside.</param>
+    /// <param name="plannedEmitters">Pre-import preview parity: the donor grafts a motion plan says
+    /// the import WILL bake, rendered via <see cref="M2Fx.M2FxReader.FromGraft"/> instead of the raw
+    /// later-client emitter summary (which has no scale/alpha curves or flipbook ranges and draws
+    /// giant flat white columns). When present, the degraded WotLK raw-summary fallback never runs.</param>
     public static bool SaveGlb(M2Model m2, Dictionary<int, byte[]> textures, string outputPath,
         bool doubleSided = false,
-        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null)
+        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null,
+        IReadOnlyList<WeaponForge.WeaponPreviewService.PreviewEmitter>? plannedEmitters = null)
     {
         if (!m2.IsValid) return false;
 
@@ -719,6 +724,32 @@ public static class GlbWriter
                 var mounted = EmbedVisualEffects(model, visualEffects);
                 if (mounted.Count > 0)
                     fx = fx with { Emitters = fx.Emitters.Concat(mounted).ToList() };
+
+                // Planned-graft emitters — what the import will actually produce (donor curves +
+                // source overrides), same as the weapon preview's AttachEmitterManifest path.
+                if (plannedEmitters is { Count: > 0 })
+                {
+                    var planned = new List<M2Fx.M2FxEmitter>();
+                    foreach (var pe in plannedEmitters)
+                    {
+                        if (pe.Png is not { Length: > 0 }) continue;
+                        var existing = model.LogicalTextures.FirstOrDefault(t => SameImage(t.PrimaryImage, pe.Png));
+                        int texIdx;
+                        if (existing is not null) texIdx = existing.LogicalIndex;
+                        else
+                        {
+                            var image = model.CreateImage();
+                            image.Content = new SharpGLTF.Memory.MemoryImage(pe.Png);
+                            image.Name = $"EmitterSheet_g{planned.Count}";
+                            var texture = model.UseTexture(image);
+                            texture.Name = image.Name;
+                            texIdx = texture.LogicalIndex;
+                        }
+                        var em = M2Fx.M2FxReader.FromGraft(pe.Graft, texIdx, pe.PositionMesh);
+                        if (em is not null) planned.Add(em);
+                    }
+                    if (planned.Count > 0) fx = fx with { Emitters = fx.Emitters.Concat(planned).ToList() };
+                }
 
                 // WotLK (v264) fallback. M2WotlkReader parses fine but leaves SourceBytes null on
                 // purpose (its raw emitter/track reader is v256-only), so M2FxReader.Build above found

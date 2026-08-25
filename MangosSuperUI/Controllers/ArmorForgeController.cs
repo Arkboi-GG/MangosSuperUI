@@ -164,8 +164,14 @@ public class ArmorForgeController : Controller
 
         IEnumerable<LegacyArmorEntry> q = all;
         if (!string.IsNullOrEmpty(family)) q = q.Where(e => e.FamilyKey == family);
-        q = q.Where(e => Match(e.Name) || Match(e.SetName) || (s.Length > 0 && e.Entry.ToString() == s));
-        var hits = q.ToList();
+        var scoped = q.ToList();
+        var hits = scoped.Where(e => Match(e.Name) || Match(e.SetName) || (s.Length > 0 && e.Entry.ToString() == s)).ToList();
+
+        // Slot-word search: "boots" / "waist" / "helmet" resolves to a family, because most boots are
+        // named Sabatons/Treads/Greaves and a name substring finds almost nothing. Slot hits fill the
+        // pieces list below (set members included, best ilvl first) but do NOT nominate set cards —
+        // every tier set contains boots, so cards would drown the answer.
+        string? slotFamily = s.Length == 0 ? null : ArmorTypeCatalog.FamilyForSlotWord(s);
 
         // Sets: any set with a matching member or matching name; list ALL its armor members.
         // Split into the current-expansion tier/arena sets (what the browse leads with) and
@@ -193,14 +199,19 @@ public class ArmorForgeController : Controller
         var sets = featuredAll.Take(limit * 4).ToList();
         var otherSets = otherAll.Take(limit * 8).ToList();
 
-        var loose = hits.Where(h => h.SetId == 0).OrderBy(h => h.Name, StringComparer.OrdinalIgnoreCase).Take(limit).Select(e => PieceDto(e, lane)).ToList();
+        var loose = slotFamily != null
+            ? scoped.Where(e => e.FamilyKey == slotFamily)
+                .OrderByDescending(e => e.ItemLevel).ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+                .Take(limit * 2).Select(e => PieceDto(e, lane)).ToList()
+            : hits.Where(h => h.SetId == 0).OrderBy(h => h.Name, StringComparer.OrdinalIgnoreCase).Take(limit).Select(e => PieceDto(e, lane)).ToList();
         return Json(new
         {
-            expansion = lane.Key, label = lane.Label, total = hits.Count,
+            expansion = lane.Key, label = lane.Label,
+            total = slotFamily != null ? scoped.Count(e => e.FamilyKey == slotFamily) : hits.Count,
             sets, otherSets,
             featuredSetCount = featuredAll.Count, otherSetCount = otherAll.Count,
             featuredMinItemLevel = lane.Catalog.FeaturedItemLevelForDisplay,
-            loose,
+            loose, slotSearch = slotFamily != null,
         });
     }
 
@@ -402,7 +413,12 @@ public class ArmorForgeController : Controller
                 if (slot < 0) slot = 0;
                 textures[slot] = skinBytes;
             }
-            bool ok = GlbWriter.SaveGlb(m2, textures, file, doubleSided: true);
+            // WotLK pre-import parity: preview the emitters the import WILL bake (donor grafts),
+            // not the raw v264 summary — GlbWriter's degraded raw-summary fallback then never runs.
+            List<WeaponPreviewService.PreviewEmitter>? planned = null;
+            if (m2.SourceBytes is null && m2.ParticleEmitters.Count > 0)
+                planned = lane.Importer.PlanPreviewEmitters(m2);
+            bool ok = GlbWriter.SaveGlb(m2, textures, file, doubleSided: true, plannedEmitters: planned);
             return ok ? url : null;
         }
         catch (Exception ex) { _logger.LogDebug(ex, "Armor preview: attachment GLB failed for {M2}", m2Path); return null; }
@@ -591,10 +607,11 @@ public class ArmorForgeController : Controller
     /// into the shipped textures. expansion=vanilla clones an existing vanilla item instead of importing art.</summary>
     [HttpPost]
     public Task<IActionResult> Import(string? expansion, uint entry, string? name, int setId = 0, string? itemConfig = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", string? glowColor = null) =>
+        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", string? glowColor = null,
+        float glowIntensity = 1f) =>
         string.Equals(expansion, "vanilla", StringComparison.OrdinalIgnoreCase)
             ? VanillaClone(entry, name, itemConfig)
-            : LaneImport(_lanes.Get(expansion), entry, name, setId, itemConfig, recolorHue, recolorTheory, recolorTier, HexToRgb255(glowColor));
+            : LaneImport(_lanes.Get(expansion), entry, name, setId, itemConfig, recolorHue, recolorTheory, recolorTier, HexToRgb255(glowColor), glowIntensity);
 
     // "#rrggbb" → RGB 0..255 vector for the emitter colour track; null when unset/malformed.
     private static Vector3? HexToRgb255(string? hex)
@@ -625,7 +642,8 @@ public class ArmorForgeController : Controller
     }
 
     private async Task<IActionResult> LaneImport(ArmorImportLane lane, uint entry, string? name, int setId, string? itemConfig,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null)
+        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null,
+        float glowIntensity = 1f)
     {
         try
         {
@@ -635,7 +653,8 @@ public class ArmorForgeController : Controller
                 return BadRequest(string.Join("\n", cfgErrors));
 
             var r = await _armor.ImportAsync(lane, entry, name, setId, gameplay: gameplay,
-                recolorHue: recolorHue, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor);
+                recolorHue: recolorHue, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor,
+                glowIntensity: glowIntensity);
             return r.Ok ? Json(ResultDto(r)) : BadRequest(r.Message + (r.Diagnostics.Length > 0 ? "\n" + string.Join("\n", r.Diagnostics.Take(12)) : ""));
         }
         catch (Exception ex) { _logger.LogWarning(ex, "ArmorForge: {Lane} import {Entry} failed", lane.Key, entry); return BadRequest(ex.Message); }
@@ -668,7 +687,8 @@ public class ArmorForgeController : Controller
 
             var r = await _armor.ImportSetAsync(lane, dto.SourceSetId, entries, perPiece, bonuses,
                 dto.RequiredSkill, dto.RequiredSkillRank, dto.Name,
-                dto.RecolorHue, dto.RecolorTheory ?? "fan", dto.RecolorTier ?? "improved", HexToRgb255(dto.GlowColor));
+                dto.RecolorHue, dto.RecolorTheory ?? "fan", dto.RecolorTier ?? "improved", HexToRgb255(dto.GlowColor),
+                dto.GlowIntensity is { } gi && gi > 0f ? gi : 1f);
             return Json(new
             {
                 ok = true, expansion = lane.Key, setId = r.SetId, name = r.Name, message = r.Message, patchDeployed = r.PatchDeployed,
@@ -694,6 +714,7 @@ public class ArmorForgeController : Controller
         public string? RecolorTheory { get; set; }
         public string? RecolorTier { get; set; }
         public string? GlowColor { get; set; }
+        public float? GlowIntensity { get; set; }
     }
     public sealed class PieceCfgDto { public uint Entry { get; set; } public string? ItemConfig { get; set; } }
 

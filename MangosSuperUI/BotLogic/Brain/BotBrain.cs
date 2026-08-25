@@ -109,6 +109,31 @@ public sealed class BotBrain
         // 1. Read snapshot → refresh sensory.
         ctx.Sense(snap);
 
+        // 1a-0. [CONSCRIPTED] Enlisted in a player's RTS army: the planner stands
+        //       down entirely. Park once (EnterGoalAsync(Idle) clears Pending,
+        //       Failure and the goal scratch; ctx.Held is deliberately PRESERVED
+        //       so dismissal resumes questing in place), then keep the progress
+        //       and still-anchor clocks warm every tick so neither the wedge
+        //       breaker nor the stuck ejector fires a stale verdict on the first
+        //       free tick after dismissal. C++ owns the army — combat AI,
+        //       formations and RTS orders run server-side, and the core's bridge
+        //       fence independently drops planner commands — so this gate is
+        //       politeness plus timer hygiene, not the only wall.
+        if (ctx.Conscripted)
+        {
+            if (ctx.Goal != Goal.Idle)
+                await EnterGoalAsync(ctx, Goal.Idle);
+            ctx.GoalReason = "conscripted";
+            ctx.MarkProgress();
+            if (ctx.Identity is { } enlisted)
+            {
+                enlisted.StillAnchorX = ctx.Pos.X;
+                enlisted.StillAnchorY = ctx.Pos.Y;
+                enlisted.StillSinceUtc = DateTime.UtcNow;
+            }
+            return;
+        }
+
         // 1a. Combat-directive overlay (grouping §3.6). The GroupCoordinator pre-pass already
         //     stamped ctx.CombatDirective this tick (Assist(anchor) / None). Emit COMBAT_DIRECTIVE
         //     to C++ ONLY when the stamp changed since we last told it -- the coordinator re-stamps
@@ -240,6 +265,10 @@ public sealed class BotBrain
     /// </summary>
     private async Task<bool> TryBreakWedgeAsync(BotContext ctx)
     {
+        // [CONSCRIPTED] An enlisted bot idles by ORDER — never a wedge, never a
+        // streak, never a stranded port. (Unreachable today via the TickAsync
+        // gate; kept as a wall against call-order drift.)
+        if (ctx.Conscripted) return false;
         var id = ctx.Identity;
         if (id?.WedgeBackoffUntil is DateTime parked && DateTime.UtcNow < parked)
             return false;   // already parked — let the backoff hold; GoalSelector keeps it Idle
@@ -350,7 +379,7 @@ public sealed class BotBrain
 
         // Not eligible (dead / in combat / player-driven): hold the anchor here so the window starts
         // fresh the moment the bot becomes eligible again.
-        if (id == null || ctx.Dead || ctx.InCombat || ctx.InPlayerParty)
+        if (id == null || ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted)
         {
             if (id != null) { id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow; }
             return false;
@@ -530,7 +559,7 @@ public sealed class BotBrain
     {
         var id = ctx.Identity;
         if (id == null || id.IslandStreak < IslandEscapeCap) return false;
-        if (ctx.Dead || ctx.InCombat || ctx.InPlayerParty) return false;
+        if (ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted) return false;
         if (id.IslandEscapeCooldownUntil is DateTime cd && DateTime.UtcNow < cd) return false;
 
         // [ESCAPE-BANDS] Level-appropriate destination: lowest band containing the level, same-faction,

@@ -286,6 +286,18 @@ function createEmitterSystem(def, texture) {
                 cells = tail;
             }
 
+            // Live glow override — the same transform the forge BAKES: a tint replaces the
+            // colour ramp (the bake writes one flat colour over the emitter's colour keys),
+            // intensity scales the colour (additive particles render colour as brightness),
+            // and a dim also shrinks the particle. Applied here, at ramp-evaluation time, so
+            // the preview matches the committed result instead of multiplying on top of it.
+            const ov = material.userData && material.userData.suiGlowOverride;
+            if (ov) {
+                if (ov.tint) { r = ov.tint[0]; g = ov.tint[1]; b = ov.tint[2]; }
+                if (ov.intensity != null) { r *= ov.intensity; g *= ov.intensity; b *= ov.intensity; }
+                if (ov.sizeMul != null) scale *= ov.sizeMul;
+            }
+
             // Billboard: a camera-facing quad of side `scale`, centred on the
             // particle. Half-extents along the camera's right and up axes.
             const half = scale * 0.5;

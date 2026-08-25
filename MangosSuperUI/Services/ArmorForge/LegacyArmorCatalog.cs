@@ -65,8 +65,10 @@ public abstract class LegacyArmorCatalog
     ///
     /// Measured against the shipped catalogs joined to the client's ItemSet.dbc:
     /// TBC ≥120 ⇒ 73 featured / 259 other — exactly T4 (120), Gladiator (123), T5 (133), T6 (154)
-    /// plus the five crafted epic sets at 120; WotLK ≥200 ⇒ 98 / 369 — T7 (200/213) through
-    /// T10 (251) plus the arena sets, with T1–T6 dropping out.</summary>
+    /// plus the five crafted epic sets at 120. WotLK ≥200 ⇒ ~350 / ~460 — T7 (200/213) through
+    /// T10 (251/264/277) plus EVERY arena season, with T1–T6 dropping out; the count grew when the
+    /// catalog's item_template.itemset union + variant splitting (steps 2b/3b below) surfaced the
+    /// seasons ItemSet.dbc alone does not list.</summary>
     protected abstract int FeaturedMinItemLevel { get; }
 
     /// <summary>The same threshold, for the browse payload's caption ("tier &amp; arena, ilvl 120+").</summary>
@@ -210,6 +212,23 @@ public abstract class LegacyArmorCatalog
             catch (Exception ex) { _logger.LogWarning(ex, "{Label} armor: ItemSet.dbc parse failed — set grouping unavailable", Label); }
         }
 
+        // 2b) Catalog-declared membership (item_template.itemset). From 3.3.5a on Blizzard stopped
+        //     maintaining ItemSet.dbc's itemID[17] for variants: a row lists only the base items
+        //     (arena Season 5, tier-10 ilvl 251) and every later season / higher-ilvl version links
+        //     to its set on the ITEM instead. Union those in so Furious/Relentless/Wrathful arena
+        //     gear and the Sanctified tier versions group like everything else.
+        //
+        //     The column OVERRIDES DBC membership on conflict: the T9 DBC rows are themselves wrong —
+        //     measured on 3.3.5a, row 823 "Worldbreaker Battlegear" (enhancement) lists 46303
+        //     (a Garb Spaulders) and 46307 (a Regalia Kilt) among its five, which mixed the three
+        //     shaman spec sets into 7- and 10-piece cards. item_template.itemset is what the server
+        //     itself counts for set bonuses, so it is the authority. Set ids the client's DBC does
+        //     not know are ignored, and the TBC catalog has no setId column (2.4.3 member lists are
+        //     complete), so the TBC lane is untouched either way.
+        foreach (var it in _catalog.Items)
+            if (it.SetId != 0 && _sets.ContainsKey(it.SetId))
+                _entryToSet[it.Entry] = it.SetId;
+
         // 3) Browse list.
         var list = new List<LegacyArmorEntry>();
         foreach (var it in _catalog.Items)
@@ -231,6 +250,58 @@ public abstract class LegacyArmorCatalog
             list.Add(e);
             if (setId != 0) ((List<uint>)_sets[setId].MemberEntries).Add(it.Entry);
         }
+
+        // 3b) Variant splitting. After the catalog union, a WotLK set row can hold several copies of
+        //     each slot — set 767 "Gladiator's Redemption" is S5 base + Savage/Hateful/Deadly/Furious/
+        //     Relentless/Wrathful, a T10 row is ilvl 251/264/277. One card with 30+ chest-to-boots
+        //     pieces is unusable, so a set with duplicated slots splits into per-variant virtual sets
+        //     keyed by (season adjective before the set name's first word, item level):
+        //     "Wrathful " + "Gladiator's Redemption" becomes its own 5-piece set. Sets without slot
+        //     duplicates (classic mixed-ilvl sets like Shadowcraft) are left alone. Virtual ids are
+        //     setId·1000+ilvl — above the client DBC's own id range, and resolvable through
+        //     <see cref="GetSet"/> so the set-import flow treats them like any real set.
+        var byEntryIdx = list.ToDictionary(e => e.Entry);
+        var remap = new Dictionary<uint, (uint SetId, string Name)>();
+        foreach (var baseSet in _sets.Values.ToList())
+        {
+            var members = baseSet.MemberEntries.Where(byEntryIdx.ContainsKey).Select(m => byEntryIdx[m]).ToList();
+            if (members.Count == 0 || members.GroupBy(m => m.InventoryType).All(g => g.Count() == 1)) continue;
+            string firstWord = baseSet.Name.Split(' ').FirstOrDefault() ?? "";
+            string AdjectiveOf(string itemName)
+            {
+                if (firstWord.Length == 0) return "";
+                int idx = itemName.IndexOf(firstWord, StringComparison.OrdinalIgnoreCase);
+                return idx > 0 ? itemName[..idx] : "";
+            }
+            var groups = members.GroupBy(m => (Adjective: AdjectiveOf(m.Name), m.ItemLevel)).ToList();
+            if (groups.Count <= 1) continue;
+
+            _sets.Remove(baseSet.SetId);
+            var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var g in groups.OrderBy(x => x.Key.ItemLevel).ThenBy(x => x.Key.Adjective, StringComparer.OrdinalIgnoreCase))
+            {
+                uint vid = baseSet.SetId * 1000u + (uint)Math.Clamp(g.Key.ItemLevel, 0, 999);
+                while (_sets.ContainsKey(vid)) vid++;
+                string vname = g.Key.Adjective.Length > 0 ? g.Key.Adjective + baseSet.Name : baseSet.Name;
+                if (!taken.Add(vname)) { vname = $"{vname} (item level {g.Key.ItemLevel})"; taken.Add(vname); }
+                // Same name twice inside one variant = two purchase paths for the same piece (T10 251
+                // ships under both an emblem id and a token id). One member per name keeps the card —
+                // and a whole-set import — at one piece per slot; prefer the id the DBC itself lists.
+                var pieces = g.GroupBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(ng => ng.OrderByDescending(m => baseSet.AllItemEntries.Contains(m.Entry)).ThenBy(m => m.Entry).First())
+                    .ToList();
+                var entries = pieces.Select(m => m.Entry).ToList();
+                _sets[vid] = new LegacySetInfo { SetId = vid, Name = vname, AllItemEntries = entries, MemberEntries = entries.ToList() };
+                // Every group member (dropped duplicates included) points at the virtual set, so a
+                // name search for a duplicate id still lands on the right card.
+                foreach (var m in g) { _entryToSet[m.Entry] = vid; remap[m.Entry] = (vid, vname); }
+            }
+        }
+        if (remap.Count > 0)
+            for (int i = 0; i < list.Count; i++)
+                if (remap.TryGetValue(list[i].Entry, out var r))
+                    list[i] = list[i] with { SetId = r.SetId, SetName = r.Name };
+
         _browse = list.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase).ToList();
 
         // 4) Featured vs "other": the later client's ItemSet.dbc carries EVERY set the game ever

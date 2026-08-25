@@ -164,10 +164,12 @@ public static class GroupCoordinator
 
         foreach (var group in groups.GetAllGroups())
         {
-            // Resolve member guids -> live contexts; skip any without a connected context.
+            // Resolve member guids -> live contexts; skip any without a connected
+            // context. [CONSCRIPTED] An enlisted bot is the RTS commander's, not
+            // the coordinator's: no assist stamp, no GroupOrder, no Held churn.
             var members = new List<BotContext>(group.MemberGuids.Count);
             foreach (var guid in group.MemberGuids)
-                if (contexts.TryGetValue(guid, out var ctx))
+                if (contexts.TryGetValue(guid, out var ctx) && !ctx.Conscripted)
                     members.Add(ctx);
 
             // Need >=2 PRESENT members to act as a team; otherwise leave None (solo).

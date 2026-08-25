@@ -68,6 +68,15 @@ public sealed class BotExecutor
     /// </summary>
     public async Task IssueAsync(BotContext ctx, BridgeCommand cmd, string expectedEvent, TimeSpan deadline)
     {
+        // [CONSCRIPTED] The commander owns this bot; no planner traffic. The C++
+        // bridge fence would drop the command anyway — refusing here keeps
+        // Pending unarmed so nothing waits on an event that can never come.
+        if (ctx.Conscripted)
+        {
+            _logger.LogDebug("[EXEC] {Name} refuse {Type} (conscripted)", ctx.Name, cmd.Type);
+            return;
+        }
+
         var now = DateTime.UtcNow;
 
         // An ENRICHED objective MOVE_TO (§4) carries creature_entry/kill_count: C++ travels
@@ -130,6 +139,14 @@ public sealed class BotExecutor
     /// </summary>
     public async Task IssueNoWaitAsync(BotContext ctx, BridgeCommand cmd)
     {
+        // [CONSCRIPTED] Same refusal as IssueAsync — the army answers to its
+        // commander, not the planner.
+        if (ctx.Conscripted)
+        {
+            _logger.LogDebug("[EXEC] {Name} refuse {Type} (conscripted)", ctx.Name, cmd.Type);
+            return;
+        }
+
         // Parity with IssueAsync: keep distance-to-target live for MOVE_TO fires.
         if (cmd.Type == "MOVE_TO")
         {

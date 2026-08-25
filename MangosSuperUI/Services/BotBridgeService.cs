@@ -166,6 +166,13 @@ public class BotStatePayload
     [JsonPropertyName("ppdist")]
     public int Ppdist { get; set; } = -1;
 
+    // [CONSCRIPTED] 1 = enlisted in a player's RTS army (client control group →
+    // CMSG_SUI_ORDER conscript, 2026-08-24). The planner stands down like the
+    // player-party hold, but the held objective is PRESERVED so a dismissal
+    // resumes questing in place. Sent 0/1 (C++ %u).
+    [JsonPropertyName("conscripted")]
+    public uint Conscripted { get; set; } = 0;
+
     // Full quest-log snapshot, pushed on every STATE (replaces the retired QUERY_QUEST_STATUS pull).
     // Pipe-delimited, identical format to the old QUEST_STATUS_ALL payload:
     //   questId:status:mob0,mob1,mob2,mob3:item0,item1,item2,item3 | questId:...
@@ -347,6 +354,9 @@ public class BotState
     // [HUB-ERRAND] Boss distance off STATE (ppdist, 2026-07-08): -1 no boss, 99999 boss on
     // another map, else 3D yards. Rides snapshot -> the errand planner's abort guard.
     public int PartyBossDist { get; set; } = -1;
+    // [CONSCRIPTED] Enlisted in a player's RTS army (server truth off STATE, 2026-08-24).
+    // Planner stands down; the held objective survives so dismissal resumes in place.
+    public bool Conscripted { get; set; } = false;
     // [HUB-ERRAND] The "do your rounds" run token (2026-07-08 §3). Stamped HERE by the
     // CHAT_RECV recognizer in HandleEventAsync — deliberately NOT in the STATE field-by-field
     // copy, so it persists across STATEs exactly like the conn.State control-plane pattern
@@ -688,6 +698,7 @@ public class BotBridgeService : BackgroundService
         bs.QuestStatus = state.QuestStatus;
         bs.Durability = state.Durability;
         bs.InPlayerParty = state.Pparty != 0;   // [PLAYERPARTY] pparty on STATE (2026-07-07)
+        bs.Conscripted = state.Conscripted != 0;   // [CONSCRIPTED] conscripted on STATE (2026-08-24)
         bs.PartyBossDist = state.Ppdist;        // [HUB-ERRAND] ppdist on STATE (2026-07-08); HubErrandUntil deliberately NOT copied — it persists
         bs.Quests = state.Quests;   // full quest-log snapshot (retired pull → STATE is the single source of truth)
         bs.HasReceivedState = true;

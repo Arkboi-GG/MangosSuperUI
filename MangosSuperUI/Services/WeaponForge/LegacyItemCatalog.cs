@@ -99,6 +99,8 @@ public abstract class LegacyItemCatalog
             {
                 // fields: entry, name, class, subclass, displayId, quality, inventoryType,
                 //         itemLevel, requiredLevel, delayMs, dmgMin, dmgMax, sheath
+                //         [, setId] — optional trailing item_template.itemset (WotLK catalog only;
+                //         seasonal/tier variants are linked to their set on the ITEM, not in ItemSet.dbc)
                 items.Add(new LegacyItemInfo
                 {
                     Entry = row[0].GetUInt32(),
@@ -114,6 +116,7 @@ public abstract class LegacyItemCatalog
                     DmgMin = row[10].GetSingle(),
                     DmgMax = row[11].GetSingle(),
                     Sheath = row[12].GetInt32(),
+                    SetId = row.GetArrayLength() > 13 ? row[13].GetUInt32() : 0,
                 });
             }
             _logger.LogInformation("{Label} item catalog: loaded {Count} items (weapons + armor/shields) from {Path}", Label, items.Count, CatalogWebPath);
@@ -217,4 +220,8 @@ public sealed record LegacyItemInfo
     public required float DmgMin { get; init; }
     public required float DmgMax { get; init; }
     public required int Sheath { get; init; }
+    /// <summary>item_template.itemset, or 0. Only the WotLK catalog carries it — from 3.3.5a on,
+    /// later arena seasons and higher-ilvl tier versions are set members through this column while
+    /// ItemSet.dbc's itemID[17] lists only the base variant.</summary>
+    public uint SetId { get; init; }
 }

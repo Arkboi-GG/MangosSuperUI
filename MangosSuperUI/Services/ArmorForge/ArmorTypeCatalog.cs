@@ -215,6 +215,34 @@ public static class ArmorTypeCatalog
         All.FirstOrDefault(p => string.Equals(p.Key, key, StringComparison.OrdinalIgnoreCase))
         ?? All.First(p => p.Key == DefaultKey);
 
+    /// <summary>Resolve a bare slot word ("boots", "waist", "helmet", "pants") to a family key, or
+    /// null when the word names no slot. The browse uses this so typing a slot word lists that
+    /// slot's pieces — most boots are named Sabatons/Treads/Greaves, so a name substring alone
+    /// finds almost nothing.</summary>
+    public static string? FamilyForSlotWord(string? word)
+    {
+        if (string.IsNullOrWhiteSpace(word)) return null;
+        string w = word.Trim();
+        foreach (var p in All)
+        {
+            if (p.Key.Equals(w, StringComparison.OrdinalIgnoreCase) || p.DefaultNoun.Equals(w, StringComparison.OrdinalIgnoreCase))
+                return p.Key;
+            foreach (var part in p.Label.Split('/', '('))
+                if (part.Trim().TrimEnd(')').Equals(w, StringComparison.OrdinalIgnoreCase))
+                    return p.Key;
+        }
+        return w.ToLowerInvariant() switch
+        {
+            "helmet" or "hat" => "helm",
+            "shoulders" or "spaulders" or "pauldrons" => "shoulder",
+            "pants" or "leggings" or "legplates" or "legguards" => "legs",
+            "cape" => "cloak",
+            "hand" or "gauntlets" => "gloves",
+            "wrists" => "bracers",
+            _ => null,
+        };
+    }
+
     /// <summary>Map a TBC/vanilla (class, subclass, inventoryType) to a forge family key, for the
     /// TBC importer. Armor is class 4; the SLOT (inventory_type) selects the family, not the
     /// subclass (which is only the material). Returns null for slots the forge doesn't handle

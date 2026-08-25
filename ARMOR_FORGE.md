@@ -150,6 +150,113 @@ bonuses" card lets the operator add `threshold → spell` bonuses to any forged 
 `ItemSet.dbc` (client tooltip from patch-6; the **server** reads its own `ItemSet.dbc` at startup —
 deploy via `ArmorForge:ServerDbcPath` and restart for bonuses to apply).
 
+### 4b. WotLK set membership — the DBC alone is not enough (2026-08-24, measured)
+
+From 3.3.5a on Blizzard stopped maintaining `ItemSet.dbc`'s `itemID[17]` for variants: a row lists
+only the base items — set 767 "Gladiator's Redemption" carries the five Season-5 pieces, a T10 row
+only the ilvl-251 five — and every later arena season (Furious/Relentless/Wrathful) and higher
+tier version (Sanctified 264/277) is linked to its set **on the item** (`item_template.itemset`).
+Measured symptom: all 121 Wrathful Gladiator pieces browsed as "loose", zero Wrathful sets.
+
+Fix, in `LegacyArmorCatalog.EnsureIndexedLocked`:
+* **2b — catalog union**: `wotlk-item-catalog.json` was regenerated with a trailing optional
+  `setId` column (item_template.itemset; 4,480 of 30,229 rows carry one) and entries the DBC does
+  not claim are unioned into `_entryToSet`. The TBC catalog has no such column (2.4.3 member lists
+  are complete) so the TBC lane is untouched.
+* **3b — variant splitting**: a set that now holds duplicated slots is a variant family and splits
+  into per-(season-adjective, ilvl) **virtual sets**, id `setId·1000+ilvl`, named by prepending the
+  member names' adjective to the DBC set name ("Wrathful " + "Gladiator's Redemption"); name
+  collisions get an "(item level N)" suffix. Same-name duplicates inside one variant (T10 251
+  ships under an emblem id and a token id) dedupe to one piece per slot, preferring the DBC-listed
+  id. Classic mixed-ilvl sets (Shadowcraft) have no slot duplicates and never split. Virtual ids
+  resolve through `GetSet` like real ones, so the set-import flow is unchanged.
+
+WotLK featured sets went 96 → ~350 (every arena season per class, T9/T10 versions). Source-set
+bonuses still are not imported — WotLK bonus spells (resilience etc.) do not exist in the vanilla
+core; the operator itemizes bonuses in the set modal as before.
+
+### 4d. Invisible bag icons — the stock-icon check read our own patches (2026-08-24, measured)
+
+In-client symptom: some imported pieces (Wrathful sets) showed blank bag icons while their
+tooltips worked. Probed formats were fine — the "invisible" WotLK icon BLPs are byte-layout
+identical to stock vanilla icons. The real defect: `AttachIcon`'s "stock icon exists" check read
+the client mount, which INCLUDES the forge's own deployed patches. An icon that a previous import
+packaged into patch-5/6 read back as "stock", the new piece skipped packaging it, and after the
+earlier piece was deleted (or its set re-imported) the next registry rebuild shipped a patch
+without the icon. Classic delete + tweak + re-import iteration triggers it every time.
+
+Fixes:
+* `AttachIcon` (armor) and the weapon lane's `inVanilla` check now exclude every custom patch
+  (`MpqPatchOrder.Rank > patch-2`) when deciding "stock" — only Blizzard's archives count.
+* `AssembleUnifiedPatchAsync` self-heals: any registered `icon_stem` that is neither stock nor
+  among the assembled members is re-pulled from a mounted import lane, shipped in the patch, and
+  persisted to `custom_armor_model` so the repair is durable. Existing broken pieces fix themselves
+  on the next patch rebuild (the Rebuild patch button, or any import).
+
+### 4b-ii. The itemset column OVERRIDES the DBC rows (2026-08-25, measured)
+
+The 4b union originally let DBC membership win on conflict. Wrong: the T9 DBC rows are themselves
+bad — 3.3.5a row 823 "Worldbreaker Battlegear" (enhancement) lists 46303 (a Garb Spaulders) and
+46307 (a Regalia Kilt) among its five, which mixed the three shaman spec sets into 7- and 10-piece
+cards. `item_template.itemset` is what the server counts for bonuses, so it now overrides the DBC
+list per item. Verified: all three Worldbreaker specs group as clean 5-piece kits at 219 and 226;
+Wrathful/T10/TBC unchanged.
+
+### 4f. Glow preview now matches the bake (2026-08-25)
+
+The old live glow tint wrote `mat.color` from a competing rAF loop: it MULTIPLIED the particle
+colour ramp instead of replacing it, fought the fx engine's own per-frame writes (changes often
+didn't show until re-import — "works only after commit"), and tinted additive PASSES the bake never
+touches. Now `m2particles.js` reads `material.userData.suiGlowOverride = {tint, intensity, sizeMul}`
+at ramp-evaluation time — the exact transform the forge bakes (tint replaces the colour keys,
+intensity scales them, a dim shrinks the particle) — and the Armor Forge page stamps that override
+on `M2Emitter` materials only (`afViewer.setGlow`/`clearGlow`; the override re-stamps automatically
+after every re-dress). Slider and colour are live and the preview is faithful to the committed
+result. Caveat: ES-module imports carry no cache-buster, so after a deploy a stale cached
+`character-viewer/*.js` can hide fixes — hard-refresh (Ctrl+F5) once.
+
+### 4g. Pre-import emitter preview now shows what the import bakes (2026-08-25, measured)
+
+Owner report: WotLK shoulder glow drew as giant flat WHITE columns pre-import, then as proper small
+wisps after committing — same piece, same intensity. Cause: the pre-import GLB fell back to
+`M2FxReader.BuildEmittersFromModel`, a degraded summary of the raw v264 emitter (flat peak-size
+scale ramp, default full-bright alpha [0,1,0], whole-sheet flipbook, white when the colour ramp is
+unreadable), while the committed piece renders the donor-rebuilt emitter (real grow/shrink ramp,
+the donor's soft alpha envelope — measured 0→0.2→0 on the Wrathful shoulder smoke — proper cells).
+
+Fix — the weapon forge already solved this (`M2FxReader.FromGraft` + `PreviewEmitter`): armor now
+does the same. `LegacyArmorImporter.PlanPreviewEmitters` runs the SAME `PlanMotion` donor-graft
+plan the import bakes and converts each graft via `FromGraft` (donor curves + source
+position/colour/size/timing overrides); `ArmorForgeController.BuildAttachmentGlbAsync` passes them
+to `GlbWriter.SaveGlb`'s new `plannedEmitters` input, which embeds the donor sheets and folds the
+emitters into the suiFx manifest — the degraded raw-summary fallback then never fires (it remains
+as last resort when no donor plan could be built). Verified: the Wrathful shoulder preview GLB now
+carries scale [0.079→0.099→0.139], alpha [0, 0.2, 0], the source's orange→white ramp, rate 50/s —
+the exact values the transplanter writes. Attachment GLB caches are stamped with the assembly MVID
+so they self-invalidate on deploy.
+
+### 4e. Glow intensity (2026-08-24)
+
+The Appearance panel's glow row gained an **Intensity** slider (10–200%, default 100). It scales
+the grafted emitter colour keys (`ColorRgb`/`ColorRamp`) — additive particles render colour as
+brightness, so this is the glow's strength — and below 100% also shrinks particle Scale by
+`sqrt(intensity)` so weak glow reads as smaller embers, not gray fire. Bakes on piece AND set
+import (`glowIntensity` form/body field → `ImportAsync`/`ImportSetAsync` → `Resolve` → `Emit`)
+independently of the tint checkbox. Live preview approximates by dimming the multiplicative
+viewer tint; a boost past 100% only shows in-game. Emitters whose source had no colour track keep
+donor colour keys — only their size changes (noted in diagnostics). The additive-PASS glow
+(M2GlowPulseWriter path) is not scaled yet — emitters dominate the armor sets that prompted this.
+
+### 4c. Slot-word search (2026-08-24)
+
+Typing `boots` used to match names only — most boots are Sabatons/Treads/Greaves, so it "did
+nothing" (and the pieces group rendered collapsed). Now `ArmorTypeCatalog.FamilyForSlotWord`
+resolves a bare slot word (key, label words, default noun, plus aliases: helmet, pants, cape,
+shoulders…) and the browse returns that slot's pieces — set members included, best ilvl first,
+under a "Matching pieces" header — without nominating set cards (every tier set contains boots).
+The vanilla clone lane applies the same aliasing to its SQL browse, and the UI auto-expands the
+pieces group whenever a search term is typed.
+
 ---
 
 ## 5. Endpoints (`ArmorForgeController`)

@@ -1770,8 +1770,14 @@ public class WeaponForgeController : Controller
         if (iconStem is not null)
         {
             string member = $@"Interface\Icons\{iconStem}.blp";
-            bool inVanilla = _mpq.ExtractFile(member) is { Length: > 0 }
-                          || _mpq.ExtractFile(member.ToLowerInvariant()) is { Length: > 0 };
+            // Only Blizzard's own archives count as "vanilla has it" — the mounted client dir also
+            // holds the forge's deployed patches, and an icon a previous import packaged reads back
+            // as present, so the new item would skip packaging and lose its icon on the next
+            // registry rebuild (same defect measured on the armor side, 2026-08-24).
+            int stockCeiling = Services.Mpq.MpqPatchOrder.Rank("patch-2.MPQ");
+            bool IsCustomPatch(string n) => Services.Mpq.MpqPatchOrder.Rank(n) > stockCeiling;
+            bool inVanilla = _mpq.ExtractFile(member, skipArchive: IsCustomPatch) is { Length: > 0 }
+                          || _mpq.ExtractFile(member.ToLowerInvariant(), skipArchive: IsCustomPatch) is { Length: > 0 };
             if (!inVanilla)
             {
                 iconBlp = src.Mpq.ExtractFile(member) ?? src.Mpq.ExtractFile(member.ToLowerInvariant());

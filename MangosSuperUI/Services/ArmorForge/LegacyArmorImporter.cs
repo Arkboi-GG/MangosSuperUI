@@ -63,7 +63,7 @@ public abstract class LegacyArmorImporter
 
     /// <summary>Resolve a TBC armor entry into a forge source. <paramref name="displayIndex"/> is the
     /// reserved display id (= SUI_A model index) so emitted member paths/internal names are final.</summary>
-    public ArmorImportSource? Resolve(uint entry, int displayIndex, ForgeDiagnostics diag, Vector3? glowColor = null)
+    public ArmorImportSource? Resolve(uint entry, int displayIndex, ForgeDiagnostics diag, Vector3? glowColor = null, float glowIntensity = 1f)
     {
         var item = _catalog.FindEntry(entry);
         if (item is null) { diag.Error("import.entry", $"{Label} entry {entry} is not a browsable armor item."); return null; }
@@ -84,7 +84,7 @@ public abstract class LegacyArmorImporter
             case ArmorRenderKind.Painted: return ResolvePainted(src, row, profile, displayIndex, diag) ? src : null;
             case ArmorRenderKind.Cloak: return ResolveCloak(src, row, displayIndex, diag) ? src : null;
             case ArmorRenderKind.Modelled:
-                return (item.FamilyKey == "helm" ? ResolveHelm(src, row, displayIndex, diag, glowColor) : ResolveShoulder(src, row, displayIndex, diag, glowColor)) ? src : null;
+                return (item.FamilyKey == "helm" ? ResolveHelm(src, row, displayIndex, diag, glowColor, glowIntensity) : ResolveShoulder(src, row, displayIndex, diag, glowColor, glowIntensity)) ? src : null;
         }
         return null;
     }
@@ -222,7 +222,7 @@ public abstract class LegacyArmorImporter
 
     // ── helm ───────────────────────────────────────────────────────────
 
-    private bool ResolveHelm(ArmorImportSource src, LegacyDisplayRow row, int displayIndex, ForgeDiagnostics diag, Vector3? glowColor = null)
+    private bool ResolveHelm(ArmorImportSource src, LegacyDisplayRow row, int displayIndex, ForgeDiagnostics diag, Vector3? glowColor = null, float glowIntensity = 1f)
     {
         string stem = StripStem(row.ModelName1);
         if (stem.Length == 0) { diag.Error("import.helm.model", "Helm row has no ModelName1."); return false; }
@@ -260,7 +260,7 @@ public abstract class LegacyArmorImporter
             if (donor is null) { diag.Warn("import.helm.donor", $"{suffix}: no vanilla donor helm — this race/gender ships no file."); continue; }
 
             var vdiag = new ForgeDiagnostics("helm-" + suffix);
-            var bytes = Emit(m2, donor, $"{ArmorNaming.ModelStem(displayIndex)}_{suffix}", ArmorNaming.HeadDir, displayIndex, effects, vdiag, $"helm {suffix}", glowColor);
+            var bytes = Emit(m2, donor, $"{ArmorNaming.ModelStem(displayIndex)}_{suffix}", ArmorNaming.HeadDir, displayIndex, effects, vdiag, $"helm {suffix}", glowColor, glowIntensity);
             // 16 variants repeat the same emitter/bake notes — keep one copy of each distinct message.
             foreach (var item in vdiag.Items.Where(i => i.Severity != ForgeSeverity.Error))
                 if (!diag.Items.Any(x => x.Code == item.Code && x.Message == item.Message)) diag.Add(item.Severity, item.Code, item.Message, item.Context);
@@ -284,7 +284,7 @@ public abstract class LegacyArmorImporter
 
     // ── shoulder ───────────────────────────────────────────────────────
 
-    private bool ResolveShoulder(ArmorImportSource src, LegacyDisplayRow row, int displayIndex, ForgeDiagnostics diag, Vector3? glowColor = null)
+    private bool ResolveShoulder(ArmorImportSource src, LegacyDisplayRow row, int displayIndex, ForgeDiagnostics diag, Vector3? glowColor = null, float glowIntensity = 1f)
     {
         string left = StripStem(row.ModelName1);
         string right = StripStem(row.ModelName2);
@@ -303,8 +303,8 @@ public abstract class LegacyArmorImporter
         byte[]? rd = _vanilla.ExtractFile($@"{ArmorNaming.ShoulderDir}\{right}.m2") ?? _vanilla.ExtractFile($@"{ArmorNaming.ShoulderDir}\{DefaultShoulderRight}.m2");
         if (ld is null || rd is null) { diag.Error("import.shoulder.donor", "No vanilla shoulder donor found."); return false; }
 
-        var lb = Emit(lm, ld, $"{ArmorNaming.ModelStem(displayIndex)}_L", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder L", glowColor);
-        var rb = Emit(rm!, rd, $"{ArmorNaming.ModelStem(displayIndex)}_R", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder R", glowColor);
+        var lb = Emit(lm, ld, $"{ArmorNaming.ModelStem(displayIndex)}_L", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder L", glowColor, glowIntensity);
+        var rb = Emit(rm!, rd, $"{ArmorNaming.ModelStem(displayIndex)}_R", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder R", glowColor, glowIntensity);
         if (lb is null || rb is null) return false;
         src.ModelMembers.Add(new MpqMember { MpqPath = ArmorNaming.ShoulderLeftMpqPath(displayIndex), Data = lb });
         src.ModelMembers.Add(new MpqMember { MpqPath = ArmorNaming.ShoulderRightMpqPath(displayIndex), Data = rb });
@@ -336,7 +336,14 @@ public abstract class LegacyArmorImporter
     {
         if (string.IsNullOrEmpty(row.IconStem)) return;
         string member = $@"Interface\Icons\{row.IconStem}.blp";
-        if (_vanilla.ExtractFile(member) is not null) return; // stock icon exists
+        // "Stock" must mean Blizzard's own archives (base data + patch/patch-2). The mounted client
+        // dir also holds the forge's OWN deployed patches, and an icon that a previous import
+        // packaged into them reads back as present — this piece then skips packaging, and the icon
+        // vanishes on the next registry rebuild once the piece that DID carry it is deleted or
+        // re-imported (measured 2026-08-24: blank bag icons after a delete + re-import cycle).
+        int stockCeiling = Mpq.MpqPatchOrder.Rank("patch-2.MPQ");
+        if (_vanilla.ExtractFile(member, skipArchive: n => Mpq.MpqPatchOrder.Rank(n) > stockCeiling) is not null)
+            return; // stock icon exists
         var blp = _catalog.ExtractFile(member);
         if (blp is not { Length: > 0 }) { diag.Warn("import.icon.missing", $"Icon '{row.IconStem}' not in vanilla or {Label} — bag icon will be blank."); return; }
         var packed = PackModelBlp(blp, diag, "icon");
@@ -378,11 +385,60 @@ public abstract class LegacyArmorImporter
         try { return _catalog.LoadM2(mpqPath); } catch { return null; }
     }
 
+    /// <summary>Preview emitters for a not-yet-imported piece: the SAME donor-graft plan the import
+    /// bakes (<see cref="PlanMotion"/> → M2EmitterTransplanter), converted for the GLB preview via
+    /// <see cref="M2FxReader.FromGraft"/> — donor curves plus the source's position/colour/size/timing
+    /// overrides. This is what makes the pre-import preview show the effect the forge will PRODUCE:
+    /// the raw WotLK emitter summary has no scale/alpha curves and no flipbook ranges, and rendering
+    /// it directly drew giant flat white columns where the committed piece shows small wisps.</summary>
+    public List<WeaponPreviewService.PreviewEmitter>? PlanPreviewEmitters(M2Model m2)
+    {
+        try
+        {
+            var plan = PlanMotion(m2, "preview");
+            if (!plan.Any) return null;
+            var result = new List<WeaponPreviewService.PreviewEmitter>();
+            var pngCache = new Dictionary<string, byte[]?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var graft in plan.Grafts)
+            {
+                string path = graft.TexturePath ?? "";
+                if (path.Length == 0) continue;
+                if (!pngCache.TryGetValue(path, out var png))
+                {
+                    var blp = _vanilla.ExtractFile(path) ?? _catalog.ExtractFile(path);
+                    png = blp is { Length: > 0 } ? BlpToPngBytes(blp) : null;
+                    pngCache[path] = png;
+                }
+                if (png is not { Length: > 0 }) continue;
+                result.Add(new WeaponPreviewService.PreviewEmitter(
+                    graft, CoordinateContract.WoWToMesh(graft.PositionWoW), png));
+            }
+            return result.Count > 0 ? result : null;
+        }
+        catch { return null; }
+    }
+
+    private static byte[]? BlpToPngBytes(byte[] blp)
+    {
+        try
+        {
+            var px = BlpDecoder.GetPixels(blp, 0, out int w, out int h);
+            if (w == 0 || h == 0) return null;
+            using var bmp = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+            System.Runtime.InteropServices.Marshal.Copy(px, 0, bmp.GetPixels(), px.Length);
+            bmp.NotifyPixelsChanged();
+            using var img = SKImage.FromBitmap(bmp);
+            using var data = img.Encode(SKEncodedImageFormat.Png, 100);
+            return data.ToArray();
+        }
+        catch { return null; }
+    }
+
     /// <summary>Re-emit one TBC M2 onto a vanilla donor scaffold. Effect (hardcoded Type-0) textures
     /// are pulled from TBC and packed under SUI_A effect paths, shared across variants via
     /// <paramref name="effects"/>.</summary>
     private byte[]? Emit(M2Model m2, byte[] donor, string internalName, string componentDir, int displayIndex,
-        EffectTextureMap effects, ForgeDiagnostics diag, string what, Vector3? glowColor = null)
+        EffectTextureMap effects, ForgeDiagnostics diag, string what, Vector3? glowColor = null, float glowIntensity = 1f)
     {
         try
         {
@@ -434,6 +490,29 @@ public abstract class LegacyArmorImporter
                     var grafts = glowColor is Vector3 gc
                         ? motionPlan.Grafts.Select(g => g with { ColorRgb = gc, ColorRamp = null }).ToList()
                         : motionPlan.Grafts.ToList();
+                    // Glow intensity: additive particles render colour AS brightness, so scaling the
+                    // colour keys dims or boosts the glow without touching the emission behaviour.
+                    // Dimming also shrinks the particles a little (sqrt) so a weak glow reads as
+                    // smaller embers rather than gray fire; boosting past 100% only brightens.
+                    if (Math.Abs(glowIntensity - 1f) > 0.01f)
+                    {
+                        float gi = Math.Clamp(glowIntensity, 0.05f, 3f);
+                        float sizeMul = gi < 1f ? MathF.Sqrt(gi) : 1f;
+                        Vector3 Scaled(Vector3 c) => new(
+                            Math.Clamp(c.X * gi, 0f, 255f), Math.Clamp(c.Y * gi, 0f, 255f), Math.Clamp(c.Z * gi, 0f, 255f));
+                        grafts = grafts.Select(g => g with
+                        {
+                            ColorRgb = g.ColorRgb is { } c ? Scaled(c) : g.ColorRgb,
+                            ColorRamp = g.ColorRamp is { } ramp
+                                ? new M2EmitterColorRamp(Scaled(ramp.Start), Scaled(ramp.Mid), Scaled(ramp.End))
+                                : g.ColorRamp,
+                            Scale = g.Scale is { } s ? s * sizeMul : g.Scale,
+                        }).ToList();
+                        int uncolored = grafts.Count(g => g.ColorRgb is null && g.ColorRamp is null);
+                        diag.Info("motion.glow.intensity", $"{what}: glow intensity {gi:P0} applied to emitter colour"
+                            + (sizeMul < 1f ? " and size" : "")
+                            + (uncolored > 0 ? $"; {uncolored} emitter(s) keep donor colour keys (no source colour track), only their size changed" : "") + ".");
+                    }
                     var motion = M2EmitterTransplanter.Apply(outM2, grafts);
                     foreach (var note in motion.Notes) diag.Info("motion.emitter", note);
                     if (motion.Grafted > 0)

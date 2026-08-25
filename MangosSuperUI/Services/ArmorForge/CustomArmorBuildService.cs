@@ -119,8 +119,8 @@ public sealed class CustomArmorBuildService
     /// <summary>Lane-keyed form ("tbc" / "wotlk").</summary>
     public Task<CustomArmorBuildResult> ImportAsync(string expansion, uint entry, string? nameOverride = null,
         int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null) =>
-        ImportAsync(_lanes.Get(expansion), entry, nameOverride, vanillaSetId, rebuild, gameplay, recolorHue, recolorTheory, recolorTier, glowColor);
+        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f) =>
+        ImportAsync(_lanes.Get(expansion), entry, nameOverride, vanillaSetId, rebuild, gameplay, recolorHue, recolorTheory, recolorTier, glowColor, glowIntensity);
 
     /// <summary>Import one later-client armor piece. <paramref name="vanillaSetId"/> is OUR set id
     /// (0 = none); <paramref name="rebuild"/> false lets a set import batch pieces and rebuild once at
@@ -130,13 +130,13 @@ public sealed class CustomArmorBuildService
     /// lane-agnostic: the same ids, SQL, persistence and patch.</summary>
     public async Task<CustomArmorBuildResult> ImportAsync(ArmorImportLane lane, uint entry, string? nameOverride = null,
         int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null)
+        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
     {
         var trace = new ArmorAttemptTrace();
         try
         {
             return await ImportCoreAsync(lane, entry, trace, nameOverride, vanillaSetId, rebuild, gameplay,
-                recolorHue, recolorTheory, recolorTier, glowColor);
+                recolorHue, recolorTheory, recolorTier, glowColor, glowIntensity);
         }
         catch (Exception ex)
         {
@@ -191,7 +191,7 @@ public sealed class CustomArmorBuildService
     private async Task<CustomArmorBuildResult> ImportCoreAsync(ArmorImportLane lane, uint entry, ArmorAttemptTrace trace,
         string? nameOverride = null,
         int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null)
+        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
     {
         if (!DonorItemTemplateFixture.Verify())
             throw new InvalidOperationException("Donor item_template fixture failed hash verification.");
@@ -220,7 +220,7 @@ public sealed class CustomArmorBuildService
         ArmorImportSource? src;
         try
         {
-            src = lane.Importer.Resolve(entry, displayIndex, diag, glowColor);
+            src = lane.Importer.Resolve(entry, displayIndex, diag, glowColor, glowIntensity);
         }
         catch (Exception ex)
         {
@@ -367,7 +367,7 @@ public sealed class CustomArmorBuildService
         IReadOnlyList<uint>? onlyEntries = null,
         IReadOnlyDictionary<uint, ValidatedVanillaItemBuildConfiguration>? perPieceGameplay = null,
         IReadOnlyList<ArmorSetBonus>? bonuses = null, int reqSkill = 0, int reqSkillRank = 0, string? setNameOverride = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null)
+        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
     {
         var set = lane.Catalog.GetSet(tbcSetId)
             ?? throw new ArgumentException($"{lane.Label} set {tbcSetId} not found (is the {lane.Label} client mounted?).");
@@ -409,7 +409,7 @@ public sealed class CustomArmorBuildService
                     ValidatedVanillaItemBuildConfiguration? pieceGameplay = null;
                     perPieceGameplay?.TryGetValue(entry, out pieceGameplay);
                     var piece = await ImportAsync(lane, entry, null, setId, rebuild: false, gameplay: pieceGameplay,
-                        recolorHue: recolorHue, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor);
+                        recolorHue: recolorHue, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor, glowIntensity: glowIntensity);
                     result.Pieces.Add(piece);
                 }
                 catch (Exception ex)
@@ -690,6 +690,15 @@ public sealed class CustomArmorBuildService
         {
             var matched = VanillaArmorSlots.Where(s => FamilyForInventory(s).Key.Equals(family, StringComparison.OrdinalIgnoreCase)).ToArray();
             if (matched.Length > 0) slots = matched;
+        }
+
+        // Slot-word search ("boots", "waist", "helmet") narrows to the slot instead of the name —
+        // same behavior as the import lanes' browse; boots are mostly named Sabatons/Treads/Greaves.
+        var slotFamily = ArmorTypeCatalog.FamilyForSlotWord(search);
+        if (slotFamily != null && string.IsNullOrWhiteSpace(family))
+        {
+            var matched = VanillaArmorSlots.Where(s => FamilyForInventory(s).Key.Equals(slotFamily, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (matched.Length > 0) { slots = matched; search = null; }
         }
 
         string like = "%" + (search ?? "").Trim() + "%";
@@ -1156,6 +1165,48 @@ public sealed class CustomArmorBuildService
                     ComponentStems = componentStems.Count > 0 ? componentStems : null,
                 },
             });
+        }
+
+        // Icon self-heal (2026-08-24): pieces imported while a deployed forge patch already carried
+        // their icon skipped packaging (AttachIcon's stock check used to read the forge's own
+        // patches), so those registry rows store no icon member and every rebuild shipped a patch
+        // without the icon — invisible bag icons. On each assembly, any registered icon stem that is
+        // neither stock-vanilla (custom patches excluded) nor already among the members is re-pulled
+        // from a mounted import lane, added to this patch, and persisted to custom_armor_model so
+        // the repair is durable.
+        int stockCeiling = Mpq.MpqPatchOrder.Rank("patch-2.MPQ");
+        foreach (var r in rows)
+        {
+            string stem = r.IconStem ?? "";
+            if (stem.Length == 0) continue;
+            string iconMember = $@"Interface\Icons\{stem}.blp";
+            if (seen.Contains(iconMember)) continue;
+            if (_mpq.ExtractFile(iconMember, skipArchive: n => Mpq.MpqPatchOrder.Rank(n) > stockCeiling) is not null)
+                continue; // genuinely stock — the client resolves it without us
+            byte[]? iconBlp = null;
+            foreach (var lane in _lanes.All)
+            {
+                try { iconBlp = lane.Catalog.ExtractFile(iconMember); } catch { iconBlp = null; }
+                if (iconBlp is { Length: > 0 }) break;
+            }
+            if (iconBlp is not { Length: > 0 } || WeaponAssetCompiler.ValidateBlp2Envelope(iconBlp) is not null)
+            {
+                _logger.LogWarning("ArmorForge: display {DisplayId} icon '{Stem}' is neither stock, stored, nor recoverable from a mounted import lane — its bag icon stays blank",
+                    r.DisplayId, stem);
+                continue;
+            }
+            seen.Add(iconMember);
+            textures.Add(new MpqMember { MpqPath = iconMember, Data = iconBlp });
+            try
+            {
+                await using var conn = _db.Admin();
+                await conn.OpenAsync();
+                await conn.ExecuteAsync(
+                    @"INSERT INTO custom_armor_model (display_id, mpq_path, compiled_m2, created_at) VALUES (@DisplayId, @MpqPath, @Data, NOW())",
+                    new { r.DisplayId, MpqPath = iconMember, Data = iconBlp });
+                _logger.LogInformation("ArmorForge: repaired missing icon '{Stem}' for display {DisplayId} from a mounted import lane", stem, r.DisplayId);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "ArmorForge: icon '{Stem}' shipped in this patch but could not be persisted", stem); }
         }
 
         var sets = await LoadSetsAsync(rows);

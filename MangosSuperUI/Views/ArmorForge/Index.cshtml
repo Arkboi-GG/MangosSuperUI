@@ -35,8 +35,11 @@
         /* TBC search + grouped results */
         .af-search { display: flex; gap: 8px; align-items: center; }
         /* flex-shrink:0 — with 60 sets in a max-height column flexbox, default shrink crushed each set to a hairline. */
-        .af-results { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; max-height: 62vh; overflow-y: auto; padding-right: 4px; }
-        .af-results > * { flex-shrink: 0; }
+        /* The set list scrolls with its bar on the LEFT (direction:rtl trick), away from the page
+           column's own right-edge scrollbar — and the boxes stand off it so the bar has its own
+           visible gutter instead of hugging the content. */
+        .af-results { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; max-height: 62vh; overflow-y: auto; padding-left: 12px; direction: rtl; }
+        .af-results > * { flex-shrink: 0; direction: ltr; }
         .af-set { border: 1px solid var(--border-light); border-radius: 9px; overflow: hidden; }
         .af-set-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; cursor: pointer; background: #ffffff05; }
         .af-set-head:hover { background: #ffffff0b; }
@@ -50,6 +53,11 @@
         .af-piece .slot { font-size: 10.5px; color: var(--text-muted); min-width: 110px; text-align: right; }
         .af-piece .q0 { color: #9d9d9d; } .af-piece .q1 { color: var(--text-primary); } .af-piece .q2 { color: #1eff00; } .af-piece .q3 { color: #0070dd; } .af-piece .q4 { color: #a335ee; } .af-piece .q5 { color: #ff8000; }
         .af-piece .ico { font-size: 11px; color: var(--text-muted); }
+        /* The set / piece currently dressed on the preview character. */
+        .af-set.previewing { border-color: color-mix(in srgb, var(--accent, #3b82c4) 55%, transparent);
+            box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #3b82c4) 40%, transparent); }
+        .af-set.previewing > .af-set-head { background: color-mix(in srgb, var(--accent, #3b82c4) 10%, transparent); }
+        .af-piece.previewing { background: color-mix(in srgb, var(--accent, #3b82c4) 10%, transparent); }
         .af-loose-h { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); margin: 6px 0 2px; }
         .af-empty { font-size: 12px; color: var(--text-muted); padding: 10px 2px; }
 
@@ -144,7 +152,7 @@
                 <h3><span class="phase">Import</span> TBC armor &amp; sets</h3>
                 <p id="tbcState">Checking TBC mount…</p>
                 <div class="af-search">
-                    <input type="text" id="tbcSearch" class="af-input" placeholder="Search sets or pieces — e.g. Netherblade, Tier 4, Cyclone, Warbringer…" disabled>
+                    <input type="text" id="tbcSearch" class="af-input" placeholder="Search sets or pieces — e.g. Netherblade, Tier 4, Warbringer… or a slot: boots, helm, waist" disabled>
                     <select id="tbcFamily" class="af-input" title="Filter loose pieces by slot">
                         <option value="">All slots</option>
                     </select>
@@ -158,7 +166,7 @@
                 <h3><span class="phase">Import</span> WotLK armor &amp; sets</h3>
                 <p id="wotlkState">Checking WotLK mount…</p>
                 <div class="af-search">
-                    <input type="text" id="wotlkSearch" class="af-input" placeholder="Search WotLK sets or pieces — e.g. Sanctified, Tier 10, Deathbringer, Valorous, Aegis…" disabled>
+                    <input type="text" id="wotlkSearch" class="af-input" placeholder="Search WotLK sets or pieces — e.g. Wrathful, Sanctified, Tier 10… or a slot: boots, helm, waist" disabled>
                     <select id="wotlkFamily" class="af-input" title="Filter loose pieces by slot">
                         <option value="">All slots</option>
                     </select>
@@ -172,7 +180,7 @@
                 <h3><span class="phase">Clone</span> Vanilla armor</h3>
                 <p id="vanillaState">Clone an existing vanilla armor piece into a new custom item — it reuses the source's own model/textures (already in your client) and lets you re-itemize it (value, stats, effects). Usable via <code>.additem</code> after a reload; no patch needed unless you recolor.</p>
                 <div class="af-search">
-                    <input type="text" id="vanillaSearch" class="af-input" placeholder="Search vanilla armor by name or item id — e.g. Cenarion, Robe of the Archmage, 16795…">
+                    <input type="text" id="vanillaSearch" class="af-input" placeholder="Search vanilla armor by name, item id, or slot — e.g. Cenarion, 16795, boots…">
                     <select id="vanillaFamily" class="af-input" title="Filter by slot">
                         <option value="">All slots</option>
                     </select>
@@ -236,6 +244,12 @@
                         <input type="checkbox" id="apGlowOn"> Recolor glow / flame effects
                     </label>
                     <input type="color" id="apGlowColor" value="#33aaff" style="width:44px;height:28px;padding:0;border:1px solid var(--border-light);border-radius:6px;background:none;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted);font-weight:600;"
+                           title="Glow strength: scales the emitter colour keys — additive flames render colour as brightness. Below 100% the particles also shrink slightly. Bakes on import even when the recolor tint is off.">
+                        Intensity
+                        <input type="range" id="apGlowIntensity" min="10" max="200" step="5" value="100" style="width:110px;">
+                        <span id="apGlowIntensityVal" style="min-width:38px;font-family:ui-monospace,Consolas,monospace;">100%</span>
+                    </label>
                     <span id="apGlowNote" class="muted" style="font-size:11px;">Tints animated glow/particle effects on the previewed piece(s).</span>
                 </div>
                 <div id="apStatus" class="muted" style="font-size:11px;margin-top:8px;"></div>
@@ -457,29 +471,28 @@
     // Live glow/flame recolor: walk the whole character (body + every equipped attachment), tint
     // additive-glow materials and M2Emitter particle materials, and re-apply each frame so the m2fx
     // engine's per-frame colour writes don't clobber it. Works for a whole SET, not just one piece.
-    var _glow = { color: null, mats: [], raf: null };
-    function _collectGlowMats() {
-        _glow.mats = [];
-        if (!handle || !handle.character || !handle.character.root) return;
+    // Live glow tint/intensity. The override rides each M2Emitter material's userData and the
+    // particle engine reads it AT RAMP-EVALUATION TIME (m2particles.js) — the same transform the
+    // forge bakes (tint replaces the colour keys, intensity scales them, a dim shrinks the
+    // particle). The old approach wrote mat.color from a competing rAF loop: that MULTIPLIED the
+    // ramp instead of replacing it, fought the engine's own per-frame writes, and also tinted
+    // additive PASSES the bake never touches — the preview never matched the committed result.
+    var _glowOverride = null; // {tint:[r,g,b]|null, intensity, sizeMul} or null
+    function _applyGlowOverride() {
+        var n = 0;
+        if (!handle || !handle.character || !handle.character.root) return 0;
         handle.character.root.traverse(function (node) {
-            if (!node.isMesh || !node.material) return;
+            if (node.name !== 'M2Emitter' || !node.material) return;
             var mats = Array.isArray(node.material) ? node.material : [node.material];
-            var isEmitter = node.name === 'M2Emitter';
             mats.forEach(function (mat) {
-                if (!mat || !mat.color) return;
-                // THREE.AdditiveBlending === 2; blend-3/4 name suffix marks additive glow shells.
-                var isAdditive = mat.blending === 2 || /_blend[34]/.test(mat.name || '');
-                if (isAdditive || isEmitter) _glow.mats.push(mat);
+                if (!mat) return;
+                mat.userData = mat.userData || {};
+                if (_glowOverride) mat.userData.suiGlowOverride = _glowOverride;
+                else delete mat.userData.suiGlowOverride;
+                n++;
             });
         });
-    }
-    function _glowTick() {
-        if (!_glow.color) { _glow.raf = null; return; }
-        for (var i = 0; i < _glow.mats.length; i++) {
-            _glow.mats[i].color.setRGB(_glow.color[0], _glow.color[1], _glow.color[2]);
-            _glow.mats[i].needsUpdate = true;
-        }
-        _glow.raf = requestAnimationFrame(_glowTick);
+        return n;
     }
 
     window.afViewer = {
@@ -487,6 +500,7 @@
         equip: async function (displayId, itemId) {
             if (!handle || !handle.character) { pending = function () { window.afViewer.equip(displayId, itemId); }; return; }
             try { await handle.cv.equip.equipDisplay(handle.character, displayId, itemId || undefined); } catch (e) { console.warn('equip failed', e); }
+            _applyGlowOverride();
         },
         // Pre-import later-client preview: dress EXACTLY like the Items page (geosets, paint order,
         // cape) by feeding equipMultiple dressing payloads from /ArmorForge/{Tbc|Wotlk}Dressing for
@@ -503,6 +517,7 @@
             };
             try { await handle.cv.equip.equipMultiple(handle.character, items, { fetchDressing: fetchFn }); }
             catch (e) { console.warn('tbc dress failed', e); }
+            _applyGlowOverride(); // a re-dress rebuilds emitter materials; keep the live glow override on them
         },
         // Live recolor of the currently-previewed piece: fetch retextured assets at the chosen
         // primary hue + palette theory and swap them onto the model without a reload (painted armor
@@ -523,6 +538,7 @@
                 if (!d.success) return false;
                 if (d.kind === 'atlas') await handle.cv.equip.equipBodyAtlasRetextureDirect(handle.character, d.slotUrls, {});
                 else if (d.kind === 'weapon') await handle.cv.equip.equipWeaponGlbDirect(handle.character, d.glbUrl, opts.inventoryType || 0, d.attachments);
+                _applyGlowOverride();
                 return true;
             } catch (e) { console.warn('recolor apply failed', e); return false; }
         },
@@ -540,13 +556,17 @@
                     : '/Items/ItemDressing?displayId=' + e.displayId + (e.itemId ? '&itemId=' + e.itemId : '') + gq;
                 return fetch(url).then(function (r) { return r.ok ? r.json() : null; });
             };
-            try { await handle.cv.equip.equipMultiple(handle.character, items, { fetchDressing: fetchFn }); return true; }
+            try { await handle.cv.equip.equipMultiple(handle.character, items, { fetchDressing: fetchFn }); _applyGlowOverride(); return true; }
             catch (e) { console.warn('recolor dress failed', e); return false; }
         },
-        // Glow recolor. rgb = [r,g,b] 0..1. Returns count of glow materials found (0 = item has no glow).
-        tintGlow: function (rgb) { _collectGlowMats(); _glow.color = rgb; if (!_glow.raf) _glowTick(); return _glow.mats.length; },
-        clearGlow: function () { _glow.color = null; },
-        hasGlow: function () { _collectGlowMats(); return _glow.mats.length; },
+        // Glow tint/intensity preview — mirrors the commit-time bake (emitters only).
+        // opts = { tint:[r,g,b] 0..1 | null, intensity:number, sizeMul:number }.
+        // Returns the count of emitter materials found (0 = no animated emitter to affect).
+        setGlow: function (opts) { _glowOverride = opts || null; return _applyGlowOverride(); },
+        clearGlow: function () { _glowOverride = null; _applyGlowOverride(); },
+        // Back-compat shim: flat tint at full intensity.
+        tintGlow: function (rgb) { return window.afViewer.setGlow({ tint: rgb, intensity: 1, sizeMul: 1 }); },
+        hasGlow: function () { return _applyGlowOverride(); },
         defaultOutfit: DEFAULT_OUTFIT,
         setChar: async function (race, gender) { curRace = race; curGender = gender; await mount(); },
         reset: async function () { await mount(); }
@@ -693,17 +713,21 @@
                 }
 
                 if (d.loose.length) {
-                    var h = document.createElement('div'); h.className = 'af-loose-h'; h.textContent = 'Pieces not in a set (' + d.loose.length + (d.total > d.loose.length + d.sets.length ? '+' : '') + ')'; host.appendChild(h);
+                    var h = document.createElement('div'); h.className = 'af-loose-h';
+                    // A slot-word search ("boots") returns the slot's pieces regardless of set — label accordingly.
+                    var looseLabel = (d.slotSearch ? 'Matching pieces (' : 'Pieces not in a set (') + d.loose.length + (d.total > d.loose.length + d.sets.length ? '+' : '') + ')';
+                    host.appendChild(h);
                     var box = document.createElement('div'); box.className = 'af-set';
                     var body = document.createElement('div'); body.className = 'af-set-body';
                     d.loose.forEach(function (p) { body.appendChild(renderPiece(p, null)); });
                     box.appendChild(body); host.appendChild(box);
-                    // Collapsed like every other group: the loose list is the longest thing on the
-                    // card (thousands of pieces) and used to open straight into a wall of rows.
+                    // Collapsed only for the browse-all view (the loose list is thousands of rows there).
+                    // With a typed search the pieces ARE the answer — open them, or the search looks dead.
+                    var open = !!(q && q.trim());
+                    if (open) box.classList.add('open');
                     h.style.cursor = 'pointer';
-                    h.title = 'Show / hide the pieces that belong to no set';
-                    var looseLabel = h.textContent;
-                    h.textContent = '▸ ' + looseLabel;
+                    h.title = 'Show / hide these pieces';
+                    h.textContent = (open ? '▾ ' : '▸ ') + looseLabel;
                     h.addEventListener('click', function () {
                         box.classList.toggle('open');
                         h.textContent = (box.classList.contains('open') ? '▾ ' : '▸ ') + looseLabel;
@@ -720,7 +744,12 @@
         var imp = document.createElement('button'); imp.className = 'af-btn small'; imp.innerHTML = '<i class="fa-solid fa-download"></i> Import set';
         imp.title = 'Import every piece of this set as one forged set'; imp.addEventListener('click', function (e) { e.stopPropagation(); importSet(s, imp); });
         var prev = document.createElement('button'); prev.className = 'af-btn secondary small'; prev.textContent = 'Preview'; prev.title = 'Dress the character in this whole set (pre-import preview)';
-        prev.addEventListener('click', function (e) { e.stopPropagation(); previewSet(s); });
+        prev.addEventListener('click', function (e) {
+            e.stopPropagation(); markPreviewing(box); previewSet(s);
+            // Fold the pieces list shut: once the set is on the character, the highlighted header
+            // row is enough, and the collapsed list leaves the column visibly scrollable.
+            box.classList.remove('open'); head.querySelector('.chev').textContent = '▸';
+        });
         head.appendChild(prev); head.appendChild(imp);
         head.addEventListener('click', function () { box.classList.toggle('open'); head.querySelector('.chev').textContent = box.classList.contains('open') ? '▾' : '▸'; });
         var body = document.createElement('div'); body.className = 'af-set-body';
@@ -742,8 +771,14 @@
         // hover fired while the pointer crossed the rows after a set Preview and re-dressed the
         // character with just one piece — that was the "loads, then drops off" bug.
         var nameEl = row.children[1]; nameEl.style.cursor = 'pointer'; nameEl.title = 'Preview this piece on the character';
-        nameEl.addEventListener('click', function (e) { e.stopPropagation(); previewPainted(p); });
+        nameEl.addEventListener('click', function (e) { e.stopPropagation(); markPreviewing(row); previewPainted(p); });
         return row;
+    }
+
+    // Highlight the set / piece row the preview character is currently wearing.
+    function markPreviewing(el) {
+        document.querySelectorAll('.af-set.previewing, .af-piece.previewing').forEach(function (x) { x.classList.remove('previewing'); });
+        if (el) el.classList.add('previewing');
     }
 
     // Preview a single piece: default outfit + that piece (so it's in context, not on a naked body).
@@ -781,6 +816,8 @@
         if (itemConfigJson) fd.append('itemConfig', itemConfigJson);
         if (apActive) { fd.append('recolorHue', apActive.hue); fd.append('recolorTheory', apActive.theory); fd.append('recolorTier', apActive.tier); }
         if ($('apGlowOn').checked) fd.append('glowColor', $('apGlowColor').value); // bake flame/glow colour
+        var giPiece = +$('apGlowIntensity').value / 100;
+        if (Math.abs(giPiece - 1) > 0.01) fd.append('glowIntensity', giPiece); // bake glow strength
         return post('/ArmorForge/Import', fd, true).then(function (r) { showPiece(r); return r; });
     }
     // Import set now opens the Set Configure modal (per-piece stats + set bonuses) first.
@@ -1252,6 +1289,8 @@
         var body = { expansion: s.expansion || 'tbc', sourceSetId: s.setId, name: $('setNameInput').value.trim() || s.name, pieces: pieces, bonuses: bonuses.slice(), requiredSkill: 0, requiredSkillRank: 0 };
         if (apActive) { body.recolorHue = apActive.hue; body.recolorTheory = apActive.theory; body.recolorTier = apActive.tier; }
         if ($('apGlowOn').checked) body.glowColor = $('apGlowColor').value; // bake flame/glow colour
+        var giSet = +$('apGlowIntensity').value / 100;
+        if (Math.abs(giSet - 1) > 0.01) body.glowIntensity = giSet; // bake glow strength
         $('setError').style.display = 'none'; $('setSubmit').disabled = true;
         result('<div class="title">Importing set ' + esc(s.name) + ' (' + s.pieces.length + ' pieces)…</div><div class="muted">Each piece is configured, reserved and persisted; patch-6 is rebuilt once.</div>');
         fetch('/ArmorForge/ImportSet', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
@@ -1341,7 +1380,8 @@
             if (ok) apActive = { hue: Math.round(hue), theory: apTheory, tier: tier }; // remember to bake on import
             if (apPending) { apApply(); return; } // a newer colour/theory arrived mid-run — apply it once
             $('apStatus').textContent = ok ? ('Applied ' + apTheory + ' at ' + Math.round(hue) + '°' + (n != null ? ' to ' + n + ' piece(s)' : '') + ' — will bake on import.') : 'No recolorable textures on this item.';
-            if ($('apGlowOn').checked) apGlowApply(); // re-tint glow after a re-equip reset materials
+            // Re-apply glow overrides after a re-equip rebuilt the emitter materials.
+            if ($('apGlowOn').checked || Math.abs(+$('apGlowIntensity').value / 100 - 1) > 0.01) apGlowApply();
         }
         if (foreign && apCurrent.items && apCurrent.items.length) {
             // Foreign (pre-import): ONE layered re-dress with recolored body + cape + helm/shoulder — no flicker.
@@ -1365,10 +1405,22 @@
         }).catch(function () { $('apStatus').textContent = 'Detect failed.'; });
     }
     function apGlowApply() {
+        var gi = +$('apGlowIntensity').value / 100;
+        $('apGlowIntensityVal').textContent = Math.round(gi * 100) + '%';
         if (!window.afViewer) return;
-        if (!$('apGlowOn').checked) { window.afViewer.clearGlow(); $('apGlowNote').textContent = 'Glow recolor off.'; return; }
-        var n = window.afViewer.tintGlow(hexToRgb01($('apGlowColor').value));
-        $('apGlowNote').textContent = n ? (n + ' glow material(s) tinted.') : 'This item has no glow/particle effect to recolor.';
+        var tintOn = $('apGlowOn').checked;
+        if (!tintOn && Math.abs(gi - 1) <= 0.01) { window.afViewer.clearGlow(); $('apGlowNote').textContent = 'Glow recolor off.'; return; }
+        // Same transform the forge bakes: tint replaces the emitter colour ramp, intensity scales
+        // it, dimming also shrinks the particles. Emitters only — the bake does not touch static
+        // additive passes, so the preview must not either.
+        var n = window.afViewer.setGlow({
+            tint: tintOn ? hexToRgb01($('apGlowColor').value) : null,
+            intensity: gi,
+            sizeMul: gi < 1 ? Math.sqrt(gi) : 1,
+        });
+        $('apGlowNote').textContent = n
+            ? (n + ' emitter system(s) ' + (tintOn ? 'tinted' : 'adjusted') + ' — the preview matches what the import bakes.')
+            : 'No animated emitter on the previewed piece(s) — tint/intensity only affect emitter glow.';
     }
     function wireAppearance() {
         var host = $('apTheories');
@@ -1384,6 +1436,7 @@
         $('apDetect').addEventListener('click', apDetect);
         $('apGlowOn').addEventListener('change', apGlowApply);
         $('apGlowColor').addEventListener('input', apGlowApply);
+        $('apGlowIntensity').addEventListener('input', apGlowApply);
     }
     wireAppearance();
 

@@ -324,7 +324,9 @@ public sealed class MaintenancePlanner : IBotPlanner
             // the streak. Cap is 3 (at 1, one unlucky death over-shelved into grind-lock); the
             // 60-min defer brings the quest back when the bot is a level or two stronger.
             // No blame id (died grinding, or between legs) → nothing to do.
-            if (id != null && ctx.DeathBlameQuestId is int blamed)
+            // [CONSCRIPTED] A death in the commander's war is not the quest's
+            // fault: enlisted deaths never bump the streak or shelve the quest.
+            if (id != null && !ctx.Conscripted && ctx.DeathBlameQuestId is int blamed)
             {
                 int fails = id.QuestFailStreak.GetValueOrDefault(blamed, 0) + 1;
                 id.QuestFailStreak[blamed] = fails;
