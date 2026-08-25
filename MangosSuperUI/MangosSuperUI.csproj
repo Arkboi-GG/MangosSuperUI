@@ -50,6 +50,23 @@
 		</None>
 	</ItemGroup>
 
+	<!-- server-config.json is the OPERATOR'S OWN config: real connection strings,
+	     the RemoteAccess password, and machine-specific paths. The Web SDK's default
+	     Content glob picks up **\*.json, so without this Remove it was staged into
+	     bin\...\publish and shipped inside every release zip — overwriting the
+	     recipient's config on extract (the profile sets DeleteExistingFiles) and
+	     leaking the publisher's credentials. It stays gitignored AND out of the
+	     publish output; the setup script writes it on the target box instead.
+	     Kept as None so it is still visible/editable in Solution Explorer. -->
+	<ItemGroup>
+		<Content Remove="server-config.json" />
+		<None Include="server-config.json" Condition="Exists('server-config.json')">
+			<!-- still copied to bin\ so running the built exe locally finds it -->
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>Never</CopyToPublishDirectory>
+		</None>
+	</ItemGroup>
+
 	<ItemGroup>
 		<Compile Remove="BotLogic\Domains\**" />
 		<Content Remove="BotLogic\Domains\**" />

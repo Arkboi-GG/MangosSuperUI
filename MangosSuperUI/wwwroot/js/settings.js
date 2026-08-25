@@ -2,92 +2,178 @@
 
 $(function () {
 
+    // ===================== FORM STATE =====================
+    //
+    // Two rules keep this form honest:
+    //
+    //   1. A field the operator has edited is never overwritten by a background
+    //      load. Anything else silently eats typing.
+    //   2. After a save, the form binds to the file the server just wrote and
+    //      handed back - NOT to /Settings/Current.
+    //
+    // Rule 2 is the fix for the revert bug: server-config.json is registered with
+    // reloadOnChange, but that reload is a file-watcher event that lands after the
+    // save response. Re-reading /Settings/Current here painted pre-save values back
+    // over the edits, and a second Save then wrote those stale values to disk,
+    // undoing the first save.
+
+    var fileStamp = null;        // content hash of server-config.json as last seen
+    var suppressDirty = false;   // true while binding programmatically
+    var loadedReconnectDelayMs = 3000;   // no form field; preserved across saves
+
+    function $cfgFields() { return $('.cfg-input'); }
+
+    // Dirty means "the operator touched this and it no longer matches what we last
+    // bound". Touch is tracked explicitly rather than inferred: on first paint there
+    // is no baseline yet, and a value typed into a field while the initial request is
+    // still in flight must not be treated as bindable-over.
+    function isDirty($el) {
+        if (!$el.data('cfgTouched')) return false;
+        var base = $el.data('cfgBaseline');
+        return base === undefined
+            ? String($el.val()) !== ''
+            : String($el.val()) !== String(base);
+    }
+
+    function baseline($el) {
+        $el.data('cfgBaseline', String($el.val()));
+        $el.data('cfgTouched', false);
+        $el.removeClass('cfg-dirty');
+    }
+
+    function nodesJson() { return JSON.stringify(getComfyNodesFromUI()); }
+
+    function nodesDirty() {
+        var base = $('#comfyNodesContainer').data('cfgBaseline');
+        return base !== undefined && nodesJson() !== base;
+    }
+
+    function dirtyCount() {
+        var n = $cfgFields().filter(function () { return isDirty($(this)); }).length;
+        if (nodesDirty()) n++;
+        return n;
+    }
+
+    function refreshDirtyUi() {
+        $cfgFields().each(function () { $(this).toggleClass('cfg-dirty', isDirty($(this))); });
+        $('#comfyNodesContainer').toggleClass('cfg-dirty', nodesDirty());
+
+        var n = dirtyCount();
+        $('#btnSaveConfig').html(n > 0
+            ? '<i class="fa-solid fa-floppy-disk"></i> Save Settings <span class="dirty-badge">' + n + '</span>'
+            : '<i class="fa-solid fa-floppy-disk"></i> Save Settings');
+        $('#btnRevertConfig').toggle(n > 0);
+
+        // Browsers ignore the string, but returning one triggers the prompt.
+        window.onbeforeunload = n > 0
+            ? function () { return 'You have unsaved settings changes.'; }
+            : null;
+    }
+
+    $(document).on('input change', '.cfg-input, #comfyNodesContainer input', function () {
+        if (suppressDirty) return;
+        $(this).data('cfgTouched', true);
+        refreshDirtyUi();
+    });
+
+    // Write one field unless the operator has edited it since the last bind.
+    // Returns 1 if the incoming value was withheld to protect an edit.
+    function setField(sel, value, force) {
+        var $el = $(sel);
+        if (!$el.length) return 0;
+        if (!force && isDirty($el)) return 1;
+        $el.val(value == null ? '' : value);
+        baseline($el);
+        return 0;
+    }
+
+    // ===================== BIND CONFIG =====================
+
+    // force=true discards local edits (used after a save, when the file IS the truth).
+    // Returns how many edited fields were left alone.
+    function bindConfig(s, force) {
+        if (!s) return 0;
+        var kept = 0;
+        suppressDirty = true;
+
+        var cs = s.connectionStrings || {};
+        kept += setField('#cfgMangos', cs.mangos, force);
+        kept += setField('#cfgCharacters', cs.characters, force);
+        kept += setField('#cfgRealmd', cs.realmd, force);
+        kept += setField('#cfgLogs', cs.logs, force);
+        kept += setField('#cfgAdmin', cs.admin, force);
+
+        var ra = s.remoteAccess || {};
+        // No form field for this one - round-trip it so a save can't reset it to the
+        // JS default and quietly overwrite a value set in the file.
+        if (ra.reconnectDelayMs != null) loadedReconnectDelayMs = ra.reconnectDelayMs;
+        kept += setField('#cfgRaHost', ra.host, force);
+        kept += setField('#cfgRaPort', ra.port, force);
+        kept += setField('#cfgRaUser', ra.username, force);
+        kept += setField('#cfgRaPass', ra.password, force);
+        kept += setField('#cfgRaTimeout', ra.commandTimeoutMs, force);
+
+        var vm = s.vmangos || {};
+        kept += setField('#cfgBinDir', vm.binDirectory, force);
+        kept += setField('#cfgRunDir', vm.runDirectory, force);
+        kept += setField('#cfgLogDir', vm.logDirectory, force);
+        kept += setField('#cfgConfDir', vm.configDirectory, force);
+        kept += setField('#cfgMangosdProcess', vm.mangosdProcess, force);
+        kept += setField('#cfgRealmdProcess', vm.realmdProcess, force);
+        kept += setField('#cfgMangosdConfPath', vm.mangosdConfPath, force);
+        kept += setField('#cfgLogsDir', vm.logsDir, force);
+        kept += setField('#cfgDbcPath', vm.dbcPath, force);
+        kept += setField('#cfgMapsDataPath', vm.mapsDataPath, force);
+        kept += setField('#cfgBackupDir', vm.backupDirectory, force);
+        kept += setField('#cfgSourcePath', vm.vmangosSourcePath, force);
+        kept += setField('#cfgSqlPath', vm.vmangosSqlPath, force);
+        kept += setField('#cfgExtractorsPath', vm.extractorsPath, force);
+        kept += setField('#cfgServerDataPath', vm.serverDataPath, force);
+        kept += setField('#cfgVmangosClientDataPath', vm.clientDataPath, force);
+        kept += setField('#cfgVmapsDataPath', vm.vmapsDataPath, force);
+
+        var sc = s.spellCreator || {};
+        kept += setField('#cfgClientM2Path', sc.clientM2Path, force);
+        kept += setField('#cfgClientDataPath', sc.clientDataPath, force);
+        kept += setField('#cfgPatchOutputPath', sc.patchOutputPath, force);
+        kept += setField('#cfgRawBlpPath', sc.rawBlpPath, force);
+        kept += setField('#cfgSpellDataPath', sc.dataPath, force);
+        kept += setField('#cfgClipModel2', sc.comfyUI ? sc.comfyUI.clipModel2 : '', force);
+
+        var ol = sc.ollama || {};
+        kept += setField('#cfgOllamaUrl', ol.baseUrl, force);
+        kept += setField('#cfgOllamaModel', ol.model, force);
+        kept += setField('#cfgOllamaVisionModel', ol.visionModel, force);
+
+        var wf = s.weaponForge || {};
+        kept += setField('#cfgTbcDataPath', wf.tbcDataPath, force);
+        kept += setField('#cfgWotlkDataPath', wf.wotlkDataPath, force);
+
+        kept += setField('#cfgWikiRoot', s.wiki ? s.wiki.root : '', force);
+        kept += setField('#cfgKestrelUrl', s.kestrel ? s.kestrel.url : '', force);
+
+        // Node rows get rebuilt wholesale, so only touch them when they are clean.
+        if (force || !nodesDirty()) {
+            renderComfyNodes(sc.comfyUI ? sc.comfyUI.nodes : []);
+            $('#comfyNodesContainer').data('cfgBaseline', nodesJson()).removeClass('cfg-dirty');
+        } else {
+            kept++;
+        }
+
+        suppressDirty = false;
+        refreshDirtyUi();
+        return kept;
+    }
+
     // ===================== LOAD CURRENT CONFIG =====================
-    function loadConfig() {
+
+    // Reads the RUNNING config (appsettings + override, merged). Correct on page load;
+    // after a save, bind to the save response instead - see the note at the top.
+    function loadConfig(force) {
         $.getJSON('/Settings/Current', function (data) {
-            var s = data.settings;
+            fileStamp = data.fileStamp || null;
+            var kept = bindConfig(data.settings, force === true);
 
-            // DB
-            $('#cfgMangos').val(s.connectionStrings.mangos);
-            $('#cfgCharacters').val(s.connectionStrings.characters);
-            $('#cfgRealmd').val(s.connectionStrings.realmd);
-            $('#cfgLogs').val(s.connectionStrings.logs);
-            $('#cfgAdmin').val(s.connectionStrings.admin);
-
-            // RA
-            $('#cfgRaHost').val(s.remoteAccess.host);
-            $('#cfgRaPort').val(s.remoteAccess.port);
-            $('#cfgRaUser').val(s.remoteAccess.username);
-            $('#cfgRaPass').val(s.remoteAccess.password);
-            $('#cfgRaTimeout').val(s.remoteAccess.commandTimeoutMs);
-
-            // Paths & Processes
-            $('#cfgBinDir').val(s.vmangos.binDirectory);
-            $('#cfgRunDir').val(s.vmangos.runDirectory || '');
-            $('#cfgLogDir').val(s.vmangos.logDirectory);
-            $('#cfgConfDir').val(s.vmangos.configDirectory);
-            $('#cfgMangosdProcess').val(s.vmangos.mangosdProcess);
-            $('#cfgRealmdProcess').val(s.vmangos.realmdProcess);
-            $('#cfgMangosdConfPath').val(s.vmangos.mangosdConfPath);
-            $('#cfgLogsDir').val(s.vmangos.logsDir);
-
-            // DBC
-            $('#cfgDbcPath').val(s.vmangos.dbcPath);
-
-            // Maps Data
-            $('#cfgMapsDataPath').val(s.vmangos.mapsDataPath);
-
-            // Spell Creator Paths (under spellCreator, not vmangos)
-            if (s.spellCreator) {
-                $('#cfgClientM2Path').val(s.spellCreator.clientM2Path || '');
-                $('#cfgClientDataPath').val(s.spellCreator.clientDataPath || '');
-                $('#cfgPatchOutputPath').val(s.spellCreator.patchOutputPath || '');
-            }
-
-            // Backup
-            $('#cfgBackupDir').val(s.vmangos.backupDirectory);
-            $('#cfgSourcePath').val(s.vmangos.vmangosSourcePath);
-            $('#cfgSqlPath').val(s.vmangos.vmangosSqlPath);
-
-            // World Viewer / Server Data paths
-            $('#cfgExtractorsPath').val(s.vmangos.extractorsPath);
-            $('#cfgServerDataPath').val(s.vmangos.serverDataPath);
-            $('#cfgVmangosClientDataPath').val(s.vmangos.clientDataPath);
-            $('#cfgVmapsDataPath').val(s.vmangos.vmapsDataPath || '');
-
-            // Weapon/Armor Forge import sources (TBC + WotLK client Data folders)
-            if (s.weaponForge) {
-                $('#cfgTbcDataPath').val(s.weaponForge.tbcDataPath || '');
-                $('#cfgWotlkDataPath').val(s.weaponForge.wotlkDataPath || '');
-            }
-
-            // Kestrel
-            $('#cfgKestrelUrl').val(s.kestrel.url);
-
-            // Wiki
-            if (s.wiki) {
-                $('#cfgWikiRoot').val(s.wiki.root || '');
-            }
-
-            // AI Services
-            if (s.spellCreator) {
-                // ComfyUI nodes
-                renderComfyNodes(s.spellCreator.comfyUI ? s.spellCreator.comfyUI.nodes : []);
-                $('#cfgClipModel2').val(s.spellCreator.comfyUI ? s.spellCreator.comfyUI.clipModel2 : '');
-
-                // Ollama
-                if (s.spellCreator.ollama) {
-                    $('#cfgOllamaUrl').val(s.spellCreator.ollama.baseUrl);
-                    $('#cfgOllamaModel').val(s.spellCreator.ollama.model);
-                    $('#cfgOllamaVisionModel').val(s.spellCreator.ollama.visionModel);
-                }
-
-                // Vanilla BLP paths
-                $('#cfgRawBlpPath').val(s.spellCreator.rawBlpPath || '');
-                $('#cfgSpellDataPath').val(s.spellCreator.dataPath || '');
-            }
-
-            // Status
             if (data.overrideExists) {
                 $('#configStatusTitle').text('Using server-config.json overrides');
                 $('#configStatusDetail').text('Config file: ' + data.configFilePath);
@@ -97,9 +183,18 @@ $(function () {
                 $('#configStatusDetail').text('Save settings to create a server-config.json override file.');
                 $('#configStatusCard').css('border-left', '3px solid var(--accent)');
             }
+
+            if (kept > 0) {
+                $('#configStatusDetail').append(
+                    ' — ' + kept + ' field(s) you edited were left as typed.');
+            }
         });
 
-        // Also load DBC status + ComfyUI pool status + Backup status + Wiki status
+        loadStatuses();
+    }
+
+    // Status panels only - never touches form fields.
+    function loadStatuses() {
         loadDbcStatus();
         loadComfyStatus();
         loadBackupStatus();
@@ -437,9 +532,6 @@ $(function () {
 
     // ===================== SAVE =====================
     $('#btnSaveConfig').on('click', function () {
-        var $btn = $(this);
-        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Saving...');
-
         var config = {
             connectionStrings: {
                 mangos: $('#cfgMangos').val(),
@@ -453,7 +545,7 @@ $(function () {
                 port: parseInt($('#cfgRaPort').val()) || 3443,
                 username: $('#cfgRaUser').val(),
                 password: $('#cfgRaPass').val(),
-                reconnectDelayMs: 3000,
+                reconnectDelayMs: loadedReconnectDelayMs,
                 commandTimeoutMs: parseInt($('#cfgRaTimeout').val()) || 5000
             },
             vmangos: {
@@ -503,14 +595,33 @@ $(function () {
             }
         };
 
+        postSave(config, false);
+    });
+
+    // expectedStamp lets the server refuse the write if server-config.json changed
+    // underneath us (hand edit, setup script, a second tab). force=true says
+    // "I saw the conflict, overwrite anyway".
+    function postSave(config, force) {
+        var $btn = $('#btnSaveConfig');
+        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Saving...');
+
         $.ajax({
             url: '/Settings/Save',
             type: 'POST',
             contentType: 'application/json',
-            data: JSON.stringify(config),
+            data: JSON.stringify({ settings: config, expectedStamp: fileStamp, force: !!force }),
             success: function (data) {
                 if (data.success) {
-                    showMessage('success', data.message);
+                    // Bind to what is actually on disk now, not to IConfiguration:
+                    // the reloadOnChange watcher has not fired yet at this point.
+                    fileStamp = data.fileStamp || null;
+                    bindConfig(data.settings, true);
+                    showSaveResult(data);
+                    loadStatuses();
+                } else if (data.conflict) {
+                    fileStamp = data.fileStamp || fileStamp;
+                    pendingConfig = config;
+                    showConflict(data);
                 } else {
                     showMessage('error', 'Save failed: ' + data.error);
                 }
@@ -519,15 +630,91 @@ $(function () {
                 showMessage('error', 'Request failed: ' + xhr.statusText);
             },
             complete: function () {
-                $btn.prop('disabled', false).html('<i class="fa-solid fa-floppy-disk"></i> Save Settings');
-                loadConfig(); // Refresh status
+                $btn.prop('disabled', false);
+                refreshDirtyUi();
             }
         });
+    }
+
+    // The form the operator tried to save, held across a conflict prompt.
+    var pendingConfig = null;
+
+    function showSaveResult(data) {
+        var keys = data.changedKeys || [];
+        if (keys.length === 0) {
+            showMessage('success', data.message);
+            return;
+        }
+
+        var list = keys.slice(0, 12).map(function (k) {
+            return '<code class="chg-key">' + escapeHtml(k) + '</code>';
+        }).join(' ');
+        if (keys.length > 12) list += ' <span class="chg-more">+' + (keys.length - 12) + ' more</span>';
+
+        $('#saveMessageBody').html(
+            '<i class="fa-solid fa-circle-check" style="color: var(--status-online); font-size: 18px;"></i>' +
+            '<div style="font-size: 13.5px;">' +
+            '<div style="font-weight:600;">' + escapeHtml(data.message) + '</div>' +
+            '<div class="chg-list">' + list + '</div>' +
+            (data.restartRequired
+                ? '<div class="restart-note">Most values are read once at startup, so restart to be sure they take effect:' +
+                  '<div class="restart-cmd"><code>' + escapeHtml(data.restartCommand || '') + '</code>' +
+                  '<button class="btn-xs btn-copy-cmd" data-cmd="' + escapeAttr(data.restartCommand || '') + '">' +
+                  '<i class="fa-solid fa-copy"></i> Copy</button></div></div>'
+                : '') +
+            '</div>');
+        $('#saveMessage').show();
+    }
+
+    function showConflict(data) {
+        $('#saveMessageBody').html(
+            '<i class="fa-solid fa-triangle-exclamation" style="color: var(--status-warning); font-size: 18px;"></i>' +
+            '<div style="font-size: 13.5px;">' +
+            '<div style="font-weight:600;">Nothing was written — ' + escapeHtml(data.error) + '</div>' +
+            '<div style="color: var(--text-secondary); margin-top:4px;">' +
+            'Someone or something else rewrote the file since this page loaded. Overwriting would ' +
+            'discard those changes.</div>' +
+            '<div style="margin-top:8px; display:flex; gap:8px;">' +
+            '<button class="btn-xs" id="btnConflictReload"><i class="fa-solid fa-rotate"></i> Discard mine, load the file</button>' +
+            '<button class="btn-xs" id="btnConflictForce"><i class="fa-solid fa-triangle-exclamation"></i> Overwrite the file with my values</button>' +
+            '</div></div>');
+        $('#saveMessage').show();
+    }
+
+    $(document).on('click', '#btnConflictReload', function () {
+        pendingConfig = null;
+        $('#saveMessage').hide();
+        loadConfig(true);
+    });
+
+    $(document).on('click', '#btnConflictForce', function () {
+        if (!pendingConfig) return;
+        $('#saveMessage').hide();
+        postSave(pendingConfig, true);
+    });
+
+    $(document).on('click', '.btn-copy-cmd', function () {
+        var cmd = $(this).data('cmd');
+        var $b = $(this);
+        if (navigator.clipboard) {
+            navigator.clipboard.writeText(cmd).then(function () {
+                $b.html('<i class="fa-solid fa-check"></i> Copied');
+                setTimeout(function () { $b.html('<i class="fa-solid fa-copy"></i> Copy'); }, 1500);
+            });
+        }
+    });
+
+    // ===================== REVERT =====================
+    $('#btnRevertConfig').on('click', function () {
+        if (dirtyCount() === 0) return;
+        if (!confirm('Discard your unsaved changes and reload the running configuration?')) return;
+        $('#saveMessage').hide();
+        loadConfig(true);
     });
 
     // ===================== RESET =====================
     $('#btnResetConfig').on('click', function () {
-        if (!confirm('This will delete server-config.json and revert to appsettings.json defaults on next restart. Continue?')) {
+        if (!confirm('This deletes server-config.json ENTIRELY, including sections this page does not manage (e.g. BotChat inference profiles), and reverts to appsettings.json defaults on next restart. Continue?')) {
             return;
         }
 
@@ -549,7 +736,8 @@ $(function () {
             },
             complete: function () {
                 $btn.prop('disabled', false);
-                loadConfig();
+                fileStamp = null;
+                loadConfig(true);   // the override is gone; defaults are the truth now
             }
         });
     });
@@ -563,6 +751,8 @@ $(function () {
         $('#saveMessageBody').html(icon + '<div style="font-size: 13.5px;">' + escapeHtml(text) + '</div>');
         $('#saveMessage').show();
 
+        // Only the plain one-liners auto-hide. The save result and the conflict
+        // prompt carry a command to run / buttons to click, so they stay put.
         setTimeout(function () { $('#saveMessage').fadeOut(300); }, 6000);
     }
 

@@ -1,5 +1,6 @@
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Services;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -96,10 +97,13 @@ public class SettingsController : Controller
             }
         };
 
-        // Also return whether a server-config.json override file exists
+        // Also return whether a server-config.json override file exists.
+        // fileStamp identifies the exact bytes on disk the client is looking at, so a
+        // later Save can refuse to overwrite an edit that landed in between (hand edits,
+        // the setup script, a second browser tab).
         var overrideExists = System.IO.File.Exists(ConfigFilePath);
 
-        return Json(new { settings, overrideExists, configFilePath = ConfigFilePath });
+        return Json(new { settings, overrideExists, configFilePath = ConfigFilePath, fileStamp = ComputeStamp() });
     }
 
     /// <summary>
@@ -152,9 +156,7 @@ public class SettingsController : Controller
 
         try
         {
-            var json = System.IO.File.ReadAllText(ConfigFilePath);
-            var parsed = JsonSerializer.Deserialize<ServerConfig>(json, JsonOpts);
-            return Json(new { exists = true, settings = parsed });
+            return Json(new { exists = true, settings = ReadOverrideSettings(), fileStamp = ComputeStamp() });
         }
         catch (Exception ex)
         {
@@ -164,13 +166,47 @@ public class SettingsController : Controller
     }
 
     /// <summary>
-    /// Saves settings to server-config.json.
+    /// Saves settings to server-config.json and returns the file as it now stands on disk.
     /// </summary>
+    /// <remarks>
+    /// The response carries the re-read file rather than IConfiguration on purpose. The
+    /// override is registered with reloadOnChange, but that reload is driven by a file
+    /// watcher that fires AFTER this response has already gone out — a client that
+    /// re-populated itself from /Settings/Current here would paint pre-save values over
+    /// the operator's edits, and a second Save would then write those stale values back,
+    /// silently reverting the first one.
+    /// </remarks>
     [HttpPost]
-    public async Task<IActionResult> Save([FromBody] ServerConfig settings)
+    public async Task<IActionResult> Save([FromBody] SettingsSaveRequest req)
     {
+        var settings = req?.Settings;
+        if (settings is null)
+        {
+            // Never treat an unparseable/empty body as "blank everything out".
+            return Json(new { success = false, error = "No settings in the request body — nothing was written." });
+        }
+
         try
         {
+            // Refuse to clobber an edit that landed between this page loading and Save:
+            // a hand edit, the setup script, or a second tab. Force skips the check.
+            var stampBefore = ComputeStamp();
+            if (!req!.Force
+                && !string.IsNullOrEmpty(req.ExpectedStamp)
+                && stampBefore is not null
+                && !string.Equals(stampBefore, req.ExpectedStamp, StringComparison.Ordinal))
+            {
+                _logger.LogWarning("Refused Save: server-config.json changed on disk since the page loaded.");
+                return Json(new
+                {
+                    success = false,
+                    conflict = true,
+                    error = "server-config.json changed on disk since this page loaded.",
+                    settings = ReadOverrideSettings(),
+                    fileStamp = stampBefore
+                });
+            }
+
             // MERGE into the existing override rather than rewriting it wholesale:
             // server-config.json carries sections this page doesn't manage
             // (BotChat.InferenceProfiles, future additions) — the old full rewrite
@@ -196,13 +232,37 @@ public class SettingsController : Controller
                 }
             }
 
+            // Snapshot before the merge so we can report exactly what this save changed.
+            var before = root.DeepClone();
+
+            // MERGE the section rather than replacing the node. Several keys inside
+            // sections this page manages are deliberately file-only and have no form
+            // field — WeaponForge:ArtifactRoot, Wiki:IndexConnection — and a wholesale
+            // replace deleted them on every save from the page.
             void Set(string name, object? section)
             {
                 if (section is null) return;
-                // drop a differently-cased existing key so we never end up with both
-                var existing = root.FirstOrDefault(kv => string.Equals(kv.Key, name, StringComparison.OrdinalIgnoreCase)).Key;
-                if (existing is not null) root.Remove(existing);
-                root[name] = JsonSerializer.SerializeToNode(section, JsonOpts);
+                var incoming = JsonSerializer.SerializeToNode(section, JsonOpts);
+
+                // Pull out any existing section, whatever its casing, so we never end
+                // up with both "Wiki" and "wiki".
+                var existingKey = root.FirstOrDefault(kv => string.Equals(kv.Key, name, StringComparison.OrdinalIgnoreCase)).Key;
+                JsonNode? existing = null;
+                if (existingKey is not null)
+                {
+                    existing = root[existingKey];
+                    root.Remove(existingKey);
+                }
+
+                if (existing is JsonObject existingObj && incoming is JsonObject incomingObj)
+                {
+                    MergeInto(existingObj, incomingObj);
+                    root[name] = existingObj;
+                }
+                else
+                {
+                    root[name] = incoming;
+                }
             }
 
             Set("connectionStrings", settings.ConnectionStrings);
@@ -216,8 +276,28 @@ public class SettingsController : Controller
             var json = root.ToJsonString(JsonOpts);
             System.IO.File.WriteAllText(ConfigFilePath, json);
             _logger.LogInformation("Saved server-config.json to {Path}", ConfigFilePath);
-            await _audit.LogConfigChangeAsync(json, null);
-            return Json(new { success = true, message = "Settings saved. Restart the application to apply changes." });
+
+            // Paths only — the values include the RA password and connection strings.
+            var changedKeys = DiffKeys(before, root);
+            await _audit.LogConfigChangeAsync(
+                json,
+                changedKeys.Count > 0 ? JsonSerializer.Serialize(changedKeys) : null);
+
+            var message = changedKeys.Count == 0
+                ? "No changes — server-config.json already matched the form."
+                : $"Saved {changedKeys.Count} change(s) to server-config.json.";
+
+            return Json(new
+            {
+                success = true,
+                message,
+                changedKeys,
+                // The file as it now stands — what the client binds to.
+                settings = ReadOverrideSettings(),
+                fileStamp = ComputeStamp(),
+                restartRequired = changedKeys.Count > 0,
+                restartCommand = "sudo systemctl restart mangossuperui"
+            });
         }
         catch (Exception ex)
         {
@@ -239,7 +319,12 @@ public class SettingsController : Controller
                 System.IO.File.Delete(ConfigFilePath);
                 _logger.LogInformation("Deleted server-config.json");
             }
-            return Json(new { success = true, message = "Override removed. Restart to revert to appsettings.json defaults." });
+            return Json(new
+            {
+                success = true,
+                message = "Override removed. Restart to revert to appsettings.json defaults.",
+                fileStamp = (string?)null
+            });
         }
         catch (Exception ex)
         {
@@ -262,6 +347,109 @@ public class SettingsController : Controller
         return Json(statuses);
     }
 
+    // ==================== File helpers ====================
+
+    /// <summary>
+    /// Short content hash of server-config.json, or null when there is no override file.
+    /// Content-based rather than timestamp-based so two writes inside the same filesystem
+    /// timestamp tick still compare as different.
+    /// </summary>
+    private string? ComputeStamp()
+    {
+        try
+        {
+            if (!System.IO.File.Exists(ConfigFilePath)) return null;
+            var bytes = System.IO.File.ReadAllBytes(ConfigFilePath);
+            return Convert.ToHexString(SHA256.HashData(bytes))[..16];
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not stamp server-config.json");
+            return null;
+        }
+    }
+
+    /// <summary>Reads server-config.json into a ServerConfig, or null if absent/unreadable.</summary>
+    private ServerConfig? ReadOverrideSettings()
+    {
+        if (!System.IO.File.Exists(ConfigFilePath)) return null;
+        return JsonSerializer.Deserialize<ServerConfig>(System.IO.File.ReadAllText(ConfigFilePath), JsonOpts);
+    }
+
+    /// <summary>
+    /// Overlays <paramref name="source"/> onto <paramref name="target"/> in place.
+    /// Nested objects merge key by key (case-insensitively, adopting the source's
+    /// casing); arrays and scalars replace outright. Keys present only in the target
+    /// survive — that is what keeps the file-only advanced overrides alive.
+    /// </summary>
+    private static void MergeInto(JsonObject target, JsonObject source)
+    {
+        foreach (var kv in source.ToList())
+        {
+            var existingKey = target.FirstOrDefault(t => string.Equals(t.Key, kv.Key, StringComparison.OrdinalIgnoreCase)).Key;
+            var existing = existingKey is null ? null : target[existingKey];
+
+            if (existing is JsonObject existingObj && kv.Value is JsonObject sourceObj)
+            {
+                MergeInto(existingObj, sourceObj);
+                if (existingKey != kv.Key)
+                {
+                    target.Remove(existingKey!);
+                    target[kv.Key] = existingObj;
+                }
+                continue;
+            }
+
+            if (existingKey is not null) target.Remove(existingKey);
+            target[kv.Key] = kv.Value?.DeepClone();
+        }
+    }
+
+    /// <summary>
+    /// Flattens a JSON tree to leaf path -> raw value, so two versions can be compared.
+    /// </summary>
+    private static void Flatten(JsonNode? node, string prefix, IDictionary<string, string> into)
+    {
+        switch (node)
+        {
+            case JsonObject obj:
+                foreach (var kv in obj)
+                    Flatten(kv.Value, prefix.Length == 0 ? kv.Key : prefix + "." + kv.Key, into);
+                break;
+            case JsonArray arr:
+                for (var i = 0; i < arr.Count; i++)
+                    Flatten(arr[i], prefix + "[" + i + "]", into);
+                break;
+            default:
+                into[prefix] = node?.ToJsonString() ?? "null";
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Leaf paths that differ between two config trees. Case-insensitive on key names so a
+    /// section renamed from "Wiki" to "wiki" by the camelCase writer isn't reported as a
+    /// change. Returns paths only — values carry the RA password and connection strings.
+    /// </summary>
+    private static List<string> DiffKeys(JsonNode? before, JsonNode? after)
+    {
+        var a = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var b = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        Flatten(before, "", a);
+        Flatten(after, "", b);
+
+        var changed = new List<string>();
+        foreach (var kv in b)
+            if (!a.TryGetValue(kv.Key, out var old) || !string.Equals(old, kv.Value, StringComparison.Ordinal))
+                changed.Add(kv.Key);
+        foreach (var kv in a)
+            if (!b.ContainsKey(kv.Key))
+                changed.Add(kv.Key + " (removed)");
+
+        changed.Sort(StringComparer.OrdinalIgnoreCase);
+        return changed;
+    }
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         WriteIndented = true,
@@ -276,6 +464,19 @@ public class SettingsController : Controller
 }
 
 // ==================== Config DTOs ====================
+
+/// <summary>
+/// Body of POST /Settings/Save. Settings is the form; ExpectedStamp is the fileStamp the
+/// page was handed when it loaded, which lets the server detect a competing write instead
+/// of silently overwriting it.
+/// </summary>
+public class SettingsSaveRequest
+{
+    public ServerConfig? Settings { get; set; }
+    public string? ExpectedStamp { get; set; }
+    /// <summary>Save anyway after a conflict was reported to the operator.</summary>
+    public bool Force { get; set; }
+}
 
 public class ServerConfig
 {
