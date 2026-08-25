@@ -33,6 +33,10 @@
     /* Borders */
     --border-light: #e2e5ea;
     --border-medium: #cbd0d8;
+    --sidebar-border: rgba(255, 255, 255, 0.06);
+    /* Sidebar text emphasis */
+    --text-sidebar-strong: #fff;
+    --text-sidebar-hover: #d1d9e6;
     /* Shadows */
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
     --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.08);
@@ -50,6 +54,39 @@
     /* Transitions */
     --transition-fast: 150ms ease;
     --transition-base: 250ms ease;
+}
+
+/* ---- Dark Mode ---- */
+
+:root[data-theme="dark"] {
+    /* Main Content */
+    --bg-body: #12151b;
+    --text-primary: #e8eaed;
+    --text-secondary: #9aa5b4;
+    --text-muted: #6b7684;
+    /* Cards & Panels */
+    --bg-card: #1a1f28;
+    --bg-card-alt: #20262f;
+    --bg-input: #1c222b;
+    --border-light: #2a313c;
+    --border-medium: #3a4250;
+    /* Accent glows — translucent so they read on both light and dark surfaces */
+    --accent-light: rgba(59, 130, 196, 0.15);
+    --accent-subtle: rgba(59, 130, 196, 0.25);
+    /* Shadows need to be stronger to read against a dark background */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+    --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.4);
+    /* Sidebar & Topnav stay light against the dark content area */
+    --bg-sidebar: #f4f5f7;
+    --bg-sidebar-hover: #e6e8eb;
+    --bg-sidebar-active: #dbeafe;
+    --text-sidebar: #5f6b7a;
+    --text-sidebar-active: #2d6da8;
+    --text-sidebar-heading: #8d96a0;
+    --sidebar-border: rgba(0, 0, 0, 0.08);
+    --text-sidebar-strong: #1a1d23;
+    --text-sidebar-hover: #2d6da8;
 }
 
 /* ---- Reset & Base ---- */
@@ -87,7 +124,7 @@ html, body {
     right: 0;
     height: var(--topbar-height);
     background: var(--bg-sidebar);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    border-bottom: 1px solid var(--sidebar-border);
     display: flex;
     align-items: stretch;
     z-index: 200;
@@ -104,13 +141,13 @@ html, body {
     justify-content: center;
     padding: 0 12px;
     text-decoration: none;
-    border-right: 1px solid rgba(255, 255, 255, 0.07);
+    border-right: 1px solid var(--sidebar-border);
 }
 
 .topnav-brand-sub {
     font-size: 15px;
     font-weight: 700;
-    color: #fff;
+    color: var(--text-sidebar-strong);
     letter-spacing: -0.01em;
 }
 
@@ -142,7 +179,7 @@ html, body {
 }
 
     .topnav-tab:hover {
-        color: #d1d9e6;
+        color: var(--text-sidebar-hover);
     }
 
     .topnav-tab.active {
@@ -179,7 +216,7 @@ html, body {
 
 .sidebar-head {
     padding: 16px 16px 14px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    border-bottom: 1px solid var(--sidebar-border);
     display: flex;
     flex-direction: column;
     gap: 14px;
@@ -220,7 +257,7 @@ html, body {
 .sidebar-head-title {
     font-size: 14.5px;
     font-weight: 700;
-    color: #fff;
+    color: var(--text-sidebar-strong);
 }
 
 .sidebar-head-sub {
@@ -362,7 +399,7 @@ html, body {
     .sidebar-nav-item a:hover,
     .sidebar-nav-item button:hover {
         background: var(--bg-sidebar-hover);
-        color: #d1d9e6;
+        color: var(--text-sidebar-hover);
     }
 
     .sidebar-nav-item a.active,
@@ -382,7 +419,7 @@ html, body {
 .sidebar-footer {
     margin-top: auto;
     padding: 12px;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    border-top: 1px solid var(--sidebar-border);
 }
 
 /* ---- Sidebar Lander ---- */
@@ -941,6 +978,23 @@ html, body {
         border-radius: 2px;
     }
 
+.theme-mode-select {
+    background: var(--bg-input);
+    border: 1px solid var(--border-medium);
+    border-radius: var(--radius-sm);
+    padding: 5px 10px;
+    font-size: 12.5px;
+    font-family: inherit;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+    .theme-mode-select:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-light);
+    }
+
 .theme-actions {
     padding-top: 12px;
     border-top: 1px solid var(--border-light);
@@ -970,5 +1024,5 @@ html, body {
 
     .sidebar-customize-btn:hover {
         background: var(--bg-sidebar-hover);
-        color: #d1d9e6;
+        color: var(--text-sidebar-hover);
     }

@@ -8,7 +8,31 @@
     'use strict';
 
     // =========================================================
-    //  1. THEME OVERRIDES — runs first, before DOM is interactive
+    //  1. THEME MODE (light/dark) — runs first, before first paint
+    // =========================================================
+
+    var THEME_MODE_KEY = 'msui_theme_mode';
+
+    function getStoredThemeMode() {
+        var stored = localStorage.getItem(THEME_MODE_KEY);
+        if (stored === 'light' || stored === 'dark') return stored;
+        return 'light';
+    }
+
+    function applyThemeMode(mode) {
+        document.documentElement.setAttribute('data-theme', mode);
+    }
+
+    function setThemeMode(mode) {
+        localStorage.setItem(THEME_MODE_KEY, mode);
+        applyThemeMode(mode);
+    }
+
+    // Apply immediately (before DOMContentLoaded) so there's no flash
+    applyThemeMode(getStoredThemeMode());
+
+    // =========================================================
+    //  2. THEME OVERRIDES — runs first, before DOM is interactive
     // =========================================================
 
     const THEME_STORAGE_KEY = 'msui_theme_overrides';
@@ -54,7 +78,7 @@
             styleEl.textContent = '';
             return;
         }
-        var css = ':root {\n';
+        var css = ':root[data-theme] {\n';
         keys.forEach(function (k) {
             css += '  ' + k + ': ' + overrides[k] + ';\n';
         });
@@ -67,7 +91,7 @@
 
 
     // =========================================================
-    //  2. SIDEBAR ORDER — read from localStorage, reorder DOM
+    //  3. SIDEBAR ORDER — read from localStorage, reorder DOM
     // =========================================================
 
     var ORDER_STORAGE_KEY = 'msui_sidebar_order';
@@ -279,7 +303,7 @@
 
 
     // =========================================================
-    //  3. SIDEBAR COLLAPSE/EXPAND
+    //  4. SIDEBAR COLLAPSE/EXPAND
     // =========================================================
 
     var COLLAPSE_STORAGE_KEY = 'msui_sidebar_expanded';
@@ -395,7 +419,7 @@
 
 
     // =========================================================
-    //  4. CUSTOMIZE MODAL — Order Tab
+    //  5. CUSTOMIZE MODAL — Order Tab
     // =========================================================
 
     function initCustomizeModal() {
@@ -429,6 +453,14 @@
                 overlay.querySelector('[data-tab-content="' + target + '"]').classList.add('active');
             });
         });
+
+        // Theme mode select (light/dark)
+        var themeModeSelect = document.getElementById('themeModeSelect');
+        if (themeModeSelect) {
+            themeModeSelect.addEventListener('change', function () {
+                setThemeMode(this.value);
+            });
+        }
 
         // Theme reset button
         var btnResetTheme = document.getElementById('btnResetTheme');
@@ -726,10 +758,15 @@
 
 
     // =========================================================
-    //  5. CUSTOMIZE MODAL — Theme Tab
+    //  6. CUSTOMIZE MODAL — Theme Tab
     // =========================================================
 
     function populateThemePickers() {
+        var themeModeSelect = document.getElementById('themeModeSelect');
+        if (themeModeSelect) {
+            themeModeSelect.value = getStoredThemeMode();
+        }
+
         var overrides = getThemeOverrides();
         document.querySelectorAll('.theme-color-input').forEach(function (input) {
             var varName = input.getAttribute('data-var');
@@ -763,7 +800,7 @@
 
 
     // =========================================================
-    //  6. INIT — on DOMContentLoaded
+    //  7. INIT — on DOMContentLoaded
     // =========================================================
 
     document.addEventListener('DOMContentLoaded', function () {
