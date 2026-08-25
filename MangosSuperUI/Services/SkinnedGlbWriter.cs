@@ -549,7 +549,7 @@ public static class SkinnedGlbWriter
     /// Bake M2 global sequences as separate clips. The browser plays these
     /// alongside Stand/Walk/Run, preserving independent loops such as blinking.
     /// </summary>
-    private static int EmitGlobalSequences(M2Model m2, NodeBuilder[] boneNodes)
+    internal static int EmitGlobalSequences(M2Model m2, NodeBuilder[] boneNodes)
     {
         int baked = 0;
         for (int globalIdx = 0; globalIdx < m2.GlobalSequenceDurations.Count; globalIdx++)
@@ -716,6 +716,262 @@ public static class SkinnedGlbWriter
     }
 
     // ────────────────────────────────────────────────────────────────────────
+    // Item rig (Thunderfury)
+    // ────────────────────────────────────────────────────────────────────────
+    //
+    // An ITEM M2 is normally written by GlbWriter as a rigid GLB: no skin, no joints, no bone
+    // animation. That is correct for a plate helm and wrong for the small class of models whose
+    // authored motion lives entirely in the SKELETON rather than in a material track, a UV
+    // transform, a particle emitter or an ItemVisual.
+    //
+    // Thunderfury (Sword_2H_Ashbringer02.mdx, displayId 30606) is the canonical case:
+    //
+    //   - its lightning fins (submeshes 0-6) are weighted to bones 21-28, whose translation and
+    //     rotation ride M2 GLOBAL SEQUENCES 10/11/13 - independent loops that run forever with no
+    //     AnimationData sequence selected;
+    //   - its glow shell and LIGHTNINGBALL orb (submeshes 7-8) are weighted to bones 0-4, which
+    //     carry flags 0x208 - bit 0x08 is a camera-facing (billboard) mode.
+    //
+    // Exported rigid, the material manifest still pulsed the fins' alpha (that part always worked)
+    // while the geometry stayed nailed to the rest pose, and the orb rendered as a frozen card
+    // facing whatever direction the artist happened to author. Both halves of that are skeleton
+    // behaviour the rigid writer had no way to carry.
+    //
+    // === Output shape ===
+    //
+    //   ItemArmature                      <- distinct from the character "Armature" ON PURPOSE:
+    //   +-- Bone_0                           m2fx.js keys the item mixer off this name so it never
+    //   |   +-- M2Billboard_0_f520           starts a second mixer on the character body, whose
+    //   |        +-- Bone_9 ...              GlobalSequence_* clips animation-control.js drives
+    //   +-- Bone_21 ...
+    //   +-- ...
+    //
+    // Animation lands on Bone_i. The M2Billboard_i child stays at identity in the file and is the
+    // node the browser rewrites each frame, so THREE.AnimationMixer and the camera-facing law never
+    // fight over the same quaternion channel. The billboard child is also the SKIN JOINT for that
+    // bone, and descendant bones hang beneath it - which is what makes a descendant inherit the
+    // rewritten parent orientation, matching SpellMeshSkinningLaw's `parentChanged` propagation.
+
+    /// <summary>Name of the item rig's root node. The browser gates its item mixer on this.</summary>
+    internal const string ItemArmatureName = "ItemArmature";
+
+    /// <summary>Bone flag: drop the parent's rotation from this bone's frame.</summary>
+    internal const uint IgnoreParentRotation = 0x04;
+    /// <summary>Bone flags 0x08/0x10/0x20/0x40: the four M2 billboard modes.</summary>
+    internal const uint BillboardMask = 0x78;
+    /// <summary>Any bit here means the client rewrites this bone's orientation against the camera.</summary>
+    internal const uint CameraFacingMask = IgnoreParentRotation | BillboardMask;
+
+    /// <summary>An item M2's skinning rig: authored bone nodes, skin joints, and their root.</summary>
+    internal sealed class ItemRig
+    {
+        /// <summary>The "ItemArmature" node every bone hangs under.</summary>
+        public NodeBuilder Root = null!;
+        /// <summary>Per M2 bone: the node that carries its animation tracks.</summary>
+        public NodeBuilder[] Bones = Array.Empty<NodeBuilder>();
+        /// <summary>Per M2 bone: the node the skin binds to - the billboard child when it has one.</summary>
+        public NodeBuilder[] Joints = Array.Empty<NodeBuilder>();
+        /// <summary>How many bones got a camera-facing correction child.</summary>
+        public int BillboardCount;
+    }
+
+    /// <summary>
+    /// Does this model's VISIBLE geometry actually depend on bone behaviour a rigid GLB cannot
+    /// carry? Only then is it worth paying for a skin.
+    ///
+    /// True when some emitted vertex has a non-zero influence on a bone that - itself or through
+    /// an ancestor - either faces the camera or rides a live global sequence. Everything else
+    /// (every ordinary weapon, helm, spaulder, prop and GameObject in the catalogue) stays on the
+    /// rigid fast path, which is both the cheap path and the one already proven on those models.
+    ///
+    /// The ancestor walk matters: submeshes 9-10 of Thunderfury sit on static bone 5, but a fin
+    /// weighted to a child of an animated bone still moves with it.
+    /// </summary>
+    internal static bool RequiresItemSkin(M2Model m2)
+    {
+        int n = m2.Bones.Count;
+        if (n == 0 || m2.Vertices.Count == 0) return false;
+
+        // Pass 1 - bones that are interesting in their own right.
+        var direct = new bool[n];
+        bool anyDirect = false;
+        for (int i = 0; i < n; i++)
+        {
+            var bone = m2.Bones[i];
+            if ((bone.Flags & CameraFacingMask) != 0 ||
+                HasLiveGlobalTrack(m2, bone.Translation) ||
+                HasLiveGlobalTrack(m2, bone.Rotation) ||
+                HasLiveGlobalTrack(m2, bone.Scale))
+            {
+                direct[i] = true;
+                anyDirect = true;
+            }
+        }
+        if (!anyDirect) return false;
+
+        // Pass 2 - close over ancestry. Depth-capped rather than cycle-checked: a malformed model
+        // that parents a bone to its own descendant must not spin here.
+        var inherited = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            int bone = i;
+            for (int depth = 0; depth < n && bone >= 0 && bone < n; depth++)
+            {
+                if (direct[bone]) { inherited[i] = true; break; }
+                bone = m2.Bones[bone].ParentBone;
+            }
+        }
+
+        // Pass 3 - only vertices this writer actually emits count. A bone graph nothing draws from
+        // is not a reason to change how the model is written.
+        foreach (int vi in EmittedVertexIndices(m2))
+        {
+            var v = m2.Vertices[vi];
+            if (v.BoneWeight0 != 0 && Influenced(inherited, v.BoneIndex0)) return true;
+            if (v.BoneWeight1 != 0 && Influenced(inherited, v.BoneIndex1)) return true;
+            if (v.BoneWeight2 != 0 && Influenced(inherited, v.BoneIndex2)) return true;
+            if (v.BoneWeight3 != 0 && Influenced(inherited, v.BoneIndex3)) return true;
+
+            // The shared skin contract (ResolveJoints) assigns a zero-total vertex fully to bone 0.
+            if (v.BoneWeight0 == 0 && v.BoneWeight1 == 0 && v.BoneWeight2 == 0 && v.BoneWeight3 == 0
+                && inherited[0]) return true;
+        }
+
+        return false;
+    }
+
+    private static bool Influenced(bool[] inherited, byte boneIndex)
+        => boneIndex < inherited.Length && inherited[boneIndex];
+
+    /// <summary>
+    /// A track that <see cref="EmitGlobalSequences"/> would actually turn into a clip: bound to a
+    /// declared global loop, that loop has a non-zero duration, and the key/timestamp arrays agree.
+    /// </summary>
+    private static bool HasLiveGlobalTrack<T>(M2Model m2, M2AnimTrack<T> track) where T : struct
+        => track.GlobalSequence >= 0
+        && track.GlobalSequence < m2.GlobalSequenceDurations.Count
+        && m2.GlobalSequenceDurations[track.GlobalSequence] > 0
+        && track.Timestamps.Count > 0
+        && track.Timestamps.Count == track.Keys.Count;
+
+    /// <summary>
+    /// The global vertex ids GlbWriter's submesh loop will emit, in the same shape that loop uses.
+    ///
+    /// M2Submesh.VertexStart/VertexCount index the SKIN's local vertex-lookup table, not
+    /// <see cref="M2Model.Vertices"/> - M2Reader has already resolved the index buffer through that
+    /// lookup, so the index range is the only honest source of "which vertices get drawn".
+    /// </summary>
+    private static IEnumerable<int> EmittedVertexIndices(M2Model m2)
+    {
+        var ranges = new List<(int start, int count)>();
+        if (m2.Submeshes.Count > 0)
+        {
+            foreach (var sub in m2.Submeshes)
+            {
+                if (m2.Submeshes.Count > 1 && (sub.IndexCount == 0 || sub.IndexCount % 3 != 0)) continue;
+                ranges.Add((sub.IndexStart, sub.IndexCount));
+            }
+        }
+        else
+        {
+            ranges.Add((0, m2.Indices.Count - (m2.Indices.Count % 3)));
+        }
+
+        var seen = new HashSet<int>();
+        foreach (var (start, count) in ranges)
+        {
+            for (int i = start; i < start + count && i < m2.Indices.Count; i++)
+            {
+                int vi = m2.Indices[i];
+                if (vi < m2.Vertices.Count && seen.Add(vi)) yield return vi;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Build the item armature described in the block comment above.
+    ///
+    /// Pivot and hierarchy rules are <see cref="BuildBoneArmature"/>'s, unchanged: a root bone's
+    /// local translation is its pivot, a child's is its pivot minus its parent's. The two
+    /// differences are the correction children and the parent-first walk - the character builder
+    /// requires parentIndex &lt; boneIndex and silently re-roots a bone that forward-references its
+    /// parent, which on an item would move geometry that used to render correctly as a rigid mesh.
+    /// </summary>
+    internal static ItemRig BuildItemRig(M2Model m2)
+    {
+        int n = m2.Bones.Count;
+        var rig = new ItemRig
+        {
+            Root = new NodeBuilder(ItemArmatureName),
+            Bones = new NodeBuilder[n],
+            Joints = new NodeBuilder[n],
+        };
+
+        foreach (int i in ParentFirstOrder(m2))
+        {
+            var bone = m2.Bones[i];
+            int parentIdx = bone.ParentBone;
+            bool hasParent = parentIdx >= 0 && parentIdx < n && parentIdx != i && rig.Joints[parentIdx] != null;
+
+            // Parent under the parent's CORRECTION node when it has one, so a descendant inherits
+            // the rewritten orientation the way the client's palette does.
+            var anchor = hasParent ? rig.Joints[parentIdx] : rig.Root;
+            var node = anchor.CreateNode($"Bone_{i}");
+            node.WithLocalTranslation(hasParent ? bone.Pivot - m2.Bones[parentIdx].Pivot : bone.Pivot);
+            rig.Bones[i] = node;
+
+            if ((bone.Flags & CameraFacingMask) != 0)
+            {
+                // Identity in the file; the browser writes its local matrix each frame. The flags
+                // ride in the name because that survives every SharpGLTF/GLTFLoader round-trip we
+                // already rely on, which NodeBuilder.Extras does not.
+                rig.Joints[i] = node.CreateNode($"M2Billboard_{i}_f{bone.Flags}");
+                rig.BillboardCount++;
+            }
+            else
+            {
+                rig.Joints[i] = node;
+            }
+        }
+
+        // A cycle would leave holes. Root the survivors rather than handing GlbWriter a null joint.
+        for (int i = 0; i < n; i++)
+        {
+            if (rig.Joints[i] != null) continue;
+            var node = rig.Root.CreateNode($"Bone_{i}");
+            node.WithLocalTranslation(m2.Bones[i].Pivot);
+            rig.Bones[i] = node;
+            rig.Joints[i] = node;
+        }
+
+        return rig;
+    }
+
+    /// <summary>
+    /// Bone indices in an order where every bone follows its parent, tolerating forward references
+    /// and stopping cleanly on a cycle. Mirrors SpellMeshSkinningLaw.ParentFirstOrder.
+    /// </summary>
+    private static IEnumerable<int> ParentFirstOrder(M2Model m2)
+    {
+        int n = m2.Bones.Count;
+        var emitted = new bool[n];
+        for (int pass = 0; pass < n; pass++)
+        {
+            bool progress = false;
+            for (int i = 0; i < n; i++)
+            {
+                if (emitted[i]) continue;
+                int parent = m2.Bones[i].ParentBone;
+                if (parent >= 0 && parent < n && parent != i && !emitted[parent]) continue;
+                emitted[i] = true;
+                progress = true;
+                yield return i;
+            }
+            if (!progress) break;
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
     // Vertex construction
     // ────────────────────────────────────────────────────────────────────────
     private static SKIN_VERTEX MakeSkinnedVertex(M2Vertex v, int boneCount)
@@ -726,23 +982,35 @@ public static class SkinnedGlbWriter
 
         var uv = new VertexTexture1(new Vector2(v.TexU, v.TexV));
 
-        int b0 = Math.Clamp(v.BoneIndex0, (byte)0, (byte)(boneCount - 1));
-        int b1 = Math.Clamp(v.BoneIndex1, (byte)0, (byte)(boneCount - 1));
-        int b2 = Math.Clamp(v.BoneIndex2, (byte)0, (byte)(boneCount - 1));
-        int b3 = Math.Clamp(v.BoneIndex3, (byte)0, (byte)(boneCount - 1));
+        return new SKIN_VERTEX(pos, uv, ResolveJoints(v, boneCount));
+    }
 
-        float w0 = v.BoneWeight0 / 255f;
-        float w1 = v.BoneWeight1 / 255f;
-        float w2 = v.BoneWeight2 / 255f;
-        float w3 = v.BoneWeight3 / 255f;
+    /// <summary>
+    /// The one skin-weight policy, shared by the character path above and the item rig that
+    /// <see cref="GlbWriter"/> builds for camera-facing / global-sequence item models.
+    ///
+    /// Normalize the four authored bytes by their ACTUAL total, and give a zero-total vertex full
+    /// weight on bone 0. That is <c>SpellMeshSkinningLaw.Resolve</c> in MSUIClient, which is the
+    /// proven client behaviour. Dividing each byte by 255 — what this used to do — agrees only
+    /// when the total happens to be exactly 255; a vertex whose weights sum to zero came out with
+    /// four zero weights, which three.js skins to the origin rather than to bone 0.
+    /// </summary>
+    internal static VertexJoints4 ResolveJoints(M2Vertex v, int boneCount)
+    {
+        int last = Math.Max(0, boneCount - 1);
+        int b0 = Math.Clamp((int)v.BoneIndex0, 0, last);
+        int b1 = Math.Clamp((int)v.BoneIndex1, 0, last);
+        int b2 = Math.Clamp((int)v.BoneIndex2, 0, last);
+        int b3 = Math.Clamp((int)v.BoneIndex3, 0, last);
 
-        var joints = new VertexJoints4(
-            (b0, w0),
-            (b1, w1),
-            (b2, w2),
-            (b3, w3));
+        float total = v.BoneWeight0 + v.BoneWeight1 + v.BoneWeight2 + v.BoneWeight3;
+        if (total <= 0f) return new VertexJoints4((0, 1f), (0, 0f), (0, 0f), (0, 0f));
 
-        return new SKIN_VERTEX(pos, uv, joints);
+        return new VertexJoints4(
+            (b0, v.BoneWeight0 / total),
+            (b1, v.BoneWeight1 / total),
+            (b2, v.BoneWeight2 / total),
+            (b3, v.BoneWeight3 / total));
     }
 
     // ────────────────────────────────────────────────────────────────────────

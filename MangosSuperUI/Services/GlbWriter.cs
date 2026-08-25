@@ -9,6 +9,11 @@ namespace MangosSuperUI.Services;
 
 using VERTEX = VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>;
 using VERTEX2 = VertexBuilder<VertexPositionNormal, VertexTexture2, VertexEmpty>;
+// Skinned twins of the two above, used only for the item rig (see SkinnedGlbWriter's "Item rig"
+// section). Both UV shapes need one: fixing only the single-UV form would silently drop JOINTS_0
+// off every fused Warglaive-style _mod primitive.
+using SKIN_VERTEX = VertexBuilder<VertexPositionNormal, VertexTexture1, VertexJoints4>;
+using SKIN_VERTEX2 = VertexBuilder<VertexPositionNormal, VertexTexture2, VertexJoints4>;
 
 /// <summary>
 /// Converts a parsed M2Model + BLP textures into a GLB (glTF Binary) file.
@@ -336,6 +341,19 @@ public static class GlbWriter
             var vertices = m2.Vertices;
             var indices = m2.Indices;
 
+            // Skinned item path. Non-null ONLY for the handful of models whose visible geometry
+            // depends on a camera-facing bone or a global-sequence bone track - Thunderfury, the
+            // enchant-orb props, a few GameObjects. Everything else keeps the rigid fast path
+            // below unchanged, which is the whole point of the selector: this file also writes
+            // every helm, spaulder, sword and chest in the catalogue.
+            //
+            // At rest a skinned pass is byte-for-byte the same geometry as the rigid one - each
+            // joint's inverse-bind matrix cancels its rest world transform - so the only thing
+            // this changes for a selected model is that its authored motion now survives export.
+            var itemRig = SkinnedGlbWriter.RequiresItemSkin(m2) ? SkinnedGlbWriter.BuildItemRig(m2) : null;
+            int itemBoneCount = m2.Bones.Count;
+            int itemSkinnedPasses = 0;
+
             // Build a per-submesh blend mode lookup. Resolved via the M2 batch
             // chain: batch.SubmeshIndex → batch.MaterialIndex → m2.RenderFlags[idx]
             // → blendingMode. Submeshes not referenced by any batch (rare)
@@ -451,31 +469,55 @@ public static class GlbWriter
                 return true;
             }
 
-            void AddTris(PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture1, VertexEmpty> prim,
-                         int indexStart, int indexCount)
+            // One index walk, four emitters. The bounds rules (stop at a short buffer, skip a
+            // triangle that points past the vertex table) are load-bearing on malformed MPQ models
+            // and must not drift between the rigid and skinned forms.
+            IEnumerable<(int i0, int i1, int i2)> Triangles(int indexStart, int indexCount)
             {
                 for (int i = indexStart; i + 2 < indexStart + indexCount; i += 3)
                 {
-                    if (i + 2 >= indices.Count) break;
+                    if (i + 2 >= indices.Count) yield break;
                     int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
                     if (i0 >= vertices.Count || i1 >= vertices.Count || i2 >= vertices.Count) continue;
-                    prim.AddTriangle(MakeVertex(vertices[i0]), MakeVertex(vertices[i1]), MakeVertex(vertices[i2]));
+                    yield return (i0, i1, i2);
                 }
+            }
+
+            void AddTris(PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture1, VertexEmpty> prim,
+                         int indexStart, int indexCount)
+            {
+                foreach (var (i0, i1, i2) in Triangles(indexStart, indexCount))
+                    prim.AddTriangle(MakeVertex(vertices[i0]), MakeVertex(vertices[i1]), MakeVertex(vertices[i2]));
             }
 
             void AddTris2(PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture2, VertexEmpty> prim,
                           int indexStart, int indexCount, bool scrollUv1, bool staticUv1)
             {
-                for (int i = indexStart; i + 2 < indexStart + indexCount; i += 3)
-                {
-                    if (i + 2 >= indices.Count) break;
-                    int i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
-                    if (i0 >= vertices.Count || i1 >= vertices.Count || i2 >= vertices.Count) continue;
+                foreach (var (i0, i1, i2) in Triangles(indexStart, indexCount))
                     prim.AddTriangle(
                         MakeVertex2(vertices[i0], scrollUv1, staticUv1),
                         MakeVertex2(vertices[i1], scrollUv1, staticUv1),
                         MakeVertex2(vertices[i2], scrollUv1, staticUv1));
-                }
+            }
+
+            void AddSkinTris(PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture1, VertexJoints4> prim,
+                             int indexStart, int indexCount)
+            {
+                foreach (var (i0, i1, i2) in Triangles(indexStart, indexCount))
+                    prim.AddTriangle(
+                        MakeSkinVertex(vertices[i0], itemBoneCount),
+                        MakeSkinVertex(vertices[i1], itemBoneCount),
+                        MakeSkinVertex(vertices[i2], itemBoneCount));
+            }
+
+            void AddSkinTris2(PrimitiveBuilder<MaterialBuilder, VertexPositionNormal, VertexTexture2, VertexJoints4> prim,
+                              int indexStart, int indexCount, bool scrollUv1, bool staticUv1)
+            {
+                foreach (var (i0, i1, i2) in Triangles(indexStart, indexCount))
+                    prim.AddTriangle(
+                        MakeSkinVertex2(vertices[i0], scrollUv1, staticUv1, itemBoneCount),
+                        MakeSkinVertex2(vertices[i1], scrollUv1, staticUv1, itemBoneCount),
+                        MakeSkinVertex2(vertices[i2], scrollUv1, staticUv1, itemBoneCount));
             }
 
             // One primitive per glTF MESH — never two primitives inside one mesh.
@@ -488,17 +530,41 @@ public static class GlbWriter
             void EmitPass(string meshName, int indexStart, int indexCount, MaterialBuilder mat,
                           bool fused, bool scrollUv1, bool staticUv1, M2Fx.M2FxMesh? fx)
             {
+                // Only the vertex skinning fragment and the scene insertion call differ between
+                // the two paths. Material selection, pass naming, blend suffixes, the fused _mod
+                // shape and the fx manifest entry below are shared, deliberately - forking them is
+                // how the Warglaive's travelling wave would quietly stop being emitted.
                 if (fused)
                 {
-                    var mb2 = new MeshBuilder<VertexPositionNormal, VertexTexture2, VertexEmpty>(meshName);
-                    AddTris2(mb2.UsePrimitive(mat), indexStart, indexCount, scrollUv1, staticUv1);
-                    scene.AddRigidMesh(mb2, rootMatrix);
+                    if (itemRig is null)
+                    {
+                        var mb2 = new MeshBuilder<VertexPositionNormal, VertexTexture2, VertexEmpty>(meshName);
+                        AddTris2(mb2.UsePrimitive(mat), indexStart, indexCount, scrollUv1, staticUv1);
+                        scene.AddRigidMesh(mb2, rootMatrix);
+                    }
+                    else
+                    {
+                        var mb2 = new MeshBuilder<VertexPositionNormal, VertexTexture2, VertexJoints4>(meshName);
+                        AddSkinTris2(mb2.UsePrimitive(mat), indexStart, indexCount, scrollUv1, staticUv1);
+                        scene.AddSkinnedMesh(mb2, rootMatrix, itemRig.Joints);
+                        itemSkinnedPasses++;
+                    }
                 }
                 else
                 {
-                    var mb = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(meshName);
-                    AddTris(mb.UsePrimitive(mat), indexStart, indexCount);
-                    scene.AddRigidMesh(mb, rootMatrix);
+                    if (itemRig is null)
+                    {
+                        var mb = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(meshName);
+                        AddTris(mb.UsePrimitive(mat), indexStart, indexCount);
+                        scene.AddRigidMesh(mb, rootMatrix);
+                    }
+                    else
+                    {
+                        var mb = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexJoints4>(meshName);
+                        AddSkinTris(mb.UsePrimitive(mat), indexStart, indexCount);
+                        scene.AddSkinnedMesh(mb, rootMatrix, itemRig.Joints);
+                        itemSkinnedPasses++;
+                    }
                 }
                 if (fx is not null)
                     emittedPasses.Add(new M2Fx.M2FxPass(meshName, mat.Name, fx));
@@ -612,6 +678,21 @@ public static class GlbWriter
             else
             {
                 EmitSubmesh(0, "mesh", 0, indices.Count - (indices.Count % 3));
+            }
+
+            // ── Item global-sequence clips ──
+            // One glTF animation per M2 global loop, named GlobalSequence_{n}, riding the AUTHORED
+            // bone nodes. They are separate clips because the M2 runs them concurrently and at
+            // independent periods; merging them into one clip, or letting the client pick a single
+            // one, leaves part of the model frozen. Emitted before ToGltf2 - that call is what
+            // harvests the curves off the NodeBuilders - and only when a pass actually bound to the
+            // rig, so we never write animation channels aimed at nodes no instance references.
+            if (itemRig is not null && itemSkinnedPasses > 0)
+            {
+                int globalClips = SkinnedGlbWriter.EmitGlobalSequences(m2, itemRig.Bones);
+                Console.WriteLine($"[GlbWriter] item rig: {m2.Bones.Count} bone(s), " +
+                                  $"{itemRig.BillboardCount} camera-facing, {globalClips} global loop(s), " +
+                                  $"{itemSkinnedPasses} skinned pass(es)");
             }
 
             // ── Save ──
@@ -1018,6 +1099,28 @@ public static class GlbWriter
             new VertexPositionNormal(new Vector3(v.PosX, v.PosY, v.PosZ), new Vector3(v.NormX, v.NormY, v.NormZ)),
             new VertexTexture2(uv0, uv1)
         );
+    }
+
+    /// <summary>Skinned twin of <see cref="MakeVertex"/>. Joints/weights come from the one shared
+    /// policy in <see cref="SkinnedGlbWriter.ResolveJoints"/> so the item rig and the character rig
+    /// cannot disagree about what a malformed weight means.</summary>
+    private static SKIN_VERTEX MakeSkinVertex(M2Vertex v, int boneCount)
+    {
+        return new SKIN_VERTEX(
+            new VertexPositionNormal(new Vector3(v.PosX, v.PosY, v.PosZ), new Vector3(v.NormX, v.NormY, v.NormZ)),
+            new VertexTexture1(new Vector2(v.TexU, v.TexV)),
+            SkinnedGlbWriter.ResolveJoints(v, boneCount));
+    }
+
+    /// <summary>Skinned twin of <see cref="MakeVertex2"/> - the fused two-UV MODULATE primitive.</summary>
+    private static SKIN_VERTEX2 MakeSkinVertex2(M2Vertex v, bool scrollUsesUv1, bool staticUsesUv1, int boneCount)
+    {
+        var uv0 = scrollUsesUv1 ? new Vector2(v.TexU2, v.TexV2) : new Vector2(v.TexU, v.TexV);
+        var uv1 = staticUsesUv1 ? new Vector2(v.TexU2, v.TexV2) : new Vector2(v.TexU, v.TexV);
+        return new SKIN_VERTEX2(
+            new VertexPositionNormal(new Vector3(v.PosX, v.PosY, v.PosZ), new Vector3(v.NormX, v.NormY, v.NormZ)),
+            new VertexTexture2(uv0, uv1),
+            SkinnedGlbWriter.ResolveJoints(v, boneCount));
     }
 
     /// <summary>

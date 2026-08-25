@@ -22,17 +22,40 @@
 // === Contract ===
 //
 //   installM2Fx(gltf)                  → an fx handle, or null when the GLB
-//                                        carries no manifest
+//                                        carries neither a manifest nor an
+//                                        item bone rig
 //   handle.update(ms, dtMs, camera)    → ms is absolute time, for the material
-//                                        loops; dtMs and camera are for the
-//                                        particle systems, which integrate
-//                                        motion and billboard against the view
-//   handle.dispose()                   → restore the materials and drop the
-//                                        particle meshes
+//                                        loops; dtMs and camera drive the item
+//                                        mixer, the camera-facing bones and the
+//                                        particle systems
+//   handle.dispose()                   → restore the materials, stop the item
+//                                        mixer and drop the particle meshes
 //
 // The handle is registered with the viewer's updater list (viewer.addFx) so the
 // one render loop drives it. Attachments have no mixer of their own, which is
-// why this cannot ride on THREE.AnimationMixer.
+// why the MATERIAL half cannot ride on THREE.AnimationMixer.
+//
+// === The item bone rig (Thunderfury) ===
+//
+// A second class of motion is not material animation at all: it is skeleton
+// behaviour. Thunderfury's lightning fins are weighted to bones whose transform
+// rides an M2 global sequence, and its lightning orb hangs off bones flagged
+// camera-facing. The server used to export item models rigid — no skin, no bone
+// clips — so the fins pulsed their alpha while staying nailed in place and the
+// orb sat there as a frozen card. GlbWriter now ships those models with an
+// `ItemArmature`, `GlobalSequence_*` clips and identity `M2Billboard_*`
+// correction nodes; this module owns the runtime half:
+//
+//   • one THREE.AnimationMixer per item scene, playing every global clip at
+//     once (they are independent loops with independent periods, so exactly one
+//     of them playing leaves the rest of the model frozen);
+//   • the M2 camera-facing law, applied to the correction nodes AFTER the mixer
+//     has sampled, so the two never fight over one quaternion channel.
+//
+// It is gated on the `ItemArmature` node name. The character body's armature is
+// named `Armature`/`Armature_HairGeoset_N` and its global clips are already
+// driven by animation-control.js — starting a second mixer on those would
+// double-drive them.
 //
 // === Two things that will bite whoever edits this ===
 //
@@ -55,6 +78,220 @@ import { installM2Particles } from './m2particles.js';
 const MANIFEST_KEY = 'suiFx';
 const SUPPORTED_VERSION = 1;
 
+// Written by SkinnedGlbWriter.BuildItemRig. See its "Item rig" section.
+const ITEM_ARMATURE_NAME = 'ItemArmature';
+const BILLBOARD_NODE_RE = /^M2Billboard_(\d+)_f(\d+)/;
+const GLOBAL_CLIP_RE = /^GlobalSequence_\d+$/;
+
+// M2 bone flags. Same masks MSUIClient's AttachedItemBillboardLaw uses.
+const IGNORE_PARENT_ROTATION = 0x04;
+const BILLBOARD_MASK = 0x78;
+
+// Three.js world up. The camera basis is locked to it exactly as the client
+// locks its own to WoW's +Z, so a rolled camera cannot spin the billboards.
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+// The M2 axes the billboard law names, expressed in the glTF frame M2Reader
+// converts models into. That conversion is the rotation (x, y, z) → (x, z, -y),
+// so WoW's +Y arrives as (0, 0, -1), its +X is unchanged, and its -Z is (0, -1, 0).
+const M2_AXIS_Y = new THREE.Vector3(0, 0, -1);
+const M2_AXIS_X = new THREE.Vector3(1, 0, 0);
+const M2_AXIS_NEG_Z = new THREE.Vector3(0, -1, 0);
+
+// Scratch. One set, reused every frame — this runs per correction node per frame
+// on up to four viewers at once and must not allocate.
+const _W = new THREE.Matrix4();
+const _Winv = new THREE.Matrix4();
+const _boneModel = new THREE.Matrix4();
+const _desired = new THREE.Matrix4();
+const _local = new THREE.Matrix4();
+const _basis = new THREE.Matrix4();
+const _pos = new THREE.Vector3();
+const _scale = new THREE.Vector3();
+const _kept = new THREE.Quaternion();
+const _facingQ = new THREE.Quaternion();
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _up = new THREE.Vector3();
+const _bx = new THREE.Vector3();
+const _by = new THREE.Vector3();
+const _bz = new THREE.Vector3();
+const _axisY = new THREE.Vector3();
+const _axisZ = new THREE.Vector3();
+const _fallback = new THREE.Vector3();
+
+function normalizeOr(v, fallback) {
+    if (v.lengthSq() > 1e-8) v.normalize();
+    else v.copy(fallback);
+    return v;
+}
+
+/**
+ * Bind an item GLB's bone rig: play its global-sequence clips and rewrite its
+ * camera-facing bones every frame.
+ *
+ * Returns null for any GLB without an `ItemArmature` — which is every character
+ * body, every rigid item, and every GLB written before this existed.
+ *
+ * @param {object} gltf
+ * @param {THREE.Object3D} sceneRoot  The item root as mounted in the scene.
+ */
+function installItemRig(gltf, sceneRoot) {
+    let armature = null;
+    const corrections = [];
+
+    sceneRoot.traverse(node => {
+        if (!node.name) return;
+        if (node.name === ITEM_ARMATURE_NAME) { armature = node; return; }
+        const m = BILLBOARD_NODE_RE.exec(node.name);
+        if (!m) return;
+        const flags = Number.parseInt(m[2], 10);
+        if (Number.isFinite(flags)) corrections.push({ node, flags, depth: 0 });
+    });
+
+    if (!armature) return null;
+
+    // Parent-before-child. A correction node under another correction node has
+    // to read a parent world matrix that already carries the rewrite, which is
+    // how the client's palette propagates a rewritten bone to its descendants.
+    for (const c of corrections) {
+        let depth = 0;
+        for (let n = c.node; n && n !== sceneRoot; n = n.parent) depth++;
+        c.depth = depth;
+        // We own this matrix from here on; leaving matrixAutoUpdate set would
+        // let updateMatrix() recompose it from the node's (identity) TRS and
+        // wipe the correction on the very next frame.
+        c.node.matrixAutoUpdate = false;
+        c.node.matrix.identity();
+    }
+    corrections.sort((a, b) => a.depth - b.depth);
+
+    const clips = Array.isArray(gltf?.animations)
+        ? gltf.animations.filter(c => c && GLOBAL_CLIP_RE.test(c.name || ''))
+        : [];
+
+    let mixer = null;
+    if (clips.length > 0) {
+        mixer = new THREE.AnimationMixer(sceneRoot);
+        for (const clip of clips) {
+            const action = mixer.clipAction(clip);
+            action.setLoop(THREE.LoopRepeat, Infinity);
+            action.play();
+        }
+    }
+
+    if (!mixer && corrections.length === 0) return null;
+
+    /** The M2 camera-facing basis, ported from SpellMeshSkinningLaw.ApplyBillboardBones. */
+    function facingQuaternion(billboard, kept, out) {
+        if (billboard & 0x08) {
+            // Full facing: the bone's local +X looks straight down the barrel of
+            // the camera and its local YZ plane spans the screen.
+            _bx.copy(_fwd).negate();
+            _by.copy(_right);
+            _bz.copy(_up);
+        } else if (billboard & 0x40) {
+            // Keep the bone's animated Y axis; solve the rest against the view.
+            normalizeOr(_bz.copy(M2_AXIS_Y).applyQuaternion(kept), M2_AXIS_Y);
+            normalizeOr(_by.copy(_fwd).cross(_bz), _right);
+            normalizeOr(_bx.copy(_by).cross(_bz), _fallback.copy(_fwd).negate());
+        } else if (billboard & 0x10) {
+            // Keep the bone's animated X axis.
+            normalizeOr(_bx.copy(M2_AXIS_X).applyQuaternion(kept), _fallback.copy(_fwd).negate());
+            normalizeOr(_bz.copy(_fwd).cross(_bx), _up);
+            normalizeOr(_by.copy(_bz).cross(_bx), _right);
+        } else {
+            // Remaining mode (normally 0x20): keep the authored -Z axis.
+            normalizeOr(_by.copy(M2_AXIS_NEG_Z).applyQuaternion(kept), _right);
+            normalizeOr(_bx.copy(_fwd).cross(_by), _fallback.copy(_fwd).negate());
+            normalizeOr(_bz.copy(_bx).cross(_by), _up);
+        }
+
+        // MSUIClient builds a row-vector matrix whose rows are (bx, bz, -by), i.e.
+        // column-major axes (bx, bz, -by) in WoW space. Carrying that through the
+        // Z-up→Y-up basis change (R_gltf = T·R_wow·T⁻¹, and T maps e2→e3, e3→-e2)
+        // permutes the last two columns into (Bx, -By, -Bz), where B = T·b. Every
+        // b above is already computed in the glTF frame, so this IS that result.
+        _axisY.copy(_by).negate();
+        _axisZ.copy(_bz).negate();
+        _basis.makeBasis(_bx, _axisY, _axisZ);
+        return out.setFromRotationMatrix(_basis);
+    }
+
+    function applyBillboards(camera) {
+        if (!camera || corrections.length === 0) return;
+
+        // Nothing has folded this frame's animation into a world matrix yet — the
+        // renderer does that at draw time — and for an equipped weapon the
+        // character's own mixer just moved the hand this hangs off. Pull the
+        // ancestors and the whole item subtree forward before reading either.
+        sceneRoot.updateWorldMatrix(true, true);
+        camera.updateWorldMatrix(true, false);
+
+        _W.copy(sceneRoot.matrixWorld);
+        _Winv.copy(_W).invert();
+
+        camera.getWorldDirection(_fwd);
+        _right.copy(_fwd).cross(WORLD_UP);
+        // Camera looking straight up or down: the cross degenerates, so fall back
+        // to the camera's own X axis rather than to a zero vector.
+        if (_right.lengthSq() < 1e-8) _right.setFromMatrixColumn(camera.matrixWorld, 0);
+        _right.normalize();
+        _up.copy(_right).cross(_fwd).normalize();
+
+        // Into the item's OWN model space. Everything below then matches the
+        // client, which does the same algebra in model space — and it is what
+        // lets an equipped weapon inherit an arbitrary hand rotation and scale
+        // without the orb picking up the character's facing.
+        _fwd.transformDirection(_Winv);
+        _right.transformDirection(_Winv);
+        _up.transformDirection(_Winv);
+
+        for (const c of corrections) {
+            const bone = c.node.parent;
+            if (!bone) continue;
+
+            _boneModel.multiplyMatrices(_Winv, bone.matrixWorld);
+            _boneModel.decompose(_pos, _kept, _scale);
+
+            const billboard = c.flags & BILLBOARD_MASK;
+            if (c.flags & IGNORE_PARENT_ROTATION) _facingQ.identity();
+            else if (billboard !== 0) facingQuaternion(billboard, _kept, _facingQ);
+            else continue;
+
+            // Position and scale survive; only the orientation is replaced. Then
+            // back out the local matrix that puts this node there:
+            //   parentWorld · local = W · desired  ⟹  local = boneModel⁻¹ · desired
+            _desired.compose(_pos, _facingQ, _scale);
+            _local.copy(_boneModel).invert().multiply(_desired);
+            c.node.matrix.copy(_local);
+            c.node.updateWorldMatrix(false, true);
+        }
+    }
+
+    return {
+        clipCount: clips.length,
+        billboardCount: corrections.length,
+        update(dtMs, camera) {
+            if (mixer) mixer.update(Math.max(0, dtMs || 0) / 1000);
+            applyBillboards(camera);
+        },
+        dispose() {
+            if (mixer) {
+                mixer.stopAllAction();
+                mixer.uncacheRoot(sceneRoot);
+                mixer = null;
+            }
+            for (const c of corrections) {
+                c.node.matrix.identity();
+                c.node.matrixAutoUpdate = true;
+                c.node.updateWorldMatrix(false, true);
+            }
+            corrections.length = 0;
+        },
+    };
+}
+
 /**
  * Read the animation manifest out of a loaded glTF and bind it to the scene's
  * materials.
@@ -65,15 +302,19 @@ const SUPPORTED_VERSION = 1;
  *            dispose: ()=>void, meshCount: number}|null}
  */
 export function installM2Fx(gltf, root = null) {
-    const manifest = readManifest(gltf);
-    if (!manifest) return null;
-
     const sceneRoot = root || gltf?.scene;
     if (!sceneRoot) return null;
 
+    // A manifest is no longer the only reason to hold a handle: an item whose
+    // motion lives entirely in its skeleton (Thunderfury's fins) can carry an
+    // empty `meshes` dictionary and still need a per-frame tick.
+    const manifest = readManifest(gltf);
+    const rig = installItemRig(gltf, sceneRoot);
+    if (!manifest && !rig) return null;
+
     const bindings = [];
 
-    sceneRoot.traverse(node => {
+    if (manifest) sceneRoot.traverse(node => {
         if (!node.isMesh) return;
 
         const mats = Array.isArray(node.material) ? node.material : [node.material];
@@ -112,7 +353,7 @@ export function installM2Fx(gltf, root = null) {
     // `disposed` guards the case where the object is swapped out first.
     let particles = null;
     let disposed = false;
-    if (Array.isArray(manifest.emitters) && manifest.emitters.length > 0) {
+    if (manifest && Array.isArray(manifest.emitters) && manifest.emitters.length > 0) {
         installM2Particles(gltf, manifest, sceneRoot)
             .then(handle => {
                 if (disposed) handle?.dispose();
@@ -121,19 +362,28 @@ export function installM2Fx(gltf, root = null) {
             .catch(err => console.warn('[m2fx] particle install failed', err));
     }
 
-    if (bindings.length === 0 && !Array.isArray(manifest.emitters)) return null;
+    if (bindings.length === 0 && !rig && !(manifest && Array.isArray(manifest.emitters))) {
+        return null;
+    }
 
     return {
         meshCount: bindings.length,
         get emitterCount() { return particles ? particles.emitterCount : 0; },
+        get boneClipCount() { return rig ? rig.clipCount : 0; },
+        get billboardBoneCount() { return rig ? rig.billboardCount : 0; },
+        // Order is load-bearing: the billboard pass inside rig.update reads the
+        // bone world matrices the mixer just wrote, and the particle systems
+        // billboard against a camera that must already be up to date.
         update(ms, dtMs, camera) {
             for (const b of bindings) b.update(ms);
+            rig?.update(dtMs, camera);
             if (particles) particles.update(ms, dtMs, camera);
         },
         dispose() {
             disposed = true;
             for (const b of bindings) b.dispose();
             bindings.length = 0;
+            rig?.dispose();
             particles?.dispose();
             particles = null;
         },
