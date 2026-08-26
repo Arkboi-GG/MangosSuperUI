@@ -43,9 +43,9 @@ public class PersonaCard
     /// <summary>Null on unparseable input — callers fall back to a seed card and log.</summary>
     public static PersonaCard? Parse(string? json)
     {
-        if (string.IsNullOrWhiteSpace(json)) return null;
+        if (string.IsNullOrWhiteSpace(json)) return null;   // cb:fold pure parse helper, fallback probed at caller
         try { return JsonSerializer.Deserialize<PersonaCard>(json, JsonOpts); }
-        catch { return null; }
+        catch { return null; }   // cb:fold pure parse helper, fallback probed at caller
     }
 }
 

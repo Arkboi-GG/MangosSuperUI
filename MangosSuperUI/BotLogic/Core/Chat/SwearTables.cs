@@ -54,15 +54,15 @@ public static class SwearTables
     /// <summary>The §10.3 prompt line. The prompt is the primary channel; this pass is the backstop.</summary>
     public static string RegisterLine(int effLevel) => effLevel switch
     {
-        0 => "You don't swear — you're the one person in the zone who says \"darn\".",
-        1 => "You swear a little when something goes wrong (damn, crap, hell) — never as an opener, " +
+        0 => "You don't swear — you're the one person in the zone who says \"darn\".",   // cb:fold register line content lookup, injection probed at assembler
+        1 => "You swear a little when something goes wrong (damn, crap, hell) — never as an opener, " +   // cb:fold register line content lookup, injection probed at assembler
              "just where the emphasis falls. Never censor yourself with asterisks, and never type " +
              "\"heck\" or \"darn\".",
-        2 => "You swear casually like everyone did in 2005 (damn, shit, ass, bastard) and you'll call " +
+        2 => "You swear casually like everyone did in 2005 (damn, shit, ass, bastard) and you'll call " +   // cb:fold register line content lookup, injection probed at assembler
              "a bad player a shitter or a scrub. It's texture, not the point of the sentence — it goes " +
              "mid-sentence where the emphasis falls, not as an opener. Never censor yourself with " +
              "asterisks, and never type \"heck\", \"darn\" or \"freaking\".",
-        _ => "You swear constantly and casually — it's punctuation to you, woven through the sentence " +
+        _ => "You swear constantly and casually — it's punctuation to you, woven through the sentence " +   // cb:fold register line content lookup, injection probed at assembler
              "rather than parked at the front. Never censor yourself with asterisks, and never type " +
              "\"heck\", \"darn\" or \"freaking\".",
     };
@@ -93,7 +93,7 @@ public static class SwearTables
 
     public static string RepairCompounds(string line)
     {
-        if (string.IsNullOrEmpty(line)) return line;
+        if (string.IsNullOrEmpty(line)) return line;   // cb:fold swear table content transform, no guid in reach
         foreach (var (rx, to) in Compounds)
             line = rx.Replace(line, m => MatchCase(m.Value, to));
         return line;
@@ -219,13 +219,13 @@ public static class SwearTables
     public static string Apply(PersonaCard card, string line, float banterIntensity,
                                float moodValence, Random rng)
     {
-        if (string.IsNullOrWhiteSpace(line)) return line;
+        if (string.IsNullOrWhiteSpace(line)) return line;   // cb:fold swear table content transform, no guid in reach
 
         // Step 0 — always, at every level (the model splits compounds regardless of persona).
         line = RepairCompounds(line);
 
         int lvl = EffectiveLevel(card.Typing.SwearLevel, banterIntensity);
-        if (lvl <= 0) return line;
+        if (lvl <= 0) return line;   // cb:fold swear table content transform, no guid in reach
 
         // Strength scalar: 1.0 at level 3, 0.33 at level 1. Times the banter slider.
         double strength = Math.Clamp((lvl / 3.0) * Math.Clamp(banterIntensity, 0f, 1f) * 2.0, 0.0, 1.0);
@@ -248,15 +248,15 @@ public static class SwearTables
     {
         foreach (var (rx, to, min) in Masked)
         {
-            if (lvl < min) continue;
+            if (lvl < min) continue;   // cb:fold swear table content transform, no guid in reach
             line = rx.Replace(line, to);
         }
 
         foreach (var s in Bowdlerized)
         {
-            if (lvl < s.MinLevel) continue;
+            if (lvl < s.MinLevel) continue;   // cb:fold swear table content transform, no guid in reach
             if (s.LeadOnly)
-            {
+            {   // cb:fold swear table content transform, no guid in reach
                 // Only as an interjection: line-initial. "shoot the boar" survives.
                 var lead = new Regex($@"^(\s*){Regex.Escape(s.From)}(?![a-z0-9])", RegexOptions.IgnoreCase);
                 line = lead.Replace(line, m => m.Groups[1].Value + s.To, 1);
@@ -272,18 +272,18 @@ public static class SwearTables
 
     private static string Escalate(string line, int lvl, double strength, Random rng, ref int budget)
     {
-        if (budget <= 0) return line;
+        if (budget <= 0) return line;   // cb:fold swear table content transform, no guid in reach
 
         var words = line.Split(' ');
         for (int i = 0; i < words.Length && budget > 0; i++)
         {
             var bare = Trim(words[i], out var lead, out var tail);
-            if (bare.Length == 0) continue;
-            if (!Escalations.TryGetValue(bare, out var byLevel)) continue;
+            if (bare.Length == 0) continue;   // cb:fold swear table content transform, no guid in reach
+            if (!Escalations.TryGetValue(bare, out var byLevel)) continue;   // cb:fold swear table content transform, no guid in reach
 
             var repl = byLevel[Math.Clamp(lvl, 0, 3)];
-            if (string.Equals(repl, bare, StringComparison.OrdinalIgnoreCase)) continue;
-            if (rng.NextDouble() >= 0.55 * strength) continue;
+            if (string.Equals(repl, bare, StringComparison.OrdinalIgnoreCase)) continue;   // cb:fold swear table content transform, no guid in reach
+            if (rng.NextDouble() >= 0.55 * strength) continue;   // cb:fold swear table content transform, no guid in reach
 
             words[i] = lead + MatchCase(bare, repl) + tail;
             budget--;
@@ -295,21 +295,21 @@ public static class SwearTables
 
     private static string Intensify(string line, int lvl, double strength, Random rng, ref int budget)
     {
-        if (budget <= 0) return line;
-        if (rng.NextDouble() >= 0.45 * strength) return line;
+        if (budget <= 0) return line;   // cb:fold swear table content transform, no guid in reach
+        if (rng.NextDouble() >= 0.45 * strength) return line;   // cb:fold swear table content transform, no guid in reach
 
         var pool = Intensifiers[Math.Clamp(lvl, 0, 3)];
-        if (pool.Length == 0) return line;
+        if (pool.Length == 0) return line;   // cb:fold swear table content transform, no guid in reach
 
         bool hit = false;
         var result = Intensifiable.Replace(line, m =>
         {
-            if (hit) return m.Value;      // one per line
+            if (hit) return m.Value;      // one per line   // cb:fold swear table content transform, no guid in reach
             hit = true;
             return MatchCase(m.Value, pool[rng.Next(pool.Length)]);
         }, 1);
 
-        if (hit) budget--;
+        if (hit) budget--;   // cb:fold swear table content transform, no guid in reach
         return result;
     }
 
@@ -318,7 +318,7 @@ public static class SwearTables
     private static string Interject(PersonaCard card, string line, int lvl, double strength,
                                     float moodValence, Random rng, ref int budget)
     {
-        if (budget <= 0 || line.Length < 6) return line;
+        if (budget <= 0 || line.Length < 6) return line;   // cb:fold swear table content transform, no guid in reach
 
         var words = line.Split(new[] { ' ', ',', '.', '!', '?', ':', ';' },
                                StringSplitOptions.RemoveEmptyEntries);
@@ -327,32 +327,32 @@ public static class SwearTables
         bool positive = words.Any(w => PositiveCues.Contains(w));
 
         // Don't stack: if the line already swears (the model did it, or we just did), stop.
-        if (AlreadySwears(line)) return line;
+        if (AlreadySwears(line)) return line;   // cb:fold swear table content transform, no guid in reach
 
         string? interjection = null;
 
         if (negative)
-        {
+        {   // cb:fold swear table content transform, no guid in reach
             // A sour mood makes the frustrated line more likely to open with one.
             double p = 0.40 * strength * (moodValence < -0.15f ? 1.5 : 1.0);
             if (rng.NextDouble() < p)
-            {
+            {   // cb:fold swear table content transform, no guid in reach
                 var pool = Interjections[Math.Clamp(lvl, 0, 3)];
-                if (pool.Length > 0) interjection = pool[rng.Next(pool.Length)];
+                if (pool.Length > 0) interjection = pool[rng.Next(pool.Length)];   // cb:fold swear table content transform, no guid in reach
             }
         }
         else if (positive && lvl >= 3 && rng.NextDouble() < 0.18 * strength)
-        {
+        {   // cb:fold swear table content transform, no guid in reach
             interjection = PositiveInterjections[rng.Next(PositiveInterjections.Length)];
         }
 
-        if (interjection == null) return line;
+        if (interjection == null) return line;   // cb:fold swear table content transform, no guid in reach
         budget--;
 
         // Proper-caps typists get it as its own sentence so we don't have to re-case the
         // body ("Ugh. That was..."); lowercase typists just run it on ("ugh that was...").
         if (card.Typing.Caps == "proper")
-        {
+        {   // cb:fold swear table content transform, no guid in reach
             var cap = char.ToUpperInvariant(interjection[0]) + interjection[1..];
             return $"{cap}. {line}";
         }
@@ -372,7 +372,7 @@ public static class SwearTables
     {
         var lower = line.ToLowerInvariant();
         foreach (var m in SwearMarkers)
-            if (lower.Contains(m)) return true;
+            if (lower.Contains(m)) return true;   // cb:fold pure swear scan helper, no guid in reach
         return false;
     }
 
@@ -393,10 +393,10 @@ public static class SwearTables
     /// <summary>Keep the original token's casing shape (lowercase chat mostly, but be safe).</summary>
     private static string MatchCase(string original, string replacement)
     {
-        if (original.Length == 0 || replacement.Length == 0) return replacement;
-        if (original.All(char.IsUpper) && original.Length > 1) return replacement.ToUpperInvariant();
+        if (original.Length == 0 || replacement.Length == 0) return replacement;   // cb:fold pure case helper, no guid in reach
+        if (original.All(char.IsUpper) && original.Length > 1) return replacement.ToUpperInvariant();   // cb:fold pure case helper, no guid in reach
         if (char.IsUpper(original[0]))
-            return char.ToUpperInvariant(replacement[0]) + replacement[1..];
+            return char.ToUpperInvariant(replacement[0]) + replacement[1..];   // cb:fold pure case helper, no guid in reach
         return replacement;
     }
 }

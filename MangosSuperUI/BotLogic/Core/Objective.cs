@@ -115,11 +115,11 @@ public readonly record struct Objective
     {
         switch (Kind)
         {
-            case ObjectiveKind.Grind:
+            case ObjectiveKind.Grind:   // cb:fold pure value-object check, no guid in reach; outcome probed at the reconcile caller
                 // C++ is GRINDING the mob in place (arrived + handed off to TASK_GRIND) — steady state.
                 if (echo.Kind == HeldTaskKind.Grind
                     && (CreatureEntry == 0 || echo.CreatureEntry == 0 || echo.CreatureEntry == CreatureEntry))
-                    return true;
+                    return true;   // cb:fold pure value-object check, no guid in reach
                 // OR C++ is still TRAVELING the ENRICHED MOVE_TO toward the grind coords. A solo grind
                 // objective is realized by ONE enriched MOVE_TO (creature_entry+kill_count) that travels to
                 // the dest, THEN ConvertMoveToGrindInPlace hands off to TASK_GRIND on arrival / scan-hit. So
@@ -129,14 +129,14 @@ public readonly record struct Objective
                 if (echo.Kind == HeldTaskKind.MoveTo
                     && echo.Dest.Map == Target.Map
                     && echo.Dest.Pos.Dist2D(Target.Pos) <= destTolYards)
-                    return true;
+                    return true;   // cb:fold pure value-object check, no guid in reach
                 return false;
-            case ObjectiveKind.Travel:
+            case ObjectiveKind.Travel:   // cb:fold pure value-object check, no guid in reach; outcome probed at the reconcile caller
                 // C++ is moving toward our destination (same map, within tolerance).
                 return echo.Kind == HeldTaskKind.MoveTo
                        && echo.Dest.Map == Target.Map
                        && echo.Dest.Pos.Dist2D(Target.Pos) <= destTolYards;
-            default:
+            default:   // cb:fold pure value-object check, no guid in reach; outcome probed at the reconcile caller
                 return true;   // Hold / Idle / None are never reconciled as mismatched
         }
     }

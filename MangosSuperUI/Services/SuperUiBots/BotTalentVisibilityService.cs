@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Dapper;
+using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Models;
 
 namespace MangosSuperUI.Services;
@@ -56,11 +57,17 @@ public sealed class BotTalentVisibilityService
     public IReadOnlyList<BotTalentProfileOption> GetProfileOptions(int classId)
     {
         if (!ClassNames.TryGetValue(classId, out string? classKey))
+        {
+            CircuitTrace.Hit(0, "talentvis: class has no vanilla profiles");
             return Array.Empty<BotTalentProfileOption>();
+        }
 
         TalentCatalog catalog = _catalog.Value;
         if (!catalog.Manifest.TreeOrder.TryGetValue(classKey, out string[]? specKeys))
+        {
+            CircuitTrace.Hit(0, "talentvis: manifest lacks tree order for class");
             return Array.Empty<BotTalentProfileOption>();
+        }
 
         var result = new List<BotTalentProfileOption>(specKeys.Length);
         for (int specTab = 0; specTab < specKeys.Length; specTab++)
@@ -69,7 +76,10 @@ public sealed class BotTalentVisibilityService
             TalentProfile? profile = catalog.Manifest.Profiles.SingleOrDefault(p =>
                 p.ClassId == classId && string.Equals(p.Spec, spec, StringComparison.OrdinalIgnoreCase));
             if (profile == null)
+            {
+                CircuitTrace.Hit(0, "talentvis: manifest profile missing for spec slot");
                 continue;
+            }
 
             int[] roles = AllowedRoles(profile);
             result.Add(new BotTalentProfileOption
@@ -116,6 +126,7 @@ public sealed class BotTalentVisibilityService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "talentvis: catalog unavailable, provenance omitted");
             _logger.LogWarning(ex, "Spellbook: talent catalog unavailable; talent provenance is omitted");
             return new Dictionary<uint, BotTalentSpellOrigin>();
         }
@@ -126,7 +137,7 @@ public sealed class BotTalentVisibilityService
         foreach (var (rankSpellId, position) in catalog.ByRankSpell)
         {
             if (!catalog.Tabs.TryGetValue(position.Talent.TabId, out var tab) || !tab.SupportsClass(classId))
-                continue;
+                continue;   // cb:fold per-class catalog projection, no per-bot routing
 
             origins[rankSpellId] = new BotTalentSpellOrigin
             {
@@ -146,7 +157,10 @@ public sealed class BotTalentVisibilityService
     public async Task<BotTalentVisibility> GetAsync(int guid, CancellationToken cancellationToken = default)
     {
         if (guid <= 0)
+        {
+            CircuitTrace.Hit(0, "talentvis: rejected, invalid guid");
             return Error(guid, "not_found", "A positive character guid is required.");
+        }
 
         BotTalentDbRow? bot;
         IReadOnlyCollection<uint> learnedSpells;
@@ -165,7 +179,10 @@ public sealed class BotTalentVisibilityService
                 new { Guid = guid }, cancellationToken: cancellationToken));
 
             if (bot == null)
+            {
+                CircuitTrace.Hit(guid, "talentvis: character not found");
                 return Error(guid, "not_found", $"Character {guid} was not found.");
+            }
 
             learnedSpells = (await conn.QueryAsync<uint>(new CommandDefinition(@"
                 SELECT spell
@@ -175,6 +192,7 @@ public sealed class BotTalentVisibilityService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "talentvis: character state read failed");
             _logger.LogWarning(ex, "Talents: failed to read character/playerbot state for guid {Guid}", guid);
             bool migrationMissing = ex.Message.Contains("Unknown column", StringComparison.OrdinalIgnoreCase)
                 && (ex.Message.Contains("spec_tab", StringComparison.OrdinalIgnoreCase)
@@ -193,13 +211,17 @@ public sealed class BotTalentVisibilityService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "talentvis: talent catalog unavailable");
             _logger.LogError(ex, "Talents: profile/DBC catalog failed to load");
             return Error(guid, "catalog_unavailable",
                 "The build-5875 talent catalog is unavailable or failed validation.", bot);
         }
 
         if (!ClassNames.TryGetValue(bot.ClassId, out var classKey))
+        {
+            CircuitTrace.Hit(guid, "talentvis: unsupported class");
             return Error(guid, "unsupported_class", $"Class {bot.ClassId} has no Vanilla talent profile.", bot);
+        }
 
         var classTabs = catalog.Tabs.Values
             .Where(t => t.SupportsClass(bot.ClassId))
@@ -210,30 +232,40 @@ public sealed class BotTalentVisibilityService
         foreach (uint spellId in learnedSpells)
         {
             if (!catalog.ByRankSpell.TryGetValue(spellId, out var pos))
-                continue;
+                continue;   // cb:fold per-spell scan detail, talent ranks probed below
             if (!actualRanks.TryGetValue(pos.Talent.Id, out int current) || pos.Rank > current)
+            {
+                CircuitTrace.Hit(guid, "talentvis: learned talent rank observed", pos.Rank);
                 actualRanks[pos.Talent.Id] = pos.Rank;
+            }
         }
 
         TalentProfile? profile = null;
         string? profileProblem = null;
         if (bot.SpecTab is >= 0 and <= 2)
         {
+            CircuitTrace.Hit(guid, "talentvis: spec tab slot assigned", bot.SpecTab);
             if (!catalog.Manifest.TreeOrder.TryGetValue(classKey, out var specKeys) || bot.SpecTab >= specKeys.Length)
             {
+                CircuitTrace.Hit(guid, "talentvis: profile slot undefined for class");
                 profileProblem = $"Profile slot {bot.SpecTab} is not defined for {Humanize(classKey)}.";
             }
             else
             {
+                CircuitTrace.Hit(guid, "talentvis: resolving manifest profile for spec");
                 string specKey = specKeys[bot.SpecTab];
                 profile = catalog.Manifest.Profiles.SingleOrDefault(p =>
                     p.ClassId == bot.ClassId && string.Equals(p.Spec, specKey, StringComparison.OrdinalIgnoreCase));
                 if (profile == null)
+                {
+                    CircuitTrace.Hit(guid, "talentvis: manifest profile missing for assigned spec");
                     profileProblem = $"Manifest profile {classKey}/{specKey} is missing.";
+                }
             }
         }
         else if (bot.SpecTab != 255)
         {
+            CircuitTrace.Hit(guid, "talentvis: persisted spec tab invalid", bot.SpecTab);
             profileProblem = $"Persisted spec_tab {bot.SpecTab} is invalid; expected 0-2 or 255.";
         }
 
@@ -268,11 +300,20 @@ public sealed class BotTalentVisibilityService
         bool roleAssigned = RoleNames.ContainsKey(bot.ActiveRole) && bot.ActiveRole != 0;
         bool roleAllowed = profile == null || (roleAssigned && IsRoleAllowed(profile, bot.ActiveRole));
         if (!roleAssigned)
+        {
+            CircuitTrace.Hit(guid, "talentvis: active role unassigned or invalid");
             warnings.Add("The active combat role is unassigned or invalid.");
+        }
         else if (!roleAllowed)
+        {
+            CircuitTrace.Hit(guid, "talentvis: active role not allowed by profile");
             warnings.Add($"The active role {RoleNames[bot.ActiveRole]} is not allowed by profile {profile!.Id}; the core will normalize it on login.");
+        }
         if (foreignPoints > 0)
+        {
+            CircuitTrace.Hit(guid, "talentvis: points in foreign class tree", foreignPoints);
             warnings.Add($"{foreignPoints} point(s) belong to a talent tree outside the character class.");
+        }
 
         string compatibilityStatus;
         string compatibilityMessage;
@@ -280,12 +321,14 @@ public sealed class BotTalentVisibilityService
 
         if (profileProblem != null)
         {
+            CircuitTrace.Hit(guid, "talentvis: compatibility verdict invalid_profile");
             compatibilityStatus = "invalid_profile";
             compatibilityMessage = profileProblem;
             compatible = false;
         }
         else if (profile == null)
         {
+            CircuitTrace.Hit(guid, "talentvis: compatibility verdict unassigned");
             compatibilityStatus = "unassigned";
             compatibilityMessage = bot.SpecTab == 255
                 ? "No specialization profile has been assigned yet. Existing talents were preserved."
@@ -294,6 +337,7 @@ public sealed class BotTalentVisibilityService
         }
         else if (unexpected.Length > 0 || spentPoints > earnedPoints)
         {
+            CircuitTrace.Hit(guid, "talentvis: compatibility verdict conflict", unexpected.Length);
             compatibilityStatus = "conflict";
             compatibilityMessage = unexpected.Length > 0
                 ? $"{unexpected.Length} learned talent(s) exceed the selected profile. The core will preserve and flag this build."
@@ -302,6 +346,7 @@ public sealed class BotTalentVisibilityService
         }
         else if (spentPoints < earnedPoints || missingAtLevel.Length > 0)
         {
+            CircuitTrace.Hit(guid, "talentvis: compatibility verdict compatible_incomplete");
             compatibilityStatus = "compatible_incomplete";
             compatibilityMessage = spentPoints < earnedPoints
                 ? $"The learned build is compatible; {earnedPoints - spentPoints} earned point(s) remain to place."
@@ -310,6 +355,7 @@ public sealed class BotTalentVisibilityService
         }
         else
         {
+            CircuitTrace.Hit(guid, "talentvis: compatibility verdict compatible");
             compatibilityStatus = "compatible";
             compatibilityMessage = "The learned ranks are compatible with the selected profile through this level.";
             compatible = true;
@@ -429,13 +475,22 @@ public sealed class BotTalentVisibilityService
             ?? throw new InvalidDataException("Talent profile manifest is empty.");
 
         if (manifest.ClientBuild != 5875)
+        {
+            CircuitTrace.Hit(0, "talentvis: manifest build mismatch, failing load");
             throw new InvalidDataException($"Talent profile build {manifest.ClientBuild} is not supported; expected 5875.");
+        }
         if (manifest.Profiles.Count != 27 || manifest.Profiles.Select(p => p.Id).Distinct(StringComparer.Ordinal).Count() != 27)
+        {
+            CircuitTrace.Hit(0, "talentvis: manifest profile count invalid, failing load");
             throw new InvalidDataException("Talent profile manifest must contain 27 unique profiles.");
+        }
         foreach (var profile in manifest.Profiles)
         {
             if (profile.TreePoints.Length != 3 || profile.TreePoints.Sum() != 51 || Expand(profile).Length != 51)
+            {
+                CircuitTrace.Hit(0, "talentvis: profile point plan invalid, failing load");
                 throw new InvalidDataException($"Talent profile {profile.Id} does not define exactly 51 points across three trees.");
+            }
         }
 
         string talentPath = Path.Combine(_dbc.DbcPath, "Talent.dbc");
@@ -446,9 +501,15 @@ public sealed class BotTalentVisibilityService
             ?? throw new InvalidDataException($"Could not parse {tabPath}.");
 
         if (talentDbc.FieldCount != 21 || talentDbc.RecordSize != 84)
+        {
+            CircuitTrace.Hit(0, "talentvis: Talent.dbc layout mismatch, failing load");
             throw new InvalidDataException($"Talent.dbc layout is {talentDbc.FieldCount} fields/{talentDbc.RecordSize} bytes; expected 21/84.");
+        }
         if (tabDbc.FieldCount < 14 || tabDbc.RecordSize < 56)
+        {
+            CircuitTrace.Hit(0, "talentvis: TalentTab.dbc layout mismatch, failing load");
             throw new InvalidDataException("TalentTab.dbc does not contain the required build-5875 fields.");
+        }
 
         var tabs = new Dictionary<uint, TalentTabDefinition>();
         for (int row = 0; row < tabDbc.RecordCount; row++)
@@ -481,7 +542,10 @@ public sealed class BotTalentVisibilityService
         foreach (var profile in manifest.Profiles)
         foreach (uint talentId in Expand(profile))
             if (!talents.ContainsKey(talentId))
+            {
+                CircuitTrace.Hit(0, "talentvis: profile references missing talent, failing load");
                 throw new InvalidDataException($"Profile {profile.Id} references missing TalentID {talentId}.");
+            }
 
         return new TalentCatalog(manifest, tabs, talents, byRankSpell, _dbc.AllSpellEntries);
     }
@@ -501,9 +565,9 @@ public sealed class BotTalentVisibilityService
             int rank = occurrence.GetValueOrDefault(talentId) + 1;
             occurrence[talentId] = rank;
             if (actualRanks.GetValueOrDefault(talentId) >= rank)
-                continue;
+                continue;   // cb:fold pure plan-walk helper without guid, result carried in NextPlannedPurchase view
             if (!catalog.Talents.TryGetValue(talentId, out var talent))
-                return null;
+                return null;   // cb:fold pure plan-walk helper without guid, result carried in NextPlannedPurchase view
 
             uint rankSpell = rank <= talent.RankSpellIds.Length ? talent.RankSpellIds[rank - 1] : 0;
             string name = catalog.SpellInfo.TryGetValue(rankSpell, out var info) && !string.IsNullOrWhiteSpace(info.Name)
@@ -529,7 +593,10 @@ public sealed class BotTalentVisibilityService
         foreach (var chunk in profile.Chunks)
         {
             if (chunk.Length != 2 || chunk[0] <= 0 || chunk[1] <= 0)
+            {
+                CircuitTrace.Hit(0, "talentvis: profile chunk invalid, failing expand");
                 throw new InvalidDataException($"Talent profile {profile.Id} contains an invalid chunk.");
+            }
             for (int i = 0; i < chunk[1]; i++)
                 result.Add(checked((uint)chunk[0]));
         }
@@ -551,24 +618,24 @@ public sealed class BotTalentVisibilityService
 
     private static int[] AllowedRoles(TalentProfile profile) => (profile.ClassId, profile.Spec) switch
     {
-        (1, "arms" or "fury") => new[] { 1, 3 },
-        (1, "protection") => new[] { 3 },
-        (2, "holy") => new[] { 4 },
-        (2, "protection") => new[] { 3 },
-        (2, "retribution") => new[] { 1 },
-        (3, _) => new[] { 2 },
-        (4, _) => new[] { 1 },
-        (5, "discipline" or "holy") => new[] { 4 },
-        (5, "shadow") => new[] { 2 },
-        (7, "elemental") => new[] { 2 },
-        (7, "enhancement") => new[] { 1 },
-        (7, "restoration") => new[] { 4 },
-        (8, _) => new[] { 2 },
-        (9, _) => new[] { 2 },
-        (11, "balance") => new[] { 2 },
-        (11, "feral_combat") => new[] { 1, 3 },
-        (11, "restoration") => new[] { 4 },
-        _ => Array.Empty<int>()
+        (1, "arms" or "fury") => CircuitTrace.Pass(new[] { 1, 3 }, 0, "talentvis: roles warrior arms/fury"),
+        (1, "protection") => CircuitTrace.Pass(new[] { 3 }, 0, "talentvis: roles warrior protection"),
+        (2, "holy") => CircuitTrace.Pass(new[] { 4 }, 0, "talentvis: roles paladin holy"),
+        (2, "protection") => CircuitTrace.Pass(new[] { 3 }, 0, "talentvis: roles paladin protection"),
+        (2, "retribution") => CircuitTrace.Pass(new[] { 1 }, 0, "talentvis: roles paladin retribution"),
+        (3, _) => CircuitTrace.Pass(new[] { 2 }, 0, "talentvis: roles hunter"),
+        (4, _) => CircuitTrace.Pass(new[] { 1 }, 0, "talentvis: roles rogue"),
+        (5, "discipline" or "holy") => CircuitTrace.Pass(new[] { 4 }, 0, "talentvis: roles priest healer"),
+        (5, "shadow") => CircuitTrace.Pass(new[] { 2 }, 0, "talentvis: roles priest shadow"),
+        (7, "elemental") => CircuitTrace.Pass(new[] { 2 }, 0, "talentvis: roles shaman elemental"),
+        (7, "enhancement") => CircuitTrace.Pass(new[] { 1 }, 0, "talentvis: roles shaman enhancement"),
+        (7, "restoration") => CircuitTrace.Pass(new[] { 4 }, 0, "talentvis: roles shaman restoration"),
+        (8, _) => CircuitTrace.Pass(new[] { 2 }, 0, "talentvis: roles mage"),
+        (9, _) => CircuitTrace.Pass(new[] { 2 }, 0, "talentvis: roles warlock"),
+        (11, "balance") => CircuitTrace.Pass(new[] { 2 }, 0, "talentvis: roles druid balance"),
+        (11, "feral_combat") => CircuitTrace.Pass(new[] { 1, 3 }, 0, "talentvis: roles druid feral"),
+        (11, "restoration") => CircuitTrace.Pass(new[] { 4 }, 0, "talentvis: roles druid restoration"),
+        _ => CircuitTrace.Pass(Array.Empty<int>(), 0, "talentvis: roles unknown spec")
     };
 
     private static bool IsRoleAllowed(TalentProfile profile, int role)

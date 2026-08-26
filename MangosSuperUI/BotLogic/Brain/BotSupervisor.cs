@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Brain;
 
@@ -34,6 +35,7 @@ public sealed class BotSupervisor
         var pending = ctx.Pending;
         if (pending != null && pending.Expired)
         {
+            CircuitTrace.Hit(ctx.Guid, "supervisor: WAIT past deadline -> stall tripped");
             Trip(ctx, $"deadline:{pending.ExpectedEvent}");
             return true;
         }
@@ -41,6 +43,7 @@ public sealed class BotSupervisor
         // No active stall condition — clear any prior verdict.
         if (ctx.Stalled)
         {
+            CircuitTrace.Hit(ctx.Guid, "supervisor: stall cleared");
             _logger.LogDebug("[SUPV] {Name} stall cleared (was {Reason})", ctx.Name, ctx.StallReason);
             ctx.Stalled = false;
             ctx.StallReason = "";
@@ -51,8 +54,9 @@ public sealed class BotSupervisor
 
     private void Trip(BotContext ctx, string reason)
     {
-        if (ctx.Stalled && ctx.StallReason == reason) return;   // already tripped on this reason
+        if (ctx.Stalled && ctx.StallReason == reason) { CircuitTrace.Hit(ctx.Guid, "supervisor: already tripped on this reason"); return; }
 
+        CircuitTrace.HitNote(ctx.Guid, "supervisor: stall verdict written", reason);
         ctx.Stalled = true;
         ctx.StallReason = reason;
         ctx.StalledSinceUtc = DateTime.UtcNow;

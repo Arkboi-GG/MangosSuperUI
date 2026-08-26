@@ -141,18 +141,18 @@ public class BotStateSnapshot
     private static Dictionary<int, QuestLogEntry> ParseQuestLog(string? data)
     {
         var log = new Dictionary<int, QuestLogEntry>();
-        if (string.IsNullOrWhiteSpace(data)) return log;
+        if (string.IsNullOrWhiteSpace(data)) return log;   // cb:fold parse detail, static helper with no guid in reach
 
         foreach (var part in data.Split('|', StringSplitOptions.RemoveEmptyEntries))
         {
             var f = part.Split(':');
-            if (f.Length < 2) continue;
-            if (!int.TryParse(f[0].Trim(), out int qid)) continue;
-            if (!int.TryParse(f[1].Trim(), out int status)) continue;
+            if (f.Length < 2) continue;   // cb:fold parse detail, static helper with no guid in reach
+            if (!int.TryParse(f[0].Trim(), out int qid)) continue;   // cb:fold parse detail, static helper with no guid in reach
+            if (!int.TryParse(f[1].Trim(), out int status)) continue;   // cb:fold parse detail, static helper with no guid in reach
 
             var mob = new int[4];
             if (f.Length >= 3)
-            {
+            {   // cb:fold parse detail, static helper with no guid in reach
                 var mc = f[2].Split(',');
                 for (int i = 0; i < 4 && i < mc.Length; i++)
                     int.TryParse(mc[i].Trim(), out mob[i]);
@@ -160,7 +160,7 @@ public class BotStateSnapshot
 
             var item = new int[4];
             if (f.Length >= 4)
-            {
+            {   // cb:fold parse detail, static helper with no guid in reach
                 var ic = f[3].Split(',');
                 for (int i = 0; i < 4 && i < ic.Length; i++)
                     int.TryParse(ic[i].Trim(), out item[i]);
@@ -178,7 +178,7 @@ public class BotStateSnapshot
     private static HeldTaskEcho ParseHeldTask(Services.BotState bs)
     {
         if (string.IsNullOrWhiteSpace(bs.TaskActivity))
-            return HeldTaskEcho.Unknown;   // no readback yet
+            return HeldTaskEcho.Unknown;   // no readback yet   // cb:fold parse detail, absent-echo guard; reconcile branches are probed at the brain
 
         var kind = ParseTaskKind(bs.TaskKind);   // committed task kind — NOT bs.TaskState (a display status)
         var activity = ParseTaskActivity(bs.TaskActivity);
@@ -188,21 +188,21 @@ public class BotStateSnapshot
 
     private static HeldTaskKind ParseTaskKind(string s) => (s ?? "").Trim().ToUpperInvariant() switch
     {
-        "GRIND" => HeldTaskKind.Grind,
-        "MOVE_TO" or "MOVE" or "MOVETO" => HeldTaskKind.MoveTo,
-        "INTERACT" => HeldTaskKind.Interact,
-        "IDLE" or "" => HeldTaskKind.Idle,
-        _ => HeldTaskKind.Idle
+        "GRIND" => HeldTaskKind.Grind,   // cb:fold parse detail, static helper with no guid in reach
+        "MOVE_TO" or "MOVE" or "MOVETO" => HeldTaskKind.MoveTo,   // cb:fold parse detail, static helper with no guid in reach
+        "INTERACT" => HeldTaskKind.Interact,   // cb:fold parse detail, static helper with no guid in reach
+        "IDLE" or "" => HeldTaskKind.Idle,   // cb:fold parse detail, static helper with no guid in reach
+        _ => HeldTaskKind.Idle   // cb:fold parse detail, static helper with no guid in reach
     };
 
     private static TaskActivity ParseTaskActivity(string s) => (s ?? "").Trim().ToLowerInvariant() switch
     {
-        "traveling" or "travelling" => Core.TaskActivity.Traveling,
-        "searching" => Core.TaskActivity.Searching,
-        "engaged" => Core.TaskActivity.Engaged,
-        "recovering" => Core.TaskActivity.Recovering,
-        "blocked" => Core.TaskActivity.Blocked,
-        "idle" => Core.TaskActivity.Idle,
-        _ => Core.TaskActivity.Unknown
+        "traveling" or "travelling" => Core.TaskActivity.Traveling,   // cb:fold parse detail, static helper with no guid in reach
+        "searching" => Core.TaskActivity.Searching,   // cb:fold parse detail, static helper with no guid in reach
+        "engaged" => Core.TaskActivity.Engaged,   // cb:fold parse detail, static helper with no guid in reach
+        "recovering" => Core.TaskActivity.Recovering,   // cb:fold parse detail, static helper with no guid in reach
+        "blocked" => Core.TaskActivity.Blocked,   // cb:fold parse detail, static helper with no guid in reach
+        "idle" => Core.TaskActivity.Idle,   // cb:fold parse detail, static helper with no guid in reach
+        _ => Core.TaskActivity.Unknown   // cb:fold parse detail, static helper with no guid in reach
     };
 }

@@ -61,6 +61,7 @@ public class GroupManager
             // If switching to Off, disband everything
             if (value == GroupingMode.Off && old != GroupingMode.Off)
             {
+                CircuitTrace.Hit(0, "groupmgr: mode switched off, disbanding all groups");
                 DisbandAll();
             }
         }
@@ -74,8 +75,8 @@ public class GroupManager
     public BotGroup? GetGroup(int botGuid)
     {
         if (_botToGroup.TryGetValue(botGuid, out int groupId))
-            if (_groups.TryGetValue(groupId, out var group))
-                return group;
+            if (_groups.TryGetValue(groupId, out var group))   // cb:fold pure lookup accessor, no routing information
+                return group;   // cb:fold pure lookup accessor, no routing information
         return null;
     }
 
@@ -124,6 +125,7 @@ public class GroupManager
     {
         if (_mode == GroupingMode.Off)
         {
+            CircuitTrace.Hit(leaderGuid, "groupmgr: form rejected, grouping mode off");
             _logger.LogDebug("[BOT-GROUP] FormGroup rejected — mode is Off");
             return null;
         }
@@ -136,6 +138,7 @@ public class GroupManager
         {
             if (_botToGroup.ContainsKey(guid))
             {
+                CircuitTrace.Hit(guid, "groupmgr: form rejected, bot already grouped");
                 _logger.LogWarning("[BOT-GROUP] FormGroup rejected — bot {Guid} is already in group {GroupId}",
                     guid, _botToGroup[guid]);
                 return null;
@@ -144,6 +147,7 @@ public class GroupManager
 
         if (allMembers.Count < 2 || allMembers.Count > 5)
         {
+            CircuitTrace.Hit(leaderGuid, "groupmgr: form rejected, invalid size", allMembers.Count);
             _logger.LogWarning("[BOT-GROUP] FormGroup rejected — invalid size {Size} (need 2-5)", allMembers.Count);
             return null;
         }
@@ -176,7 +180,10 @@ public class GroupManager
     public bool DisbandGroup(int groupId)
     {
         if (!_groups.TryRemove(groupId, out var group))
+        {
+            CircuitTrace.Hit(0, "groupmgr: disband rejected, unknown group");
             return false;
+        }
 
         foreach (var guid in group.MemberGuids)
             _botToGroup.TryRemove(guid, out _);
@@ -193,7 +200,7 @@ public class GroupManager
     public bool RemoveFromGroup(int botGuid)
     {
         var group = GetGroup(botGuid);
-        if (group == null) return false;
+        if (group == null) { CircuitTrace.Hit(botGuid, "groupmgr: remove rejected, bot not grouped"); return false; }
 
         group.MemberGuids.Remove(botGuid);
         _botToGroup.TryRemove(botGuid, out _);
@@ -206,11 +213,13 @@ public class GroupManager
         // If only 1 member left, disband
         if (group.MemberGuids.Count <= 1)
         {
+            CircuitTrace.Hit(botGuid, "groupmgr: removal leaves <=1 member, disband group");
             DisbandGroup(group.GroupId);
         }
         // If the leader left, promote lowest GUID
         else if (group.LeaderGuid == botGuid)
         {
+            CircuitTrace.Hit(botGuid, "groupmgr: leader left, promote lowest guid");
             group.LeaderGuid = group.MemberGuids.Min();
             _logger.LogInformation("[BOT-GROUP] New leader for group {GroupId}: {NewLeader}",
                 group.GroupId, group.LeaderGuid);
@@ -274,9 +283,9 @@ public class GroupManager
 
     private static Role RoleFor(int classId) => (WowClass)classId switch
     {
-        WowClass.Warrior => Role.Tank,
-        WowClass.Paladin or WowClass.Priest or WowClass.Shaman or WowClass.Druid => Role.Healer,
-        _ => Role.Dps   // Hunter, Rogue, Mage, Warlock (and anything unrecognized)
+        WowClass.Warrior => Role.Tank,   // cb:fold pure role classification, static with no guid in reach
+        WowClass.Paladin or WowClass.Priest or WowClass.Shaman or WowClass.Druid => Role.Healer,   // cb:fold pure role classification, static with no guid in reach
+        _ => Role.Dps   // Hunter, Rogue, Mage, Warlock (and anything unrecognized)   // cb:fold pure role classification, static with no guid in reach
     };
 
     /// <summary>
@@ -305,6 +314,7 @@ public class GroupManager
     {
         if (_mode == GroupingMode.Off)
         {
+            CircuitTrace.Hit(0, "groupmgr: autoform skipped, grouping mode off");
             _logger.LogDebug("[BOT-GROUP] AutoFormGroups skipped — mode is Off");
             return new List<BotGroup>();
         }
@@ -319,17 +329,17 @@ public class GroupManager
         // Helper: check if two bots are compatible (level + distance)
         bool AreCompatible(BotIdentity a, BotIdentity b)
         {
-            if (Math.Abs(a.Level - b.Level) > MAX_LEVEL_GAP) return false;
+            if (Math.Abs(a.Level - b.Level) > MAX_LEVEL_GAP) { CircuitTrace.Hit(a.Guid, "groupmgr: pair incompatible, level gap", Math.Abs(a.Level - b.Level)); return false; }
             if (getPosition != null)
-            {
+            {   // cb:fold trivial data-shape guard, position provider availability
                 var posA = getPosition(a.Guid);
                 var posB = getPosition(b.Guid);
                 if (posA != null && posB != null)
-                {
-                    if (posA.MapId != posB.MapId) return false;
+                {   // cb:fold trivial data-shape guard, positions available
+                    if (posA.MapId != posB.MapId) { CircuitTrace.Hit(a.Guid, "groupmgr: pair incompatible, different maps"); return false; }
                     float dx = posA.X - posB.X;
                     float dy = posA.Y - posB.Y;
-                    if (dx * dx + dy * dy > MAX_PAIR_DISTANCE * MAX_PAIR_DISTANCE) return false;
+                    if (dx * dx + dy * dy > MAX_PAIR_DISTANCE * MAX_PAIR_DISTANCE) { CircuitTrace.Hit(a.Guid, "groupmgr: pair incompatible, too far apart"); return false; }
                 }
             }
             return true;
@@ -344,9 +354,9 @@ public class GroupManager
         {
             int RolePriority(int classId) => RoleFor(classId) switch
             {
-                Role.Tank => 0,
-                Role.Healer => 1,
-                _ => 2   // Dps
+                Role.Tank => 0,   // cb:fold pure ranking helper, leader choice carried by the form probes
+                Role.Healer => 1,   // cb:fold pure ranking helper, leader choice carried by the form probes
+                _ => 2   // Dps   // cb:fold pure ranking helper, leader choice carried by the form probes
             };
             return members
                 .OrderBy(m => RolePriority(m.ClassId))
@@ -358,11 +368,11 @@ public class GroupManager
         // Helper: try to form a group, returns true if successful
         bool TryForm(params BotIdentity[] members)
         {
-            if (members.Any(m => claimed.Contains(m.Guid))) return false;
+            if (members.Any(m => claimed.Contains(m.Guid))) { CircuitTrace.Hit(members[0].Guid, "groupmgr: tryform rejected, member already claimed this round"); return false; }
             int leader = PickLeader(members);
             var followers = members.Where(m => m.Guid != leader).Select(m => m.Guid).ToArray();
             var group = FormGroup(leader, followers);
-            if (group == null) return false;
+            if (group == null) return false;   // cb:fold reject reason probed inside FormGroup
             formed.Add(group);
             foreach (var m in members) claimed.Add(m.Guid);
             return true;
@@ -379,44 +389,56 @@ public class GroupManager
         foreach (var t in GetAvailable(Role.Tank))
         {
             var healer = GetAvailable(Role.Healer).FirstOrDefault(h => AreCompatible(t, h));
-            if (healer == null) continue;
+            if (healer == null) { CircuitTrace.Hit(t.Guid, "groupmgr: trinity pass, no compatible healer for tank"); continue; }
 
             var dps = GetAvailable(Role.Dps).FirstOrDefault(d => IsCompatibleWithBoth(d, t, healer));
             if (dps != null)
+            {
+                CircuitTrace.Hit(t.Guid, "groupmgr: trio attempt tank+healer+dps");
                 TryForm(t, healer, dps);
+            }
         }
 
         // Tank + Healer + Healer (a spare healer beats a missing one)
         foreach (var t in GetAvailable(Role.Tank))
         {
             var healers = GetAvailable(Role.Healer).Where(h => AreCompatible(t, h)).ToList();
-            if (healers.Count < 2) continue;
+            if (healers.Count < 2) { CircuitTrace.Hit(t.Guid, "groupmgr: tank+2healer pass, not enough healers", healers.Count); continue; }
             var h1 = healers[0];
             var h2 = healers.Skip(1).FirstOrDefault(h => IsCompatibleWithBoth(h, t, h1));
             if (h2 != null)
+            {
+                CircuitTrace.Hit(t.Guid, "groupmgr: trio attempt tank+healer+healer");
                 TryForm(t, h1, h2);
+            }
         }
 
         // Healer + Dps + Dps (no tank left)
         foreach (var h in GetAvailable(Role.Healer))
         {
             var dpsList = GetAvailable(Role.Dps).Where(d => AreCompatible(h, d)).ToList();
-            if (dpsList.Count < 2) continue;
+            if (dpsList.Count < 2) { CircuitTrace.Hit(h.Guid, "groupmgr: healer+2dps pass, not enough dps", dpsList.Count); continue; }
             var d1 = dpsList[0];
             var d2 = dpsList.Skip(1).FirstOrDefault(d => IsCompatibleWithBoth(d, h, d1));
             if (d2 != null)
+            {
+                CircuitTrace.Hit(h.Guid, "groupmgr: trio attempt healer+dps+dps");
                 TryForm(h, d1, d2);
+            }
         }
 
         // Tank + Dps + Dps (no healer left)
         foreach (var t in GetAvailable(Role.Tank))
         {
             var dpsList = GetAvailable(Role.Dps).Where(d => AreCompatible(t, d)).ToList();
-            if (dpsList.Count < 2) continue;
+            if (dpsList.Count < 2) { CircuitTrace.Hit(t.Guid, "groupmgr: tank+2dps pass, not enough dps", dpsList.Count); continue; }
             var d1 = dpsList[0];
             var d2 = dpsList.Skip(1).FirstOrDefault(d => IsCompatibleWithBoth(d, t, d1));
             if (d2 != null)
+            {
+                CircuitTrace.Hit(t.Guid, "groupmgr: trio attempt tank+dps+dps");
                 TryForm(t, d1, d2);
+            }
         }
 
         // ── Pass 2: Duos (remaining ungrouped) ──
@@ -425,21 +447,21 @@ public class GroupManager
         foreach (var t in GetAvailable(Role.Tank))
         {
             var healer = GetAvailable(Role.Healer).FirstOrDefault(h => AreCompatible(t, h));
-            if (healer != null) TryForm(t, healer);
+            if (healer != null) { CircuitTrace.Hit(t.Guid, "groupmgr: duo attempt tank+healer"); TryForm(t, healer); }
         }
 
         // Tank + Dps
         foreach (var t in GetAvailable(Role.Tank))
         {
             var dps = GetAvailable(Role.Dps).FirstOrDefault(d => AreCompatible(t, d));
-            if (dps != null) TryForm(t, dps);
+            if (dps != null) { CircuitTrace.Hit(t.Guid, "groupmgr: duo attempt tank+dps"); TryForm(t, dps); }
         }
 
         // Healer + Dps (no tanks left)
         foreach (var h in GetAvailable(Role.Healer))
         {
             var dps = GetAvailable(Role.Dps).FirstOrDefault(d => AreCompatible(h, d));
-            if (dps != null) TryForm(h, dps);
+            if (dps != null) { CircuitTrace.Hit(h.Guid, "groupmgr: duo attempt healer+dps"); TryForm(h, dps); }
         }
 
         // ── Pass 3 (Session 33): Any-remaining duos — better grouped than solo ──
@@ -455,12 +477,14 @@ public class GroupManager
 
                 if (partner != null)
                 {
+                    CircuitTrace.Hit(first.Guid, "groupmgr: role-blind duo pairing");
                     TryForm(first, partner);
                     stillUngrouped.Remove(first);
                     stillUngrouped.Remove(partner);
                 }
                 else
                 {
+                    CircuitTrace.Hit(first.Guid, "groupmgr: no compatible partner, bot left solo this pass");
                     // Can't pair this bot with anyone (level/distance gap) — skip
                     stillUngrouped.Remove(first);
                 }
@@ -474,6 +498,7 @@ public class GroupManager
             var loner = ungrouped.Where(b => !claimed.Contains(b.Guid)).ToList();
             if (loner.Count == 1)
             {
+                CircuitTrace.Hit(loner[0].Guid, "groupmgr: single stray, try absorbing into smallest group");
                 var stray = loner[0];
                 // Find smallest compatible group to absorb the stray
                 var bestGroup = formed
@@ -483,7 +508,7 @@ public class GroupManager
                         // Check level compatibility with all members
                         return g.MemberGuids.All(mg =>
                         {
-                            if (!allBots.TryGetValue(mg, out var member)) return true;
+                            if (!allBots.TryGetValue(mg, out var member)) return true;   // cb:fold trivial data-shape guard, missing roster entry
                             return Math.Abs(member.Level - stray.Level) <= MAX_LEVEL_GAP;
                         });
                     })
@@ -492,6 +517,7 @@ public class GroupManager
 
                 if (bestGroup != null)
                 {
+                    CircuitTrace.Hit(stray.Guid, "groupmgr: stray absorbed into existing group");
                     bestGroup.MemberGuids.Add(stray.Guid);
                     _botToGroup[stray.Guid] = bestGroup.GroupId;
                     claimed.Add(stray.Guid);
@@ -535,11 +561,13 @@ public class GroupManager
         var group = GetGroup(bot.Guid);
         if (group != null)
         {
+            CircuitTrace.Hit(bot.Guid, "groupmgr: enrich stamps grouped state");
             bot.GroupId = group.GroupId;
             bot.GroupLeaderGuid = group.IsLeader(bot.Guid) ? bot.Guid : group.LeaderGuid;
         }
         else
         {
+            CircuitTrace.Hit(bot.Guid, "groupmgr: enrich stamps solo state");
             bot.GroupId = null;
             bot.GroupLeaderGuid = null;
         }
@@ -550,13 +578,13 @@ public class GroupManager
         var story = bot.Story;
         if (story != null && story.Enabled
             && (bot.GroupId != prevGroup || bot.GroupLeaderGuid != prevLeader))
-        {
+        {   // cb:fold logging-only branch (story narration)
             if (bot.GroupId == null)
-                story.Note($"left group {prevGroup} (now solo)");
+                story.Note($"left group {prevGroup} (now solo)");   // cb:fold logging only, narration wording
             else if (prevGroup == null)
-                story.Note($"joined group {bot.GroupId} as {(bot.IsGroupLeader ? "leader" : "follower")} (leader={bot.GroupLeaderGuid})");
+                story.Note($"joined group {bot.GroupId} as {(bot.IsGroupLeader ? "leader" : "follower")} (leader={bot.GroupLeaderGuid})");   // cb:fold logging only, narration wording
             else
-                story.Note($"group {bot.GroupId}: now {(bot.IsGroupLeader ? "leader" : "follower")} (leader {prevLeader}→{bot.GroupLeaderGuid})");
+                story.Note($"group {bot.GroupId}: now {(bot.IsGroupLeader ? "leader" : "follower")} (leader {prevLeader}→{bot.GroupLeaderGuid})");   // cb:fold logging only, narration wording
         }
     }
 
@@ -588,7 +616,7 @@ public class GroupManager
                     .Select(s => int.Parse(s.Trim()))
                     .ToList();
 
-                if (memberGuids.Count < 2) continue;
+                if (memberGuids.Count < 2) continue;   // cb:fold trivial data-shape guard on the DB row
 
                 var group = new BotGroup
                 {
@@ -604,7 +632,7 @@ public class GroupManager
                     _botToGroup[guid] = group.GroupId;
 
                 if (group.GroupId >= _nextGroupId)
-                    _nextGroupId = group.GroupId + 1;
+                    _nextGroupId = group.GroupId + 1;   // cb:fold id-counter bookkeeping, no routing information
 
                 loaded++;
             }
@@ -613,6 +641,7 @@ public class GroupManager
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "groupmgr: load groups from DB failed");
             _logger.LogError(ex, "[BOT-GROUP] Failed to load groups from DB");
         }
     }
@@ -646,6 +675,7 @@ public class GroupManager
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "groupmgr: save groups to DB failed");
             _logger.LogError(ex, "[BOT-GROUP] Failed to save groups to DB");
         }
     }

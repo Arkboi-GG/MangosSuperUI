@@ -17,10 +17,10 @@ public static class WeightedRoller
     {
         var valid = weights.Where(kv => kv.Value > 0).ToList();
         if (valid.Count == 0)
-            throw new InvalidOperationException("No valid weights to roll from");
+            throw new InvalidOperationException("No valid weights to roll from");   // cb:fold pure value-object math, no guid in reach
 
         if (valid.Count == 1)
-            return (valid[0].Key, 0.5f);
+            return (valid[0].Key, 0.5f);   // cb:fold pure value-object math, no guid in reach
 
         float total = valid.Sum(kv => kv.Value);
         float roll = (float)(Rng.NextDouble() * total);
@@ -30,7 +30,7 @@ public static class WeightedRoller
         {
             cumulative += kvp.Value;
             if (roll <= cumulative)
-                return (kvp.Key, roll / total);
+                return (kvp.Key, roll / total);   // cb:fold pure value-object math, no guid in reach
         }
 
         return (valid.Last().Key, 1.0f);
@@ -93,7 +93,7 @@ public static class WeightedRoller
         float dx = fromX - targetX;
         float dy = fromY - targetY;
         float len = MathF.Sqrt(dx * dx + dy * dy);
-        if (len < 0.5f) return Jitter(targetX, targetY);
+        if (len < 0.5f) return Jitter(targetX, targetY);   // cb:fold pure value-object math, no guid in reach
 
         float baseAngle = MathF.Atan2(dy, dx);
         float spread = Range(-0.52f, 0.52f); // ±30° in radians

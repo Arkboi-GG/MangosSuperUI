@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.Services;
 
@@ -147,12 +148,13 @@ public class RaidPlanService
         foreach (var file in Directory.EnumerateFiles(_dir, "*.json"))
         {
             if (string.Equals(Path.GetFileName(file), "assignments.json", StringComparison.OrdinalIgnoreCase))
-                continue;
+                continue;   // cb:fold plan-file enumeration detail, no per-bot routing
             try
             {
                 var plan = JsonSerializer.Deserialize<RaidPlanDocument>(File.ReadAllText(file), JsonOpts);
                 if (plan == null || string.IsNullOrWhiteSpace(plan.Name) || plan.SchemaVersion != 1)
                 {
+                    CircuitTrace.Hit(0, "raidplan: plan file invalid, ignored");
                     _logger.LogWarning("[RAID-PLAN] plan file '{File}' is empty/nameless/wrong-schema — ignored", file);
                     continue;
                 }
@@ -160,6 +162,7 @@ public class RaidPlanService
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(0, "raidplan: plan file parse failed, ignored");
                 _logger.LogWarning("[RAID-PLAN] plan file '{File}' failed to parse: {Err}", file, ex.Message);
             }
         }
@@ -189,13 +192,17 @@ public class RaidPlanService
     {
         var plan = FindPlan(planName);
         if (plan == null)
+        {
+            CircuitTrace.Hit(0, "raidplan: assign failed, plan not found");
             return $"plan '{planName}' not found (have: {string.Join(", ", LoadPlans().Select(p => p.Name))})";
+        }
 
         List<(int guid, string name)> targets = botName == "*"
             ? _bridge.Connections.Select(kvp => (kvp.Key, kvp.Value.State.Name)).ToList()
             : new List<(int, string)>();
         if (botName != "*")
         {
+            CircuitTrace.Hit(0, "raidplan: assigning plan to single bot");
             lock (_gate)
             {
                 LoadAssignments();
@@ -204,7 +211,10 @@ public class RaidPlanService
             }
             var online = FindOnlineBot(botName);
             if (online == null)
+            {
+                CircuitTrace.Hit(0, "raidplan: assignment persisted, bot offline");
                 return $"assigned '{plan.Name}' to {botName} (offline — pushes on next login)";
+            }
             await PushAsync(online.Value.guid, online.Value.name, plan);
             return $"assigned '{plan.Name}' to {botName} and pushed";
         }
@@ -228,7 +238,7 @@ public class RaidPlanService
         {
             LoadAssignments();
             had = _assignments.Remove(botName.Trim());
-            if (had) SaveAssignments();
+            if (had) { CircuitTrace.Hit(0, "raidplan: assignment cleared and saved"); SaveAssignments(); }
         }
         // No live "unload" wire yet: the plan stands on the bot until replaced or
         // relog. Honest status over a pretend-clear.
@@ -247,10 +257,11 @@ public class RaidPlanService
             LoadAssignments();
             _assignments.TryGetValue(name.Trim(), out planName);
         }
-        if (planName == null) return;
+        if (planName == null) { CircuitTrace.Hit(guid, "raidplan: no plan assigned on hello"); return; }
         var plan = FindPlan(planName);
         if (plan == null)
         {
+            CircuitTrace.Hit(guid, "raidplan: assigned plan file missing, nothing pushed");
             _logger.LogWarning("[RAID-PLAN] {Bot} is assigned '{Plan}' but no such plan file exists — nothing pushed", name, planName);
             return;
         }
@@ -273,9 +284,9 @@ public class RaidPlanService
         var mainTank = bodies.FirstOrDefault(b => b.Job == RaidJob.Tank);
         string Bucket(RaidPlanBody b) => ReferenceEquals(b, mainTank) ? "mt" : b.Job switch
         {
-            RaidJob.Tank or RaidJob.Melee => "melee",
-            RaidJob.Healer => "healer",
-            _ => "ranged",
+            RaidJob.Tank or RaidJob.Melee => CircuitTrace.Pass("melee", 0, "raidplan: formation bucket melee"),
+            RaidJob.Healer => CircuitTrace.Pass("healer", 0, "raidplan: formation bucket healer"),
+            _ => CircuitTrace.Pass("ranged", 0, "raidplan: formation bucket ranged"),
         };
         var meta = new Dictionary<string, FormationMeta>(StringComparer.Ordinal);
         foreach (var bucket in bodies.GroupBy(Bucket))
@@ -283,9 +294,9 @@ public class RaidPlanService
             int unsided = 0;
             var flanked = bucket.Select(b => (Body: b, Sign: b.Side switch
             {
-                RaidSide.Left => 1,
-                RaidSide.Right => -1,
-                _ => unsided++ % 2 == 0 ? 1 : -1,
+                RaidSide.Left => CircuitTrace.Pass(1, 0, "raidplan: flank kept left"),
+                RaidSide.Right => CircuitTrace.Pass(-1, 0, "raidplan: flank kept right"),
+                _ => CircuitTrace.Pass(unsided++ % 2 == 0 ? 1 : -1, 0, "raidplan: unsided body alternated"),
             })).ToList();
             foreach (var flank in flanked.GroupBy(entry => entry.Sign))
             {
@@ -318,6 +329,7 @@ public class RaidPlanService
         IEnumerable<string> bakedAssignments = Enumerable.Empty<string>();
         if (body != null && d.Assignments is { Count: > 0 })
         {
+            CircuitTrace.Hit(guid, "raidplan: baking bucket assignments for body");
             int ordinal = 1 + plan.Bodies.Count(other => other.Job == body.Job &&
                 string.CompareOrdinal(other.Key, body.Key) < 0);
             bakedAssignments = d.Assignments
@@ -376,7 +388,10 @@ public class RaidPlanService
     {
         foreach (var kvp in _bridge.Connections)
             if (string.Equals(kvp.Value.State.Name, botName, StringComparison.OrdinalIgnoreCase))
+            {
+                CircuitTrace.Hit(kvp.Key, "raidplan: online bot matched by name");
                 return (kvp.Key, kvp.Value.State.Name);
+            }
         return null;
     }
 
@@ -394,6 +409,7 @@ public class RaidPlanService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "raidplan: assignments file parse failed, starting empty");
             _logger.LogWarning("[RAID-PLAN] assignments.json failed to parse ({Err}) — starting empty", ex.Message);
             _assignments = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }

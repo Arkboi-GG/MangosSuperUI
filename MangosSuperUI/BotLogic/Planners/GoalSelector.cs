@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 using Microsoft.Extensions.Logging;
 
 namespace MangosSuperUI.BotLogic.Planners;
@@ -70,8 +71,12 @@ public sealed class GoalSelector
             // itself lives on the bridge connection and lapses on its own clock — consuming here
             // only retires THIS run; a fresh "do your rounds" re-arms with a new timestamp.
             if (ctx.InPlayerParty && snap.HubErrandUntil is DateTime deadHu)
+            {
+                CircuitTrace.Hit(ctx.Guid, "goal: death consumed hub-errand token");
                 ctx.HubErrandDone = deadHu;
+            }
             ctx.GoalReason = "dead";
+            CircuitTrace.Hit(ctx.Guid, "goal: dead -> maintenance");
             return Goal.Maintenance;
         }
 
@@ -84,6 +89,7 @@ public sealed class GoalSelector
         if (ctx.Goal == Goal.Maintenance && ctx.Maintenance is { RezSent: true, HealDone: false })
         {
             ctx.GoalReason = "healing";
+            CircuitTrace.Hit(ctx.Guid, "goal: post-rez heal hold");
             return Goal.Maintenance;
         }
 
@@ -96,6 +102,7 @@ public sealed class GoalSelector
         if (ctx.Teleport != null)
         {
             ctx.GoalReason = $"teleport:{ctx.Teleport.Phase}";
+            CircuitTrace.HitNote(ctx.Guid, "goal: teleport round-trip hold", ctx.GoalReason);
             return ctx.Goal;
         }
 
@@ -129,10 +136,12 @@ public sealed class GoalSelector
                 && ctx.HubErrandDone != hubUntil)
             {
                 ctx.GoalReason = "hub-errand";
+                CircuitTrace.Hit(ctx.Guid, "goal: hub-errand run under player party");
                 return Goal.Vendoring;
             }
 
             ctx.GoalReason = "player-party";
+            CircuitTrace.Hit(ctx.Guid, "goal: player-party escort hold -> idle");
             return Goal.Idle;
         }
 
@@ -143,6 +152,7 @@ public sealed class GoalSelector
         if (ctx.Goal == Goal.Maintenance && ctx.Service is { Phase: not VendorPhase.None })
         {
             ctx.GoalReason = "vendor";
+            CircuitTrace.Hit(ctx.Guid, "goal: vendor errand hold");
             return Goal.Maintenance;
         }
 
@@ -153,6 +163,7 @@ public sealed class GoalSelector
         if (ctx.Goal == Goal.Training && ctx.Train != null)
         {
             ctx.GoalReason = "training";
+            CircuitTrace.Hit(ctx.Guid, "goal: training errand hold");
             return Goal.Training;
         }
 
@@ -177,6 +188,7 @@ public sealed class GoalSelector
             && (ctx.Durability < DurabilityVendorThreshold || ctx.FreeSlots <= 0))
         {
             ctx.GoalReason = ctx.Durability < DurabilityVendorThreshold ? "repair" : "bags-full";
+            CircuitTrace.HitNote(ctx.Guid, "goal: self-maintenance trigger", ctx.GoalReason);
             return Goal.Maintenance;
         }
 
@@ -201,6 +213,7 @@ public sealed class GoalSelector
         if (ctx.GroupOrder.IsActive && !groupTrainWindow)
         {
             ctx.GoalReason = $"group:{ctx.GroupOrder.Phase}";
+            CircuitTrace.HitNote(ctx.Guid, "goal: group directive -> team questing", ctx.GoalReason);
             return Goal.Questing;
         }
 
@@ -216,6 +229,7 @@ public sealed class GoalSelector
             && ctx.Copper >= TrainGoldFloor)
         {
             ctx.GoalReason = "train";
+            CircuitTrace.Hit(ctx.Guid, "goal: training trigger (unlearned spells)");
             return Goal.Training;
         }
 
@@ -226,6 +240,7 @@ public sealed class GoalSelector
         if (ctx.Identity?.WedgeBackoffUntil is DateTime wb && DateTime.UtcNow < wb)
         {
             ctx.GoalReason = $"wedge-backoff {(int)Math.Ceiling((wb - DateTime.UtcNow).TotalSeconds)}s";
+            CircuitTrace.HitNote(ctx.Guid, "goal: wedge backoff park", ctx.GoalReason);
             return Goal.Idle;
         }
 
@@ -242,12 +257,14 @@ public sealed class GoalSelector
             // no valid targets, e.g. a city: 216 bots were idling at 100% HP) AND questing is viable
             // again (a deferral has expired into a pickable, in-reach quest), release the lock and quest
             // instead of idling out the clock. A productive lock keeps LastKillUtc fresh → never released.
+            CircuitTrace.Hit(ctx.Guid, "goal: grind-lock window active");
             var glId = ctx.Identity;
             bool released = false;
             if (glId != null && _quests.IsLoaded
                 && !(glId.GrindLockReleaseCooldownUntil is DateTime glrc && DateTime.UtcNow < glrc)
                 && (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds > UnproductiveGrindLockSec)
             {
+                CircuitTrace.Hit(ctx.Guid, "goal: unproductive grind-lock, release check", (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds);
                 glId.PruneExpiredDeferrals();
                 var glPick = _quests.GetAvailableQuests(
                         QuestGraphLoader.RaceToBitmask(glId.Race),
@@ -258,6 +275,7 @@ public sealed class GoalSelector
                 if (glTier >= 0 && glPick.Any(q => QuestPlanner.InReach(q, ctx.Pos.X, ctx.Pos.Y, ctx.MapId,
                         ZoneSafetyMap.GetMaxTravelDistance(glId.Level, ctx.ZoneId, glTier))))
                 {
+                    CircuitTrace.Hit(ctx.Guid, "goal: grind-lock released early (quest workable)", glTier);
                     glId.GrindLockUntil = null;
                     glId.GrindLockReleaseCooldownUntil = DateTime.UtcNow.AddSeconds(GrindLockReleaseRetrySec);
                     _log.LogInformation("[GOAL] {Name} grind-lock released early — unproductive ({S:F0}s no kill) and a quest is workable again (reach t{T})",
@@ -268,6 +286,7 @@ public sealed class GoalSelector
             if (!released)
             {
                 ctx.GoalReason = $"grind-lock {(int)Math.Ceiling((gl - DateTime.UtcNow).TotalMinutes)}m";
+                CircuitTrace.HitNote(ctx.Guid, "goal: grind-lock holds -> grinding", ctx.GoalReason);
                 return Goal.Grinding;
             }
             // released → fall through to normal quest/grind selection below
@@ -277,12 +296,13 @@ public sealed class GoalSelector
         if (ctx.Goal == Goal.Questing && ctx.Quest?.Node != null)
         {
             ctx.GoalReason = "in-quest";
+            CircuitTrace.Hit(ctx.Guid, "goal: stay the course on live quest");
             return Goal.Questing;
         }
 
         var id = ctx.Identity;
-        if (id == null) { ctx.GoalReason = "no-identity"; return Goal.Grinding; }
-        if (!_quests.IsLoaded) { ctx.GoalReason = "graph-loading"; return Goal.Grinding; }
+        if (id == null) { ctx.GoalReason = "no-identity"; CircuitTrace.Hit(ctx.Guid, "goal: no identity -> grind"); return Goal.Grinding; }
+        if (!_quests.IsLoaded) { ctx.GoalReason = "graph-loading"; CircuitTrace.Hit(ctx.Guid, "goal: quest graph not loaded -> grind"); return Goal.Grinding; }
 
         id.PruneExpiredDeferrals();
 
@@ -305,6 +325,7 @@ public sealed class GoalSelector
 
         ctx.GoalReason = tier > 0 ? $"q av={avail.Count} pick={pick} reach=t{tier}"
                                   : $"q av={avail.Count} pick={pick}";
+        CircuitTrace.HitNote(ctx.Guid, "goal: quest/grind arbitration", ctx.GoalReason);
         return pick > 0 ? Goal.Questing : Goal.Grinding;
     }
 }

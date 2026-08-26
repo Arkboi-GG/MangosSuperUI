@@ -8,6 +8,7 @@ using MangosSuperUI.Hubs;
 using MangosSuperUI.BotLogic.Chat.Core;
 using MangosSuperUI.BotLogic.Chat.Capacity;
 using MangosSuperUI.BotLogic.Chat.Engine;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Voice;
 
@@ -78,7 +79,7 @@ public class VoiceLibraryBuilder
     /// <summary>Kick a build. Returns false if one is already running.</summary>
     public bool TryStart()
     {
-        if (Interlocked.CompareExchange(ref _running, 1, 0) != 0) return false;
+        if (Interlocked.CompareExchange(ref _running, 1, 0) != 0) { CircuitTrace.Hit(0, "chat: voice build already running, start refused"); return false; }
         _ = Task.Run(RunAsync);
         return true;
     }
@@ -117,7 +118,7 @@ public class VoiceLibraryBuilder
             // Era pack source in the generation context when one is active (§13.4(1)).
             string eraContext = await conn.QuerySingleOrDefaultAsync<string?>(
                 "SELECT source_md FROM chat_era_pack WHERE active=1 LIMIT 1") ?? "";
-            if (eraContext.Length > 3000) eraContext = eraContext[..3000];
+            if (eraContext.Length > 3000) { CircuitTrace.Hit(0, "chat: era context truncated for build"); eraContext = eraContext[..3000]; }
 
             _logger.LogInformation("[CHAT-CAP] voice library build started: {Existing} existing, target {Target}",
                 accepted, target);
@@ -146,6 +147,7 @@ public class VoiceLibraryBuilder
                         TimeSpan.FromSeconds(30), CancellationToken.None);
                     if (lease == null)
                     {
+                        CircuitTrace.Hit(0, "chat: voice build starved of batch lease, pausing");
                         _logger.LogWarning("[CHAT-CAP] voice build: no Batch lease — pausing 15 s");
                         await Task.Delay(TimeSpan.FromSeconds(15));
                         continue;
@@ -156,10 +158,10 @@ public class VoiceLibraryBuilder
                         new GenOptions(0.95f, 0.92f, 400, RepeatPenalty: 1.05f, RepeatLastN: 256,
                                        PresencePenalty: 0.3f, Seed: rng.Next()),
                         CancellationToken.None);
-                    if (raw == null) { rejectedParse++; continue; }
+                    if (raw == null) { CircuitTrace.Hit(0, "chat: voice build raw generation failed"); rejectedParse++; continue; }
 
                     var parsed = ParseProse(raw);
-                    if (parsed == null) { rejectedParse++; continue; }
+                    if (parsed == null) { CircuitTrace.Hit(0, "chat: voice build prose unparseable"); rejectedParse++; continue; }
 
                     var candidate = Materialize(skel, parsed);
 
@@ -167,6 +169,7 @@ public class VoiceLibraryBuilder
                     var bad = ShapeViolation(candidate);
                     if (bad != null)
                     {
+                        CircuitTrace.HitNote(0, "chat: voice build card rejected on shape", bad);
                         rejectedShape++;
                         shapeReasons[bad] = shapeReasons.GetValueOrDefault(bad) + 1;
                         continue;   // regenerate prose, skeleton kept
@@ -176,6 +179,7 @@ public class VoiceLibraryBuilder
                     var tris = Trigrams(candidate.ExampleLines);
                     if (acceptedTrigrams.Any(a => a.Intersect(tris).Count() > 2))
                     {
+                        CircuitTrace.Hit(0, "chat: voice build card rejected on trigram dedup");
                         rejectedDedup++;
                         continue;
                     }
@@ -184,7 +188,7 @@ public class VoiceLibraryBuilder
                     acceptedTrigrams.Add(tris);
                 }
 
-                if (card == null) continue;   // skeleton exhausted its prose tries — resample
+                if (card == null) { CircuitTrace.Hit(0, "chat: voice build skeleton exhausted prose tries"); continue; }   // skeleton exhausted its prose tries — resample
 
                 // ── 4. Store ──
                 await conn.ExecuteAsync(
@@ -197,6 +201,7 @@ public class VoiceLibraryBuilder
 
                 if (accepted % 10 == 0)
                 {
+                    CircuitTrace.Hit(0, "chat: voice build progress checkpoint", accepted);
                     _logger.LogInformation("[CHAT-CAP] voice build: {Accepted}/{Target} (rejects — dedup {Dedup}, parse {Parse}, shape {Shape})",
                         accepted, target, rejectedDedup, rejectedParse, rejectedShape);
                     await Publish(accepted, target, rejectedDedup, rejectedParse, rejectedShape, started, null, null, running: true);
@@ -207,13 +212,14 @@ public class VoiceLibraryBuilder
             _logger.LogInformation("[CHAT-CAP] voice library build {Note}: {Accepted}/{Target}, rejects — dedup {Dedup}, parse {Parse}, shape {Shape}",
                 note, accepted, target, rejectedDedup, rejectedParse, rejectedShape);
             if (shapeReasons.Count > 0)
-                _logger.LogInformation("[CHAT-CAP] shape rejects by reason: {Reasons}",
+                _logger.LogInformation("[CHAT-CAP] shape rejects by reason: {Reasons}",   // cb:fold logging only, rejects carried by shape reject probes
                     string.Join(", ", shapeReasons.OrderByDescending(k => k.Value).Select(k => $"{k.Key}={k.Value}")));
 
             await Publish(accepted, target, rejectedDedup, rejectedParse, rejectedShape, started, DateTime.UtcNow, null, running: false);
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "chat: voice library build failed");
             _logger.LogError(ex, "[CHAT-CAP] voice library build failed");
             await Publish(accepted, target, rejectedDedup, rejectedParse, rejectedShape, started, DateTime.UtcNow, ex.Message, running: false);
         }
@@ -240,7 +246,7 @@ public class VoiceLibraryBuilder
     /// <summary>How many of the five lines may contain profanity at all, by swear level.
     /// Two is the ceiling even for a sailor: these are FEW-SHOT ANCHORS, and if most of
     /// them swear, every reply the bot ever writes will swear.</summary>
-    private static int MaxSwearLines(int level) => level switch { 0 => 0, 1 => 1, _ => 2 };
+    private static int MaxSwearLines(int level) => level switch { 0 => 0, 1 => 1, _ => 2 };   // cb:fold pure level table, verdict carried by shape reject probe
 
     /// <summary>Null = the card is fine; otherwise the reason, for the reject log.</summary>
     public static string? ShapeViolation(PersonaCard c)
@@ -249,28 +255,28 @@ public class VoiceLibraryBuilder
         int level = c.Typing.SwearLevel;
 
         int swearLines = lines.Count(SwearTables.ContainsSwear);
-        if (swearLines > MaxSwearLines(level)) return "swear-density";
+        if (swearLines > MaxSwearLines(level)) return "swear-density";   // cb:fold shape reason carried by build reject probe
 
         // Profanity is texture, not the subject of the sentence. At most one of five may
         // lead with it, and only for a persona who actually swears that much.
         int swearOpeners = lines.Count(l => SwearOpener.IsMatch(l));
-        if (swearOpeners > (level >= 2 ? 1 : 0)) return "swear-opener";
+        if (swearOpeners > (level >= 2 ? 1 : 0)) return "swear-opener";   // cb:fold shape reason carried by build reject probe
 
         // "hey guys" x5 is exactly how the fallback card collapsed the fleet.
         int greetings = lines.Count(l => GreetingOpener.IsMatch(l));
-        if (greetings > 1) return "greeting-opener";
+        if (greetings > 1) return "greeting-opener";   // cb:fold shape reason carried by build reject probe
 
         // A swearing persona whose anchors say "darn" teaches the bot to say "darn".
-        if (level >= 1 && lines.Any(l => Bowdlerism.IsMatch(l))) return "bowdlerized";
+        if (level >= 1 && lines.Any(l => Bowdlerism.IsMatch(l))) return "bowdlerized";   // cb:fold shape reason carried by build reject probe
 
         // The model likes writing the persona's own name into their chat lines
         // ("hey kaito here again") — nobody types their own name at people.
         if (!string.IsNullOrEmpty(c.GivenName) &&
             lines.Any(l => l.Contains(c.GivenName, StringComparison.OrdinalIgnoreCase)))
-            return "self-name";
+            return "self-name";   // cb:fold shape reason carried by build reject probe
 
         // Anchors must be chat, not prose. Five long lines produce a bot that writes essays.
-        if (lines.Count(l => l.Length > 90) > 1) return "too-long";
+        if (lines.Count(l => l.Length > 90) > 1) return "too-long";   // cb:fold shape reason carried by build reject probe
 
         return null;
     }
@@ -280,14 +286,14 @@ public class VoiceLibraryBuilder
     /// <summary>Plain-English register brief for the prose model (§6.2 v2 swear_level).</summary>
     private static string SwearBrief(int level) => level switch
     {
-        0 => "never swears. Not once. This person says \"darn\" and means it — the one clean mouth in the zone. " +
+        0 => "never swears. Not once. This person says \"darn\" and means it — the one clean mouth in the zone. " +   // cb:fold prompt content table, no guid in reach
              "NONE of the five lines may contain profanity",
-        1 => "swears mildly, and only when something goes wrong: damn, crap, hell. AT MOST ONE of the five " +
+        1 => "swears mildly, and only when something goes wrong: damn, crap, hell. AT MOST ONE of the five " +   // cb:fold prompt content table, no guid in reach
              "lines contains any profanity, and it falls mid-sentence, never at the start",
-        2 => "swears casually the way most people did in 2005: damn, shit, ass, bastard; will call a bad " +
+        2 => "swears casually the way most people did in 2005: damn, shit, ass, bastard; will call a bad " +   // cb:fold prompt content table, no guid in reach
              "player a shitter or a scrub. AT MOST TWO of the five lines contain profanity, woven " +
              "mid-sentence where the emphasis falls",
-        _ => "swears a lot — profanity is punctuation to this person. Even so, AT MOST TWO of the five lines " +
+        _ => "swears a lot — profanity is punctuation to this person. Even so, AT MOST TWO of the five lines " +   // cb:fold prompt content table, no guid in reach
              "contain profanity, woven mid-sentence rather than parked at the front",
     };
 
@@ -355,18 +361,18 @@ public class VoiceLibraryBuilder
         var text = raw.Trim();
         int start = text.IndexOf('{');
         int end = text.LastIndexOf('}');
-        if (start < 0 || end <= start) return null;
+        if (start < 0 || end <= start) return null;   // cb:fold parse detail carried by build parse-reject probe
         try
         {
             var r = JsonSerializer.Deserialize<ProseResult>(text[start..(end + 1)]);
-            if (r == null) return null;
-            if (string.IsNullOrWhiteSpace(r.Occupation)) return null;
-            if (r.ExampleLines.Count != 5 || r.ExampleLines.Any(string.IsNullOrWhiteSpace)) return null;
-            if (r.ExampleLines.Any(l => l.Length > 120)) return null;
-            if (r.Opinions.Count < 1) return null;
+            if (r == null) return null;   // cb:fold parse detail carried by build parse-reject probe
+            if (string.IsNullOrWhiteSpace(r.Occupation)) return null;   // cb:fold parse detail carried by build parse-reject probe
+            if (r.ExampleLines.Count != 5 || r.ExampleLines.Any(string.IsNullOrWhiteSpace)) return null;   // cb:fold parse detail carried by build parse-reject probe
+            if (r.ExampleLines.Any(l => l.Length > 120)) return null;   // cb:fold parse detail carried by build parse-reject probe
+            if (r.Opinions.Count < 1) return null;   // cb:fold parse detail carried by build parse-reject probe
             return r;
         }
-        catch { return null; }
+        catch { return null; }   // cb:fold parse detail carried by build parse-reject probe
     }
 
     /// <summary>
@@ -426,6 +432,6 @@ public class VoiceLibraryBuilder
             await _hub.Clients.All.SendAsync("VoiceLibraryProgress",
                 new { running, accepted, target, rejectedDedup = dedup, rejectedParse = parse, rejectedShape = shape, error });
         }
-        catch { /* dashboard push is best-effort */ }
+        catch { CircuitTrace.Hit(0, "chat: voice build progress push failed"); /* dashboard push is best-effort */ }
     }
 }

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Planners;
 
@@ -130,6 +131,7 @@ public sealed class HubErrandPlanner : IBotPlanner
         // Nothing to send: the goal flip's SET_TASK IDLE puts C++ back into follow.
         if (snap.HubErrandUntil is not DateTime stamp || DateTime.UtcNow >= stamp)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: run token gone/expired, drop scratch");
             _scratch.TryRemove(ctx.Guid, out _);
             ctx.Failure = null;
             return StepResult.Complete();
@@ -137,24 +139,31 @@ public sealed class HubErrandPlanner : IBotPlanner
 
         _scratch.TryGetValue(ctx.Guid, out var s);
         if (s != null && s.Stamp != stamp)
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: new run token mid-flight, replan fresh");
             s = null;   // a NEW "do your rounds" mid-flight — the old round is dead, plan fresh
+        }
 
         // ── Fresh entry ─────────────────────────────────────────────────────
         if (s == null)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: fresh entry, planning round");
             // Unwind any dangling teleport-assist BEFORE planning — an interrupted previous
             // run (re-command mid-hop) can leave the bot hopped into a nav pocket; never
             // anchor a new round inside one. The GoalSelector's teleport hold guarantees we
             // are still on this goal to run the unwind.
             if (ctx.Failure is { CommandType: "TELEPORT_TO" })
             {
+                CircuitTrace.Hit(ctx.Guid, "errand: stale teleport failure cleared before planning");
                 ctx.Failure = null;
                 ctx.Teleport = null;   // the hop itself failed — we never left the mesh
             }
             if (ctx.Teleport is { } danglingTp)
             {
+                CircuitTrace.Hit(ctx.Guid, "errand: dangling teleport-assist found on entry");
                 if (danglingTp.Phase == TpPhase.Outbound || danglingTp.Phase == TpPhase.AtTarget)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "errand: unwinding dangling hop-in before planning");
                     danglingTp.Phase = TpPhase.AtTarget;
                     _log.LogInformation("[HUB] {Name} fresh run found a dangling hop-in — returning to anchor before planning", ctx.Name);
                     return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
@@ -167,7 +176,10 @@ public sealed class HubErrandPlanner : IBotPlanner
             _scratch[ctx.Guid] = s;
 
             if (s.Work.Count == 0)
+            {
+                CircuitTrace.Hit(ctx.Guid, "errand: nothing in reach, finish immediately");
                 return Finish(ctx, s, "Nothing in reach here — sticking with you.");
+            }
 
             int ti = s.Work.Count(t => t.Kind == HubKind.TurnIn);
             int ac = s.Work.Count(t => t.Kind == HubKind.Accept);
@@ -177,17 +189,19 @@ public sealed class HubErrandPlanner : IBotPlanner
                 ctx.Name, ti, ac, vend, trn, s.AnchorX, s.AnchorY, s.AnchorMap, stamp);
 
             ctx.SetStep("hub_start");
+            CircuitTrace.Hit(ctx.Guid, "errand: round planned, announcing", s.Work.Count);
             var bits = new List<string>();
-            if (ti > 0) bits.Add($"{ti} hand-in{(ti == 1 ? "" : "s")}");
-            if (ac > 0) bits.Add($"{ac} pickup{(ac == 1 ? "" : "s")}");
-            if (vend) bits.Add("vendor");
-            if (trn) bits.Add("trainer");
+            if (ti > 0) bits.Add($"{ti} hand-in{(ti == 1 ? "" : "s")}");   // cb:fold narration wording only
+            if (ac > 0) bits.Add($"{ac} pickup{(ac == 1 ? "" : "s")}");   // cb:fold narration wording only
+            if (vend) bits.Add("vendor");   // cb:fold narration wording only
+            if (trn) bits.Add("trainer");   // cb:fold narration wording only
             return Say(ctx, $"On it — doing my rounds: {string.Join(", ", bits)}.");
         }
 
         // ── Consume a failure FIRST (TrainingPlanner order) ─────────────────
         if (ctx.Failure != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "errand: consuming failure", ctx.Failure.Reason);
             var f = ctx.Failure;
             ctx.Failure = null;
             return OnFailure(ctx, s, f);
@@ -196,10 +210,12 @@ public sealed class HubErrandPlanner : IBotPlanner
         // ── Advance a committed teleport-assist round trip ──────────────────
         if (ctx.Teleport is { Phase: TpPhase.Outbound })
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: hop-in landed at target");
             // Hopped in — the executor set ctx.Pos from the ack, so we're AT the target.
             ctx.Teleport.Phase = TpPhase.AtTarget;
             if (s.Cur is { } hopped)
             {
+                CircuitTrace.Hit(ctx.Guid, "errand: teleported in, doing business", hopped.NpcEntry);
                 _log.LogInformation("[HUB] {Name} teleported in → {Kind} entry={Entry}", ctx.Name, hopped.Kind, hopped.NpcEntry);
                 return Business(ctx, s, hopped);
             }
@@ -209,12 +225,16 @@ public sealed class HubErrandPlanner : IBotPlanner
         }
         if (ctx.Teleport is { Phase: TpPhase.Inbound })
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: hop home landed, advancing");
             // Back at the pre-hop anchor. The business outcome was already tallied/noted at
             // the target; the hop home is pure unwinding — advance (or finish an abort).
             ctx.Teleport = null;
             s.Cur = null;
             if (s.Aborting)
+            {
+                CircuitTrace.Hit(ctx.Guid, "errand: abort unwind complete, finishing");
                 return Finish(ctx, s, "Coming!");
+            }
             return DriveNext(ctx, s);
         }
 
@@ -223,7 +243,10 @@ public sealed class HubErrandPlanner : IBotPlanner
         // GoalSelector's teleport hold keeps us on this goal until it does). -1 = no reading
         // yet — never abort on unknown.
         if (snap.PartyBossDist == BossOffMapSentinel || snap.PartyBossDist > BossAbortYards)
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: boss guard tripped, aborting", snap.PartyBossDist);
             return Abort(ctx, s, $"boss at {snap.PartyBossDist}yd");
+        }
 
         // ── Apply the leg whose WAIT just cleared ───────────────────────────
         switch (ctx.Step)
@@ -231,18 +254,21 @@ public sealed class HubErrandPlanner : IBotPlanner
             case "hub_route":
                 {
                     // TASK_COMPLETE landed (the bridge refreshed ctx.Pos from its x|y|z).
-                    if (s.Cur is not { } c) return DriveNext(ctx, s);
-                    if (AtNpc(ctx, c)) return Business(ctx, s, c);
+                    CircuitTrace.Hit(ctx.Guid, "errand: route leg completed");
+                    if (s.Cur is not { } c) { CircuitTrace.Hit(ctx.Guid, "errand: leg landed with no target, drive next"); return DriveNext(ctx, s); }
+                    if (AtNpc(ctx, c)) { CircuitTrace.Hit(ctx.Guid, "errand: arrived at npc, doing business"); return Business(ctx, s, c); }
                     return DriveNext(ctx, s);   // short of the gate — another leg (capped)
                 }
 
             case "hub_interact":
                 {
                     // QUEST_ACCEPT_ACK / QUEST_COMPLETE_ACK cleared the WAIT.
+                    CircuitTrace.Hit(ctx.Guid, "errand: quest interact acked");
                     if (s.Cur is { } c)
                     {
-                        if (c.Kind == HubKind.TurnIn) s.TurnIns++;
-                        else s.Accepts++;
+                        CircuitTrace.Hit(ctx.Guid, "errand: tallying interact outcome", c.QuestId);
+                        if (c.Kind == HubKind.TurnIn) { CircuitTrace.Hit(ctx.Guid, "errand: turn-in ok", c.QuestId); s.TurnIns++; }
+                        else { CircuitTrace.Hit(ctx.Guid, "errand: accept ok", c.QuestId); s.Accepts++; }
                         _log.LogInformation("[HUB] {Name} {Kind} ok quest={Q} entry={E} (ti={Ti} ac={Ac})",
                             ctx.Name, c.Kind, c.QuestId, c.NpcEntry, s.TurnIns, s.Accepts);
                     }
@@ -253,9 +279,11 @@ public sealed class HubErrandPlanner : IBotPlanner
                 {
                     // SELL_ACK landed. Gear may be wrecked even when nothing sold — repair when
                     // the NPC can, exactly the MaintenancePlanner shape.
+                    CircuitTrace.Hit(ctx.Guid, "errand: sell acked", ctx.FreeSlots);
                     s.Vendored = true;
                     if (s.Cur is { CanRepair: true } v)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "errand: vendor can repair, repairing", ctx.Durability);
                         ctx.SetStep("hub_repair");
                         _log.LogInformation("[HUB] {Name} sold (bag={Bag}) → REPAIR_AT_NPC entry={E}", ctx.Name, ctx.FreeSlots, v.NpcEntry);
                         return StepResult.Send(
@@ -267,6 +295,7 @@ public sealed class HubErrandPlanner : IBotPlanner
                 }
 
             case "hub_repair":
+                CircuitTrace.Hit(ctx.Guid, "errand: repair acked, vendor done", ctx.Durability);
                 _log.LogInformation("[HUB] {Name} repaired (dur={Dur} cu={Cu}) — vendor done", ctx.Name, ctx.Durability, ctx.Copper);
                 return TargetDone(ctx, s);
 
@@ -274,8 +303,9 @@ public sealed class HubErrandPlanner : IBotPlanner
                 {
                     // TRAIN_ACK — C++ bought whatever the bot could afford. Clear the solo
                     // trigger's flag exactly as TrainingPlanner does; the next LEVEL_UP re-arms it.
+                    CircuitTrace.Hit(ctx.Guid, "errand: train acked, trainer done");
                     if (ctx.Identity is { } id)
-                    {
+                    {   // cb:fold flag clear, outcome carried by the ack probe
                         id.HasUnlearnedSpells = false;
                         id.TicksSinceLastTrained = 0;
                     }
@@ -297,8 +327,12 @@ public sealed class HubErrandPlanner : IBotPlanner
     {
         if (s.Cur == null)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: picking next target", s.Work.Count);
             if (s.Work.Count == 0)
+            {
+                CircuitTrace.Hit(ctx.Guid, "errand: queue empty, round complete");
                 return Finish(ctx, s, WrapLine(s));
+            }
             s.Cur = s.Work.Dequeue();
             _log.LogInformation("[HUB] {Name} next target: {Kind} quest={Q} entry={E} @ ({X:F0},{Y:F0}) d={D:F0}yd",
                 ctx.Name, s.Cur.Kind, s.Cur.QuestId, s.Cur.NpcEntry, s.Cur.Pos.X, s.Cur.Pos.Y,
@@ -307,12 +341,19 @@ public sealed class HubErrandPlanner : IBotPlanner
 
         var c = s.Cur;
         if (AtNpc(ctx, c))
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: already at npc, doing business");
             return Business(ctx, s, c);   // consecutive same-NPC targets skip the route for free
+        }
 
         if (++c.Legs > MaxLegsPerTarget)
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: legs exhausted, skipping target", c.Legs);
             return SkipCur(ctx, s, $"{c.Kind}:{c.NpcEntry} legs-exhausted");
+        }
 
         ctx.SetStep("hub_route");
+        CircuitTrace.Hit(ctx.Guid, "errand: routing leg to target", c.Legs);
         return StepResult.Send(
             new BridgeCommand("MOVE_TO", new { mapId = c.Pos.Map, x = c.Pos.X, y = c.Pos.Y, z = c.Pos.Z }),
             "TASK_COMPLETE", LegDeadline);
@@ -324,24 +365,28 @@ public sealed class HubErrandPlanner : IBotPlanner
         switch (c.Kind)
         {
             case HubKind.TurnIn:
+                CircuitTrace.Hit(ctx.Guid, "errand: turn-in interact issued", c.QuestId);
                 ctx.SetStep("hub_interact");
                 return StepResult.Send(
                     new BridgeCommand("QUEST_INTERACT", new { action = "complete", quest_id = c.QuestId, npc_entry = c.NpcEntry }),
                     "QUEST_COMPLETE_ACK", InteractDeadline);
 
             case HubKind.Accept:
+                CircuitTrace.Hit(ctx.Guid, "errand: accept interact issued", c.QuestId);
                 ctx.SetStep("hub_interact");
                 return StepResult.Send(
                     new BridgeCommand("QUEST_INTERACT", new { action = "accept", quest_id = c.QuestId, npc_entry = c.NpcEntry }),
                     "QUEST_ACCEPT_ACK", InteractDeadline);
 
             case HubKind.Vendor:
+                CircuitTrace.Hit(ctx.Guid, "errand: sell issued at vendor", c.NpcEntry);
                 ctx.SetStep("hub_sell");
                 return StepResult.Send(
                     new BridgeCommand("SELL_ITEMS", new { npc_entry = c.NpcEntry, keep_quality = 2 }),
                     "SELL_ACK", AckDeadline);
 
             default:   // HubKind.Train
+                CircuitTrace.Hit(ctx.Guid, "errand: train issued at trainer", c.NpcEntry);
                 ctx.SetStep("hub_train");
                 return StepResult.Send(
                     new BridgeCommand("TRAIN_AT_NPC", new { npc_entry = c.NpcEntry }),
@@ -354,7 +399,10 @@ public sealed class HubErrandPlanner : IBotPlanner
     private StepResult TargetDone(BotContext ctx, HubScratch s)
     {
         if (ctx.Teleport is { Phase: TpPhase.AtTarget })
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: target done inside hop, returning home first");
             return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
+        }
         s.Cur = null;
         return DriveNext(ctx, s);
     }
@@ -363,11 +411,13 @@ public sealed class HubErrandPlanner : IBotPlanner
     // committed, move on. Per-target failure never ends the round; only the guards do.
     private StepResult SkipCur(BotContext ctx, HubScratch s, string why)
     {
+        CircuitTrace.HitNote(ctx.Guid, "errand: skip target", why);
         s.Notes.Add(why);
         _log.LogWarning("[HUB] {Name} skip target: {Why} pos=({X:F0},{Y:F0})@{Map}",
             ctx.Name, why, ctx.Pos.X, ctx.Pos.Y, ctx.MapId);
         if (ctx.Teleport is { Phase: TpPhase.AtTarget } tp)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: skip inside hop, returning home first");
             tp.Failed = true;   // informational — the Inbound completion advances either way
             return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
         }
@@ -383,16 +433,21 @@ public sealed class HubErrandPlanner : IBotPlanner
         // The TELEPORT_TO hop ITSELF failed/deadlined.
         if (f.CommandType == "TELEPORT_TO" && ctx.Teleport is { } tpf)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: teleport hop itself failed");
             var phase = tpf.Phase;
             ctx.Teleport = null;
             if (phase == TpPhase.Inbound)
             {
+                CircuitTrace.Hit(ctx.Guid, "errand: return hop failed, carrying on from target");
                 // Business already ran at a safe town NPC — we just couldn't get home. The
                 // per-target ladder self-heals the next leg out; note it and carry on.
                 s.Notes.Add($"tp-return:{f.Reason}");
                 s.Cur = null;
                 if (s.Aborting)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "errand: abort finishing despite failed return");
                     return Finish(ctx, s, "Coming!");
+                }
                 return DriveNext(ctx, s);
             }
             return SkipCur(ctx, s, $"teleport:{f.Reason}");   // couldn't hop in
@@ -402,14 +457,17 @@ public sealed class HubErrandPlanner : IBotPlanner
         // first no_path retries (the leg may close it), the second, within reach, hops.
         if (ctx.Step == "hub_route" && s.Cur is { } c && TeleportAssist.IsApproachNoPath(f))
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: approach no_path near target", c.ApproachFails + 1);
             c.ApproachFails++;
             switch (TeleportAssist.Decide(c.ApproachFails, ctx.Pos, c.Pos, ctx.MapId))
             {
                 case TeleportAssist.TpDecision.Teleport:
+                    CircuitTrace.Hit(ctx.Guid, "errand: teleport-assist hop to target issued");
                     _log.LogInformation("[HUB] {Name} {Kind} entry={E} unreachable ({N}× no_path, {D:F0}yd) — TELEPORT_TO",
                         ctx.Name, c.Kind, c.NpcEntry, c.ApproachFails, Dist2(ctx.Pos.X, ctx.Pos.Y, c.Pos.X, c.Pos.Y));
                     return StepResult.Send(TeleportAssist.BeginOutbound(ctx, c.Pos), "TELEPORT_ACK", TeleportAssist.AckDeadline);
                 case TeleportAssist.TpDecision.Retry:
+                    CircuitTrace.Hit(ctx.Guid, "errand: retry route leg to target");
                     ctx.SetStep("hub_route");
                     return StepResult.Send(
                         new BridgeCommand("MOVE_TO", new { mapId = c.Pos.Map, x = c.Pos.X, y = c.Pos.Y, z = c.Pos.Z }),
@@ -421,19 +479,22 @@ public sealed class HubErrandPlanner : IBotPlanner
         switch (ctx.Step)
         {
             case "hub_route":
+                CircuitTrace.Hit(ctx.Guid, "errand: route leg failed, skip target");
                 return SkipCur(ctx, s, $"route:{f.Reason}");
 
             case "hub_interact":
                 // quest_log_full ends the ACCEPT phase for the whole round — every further
                 // accept would fail the same way. Turn-ins/vendor/trainer are unaffected.
+                CircuitTrace.Hit(ctx.Guid, "errand: quest interact failed");
                 if (f.Reason == "quest_log_full")
                 {
+                    CircuitTrace.Hit(ctx.Guid, "errand: quest log full, dropping remaining pickups");
                     int pruned = 0;
                     var kept = new Queue<HubTarget>();
                     while (s.Work.Count > 0)
                     {
                         var t = s.Work.Dequeue();
-                        if (t.Kind == HubKind.Accept) { pruned++; continue; }
+                        if (t.Kind == HubKind.Accept) { pruned++; continue; }   // cb:fold prune detail, count carried in the skip note
                         kept.Enqueue(t);
                     }
                     s.Work = kept;
@@ -444,11 +505,16 @@ public sealed class HubErrandPlanner : IBotPlanner
             case "hub_sell":
                 // A phantom vendor (runtime despawn) skips; a deadline proceeds best-effort
                 // to repair/done — the old economy-domain timeout behaviour, never a wedge.
+                CircuitTrace.Hit(ctx.Guid, "errand: sell failed");
                 if (f.Reason is "vendor_not_found" or "missing_npc_entry")
+                {
+                    CircuitTrace.Hit(ctx.Guid, "errand: phantom vendor, skip target");
                     return SkipCur(ctx, s, $"vendor-phantom:{f.Reason}");
+                }
                 s.Vendored = true;
                 if (s.Cur is { CanRepair: true } v2)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "errand: sell failed but npc repairs, repairing anyway");
                     ctx.SetStep("hub_repair");
                     return StepResult.Send(
                         new BridgeCommand("REPAIR_AT_NPC", new { npc_entry = v2.NpcEntry }),
@@ -459,11 +525,16 @@ public sealed class HubErrandPlanner : IBotPlanner
             case "hub_repair":
                 // not_enough_gold is the economic wall, not an error; npc_not_found is a
                 // phantom. Either way the sell leg already ran — finish the vendor stop.
+                CircuitTrace.Hit(ctx.Guid, "errand: repair failed, vendor stop done anyway");
                 if (f.Reason != "not_enough_gold")
+                {
+                    CircuitTrace.HitNote(ctx.Guid, "errand: repair failure noted", f.Reason);
                     s.Notes.Add($"repair:{f.Reason}");
+                }
                 return TargetDone(ctx, s);
 
             case "hub_train":
+                CircuitTrace.Hit(ctx.Guid, "errand: train failed, skip target");
                 return SkipCur(ctx, s, $"train:{f.Reason}");
         }
 
@@ -486,6 +557,7 @@ public sealed class HubErrandPlanner : IBotPlanner
         var id = ctx.Identity;
         if (id == null || !_quests.IsLoaded)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: planning without quest graph");
             s.Notes.Add(id == null ? "no-identity" : "graph-loading");
             // Vendor + trainer below still work without the quest graph.
         }
@@ -497,10 +569,14 @@ public sealed class HubErrandPlanner : IBotPlanner
             bool requireRepair = ctx.Durability < RepairRequiredBelowDurability;
             var v = _zoneData.GetNearestVendor(ctx.ZoneId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y, ctx.Level, requireRepair);
             if (v == null && requireRepair)
+            {
+                CircuitTrace.Hit(ctx.Guid, "errand: no repair vendor, sell-only fallback", ctx.Durability);
                 v = _zoneData.GetNearestVendor(ctx.ZoneId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y, ctx.Level, false);
+            }
             if (v != null && v.MapId == s.AnchorMap
                 && Dist2(s.AnchorX, s.AnchorY, v.X, v.Y) <= HubRadiusYards)
             {
+                CircuitTrace.Hit(ctx.Guid, "errand: vendor found in hub", v.NpcEntry);
                 vendor = new HubTarget
                 {
                     Kind = HubKind.Vendor,
@@ -510,13 +586,18 @@ public sealed class HubErrandPlanner : IBotPlanner
                 };
             }
             else
+            {
+                CircuitTrace.Hit(ctx.Guid, "errand: no vendor in hub");
                 s.Notes.Add("no-vendor-in-hub");
+            }
         }
 
         // (0) Bags tight → sell FIRST so turn-in rewards have room (a full-bag turn-in fails
         // CanRewardQuest → cannot_reward). A second vendor stop still runs at (3) — by then
         // the bot is usually standing next to it, so the extra stop is nearly free.
         if (vendor != null && ctx.FreeSlots <= BagsTightFreeSlots)
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: bags tight, leading vendor visit queued", ctx.FreeSlots);
             s.Work.Enqueue(new HubTarget
             {
                 Kind = HubKind.Vendor,
@@ -524,20 +605,22 @@ public sealed class HubErrandPlanner : IBotPlanner
                 Pos = vendor.Pos,
                 CanRepair = vendor.CanRepair
             });
+        }
 
         // (1) Turn-ins: server-COMPLETE (or objective-less) held quests whose ender is in the hub.
         if (id != null && _quests.IsLoaded)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: scanning quest log and hub givers");
             var turnIns = new List<HubTarget>();
             foreach (var kv in ctx.QuestLog)
             {
                 var node = _quests.GetQuest(kv.Key);
-                if (node == null) continue;
+                if (node == null) { CircuitTrace.Hit(ctx.Guid, "errand: held quest not in graph, skip", kv.Key); continue; }
                 bool actionable = kv.Value.Status == QuestStatusComplete || !node.HasObjectives;
-                if (!actionable) continue;
+                if (!actionable) { CircuitTrace.Hit(ctx.Guid, "errand: held quest not turn-in ready, skip", kv.Key); continue; }
                 var ender = node.TurnIn ?? node.Giver;
-                if (ender == null || ender.Map != s.AnchorMap) continue;
-                if (Dist2(s.AnchorX, s.AnchorY, ender.X, ender.Y) > HubRadiusYards) continue;
+                if (ender == null || ender.Map != s.AnchorMap) { CircuitTrace.Hit(ctx.Guid, "errand: quest ender missing or off-map, skip", kv.Key); continue; }
+                if (Dist2(s.AnchorX, s.AnchorY, ender.X, ender.Y) > HubRadiusYards) { CircuitTrace.Hit(ctx.Guid, "errand: quest ender outside hub radius, skip", kv.Key); continue; }
                 turnIns.Add(new HubTarget
                 {
                     Kind = HubKind.TurnIn,
@@ -561,10 +644,10 @@ public sealed class HubErrandPlanner : IBotPlanner
             var accepts = new List<HubTarget>();
             foreach (var q in _quests.GetAvailableQuests(raceBit, classBit, id.Level, id.CompletedQuestIds, active))
             {
-                if (!QuestPlanner.IsPickable(q, id)) continue;
+                if (!QuestPlanner.IsPickable(q, id)) { CircuitTrace.Hit(ctx.Guid, "errand: giver quest not pickable, skip", q.QuestId); continue; }
                 var g = q.Giver!;
-                if (g.Map != s.AnchorMap) continue;
-                if (Dist2(s.AnchorX, s.AnchorY, g.X, g.Y) > HubRadiusYards) continue;
+                if (g.Map != s.AnchorMap) { CircuitTrace.Hit(ctx.Guid, "errand: giver off-map, skip", q.QuestId); continue; }
+                if (Dist2(s.AnchorX, s.AnchorY, g.X, g.Y) > HubRadiusYards) { CircuitTrace.Hit(ctx.Guid, "errand: giver outside hub radius, skip", q.QuestId); continue; }
                 accepts.Add(new HubTarget
                 {
                     Kind = HubKind.Accept,
@@ -579,15 +662,20 @@ public sealed class HubErrandPlanner : IBotPlanner
 
         // (3) Vendor — always.
         if (vendor != null)
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: vendor stop queued", vendor.NpcEntry);
             s.Work.Enqueue(vendor);
+        }
 
         // (4) Trainer — always (see the header for why not HasUnlearnedSpells-gated).
         if (_trainers.IsLoaded && id != null)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: looking for trainer in hub");
             var tr = _trainers.GetNearestTrainer(id.ClassId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y);
             if (tr != null && tr.Map == s.AnchorMap
                 && Dist2(s.AnchorX, s.AnchorY, tr.X, tr.Y) <= HubRadiusYards)
             {
+                CircuitTrace.Hit(ctx.Guid, "errand: trainer stop queued", tr.NpcEntry);
                 s.Work.Enqueue(new HubTarget
                 {
                     Kind = HubKind.Train,
@@ -596,7 +684,10 @@ public sealed class HubErrandPlanner : IBotPlanner
                 });
             }
             else
+            {
+                CircuitTrace.Hit(ctx.Guid, "errand: no trainer in hub");
                 s.Notes.Add("no-trainer-in-hub");
+            }
         }
 
         return s;
@@ -614,6 +705,7 @@ public sealed class HubErrandPlanner : IBotPlanner
             ctx.Name, why, s.TurnIns, s.Accepts, s.Vendored, s.Trained);
         if (ctx.Teleport is { Phase: TpPhase.AtTarget } tp)
         {
+            CircuitTrace.Hit(ctx.Guid, "errand: abort with hop committed, returning home first");
             s.Aborting = true;
             tp.Failed = true;
             return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
@@ -637,10 +729,10 @@ public sealed class HubErrandPlanner : IBotPlanner
     private string WrapLine(HubScratch s)
     {
         var bits = new List<string>();
-        if (s.TurnIns > 0) bits.Add($"turned in {s.TurnIns}");
-        if (s.Accepts > 0) bits.Add($"picked up {s.Accepts}");
-        if (s.Vendored) bits.Add("vendored");
-        if (s.Trained) bits.Add("trained");
+        if (s.TurnIns > 0) bits.Add($"turned in {s.TurnIns}");   // cb:fold narration helper, no bot context
+        if (s.Accepts > 0) bits.Add($"picked up {s.Accepts}");   // cb:fold narration helper, no bot context
+        if (s.Vendored) bits.Add("vendored");   // cb:fold narration helper, no bot context
+        if (s.Trained) bits.Add("trained");   // cb:fold narration helper, no bot context
         string body = bits.Count > 0 ? string.Join(", ", bits) : "nothing needed doing";
         string skips = s.Notes.Count > 0 ? $" ({s.Notes.Count} skipped)" : "";
         return $"Rounds done — {body}{skips}.";
@@ -669,10 +761,13 @@ public sealed class HubErrandPlanner : IBotPlanner
     // straight back into this planner — the one loop this feature must never have).
     public bool IsProgressing(BotContext ctx, BotStateSnapshot snap)
     {
-        if (ctx.TimeInGoalSec < 30) return true;
-        if (ctx.TimeSinceProgressSec < 300) return true;
+        if (ctx.TimeInGoalSec < 30) return true;   // cb:fold arm grace, no routing information
+        if (ctx.TimeSinceProgressSec < 300) { CircuitTrace.Hit(ctx.Guid, "errand: progressing, holding goal", ctx.TimeSinceProgressSec); return true; }
         if (snap.HubErrandUntil is DateTime st)
+        {
+            CircuitTrace.Hit(ctx.Guid, "errand: wedged, consuming run token");
             ctx.HubErrandDone = st;
+        }
         _scratch.TryRemove(ctx.Guid, out _);
         _log.LogWarning("[HUB] {Name} no-progress ceiling — run token consumed, reselecting", ctx.Name);
         return false;

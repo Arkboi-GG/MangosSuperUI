@@ -5,6 +5,7 @@ using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Chat.Core;
 using MangosSuperUI.BotLogic.Chat.Engine;
 using MangosSuperUI.BotLogic.Chat.Voice;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Health;
 
@@ -105,7 +106,7 @@ public class ChatHealthService
         foreach (var c in cards)
         {
             var bad = VoiceLibraryBuilder.ShapeViolation(c);
-            if (bad != null) shapeReasons[bad] = shapeReasons.GetValueOrDefault(bad) + 1;
+            if (bad != null) { CircuitTrace.HitNote(0, "chat: library card shape violation counted", bad); shapeReasons[bad] = shapeReasons.GetValueOrDefault(bad) + 1; }
         }
         int shapeViolations = shapeReasons.Values.Sum();
 
@@ -117,12 +118,14 @@ public class ChatHealthService
 
         if (voices == 0)
         {
+            CircuitTrace.Hit(0, "chat: library health, library empty");
             checks.Add(new("empty", "Library is empty", "fail",
                 "Every bot falls back to one generic card, and the fleet will parrot its example lines. " +
                 "This is the failure mode that produced the 2026-07-13 repetition bug. Build the library."));
         }
         else
         {
+            CircuitTrace.Hit(0, "chat: library health checks computed", voices);
             int target = _settings.GetInt(0, "voice.library_target", 300);
             checks.Add(voices >= target
                 ? new("size", "Library size", "pass", $"{voices} voices (target {target})")
@@ -141,31 +144,37 @@ public class ChatHealthService
             double dupRate = exampleTotal == 0 ? 0 : 1.0 - (double)exampleDistinct / exampleTotal;
             checks.Add(dupRate switch
             {
-                > 0.10 => new("lines", "Example-line uniqueness", "fail",
-                    $"{exampleDistinct}/{exampleTotal} distinct ({dupRate:P1} duplicated) — the batch model is recycling phrasings"),
-                > 0.03 => new("lines", "Example-line uniqueness", "warn",
-                    $"{exampleDistinct}/{exampleTotal} distinct ({dupRate:P1} duplicated)"),
-                _ => new("lines", "Example-line uniqueness", "pass",
-                    $"{exampleDistinct}/{exampleTotal} distinct")
+                > 0.10 => CircuitTrace.Pass(new Check("lines", "Example-line uniqueness", "fail",
+                    $"{exampleDistinct}/{exampleTotal} distinct ({dupRate:P1} duplicated) — the batch model is recycling phrasings"), 0, "chat: library line uniqueness fail"),
+                > 0.03 => CircuitTrace.Pass(new Check("lines", "Example-line uniqueness", "warn",
+                    $"{exampleDistinct}/{exampleTotal} distinct ({dupRate:P1} duplicated)"), 0, "chat: library line uniqueness warn"),
+                _ => CircuitTrace.Pass(new Check("lines", "Example-line uniqueness", "pass",
+                    $"{exampleDistinct}/{exampleTotal} distinct"), 0, "chat: library line uniqueness pass")
             });
 
             // Shape contract — would today's guards accept the cards already in the library?
             double shapeRate = voices == 0 ? 0 : (double)shapeViolations / voices;
             checks.Add(shapeRate switch
             {
-                > 0.15 => new("shape", "Shape contract", "fail",
+                > 0.15 => CircuitTrace.Pass(new Check("shape", "Shape contract", "fail",
                     $"{shapeViolations} of {voices} cards would be REJECTED by today's guards " +
-                    $"({string.Join(", ", shapeReasons.OrderByDescending(k => k.Value).Take(3).Select(k => $"{k.Key} {k.Value}"))}) — rebuild"),
-                > 0.02 => new("shape", "Shape contract", "warn",
-                    $"{shapeViolations} of {voices} cards violate the current shape guards"),
-                _ => new("shape", "Shape contract", "pass", "cards satisfy the current guards")
+                    $"({string.Join(", ", shapeReasons.OrderByDescending(k => k.Value).Take(3).Select(k => $"{k.Key} {k.Value}"))}) — rebuild"), 0, "chat: library shape contract fail"),
+                > 0.02 => CircuitTrace.Pass(new Check("shape", "Shape contract", "warn",
+                    $"{shapeViolations} of {voices} cards violate the current shape guards"), 0, "chat: library shape contract warn"),
+                _ => CircuitTrace.Pass(new Check("shape", "Shape contract", "pass", "cards satisfy the current guards"), 0, "chat: library shape contract pass")
             });
 
             if (schemaOld > 0)
+            {
+                CircuitTrace.Hit(0, "chat: library has old-schema cards", schemaOld);
                 checks.Add(new("schema", "Card schema", "warn",
                     $"{schemaOld} cards predate schema v2 (no swear_level) — they default to level 1. Rebuild to fix."));
+            }
             else
+            {
+                CircuitTrace.Hit(0, "chat: library all schema v2");
                 checks.Add(new("schema", "Card schema", "pass", $"all {voices} cards on schema v2"));
+            }
 
             // Occupation spread is the canary for the stratified sampler doing its job.
             int distinctOcc = occupations.Distinct(StringComparer.OrdinalIgnoreCase).Count();
@@ -236,18 +245,20 @@ public class ChatHealthService
 
         if (total < 20)
         {
+            CircuitTrace.Hit(0, "chat: chat health thin sample", total);
             checks.Add(new("volume", "Sample size", "warn",
                 $"only {total} out-lines in the last {days} days — talk to some bots, then re-check"));
         }
         else
         {
+            CircuitTrace.Hit(0, "chat: chat health checks computed", total);
             double dupRate = 1.0 - (double)distinct / total;
             checks.Add(dupRate switch
             {
-                > 0.15 => new("dupes", "Exact duplication", "fail",
-                    $"{distinct}/{total} distinct — {dupRate:P0} of lines are verbatim repeats"),
-                > 0.05 => new("dupes", "Exact duplication", "warn", $"{distinct}/{total} distinct ({dupRate:P0} repeats)"),
-                _ => new("dupes", "Exact duplication", "pass", $"{distinct}/{total} distinct")
+                > 0.15 => CircuitTrace.Pass(new Check("dupes", "Exact duplication", "fail",
+                    $"{distinct}/{total} distinct — {dupRate:P0} of lines are verbatim repeats"), 0, "chat: duplication check fail"),
+                > 0.05 => CircuitTrace.Pass(new Check("dupes", "Exact duplication", "warn", $"{distinct}/{total} distinct ({dupRate:P0} repeats)"), 0, "chat: duplication check warn"),
+                _ => CircuitTrace.Pass(new Check("dupes", "Exact duplication", "pass", $"{distinct}/{total} distinct"), 0, "chat: duplication check pass")
             });
 
             // The one that actually caught the bug: exact-dupe rate looked FINE (74/68) while
@@ -257,12 +268,12 @@ public class ChatHealthService
             double bigramShare = topBigram == null || total == 0 ? 0 : (double)topBigram.Count / total;
             checks.Add(bigramShare switch
             {
-                > 0.15 => new("register", "Opening variety", "fail",
+                > 0.15 => CircuitTrace.Pass(new Check("register", "Opening variety", "fail",
                     $"{bigramShare:P0} of all lines open with \"{topBigram!.Key}\" — register collapse, " +
-                    "not exact duplication. Check the persona few-shot anchors."),
-                > 0.08 => new("register", "Opening variety", "warn",
-                    $"{bigramShare:P0} of lines open with \"{topBigram!.Key}\""),
-                _ => new("register", "Opening variety", "pass", "no single opener dominates")
+                    "not exact duplication. Check the persona few-shot anchors."), 0, "chat: opening variety fail"),
+                > 0.08 => CircuitTrace.Pass(new Check("register", "Opening variety", "warn",
+                    $"{bigramShare:P0} of lines open with \"{topBigram!.Key}\""), 0, "chat: opening variety warn"),
+                _ => CircuitTrace.Pass(new Check("register", "Opening variety", "pass", "no single opener dominates"), 0, "chat: opening variety pass")
             });
 
             checks.Add(bots < 5
@@ -303,6 +314,7 @@ public class ChatHealthService
 
         if (p == null)
         {
+            CircuitTrace.Hit(0, "chat: preflight fail, no active profile");
             checks.Add(new("profile", "Active inference profile", "fail",
                 "No profile is active. Activate one in the table above."));
             return new Preflight(false, "(none)", "", "", "", false, voices, oldSchema, target, personasOnOld,
@@ -315,39 +327,66 @@ public class ChatHealthService
         var models = await ProbeModelsAsync(p.Endpoint, flavor);
 
         if (models.Count == 0)
+        {
+            CircuitTrace.Hit(0, "chat: preflight endpoint unreachable");
             checks.Add(new("endpoint", "Endpoint reachable", "fail",
                 $"No models returned from {p.Endpoint}. Is it up, and is the API flavor right?"));
+        }
         else
+        {
+            CircuitTrace.Hit(0, "chat: preflight endpoint ok", models.Count);
             checks.Add(new("endpoint", "Endpoint reachable", "pass", $"{models.Count} models served"));
+        }
 
         bool fallback = string.IsNullOrWhiteSpace(p.ModelBatch);
         var effective = fallback ? p.ModelReactive : p.ModelBatch;
 
         if (string.IsNullOrWhiteSpace(effective))
+        {
+            CircuitTrace.Hit(0, "chat: preflight no batch model at all");
             checks.Add(new("model", "Batch model", "fail",
                 "Neither model_batch nor model_reactive is set on this profile."));
+        }
         else if (fallback)
+        {
+            CircuitTrace.Hit(0, "chat: preflight batch falls back to reactive model");
             checks.Add(new("model", "Batch model", "warn",
                 $"model_batch is empty → the build will run on the REACTIVE model '{effective}'. " +
                 "The library is written once and every bot on the server descends from it. " +
                 "If you have a bigger model, put it in the Batch column first."));
+        }
         else
+        {
+            CircuitTrace.Hit(0, "chat: preflight batch model set");
             checks.Add(new("model", "Batch model", "pass", $"'{effective}'"));
+        }
 
         if (!string.IsNullOrWhiteSpace(effective) && models.Count > 0 &&
             !models.Any(m => m.Equals(effective, StringComparison.OrdinalIgnoreCase)))
+        {
+            CircuitTrace.Hit(0, "chat: preflight model tag missing at endpoint");
             checks.Add(new("modeltag", "Model tag exists", "fail",
                 $"'{effective}' is not served at this endpoint. Pick one of: {string.Join(", ", models.Take(6))}"));
+        }
         else if (models.Count > 0)
+        {
+            CircuitTrace.Hit(0, "chat: preflight model tag found");
             checks.Add(new("modeltag", "Model tag exists", "pass", "tag found at the endpoint"));
+        }
 
         if (voices > 0)
+        {
+            CircuitTrace.Hit(0, "chat: preflight existing library present", voices);
             checks.Add(new("existing", "Existing library", "warn",
                 $"{voices} voices already present. A build is RESUMABLE — it tops up to the target and leaves " +
                 $"these alone{(oldSchema > 0 ? $", including {oldSchema} on the old schema" : "")}. " +
                 "Use \"Rebuild from scratch\" if you want them replaced."));
+        }
         else
+        {
+            CircuitTrace.Hit(0, "chat: preflight clean build, empty library");
             checks.Add(new("existing", "Existing library", "pass", "empty — a clean build"));
+        }
 
         bool canBuild = !checks.Any(c => c.Status == "fail");
 
@@ -358,19 +397,21 @@ public class ChatHealthService
     /// <summary>Ask the endpoint what it actually serves. Populates the model dropdowns.</summary>
     public async Task<List<string>> ProbeModelsAsync(string endpoint, string flavor)
     {
-        if (string.IsNullOrWhiteSpace(endpoint)) return new();
+        if (string.IsNullOrWhiteSpace(endpoint)) { CircuitTrace.Hit(0, "chat: model probe skipped, empty endpoint"); return new(); }
         try
         {
             var baseUrl = endpoint.TrimEnd('/');
             if (flavor == "openai")
             {
-                if (baseUrl.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)) baseUrl = baseUrl[..^3];
+                CircuitTrace.Hit(0, "chat: model probe via openai /v1/models");
+                if (baseUrl.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)) baseUrl = baseUrl[..^3];   // cb:fold url normalization detail, probe outcome carried by flavor probes
                 var json = await Http.GetStringAsync($"{baseUrl}/v1/models");
                 var list = JsonSerializer.Deserialize<OpenAiModelList>(json);
                 return list?.Data?.Select(d => d.Id).Where(s => !string.IsNullOrWhiteSpace(s)).ToList() ?? new();
             }
             else
             {
+                CircuitTrace.Hit(0, "chat: model probe via ollama /api/tags");
                 var json = await Http.GetStringAsync($"{baseUrl}/api/tags");
                 var list = JsonSerializer.Deserialize<OllamaTagList>(json);
                 return list?.Models?.Select(m => m.Name).Where(s => !string.IsNullOrWhiteSpace(s)).ToList() ?? new();
@@ -378,6 +419,7 @@ public class ChatHealthService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "chat: model probe failed");
             _logger.LogWarning("[CHAT-CAP] model probe failed for {Endpoint} ({Flavor}): {Error}",
                 endpoint, flavor, ex.Message);
             return new();
@@ -413,7 +455,7 @@ public class ChatHealthService
     private static string OpeningBigram(string line)
     {
         var w = (line ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (w.Length == 0) return "";
+        if (w.Length == 0) return "";   // cb:fold pure text helper, no guid in reach
         return w.Length == 1 ? w[0] : $"{w[0]} {w[1]}";
     }
 

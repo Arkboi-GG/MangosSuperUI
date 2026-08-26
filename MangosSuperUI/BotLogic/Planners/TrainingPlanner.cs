@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Planners;
 
@@ -55,6 +56,7 @@ public sealed class TrainingPlanner : IBotPlanner
         //     or anything else (→ give up the trip).
         if (ctx.Failure != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "train: consuming failure", ctx.Failure.Reason);
             var f = ctx.Failure;
             ctx.Failure = null;
 
@@ -62,11 +64,13 @@ public sealed class TrainingPlanner : IBotPlanner
             // TRAIN_FAIL, which flows to the give-up below and returns-to-anchor via GiveUp).
             if (f.CommandType == "TELEPORT_TO" && ctx.Teleport is { } tpf)
             {
+                CircuitTrace.Hit(ctx.Guid, "train: teleport hop itself failed");
                 var phase = tpf.Phase;
                 bool wasFailed = tpf.Failed;
                 ctx.Teleport = null;
                 if (phase == TpPhase.Inbound)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "train: return hop failed, exiting per trip outcome");
                     // Business already attempted; just couldn't get home (the bot is at the trainer —
                     // a safe town NPC). Exit per the trip outcome.
                     ctx.Train = null;
@@ -80,18 +84,23 @@ public sealed class TrainingPlanner : IBotPlanner
             // close it); the second, within reach, teleports.
             if (t != null && ctx.Step == "to_trainer" && TeleportAssist.IsApproachNoPath(f))
             {
+                CircuitTrace.Hit(ctx.Guid, "train: approach no_path near trainer", t.ApproachFails + 1);
                 t.ApproachFails++;
                 switch (TeleportAssist.Decide(t.ApproachFails, ctx.Pos, t.TrainerPos, ctx.MapId))
                 {
                     case TeleportAssist.TpDecision.Teleport:
+                        CircuitTrace.Hit(ctx.Guid, "train: teleport-assist hop to trainer issued");
                         _log.LogInformation("[TRAIN] {Name} trainer unreachable ({N}× no_path, {D:F0}yd) — TELEPORT_TO entry={Entry}",
                             ctx.Name, t.ApproachFails, ctx.Pos.Dist2D(t.TrainerPos.Pos), t.TrainerEntry);
                         return StepResult.Send(TeleportAssist.BeginOutbound(ctx, t.TrainerPos), "TELEPORT_ACK", TeleportAssist.AckDeadline);
                     case TeleportAssist.TpDecision.Retry:
+                        CircuitTrace.Hit(ctx.Guid, "train: retry route to trainer");
                         return RouteToTrainer(t);   // one more chance to path closer
                                                     // TpDecision.GiveUp → fall through (NPC genuinely far — not a final-approach pocket)
                 }
             }
+
+            CircuitTrace.Hit(ctx.Guid, "train: unhandled failure -> give up trip");
 
             return GiveUp(ctx, $"fail:{f.Reason}");
         }
@@ -99,6 +108,7 @@ public sealed class TrainingPlanner : IBotPlanner
         // (B) Advance a committed teleport-assist round-trip (TELEPORT_ACK arrivals).
         if (ctx.Teleport is { Phase: TpPhase.Outbound })
         {
+            CircuitTrace.Hit(ctx.Guid, "train: teleported in, TRAIN_AT_NPC issued");
             // Hopped to the trainer — the executor already set ctx.Pos from the ack, so we're AT it.
             ctx.Teleport.Phase = TpPhase.AtTarget;
             ctx.SetStep("train");
@@ -109,11 +119,12 @@ public sealed class TrainingPlanner : IBotPlanner
         }
         if (ctx.Teleport is { Phase: TpPhase.Inbound } tpr)
         {
+            CircuitTrace.Hit(ctx.Guid, "train: returned to anchor");
             // Returned to the pre-teleport anchor. The flag was cleared at TRAIN_ACK on success; a
             // failed train set Failed and gives up here (after the safe return) instead of finishing.
             bool failed = tpr.Failed;
             ctx.Teleport = null;
-            if (failed) return GiveUp(ctx, "train failed at trainer (returned)");
+            if (failed) { CircuitTrace.Hit(ctx.Guid, "train: trip had failed, giving up after safe return"); return GiveUp(ctx, "train failed at trainer (returned)"); }
             ctx.Train = null;
             _log.LogInformation("[TRAIN] {Name} trained + returned to anchor — done (cu={Cu})", ctx.Name, ctx.Copper);
             return StepResult.Complete();
@@ -122,12 +133,13 @@ public sealed class TrainingPlanner : IBotPlanner
         // First entry → find the nearest class trainer on this map. None in range → give up.
         if (t == null)
         {
+            CircuitTrace.Hit(ctx.Guid, "train: fresh entry, locating trainer");
             if (id == null || !_trainers.IsLoaded)
-                return GiveUp(ctx, "no-loader");
+                { CircuitTrace.Hit(ctx.Guid, "train: no identity/loader -> give up"); return GiveUp(ctx, "no-loader"); }
 
             var trainer = _trainers.GetNearestTrainer(id.ClassId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y);
             if (trainer == null)
-                return GiveUp(ctx, "no-trainer-in-range");
+                { CircuitTrace.Hit(ctx.Guid, "train: no trainer in range -> give up"); return GiveUp(ctx, "no-trainer-in-range"); }
 
             ctx.Train = t = new TrainScratch
             {
@@ -144,6 +156,7 @@ public sealed class TrainingPlanner : IBotPlanner
         switch (ctx.Step)
         {
             case "to_trainer":
+                CircuitTrace.Hit(ctx.Guid, "train: arrived at trainer, TRAIN_AT_NPC issued");
                 // TASK_COMPLETE = arrived → train.
                 ctx.SetStep("train");
                 _log.LogInformation("[TRAIN] {Name} arrived → TRAIN_AT_NPC entry={Entry}", ctx.Name, t.TrainerEntry);
@@ -152,11 +165,12 @@ public sealed class TrainingPlanner : IBotPlanner
                     "TRAIN_ACK", TrainAckDeadline);
 
             case "train":
+                CircuitTrace.Hit(ctx.Guid, "train: TRAIN_ACK, spells learned");
                 // TRAIN_ACK cleared the WAIT → C++ learned whatever the bot could afford. Clear the
                 // flag regardless of count; the next LEVEL_UP re-flags (and the bot has more gold by
                 // then for what it couldn't afford this time — "buy what you can next level up").
                 if (id != null)
-                {
+                {   // cb:fold flag clear, outcome carried by the ack probe
                     id.HasUnlearnedSpells = false;
                     id.TicksSinceLastTrained = 0;
                 }
@@ -164,6 +178,7 @@ public sealed class TrainingPlanner : IBotPlanner
                 // — the bot's next goal would otherwise try to MOVE_TO out of the same pocket and no_path.
                 if (ctx.Teleport is { Phase: TpPhase.AtTarget })
                 {
+                    CircuitTrace.Hit(ctx.Guid, "train: teleporting back to anchor after training");
                     _log.LogInformation("[TRAIN] {Name} trained (cu={Cu}) — teleporting back to anchor", ctx.Name, ctx.Copper);
                     return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
                 }
@@ -175,6 +190,7 @@ public sealed class TrainingPlanner : IBotPlanner
         // No leg applied yet (fresh entry) → at the trainer already? train; else route to it.
         if (AtTrainer(ctx, t))
         {
+            CircuitTrace.Hit(ctx.Guid, "train: already at trainer, TRAIN_AT_NPC issued");
             ctx.SetStep("train");
             return StepResult.Send(
                 new BridgeCommand("TRAIN_AT_NPC", new { npc_entry = t.TrainerEntry }),
@@ -182,6 +198,7 @@ public sealed class TrainingPlanner : IBotPlanner
         }
 
         ctx.SetStep("to_trainer");
+        CircuitTrace.Hit(ctx.Guid, "train: routing to trainer");
         return RouteToTrainer(t);
     }
 
@@ -202,13 +219,15 @@ public sealed class TrainingPlanner : IBotPlanner
         // real give-up below.
         if (ctx.Teleport is { Phase: TpPhase.AtTarget } tp)
         {
+            CircuitTrace.Hit(ctx.Guid, "train: give-up at trainer, safe return first");
             tp.Failed = true;
             _log.LogInformation("[TRAIN] {Name} give-up at trainer ({Why}) — teleporting back to anchor first", ctx.Name, why);
             return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
         }
 
+        CircuitTrace.HitNote(ctx.Guid, "train: GIVEUP, flag cleared + cooldown", why);
         if (ctx.Identity is { } id)
-        {
+        {   // cb:fold flag clear, outcome carried by the give-up probe
             id.HasUnlearnedSpells = false;
             id.TrainCooldownUntil = DateTime.UtcNow.AddSeconds(TrainGiveupCooldownSec);
         }
@@ -232,7 +251,7 @@ public sealed class TrainingPlanner : IBotPlanner
     // then a long no-progress ceiling so a wedged trip eventually reselects instead of hanging.
     public bool IsProgressing(BotContext ctx, BotStateSnapshot snap)
     {
-        if (ctx.TimeInGoalSec < 30) return true;
+        if (ctx.TimeInGoalSec < 30) return true;   // cb:fold arm grace, no routing information
         return ctx.TimeSinceProgressSec < 300;
     }
 

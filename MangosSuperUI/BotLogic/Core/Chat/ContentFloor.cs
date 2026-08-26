@@ -58,13 +58,13 @@ public static class ContentFloor
     public static bool IsBlocked(string line, out string matchedStem)
     {
         matchedStem = "";
-        if (string.IsNullOrEmpty(line)) return false;
+        if (string.IsNullOrEmpty(line)) return false;   // cb:fold pure text scan, floor verdict probed at caller
 
         var lower = line.ToLowerInvariant();
         foreach (Match word in WordScan.Matches(lower))
         {
             if (BlockedWords.Contains(word.Value))
-            {
+            {   // cb:fold pure text scan, floor verdict probed at caller
                 matchedStem = word.Value;
                 return true;
             }
@@ -72,7 +72,7 @@ public static class ContentFloor
             foreach (var stem in BlockedStems)
             {
                 if (word.Value.Contains(stem))
-                {
+                {   // cb:fold pure text scan, floor verdict probed at caller
                     matchedStem = stem;
                     return true;
                 }

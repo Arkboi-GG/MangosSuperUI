@@ -1,5 +1,7 @@
 namespace MangosSuperUI.BotLogic.Core;
 
+using MangosSuperUI.BotLogic.Tracking;
+
 // ============================================================================
 // GroupPlan — the locked group-coordinator contract (AIBOT_GROUPING_DESIGN §7.1).
 //
@@ -379,7 +381,7 @@ public sealed class GroupPlan
     /// The coordinator calls this; member GroupOrders are then re-stamped from the new phase.</summary>
     public void SetPhase(GroupPhase phase)
     {
-        if (Phase != phase) PhaseSinceUtc = DateTime.UtcNow;
+        if (Phase != phase) { CircuitTrace.Hit(0, "plan: group phase changed, timeout clock stamped"); PhaseSinceUtc = DateTime.UtcNow; }
 
         // Fix 2 (2026-07-04): the latch LIVES only while the group is actually on an objective
         // (Objective, and the HoldAtAnchor transient that can interleave with it — obj_sync /
@@ -388,13 +390,17 @@ public sealed class GroupPlan
         // previously cleared only by ResetForForming). Re-entry to Objective re-latches naturally
         // from the leg's own translation.
         if (phase != GroupPhase.Objective && phase != GroupPhase.HoldAtAnchor)
+        {
+            CircuitTrace.Hit(0, "plan: off-objective phase clears latched objective");
             LatchedObjective = ExecDirective.None;
+        }
 
         // Axiom 1 / Axiom 2: the memoized clump point lives across the grind<->defend family
         // (a corpse point set while a member was dead must persist through the dead->healing
         // flip so the group keeps guarding the same spot) and dies on any transition out of it.
         if (phase != GroupPhase.GroupGrind && phase != GroupPhase.GroupDefend)
         {
+            CircuitTrace.Hit(0, "plan: leaving grind/defend family clears clump point");
             GrindPoint = default;
             HasGrindPoint = false;
         }

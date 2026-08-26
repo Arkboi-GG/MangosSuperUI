@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Coordinator;
 
@@ -76,9 +77,10 @@ public class TypingScheduler
         // is active, on any kind (the old rule only softened it for whispers, and only to 1/3).
         // Outside a live thread the tail is exactly as before — that is where it reads as human.
         double altChance = t.AltTabChance;
-        if (threadActive) altChance = 0.0;
+        if (threadActive) { CircuitTrace.Hit(botGuid, "chat: alt-tab tail suppressed, thread active"); altChance = 0.0; }
         if (rng.NextDouble() < altChance)
         {
+            CircuitTrace.Hit(botGuid, "chat: alt-tab tail added to hold");
             holdUntil = holdUntil.AddSeconds(rng.Next(60, 121));
             _logger.LogDebug("[CHAT-COORD] alt-tab tail for bot={Guid} (+{S}s)", botGuid, (holdUntil - recvUtc).TotalSeconds);
         }
@@ -93,12 +95,14 @@ public class TypingScheduler
         var sends = new List<ScheduledSend>();
         if (line.Length > threshold && TrySplit(line, out var first, out var second))
         {
+            CircuitTrace.Hit(botGuid, "chat: line split into two sends", line.Length);
             sends.Add(new ScheduledSend(botGuid, first, wire, target, channel, sendUtc, conversationKey, holdUntil, inferenceReadyUtc, chainDepth, recvUtc));
             sends.Add(new ScheduledSend(botGuid, second, wire, target, channel,
                 sendUtc.AddSeconds(rng.Next(2, 7)), conversationKey, holdUntil, inferenceReadyUtc, chainDepth, recvUtc));
         }
         else
         {
+            CircuitTrace.Hit(botGuid, "chat: line scheduled unsplit", line.Length);
             sends.Add(new ScheduledSend(botGuid, line, wire, target, channel, sendUtc, conversationKey, holdUntil, inferenceReadyUtc, chainDepth, recvUtc));
         }
 
@@ -121,7 +125,10 @@ public class TypingScheduler
         {
             var key = (botGuid, conversationKey);
             if (!_newestStimulus.TryGetValue(key, out var prev) || stimulusUtc > prev)
+            {
+                CircuitTrace.Hit(botGuid, "chat: newest stimulus stamped for conversation");
                 _newestStimulus[key] = stimulusUtc;
+            }
         }
     }
 
@@ -152,12 +159,13 @@ public class TypingScheduler
             while (_queue.TryPeek(out var head, out var at) && at <= nowUtc)
             {
                 _queue.Dequeue();
-                if (_cancelled.Contains((head.BotGuid, head.ConversationKey))) continue;
+                if (_cancelled.Contains((head.BotGuid, head.ConversationKey))) { CircuitTrace.Hit(head.BotGuid, "chat: due send dropped, conversation cancelled"); continue; }
 
                 if (_newestStimulus.TryGetValue((head.BotGuid, head.ConversationKey), out var newest)
                     && newest > head.StimulusUtc
                     && (nowUtc - head.StimulusUtc) > StaleAfter)
                 {
+                    CircuitTrace.Hit(head.BotGuid, "chat: due send superseded by newer stimulus");
                     superseded.Add(head);
                     continue;
                 }
@@ -191,7 +199,7 @@ public class TypingScheduler
     {
         lock (_gate)
         {
-            if (_newestStimulus.Count < 256) return;
+            if (_newestStimulus.Count < 256) { CircuitTrace.Hit(0, "chat: stimulus ledger sweep skipped, below cap"); return; }
             var cutoff = nowUtc.AddMinutes(-5);
             foreach (var k in _newestStimulus.Where(kv => kv.Value < cutoff).Select(kv => kv.Key).ToList())
                 _newestStimulus.Remove(k);
@@ -209,14 +217,14 @@ public class TypingScheduler
         for (int i = 10; i < line.Length - 10; i++)
         {
             bool boundary = (line[i] == '.' || line[i] == '?' || line[i] == '!') && i + 1 < line.Length && line[i + 1] == ' ';
-            if (!boundary) continue;
+            if (!boundary) continue;   // cb:fold pure text split helper, split decision probed at Schedule
             int dist = Math.Abs(i - mid);
-            if (dist < bestDist) { bestDist = dist; best = i + 1; }
+            if (dist < bestDist) { bestDist = dist; best = i + 1; }   // cb:fold pure text split helper, split decision probed at Schedule
         }
         if (best < 0)
-        {
+        {   // cb:fold pure text split helper, split decision probed at Schedule
             best = line.LastIndexOf(' ', Math.Min(mid + 20, line.Length - 1));
-            if (best < 10) return false;
+            if (best < 10) return false;   // cb:fold pure text split helper, split decision probed at Schedule
         }
         first = line[..best].Trim();
         second = line[best..].Trim();

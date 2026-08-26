@@ -1,6 +1,7 @@
 namespace MangosSuperUI.BotLogic.Core;
 
 using MangosSuperUI.BotLogic.Data;   // QuestNode (quest scratch)
+using MangosSuperUI.BotLogic.Tracking;
 
 // ============================================================================
 // BotContext — THE live state. The keystone of the rebuild (§3.4).
@@ -432,7 +433,7 @@ public sealed class BotContext
     {
         _deadGrindCells.Clear();
         ConsecutiveFailures = 0;
-        if (Identity != null) Identity.WedgeStreak = 0;   // killing again = not stranded (FINDING_010)
+        if (Identity != null) { CircuitTrace.Hit(Guid, "ctx: grind progress resets wedge streak"); Identity.WedgeStreak = 0; }   // killing again = not stranded (FINDING_010)
     }
 
     // ---- step / goal timing ----
@@ -556,7 +557,7 @@ public sealed class BotContext
     /// keep resetting the reconcile adoption grace.</summary>
     public void SetObjective(Objective o)
     {
-        if (Held is not { } cur || !cur.Equals(o)) ObjectiveSinceUtc = DateTime.UtcNow;
+        if (Held is not { } cur || !cur.Equals(o)) { CircuitTrace.Hit(Guid, "ctx: held objective changed, adoption grace stamped"); ObjectiveSinceUtc = DateTime.UtcNow; }
         Held = o;
     }
 
@@ -585,7 +586,7 @@ public sealed class BotContext
     /// <summary>Switch the high-level goal, resetting step + timers. Scratch is the brain's to swap.</summary>
     public void SetGoal(Goal goal, string step)
     {
-        if (Goal != goal) GoalSinceUtc = DateTime.UtcNow;
+        if (Goal != goal) { CircuitTrace.Hit(Guid, "ctx: goal changed, goal timer reset"); GoalSinceUtc = DateTime.UtcNow; }
         Goal = goal;
         SetStep(step);
     }
@@ -593,7 +594,7 @@ public sealed class BotContext
     /// <summary>Move to a new step within the current goal; stamps the step timer on change.</summary>
     public void SetStep(string step)
     {
-        if (Step != step) StepSinceUtc = DateTime.UtcNow;
+        if (Step != step) { CircuitTrace.HitNote(Guid, "ctx: step changed", step); StepSinceUtc = DateTime.UtcNow; }
         Step = step;
     }
 

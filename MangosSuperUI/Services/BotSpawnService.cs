@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Dapper;
+using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.Models;
 using Microsoft.AspNetCore.SignalR;
@@ -118,14 +119,23 @@ public sealed class BotSpawnService
     public async Task<(SpawnJobSnapshot? Job, string? Error)> StartAsync(IReadOnlyList<SpawnRequest> spawns)
     {
         if (spawns.Count == 0)
+        {
+            CircuitTrace.Hit(0, "spawn: empty batch refused");
             return (Snapshot(), "Nothing to spawn");
+        }
 
         var max = MaxPerRequest;
         if (max > 0 && spawns.Count > max)
+        {
+            CircuitTrace.Hit(0, "spawn: batch over per-request ceiling", spawns.Count);
             return (Snapshot(), $"Too many at once (max {max} per batch — BotSpawn:MaxPerRequest)");
+        }
 
         if (IsRunning)
+        {
+            CircuitTrace.Hit(0, "spawn: refused, a batch is already running");
             return (Snapshot(), "A spawn batch is already running");
+        }
 
         List<string> names;
         try
@@ -134,6 +144,7 @@ public sealed class BotSpawnService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "spawn: name draw failed, batch refused");
             return (Snapshot(), ex.Message);
         }
 
@@ -141,7 +152,10 @@ public sealed class BotSpawnService
         lock (_gate)
         {
             if (_job is { Phase: "running" })
+            {
+                CircuitTrace.Hit(0, "spawn: lost start race, batch already running");
                 return (Snapshot(_job), "A spawn batch is already running");
+            }
             _job = job;
         }
 
@@ -156,7 +170,10 @@ public sealed class BotSpawnService
         lock (_gate)
         {
             if (_job is not { Phase: "running" })
+            {
+                CircuitTrace.Hit(0, "spawn: cancel with no running batch");
                 return false;
+            }
             _job.Cts.Cancel();
             return true;
         }
@@ -175,6 +192,7 @@ public sealed class BotSpawnService
             {
                 if (ct.IsCancellationRequested)
                 {
+                    CircuitTrace.Hit(0, "spawn: cancel requested, stopping batch", i);
                     lock (_gate) job.Phase = "cancelled";
                     break;
                 }
@@ -185,9 +203,13 @@ public sealed class BotSpawnService
 
                 var (outcome, failure) = await SendOneAsync($".bot addai {cls} {race} {name}", name, ct);
                 if (failure != null)
+                {
+                    CircuitTrace.HitNote(0, "spawn: send failure noted", failure);
                     lastFailure = failure;
+                }
                 if (outcome == Outcome.Cancelled)
                 {
+                    CircuitTrace.Hit(0, "spawn: cancelled mid-send, stopping batch", i);
                     lock (_gate) job.Phase = "cancelled";
                     break;
                 }
@@ -195,9 +217,13 @@ public sealed class BotSpawnService
                 lock (_gate)
                 {
                     if (outcome == Outcome.Sent)
+                    {
+                        CircuitTrace.Hit(0, "spawn: bot sent ok");
                         job.Sent++;
+                    }
                     else
                     {
+                        CircuitTrace.HitNote(0, "spawn: bot failed", name);
                         job.Failed++;
                         job.FailedNames.Add(name);
                     }
@@ -206,6 +232,7 @@ public sealed class BotSpawnService
                 consecutiveTransportFailures = outcome == Outcome.TransportFailure ? consecutiveTransportFailures + 1 : 0;
                 if (consecutiveTransportFailures >= MaxConsecutiveTransportFailures)
                 {
+                    CircuitTrace.Hit(0, "spawn: RA unreachable, batch aborted", consecutiveTransportFailures);
                     lock (_gate)
                     {
                         job.Phase = "failed";
@@ -216,6 +243,7 @@ public sealed class BotSpawnService
 
                 if (job.Clock.ElapsedMilliseconds - lastPush >= ProgressPushIntervalMs)
                 {
+                    CircuitTrace.Hit(0, "spawn: progress push interval elapsed");
                     lastPush = job.Clock.ElapsedMilliseconds;
                     await PushAsync(job);
                 }
@@ -225,19 +253,25 @@ public sealed class BotSpawnService
             {
                 if (job.Phase == "running")
                 {
+                    CircuitTrace.Hit(0, "spawn: batch ran to completion, finalizing");
                     // Every bot failing is a failed batch, whatever the size — not a "done" one.
                     if (job.Sent == 0 && job.Failed > 0)
                     {
+                        CircuitTrace.Hit(0, "spawn: zero sent -> batch failed", job.Failed);
                         job.Phase = "failed";
                         job.Error = lastFailure ?? "No bots were spawned";
                     }
                     else
+                    {
+                        CircuitTrace.Hit(0, "spawn: batch done", job.Sent);
                         job.Phase = "done";
+                    }
                 }
             }
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "spawn: batch crashed");
             _logger.LogError(ex, "AddBots: batch {Id} crashed", job.Id);
             lock (_gate)
             {
@@ -272,6 +306,7 @@ public sealed class BotSpawnService
                 var response = await _ra.SendCommandAsync(command);
                 if (IsCoreRefusal(response))
                 {
+                    CircuitTrace.HitNote(0, "spawn: core refused bot", response);
                     _logger.LogWarning("AddBots: core refused {Name}: {Response}", name, response);
                     return (Outcome.CoreRefused, "core: " + response.Trim());
                 }
@@ -279,16 +314,21 @@ public sealed class BotSpawnService
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(0, "spawn: RA send attempt failed", attempt);
                 _logger.LogWarning(ex, "AddBots: RA send failed for {Name} (attempt {Attempt}/2)", name, attempt);
                 failure = "RA: " + ex.Message;
                 if (attempt == 2)
+                {
+                    CircuitTrace.Hit(0, "spawn: transport failure, retries exhausted");
                     return (Outcome.TransportFailure, failure);
+                }
                 try
                 {
                     await Task.Delay(RetryDelayMs, ct);   // RaService reconnects lazily on the retry
                 }
                 catch (OperationCanceledException)
                 {
+                    CircuitTrace.Hit(0, "spawn: retry wait cancelled");
                     return (Outcome.Cancelled, failure);
                 }
             }
@@ -313,7 +353,7 @@ public sealed class BotSpawnService
             await _hub.Clients.All.SendAsync("SpawnProgress", snapshot);
         }
         catch (Exception ex)
-        {
+        {   // cb:fold logging only — hub progress push failure swallowed by design
             _logger.LogDebug(ex, "AddBots: progress push failed");
         }
     }
@@ -345,10 +385,15 @@ public sealed class BotSpawnService
     {
         var root = _env.WebRootPath;
         if (string.IsNullOrEmpty(root))
+        {   // cb:fold load-time data assembly — WebRootPath fallback, pure path resolution detail
             root = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
+        }
         var path = Path.Combine(root, NameListRelativePath);
         if (!File.Exists(path))
+        {
+            CircuitTrace.Hit(0, "spawn: name list file missing");
             throw new Exception("Name list not found at wwwroot/" + NameListRelativePath);
+        }
 
         var all = (await File.ReadAllLinesAsync(path))
             .Select(l => l.Trim())
@@ -368,7 +413,10 @@ public sealed class BotSpawnService
     {
         var avail = await LoadAvailableNamesAsync();
         if (avail.Count < need)
+        {
+            CircuitTrace.Hit(0, "spawn: name pool exhausted, batch refused", avail.Count);
             throw new Exception($"Only {avail.Count} unused names available (need {need}). Add more names to the list.");
+        }
 
         var rng = Random.Shared;
         for (int i = avail.Count - 1; i > 0; i--)
@@ -390,7 +438,10 @@ public sealed class BotSpawnService
     {
         var path = _vmangos.CurrentValue.MangosdConfPath;
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            CircuitTrace.Hit(0, "spawn: mangosd conf unavailable -> no player limit");
             return null;
+        }
         try
         {
             var doc = await MangosdConfigDocument.LoadAsync(path);
@@ -398,6 +449,7 @@ public sealed class BotSpawnService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "spawn: player limit read failed");
             _logger.LogDebug(ex, "AddBots: could not read PlayerLimit from {Path}", path);
             return null;
         }

@@ -1,5 +1,7 @@
 namespace MangosSuperUI.BotLogic.Core;
 
+using MangosSuperUI.BotLogic.Tracking;
+
 /// <summary>
 /// The single object that represents everything about one bot.
 /// Domains never store per-bot state — they read/write BotIdentity.
@@ -457,7 +459,10 @@ public class BotIdentity
         var key = ((int)MathF.Round(destX), (int)MathF.Round(destY));
         // Keep the higher danger level if already blacklisted
         if (PathBlacklist.TryGetValue(key, out int existing) && existing >= dangerLevel)
+        {
+            CircuitTrace.Hit(Guid, "identity: path blacklist keeps higher existing danger", existing);
             return;
+        }
         PathBlacklist[key] = dangerLevel;
         PathUnsafeCountSinceLastPick++;
     }
@@ -475,11 +480,11 @@ public class BotIdentity
         foreach (var kvp in PathBlacklist)
         {
             // Bot has leveled past the danger — can handle it now
-            if (Level >= kvp.Value - 3) continue;
+            if (Level >= kvp.Value - 3) { CircuitTrace.Hit(Guid, "identity: blacklist entry outleveled, skipped", kvp.Value); continue; }
 
             int dx = Math.Abs(kvp.Key.X - ix);
             int dy = Math.Abs(kvp.Key.Y - iy);
-            if (dx <= 20 && dy <= 20) return true;
+            if (dx <= 20 && dy <= 20) { CircuitTrace.Hit(Guid, "identity: destination hits path blacklist"); return true; }
         }
 
         return false;
@@ -598,15 +603,15 @@ public class BotIdentity
     /// </summary>
     public static (float X, float Y, float Z, int Map) RacialStart(int race) => race switch
     {
-        1 => (-8949.95f, -132.493f, 83.5312f, 0),   // Human      — Northshire (EK)
-        2 => (-618.518f, -4251.67f, 38.718f, 1),    // Orc        — Durotar (Kalimdor)
-        3 => (-6240.32f, 331.033f, 382.758f, 0),    // Dwarf      — Coldridge (EK)
-        4 => (10311.3f, 831.463f, 1326.41f, 1),     // Night Elf  — Shadowglen (Kalimdor)
-        5 => (1676.35f, 1677.45f, 121.67f, 0),      // Undead     — Deathknell/Tirisfal (EK)
-        6 => (-2917.58f, -257.98f, 52.9968f, 1),    // Tauren     — Camp Narache (Kalimdor)
-        7 => (-6240.32f, 331.033f, 382.758f, 0),    // Gnome      — Coldridge (EK)
-        8 => (-618.518f, -4251.67f, 38.718f, 1),    // Troll      — Durotar (Kalimdor)
-        _ => (0f, 0f, 0f, -1),                       // unknown → no valid home (hearth won't fire)
+        1 => (-8949.95f, -132.493f, 83.5312f, 0),   // Human      — Northshire (EK)   // cb:fold pure data lookup, static with no guid in reach
+        2 => (-618.518f, -4251.67f, 38.718f, 1),    // Orc        — Durotar (Kalimdor)   // cb:fold pure data lookup, static with no guid in reach
+        3 => (-6240.32f, 331.033f, 382.758f, 0),    // Dwarf      — Coldridge (EK)   // cb:fold pure data lookup, static with no guid in reach
+        4 => (10311.3f, 831.463f, 1326.41f, 1),     // Night Elf  — Shadowglen (Kalimdor)   // cb:fold pure data lookup, static with no guid in reach
+        5 => (1676.35f, 1677.45f, 121.67f, 0),      // Undead     — Deathknell/Tirisfal (EK)   // cb:fold pure data lookup, static with no guid in reach
+        6 => (-2917.58f, -257.98f, 52.9968f, 1),    // Tauren     — Camp Narache (Kalimdor)   // cb:fold pure data lookup, static with no guid in reach
+        7 => (-6240.32f, 331.033f, 382.758f, 0),    // Gnome      — Coldridge (EK)   // cb:fold pure data lookup, static with no guid in reach
+        8 => (-618.518f, -4251.67f, 38.718f, 1),    // Troll      — Durotar (Kalimdor)   // cb:fold pure data lookup, static with no guid in reach
+        _ => (0f, 0f, 0f, -1),                       // unknown → no valid home (hearth won't fire)   // cb:fold pure data lookup, static with no guid in reach
     };
 
     /// <summary>
@@ -622,23 +627,23 @@ public class BotIdentity
     /// </summary>
     public static (float X, float Y, float Z, int Map) HomeFor(int race, int level)
     {
-        if (level <= 9) return RacialStart(race);
+        if (level <= 9) { CircuitTrace.Hit(0, "identity: home band = racial start (L<=9)", level); return RacialStart(race); }
         bool mid = level <= 15;
         return race switch
         {
-            1 => mid ? (-10628.0f, 1036.0f, 33.0f, 0)    // Human   — Sentinel Hill (Westfall)
+            1 => mid ? (-10628.0f, 1036.0f, 33.0f, 0)    // Human   — Sentinel Hill (Westfall)   // cb:fold pure data lookup, band carried by the L<=9 probe above
                      : (-10559.0f, -1189.0f, 28.0f, 0),  //          Darkshire (Duskwood)
-            3 or 7 => mid ? (-5360.0f, -2953.0f, 323.0f, 0)   // Dwarf/Gnome — Thelsamar (Loch Modan)
+            3 or 7 => mid ? (-5360.0f, -2953.0f, 323.0f, 0)   // Dwarf/Gnome — Thelsamar (Loch Modan)   // cb:fold pure data lookup, band carried by the L<=9 probe above
                           : (-3688.0f, -830.0f, 10.0f, 0),    //             Menethil Harbor (Wetlands)
-            4 => mid ? (9821.0f, 959.0f, 1314.0f, 1)     // Night Elf — Dolanaar (Teldrassil)
+            4 => mid ? (9821.0f, 959.0f, 1314.0f, 1)     // Night Elf — Dolanaar (Teldrassil)   // cb:fold pure data lookup, band carried by the L<=9 probe above
                      : (6420.0f, 529.0f, 9.0f, 1),       //            Auberdine (Darkshore)
-            2 or 8 => mid ? (338.0f, -4688.0f, 17.0f, 1)      // Orc/Troll — Razor Hill (Durotar)
+            2 or 8 => mid ? (338.0f, -4688.0f, 17.0f, 1)      // Orc/Troll — Razor Hill (Durotar)   // cb:fold pure data lookup, band carried by the L<=9 probe above
                           : (-472.0f, -2653.0f, 97.0f, 1),    //            The Crossroads (Barrens)
-            5 => mid ? (2247.0f, 252.0f, 34.0f, 0)       // Undead  — Brill (Tirisfal)
+            5 => mid ? (2247.0f, 252.0f, 34.0f, 0)       // Undead  — Brill (Tirisfal)   // cb:fold pure data lookup, band carried by the L<=9 probe above
                      : (457.0f, 1548.0f, 132.0f, 0),     //          The Sepulcher (Silverpine)
-            6 => mid ? (-2361.0f, -349.0f, -9.0f, 1)     // Tauren  — Bloodhoof Village (Mulgore)
+            6 => mid ? (-2361.0f, -349.0f, -9.0f, 1)     // Tauren  — Bloodhoof Village (Mulgore)   // cb:fold pure data lookup, band carried by the L<=9 probe above
                      : (-472.0f, -2653.0f, 97.0f, 1),    //          The Crossroads (Barrens)
-            _ => (0f, 0f, 0f, -1),
+            _ => (0f, 0f, 0f, -1),   // cb:fold pure data lookup, band carried by the L<=9 probe above
         };
     }
 
@@ -657,9 +662,9 @@ public class BotIdentity
     /// </summary>
     public static string FactionForRace(int race) => race switch
     {
-        2 or 5 or 6 or 8 => "Horde",
-        1 or 3 or 4 or 7 => "Alliance",
-        _ => "Unknown"
+        2 or 5 or 6 or 8 => "Horde",   // cb:fold pure data lookup, static with no guid in reach
+        1 or 3 or 4 or 7 => "Alliance",   // cb:fold pure data lookup, static with no guid in reach
+        _ => "Unknown"   // cb:fold pure data lookup, static with no guid in reach
     };
 }
 
@@ -704,9 +709,9 @@ public class QuestDeferral
     public bool IsExpired(DateTime now, int botLevel)
     {
         // Time-gated: expired if past the clock
-        if (ExpiresAt.HasValue && now >= ExpiresAt.Value) return true;
+        if (ExpiresAt.HasValue && now >= ExpiresAt.Value) return true;   // cb:fold pure deferral value check, no guid in reach; outcome probed at callers
         // Level-gated: expired if bot reached the required level
-        if (RequiredLevel.HasValue && botLevel >= RequiredLevel.Value) return true;
+        if (RequiredLevel.HasValue && botLevel >= RequiredLevel.Value) return true;   // cb:fold pure deferral value check, no guid in reach; outcome probed at callers
         // Neither condition met — still deferred
         return false;
     }

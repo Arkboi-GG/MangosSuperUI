@@ -1,6 +1,7 @@
 using Dapper;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Chat.Voice;
+using MangosSuperUI.BotLogic.Tracking;
 using System.Collections.Concurrent;
 
 namespace MangosSuperUI.BotLogic.Chat.Core;
@@ -42,7 +43,10 @@ public class PersonaService
     public async Task<BotPersona> GetOrCreateAsync(int guid, string botName)
     {
         if (_cache.TryGetValue(guid, out var cached))
+        {
+            CircuitTrace.Hit(guid, "chat: persona cache hit");
             return cached;
+        }
 
         using var conn = _db.Admin();
         var row = await conn.QuerySingleOrDefaultAsync<PersonaRow>(@"
@@ -52,9 +56,11 @@ public class PersonaService
 
         if (row != null)
         {
+            CircuitTrace.Hit(guid, "chat: persona row found in db");
             var existing = PersonaCard.Parse(row.CardJson);
             if (existing != null)
             {
+                CircuitTrace.Hit(guid, "chat: persona card parsed, loaded");
                 var loaded = new BotPersona(guid, existing, row.MoodValence,
                     row.MoodEnergy, row.Situation, row.Narrative);
                 _cache[guid] = loaded;
@@ -98,7 +104,7 @@ public class PersonaService
         foreach (var guid in seedGuids)
         {
             var (card, voiceId) = await AssignFromLibraryAsync(conn, guid);
-            if (voiceId == null) break;   // library empty — nothing sensible to do
+            if (voiceId == null) { CircuitTrace.Hit(guid, "chat: reroll aborted, library empty"); break; }   // library empty — nothing sensible to do
             await conn.ExecuteAsync(@"
                 UPDATE bot_persona SET voice_id=@voiceId, card_json=@cardJson,
                        narrative=@narrative, updated_utc=UTC_TIMESTAMP()
@@ -132,6 +138,7 @@ public class PersonaService
         var card = pick != null ? PersonaCard.Parse(pick.CardJson) : null;
         if (card == null)
         {
+            CircuitTrace.Hit(guid, "chat: library empty, fallback card assigned");
             _logger.LogError("[CHAT-ENGINE] voice library EMPTY (or unparseable) — every bot is falling back to a " +
                              "generic card. THIS IS THE REPETITION BUG: with no library there is no voice diversity, " +
                              "and the model parrots the fallback card's few-shot lines. Build the library on the " +
@@ -163,7 +170,7 @@ public class PersonaService
         // Swear register: ±1 at 25%. Level 0 is a character trait, not a rounding error —
         // a persona written as the one clean mouth in the zone stays that way.
         if (t.SwearLevel > 0 && rng.NextDouble() < 0.25)
-            t.SwearLevel = Math.Clamp(t.SwearLevel + (rng.NextDouble() < 0.5 ? -1 : 1), 1, 3);
+            t.SwearLevel = Math.Clamp(t.SwearLevel + (rng.NextDouble() < 0.5 ? -1 : 1), 1, 3);   // cb:fold jitter detail, assignment probed at caller, no guid in reach
 
         var d = card.Disposition;
         d.Warmth = JDisp(rng, d.Warmth);
@@ -172,10 +179,10 @@ public class PersonaService
         d.Openness = JDisp(rng, d.Openness);
 
         if (card.Interests.Count > 0 && rng.NextDouble() < 0.20)
-        {
+        {   // cb:fold jitter detail, assignment probed at caller, no guid in reach
             card.Interests.RemoveAt(rng.Next(card.Interests.Count));
             var add = VoiceTables.RandomInterest(rng);
-            if (!card.Interests.Contains(add)) card.Interests.Add(add);
+            if (!card.Interests.Contains(add)) card.Interests.Add(add);   // cb:fold jitter detail, assignment probed at caller, no guid in reach
         }
     }
 

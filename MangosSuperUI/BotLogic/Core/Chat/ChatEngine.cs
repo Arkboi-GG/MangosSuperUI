@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Chat.Capacity;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Engine;
 
@@ -69,6 +70,7 @@ public class ChatEngine : IChatEngine
         using var lease = await _broker.TryAcquireAsync(TrafficClass.Reactive, ReactiveMaxWait, ct);
         if (lease == null)
         {
+            CircuitTrace.Hit(job.BotGuid, "chat: reactive lease starved, reply abandoned");
             _logger.LogWarning("[CHAT-CAP] reactive starved — no lease within {Wait}s for {Bot} (should never happen)",
                 ReactiveMaxWait.TotalSeconds, job.BotName);
             return null;

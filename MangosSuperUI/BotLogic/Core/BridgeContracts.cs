@@ -22,7 +22,7 @@ public class BridgeCommand
     {
         Type = type;
         if (payloadObj != null)
-        {
+        {   // cb:fold trivial data-shape guard, wire value object with no guid in reach
             foreach (var prop in payloadObj.GetType().GetProperties())
                 Payload[prop.Name] = prop.GetValue(payloadObj)!;
         }
@@ -36,7 +36,7 @@ public class BridgeCommand
     /// </summary>
     public BridgeCommand WithCorr(string? corr)
     {
-        if (corr != null) Payload["corr"] = corr;
+        if (corr != null) Payload["corr"] = corr;   // cb:fold trivial data-shape guard, wire value object with no guid in reach
         return this;
     }
 

@@ -2,6 +2,7 @@ using System.Text;
 using Dapper;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Engine;
 
@@ -71,21 +72,31 @@ public class PromptAssembler
             int est = EstimateTokens(system) + EstimateTokens(user);
             if (est <= cap || pass >= 6)
             {
+                CircuitTrace.Hit(job.BotGuid, "chat: prompt render accepted", est);
                 var report = $"win={window.Count}L era={EstimateTokens(eraDigest)}t snap={includeSnapshot} " +
                              $"fewshot={includeFewShot} opinions={opinions.Count} " +
                              $"swear={SwearTables.EffectiveLevel(card.Typing.SwearLevel, Banter())} " +
                              $"est={est}t cap={cap}t";
                 if (est > cap)
+                {
+                    CircuitTrace.Hit(job.BotGuid, "chat: prompt over budget after all drops", est);
                     _logger.LogWarning("[CHAT-ENGINE] prompt over budget after all drops for {Bot}: {Report}", job.BotName, report);
+                }
                 return (system, user, est, report);
             }
 
             // Drop order (§10.2)
-            if (opinions.Count > 0) { opinions.Clear(); continue; }                       // persona: trim opinions first
-            if (window.Count > 1) { window = window.Skip(window.Count / 2).ToList(); continue; } // 1st: halve, keep newest
-            if (eraDigest.Length > 0) { eraDigest = eraDigest[..(eraDigest.Length / 2)]; if (eraDigest.Length < 40) eraDigest = ""; continue; } // 2nd: halve
-            if (includeSnapshot) { includeSnapshot = false; continue; }                   // 3rd
-            if (includeFewShot) { includeFewShot = false; continue; }                     // 4th
+            if (opinions.Count > 0) { CircuitTrace.Hit(job.BotGuid, "chat: budget drop, opinions trimmed"); opinions.Clear(); continue; }                       // persona: trim opinions first
+            if (window.Count > 1) { CircuitTrace.Hit(job.BotGuid, "chat: budget drop, window halved", window.Count); window = window.Skip(window.Count / 2).ToList(); continue; } // 1st: halve, keep newest
+            if (eraDigest.Length > 0)
+            {
+                CircuitTrace.Hit(job.BotGuid, "chat: budget drop, era digest halved");
+                eraDigest = eraDigest[..(eraDigest.Length / 2)];
+                if (eraDigest.Length < 40) { CircuitTrace.Hit(job.BotGuid, "chat: era digest under floor, cleared"); eraDigest = ""; }
+                continue;
+            } // 2nd: halve
+            if (includeSnapshot) { CircuitTrace.Hit(job.BotGuid, "chat: budget drop, snapshot removed"); includeSnapshot = false; continue; }                   // 3rd
+            if (includeFewShot) { CircuitTrace.Hit(job.BotGuid, "chat: budget drop, few-shot removed"); includeFewShot = false; continue; }                     // 4th
             break;
         }
 
@@ -134,12 +145,14 @@ public class PromptAssembler
         // in 3 of 4 consecutive lines and Vase his kiosk in 3 of 4.
         if (!alreadySpoke)
         {
+            CircuitTrace.Hit(job.BotGuid, "chat: prompt full persona intro");
             sb.AppendLine($"About you: {card.Occupation}. {card.LifeSituationSeed}.");
             sb.AppendLine($"Into: {string.Join(", ", card.Interests)}.");
-            if (opinions.Count > 0) sb.AppendLine($"Things you think: {string.Join("; ", opinions)}.");
+            if (opinions.Count > 0) { CircuitTrace.Hit(job.BotGuid, "chat: prompt includes opinions", opinions.Count); sb.AppendLine($"Things you think: {string.Join("; ", opinions)}."); }
         }
         else
         {
+            CircuitTrace.Hit(job.BotGuid, "chat: prompt decayed persona intro");
             sb.AppendLine($"Into: {string.Join(", ", card.Interests)}. Your job and home situation already came up — don't bring them up again.");
         }
 
@@ -148,23 +161,29 @@ public class PromptAssembler
 
         // The bot's REAL in-game state. Always included — it is live context, not decoration.
         if (snapshot && !string.IsNullOrWhiteSpace(job.SnapshotLine))
+        {
+            CircuitTrace.Hit(job.BotGuid, "chat: prompt includes in-game snapshot");
             sb.AppendLine($"In game right now: {job.SnapshotLine}.");
+        }
         sb.AppendLine();
 
         if (!string.IsNullOrWhiteSpace(eraDigest))
         {
+            CircuitTrace.Hit(job.BotGuid, "chat: prompt includes era digest");
             sb.AppendLine(eraDigest.Trim());
             sb.AppendLine();
         }
 
         if (!string.IsNullOrWhiteSpace(job.RelationshipSummary))
         {
+            CircuitTrace.Hit(job.BotGuid, "chat: prompt includes relationship summary");
             sb.AppendLine(job.RelationshipSummary);
             sb.AppendLine();
         }
 
         if (fewShot && card.ExampleLines.Count > 0)
         {
+            CircuitTrace.Hit(job.BotGuid, "chat: prompt includes few-shot lines");
             sb.AppendLine("How you type:");
             foreach (var line in card.ExampleLines.OrderBy(_ => Random.Shared.Next()).Take(3))
                 sb.AppendLine(line);
@@ -183,13 +202,13 @@ public class PromptAssembler
         // how it would type, so the frame is chosen from Activity.
         sb.AppendLine(job.Activity switch
         {
-            ChatActivity.Fighting => "You're in the middle of a fight while you type this — short, clipped, maybe a bit late.",
-            ChatActivity.Dead => "You're dead and running back to your corpse, so you've got nothing but time to type.",
-            ChatActivity.Travelling => "You're running somewhere with autorun on, half paying attention.",
-            ChatActivity.Grinding => "You're killing mobs while you chat — typing between pulls.",
-            ChatActivity.Recovering => "You're sat down eating and drinking after a fight, so you can type properly.",
-            ChatActivity.Stuck => "You're stuck on something in the game and mildly annoyed about it.",
-            _ => "You're not doing anything in particular right now — just stood about with your party."
+            ChatActivity.Fighting => CircuitTrace.Pass("You're in the middle of a fight while you type this — short, clipped, maybe a bit late.", job.BotGuid, "chat: prompt frame fighting"),
+            ChatActivity.Dead => CircuitTrace.Pass("You're dead and running back to your corpse, so you've got nothing but time to type.", job.BotGuid, "chat: prompt frame dead"),
+            ChatActivity.Travelling => CircuitTrace.Pass("You're running somewhere with autorun on, half paying attention.", job.BotGuid, "chat: prompt frame travelling"),
+            ChatActivity.Grinding => CircuitTrace.Pass("You're killing mobs while you chat — typing between pulls.", job.BotGuid, "chat: prompt frame grinding"),
+            ChatActivity.Recovering => CircuitTrace.Pass("You're sat down eating and drinking after a fight, so you can type properly.", job.BotGuid, "chat: prompt frame recovering"),
+            ChatActivity.Stuck => CircuitTrace.Pass("You're stuck on something in the game and mildly annoyed about it.", job.BotGuid, "chat: prompt frame stuck"),
+            _ => CircuitTrace.Pass("You're not doing anything in particular right now — just stood about with your party.", job.BotGuid, "chat: prompt frame idle")
         });
 
         // ANTI-NARRATION (2026-07-20). This is the fix for "every other line is 'gonna farm
@@ -207,21 +226,22 @@ public class PromptAssembler
         // transcript of them read as a list. Length variation is most of what sounds human.
         sb.AppendLine(Random.Shared.Next(100) switch
         {
-            < 40 => "Write ONE short fragment — a few words. Not a sentence. lowercase is fine.",
-            < 80 => "Write ONE short line, under 12 words.",
-            _ => "Write one or two short sentences, under 25 words."
+            < 40 => CircuitTrace.Pass("Write ONE short fragment — a few words. Not a sentence. lowercase is fine.", job.BotGuid, "chat: reply shape fragment"),
+            < 80 => CircuitTrace.Pass("Write ONE short line, under 12 words.", job.BotGuid, "chat: reply shape short line"),
+            _ => CircuitTrace.Pass("Write one or two short sentences, under 25 words.", job.BotGuid, "chat: reply shape sentences")
         });
         sb.AppendLine($"You are {job.BotName}. Your class, race, level and location are exactly as stated above.");
         sb.AppendLine("Don't invent places or dungeons. No emojis. No quote marks around your line.");
 
         var register = SwearTables.RegisterLine(SwearTables.EffectiveLevel(card.Typing.SwearLevel, Banter()));
-        if (!string.IsNullOrEmpty(register)) sb.AppendLine(register);
+        if (!string.IsNullOrEmpty(register)) { CircuitTrace.Hit(job.BotGuid, "chat: prompt includes swear register line"); sb.AppendLine(register); }
 
         var ownRecent = window
             .Where(w => string.Equals(w.Speaker, job.BotName, StringComparison.OrdinalIgnoreCase))
             .Select(w => w.Line).TakeLast(2).ToList();
         if (ownRecent.Count > 0)
         {
+            CircuitTrace.Hit(job.BotGuid, "chat: prompt includes no-repeat block", ownRecent.Count);
             sb.AppendLine();
             sb.AppendLine("You already said these — don't repeat yourself:");
             foreach (var l in ownRecent) sb.AppendLine($"- {l}");
@@ -237,17 +257,32 @@ public class PromptAssembler
         // that produces natural turn-taking instead of narrated statements.
         var user = new StringBuilder();
         if (job.Kind == ChatKind.Whisper)
+        {
+            CircuitTrace.Hit(job.BotGuid, "chat: transcript header whisper");
             user.AppendLine($"[private whisper between you and {job.Sender}]");
+        }
         else if (job.Kind == ChatKind.Channel)
+        {
+            CircuitTrace.Hit(job.BotGuid, "chat: transcript header channel");
             user.AppendLine($"[{job.ChannelName} channel]");
+        }
         else if (job.Kind == ChatKind.Party)
+        {
+            CircuitTrace.Hit(job.BotGuid, "chat: transcript header party");
             user.AppendLine("[party chat]");
+        }
 
         if (window.Count > 0)
+        {
+            CircuitTrace.Hit(job.BotGuid, "chat: transcript from live window", window.Count);
             foreach (var (speaker, line) in window)
                 user.AppendLine($"{speaker}: {line}");
+        }
         else
+        {
+            CircuitTrace.Hit(job.BotGuid, "chat: transcript from single stimulus");
             user.AppendLine($"{job.Sender}: {job.Message}");
+        }
 
         user.Append($"{job.BotName}:");
 
@@ -257,19 +292,19 @@ public class PromptAssembler
     /// <summary>§10.6 quadrant table — one line, never numbers in the prompt.</summary>
     public static string MoodWords(float valence, float energy)
     {
-        if (Math.Abs(valence) < 0.15f && Math.Abs(energy) < 0.15f) return "normal";
+        if (Math.Abs(valence) < 0.15f && Math.Abs(energy) < 0.15f) return "normal";   // cb:fold pure prose transform for prompt, no guid in reach
         return (valence >= 0, energy >= 0) switch
         {
-            (true, true) => "in a good mood, upbeat",
-            (true, false) => "content, low-key",
-            (false, true) => "irritated, wound up",
-            (false, false) => "kind of down, tired"
+            (true, true) => "in a good mood, upbeat",   // cb:fold pure prose transform for prompt, no guid in reach
+            (true, false) => "content, low-key",   // cb:fold pure prose transform for prompt, no guid in reach
+            (false, true) => "irritated, wound up",   // cb:fold pure prose transform for prompt, no guid in reach
+            (false, false) => "kind of down, tired"   // cb:fold pure prose transform for prompt, no guid in reach
         };
     }
 
     private string RealmName()
     {
-        if (_realmName != null) return _realmName;
+        if (_realmName != null) { CircuitTrace.Hit(0, "chat: realm name cache hit"); return _realmName; }
         try
         {
             using var conn = _db.Realmd();
@@ -277,6 +312,7 @@ public class PromptAssembler
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "chat: realm name lookup failed, fallback used");
             _logger.LogWarning("[CHAT-ENGINE] realm name lookup failed ({Error}) — using fallback", ex.Message);
             _realmName = "Azeroth";
         }

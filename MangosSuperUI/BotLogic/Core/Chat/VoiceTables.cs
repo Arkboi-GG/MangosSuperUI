@@ -82,7 +82,7 @@ public static class VoiceTables
     private static AgeBand SampleAgeBand(Random rng)
     {
         double roll = rng.NextDouble(), acc = 0;
-        foreach (var b in AgeBands) { acc += b.Weight; if (roll < acc) return b; }
+        foreach (var b in AgeBands) { acc += b.Weight; if (roll < acc) return b; }   // cb:fold content table sampling, build acceptance probed in builder
         return AgeBands[^1];
     }
 
@@ -135,29 +135,29 @@ public static class VoiceTables
 
         string[] pool = region switch
         {
-            "UK" or "Ireland" => age <= 23
+            "UK" or "Ireland" => age <= 23   // cb:fold content table sampling, build acceptance probed in builder
                 ? (male ? BritYoungM : BritYoungF)
                 : (male ? BritAdultM : BritAdultF),
 
-            "Germany" => age <= 23
+            "Germany" => age <= 23   // cb:fold content table sampling, build acceptance probed in builder
                 ? (male ? GerYoungM : GerYoungF)
                 : (male ? GerAdultM : GerAdultF),
 
-            "Scandinavia" => age <= 23
+            "Scandinavia" => age <= 23   // cb:fold content table sampling, build acceptance probed in builder
                 ? (male ? ScanYoungM : ScanYoungF)
                 : (male ? ScanAdultM : ScanAdultF),
 
-            "Netherlands" => age <= 23
+            "Netherlands" => age <= 23   // cb:fold content table sampling, build acceptance probed in builder
                 ? (male ? NlYoungM : NlYoungF)
                 : (male ? NlAdultM : NlAdultF),
 
             // US-*, Canada, Australia — cohort-gated, because a first name is a birth-year stamp
-            _ => age switch
+            _ => age switch   // cb:fold content table sampling, build acceptance probed in builder
             {
-                <= 18 => male ? AngloTeenM : AngloTeenF,
-                <= 30 => male ? AngloTwentiesM : AngloTwentiesF,
-                <= 45 => male ? AngloAdultM : AngloAdultF,
-                _ => male ? AngloOlderM : AngloOlderF,
+                <= 18 => male ? AngloTeenM : AngloTeenF,   // cb:fold content table sampling, build acceptance probed in builder
+                <= 30 => male ? AngloTwentiesM : AngloTwentiesF,   // cb:fold content table sampling, build acceptance probed in builder
+                <= 45 => male ? AngloAdultM : AngloAdultF,   // cb:fold content table sampling, build acceptance probed in builder
+                _ => male ? AngloOlderM : AngloOlderF,   // cb:fold content table sampling, build acceptance probed in builder
             }
         };
 
@@ -289,11 +289,11 @@ public static class VoiceTables
         for (int i = 0; i < w.Length; i++)
         {
             acc += w[i];
-            if (roll < acc) { lvl = i; break; }
+            if (roll < acc) { lvl = i; break; }   // cb:fold content table sampling, build acceptance probed in builder
         }
 
-        if (d.Irritability > 0.65f && rng.NextDouble() < d.Irritability - 0.5f) lvl++;
-        if (d.Warmth > 0.75f && d.Irritability < 0.30f && rng.NextDouble() < 0.35) lvl--;
+        if (d.Irritability > 0.65f && rng.NextDouble() < d.Irritability - 0.5f) lvl++;   // cb:fold content table sampling, build acceptance probed in builder
+        if (d.Warmth > 0.75f && d.Irritability < 0.30f && rng.NextDouble() < 0.35) lvl--;   // cb:fold content table sampling, build acceptance probed in builder
 
         return Math.Clamp(lvl, 0, 3);
     }
@@ -305,12 +305,12 @@ public static class VoiceTables
         // (capsWeights: lower/proper/mixed/CRUISE), abbrev range, wpm mean/spread, typo range
         var (caps, abMin, abMax, wpmMean, wpmSpread, tpMin, tpMax) = band.Name switch
         {
-            "13-15" => (new[] { 0.75f, 0.00f, 0.15f, 0.10f }, 2, 3, 55f, 10f, 0.04f, 0.09f),
-            "16-18" => (new[] { 0.60f, 0.10f, 0.22f, 0.08f }, 2, 3, 60f, 12f, 0.03f, 0.08f),
-            "19-23" => (new[] { 0.48f, 0.25f, 0.24f, 0.03f }, 1, 3, 58f, 12f, 0.02f, 0.06f),
-            "24-30" => (new[] { 0.25f, 0.45f, 0.28f, 0.02f }, 1, 2, 52f, 12f, 0.02f, 0.05f),
-            "31-45" => (new[] { 0.10f, 0.68f, 0.20f, 0.02f }, 0, 2, 42f, 10f, 0.01f, 0.04f),
-            _ => (new[] { 0.05f, 0.85f, 0.10f, 0.00f }, 0, 1, 32f, 8f, 0.01f, 0.04f),
+            "13-15" => (new[] { 0.75f, 0.00f, 0.15f, 0.10f }, 2, 3, 55f, 10f, 0.04f, 0.09f),   // cb:fold content table sampling, build acceptance probed in builder
+            "16-18" => (new[] { 0.60f, 0.10f, 0.22f, 0.08f }, 2, 3, 60f, 12f, 0.03f, 0.08f),   // cb:fold content table sampling, build acceptance probed in builder
+            "19-23" => (new[] { 0.48f, 0.25f, 0.24f, 0.03f }, 1, 3, 58f, 12f, 0.02f, 0.06f),   // cb:fold content table sampling, build acceptance probed in builder
+            "24-30" => (new[] { 0.25f, 0.45f, 0.28f, 0.02f }, 1, 2, 52f, 12f, 0.02f, 0.05f),   // cb:fold content table sampling, build acceptance probed in builder
+            "31-45" => (new[] { 0.10f, 0.68f, 0.20f, 0.02f }, 0, 2, 42f, 10f, 0.01f, 0.04f),   // cb:fold content table sampling, build acceptance probed in builder
+            _ => (new[] { 0.05f, 0.85f, 0.10f, 0.00f }, 0, 1, 32f, 8f, 0.01f, 0.04f),   // cb:fold content table sampling, build acceptance probed in builder
         };
 
         string capsStyle = WeightedPick(rng, caps, new[] { "lower", "proper", "mixed", "CRUISE" });
@@ -349,7 +349,7 @@ public static class VoiceTables
     private static string WeightedPick(Random rng, float[] weights, string[] values)
     {
         double roll = rng.NextDouble(), acc = 0;
-        for (int i = 0; i < weights.Length; i++) { acc += weights[i]; if (roll < acc) return values[i]; }
+        for (int i = 0; i < weights.Length; i++) { acc += weights[i]; if (roll < acc) return values[i]; }   // cb:fold content table sampling, build acceptance probed in builder
         return values[0];
     }
 }

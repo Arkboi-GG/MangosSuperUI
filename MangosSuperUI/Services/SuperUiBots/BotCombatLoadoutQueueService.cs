@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Dapper;
+using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.Models;
 using Microsoft.AspNetCore.SignalR;
@@ -168,8 +169,11 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         await using WorldMaintenanceGate.Lease maintenance = await AcquireQueueOperationAsync();
         SemaphoreSlim gate = _botGates.GetOrAdd(guid, static _ => new SemaphoreSlim(1, 1));
         if (!await gate.WaitAsync(0, cancellationToken))
+        {
+            CircuitTrace.Hit(guid, "loadout: enqueue blocked, per-bot gate busy");
             throw QueueError(409, "queue_busy",
                 "This bot's combat build is changing right now. Refresh its live state before trying again.");
+        }
         try
         {
             return await EnqueueCoreAsync(guid, request, queuedBy, queuedFrom, cancellationToken);
@@ -208,20 +212,32 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                 new { guid }, tx, cancellationToken: cancellationToken));
 
             if (string.Equals(existing?.Status, Dispatching, StringComparison.OrdinalIgnoreCase))
+            {
+                CircuitTrace.Hit(guid, "loadout: enqueue rejected, row already dispatching");
                 throw QueueError(409, "queue_dispatching",
                     "This bot's queued build is already being dispatched and can no longer be replaced.");
+            }
             if (string.Equals(existing?.Status, Uncertain, StringComparison.OrdinalIgnoreCase))
+            {
+                CircuitTrace.Hit(guid, "loadout: enqueue rejected, prior dispatch uncertain");
                 throw QueueError(409, "queue_uncertain",
                     "The prior queued dispatch has an uncertain result. Refresh live state before dismissing or creating another build.");
+            }
 
             string expectedQueueId = (request.ExpectedQueueId ?? "").Trim().ToLowerInvariant();
             bool replaceable = existing?.Status is Waiting or Failed;
             if (replaceable && !string.Equals(expectedQueueId, existing!.QueueId, StringComparison.OrdinalIgnoreCase))
+            {
+                CircuitTrace.Hit(guid, "loadout: enqueue rejected, queue id CAS mismatch on replaceable row");
                 throw QueueError(409, "queue_changed",
                     "The queued build changed in another client. Refresh before replacing it.");
+            }
             if (!replaceable && expectedQueueId.Length > 0)
+            {
+                CircuitTrace.Hit(guid, "loadout: enqueue rejected, row no longer replaceable");
                 throw QueueError(409, "queue_changed",
                     "The queued build is no longer replaceable. Refresh its current state.");
+            }
 
             replaced = replaceable;
             await conn.ExecuteAsync(new CommandDefinition(@"
@@ -297,7 +313,9 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         catch
         {
-            try { await tx.RollbackAsync(CancellationToken.None); } catch { }
+            CircuitTrace.Hit(guid, "loadout: enqueue tx failed, rolling back");
+            try { await tx.RollbackAsync(CancellationToken.None); }
+            catch { CircuitTrace.Hit(guid, "loadout: enqueue rollback itself failed"); }
             throw;
         }
 
@@ -331,8 +349,11 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         await using WorldMaintenanceGate.Lease maintenance = await AcquireQueueOperationAsync();
         SemaphoreSlim gate = _botGates.GetOrAdd(guid, static _ => new SemaphoreSlim(1, 1));
         if (!await gate.WaitAsync(0, cancellationToken))
+        {
+            CircuitTrace.Hit(guid, "loadout: cancel blocked, per-bot gate busy");
             throw QueueError(409, "queue_busy",
                 "This bot's queued build is changing right now. Refresh its live state before trying again.");
+        }
         try
         {
             return await CancelCoreAsync(guid, expectedQueueId, expectedStatus, cancellationToken);
@@ -361,25 +382,38 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                 new { guid }, tx, cancellationToken: cancellationToken))
                 ?? throw QueueError(404, "queue_not_found", "This bot has no queued combat loadout.");
             if (IsTerminalHidden(row.Status))
+            {
+                CircuitTrace.Hit(guid, "loadout: cancel target already terminal-hidden");
                 throw QueueError(404, "queue_not_found", "This bot has no queued combat loadout.");
+            }
             if (!string.Equals(
                     (expectedQueueId ?? "").Trim(),
                     row.QueueId,
                     StringComparison.OrdinalIgnoreCase))
             {
+                CircuitTrace.Hit(guid, "loadout: cancel rejected, queue id CAS mismatch");
                 throw QueueError(409, "queue_changed",
                     "The queued build changed in another client. Refresh before cancelling or dismissing it.");
             }
             if (row.Status == Dispatching)
+            {
+                CircuitTrace.Hit(guid, "loadout: cancel rejected, dispatch already started");
                 throw QueueError(409, "queue_dispatching",
                     "The core dispatch has already started. It cannot be cancelled safely.");
+            }
             string statusToken = (expectedStatus ?? "").Trim().ToLowerInvariant();
             if (!string.Equals(statusToken, row.Status, StringComparison.OrdinalIgnoreCase))
+            {
+                CircuitTrace.Hit(guid, "loadout: cancel rejected, status CAS mismatch");
                 throw QueueError(409, "queue_changed",
                     "The queued build status changed in another client. Refresh before cancelling or dismissing it.");
+            }
             if (row.Status is not (Waiting or Failed or Uncertain))
+            {
+                CircuitTrace.Hit(guid, "loadout: cancel rejected, status not cancellable");
                 throw QueueError(409, "queue_not_cancellable",
                     "This queued build can no longer be cancelled or dismissed.");
+            }
             dismissingUncertain = row.Status == Uncertain;
             string code = dismissingUncertain ? "uncertain_dismissed" : "cancelled";
             string message = dismissingUncertain
@@ -394,13 +428,18 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                 new { guid, queueId = row.QueueId, expectedStatus = statusToken, code, message }, tx,
                 cancellationToken: cancellationToken));
             if (changed != 1)
+            {
+                CircuitTrace.Hit(guid, "loadout: cancel update CAS lost");
                 throw QueueError(409, "queue_changed",
                     "The queued build changed before it could be cancelled. Refresh its current state.");
+            }
             await tx.CommitAsync(cancellationToken);
         }
         catch
         {
-            try { await tx.RollbackAsync(CancellationToken.None); } catch { }
+            CircuitTrace.Hit(guid, "loadout: cancel tx failed, rolling back");
+            try { await tx.RollbackAsync(CancellationToken.None); }
+            catch { CircuitTrace.Hit(guid, "loadout: cancel rollback itself failed"); }
             throw;
         }
 
@@ -424,6 +463,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         WorldMaintenanceGate.Lease? startupLease = await _worldMaintenance.TryAcquireOperationAsync();
         if (startupLease != null)
         {
+            CircuitTrace.Hit(0, "loadout: startup lease acquired, recovering interrupted dispatches");
             await using (startupLease)
                 await RecoverInterruptedDispatchesAsync(stoppingToken);
         }
@@ -435,6 +475,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                 WorldMaintenanceGate.Lease? sweepLease = await _worldMaintenance.TryAcquireOperationAsync();
                 if (sweepLease != null)
                 {
+                    CircuitTrace.Hit(0, "loadout: sweep lease acquired");
                     // One lease covers claim, core acknowledgement, and terminal DB
                     // write so a restore cannot split a sweep across two snapshots.
                     await using (sweepLease)
@@ -442,17 +483,22 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                         await RecoverStaleDispatchesAsync(stoppingToken);
                         IReadOnlyList<QueueRow> due = await LoadDueRowsAsync(stoppingToken);
                         if (due.Count > 0)
+                        {
+                            CircuitTrace.Hit(0, "loadout: dispatching due queue rows", due.Count);
                             await Task.WhenAll(due.Take(MaximumConcurrentDispatches)
                                 .Select(row => DispatchOneAsync(row, stoppingToken)));
+                        }
                     }
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
+                CircuitTrace.Hit(0, "loadout: sweep cancelled, dispatcher stopping");
                 break;
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(0, "loadout: sweep failed, durable queue intact");
                 _logger.LogError(ex,
                     "[COMBAT-LOADOUT-QUEUE] sweep failed; the durable queue remains intact and will be retried");
             }
@@ -463,6 +509,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
+                CircuitTrace.Hit(0, "loadout: sweep delay cancelled, dispatcher stopping");
                 break;
             }
         }
@@ -478,13 +525,19 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         await using WorldMaintenanceGate.Lease maintenance = await AcquireQueueOperationAsync();
         SemaphoreSlim gate = _botGates.GetOrAdd(guid, static _ => new SemaphoreSlim(1, 1));
         if (!await gate.WaitAsync(0, cancellationToken))
+        {
+            CircuitTrace.Hit(guid, "loadout: direct apply blocked, per-bot gate busy");
             throw QueueError(409, "queue_busy",
                 "This bot's combat build is changing right now. Refresh its live state before trying again.");
+        }
         try
         {
             if (await HasDispatchBlockingEntryCoreAsync(guid, cancellationToken))
+            {
+                CircuitTrace.Hit(guid, "loadout: direct apply rejected, blocking queue entry exists");
                 throw QueueError(409, "queue_exists",
                     "This bot already has a pending combat build. Replace or cancel it instead of applying around the queue.");
+            }
 
             // Validation is read-only and may still honor an abandoned HTTP request.
             // Once the durable dispatch claim is inserted below, the operation owns a
@@ -520,6 +573,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                         row, Applied, result.Status, result.Message,
                         TerminalCas.OwnedDispatch, CancellationToken.None))
                 {
+                    CircuitTrace.Hit(guid, "loadout: direct apply journal CAS lost after core applied");
                     throw QueueError(409, "direct_journal_changed",
                         "The core completed the build, but its durable journal changed before completion was recorded. Refresh live state; do not repeat the reset.");
                 }
@@ -527,10 +581,12 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             }
             catch (BotCombatLoadoutException ex) when (TransientCodes.Contains(ex.Code))
             {
+                CircuitTrace.HitNote(guid, "loadout: direct apply transient rejection before mutation", ex.Code);
                 if (!await MarkTerminalAsync(
                         row, Failed, ex.Code, ex.Message,
                         TerminalCas.OwnedDispatch, CancellationToken.None))
                 {
+                    CircuitTrace.Hit(guid, "loadout: direct apply failed-mark journal CAS lost");
                     throw QueueError(409, "direct_journal_changed",
                         "The direct build was rejected before mutation, but its durable journal changed. Refresh before trying again.");
                 }
@@ -544,6 +600,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             }
             catch (BotCombatLoadoutException ex) when (UncertainAfterClaimCodes.Contains(ex.Code))
             {
+                CircuitTrace.HitNote(guid, "loadout: direct apply uncertain after claim", ex.Code);
                 await MarkTerminalAsync(
                     row, Uncertain, ex.Code,
                     ex.Message + " Automatic retry is disabled.",
@@ -552,6 +609,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             }
             catch (BotCombatLoadoutException ex)
             {
+                CircuitTrace.HitNote(guid, "loadout: direct apply failed", ex.Code);
                 await MarkTerminalAsync(
                     row, Failed, ex.Code, ex.Message,
                     TerminalCas.OwnedDispatch, CancellationToken.None);
@@ -559,6 +617,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             }
             catch (OperationCanceledException)
             {
+                CircuitTrace.Hit(guid, "loadout: direct apply interrupted after durable claim");
                 await MarkTerminalAsync(
                     row, Uncertain, "dispatch_interrupted",
                     "The direct dispatch was interrupted after its durable claim. Refresh live state; automatic retry is disabled.",
@@ -567,6 +626,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(guid, "loadout: direct apply unexpected error, marking uncertain");
                 _logger.LogError(ex,
                     "[COMBAT-LOADOUT-QUEUE] unexpected direct dispatch failure for {Bot} ({Guid}); marking uncertain",
                     row.BotName, row.Guid);
@@ -606,20 +666,27 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                 new { guid = validation.Guid }, tx, cancellationToken: cancellationToken));
 
             if (existing?.Status is Waiting or Dispatching or Uncertain)
+            {
+                CircuitTrace.Hit(validation.Guid, "loadout: direct claim rejected, pending or uncertain row exists");
                 throw QueueError(409, "queue_exists",
                     "This bot already has a pending or uncertain combat build. Review that record before applying another build.");
+            }
 
             string expectedQueueId = (originalRequest.ExpectedQueueId ?? "").Trim().ToLowerInvariant();
             bool replacingFailed = string.Equals(existing?.Status, Failed, StringComparison.OrdinalIgnoreCase);
             if (replacingFailed
                 && !string.Equals(expectedQueueId, existing!.QueueId, StringComparison.OrdinalIgnoreCase))
             {
+                CircuitTrace.Hit(validation.Guid, "loadout: direct claim rejected, failed-row CAS mismatch");
                 throw QueueError(409, "queue_changed",
                     "The prior failed build changed in another client. Refresh before replacing it.");
             }
             if (!replacingFailed && expectedQueueId.Length > 0)
+            {
+                CircuitTrace.Hit(validation.Guid, "loadout: direct claim rejected, prior row not replaceable");
                 throw QueueError(409, "queue_changed",
                     "The prior build record is no longer replaceable. Refresh its current state.");
+            }
 
             await conn.ExecuteAsync(new CommandDefinition(@"
                 INSERT INTO bot_combat_loadout_queue
@@ -696,7 +763,9 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         catch
         {
-            try { await tx.RollbackAsync(CancellationToken.None); } catch { }
+            CircuitTrace.Hit(validation.Guid, "loadout: direct claim tx failed, rolling back");
+            try { await tx.RollbackAsync(CancellationToken.None); }
+            catch { CircuitTrace.Hit(validation.Guid, "loadout: direct claim rollback itself failed"); }
             throw;
         }
 
@@ -707,6 +776,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             || row.Status != Dispatching
             || !string.Equals(row.ClaimOwner, _instanceId, StringComparison.Ordinal))
         {
+            CircuitTrace.Hit(validation.Guid, "loadout: direct claim readback mismatch, aborting before core write");
             throw QueueError(409, "direct_journal_changed",
                 "The direct build journal changed before the core write. Nothing was sent; refresh before trying again.");
         }
@@ -732,6 +802,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
     {
         if (row.IsExpired)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: queued build expired, failing");
             await MarkTerminalAsync(row, Failed, "queue_expired",
                 "The queued build expired after 15 minutes without reaching a safe state. Review the bot and queue it again.",
                 TerminalCas.Waiting, stoppingToken);
@@ -742,6 +813,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         bool connected = _bridge.Connections.ContainsKey(row.Guid);
         if (!connected || runtime == null)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: dispatch deferred, bot offline");
             await DeferAsync(row, "bot_offline", "Waiting for the bot to reconnect.", stoppingToken);
             return;
         }
@@ -749,17 +821,20 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             || DateTime.UtcNow - runtime.ConnectedAt < ConnectionHydrationDelay
             || DateTime.UtcNow - runtime.LastUpdate > MaximumStateAge)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: dispatch deferred, runtime hydrating or stale");
             await DeferAsync(row, "runtime_hydrating",
                 "Waiting for a fresh post-login state and rotation hydration.", stoppingToken);
             return;
         }
         if (runtime.IsDead)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: dispatch deferred, bot dead");
             await DeferAsync(row, "bot_dead", "Waiting for the bot to be alive.", stoppingToken);
             return;
         }
         if (runtime.InCombat)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: dispatch deferred, bot in combat");
             await DeferAsync(row, "bot_in_combat", "Waiting for the bot to leave combat.", stoppingToken);
             return;
         }
@@ -772,6 +847,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: queue payload invalid, failing");
             await MarkTerminalAsync(
                 row, Failed, "queue_payload_invalid", ex.Message,
                 TerminalCas.Waiting, stoppingToken);
@@ -780,6 +856,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
 
         if (!SameSession(row.ObservedSessionAt, runtime.ConnectedAt))
         {
+            CircuitTrace.Hit(row.Guid, "loadout: session changed since queue, failing");
             // Never carry a destructive reset intent across a reconnect. The bot
             // may have been edited elsewhere, and combatConfigRevision is scoped
             // to the live bridge session. Require an explicit review/requeue.
@@ -790,6 +867,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         else if (request.ExpectedRevision != runtime.CombatConfigRevision)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: revision stale before dispatch", runtime.CombatConfigRevision);
             await MarkTerminalAsync(row, Failed, "stale_revision",
                 $"The live combat revision changed from {request.ExpectedRevision} to {runtime.CombatConfigRevision} before dispatch.",
                 TerminalCas.Waiting, stoppingToken);
@@ -802,6 +880,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                 row.Guid, request, stoppingToken);
             if (!SameSession(row.ObservedSessionAt, validation.ObservedSessionAt))
             {
+                CircuitTrace.Hit(row.Guid, "loadout: session changed during final validation, failing");
                 await MarkTerminalAsync(row, Failed, "session_changed",
                     "The bot reconnected during final validation. Review its live build and queue the change again.",
                     TerminalCas.Waiting, stoppingToken);
@@ -812,6 +891,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                     validation.RotationFingerprint,
                     StringComparison.OrdinalIgnoreCase))
             {
+                CircuitTrace.Hit(row.Guid, "loadout: rotation fingerprint changed while waiting, failing");
                 await MarkTerminalAsync(row, Failed, "rotation_changed",
                     "The selected custom rotation changed while this build was waiting. Review it and queue the build again.",
                     TerminalCas.Waiting, stoppingToken);
@@ -820,18 +900,28 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         catch (BotCombatLoadoutException ex)
         {
+            CircuitTrace.HitNote(row.Guid, "loadout: final validation raised", ex.Code);
             if (TransientCodes.Contains(ex.Code))
+            {
+                CircuitTrace.Hit(row.Guid, "loadout: transient validation code, deferring");
                 await DeferAsync(row, ex.Code, ex.Message, stoppingToken);
+            }
             else
+            {
+                CircuitTrace.Hit(row.Guid, "loadout: permanent validation code, failing");
                 await MarkTerminalAsync(
                     row, Failed, ex.Code, ex.Message,
                     TerminalCas.Waiting, stoppingToken);
+            }
             return;
         }
 
         string requestId = Guid.NewGuid().ToString("N");
         if (!await TryClaimAsync(row, requestId, stoppingToken))
+        {
+            CircuitTrace.Hit(row.Guid, "loadout: waiting-row claim CAS lost, skipping");
             return;
+        }
 
         row.Status = Dispatching;
         row.RequestId = requestId;
@@ -855,10 +945,12 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         catch (BotCombatLoadoutException ex) when (TransientCodes.Contains(ex.Code))
         {
+            CircuitTrace.HitNote(row.Guid, "loadout: dispatch transient, returning to waiting", ex.Code);
             await ReturnToWaitingAsync(row, ex.Code, ex.Message, stoppingToken);
         }
         catch (BotCombatLoadoutException ex) when (ex.Code == "stale_revision")
         {
+            CircuitTrace.Hit(row.Guid, "loadout: dispatch failed, revision stale at core");
             await MarkTerminalAsync(
                 row, Failed, ex.Code, ex.Message,
                 TerminalCas.OwnedDispatch, stoppingToken);
@@ -867,27 +959,34 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             ex.Code is "ack_timeout" or "outcome_unknown" or "bridge_send_failed" or "rotation_persistence_failed"
                 or "ack_state_mismatch" or "rollback_failed" or "bot_offline")
         {
+            CircuitTrace.HitNote(row.Guid, "loadout: dispatch uncertain after claim", ex.Code);
             await MarkTerminalAsync(row, Uncertain, ex.Code,
                 ex.Message + " Automatic retry is disabled.",
                 TerminalCas.OwnedDispatch, CancellationToken.None);
         }
         catch (BotCombatLoadoutException ex)
         {
+            CircuitTrace.HitNote(row.Guid, "loadout: dispatch failed", ex.Code);
             await MarkTerminalAsync(
                 row, Failed, ex.Code, ex.Message,
                 TerminalCas.OwnedDispatch, stoppingToken);
         }
         catch (OperationCanceledException)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: dispatch interrupted after claim");
             await MarkTerminalAsync(row, Uncertain, "dispatch_interrupted",
                 "Dispatch was interrupted after it was claimed. Refresh live state; automatic retry is disabled.",
                 TerminalCas.OwnedDispatch, CancellationToken.None);
             if (stoppingToken.IsCancellationRequested)
+            {
+                CircuitTrace.Hit(row.Guid, "loadout: shutdown cancellation absorbed");
                 return;
+            }
             throw;
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(row.Guid, "loadout: dispatch unexpected error, marking uncertain");
             _logger.LogError(ex,
                 "[COMBAT-LOADOUT-QUEUE] unexpected dispatch failure for {Bot} ({Guid}); marking uncertain",
                 row.BotName, row.Guid);
@@ -912,12 +1011,16 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                    AND (claim_expires_at IS NULL OR claim_expires_at <= CURRENT_TIMESTAMP(3))",
                 cancellationToken: cancellationToken));
             if (changed > 0)
+            {
+                CircuitTrace.Hit(0, "loadout: interrupted dispatches recovered as uncertain", changed);
                 _logger.LogWarning(
                     "[COMBAT-LOADOUT-QUEUE] recovered {Count} interrupted dispatch(es) as uncertain; none were retried",
                     changed);
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            CircuitTrace.Hit(0, "loadout: interrupted-row recovery failed, dispatcher fails closed");
             _logger.LogError(ex,
                 "[COMBAT-LOADOUT-QUEUE] could not recover interrupted rows; dispatcher will fail closed until the queue table is available");
         }
@@ -956,7 +1059,10 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
     private async Task<QueueRow?> LoadRowAsync(int guid, CancellationToken cancellationToken)
     {
         if (guid <= 0)
+        {
+            CircuitTrace.Hit(0, "loadout: queue lookup rejected, invalid guid");
             throw QueueError(400, "guid_invalid", "A positive bot guid is required.");
+        }
         try
         {
             await using var conn = _db.Admin();
@@ -967,10 +1073,12 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         catch (BotCombatLoadoutQueueException)
         {
+            CircuitTrace.Hit(guid, "loadout: queue lookup error passthrough");
             throw;
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "loadout: queue storage unavailable");
             _logger.LogError(ex, "[COMBAT-LOADOUT-QUEUE] queue storage unavailable for guid={Guid}", guid);
             throw QueueError(503, "queue_unavailable",
                 "The durable combat-loadout queue is unavailable. No request was queued.");
@@ -1023,6 +1131,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         if (changed == 1 && (!string.Equals(row.LastCode, code, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(row.LastMessage, message, StringComparison.Ordinal)))
         {
+            CircuitTrace.HitNote(row.Guid, "loadout: defer reason changed, notifying", code);
             row.LastCode = code;
             row.LastMessage = message;
             row.NextAttemptAt = DateTime.Now + RetryDelay;
@@ -1056,7 +1165,10 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
                 queueId = row.QueueId
             }, cancellationToken: cancellationToken));
         if (changed != 1)
+        {
+            CircuitTrace.Hit(row.Guid, "loadout: return-to-waiting CAS lost");
             return;
+        }
         row.Status = Waiting;
         row.RequestId = null;
         row.LastCode = code;
@@ -1075,13 +1187,17 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
     {
         string predicate = terminalCas switch
         {
-            TerminalCas.Waiting => "AND status = 'waiting'",
-            TerminalCas.OwnedDispatch => "AND status = 'dispatching' AND claim_owner = @expectedClaimOwner",
-            TerminalCas.ExpiredDispatch => @"AND status = 'dispatching'
+            TerminalCas.Waiting => CircuitTrace.Pass("AND status = 'waiting'",
+                row.Guid, "loadout: terminal CAS on waiting row"),
+            TerminalCas.OwnedDispatch => CircuitTrace.Pass("AND status = 'dispatching' AND claim_owner = @expectedClaimOwner",
+                row.Guid, "loadout: terminal CAS on owned dispatch"),
+            TerminalCas.ExpiredDispatch => CircuitTrace.Pass(@"AND status = 'dispatching'
                 AND (claim_expires_at IS NULL OR claim_expires_at <= CURRENT_TIMESTAMP(3))
                 AND ((claim_owner = @expectedClaimOwner)
                      OR (claim_owner IS NULL AND @expectedClaimOwner IS NULL))",
-            _ => throw new ArgumentOutOfRangeException(nameof(terminalCas))
+                row.Guid, "loadout: terminal CAS on expired dispatch"),
+            _ => throw CircuitTrace.Pass(new ArgumentOutOfRangeException(nameof(terminalCas)),
+                row.Guid, "loadout: terminal CAS enum out of range")
         };
         string? expectedClaimOwner = terminalCas == TerminalCas.OwnedDispatch
             ? _instanceId
@@ -1109,7 +1225,10 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
             },
             cancellationToken: cancellationToken));
         if (changed != 1)
+        {
+            CircuitTrace.Hit(row.Guid, "loadout: terminal mark CAS lost, journal unchanged");
             return false;
+        }
         row.Status = status;
         row.LastCode = code;
         row.LastMessage = message;
@@ -1141,11 +1260,13 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            CircuitTrace.Hit(guid, "loadout: queue notify cancelled at shutdown");
             // Database state is authoritative; shutdown must not roll back or
             // reclassify a transition merely because its UI broadcast stopped.
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "loadout: queue notify broadcast failed");
             _logger.LogWarning(ex,
                 "[COMBAT-LOADOUT-QUEUE] SignalR notification failed for guid={Guid}, status={Status}",
                 guid, status);
@@ -1195,7 +1316,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
     {
         string cleaned = string.IsNullOrWhiteSpace(value) ? fallback ?? "" : value.Trim();
         if (cleaned.Length > maxLength)
-            cleaned = cleaned[..maxLength];
+            cleaned = cleaned[..maxLength];   // cb:fold pure audit-string helper, no bot context
         return cleaned.Length == 0 ? null : cleaned;
     }
 

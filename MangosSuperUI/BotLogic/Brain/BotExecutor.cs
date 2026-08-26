@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Services;
 
 namespace MangosSuperUI.BotLogic.Brain;
@@ -73,6 +74,7 @@ public sealed class BotExecutor
         // Pending unarmed so nothing waits on an event that can never come.
         if (ctx.Conscripted)
         {
+            CircuitTrace.HitNote(ctx.Guid, "issue: refused (conscripted)", cmd.Type);
             _logger.LogDebug("[EXEC] {Name} refuse {Type} (conscripted)", ctx.Name, cmd.Type);
             return;
         }
@@ -110,22 +112,24 @@ public sealed class BotExecutor
         Vec4? moveTgt = null;
         if (cmd.Type == "MOVE_TO")
         {
+            CircuitTrace.Hit(ctx.Guid, "issue: MOVE_TO destination captured");
             moveTgt = ExtractTarget(cmd);
-            if (moveTgt != null) ctx.Target = moveTgt;
+            if (moveTgt != null) ctx.Target = moveTgt;   // cb:fold outcome carried by the capture probe
         }
+        CircuitTrace.HitNote(ctx.Guid, "issue: WAIT armed + command sent", cmd.Type);
 
         // Instrumentation: a travel MOVE_TO logs dest + bot pos + distance; a QUEST_INTERACT logs the
         // npc_entry + bot pos. A premature/stale arrival ack (interact fired far from the NPC) is then a
         // one-line grep: "issue MOVE_TO -> (X,Y)" followed by "issue QUEST_INTERACT npc=N from (px,py)"
         // with (px,py) nowhere near (X,Y). Everything else logs exactly as before.
         if (cmd.Type == "MOVE_TO" && moveTgt is { } mt)
-            _logger.LogDebug("[EXEC] {Name} issue MOVE_TO map={Map} -> ({X:F0},{Y:F0}) from ({PX:F0},{PY:F0}) d={D:F0} expect={Expect} deadline={Sec}s",
+            _logger.LogDebug("[EXEC] {Name} issue MOVE_TO map={Map} -> ({X:F0},{Y:F0}) from ({PX:F0},{PY:F0}) d={D:F0} expect={Expect} deadline={Sec}s",   // cb:fold logging only
                 ctx.Name, ctx.MapId, mt.X, mt.Y, ctx.Pos.X, ctx.Pos.Y, ctx.DistToTarget, expectedEvent, deadline.TotalSeconds);
         else if (cmd.Type == "QUEST_INTERACT")
-            _logger.LogDebug("[EXEC] {Name} issue QUEST_INTERACT map={Map} npc={Npc} from ({PX:F0},{PY:F0}) expect={Expect} deadline={Sec}s",
+            _logger.LogDebug("[EXEC] {Name} issue QUEST_INTERACT map={Map} npc={Npc} from ({PX:F0},{PY:F0}) expect={Expect} deadline={Sec}s",   // cb:fold logging only
                 ctx.Name, ctx.MapId, cmd.Payload.TryGetValue("npc_entry", out var ne) ? ne : "?", ctx.Pos.X, ctx.Pos.Y, expectedEvent, deadline.TotalSeconds);
         else
-            _logger.LogDebug("[EXEC] {Name} issue {Type} expect={Expect} deadline={Sec}s",
+            _logger.LogDebug("[EXEC] {Name} issue {Type} expect={Expect} deadline={Sec}s",   // cb:fold logging only
                 ctx.Name, cmd.Type, expectedEvent, deadline.TotalSeconds);
 
         await _bridge.SendToBotAsync(ctx.Guid, cmd.Type, cmd.Payload);
@@ -143,6 +147,7 @@ public sealed class BotExecutor
         // commander, not the planner.
         if (ctx.Conscripted)
         {
+            CircuitTrace.HitNote(ctx.Guid, "fire: refused (conscripted)", cmd.Type);
             _logger.LogDebug("[EXEC] {Name} refuse {Type} (conscripted)", ctx.Name, cmd.Type);
             return;
         }
@@ -150,9 +155,11 @@ public sealed class BotExecutor
         // Parity with IssueAsync: keep distance-to-target live for MOVE_TO fires.
         if (cmd.Type == "MOVE_TO")
         {
+            CircuitTrace.Hit(ctx.Guid, "fire: MOVE_TO destination captured");
             var tgt = ExtractTarget(cmd);
-            if (tgt != null) ctx.Target = tgt;
+            if (tgt != null) ctx.Target = tgt;   // cb:fold outcome carried by the capture probe
         }
+        CircuitTrace.HitNote(ctx.Guid, "fire: no-wait command sent", cmd.Type);
 
         _logger.LogDebug("[EXEC] {Name} fire {Type} (no-wait)", ctx.Name, cmd.Type);
 
@@ -170,12 +177,14 @@ public sealed class BotExecutor
         switch (evt.EventType)
         {
             case "KILL":
+                CircuitTrace.Hit(ctx.Guid, "event: KILL received", evt.CreatureEntry);
                 // Only a REAL kill is progress. A critter/grey kill (e.g. a chicken in a farmyard) must
                 // NOT advance LastKillUtc or reset the stall nets — counting it masked the no-kills
                 // reselect AND the no-progress breaker (the farmyard-grind-forever bug). Server-side
                 // quest kill credit is unaffected (TASK_COMPLETE is authoritative in C++).
                 if (_safety.IsRealKill(evt.CreatureEntry, ctx.Level))
                 {
+                    CircuitTrace.Hit(ctx.Guid, "event: real kill, progress stamped");
                     ctx.LastKillUtc = DateTime.UtcNow;
                     ctx.MarkProgress();
                     ctx.OnGrindProgress();   // a real kill: clear the fail streak + dead-cell history
@@ -192,25 +201,32 @@ public sealed class BotExecutor
                         && ctx.Held is { Source: ObjectiveSource.Coordinator } groupObjective
                         && groupObjective.QuestId == directive.QuestId)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "event: kill credits group objective, no-path streak cleared");
                         ctx.Identity?.ClearNoPathStreak(directive.Map, directive.X, directive.Y);
                     }
                     // Refresh the objective-grind deadline on progress so a slow-but-killing bot is
                     // never false-failed mid-grind (enriched MOVE_TO or SET_TASK {kill_count=N}).
                     if (ctx.Pending is { } objWait && (objWait.CommandType == "SET_TASK" || objWait.IsObjectiveGrind))
+                    {
+                        CircuitTrace.Hit(ctx.Guid, "event: objective-grind deadline pushed by kill");
                         objWait.DeadlineUtc = DateTime.UtcNow + ObjectiveKillGrace;
+                    }
                 }
                 else
                 {
+                    CircuitTrace.Hit(ctx.Guid, "event: trash kill ignored (critter/grey)");
                     _logger.LogDebug("[EXEC] {Name} trash kill entry={Entry} (critter/grey) — not progress",
                         ctx.Name, evt.CreatureEntry);
                 }
                 break;
             case "QUEST_UPDATE":
             case "QUEST_COMPLETE_ACK":
+                CircuitTrace.Hit(ctx.Guid, "event: quest advance stamped");
                 ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
                 break;
             case "QUEST_ACCEPT_ACK":
+                CircuitTrace.Hit(ctx.Guid, "event: quest accept stamped");
                 ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
                 // No cache seed anymore. ctx.QuestLog is fed exclusively by STATE (the retired pull), so the
@@ -221,6 +237,7 @@ public sealed class BotExecutor
                 // idempotent, so it's one wasted interact at worst. Strictly better than the old stale-cache class.)
                 break;
             case "LEVEL_UP":
+                CircuitTrace.Hit(ctx.Guid, "event: level-up stamped");
                 ctx.LastLevelUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
                 ctx.OnGrindProgress();
@@ -231,6 +248,7 @@ public sealed class BotExecutor
             // empty-payload guard and dropped-held instrumentation) is gone with it. C++ no longer emits this
             // event because nothing sends QUERY_QUEST_STATUS.
             case "TELEPORT_ACK":
+                CircuitTrace.Hit(ctx.Guid, "event: teleport ack, position snapped");
                 // Teleport-assist: the bot was relocated (NearTeleportTo). Update Pos from the ack
                 // payload (x|y|z|map) IMMEDIATELY so the planner sees DistToTarget≈0 and fires the
                 // interaction THIS cycle — the 5 s STATE cadence would otherwise lag the new pos and
@@ -239,11 +257,11 @@ public sealed class BotExecutor
                 {
                     var tk = ParsePipe(evt.Data);
                     if (tk.TryGetValue("x", out var txs) && tk.TryGetValue("y", out var tys))
-                    {
+                    {   // cb:fold parse detail, outcome carried by the ack probe
                         float tz = tk.TryGetValue("z", out var tzs) ? ParseF(tzs) : ctx.Pos.Z;
                         ctx.Pos = new Vec3(ParseF(txs), ParseF(tys), tz);
                         if (tk.TryGetValue("map", out var tms) && int.TryParse(tms, out var tmap))
-                            ctx.MapId = tmap;
+                            ctx.MapId = tmap;   // cb:fold parse detail
                     }
                 }
                 break;
@@ -259,10 +277,11 @@ public sealed class BotExecutor
                 // Not a WAIT ack and not progress; bump the fail streak so the wedge breaker stays a backstop
                 // (a successful detour's TASK_COMPLETE resets it).
                 {
+                    CircuitTrace.Hit(ctx.Guid, "event: GRIND_BLOCKED handback -> failure for detour");
                     var gb = ParsePipe(evt.Data);
                     Vec4? dead = null;
                     if (gb.TryGetValue("x", out var gxs) && gb.TryGetValue("y", out var gys))
-                    {
+                    {   // cb:fold parse detail, outcome carried in the failure record
                         float gz = gb.TryGetValue("z", out var gzs) ? ParseF(gzs) : ctx.Pos.Z;
                         dead = new Vec4(ParseF(gxs), ParseF(gys), gz, ctx.MapId);
                     }
@@ -298,10 +317,14 @@ public sealed class BotExecutor
         // duplicate recorder inside TryNegate is removed so a waited fail doesn't double-count.
         if (evt.EventType == "MOVE_FAILED" && ctx.Identity is { } idNoPath)
         {
+            CircuitTrace.Hit(ctx.Guid, "event: MOVE_FAILED durable bookkeeping");
             var mfk = ParsePipe(evt.Data);
             if (mfk.TryGetValue("reason", out var mfr) && mfr == "no_path"
                 && mfk.TryGetValue("dest_x", out var mfx) && mfk.TryGetValue("dest_y", out var mfy))
+            {
+                CircuitTrace.Hit(ctx.Guid, "event: no_path streak recorded");
                 idNoPath.RecordNoPath(ctx.MapId, ParseF(mfx), ParseF(mfy));
+            }
 
             // [FINDING_020] Island streak. The core tags a MOVE_FAILED start_isolated=1 when the bot's
             // OWN start cannot path ~20yd in any direction (navmesh island / WMO pocket / harbour water).
@@ -310,9 +333,11 @@ public sealed class BotExecutor
             // above) and let BotBrain.TryEscapeIslandAsync port it out. Moving >10yd resets the streak.
             if (mfk.TryGetValue("start_isolated", out var iso) && iso == "1")
             {
+                CircuitTrace.Hit(ctx.Guid, "event: start-isolated fail counted");
                 float sdx = ctx.Pos.X - idNoPath.IslandStreakX, sdy = ctx.Pos.Y - idNoPath.IslandStreakY;
                 if (idNoPath.IslandStreak == 0 || (sdx * sdx + sdy * sdy) > 10f * 10f)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "event: island streak restarted (new spot)");
                     idNoPath.IslandStreak = 0;
                     idNoPath.IslandStreakX = ctx.Pos.X;
                     idNoPath.IslandStreakY = ctx.Pos.Y;
@@ -321,26 +346,27 @@ public sealed class BotExecutor
             }
             else if (idNoPath.IslandStreak > 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "event: island streak cleared (non-isolated fail)");
                 // a non-isolated failure means the start CAN path somewhere — not an island
                 idNoPath.IslandStreak = 0;
             }
         }
 
         var pending = ctx.Pending;
-        if (pending == null) return false;
+        if (pending == null) { CircuitTrace.Hit(ctx.Guid, "event: no WAIT outstanding"); return false; }
 
         // Negative outcome FIRST: a failure event that NEGATES the matching WAIT
         // (the no_path-plateau fix). MOVE_FAILED/PATH_UNSAFE negate a MOVE_TO WAIT;
         // QUEST_INTERACT_FAIL negates a QUEST_INTERACT WAIT. Clears the WAIT + stamps
         // ctx.Failure so the planner escapes now, not after the (generous) deadline.
         // No MarkProgress — a failure is not progress.
-        if (TryNegate(ctx, pending, evt)) return true;
+        if (TryNegate(ctx, pending, evt)) { CircuitTrace.Hit(ctx.Guid, "event: WAIT negated by failure event"); return true; }
 
         // Positive ack: match purely by event type (corr is story-file-only — §5.2).
         // One outstanding command per bot, so at most one WAIT to satisfy.
         bool typeMatch = !string.IsNullOrEmpty(pending.ExpectedEvent)
                          && string.Equals(evt.EventType, pending.ExpectedEvent, StringComparison.OrdinalIgnoreCase);
-        if (!typeMatch) return false;
+        if (!typeMatch) { CircuitTrace.Hit(ctx.Guid, "event: does not match the outstanding WAIT"); return false; }
 
         // Stale/duplicate TASK_COMPLETE guard (premature-arrival fix). A PLAIN travel MOVE_TO only
         // truly completes when the bot is AT the dest. Because acks match by type only (no corr), a
@@ -353,6 +379,7 @@ public sealed class BotExecutor
             && pending.AgeSec < PrematureArrivalSec
             && ctx.DistToTarget >= 0 && ctx.DistToTarget > ArrivalGateYards)
         {
+            CircuitTrace.Hit(ctx.Guid, "event: premature TASK_COMPLETE ignored (stale duplicate)", ctx.DistToTarget);
             _logger.LogDebug("[EXEC] {Name} ignoring premature TASK_COMPLETE — {D:F0}yd out, leg only {A:F1}s old (stale duplicate)",
                 ctx.Name, ctx.DistToTarget, pending.AgeSec);
             return false;   // a too-young far arrival is a previous-leg duplicate; wait for the real one
@@ -376,6 +403,7 @@ public sealed class BotExecutor
             && pending.QuestId is int rewardedId
             && ctx.Identity is { } rid)
         {
+            CircuitTrace.Hit(ctx.Guid, "event: quest rewarded, completion stamped durable", rewardedId);
             rid.CompletedQuestIds.Add(rewardedId);
             rid.QuestDeferralCounts.Remove(rewardedId);
             rid.QuestOverflowGrinds.Remove(rewardedId);
@@ -385,8 +413,12 @@ public sealed class BotExecutor
         }
 
         if (pending.CommandType == "MOVE_TO" && ctx.Target is { } reached && ctx.Identity is { } moveId)
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: arrival clears the no-path streak");
             moveId.ClearNoPathStreak(reached.Map, reached.X, reached.Y);
+        }
 
+        CircuitTrace.HitNote(ctx.Guid, "event: WAIT acked, progress stamped", pending.CommandType);
         ctx.Pending = null;
         ctx.MarkProgress();
         ctx.ConsecutiveFailures = 0;   // a real ack breaks any fail streak
@@ -423,7 +455,11 @@ public sealed class BotExecutor
         // immediately instead of burning the 10 s TELEPORT_ACK deadline. Carries reason=<code>.
         bool teleportFail = evt.EventType == "TELEPORT_FAIL"
                             && pending.CommandType == "TELEPORT_TO";
-        if (!moveFail && !interactFail && !trainFail && !sellFail && !repairFail && !teleportFail) return false;
+        if (!moveFail && !interactFail && !trainFail && !sellFail && !repairFail && !teleportFail)
+        {
+            CircuitTrace.Hit(ctx.Guid, "negate: event is not a failure for this WAIT");
+            return false;
+        }
 
         var kv = ParsePipe(evt.Data);
 
@@ -437,7 +473,7 @@ public sealed class BotExecutor
 
         Vec4? dest = null;
         if (kv.TryGetValue("dest_x", out var dxs) && kv.TryGetValue("dest_y", out var dys))
-        {
+        {   // cb:fold parse detail, outcome carried in the failure record
             float dz = kv.TryGetValue("dest_z", out var dzs) ? ParseF(dzs) : ctx.Pos.Z;
             dest = new Vec4(ParseF(dxs), ParseF(dys), dz, ctx.MapId);
         }
@@ -456,6 +492,7 @@ public sealed class BotExecutor
             Utc = DateTime.UtcNow
         };
 
+        CircuitTrace.HitNote(ctx.Guid, "negate: failure stamped, WAIT cleared", reason);
         _logger.LogDebug("[EXEC] {Name} WAIT negated: {Cmd} ← {Evt} reason={Reason}",
             ctx.Name, pending.CommandType, evt.EventType, reason);
 
@@ -481,7 +518,7 @@ public sealed class BotExecutor
 
     private static string FirstBareSegment(string? data)
     {
-        if (string.IsNullOrEmpty(data)) return "";
+        if (string.IsNullOrEmpty(data)) return "";   // cb:fold pure helper
         var first = data.Split('|', 2)[0].Trim();
         return first.Contains('=') ? "" : first;
     }
@@ -495,7 +532,7 @@ public sealed class BotExecutor
         if (!cmd.Payload.TryGetValue("x", out var xo) ||
             !cmd.Payload.TryGetValue("y", out var yo) ||
             !cmd.Payload.TryGetValue("z", out var zo))
-            return null;
+            return null;   // cb:fold pure helper
         int map = cmd.Payload.TryGetValue("mapId", out var mo) ? ToInt(mo) : 0;
         return new Vec4(ToFloat(xo), ToFloat(yo), ToFloat(zo), map);
     }
@@ -504,8 +541,8 @@ public sealed class BotExecutor
     // anonymous-object int). Null for every other command type, or if the key is somehow absent.
     private static int? ExtractQuestId(BridgeCommand cmd)
     {
-        if (cmd.Type != "QUEST_INTERACT") return null;
-        if (!cmd.Payload.TryGetValue("quest_id", out var qo)) return null;
+        if (cmd.Type != "QUEST_INTERACT") return null;   // cb:fold pure helper
+        if (!cmd.Payload.TryGetValue("quest_id", out var qo)) return null;   // cb:fold pure helper
         return qo is IConvertible ? Convert.ToInt32(qo) : (int?)null;
     }
 

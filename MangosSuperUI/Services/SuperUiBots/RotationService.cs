@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text;
 using System.Text.RegularExpressions;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.Services;
 
@@ -101,10 +102,10 @@ public class RotationService
 
     private static int TargetToWire(string target) => target.Trim().ToUpperInvariant() switch
     {
-        "SELF" => 0,
-        "CURRENT_TARGET" => 1,
-        "LOWEST_HP_PARTY" => 2,
-        _ => 1   // unknown kinds degrade to CURRENT_TARGET; the profile lists valid names
+        "SELF" => CircuitTrace.Pass(0, 0, "rotation: target wire self"),
+        "CURRENT_TARGET" => CircuitTrace.Pass(1, 0, "rotation: target wire current target"),
+        "LOWEST_HP_PARTY" => CircuitTrace.Pass(2, 0, "rotation: target wire lowest hp party"),
+        _ => CircuitTrace.Pass(1, 0, "rotation: unknown target degraded to current")   // unknown kinds degrade to CURRENT_TARGET; the profile lists valid names
     };
 
     public sealed record PreparedRotation(
@@ -172,12 +173,13 @@ public class RotationService
         foreach (var file in Directory.EnumerateFiles(_dir, "*.json"))
         {
             if (string.Equals(Path.GetFileName(file), "assignments.json", StringComparison.OrdinalIgnoreCase))
-                continue;
+                continue;   // cb:fold profile-file enumeration detail, no per-bot routing
             try
             {
                 var p = JsonSerializer.Deserialize<RotationProfile>(File.ReadAllText(file), JsonOpts);
                 if (p == null || string.IsNullOrWhiteSpace(p.Name) || p.Instructions == null || p.Instructions.Count == 0)
                 {
+                    CircuitTrace.Hit(0, "rotation: profile file invalid, ignored");
                     _logger.LogWarning("[ROTATION] profile file '{File}' is empty/nameless — ignored", file);
                     continue;
                 }
@@ -185,6 +187,7 @@ public class RotationService
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(0, "rotation: profile file parse failed, ignored");
                 _logger.LogWarning("[ROTATION] profile file '{File}' failed to parse: {Err}", file, ex.Message);
             }
         }
@@ -204,56 +207,95 @@ public class RotationService
     {
         string requested = (profileName ?? "").Trim();
         if (requested.Length == 0)
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, profile name empty");
             throw new RotationValidationException("rotation_profile_required", "A custom rotation profile is required.");
+        }
 
         var matches = LoadProfiles()
             .Where(p => string.Equals(p.Name, requested, StringComparison.OrdinalIgnoreCase))
             .ToArray();
         if (matches.Length == 0)
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, profile not found");
             throw new RotationValidationException("rotation_profile_not_found", $"Rotation profile '{requested}' was not found.");
+        }
         if (matches.Length > 1)
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, profile ambiguous");
             throw new RotationValidationException("rotation_profile_ambiguous", $"Rotation profile id '{requested}' is defined more than once.");
+        }
         var profile = matches[0];
 
         string name = profile.Name.Trim();
         if (!SafeProfileId.IsMatch(name) || Encoding.UTF8.GetByteCount(name) > MaxProfileIdUtf8Bytes)
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, profile id invalid");
             throw new RotationValidationException("rotation_profile_id_invalid",
                 "Rotation profile ids must be 1-63 ASCII letters, digits, dots, underscores, or hyphens.");
+        }
         if (profile.ClassId != classId)
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, class mismatch");
             throw new RotationValidationException("rotation_class_mismatch",
                 $"Rotation '{name}' is for class {profile.ClassId}, not class {classId}.");
+        }
         int[] allowedSpecTabs = profile.AllowedSpecTabs ?? Array.Empty<int>();
         int[] allowedRoles = profile.AllowedRoles ?? Array.Empty<int>();
         if (allowedSpecTabs.Length == 0 || !allowedSpecTabs.Contains(specTab))
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, spec not allowed");
             throw new RotationValidationException("rotation_spec_mismatch",
                 $"Rotation '{name}' does not allow specialization slot {specTab}.");
+        }
         if (allowedRoles.Length == 0 || !allowedRoles.Contains(activeRole))
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, role not allowed");
             throw new RotationValidationException("rotation_role_mismatch",
                 $"Rotation '{name}' does not allow combat role {activeRole}.");
+        }
         if (profile.Instructions.Count == 0 || profile.Instructions.Count > MaxInstructions)
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, instruction count invalid", profile.Instructions.Count);
             throw new RotationValidationException("rotation_instruction_count_invalid",
                 $"Rotation '{name}' must contain between 1 and {MaxInstructions} instructions.");
+        }
 
         for (int index = 0; index < profile.Instructions.Count; index++)
         {
             var instruction = profile.Instructions[index];
             string label = $"Rotation '{name}' instruction {index + 1}";
             if (instruction.SpellId == 0)
+            {
+                CircuitTrace.Hit(0, "rotation: prepare rejected, instruction missing spell");
                 throw new RotationValidationException("rotation_spell_invalid", $"{label} has no spell id.");
+            }
             if (instruction.Priority is < 0 or > 10000)
+            {
+                CircuitTrace.Hit(0, "rotation: prepare rejected, priority out of range", instruction.Priority);
                 throw new RotationValidationException("rotation_priority_invalid", $"{label} has priority outside 0-10000.");
+            }
             if (instruction.HpMin is < 0 or > 100 || instruction.HpMax is < 0 or > 100 || instruction.HpMin > instruction.HpMax)
+            {
+                CircuitTrace.Hit(0, "rotation: prepare rejected, health window invalid");
                 throw new RotationValidationException("rotation_health_window_invalid", $"{label} has an invalid health window.");
+            }
 
             string target = (instruction.Target ?? "").Trim().ToUpperInvariant();
             if (target is not ("SELF" or "CURRENT_TARGET" or "LOWEST_HP_PARTY"))
+            {
+                CircuitTrace.Hit(0, "rotation: prepare rejected, unsupported target");
                 throw new RotationValidationException("rotation_target_invalid", $"{label} has unsupported target '{instruction.Target}'.");
+            }
         }
 
         string data = BuildWireData(profile);
         if (Encoding.UTF8.GetByteCount(data) > MaxWireDataUtf8Bytes)
+        {
+            CircuitTrace.Hit(0, "rotation: prepare rejected, wire payload too large");
             throw new RotationValidationException("rotation_payload_too_large",
                 $"Rotation '{name}' exceeds the bridge payload limit of {MaxWireDataUtf8Bytes} UTF-8 bytes.");
+        }
 
         return new PreparedRotation(
             name,
@@ -315,9 +357,15 @@ public class RotationService
         string bot = (botName ?? "").Trim();
         string profile = (profileName ?? "").Trim();
         if (bot.Length == 0)
+        {
+            CircuitTrace.Hit(0, "rotation: commit rejected, bot name empty");
             throw new ArgumentException("A bot name is required.", nameof(botName));
+        }
         if (!SafeProfileId.IsMatch(profile))
+        {
+            CircuitTrace.Hit(0, "rotation: commit rejected, profile id invalid");
             throw new ArgumentException("The rotation profile id is invalid.", nameof(profileName));
+        }
 
         lock (_gate)
         {
@@ -330,6 +378,7 @@ public class RotationService
             }
             catch
             {
+                CircuitTrace.Hit(0, "rotation: commit save failed, memory rolled back");
                 _assignments = before;
                 throw;
             }
@@ -344,7 +393,10 @@ public class RotationService
     {
         string bot = (botName ?? "").Trim();
         if (bot.Length == 0)
+        {
+            CircuitTrace.Hit(0, "rotation: clear rejected, bot name empty");
             throw new ArgumentException("A bot name is required.", nameof(botName));
+        }
 
         lock (_gate)
         {
@@ -352,7 +404,10 @@ public class RotationService
             var before = new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase);
             bool removed = _assignments.Remove(bot);
             if (!removed)
+            {
+                CircuitTrace.Hit(0, "rotation: clear no-op, no assignment present");
                 return false;
+            }
             try
             {
                 SaveAssignments();
@@ -360,6 +415,7 @@ public class RotationService
             }
             catch
             {
+                CircuitTrace.Hit(0, "rotation: clear save failed, memory rolled back");
                 _assignments = before;
                 throw;
             }
@@ -375,7 +431,10 @@ public class RotationService
     {
         var profile = FindProfile(profileName);
         if (profile == null)
+        {
+            CircuitTrace.Hit(0, "rotation: assign failed, profile not found");
             return $"profile '{profileName}' not found (have: {string.Join(", ", LoadProfiles().Select(p => p.Name))})";
+        }
 
         lock (_gate)
         {
@@ -388,6 +447,7 @@ public class RotationService
             }
             catch
             {
+                CircuitTrace.Hit(0, "rotation: assign save failed, memory rolled back");
                 _assignments = before;
                 throw;
             }
@@ -396,6 +456,7 @@ public class RotationService
         var bot = FindOnlineBot(botName);
         if (bot == null)
         {
+            CircuitTrace.Hit(0, "rotation: assignment persisted, bot offline");
             _logger.LogInformation("[ROTATION] '{Profile}' assigned to {Bot} (offline — pushes on next HELLO)", profile.Name, botName);
             return $"assigned '{profile.Name}' to {botName} (offline — pushes on next login)";
         }
@@ -415,12 +476,14 @@ public class RotationService
             had = _assignments.Remove(botName.Trim());
             if (had)
             {
+                CircuitTrace.Hit(0, "rotation: clearing persisted assignment");
                 try
                 {
                     SaveAssignments();
                 }
                 catch
                 {
+                    CircuitTrace.Hit(0, "rotation: clear-async save failed, memory rolled back");
                     _assignments = before;
                     throw;
                 }
@@ -429,7 +492,10 @@ public class RotationService
 
         var bot = FindOnlineBot(botName);
         if (bot != null)
+        {
+            CircuitTrace.Hit(bot.Value.guid, "rotation: live slate cleared, vanilla resumes");
             await _bridge.SendToBotAsync(bot.Value.guid, "LOAD_ROTATION", new { profile = "", data = "" });
+        }
 
         _logger.LogInformation("[ROTATION] {Bot}: assignment cleared (had={Had}, online={Online})", botName, had, bot != null);
         return had ? $"cleared {botName} — vanilla class AI resumes" : $"{botName} had no assignment";
@@ -454,7 +520,10 @@ public class RotationService
     {
         ArgumentNullException.ThrowIfNull(registration);
         if (Interlocked.Exchange(ref registration.Started, 1) != 0)
+        {
+            CircuitTrace.Hit(registration.Connection.Guid, "rotation: hello hydration already started");
             return;
+        }
         _ = CompleteHelloHydrationAsync(registration);
     }
 
@@ -483,7 +552,10 @@ public class RotationService
     {
         ArgumentNullException.ThrowIfNull(connection);
         if (_helloHydrations.TryGetValue(connection, out HelloHydrationRegistration? hydration))
+        {
+            CircuitTrace.Hit(connection.Guid, "rotation: waiting on hello hydration to settle");
             await hydration.Completion.Task.WaitAsync(cancellationToken);
+        }
     }
 
     private async Task CompleteHelloHydrationAsync(HelloHydrationRegistration registration)
@@ -499,6 +571,7 @@ public class RotationService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(registration.Connection.Guid, "rotation: hello replay failed, settling");
             // A failed replay must be observed, but it must also settle so a new
             // atomic loadout can safely replace it rather than waiting forever.
             _logger.LogError(ex,
@@ -522,11 +595,15 @@ public class RotationService
             _assignments.TryGetValue(name.Trim(), out profileName);
         }
         if (profileName == null)
+        {
+            CircuitTrace.Hit(registration.Connection.Guid, "rotation: no persisted assignment on hello");
             return;
+        }
 
         var profile = FindProfile(profileName);
         if (profile == null)
         {
+            CircuitTrace.Hit(registration.Connection.Guid, "rotation: assigned profile file missing, nothing replayed");
             _logger.LogWarning("[ROTATION] {Bot} is assigned '{Profile}' but no such profile file exists — nothing pushed", name, profileName);
             return;
         }
@@ -560,7 +637,10 @@ public class RotationService
     {
         foreach (var kvp in _bridge.Connections)
             if (string.Equals(kvp.Value.State.Name, botName, StringComparison.OrdinalIgnoreCase))
+            {
+                CircuitTrace.Hit(kvp.Key, "rotation: online bot matched by name");
                 return (kvp.Key, kvp.Value.State.Name);
+            }
         return null;
     }
 
@@ -579,15 +659,19 @@ public class RotationService
                 var botName = assignment.Key.Trim();
                 var profileName = assignment.Value?.Trim();
                 if (botName.Length > 0 && !string.IsNullOrWhiteSpace(profileName))
-                    _assignments[botName] = profileName;
+                    _assignments[botName] = profileName;   // cb:fold assignment-file load detail, no per-bot routing
             }
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "rotation: assignments file parse failed, starting empty");
             _logger.LogWarning("[ROTATION] assignments.json failed to parse ({Err}) — starting empty", ex.Message);
             _assignments = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (throwOnError)
+            {
+                CircuitTrace.Hit(0, "rotation: assignments load failure escalated");
                 throw new IOException($"Could not load rotation assignments from '{_assignmentsPath}'.", ex);
+            }
         }
     }
 
@@ -607,6 +691,7 @@ public class RotationService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "rotation: assignments save failed");
             _logger.LogWarning("[ROTATION] failed to save assignments.json: {Err}", ex.Message);
             throw new IOException($"Could not save rotation assignments to '{_assignmentsPath}'.", ex);
         }
@@ -615,10 +700,11 @@ public class RotationService
             try
             {
                 if (File.Exists(tempPath))
-                    File.Delete(tempPath);
+                    File.Delete(tempPath);   // cb:fold temp-file cleanup detail, no per-bot routing
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(0, "rotation: temp assignment file cleanup failed");
                 _logger.LogDebug(ex, "[ROTATION] could not remove temporary assignment file '{Path}'", tempPath);
             }
         }

@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Dapper;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Coordinator;
 
@@ -90,10 +91,14 @@ public class UrgeScorer
                     "SELECT spontaneity AS Spontaneity, chat_style AS ChatStyle FROM bot_personality WHERE bot_guid=@guid",
                     new { guid });
                 if (row != null)
+                {
+                    CircuitTrace.Hit(guid, "chat: personality row loaded for urge scoring");
                     return (row.Spontaneity, Chattiness.FromChatStyle(row.ChatStyle));
+                }
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(guid, "chat: personality read failed, defaults used");
                 _logger.LogWarning("[CHAT-COORD] bot_personality read failed for {Guid}: {Error}", guid, ex.Message);
             }
             return (0.5f, 0.5f);   // rolled-average defaults when the row is missing

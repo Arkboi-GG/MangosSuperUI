@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Planners;
 
@@ -86,11 +87,13 @@ public sealed class GrindPlanner : IBotPlanner
 
         if (empty != null && ctx.Identity is { } hid)
         {
+            CircuitTrace.HitNote(ctx.Guid, "grind: barren verdict", empty.Reason);
             ctx.Failure = null;
             ctx.RecordDeadGrindCell(empty.Dest?.X ?? snap.X, empty.Dest?.Y ?? snap.Y);
 
             if (ctx.InCombat || ctx.InPlayerParty)
             {
+                CircuitTrace.Hit(ctx.Guid, "grind-hub: port blocked by combat/party, parking");
                 hid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
                 ctx.Grind = null;
                 _log.LogInformation("[GRIND-HUB] {Name} empty grind but combat/player-party blocks port — parking {P}s",
@@ -100,6 +103,7 @@ public sealed class GrindPlanner : IBotPlanner
 
             if (hid.GrindHubJumpCooldownUntil is DateTime hcd && DateTime.UtcNow < hcd)
             {
+                CircuitTrace.Hit(ctx.Guid, "grind-hub: in jump cooldown, parking");
                 hid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
                 ctx.Grind = null;
                 _log.LogInformation("[GRIND-HUB] {Name} empty grind during hub-jump cooldown — parking {P}s",
@@ -117,6 +121,7 @@ public sealed class GrindPlanner : IBotPlanner
 
             if (hub is { } h)
             {
+                CircuitTrace.Hit(ctx.Guid, "grind-hub: cross-continent camp jump issued");
                 hid.GrindHubJumpCooldownUntil = DateTime.UtcNow.AddMinutes(GrindHubJumpCooldownMin);
                 hid.GrindHubJumpRotation++;
                 hid.GrindLockUntil = null;
@@ -144,6 +149,7 @@ public sealed class GrindPlanner : IBotPlanner
 
             // No camp data is safer than a blind teleport. Park and let the existing wedge ladder
             // remain the fail-safe; this path is visible and bounded rather than lying as Grinding.
+            CircuitTrace.Hit(ctx.Guid, "grind-hub: no camp on either continent, parking");
             hid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
             ctx.Grind = null;
             _log.LogWarning("[GRIND-HUB] {Name} no level-safe camp found on either continent — parking {P}s",
@@ -158,6 +164,7 @@ public sealed class GrindPlanner : IBotPlanner
         // so there is no WAIT that could false-stall a killing bot).
         if (ctx.Grind == null)
         {
+            CircuitTrace.Hit(ctx.Guid, "grind: not armed yet");
             // GUARD-TOWN BAIL (FINDING_005). Never arm a filler grind while standing in an ENEMY city-guard
             // cell: city guards social-assist + respawn, so an L18 that strayed into Menethil grinds L47
             // guards forever (100-attacker chain-pull → 1%-HP grind-lock). The C++ SelectGrindTarget
@@ -168,6 +175,7 @@ public sealed class GrindPlanner : IBotPlanner
             if (_safety.IsLoaded &&
                 _safety.IsEnemyGuardCell(snap.MapId, snap.X, snap.Y, ZoneSafetyMap.TeamFromFaction(ctx.Identity?.Faction)))
             {
+                CircuitTrace.Hit(ctx.Guid, "grind: refusing enemy guard cell, parking");
                 ctx.RecordDeadGrindCell(snap.X, snap.Y);
                 // PARK, don't just Block: Block → OnStall → ReselectGoal re-enters Grinding next tick
                 // (grind-lock / pick=0 hasn't changed), which re-bails here at tick speed — observed
@@ -176,7 +184,10 @@ public sealed class GrindPlanner : IBotPlanner
                 // future-stamp LastProgressUtc, so the real wedge breaker still accrues no-progress and
                 // runs its park→dead-cell→escalation ladder on schedule.
                 if (ctx.Identity is { } gid)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "grind: guard-cell park stamped");
                     gid.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(GuardTownParkSec);
+                }
                 _log.LogWarning(
                     "[GRIND] {Name} refusing filler grind in enemy guard cell @ ({X:F0},{Y:F0}) map {M} — parking {P}s (FINDING_005)",
                     ctx.Name, snap.X, snap.Y, snap.MapId, GuardTownParkSec);
@@ -192,15 +203,20 @@ public sealed class GrindPlanner : IBotPlanner
             // cooldown window, and every failure path falls through to today's arm-here behavior —
             // worst case is exactly the status quo.
             if (ctx.Identity is { } rid)
-            {
+            {   // cb:fold identity gate, every inner arm probed
                 if (rid.GrindRelocating && ctx.Failure is { CommandType: "MOVE_TO" } rf)
                 {
+                    CircuitTrace.HitNote(ctx.Guid, "grind-relocate: leg failed, arming in place", rf.Reason);
                     // relocate leg failed — grind here as before; this window's attempt is spent
                     if (rf.Reason is "no_path" or "empty_path")
                     {
+                        CircuitTrace.Hit(ctx.Guid, "grind-relocate: failed dest recorded dead");
                         // [FINDING_020] an isolated START says nothing about the dest — keep it per-bot only
                         if (!rf.StartIsolated)
+                        {
+                            CircuitTrace.Hit(ctx.Guid, "grind-relocate: fleet-wide no-path dest recorded");
                             _safety.RecordNoPathDest(snap.MapId, rid.GrindRelocateX, rid.GrindRelocateY);
+                        }
                         ctx.RecordDeadGrindCell(rid.GrindRelocateX, rid.GrindRelocateY);
                     }
                     rid.ClearGrindRelocate();
@@ -210,21 +226,27 @@ public sealed class GrindPlanner : IBotPlanner
                 }
                 else if (rid.GrindRelocating)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "grind-relocate: leg in flight, checking arrival");
                     float rdx = snap.X - rid.GrindRelocateX, rdy = snap.Y - rid.GrindRelocateY;
                     if (rdx * rdx + rdy * rdy <= 20f * 20f)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "grind-relocate: arrived, arming at new spot");
                         rid.ClearGrindRelocate();   // arrived — fall through, arm at the NEW spot
                         _log.LogInformation("[GRIND] {Name} relocate arrived @ ({X:F0},{Y:F0}) — arming grind",
                             ctx.Name, snap.X, snap.Y);
                     }
                     else
+                    {
+                        CircuitTrace.Hit(ctx.Guid, "grind-relocate: still walking the leg");
                         return StepResult.Wait();   // C++ is still walking the relocate leg
+                    }
                 }
                 else if (rid.GrindLockUntil is DateTime rgl && DateTime.UtcNow < rgl
                     && (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds > KillRecencySec
                     && !(rid.GrindRelocateCooldownUntil is DateTime rcd && DateTime.UtcNow < rcd)
                     && _safety.IsLoaded)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "grind-relocate: attempt window opened");
                     rid.GrindRelocateCooldownUntil = DateTime.UtcNow.AddMinutes(RelocateCooldownMin);
                     var rteam = ZoneSafetyMap.TeamFromFaction(rid.Faction);
                     var cell = _safety.FindGrindCell(
@@ -238,6 +260,7 @@ public sealed class GrindPlanner : IBotPlanner
                                 > ctx.Level + RelocatePathDangerCeil);
                     if (cell is { } c && c.DistYards >= RelocateMinDist)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "grind-relocate: safe cell found, MOVE_TO issued", c.DistYards);
                         rid.GrindRelocating = true;
                         rid.GrindRelocateMoveIssued = true;
                         rid.GrindRelocateX = c.X;
@@ -271,6 +294,7 @@ public sealed class GrindPlanner : IBotPlanner
                 KillCount = 0
             };
             ctx.SetStep("grind");
+            CircuitTrace.Hit(ctx.Guid, "grind: armed SET_TASK GRIND here");
 
             // Wire shape ported 1:1 from CombatDomain.BuildGrind (snake_case keys the C++
             // BridgeHandleSetTask parses; radius<10→40 clamp doesn't bite at 60).
@@ -295,13 +319,13 @@ public sealed class GrindPlanner : IBotPlanner
     {
         // A relocate walk IS progress (per the BotIdentity design note): the Send deadline
         // bounds it, and the goal-change / wedge clears abort it — no unbounded pass.
-        if (ctx.Identity is { GrindRelocating: true }) return true;
+        if (ctx.Identity is { GrindRelocating: true }) { CircuitTrace.Hit(ctx.Guid, "grind: progressing (relocate walk)"); return true; }
 
         // Once armed, PlanNext owns the no-real-kill verdict and converts it into the same hub jump as
         // GRIND_BLOCKED. Returning false here used to route through OnStall -> EnterGoal(Idle), which
         // cancelled and re-issued the C++ patrol every ~45s before its negative feedback could help.
         // Keep the patrol intact; PlanNext still runs every tick because grind carries no Pending WAIT.
-        if (ctx.Grind != null) return true;
+        if (ctx.Grind != null) { CircuitTrace.Hit(ctx.Guid, "grind: progressing (armed, C++ owns scan)"); return true; }
 
         return ctx.TimeInGoalSec < ArmGraceSec
             || (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds < KillRecencySec;

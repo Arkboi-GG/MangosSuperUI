@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Coordinator;
 
@@ -37,10 +38,10 @@ public class BudgetBuckets
 
         lock (botBucket)
         {
-            if (botBucket.Tokens < 1) return false;
+            if (botBucket.Tokens < 1) { CircuitTrace.Hit(botGuid, "chat: bot budget exhausted, line dropped"); return false; }
             lock (zoneBucket)
             {
-                if (zoneBucket.Tokens < 1) return false;
+                if (zoneBucket.Tokens < 1) { CircuitTrace.Hit(botGuid, "chat: zone budget exhausted, line dropped", zoneId); return false; }
                 botBucket.Tokens -= 1;
                 zoneBucket.Tokens -= 1;
                 return true;
@@ -54,7 +55,7 @@ public class BudgetBuckets
         var now = DateTime.UtcNow;
         double elapsed = Math.Clamp((now - _lastRefill).TotalSeconds, 0, 10);
         _lastRefill = now;
-        if (elapsed <= 0) return;
+        if (elapsed <= 0) { CircuitTrace.Hit(0, "chat: budget refill skipped, zero elapsed"); return; }
 
         double botCap = BotCap();
         foreach (var b in _botBuckets.Values)
@@ -72,8 +73,8 @@ public class BudgetBuckets
 
     private double ZoneCap(ChatKind kind) => Math.Max(1, kind switch
     {
-        ChatKind.Channel => _settings.GetInt(0, "budget.zone_channel_lines_per_min", 10),
-        ChatKind.Party => _settings.GetInt(0, "budget.zone_party_lines_per_min", 10),
-        _ => _settings.GetInt(0, "budget.zone_say_lines_per_min", 20)
+        ChatKind.Channel => CircuitTrace.Pass(_settings.GetInt(0, "budget.zone_channel_lines_per_min", 10), 0, "chat: zone cap resolved for channel"),
+        ChatKind.Party => CircuitTrace.Pass(_settings.GetInt(0, "budget.zone_party_lines_per_min", 10), 0, "chat: zone cap resolved for party"),
+        _ => CircuitTrace.Pass(_settings.GetInt(0, "budget.zone_say_lines_per_min", 20), 0, "chat: zone cap resolved for say")
     });
 }

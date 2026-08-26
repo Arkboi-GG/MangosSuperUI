@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using MangosSuperUI.Hubs;
 using MangosSuperUI.BotLogic.Chat.Coordinator;
+using MangosSuperUI.BotLogic.Tracking;
 using Microsoft.AspNetCore.SignalR;
 
 namespace MangosSuperUI.Services;
@@ -664,6 +665,7 @@ public class BotBridgeService : BackgroundService
         }
         catch (SocketException ex)
         {
+            CircuitTrace.Hit(0, "bridge: port 3444 busy, bridge disabled for this instance");
             // Another instance (e.g. the WSL-hosted server stack) already owns 3444. Losing the
             // bridge only means bots can't connect to THIS instance — that must not take down the
             // whole host (BackgroundServiceExceptionBehavior is StopHost).
@@ -682,9 +684,10 @@ public class BotBridgeService : BackgroundService
                 _ = HandleClientAsync(client, stoppingToken);
             }
         }
-        catch (OperationCanceledException) { /* shutdown */ }
+        catch (OperationCanceledException) { /* shutdown */ }   // cb:fold shutdown trivia
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "bridge: listener crashed");
             _logger.LogError(ex, "BotBridge listener error");
         }
         finally
@@ -702,14 +705,15 @@ public class BotBridgeService : BackgroundService
 
         foreach (var kvp in Connections)
         {
-            try { kvp.Value.Cts.Cancel(); } catch { }
-            try { kvp.Value.Client.Dispose(); } catch { }
+            try { kvp.Value.Cts.Cancel(); } catch { /* cb:fold disposal trivia */ }
+            try { kvp.Value.Client.Dispose(); } catch { /* cb:fold disposal trivia */ }
         }
         Connections.Clear();
         foreach (var pending in _pendingCombatLoadouts.ToArray())
         {
             if (_pendingCombatLoadouts.TryRemove(pending.Key, out var removed))
             {
+                CircuitTrace.Hit(removed.Guid, "bridge: pending loadout failed on shutdown");
                 Exception error = Volatile.Read(ref removed.SendAttempted) == 0
                     ? new BotNotConnectedException(removed.Guid)
                     : new CombatLoadoutOutcomeUnknownException(removed.Guid, pending.Key);
@@ -738,32 +742,35 @@ public class BotBridgeService : BackgroundService
             while (!linked.Token.IsCancellationRequested)
             {
                 var line = await reader.ReadLineAsync(linked.Token);
-                if (line == null) break; // connection closed
+                if (line == null) { CircuitTrace.Hit(conn.Guid, "bridge: socket closed by peer"); break; }
 
-                if (string.IsNullOrWhiteSpace(line)) continue;
+                if (string.IsNullOrWhiteSpace(line)) continue;   // cb:fold blank keepalive line
 
                 try
                 {
                     var msg = JsonSerializer.Deserialize<BridgeMessage>(line, JsonOpts);
                     if (msg != null)
-                        await ProcessInboundAsync(msg, conn);
+                        await ProcessInboundAsync(msg, conn);   // cb:fold parse detail, dispatch cases probe every message
                 }
                 catch (JsonException ex)
                 {
+                    CircuitTrace.Hit(conn.Guid, "bridge: malformed JSON line dropped");
                     _logger.LogWarning("BotBridge: malformed JSON from {Endpoint}: {Error}", endpoint, ex.Message);
                 }
             }
         }
-        catch (OperationCanceledException) { /* normal */ }
-        catch (IOException) { /* disconnected */ }
+        catch (OperationCanceledException) { /* normal */ }   // cb:fold shutdown trivia
+        catch (IOException) { /* disconnected */ }            // cb:fold disconnect trivia, teardown probe below fires
         catch (Exception ex)
         {
+            CircuitTrace.Hit(conn?.Guid ?? 0, "bridge: client loop error");
             _logger.LogWarning(ex, "BotBridge: client error from {Endpoint}", endpoint);
         }
         finally
         {
             if (conn != null && conn.Guid != 0)
             {
+                CircuitTrace.Hit(conn.Guid, "bridge: bot disconnected, teardown");
                 // A fast relog can replace the dictionary entry before this old
                 // socket's finally runs. Only tear down state/requests if this is
                 // still the active connection for the guid.
@@ -776,14 +783,17 @@ public class BotBridgeService : BackgroundService
                 FailPendingCombatLoadoutsForConnection(conn);
                 // Mark state as disconnected but keep it for UI
                 if (removedActive && BotStates.TryGetValue(conn.Guid, out var state))
+                {
+                    CircuitTrace.Hit(conn.Guid, "bridge: state marked DISCONNECTED");
                     state.TaskState = "DISCONNECTED";
+                }
 
                 _logger.LogInformation("BotBridge: bot {Guid} ({Name}) disconnected", conn.Guid, conn.State.Name);
                 if (removedActive)
-                    await _hub.Clients.All.SendAsync("BotDisconnected", conn.Guid);
+                    await _hub.Clients.All.SendAsync("BotDisconnected", conn.Guid);   // cb:fold notify only, teardown probe above fires
             }
 
-            try { client.Dispose(); } catch { }
+            try { client.Dispose(); } catch { /* cb:fold disposal trivia */ }
         }
     }
 
@@ -794,18 +804,22 @@ public class BotBridgeService : BackgroundService
         switch (msg.Type.ToUpperInvariant())
         {
             case "HELLO":
+                CircuitTrace.Hit(conn.Guid, "bridge: HELLO dispatched");
                 await HandleHelloAsync(msg.Payload, conn);
                 break;
 
             case "STATE":
+                CircuitTrace.Hit(conn.Guid, "bridge: STATE dispatched");
                 await HandleStateAsync(msg.Payload, conn);
                 break;
 
             case "EVENT":
+                CircuitTrace.Hit(conn.Guid, "bridge: EVENT dispatched");
                 await HandleEventAsync(msg.Payload, conn);
                 break;
 
             default:
+                CircuitTrace.HitNote(conn.Guid, "bridge: unknown message type", msg.Type);
                 _logger.LogWarning("BotBridge: unknown message type '{Type}' from bot {Guid}", msg.Type, conn.Guid);
                 break;
         }
@@ -814,8 +828,9 @@ public class BotBridgeService : BackgroundService
     private async Task HandleHelloAsync(JsonElement payload, BotConnection conn)
     {
         var hello = payload.Deserialize<BotHelloPayload>(JsonOpts);
-        if (hello == null) return;
+        if (hello == null) { CircuitTrace.Hit(conn.Guid, "bridge: HELLO payload malformed"); return; }
 
+        CircuitTrace.Hit(hello.Guid, "bridge: HELLO adopted, bot registered", hello.Level);
         conn.Guid = hello.Guid;
         conn.State = new BotState
         {
@@ -861,7 +876,10 @@ public class BotBridgeService : BackgroundService
             // writer will reject this inactive connection and completion still
             // releases any waiter instead of stranding it forever.
             if (rotationHydration != null)
+            {
+                CircuitTrace.Hit(conn.Guid, "bridge: rotation hydration started");
                 _rotations!.StartHelloHydration(rotationHydration);
+            }
         }
 
         _logger.LogInformation("BotBridge: HELLO from {Name} (guid={Guid}, class={Class}, level={Level})",
@@ -874,23 +892,27 @@ public class BotBridgeService : BackgroundService
         // [RAID-PLAN] Same law for the raid plan: the persisted assignment re-pushes
         // on every HELLO, fire-and-forget, failures log inside (PLAN_19 M-B).
         if (_raidPlans != null)
+        {
+            CircuitTrace.Hit(conn.Guid, "bridge: raid-plan re-push queued");
             _ = _raidPlans.OnBotHelloAsync(hello.Guid, hello.Name);
+        }
     }
 
     private async Task HandleStateAsync(JsonElement payload, BotConnection conn)
     {
         var state = payload.Deserialize<BotStatePayload>(JsonOpts);
-        if (state == null) return;
+        if (state == null) { CircuitTrace.Hit(conn.Guid, "bridge: STATE payload malformed"); return; }
 
+        CircuitTrace.Hit(conn.Guid, "bridge: STATE heartbeat applied");
         var bs = conn.State;
         bs.Health = state.Health;
         bs.MaxHealth = state.MaxHealth;
         bs.Mana = state.Mana;
         bs.MaxMana = state.MaxMana;
         bs.Level = state.Level;
-        if (state.SpecTab is >= 0 and <= 2) bs.SpecTab = state.SpecTab;
+        if (state.SpecTab is >= 0 and <= 2) bs.SpecTab = state.SpecTab;   // cb:fold field normalization
         bs.SpecProfile = state.SpecProfile?.Trim() ?? "";
-        if (state.ActiveRole is >= 1 and <= 4) bs.ActiveRole = state.ActiveRole;
+        if (state.ActiveRole is >= 1 and <= 4) bs.ActiveRole = state.ActiveRole;   // cb:fold field normalization
         bs.TalentProfileState = NormalizeRuntimeToken(state.TalentProfileState, "unchecked");
         bs.RotationSource = NormalizeRuntimeToken(state.RotationSource, "legacy");
         bs.RotationProfile = state.RotationProfile?.Trim() ?? "";
@@ -934,9 +956,10 @@ public class BotBridgeService : BackgroundService
     private async Task HandleEventAsync(JsonElement payload, BotConnection conn)
     {
         var evt = payload.Deserialize<BotEventPayload>(JsonOpts);
-        if (evt == null) return;
+        if (evt == null) { CircuitTrace.Hit(conn.Guid, "bridge: EVENT payload malformed"); return; }
 
         var eventType = evt.Event?.ToUpperInvariant() ?? "";
+        CircuitTrace.HitNote(conn.Guid, "bridge: event received", eventType);
 
         // Fresh-position refresh ("give C# fresh data whenever C++ has it"). Any event whose data
         // carries x|y|z — a TASK_COMPLETE arrival, a TELEPORT_ACK — updates the bot's canonical
@@ -947,6 +970,7 @@ public class BotBridgeService : BackgroundService
         // C++ already knows the exact arrival coord; this stops discarding it until the next STATE.
         if (!string.IsNullOrEmpty(evt.Data) && evt.Data.Contains("x="))
         {
+            CircuitTrace.Hit(conn.Guid, "bridge: event carries fresh position, canonical pos updated");
             var posKv = ParsePipeDelimited(evt.Data);
             if (posKv.TryGetValue("x", out var sx) &&
                 posKv.TryGetValue("y", out var sy) &&
@@ -954,7 +978,7 @@ public class BotBridgeService : BackgroundService
                 float.TryParse(sx, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fx) &&
                 float.TryParse(sy, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fy) &&
                 float.TryParse(sz, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var fz))
-            {
+            {   // cb:fold parse detail, outcome carried by the fresh-position probe
                 conn.State.X = fx;
                 conn.State.Y = fy;
                 conn.State.Z = fz;
@@ -965,6 +989,7 @@ public class BotBridgeService : BackgroundService
         {
             case "COMBAT_LOADOUT_ACK":
                 {
+                    CircuitTrace.Hit(conn.Guid, "bridge: combat-loadout ack received");
                     var values = ParsePipeDelimited(evt.Data ?? "");
                     string requestId = values.GetValueOrDefault("requestId", "").Trim();
                     var ack = new CombatLoadoutAck
@@ -991,10 +1016,12 @@ public class BotBridgeService : BackgroundService
                     if (!Connections.TryGetValue(conn.Guid, out BotConnection? activeConnection)
                         || !ReferenceEquals(activeConnection, conn))
                     {
+                        CircuitTrace.Hit(conn.Guid, "bridge: ack from superseded connection ignored");
                         if (requestId.Length > 0
                             && _pendingCombatLoadouts.TryGetValue(requestId, out PendingCombatLoadout? inactivePending)
                             && ReferenceEquals(inactivePending.Connection, conn))
                         {
+                            CircuitTrace.Hit(conn.Guid, "bridge: superseded ack fails its own waiter");
                             inactivePending.Completion.TrySetException(
                                 new CombatLoadoutOutcomeUnknownException(conn.Guid, requestId));
                         }
@@ -1007,9 +1034,9 @@ public class BotBridgeService : BackgroundService
                     // The ACK describes final runtime truth on both success and a
                     // verified rollback. Copy every well-formed field before waking
                     // the HTTP request so its follow-up GET sees the same revision.
-                    if (ack.SpecTab is >= 0 and <= 2) conn.State.SpecTab = ack.SpecTab;
+                    if (ack.SpecTab is >= 0 and <= 2) conn.State.SpecTab = ack.SpecTab;   // cb:fold field normalization
                     conn.State.SpecProfile = ack.TalentProfile.Trim();
-                    if (ack.ActiveRole is >= 1 and <= 4) conn.State.ActiveRole = ack.ActiveRole;
+                    if (ack.ActiveRole is >= 1 and <= 4) conn.State.ActiveRole = ack.ActiveRole;   // cb:fold field normalization
                     conn.State.TalentProfileState = ack.TalentProfileState;
                     conn.State.RotationSource = ack.RotationSource;
                     conn.State.RotationProfile = ack.RotationProfile.Trim();
@@ -1025,23 +1052,28 @@ public class BotBridgeService : BackgroundService
                         && pending.Guid == conn.Guid
                         && ReferenceEquals(pending.Connection, conn))
                     {
+                        CircuitTrace.Hit(conn.Guid, "bridge: ack correlated to its waiter");
                         matched = pending.Completion.TrySetResult(ack);
                     }
 
                     if (ack.Success)
-                        _logger.LogInformation(
+                        _logger.LogInformation(   // cb:fold logging only, ack probes carry the outcome
                             "[COMBAT-LOADOUT] {Name} ACK {RequestId}: revision={Revision} spec={Spec} role={Role} rotation={Source}/{Profile} loaded={Loaded} skipped={Skipped}",
                             conn.State.Name, requestId, ack.Revision, ack.SpecTab, ack.ActiveRole,
                             ack.RotationSource, ack.RotationProfile, ack.LoadedInstructions, ack.SkippedInstructions);
                     else
-                        _logger.LogWarning(
+                        _logger.LogWarning(   // cb:fold logging only, rejection rides the ack status note below
                             "[COMBAT-LOADOUT] {Name} rejected {RequestId}: status={Status} code={Code} revision={Revision}",
                             conn.State.Name, requestId, ack.Status, ack.Code, ack.Revision);
+                    CircuitTrace.HitNote(conn.Guid, "bridge: loadout ack outcome", ack.Status);
 
                     if (!matched)
+                    {
+                        CircuitTrace.Hit(conn.Guid, "bridge: late or uncorrelated loadout ack");
                         _logger.LogWarning(
                             "[COMBAT-LOADOUT] late or uncorrelated ACK from {Name}: requestId={RequestId}",
                             conn.State.Name, requestId.Length == 0 ? "(missing)" : requestId);
+                    }
 
                     await _hub.Clients.All.SendAsync("BotCombatLoadoutChanged", new
                     {
@@ -1053,8 +1085,9 @@ public class BotBridgeService : BackgroundService
                     return;
                 }
 
-            case "ROTATION_ACK":
+            case "ROTATION_ACK":   // cb:fold forwarding shell, event probed at method entry; the skipped-spells arm is the decision
                 {
+
                     // [ROTATION] C++ resolved the pushed slate. skipped>0 = the profile names
                     // spells this bot doesn't know (wrong rank / not yet trained) — warn loudly
                     // so an under-performing rotation is a log line, not a mystery at the keyboard.
@@ -1063,15 +1096,18 @@ public class BotBridgeService : BackgroundService
                     ackKv.TryGetValue("loaded", out var ackLoaded);
                     ackKv.TryGetValue("skipped", out var ackSkipped);
                     if (int.TryParse(ackSkipped, out var nSkipped) && nSkipped > 0)
+                    {
+                        CircuitTrace.Hit(conn.Guid, "bridge: rotation ack reports skipped spells", nSkipped);
                         _logger.LogWarning("[ROTATION] {Name} ACK '{Profile}': loaded={Loaded} SKIPPED={Skipped} — profile names unknown/unlearned spells",
                             conn.State.Name, ackProfile ?? "?", ackLoaded ?? "?", nSkipped);
+                    }
                     else
-                        _logger.LogInformation("[ROTATION] {Name} ACK '{Profile}': loaded={Loaded} skipped={Skipped}",
+                        _logger.LogInformation("[ROTATION] {Name} ACK '{Profile}': loaded={Loaded} skipped={Skipped}",   // cb:fold logging only
                             conn.State.Name, ackProfile ?? "?", ackLoaded ?? "0", ackSkipped ?? "0");
                     break;
                 }
 
-            case "KILL":
+            case "KILL":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: KILL by {Name} — creature entry={Entry} guid={CrGuid}",
                     conn.State.Name, evt.CreatureEntry, evt.CreatureGuid);
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1085,7 +1121,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "QUEST_UPDATE":
+            case "QUEST_UPDATE":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: QUEST_UPDATE {Name} — quest={QuestId} status={Status}",
                     conn.State.Name, evt.QuestId, evt.Status);
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1099,11 +1135,11 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "LEVEL_UP":
+            case "LEVEL_UP":   // cb:fold UI forward only, event probed at method entry; executor probes the progress stamp
                 _logger.LogInformation("BotBridge: LEVEL_UP {Name} → level {Level}",
                     conn.State.Name, evt.NewLevel);
                 if (evt.NewLevel.HasValue)
-                    conn.State.Level = evt.NewLevel.Value;
+                    conn.State.Level = evt.NewLevel.Value;   // cb:fold field normalization
                 await _hub.Clients.All.SendAsync("BotEvent", new
                 {
                     guid = conn.Guid,
@@ -1115,6 +1151,7 @@ public class BotBridgeService : BackgroundService
                 break;
 
             case "CHAT_RECV":
+                CircuitTrace.Hit(conn.Guid, "bridge: chat received, recognizer + coordinator hand-off");
                 _logger.LogInformation("BotBridge: CHAT_RECV bot={Name} from={Sender} [{ChatType}]: {Message}",
                     conn.State.Name, evt.Sender, evt.ChatType ?? "say", evt.Message);
                 await _hub.Clients.All.SendAsync("BotChatReceived", new
@@ -1142,21 +1179,24 @@ public class BotBridgeService : BackgroundService
                     && !BotStates.ContainsKey((int)hubSender)
                     && !string.IsNullOrWhiteSpace(evt.Message))
                 {
+                    CircuitTrace.Hit(conn.Guid, "bridge: party line from real player, command recognizer running");
                     string hubMsg = evt.Message.Replace("'", "").ToLowerInvariant();
                     if (hubMsg.Contains("do your rounds"))
                     {
+                        CircuitTrace.Hit(conn.Guid, "bridge: hub-errand token armed");
                         conn.State.HubErrandUntil = DateTime.UtcNow.Add(HubErrandWindow);
                         _logger.LogInformation("[HUB-ERRAND] {Name} armed by {Sender}: 'do your rounds' (until {Until:HH:mm:ss}Z)",
                             conn.State.Name, evt.Sender ?? "?", conn.State.HubErrandUntil);
                     }
                     else if (hubMsg.Contains("lets move"))
                     {
+                        CircuitTrace.Hit(conn.Guid, "bridge: hub-errand token cleared");
                         conn.State.HubErrandUntil = null;
                         _logger.LogInformation("[HUB-ERRAND] {Name} cleared by {Sender}: 'lets move'",
                             conn.State.Name, evt.Sender ?? "?");
                     }
                     else
-                    {
+                    {   // cb:fold recognizer fall-through, follow-cmd arm below is the decision
                         // [FOLLOW-CMD] "{bot} follow {player|me|auto}" (2026-07-16) — addressed
                         // escort override. ONLY the named bot obeys (each connection checks the
                         // first token against ITS OWN name — a party line reaches every bot's
@@ -1171,9 +1211,10 @@ public class BotBridgeService : BackgroundService
                             && string.Equals(tok[0], conn.State.Name, StringComparison.OrdinalIgnoreCase)
                             && tok[1] == "follow")
                         {
+                            CircuitTrace.Hit(conn.Guid, "bridge: follow override command for this bot");
                             string target = tok.Length >= 3 ? tok[2] : "auto";
                             if (target == "me")
-                                target = (evt.Sender ?? "").ToLowerInvariant();
+                                target = (evt.Sender ?? "").ToLowerInvariant();   // cb:fold target resolution detail
                             bool clearOverride = target is "auto" or "";
 
                             await SendToBotAsync(conn.Guid, "SET_ESCORT",
@@ -1201,7 +1242,7 @@ public class BotBridgeService : BackgroundService
                     DateTime.UtcNow));
                 return;
 
-            case "TASK_COMPLETE":
+            case "TASK_COMPLETE":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: TASK_COMPLETE {Name} — {Data}",
                     conn.State.Name, evt.Data);
                 conn.State.TaskState = "IDLE";
@@ -1215,7 +1256,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "FLIGHT_STARTED":
+            case "FLIGHT_STARTED":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: FLIGHT_STARTED {Name}", conn.State.Name);
                 conn.State.TaskState = "FLYING";
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1227,7 +1268,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "FLIGHT_COMPLETE":
+            case "FLIGHT_COMPLETE":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: FLIGHT_COMPLETE {Name}", conn.State.Name);
                 conn.State.TaskState = "IDLE";
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1239,7 +1280,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "FLIGHT_FAILED":
+            case "FLIGHT_FAILED":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: FLIGHT_FAILED {Name} — reason={Reason} have={Have} need={Need}",
                     conn.State.Name, evt.Reason, evt.Have, evt.Need);
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1255,7 +1296,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "LOOT":
+            case "LOOT":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: LOOT {Name} — {Data}",
                     conn.State.Name, evt.Data);
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1268,7 +1309,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "SELL_ACK":
+            case "SELL_ACK":   // cb:fold UI forward only, event probed at method entry
                 {
                     var sellParts = ParsePipeDelimited(evt.Data);
                     _logger.LogInformation(
@@ -1289,7 +1330,7 @@ public class BotBridgeService : BackgroundService
                     break;
                 }
 
-            case "SELL_FAIL":
+            case "SELL_FAIL":   // cb:fold UI forward only, event probed at method entry
                 {
                     _logger.LogWarning("BotBridge: SELL_FAIL {Name} — {Data}",
                         conn.State.Name, evt.Data);
@@ -1304,7 +1345,7 @@ public class BotBridgeService : BackgroundService
                     break;
                 }
 
-            case "EQUIP":
+            case "EQUIP":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: EQUIP {Name} — {Data}",
                     conn.State.Name, evt.Data);
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1317,7 +1358,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            case "BAG_EQUIP":
+            case "BAG_EQUIP":   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: BAG_EQUIP {Name} — {Data}",
                     conn.State.Name, evt.Data);
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1330,7 +1371,7 @@ public class BotBridgeService : BackgroundService
                 });
                 break;
 
-            default:
+            default:   // cb:fold UI forward only, event probed at method entry
                 _logger.LogInformation("BotBridge: EVENT {Event} from {Name} (guid={Guid}): {Data}",
                     evt.Event, conn.State.Name, conn.Guid, evt.Data);
                 await _hub.Clients.All.SendAsync("BotEvent", new
@@ -1347,6 +1388,7 @@ public class BotBridgeService : BackgroundService
         // Route to behavioral engine (if wired)
         if (_brain != null)
         {
+            CircuitTrace.Hit(conn.Guid, "bridge: event routed to brain");
             var botEvent = new MangosSuperUI.BotLogic.Core.BotEvent
             {
                 EventType = eventType,
@@ -1376,16 +1418,19 @@ public class BotBridgeService : BackgroundService
     {
         if (!Connections.TryGetValue(guid, out var conn))
         {
+            CircuitTrace.HitNote(guid, "bridge: send dropped, bot not connected", type);
             _logger.LogWarning("BotBridge: cannot send {Type} — bot {Guid} not connected", type, guid);
             return;
         }
 
         try
         {
+            CircuitTrace.HitNote(guid, "bridge: command sent", type);
             await WriteEnvelopeAsync(conn, type, payload, CancellationToken.None);
         }
         catch (Exception ex)
         {
+            CircuitTrace.HitNote(guid, "bridge: send failed", type);
             _logger.LogWarning(ex, "BotBridge: send to bot {Guid} failed", guid);
         }
     }
@@ -1410,6 +1455,7 @@ public class BotBridgeService : BackgroundService
             if (!Connections.TryGetValue(guid, out BotConnection? active)
                 || !ReferenceEquals(active, expectedConnection))
             {
+                CircuitTrace.Hit(guid, "bridge: exact-connection send refused (superseded)");
                 throw new BotNotConnectedException(guid);
             }
 
@@ -1438,27 +1484,27 @@ public class BotBridgeService : BackgroundService
     {
         if (!Connections.TryGetValue(guid, out var conn)
             || !ReferenceEquals(conn, expectedConnection))
-            throw new BotNotConnectedException(guid);
+            { CircuitTrace.Hit(guid, "loadout: bot not connected"); throw new BotNotConnectedException(guid); }
         if (!Guid.TryParseExact(command.RequestId, "N", out _))
-            throw new ArgumentException("Combat loadout request ids must be GUIDs in N format.", nameof(command));
+            throw new ArgumentException("Combat loadout request ids must be GUIDs in N format.", nameof(command));   // cb:fold argument validation
         if (command.SpecTab is < 0 or > 2)
-            throw new ArgumentOutOfRangeException(nameof(command), "Specialization slot must be 0-2.");
+            throw new ArgumentOutOfRangeException(nameof(command), "Specialization slot must be 0-2.");   // cb:fold argument validation
         if (command.ActiveRole is < 1 or > 4)
-            throw new ArgumentOutOfRangeException(nameof(command), "Active role must be 1-4.");
+            throw new ArgumentOutOfRangeException(nameof(command), "Active role must be 1-4.");   // cb:fold argument validation
 
         string rotationMode = (command.RotationMode ?? "").Trim().ToUpperInvariant();
         if (rotationMode is not ("SPEC" or "CUSTOM"))
-            throw new ArgumentException("Rotation mode must be SPEC or CUSTOM.", nameof(command));
+            throw new ArgumentException("Rotation mode must be SPEC or CUSTOM.", nameof(command));   // cb:fold argument validation
         if (rotationMode == "CUSTOM"
             && (string.IsNullOrWhiteSpace(command.RotationProfile) || string.IsNullOrWhiteSpace(command.RotationData)))
-            throw new ArgumentException("Custom rotations require profile and data.", nameof(command));
+            throw new ArgumentException("Custom rotations require profile and data.", nameof(command));   // cb:fold argument validation
 
         var completion = new TaskCompletionSource<CombatLoadoutAck>(TaskCreationOptions.RunContinuationsAsynchronously);
         var pending = new PendingCombatLoadout(guid, conn, completion);
         if (!_pendingCombatLoadouts.TryAdd(
                 command.RequestId,
                 pending))
-            throw new InvalidOperationException($"Combat loadout request {command.RequestId} is already pending.");
+            { CircuitTrace.Hit(guid, "loadout: request id already pending"); throw new InvalidOperationException($"Combat loadout request {command.RequestId} is already pending."); }
 
         try
         {
@@ -1473,7 +1519,8 @@ public class BotBridgeService : BackgroundService
             // registration and write must fail this request, not deliver it to a
             // different session and ambiguously await the old one.
             if (!Connections.TryGetValue(guid, out var active) || !ReferenceEquals(active, conn))
-                throw new BotNotConnectedException(guid);
+                { CircuitTrace.Hit(guid, "loadout: connection lost before write"); throw new BotNotConnectedException(guid); }
+            CircuitTrace.Hit(guid, "loadout: destructive write beginning");
 
             // Once a destructive write begins we keep the correlated
             // waiter alive for its bounded ACK window even if the browser or
@@ -1494,6 +1541,7 @@ public class BotBridgeService : BackgroundService
             }
             catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
             {
+                CircuitTrace.Hit(guid, "loadout: write failed, outcome unknown");
                 throw new CombatLoadoutOutcomeUnknownException(guid, command.RequestId, ex);
             }
 
@@ -1503,6 +1551,7 @@ public class BotBridgeService : BackgroundService
             }
             catch (TimeoutException)
             {
+                CircuitTrace.Hit(guid, "loadout: ack timeout");
                 throw new CombatLoadoutAckTimeoutException(guid, command.RequestId, CombatLoadoutAckTimeout);
             }
         }
@@ -1643,12 +1692,12 @@ public class BotBridgeService : BackgroundService
     private static Dictionary<string, string> ParsePipeDelimited(string? data)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (string.IsNullOrEmpty(data)) return result;
+        if (string.IsNullOrEmpty(data)) return result;   // cb:fold pure helper
         foreach (var segment in data.Split('|'))
         {
             var eq = segment.IndexOf('=');
             if (eq > 0)
-                result[segment[..eq].Trim()] = segment[(eq + 1)..].Trim();
+                result[segment[..eq].Trim()] = segment[(eq + 1)..].Trim();   // cb:fold pure helper
         }
         return result;
     }
@@ -1681,9 +1730,10 @@ public class BotBridgeService : BackgroundService
         foreach (var entry in _pendingCombatLoadouts.ToArray())
         {
             if (!ReferenceEquals(entry.Value.Connection, connection))
-                continue;
+                continue;   // cb:fold iteration filter
             if (_pendingCombatLoadouts.TryRemove(entry.Key, out var removed))
             {
+                CircuitTrace.Hit(connection.Guid, "bridge: pending loadout failed for dropped connection");
                 Exception error = Volatile.Read(ref removed.SendAttempted) == 0
                     ? new BotNotConnectedException(connection.Guid)
                     : new CombatLoadoutOutcomeUnknownException(connection.Guid, entry.Key);

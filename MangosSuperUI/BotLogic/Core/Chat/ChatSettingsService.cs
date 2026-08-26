@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Dapper;
 using MangosSuperUI.Models;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Core;
 
@@ -379,8 +380,8 @@ public class ChatSettingsService
     public string? Get(int zoneId, string key)
     {
         var snap = Snapshot();
-        if (zoneId > 0 && snap.TryGetValue(($"zone:{zoneId}", key), out var zv)) return zv;
-        if (snap.TryGetValue(("global", key), out var gv)) return gv;
+        if (zoneId > 0 && snap.TryGetValue(($"zone:{zoneId}", key), out var zv)) { CircuitTrace.Hit(0, "chat: setting resolved from zone override"); return zv; }
+        if (snap.TryGetValue(("global", key), out var gv)) { CircuitTrace.Hit(0, "chat: setting resolved from global scope"); return gv; }
         return ChatSettingsRegistry.ByKey.TryGetValue(key, out var def) ? def.Default : null;
     }
 
@@ -396,7 +397,7 @@ public class ChatSettingsService
     public bool GetBool(int zoneId, string key, bool fallback = false)
     {
         var s = Get(zoneId, key);
-        if (string.IsNullOrEmpty(s)) return fallback;
+        if (string.IsNullOrEmpty(s)) { CircuitTrace.Hit(0, "chat: bool setting missing, fallback used"); return fallback; }
         return s.Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
     }
 
@@ -443,10 +444,10 @@ public class ChatSettingsService
         {
             var json = await conn.QuerySingleOrDefaultAsync<string?>(
                 "SELECT settings_json FROM chat_preset WHERE name=@name", new { name });
-            if (json == null) return null;
+            if (json == null) { CircuitTrace.Hit(0, "chat: preset not found for apply"); return null; }
             pairs = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
         }
-        if (pairs == null) return null;
+        if (pairs == null) { CircuitTrace.Hit(0, "chat: preset json unparseable"); return null; }
 
         var changes = new List<(string, string?, string)>();
         foreach (var (key, value) in pairs)
@@ -466,7 +467,7 @@ public class ChatSettingsService
         using var conn = _db.Admin();
         var builtin = await conn.QuerySingleOrDefaultAsync<int?>(
             "SELECT builtin FROM chat_preset WHERE name=@name", new { name });
-        if (builtin == 1) return false;   // never overwrite a built-in
+        if (builtin == 1) { CircuitTrace.Hit(0, "chat: preset save refused, builtin"); return false; }   // never overwrite a built-in
 
         await conn.ExecuteAsync(@"
             INSERT INTO chat_preset (name, settings_json, builtin) VALUES (@name, @json, 0)
@@ -483,12 +484,18 @@ public class ChatSettingsService
     {
         var snap = _snapshot;
         if (snap != null && DateTime.UtcNow - _snapshotUtc < SnapshotTtl)
+        {
+            CircuitTrace.Hit(0, "chat: settings snapshot fresh, fast path");
             return snap;
+        }
 
         lock (_gate)
         {
             if (_snapshot != null && DateTime.UtcNow - _snapshotUtc < SnapshotTtl)
+            {
+                CircuitTrace.Hit(0, "chat: settings snapshot fresh on locked recheck");
                 return _snapshot;
+            }
             try
             {
                 using var conn = _db.Admin();
@@ -499,6 +506,7 @@ public class ChatSettingsService
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(0, "chat: settings snapshot refresh failed, stale served");
                 _logger.LogError(ex, "[CHAT-SET] snapshot refresh failed — serving stale/registry defaults");
                 _snapshot ??= new Dictionary<(string, string), string>();
                 _snapshotUtc = DateTime.UtcNow;   // don't hammer a down DB; retry after TTL

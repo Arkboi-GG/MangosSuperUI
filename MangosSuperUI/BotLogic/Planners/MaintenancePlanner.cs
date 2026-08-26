@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;   // ZoneDataLoader — vendor/repair NPC lookup (GetNearestVendor)
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Planners;
 
@@ -240,6 +241,7 @@ public sealed class MaintenancePlanner : IBotPlanner
         // ── ALIVE ──
         if (!ctx.Dead)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: alive tick");
             var rm = ctx.Maintenance;
 
             // Death-recovery in flight takes priority — heal first. Repositioning happens
@@ -247,9 +249,13 @@ public sealed class MaintenancePlanner : IBotPlanner
             // already on safe ground — nothing to relocate, just heal.
             if (rm != null && rm.RezSent)
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: back alive after rez");
                 rm.Rezzed = true;                        // came back alive after a RESURRECT — a later dead tick is a re-death
                 if (!rm.HealDone)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "maint: heal hold until full", ctx.HpPct);
                     return HealToFull(ctx, rm);          // hold IDLE, eat back to ~full
+                }
                 // Healed. Gear may be wrecked from the death — fall through to the vendor
                 // errand (durability/bags are re-checked there; it no-ops if we're fine).
             }
@@ -266,11 +272,15 @@ public sealed class MaintenancePlanner : IBotPlanner
         // NB: gated on Rezzed, NOT RezSent — during the pre-alive RESPAWN wait RezSent is
         // already true but Rezzed is not, so this won't spuriously re-arm mid-rez.
         if (ctx.Maintenance is { Rezzed: true })
+        {
+            CircuitTrace.Hit(ctx.Guid, "maint: re-death after rez, dropping scratch");
             ctx.Maintenance = null;
+        }
 
         // ── Arm on the first dead tick (of this death) ──
         if (ctx.Maintenance == null)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: first dead tick, arming recovery");
             // The ghost stands at the corpse (C++ never moves it), so ctx.Pos IS the death
             // spot. Loop = a quick re-death in the SAME pocket — check BEFORE RecordDeath
             // (which overwrites LastDeathTime / LastDeathLocation).
@@ -289,7 +299,11 @@ public sealed class MaintenancePlanner : IBotPlanner
             // Escalation counter: a loop death pushes the relocate further next rez; a death
             // somewhere new means the last relocate worked → reset. Bump BEFORE RecordDeath
             // (which overwrites LastDeathLocation) using the loop verdict computed above.
-            if (id != null) id.DeathLoopStreak = deathLoop ? id.DeathLoopStreak + 1 : 0;
+            if (id != null)
+            {
+                CircuitTrace.Hit(ctx.Guid, "maint: death-loop streak update", deathLoop ? id.DeathLoopStreak + 1 : 0);
+                id.DeathLoopStreak = deathLoop ? id.DeathLoopStreak + 1 : 0;
+            }
 
             var deathPos = new Vec4(ctx.Pos.X, ctx.Pos.Y, ctx.Pos.Z, ctx.MapId);
             id?.RecordDeath(deathPos.X, deathPos.Y, deathPos.Map);  // durable; also feeds QuestPlanner shelving
@@ -315,7 +329,10 @@ public sealed class MaintenancePlanner : IBotPlanner
             // back here until the bot out-levels it (clears at danger-3). This only steers
             // future quest selection — it does NOT move the bot; the ghost-walk below does.
             if (deathLoop)
+            {
+                CircuitTrace.Hit(ctx.Guid, "maint: loop death, blacklisting pocket");
                 id?.AddPathBlacklist(deathPos.X, deathPos.Y, ctx.Level + DeathSpotDangerGate);
+            }
 
             // ── Attribute this death to the quest the bot was working (the macro-loop exit) ──
             // The brain stamped ctx.DeathBlameQuestId at the death transition (it had ctx.Quest
@@ -328,10 +345,12 @@ public sealed class MaintenancePlanner : IBotPlanner
             // fault: enlisted deaths never bump the streak or shelve the quest.
             if (id != null && !ctx.Conscripted && ctx.DeathBlameQuestId is int blamed)
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: death blamed on quest", blamed);
                 int fails = id.QuestFailStreak.GetValueOrDefault(blamed, 0) + 1;
                 id.QuestFailStreak[blamed] = fails;
                 if (fails >= QuestFailCap)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "maint: quest fail cap hit, shelving quest", fails);
                     id.DeferQuest(blamed, TimeSpan.FromMinutes(QuestDeathDeferMinutes));
                     id.QuestFailStreak.Remove(blamed);
                     _log.LogInformation("[REZ] {Name} shelving quest [{Q}] {Min}min — {N} death(s) attributed (won't route back)",
@@ -339,6 +358,7 @@ public sealed class MaintenancePlanner : IBotPlanner
                 }
                 else
                 {
+                    CircuitTrace.Hit(ctx.Guid, "maint: quest death below cap", fails);
                     _log.LogInformation("[REZ] {Name} death blamed on quest [{Q}] (streak {N}/{Cap})",
                         ctx.Name, blamed, fails, QuestFailCap);
                 }
@@ -352,6 +372,7 @@ public sealed class MaintenancePlanner : IBotPlanner
             // port (below / earlier) is what physically relocates it; this just stops re-pinning it.
             if (id?.GrindLockUntil is DateTime glk && DateTime.UtcNow < glk)
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: died grind-locked, releasing lock");
                 id.GrindLockUntil = null;
                 _log.LogInformation("[REZ] {Name} grind-lock released (died while locked)", ctx.Name);
             }
@@ -380,16 +401,25 @@ public sealed class MaintenancePlanner : IBotPlanner
 
         // RESURRECT WAIT blew its deadline (RESPAWN never arrived) → re-issue.
         if (failure != null && m.RezSent)
+        {
+            CircuitTrace.Hit(ctx.Guid, "maint: rez deadline blown, re-issuing RESURRECT");
             return SendResurrect(ctx, m);
+        }
 
         // Already sent and waiting (Pending cleared but STATE not yet alive) — don't
         // spam a second RESURRECT; the WAIT / next STATE resolves it.
         if (m.RezSent)
+        {
+            CircuitTrace.Hit(ctx.Guid, "maint: rez sent, awaiting RESPAWN");
             return StepResult.Wait();
+        }
 
         // Absolute dead-time backstop → rez now, wherever we are.
         if ((DateTime.UtcNow - m.DeadSinceUtc).TotalSeconds > MaxDeadSec)
+        {
+            CircuitTrace.Hit(ctx.Guid, "maint: dead past backstop, force rez", (DateTime.UtcNow - m.DeadSinceUtc).TotalSeconds);
             return SendResurrect(ctx, m);
+        }
 
         // ── GRAVEYARD ESCALATION ──
         // Three triggers, same escape: (1) DeathLoopStreak — died >2× in the SAME pocket inside the
@@ -412,14 +442,19 @@ public sealed class MaintenancePlanner : IBotPlanner
         // behaviour without moving anyone now.
         if (useGraveyard && ctx.InPlayerParty)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: port suppressed, in player party");
             useGraveyard = false;
             _log.LogInformation("[GRAVE] {Name} port suppressed — in a REAL player's party (in-place rez beside the group)",
                 ctx.Name);
         }
         if (useGraveyard)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: graveyard escalation active");
             if (!m.RelocateSent)
+            {
+                CircuitTrace.Hit(ctx.Guid, "maint: sending graveyard port");
                 return SendGraveyardPort(ctx, m);
+            }
 
             if (!m.RelocateDone)
             {
@@ -428,6 +463,7 @@ public sealed class MaintenancePlanner : IBotPlanner
                 // the teleport fired it has already landed — PlayerBotAI::UpdateAI applies
                 // pending teleports at the TOP of the tick, before BridgeRecv processes this
                 // RESURRECT, so the rez can't beat the port.
+                CircuitTrace.Hit(ctx.Guid, "maint: port resolved, marking done and rezzing");
                 m.RelocateDone = true;
                 _log.LogInformation("[GRAVE] {Name} port {Why} — rez @ ({X:F0},{Y:F0})@{Map} streak={Streak}",
                     ctx.Name, failure != null ? "FAILED/deadline (rez in place)" : "done",
@@ -439,6 +475,7 @@ public sealed class MaintenancePlanner : IBotPlanner
                 // blacklist the death zone from quest routing, and clear the death counters/streaks.
                 if (m.HearthEscape && id != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "maint: hearth escape, hard reset at racial start");
                     int wasDeaths = id.DeathsSinceQuestStart;
                     id.AddPathBlacklist(m.DeathPos.X, m.DeathPos.Y, ctx.Level + DeathSpotDangerGate);
                     id.ResetDeathCounter();          // also clears HearthDeaths
@@ -455,7 +492,10 @@ public sealed class MaintenancePlanner : IBotPlanner
         // Still waiting out the corpse-run delay — lets a leashing mob wander off before we
         // pop up at 50% HP in place. (Heal-to-full then tops us off before re-engaging.)
         if (DateTime.UtcNow < m.RezAtUtc)
+        {
+            CircuitTrace.Hit(ctx.Guid, "maint: corpse-run delay, holding rez", (m.RezAtUtc - DateTime.UtcNow).TotalSeconds);
             return StepResult.Wait();
+        }
 
         // ── GROUP GUARD GATE (round 5) ── a grouped bot waits for the defend converge before
         // standing up at 50% in the camp that killed it. Fresh guard stamp OR the cap elapsed ->
@@ -464,8 +504,10 @@ public sealed class MaintenancePlanner : IBotPlanner
             && (DateTime.UtcNow - ctx.GroupGuardNearUtc).TotalSeconds > GuardFreshSec
             && (DateTime.UtcNow - m.RezAtUtc).TotalSeconds < GuardWaitCapSec)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: holding rez for group guard");
             if (ctx.Step != "rez_guard_wait")
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: entering guard-wait step");
                 ctx.SetStep("rez_guard_wait");
                 _log.LogInformation("[REZ] {Name} holding rez — waiting for a guard (group converging on corpse)", ctx.Name);
             }
@@ -502,11 +544,15 @@ public sealed class MaintenancePlanner : IBotPlanner
         // (safe) town vendor, just couldn't get home → exit per the trip outcome.
         if (failure != null && failure.CommandType == "TELEPORT_TO" && ctx.Teleport is { } tpf)
         {
+            CircuitTrace.HitNote(ctx.Guid, "maint: vendor teleport hop failed", failure.Reason);
             var phase = tpf.Phase;
             bool wasFailed = tpf.Failed;
             ctx.Teleport = null;
             if (phase == TpPhase.Inbound)
+            {
+                CircuitTrace.Hit(ctx.Guid, "maint: return hop failed, exit per trip outcome");
                 return wasFailed ? GiveUp(ctx, $"tp-return:{failure.Reason}") : FinishVendor(ctx);
+            }
             return GiveUp(ctx, $"teleport:{failure.Reason}");
         }
 
@@ -516,8 +562,10 @@ public sealed class MaintenancePlanner : IBotPlanner
         // AtTarget falls through to the phase switch, which drives sell/repair at real proximity.
         if (sv != null && ctx.Teleport is { } tp)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: vendor teleport round-trip active");
             if (tp.Phase == TpPhase.Outbound)
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: teleported in at vendor, selling");
                 tp.Phase = TpPhase.AtTarget;
                 sv.Phase = VendorPhase.Sell;
                 ctx.SetStep("vendor_sell");
@@ -528,6 +576,7 @@ public sealed class MaintenancePlanner : IBotPlanner
             }
             if (tp.Phase == TpPhase.Inbound)
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: returned from vendor teleport");
                 bool failed = tp.Failed;
                 ctx.Teleport = null;
                 return failed ? GiveUp(ctx, "vendor failed at npc (returned)") : FinishVendor(ctx);
@@ -538,8 +587,10 @@ public sealed class MaintenancePlanner : IBotPlanner
         // Not started — confirm we still need it and pick the nearest (repair-biased) vendor.
         if (sv == null || sv.Phase == VendorPhase.None)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: vendor errand not started, evaluating");
             if (!NeedsVendor(ctx))
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: vendor not needed, releasing", ctx.Durability);
                 _log.LogInformation("[VENDOR] {Name} release: NeedsVendor=false (bag={Bag} dur={Dur} cooldownUntil={CD})",
                     ctx.Name, ctx.FreeSlots, ctx.Durability, ctx.Identity?.VendorCooldownUntil);
                 return StepResult.Complete();   // durability/slots already fine / on cooldown → release
@@ -555,12 +606,16 @@ public sealed class MaintenancePlanner : IBotPlanner
             bool requireRepair = ctx.Durability < RepairRequiredBelowDurability;
             var vendor = _zoneData.GetNearestVendor(ctx.ZoneId, ctx.MapId, ctx.Pos.X, ctx.Pos.Y, ctx.Level, requireRepair);
             if (vendor == null)
+            {
+                CircuitTrace.Hit(ctx.Guid, "maint: no vendor found, giving up");
                 return GiveUp(ctx, requireRepair ? "no repair vendor in range (dur low)" : "no vendor in zone");   // ZoneDataLoader logs the cap/closest that drove the null
+            }
 
             var target = new Vec4(vendor.X, vendor.Y, vendor.Z, vendor.MapId);
             float startDist = ctx.Pos.Dist2D(target.Pos);
             if (startDist > VendorMaxTravelYards)
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: nearest vendor past travel cap", startDist);
                 _log.LogInformation("[VENDOR] {Name} nearest {Vendor} @ {Dist:F0}yd past policy cap {Cap:F0} → giveup",
                     ctx.Name, vendor.NpcName, startDist, VendorMaxTravelYards);
                 return GiveUp(ctx, "nearest vendor past travel cap");
@@ -585,10 +640,10 @@ public sealed class MaintenancePlanner : IBotPlanner
         // In flight — advance the active phase (its WAIT just resolved; failure consumed).
         switch (sv.Phase)
         {
-            case VendorPhase.Route: return RouteStep(ctx, sv, failure);
-            case VendorPhase.Sell: return SellStep(ctx, sv, failure);
-            case VendorPhase.Repair: return RepairStep(ctx, sv, failure);   // REPAIR_ACK / REPAIR_FAIL / deadline
-            default: return FinishVendor(ctx);
+            case VendorPhase.Route: CircuitTrace.Hit(ctx.Guid, "maint: advancing vendor route phase"); return RouteStep(ctx, sv, failure);
+            case VendorPhase.Sell: CircuitTrace.Hit(ctx.Guid, "maint: advancing vendor sell phase"); return SellStep(ctx, sv, failure);
+            case VendorPhase.Repair: CircuitTrace.Hit(ctx.Guid, "maint: advancing vendor repair phase"); return RepairStep(ctx, sv, failure);   // REPAIR_ACK / REPAIR_FAIL / deadline
+            default: CircuitTrace.Hit(ctx.Guid, "maint: unknown vendor phase, finishing"); return FinishVendor(ctx);
         }
     }
 
@@ -599,19 +654,23 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         if (failure != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "maint: vendor route leg failed", failure.Reason);
             // Teleport-assist: a no_path on the final approach to the vendor, in the vicinity → hop
             // the last few yards instead of giving up (the vendor sits in a nav-dead pocket MOVE_TO
             // can't reach the last yards into). First no_path retries; the second, within reach, warps.
             if (TeleportAssist.IsApproachNoPath(failure))
             {
+                CircuitTrace.Hit(ctx.Guid, "maint: approach no_path near vendor", sv.RouteFails + 1);
                 sv.RouteFails++;
                 switch (TeleportAssist.Decide(sv.RouteFails, ctx.Pos, sv.TargetPos, ctx.MapId))
                 {
                     case TeleportAssist.TpDecision.Teleport:
+                        CircuitTrace.Hit(ctx.Guid, "maint: teleport-assist hop to vendor issued");
                         _log.LogInformation("[VENDOR] {Name} vendor unreachable ({N}× no_path, {D:F0}yd) — TELEPORT_TO entry={Entry}",
                             ctx.Name, sv.RouteFails, ctx.Pos.Dist2D(sv.TargetPos.Pos), sv.TargetNpcEntry);
                         return StepResult.Send(TeleportAssist.BeginOutbound(ctx, sv.TargetPos), "TELEPORT_ACK", TeleportAssist.AckDeadline);
                     case TeleportAssist.TpDecision.Retry:
+                        CircuitTrace.Hit(ctx.Guid, "maint: retry route to vendor");
                         return MoveToVendor(sv);   // one more chance to path closer
                                                    // TpDecision.GiveUp → fall through (vendor genuinely far — not a final-approach pocket)
                 }
@@ -626,6 +685,7 @@ public sealed class MaintenancePlanner : IBotPlanner
 
         if (dist <= VendorArriveYards)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: arrived at vendor, selling", dist);
             sv.Phase = VendorPhase.Sell;
             ctx.SetStep("vendor_sell");
             // [VENDOR] point 3 — arrived. The arrival distance vs the 15yd gate is the whole
@@ -640,6 +700,7 @@ public sealed class MaintenancePlanner : IBotPlanner
 
         if ((DateTime.UtcNow - sv.StartedUtc).TotalSeconds > VendorRouteGiveupSec)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: never arrived at vendor, giving up", dist);
             _log.LogInformation("[VENDOR] {Name} NEVER ARRIVED — closest approach {Dist:F1}yd (gate {Gate}) after {Sec:F0}s (target entry={Entry}) → giveup",
                 ctx.Name, dist, VendorArriveYards, (DateTime.UtcNow - sv.StartedUtc).TotalSeconds, sv.TargetNpcEntry);
             return GiveUp(ctx, "never arrived");
@@ -663,8 +724,12 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         if (failure != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "maint: sell failed", failure.Reason);
             if (failure.Reason is "vendor_not_found" or "missing_npc_entry")
+            {
+                CircuitTrace.Hit(ctx.Guid, "maint: phantom sell vendor, short cooldown");
                 return GiveUpPhantom(ctx, $"sell {failure.Reason} entry={sv.TargetNpcEntry}");
+            }
             return GiveUp(ctx, $"sell {failure.Reason}");
         }
 
@@ -675,6 +740,7 @@ public sealed class MaintenancePlanner : IBotPlanner
             ctx.Name, ctx.FreeSlots, ctx.Durability, sv.CanRepair, sv.CanRepair ? "REPAIR_AT_NPC" : "finish");
         if (sv.CanRepair)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: sold, repairing at vendor", ctx.Durability);
             sv.Phase = VendorPhase.Repair;
             ctx.SetStep("vendor_repair");
             var cmd = new BridgeCommand("REPAIR_AT_NPC", new { npc_entry = sv.TargetNpcEntry });
@@ -693,8 +759,12 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         if (failure != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "maint: repair failed", failure.Reason);
             if (failure.Reason == "npc_not_found")
+            {
+                CircuitTrace.Hit(ctx.Guid, "maint: phantom repair npc, short cooldown");
                 return GiveUpPhantom(ctx, $"repair npc_not_found entry={sv.TargetNpcEntry}");
+            }
             _log.LogInformation("[VENDOR] {Name} repair failed reason={Reason} → finish (sell leg already done)",
                 ctx.Name, failure.Reason);
         }
@@ -717,6 +787,7 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         if (ctx.Teleport is { Phase: TpPhase.AtTarget } tp)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: teleported in earlier, hopping home first");
             tp.Failed = tripFailed;
             return StepResult.Send(TeleportAssist.BeginReturn(ctx), "TELEPORT_ACK", TeleportAssist.AckDeadline);
         }
@@ -727,8 +798,8 @@ public sealed class MaintenancePlanner : IBotPlanner
     // re-evaluates, clear the errand, release to the GoalSelector.
     private StepResult FinishVendor(BotContext ctx)
     {
-        if (ReturnIfTeleported(ctx, tripFailed: false) is { } ret) return ret;   // hop home first if we teleported in
-        if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorDoneCooldownSec);
+        if (ReturnIfTeleported(ctx, tripFailed: false) is { } ret) { CircuitTrace.Hit(ctx.Guid, "maint: return hop before finish"); return ret; }   // hop home first if we teleported in
+        if (ctx.Identity is { } id) { CircuitTrace.Hit(ctx.Guid, "maint: vendor done, cooldown set", VendorDoneCooldownSec); id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorDoneCooldownSec); }
         ctx.Service = null;
         ctx.SetStep("vendor_done");
         // [VENDOR] point 5 — reached the END of the errand cleanly. If bag is STILL 0 / dur
@@ -743,8 +814,9 @@ public sealed class MaintenancePlanner : IBotPlanner
     // while before retrying instead of re-rolling the same far vendor every tick.
     private StepResult GiveUp(BotContext ctx, string why)
     {
-        if (ReturnIfTeleported(ctx, tripFailed: true) is { } ret) return ret;   // hop home first if we teleported in
-        if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorGiveupCooldownSec);
+        CircuitTrace.HitNote(ctx.Guid, "maint: vendor giveup", why);
+        if (ReturnIfTeleported(ctx, tripFailed: true) is { } ret) { CircuitTrace.Hit(ctx.Guid, "maint: return hop before giveup"); return ret; }   // hop home first if we teleported in
+        if (ctx.Identity is { } id) { CircuitTrace.Hit(ctx.Guid, "maint: giveup cooldown set", VendorGiveupCooldownSec); id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorGiveupCooldownSec); }
         ctx.Service = null;
         ctx.SetStep($"vendor_giveup:{why}");
         // [VENDOR] point 6 — THE silent killer, now loud. This is the line that was never
@@ -766,8 +838,9 @@ public sealed class MaintenancePlanner : IBotPlanner
     // visible in one grep instead of hiding among the policy give-ups.
     private StepResult GiveUpPhantom(BotContext ctx, string why)
     {
-        if (ReturnIfTeleported(ctx, tripFailed: true) is { } ret) return ret;   // hop home first if we teleported in
-        if (ctx.Identity is { } id) id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorPhantomCooldownSec);
+        CircuitTrace.HitNote(ctx.Guid, "maint: vendor phantom giveup", why);
+        if (ReturnIfTeleported(ctx, tripFailed: true) is { } ret) { CircuitTrace.Hit(ctx.Guid, "maint: return hop before phantom giveup"); return ret; }   // hop home first if we teleported in
+        if (ctx.Identity is { } id) { CircuitTrace.Hit(ctx.Guid, "maint: phantom cooldown set", VendorPhantomCooldownSec); id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorPhantomCooldownSec); }
         ctx.Service = null;
         ctx.SetStep($"vendor_phantom:{why}");
         _log.LogWarning("[VENDOR] {Name} PHANTOM why='{Why}' (short cooldown {Sec}s) bag={Bag} dur={Dur} z={Zone} pos=({X:F0},{Y:F0})@{Map} lvl={Lvl}",
@@ -781,7 +854,10 @@ public sealed class MaintenancePlanner : IBotPlanner
     private static bool NeedsVendor(BotContext ctx)
     {
         if (ctx.Identity?.VendorCooldownUntil is DateTime cd && DateTime.UtcNow < cd)
+        {
+            CircuitTrace.Hit(ctx.Guid, "maint: vendor on cooldown, no errand");
             return false;
+        }
         return ctx.Durability < DurabilityVendorThreshold || ctx.FreeSlots <= 0;
     }
 
@@ -794,6 +870,7 @@ public sealed class MaintenancePlanner : IBotPlanner
     {
         if (!m.IdleFired)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: firing IDLE to eat back to full");
             m.IdleFired = true;
             m.HealSinceUtc = DateTime.UtcNow;
             ctx.SetStep("heal");
@@ -806,6 +883,7 @@ public sealed class MaintenancePlanner : IBotPlanner
         bool manaOk = ctx.ManaPct >= RezHealManaTarget;   // 1f for no-mana classes → always ok
         if (hpOk && manaOk)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: healed to target, releasing", ctx.HpPct);
             m.HealDone = true;
             return StepResult.Complete();
         }
@@ -816,6 +894,7 @@ public sealed class MaintenancePlanner : IBotPlanner
         // the same pocket, next cycle escalates to a graveyard rez.
         if ((DateTime.UtcNow - m.HealSinceUtc).TotalSeconds > HealTimeoutSec)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: heal timeout, releasing anyway", ctx.HpPct);
             m.HealDone = true;
             return StepResult.Complete();
         }
@@ -828,7 +907,7 @@ public sealed class MaintenancePlanner : IBotPlanner
     // BotIdentity — we check before RecordDeath) against the current ghost position.
     private static bool SameSpotAsLastDeath(in (float X, float Y, int Map) last, BotContext ctx)
     {
-        if (last.Map != ctx.MapId) return false;
+        if (last.Map != ctx.MapId) { CircuitTrace.Hit(ctx.Guid, "maint: last death on another map, not a loop"); return false; }
         float dx = last.X - ctx.Pos.X, dy = last.Y - ctx.Pos.Y;
         return (dx * dx + dy * dy) <= DeathLoopRadiusYards * DeathLoopRadiusYards;
     }
@@ -880,11 +959,13 @@ public sealed class MaintenancePlanner : IBotPlanner
         BridgeCommand cmd;
         if (m.HearthEscape && ctx.Identity != null)
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: porting ghost to racial home");
             var h = BotIdentity.HomeFor(ctx.Identity.Race, ctx.Identity.Level);
             cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1, home_x = h.X, home_y = h.Y, home_z = h.Z, home_map = h.Map });
         }
         else
         {
+            CircuitTrace.Hit(ctx.Guid, "maint: porting ghost to nearest graveyard");
             cmd = new BridgeCommand("RESURRECT", new { at_graveyard = 1 });
         }
         return StepResult.Send(cmd, "GRAVEYARD_PORT", TimeSpan.FromSeconds(GraveyardPortDeadlineSec));

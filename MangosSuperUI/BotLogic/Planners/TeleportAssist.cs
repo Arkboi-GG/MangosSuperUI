@@ -63,9 +63,9 @@ public static class TeleportAssist
     public static TpDecision Decide(int noPathCount, Vec3 botPos, Vec4 target, int botMap)
     {
         if (noPathCount < AfterNoPaths)
-            return TpDecision.Retry;
+            return TpDecision.Retry;   // cb:fold pure decision, outcome probed at each caller
         if (botMap == target.Map && botPos.Dist2D(target.Pos) <= ReachYards)
-            return TpDecision.Teleport;
+            return TpDecision.Teleport;   // cb:fold pure decision, outcome probed at each caller
         return TpDecision.GiveUp;   // exhausted retries but the NPC is far / cross-map — a real travel failure
     }
 

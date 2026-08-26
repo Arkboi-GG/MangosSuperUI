@@ -1,4 +1,5 @@
 using Dapper;
+using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Models;
 
 namespace MangosSuperUI.Services;
@@ -61,7 +62,10 @@ public sealed class BotSpellbookVisibilityService
     public async Task<BotSpellbookVisibility> GetAsync(int guid, CancellationToken cancellationToken = default)
     {
         if (guid <= 0)
+        {
+            CircuitTrace.Hit(0, "spellbook: rejected, invalid guid");
             return Error(guid, "not_found", "A positive character guid is required.");
+        }
 
         BotSpellbookDbRow? bot;
         IReadOnlyList<KnownSpellRow> known;
@@ -77,7 +81,10 @@ public sealed class BotSpellbookVisibilityService
                 new { Guid = guid }, cancellationToken: cancellationToken));
 
             if (bot == null)
+            {
+                CircuitTrace.Hit(guid, "spellbook: character not found");
                 return Error(guid, "not_found", $"Character {guid} was not found.");
+            }
 
             known = (await conn.QueryAsync<KnownSpellRow>(new CommandDefinition(@"
                 SELECT spell AS SpellId, active AS Active, disabled AS Disabled
@@ -87,6 +94,7 @@ public sealed class BotSpellbookVisibilityService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "spellbook: character_spell read failed");
             _logger.LogWarning(ex, "Spellbook: failed to read character_spell for guid {Guid}", guid);
             return Error(guid, "database_unavailable", "Character spell data is temporarily unavailable.");
         }
@@ -98,6 +106,7 @@ public sealed class BotSpellbookVisibilityService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "spellbook: skill catalog unavailable");
             _logger.LogError(ex, "Spellbook: skill-line catalog failed to load");
             return Error(guid, "catalog_unavailable",
                 "The build-5875 skill-line catalog is unavailable or failed validation.", bot);
@@ -113,6 +122,7 @@ public sealed class BotSpellbookVisibilityService
         {
             if (row.Disabled != 0)
             {
+                CircuitTrace.Hit(guid, "spellbook: disabled spell row suppressed", row.SpellId);
                 disabledCount++;
                 continue;
             }
@@ -129,7 +139,10 @@ public sealed class BotSpellbookVisibilityService
         {
             _dbc.AllSpellEntries.TryGetValue(row.SpellId, out SpellDbcEntry? spell);
             if (spell == null)
+            {
+                CircuitTrace.Hit(guid, "spellbook: learned spell unresolved in Spell.dbc", row.SpellId);
                 unresolved++;
+            }
 
             // A chain's top is the last link still present in THIS bot's learned set.
             // Walking forward_spellid (rather than comparing "Rank N" strings) is the
@@ -243,7 +256,10 @@ public sealed class BotSpellbookVisibilityService
     {
         var bySpellId = new Dictionary<uint, int>();
         if (!_rotations.TryGetAssignment(bot.Name, out string profileName) || string.IsNullOrWhiteSpace(profileName))
+        {
+            CircuitTrace.Hit(bot.Guid, "spellbook: no rotation assignment for bot");
             return new RotationCrossReference(bySpellId, new BotSpellbookRotationView { Assigned = false });
+        }
 
         RotationService.RotationProfile? profile;
         try
@@ -252,12 +268,14 @@ public sealed class BotSpellbookVisibilityService
         }
         catch (Exception ex)
         {
+            CircuitTrace.HitNote(bot.Guid, "spellbook: rotation profile read failed", profileName);
             _logger.LogWarning(ex, "Spellbook: rotation profile '{Profile}' could not be read", profileName);
             profile = null;
         }
 
         if (profile == null)
         {
+            CircuitTrace.HitNote(bot.Guid, "spellbook: assigned rotation profile not found", profileName);
             return new RotationCrossReference(bySpellId, new BotSpellbookRotationView
             {
                 Assigned = true,
@@ -273,12 +291,18 @@ public sealed class BotSpellbookVisibilityService
         {
             uint spellId = instruction.SpellId;
             if (spellId == 0)
+            {
+                CircuitTrace.Hit(bot.Guid, "spellbook: rotation instruction without spell id");
                 continue;
+            }
 
             // First writer wins so the displayed priority is the strongest one the
             // slate assigns to that spell, matching the C++ first-match-wins walk.
             if (!bySpellId.ContainsKey(spellId) || instruction.Priority < bySpellId[spellId])
+            {
+                CircuitTrace.Hit(bot.Guid, "spellbook: rotation priority recorded", instruction.Priority);
                 bySpellId[spellId] = instruction.Priority;
+            }
 
             _dbc.AllSpellEntries.TryGetValue(spellId, out SpellDbcEntry? spell);
             string label = string.IsNullOrWhiteSpace(spell?.Name) ? $"Spell #{spellId}" : spell!.Name;
@@ -286,6 +310,7 @@ public sealed class BotSpellbookVisibilityService
 
             if (!learned.ContainsKey(spellId))
             {
+                CircuitTrace.Hit(bot.Guid, "spellbook: rotation names unknown spell", spellId);
                 missing.Add(new BotSpellbookRotationGapView
                 {
                     SpellId = spellId,
@@ -300,6 +325,7 @@ public sealed class BotSpellbookVisibilityService
             uint forward = catalog.Forward.GetValueOrDefault(spellId);
             if (forward != 0 && learned.ContainsKey(forward))
             {
+                CircuitTrace.Hit(bot.Guid, "spellbook: rotation names outgrown rank", spellId);
                 // Castable, so the core loads it and reports zero skipped — but the
                 // bot knows a strictly better rank of the same spell. This is the
                 // failure mode a loaded/skipped count can never surface.
@@ -376,16 +402,16 @@ public sealed class BotSpellbookVisibilityService
             uint skillId = abilityDbc.GetUInt(row, 1);
             uint spellId = abilityDbc.GetUInt(row, 2);
             if (spellId == 0)
-                continue;
+                continue;   // cb:fold load-time catalog assembly, no per-bot routing
 
             bool isClassSkill = lines.TryGetValue(skillId, out SkillLineDefinition? line)
                 && line.CategoryId == ClassSkillCategoryId;
             if (!skillOf.ContainsKey(spellId) || (isClassSkill && !IsClassSkill(skillOf[spellId], lines)))
-                skillOf[spellId] = skillId;
+                skillOf[spellId] = skillId;   // cb:fold load-time catalog assembly, no per-bot routing
 
             uint forwardSpellId = abilityDbc.GetUInt(row, 8);
             if (forwardSpellId != 0 && forwardSpellId != spellId && !forward.ContainsKey(spellId))
-            {
+            {   // cb:fold load-time catalog assembly, no per-bot routing
                 forward[spellId] = forwardSpellId;
                 backward.TryAdd(forwardSpellId, spellId);
             }
@@ -407,8 +433,11 @@ public sealed class BotSpellbookVisibilityService
         WowDbcFile parsed = WowDbcFile.Parse(File.ReadAllBytes(path))
             ?? throw new InvalidDataException($"Could not parse {path}.");
         if (parsed.FieldCount != fieldCount || parsed.RecordSize != recordSize)
+        {
+            CircuitTrace.Hit(0, "spellbook: dbc layout mismatch, failing catalog load");
             throw new InvalidDataException(
                 $"{fileName} layout is {parsed.FieldCount} fields/{parsed.RecordSize} bytes; expected {fieldCount}/{recordSize}.");
+        }
         return parsed;
     }
 
@@ -477,10 +506,10 @@ public sealed class BotSpellbookVisibilityService
             for (int step = 0; step < MaxChain; step++)
             {
                 if (!Backward.TryGetValue(root, out uint previous) || !seen.Add(previous))
-                    break;
+                    break;   // cb:fold pure chain-walk helper without guid, result carried in entry view
                 root = previous;
                 if (learned.ContainsKey(previous))
-                    before++;
+                    before++;   // cb:fold pure chain-walk helper without guid, result carried in entry view
             }
 
             int after = 0;
@@ -488,10 +517,10 @@ public sealed class BotSpellbookVisibilityService
             for (int step = 0; step < MaxChain; step++)
             {
                 if (!Forward.TryGetValue(cursor, out uint next) || !seen.Add(next))
-                    break;
+                    break;   // cb:fold pure chain-walk helper without guid, result carried in entry view
                 cursor = next;
                 if (learned.ContainsKey(next))
-                    after++;
+                    after++;   // cb:fold pure chain-walk helper without guid, result carried in entry view
             }
 
             return (root, before + 1 + after, before + 1);

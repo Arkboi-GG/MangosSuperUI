@@ -3,6 +3,7 @@ using MangosSuperUI.BotLogic.Chat.Core;
 using MangosSuperUI.BotLogic.Chat.Engine;
 using MangosSuperUI.BotLogic.Chat.Memory;
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Services;
 
 namespace MangosSuperUI.BotLogic.Chat.Coordinator;
@@ -110,7 +111,10 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
     public void EnqueueStimulus(ChatStimulusRaw raw)
     {
         if (!_stimuli.Writer.TryWrite(raw))
+        {
+            CircuitTrace.Hit(raw.HearerGuid, "chat: stimulus dropped, intake channel closed");
             _logger.LogWarning("[CHAT-COORD] stimulus dropped — channel closed (shutdown?)");
+        }
     }
 
     public override Task StartAsync(CancellationToken cancellationToken)
@@ -128,7 +132,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             loops.Add(ReactiveWorkerAsync(i, stoppingToken));
 
         try { await Task.WhenAll(loops); }
-        catch (OperationCanceledException) { /* shutdown */ }
+        catch (OperationCanceledException) { CircuitTrace.Hit(0, "chat: coordinator loops cancelled on shutdown"); /* shutdown */ }
 
         _logger.LogInformation("[CHAT-COORD] ChatCoordinator stopped");
     }
@@ -153,12 +157,14 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
 
             if (!_settings.GetBool(0, "global.chat_enabled", true))
             {
+                CircuitTrace.Hit(raw.HearerGuid, "chat: stimulus dropped, chat disabled");
                 _logger.LogDebug("[CHAT-COORD] dropped hearer={Hearer} reason=disabled", raw.HearerGuid);
                 continue;
             }
 
             if (kind == ChatKind.Whisper)
             {
+                CircuitTrace.Hit(raw.HearerGuid, "chat: whisper fast-path taken");
                 await HandleWhisperAsync(raw, ct);
                 continue;
             }
@@ -170,10 +176,12 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             {
                 if (_folds.TryGetValue(key, out var fold))
                 {
+                    CircuitTrace.Hit(raw.HearerGuid, "chat: hearer joined existing fold");
                     fold.Hearers.Add(raw.HearerGuid);
                 }
                 else
                 {
+                    CircuitTrace.Hit(raw.HearerGuid, "chat: new fold opened for stimulus");
                     var f = new PendingFold
                     {
                         Sender = raw.Sender,
@@ -206,6 +214,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
         int maxDepth = _settings.GetInt(0, "noise.max_bot_chain_depth", 2);
         if (depth >= maxDepth)
         {
+            CircuitTrace.Hit(raw.HearerGuid, "chat: whisper chain-depth drop", depth);
             _logger.LogInformation("[CHAT-COORD] chain drop — whisper from bot {Sender} at depth {Depth} ≥ {Max}",
                 raw.Sender, depth, maxDepth);
             return;
@@ -220,6 +229,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
 
         if (!_settings.GetBool(0, "responsiveness.whisper_always_replies", true))
         {
+            CircuitTrace.Hit(raw.HearerGuid, "chat: whisper routed through urge scoring");
             // §9.2: whisper_always off → whispers go through urge like everything else.
             var inputs = new UrgeInputs(raw.HearerGuid, Addressed: true, threadActive,
                 await _memory.GetStrengthAsync(raw.HearerGuid, raw.Sender),
@@ -228,9 +238,10 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             var (urge, speaks, breakdown) = _urge.Score(inputs, zoneId);
             _logger.LogInformation("[CHAT-COORD] urge bot={Bot} kind=whisper {Verdict}: {Breakdown}",
                 raw.HearerGuid, speaks ? "spoke" : "held", breakdown);
-            if (!speaks) return;
+            if (!speaks) { CircuitTrace.Hit(raw.HearerGuid, "chat: whisper urge held", urge); return; }
             if (Random.Shared.NextDouble() < _settings.GetFloat(zoneId, "noise.ignore_chance", 0.06f))
             {
+                CircuitTrace.Hit(raw.HearerGuid, "chat: whisper ignore roll", urge);
                 _logger.LogInformation("[CHAT-COORD] ignored bot={Bot} reason=ignore-roll (urge {Urge:0.00})", raw.HearerGuid, urge);
                 return;
             }
@@ -277,31 +288,40 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
 
         foreach (var hearerGuid in hearers)
         {
-            if (!_bridge.BotStates.TryGetValue(hearerGuid, out var state)) continue;
+            if (!_bridge.BotStates.TryGetValue(hearerGuid, out var state)) { CircuitTrace.Hit(hearerGuid, "chat: hearer skipped, no bot state"); continue; }
 
             bool addressed = IsAddressed(fold.Message, state.Name);
             bool threadActive = _tracker.IsThreadActive(hearerGuid, fold.Sender);
-            if (threadActive) addressed = true;   // §9.1: Tier-0 active counterpart = addressed
+            if (threadActive) { CircuitTrace.Hit(hearerGuid, "chat: tier0 thread active, treated addressed"); addressed = true; }   // §9.1: Tier-0 active counterpart = addressed
 
             // Design amendment (Nico, 2026-07-07): PARTY CHAT IS INHERENTLY ADDRESSED.
             // You only hear /p from your own group, and nobody types in /p except to
             // talk TO the group — a partymate's line deserves the full W_addr weight.
             // (Cooldown, ignore roll, and budgets still thin replies in big parties.)
-            if (fold.Kind == ChatKind.Party) addressed = true;
+            if (fold.Kind == ChatKind.Party) { CircuitTrace.Hit(hearerGuid, "chat: party line inherently addressed"); addressed = true; }
 
             // ── Tier-1 policy (§7.2), independent of the speak decision ──
             if (addressed)
+            {
+                CircuitTrace.Hit(hearerGuid, "chat: tier1 logged participated (addressed)");
                 _memory.LogParticipatedIn(hearerGuid, fold.Sender, fold.SenderGuid,
                     fold.Kind, fold.ChannelName, state.ZoneId, fold.Message, addressed: true);
+            }
             else if (threadActive)
+            {
+                CircuitTrace.Hit(hearerGuid, "chat: tier1 logged participated (thread)");
                 _memory.LogParticipatedIn(hearerGuid, fold.Sender, fold.SenderGuid,
                     fold.Kind, fold.ChannelName, state.ZoneId, fold.Message, addressed: false);
+            }
             else
+            {
+                CircuitTrace.Hit(hearerGuid, "chat: tier1 logged overheard");
                 _memory.LogOverheard(hearerGuid, fold.Sender, fold.SenderGuid,
                     fold.Kind, fold.ChannelName, state.ZoneId, fold.Message,
                     mentionsBotName: false, isQuestion);
+            }
 
-            if (chainDropped) continue;   // memory recorded; nobody replies past the cap
+            if (chainDropped) { CircuitTrace.Hit(hearerGuid, "chat: chain cap drop, memory only", stimulusDepth); continue; }   // memory recorded; nobody replies past the cap
 
             // ── §9.2 urge ──
             var inputs = new UrgeInputs(hearerGuid, addressed, threadActive,
@@ -312,6 +332,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
 
             if (!speaks)
             {
+                CircuitTrace.Hit(hearerGuid, "chat: urge held below threshold", urge);
                 _logger.LogInformation("[CHAT-COORD] urge bot={Bot}({Name}) held: {Breakdown}",
                     hearerGuid, state.Name, breakdown);
                 continue;
@@ -320,6 +341,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             // Post-threshold ignore roll (D18: sometimes the guy just doesn't feel like it)
             if (Random.Shared.NextDouble() < _settings.GetFloat(state.ZoneId, "noise.ignore_chance", 0.06f))
             {
+                CircuitTrace.Hit(hearerGuid, "chat: post-threshold ignore roll", urge);
                 _logger.LogInformation("[CHAT-COORD] urge bot={Bot}({Name}) ignored (roll): {Breakdown}",
                     hearerGuid, state.Name, breakdown);
                 continue;
@@ -329,10 +351,12 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             // capped by live threads among the hearer set (§9.2).
             if (!threadActive)
             {
+                CircuitTrace.Hit(hearerGuid, "chat: new-conversation crosstalk check");
                 int maxConvos = _settings.GetInt(state.ZoneId, "noise.max_parallel_convos_per_spot", 2);
                 int active = _tracker.CountActiveThreads(hearers);
                 if (active + speakers.Count >= maxConvos)
                 {
+                    CircuitTrace.Hit(hearerGuid, "chat: crosstalk cap held", active);
                     _logger.LogInformation("[CHAT-COORD] urge bot={Bot}({Name}) held reason=crosstalk ({Active} live ≥ {Max})",
                         hearerGuid, state.Name, active, maxConvos);
                     continue;
@@ -342,6 +366,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             // Token buckets (§9.4.3) — consumed at the decision, not the send
             if (!_buckets.TryConsume(hearerGuid, state.ZoneId, fold.Kind))
             {
+                CircuitTrace.Hit(hearerGuid, "chat: budget bucket drop at decision");
                 _logger.LogDebug("[CHAT-COORD] bucket drop bot={Bot}({Name}) kind={Kind}", hearerGuid, state.Name, fold.Kind);
                 continue;
             }
@@ -375,11 +400,11 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
     /// </summary>
     private static bool IsAddressed(string message, string botName)
     {
-        if (string.IsNullOrEmpty(botName)) return false;
+        if (string.IsNullOrEmpty(botName)) return false;   // cb:fold pure text addressing helper, addressed outcome feeds urge probes
         foreach (var token in message.Split(_tokenSeps, StringSplitOptions.RemoveEmptyEntries))
         {
-            if (token.Equals(botName, StringComparison.OrdinalIgnoreCase)) return true;
-            if (token.Length >= 4 && botName.StartsWith(token, StringComparison.OrdinalIgnoreCase)) return true;
+            if (token.Equals(botName, StringComparison.OrdinalIgnoreCase)) return true;   // cb:fold pure text addressing helper, addressed outcome feeds urge probes
+            if (token.Length >= 4 && botName.StartsWith(token, StringComparison.OrdinalIgnoreCase)) return true;   // cb:fold pure text addressing helper, addressed outcome feeds urge probes
         }
         return false;
     }
@@ -394,10 +419,10 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
     /// </summary>
     private float Proximity(PendingFold fold, BotState hearer)
     {
-        if (fold.Kind != ChatKind.Say) return 0.5f;
+        if (fold.Kind != ChatKind.Say) return 0.5f;   // cb:fold proximity input detail, value carried by urge breakdown probes
         if (fold.SenderGuid != 0 && _bridge.BotStates.TryGetValue((int)fold.SenderGuid, out var sender)
             && sender.MapId == hearer.MapId)
-        {
+        {   // cb:fold proximity input detail, value carried by urge breakdown probes
             float dx = sender.X - hearer.X, dy = sender.Y - hearer.Y;
             float dist = MathF.Sqrt(dx * dx + dy * dy);
             return Math.Clamp(1f - dist / 25f, 0f, 1f);
@@ -418,9 +443,10 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
         await foreach (var job in _reactiveJobs.Reader.ReadAllAsync(ct))
         {
             try { await ProcessReactiveAsync(job, ct); }
-            catch (OperationCanceledException) { throw; }
+            catch (OperationCanceledException) { CircuitTrace.Hit(job.HearerGuid, "chat: reactive worker cancelled"); throw; }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(job.HearerGuid, "chat: reactive worker failed, job abandoned");
                 _logger.LogError(ex, "[CHAT-COORD] reactive worker {Id} failed for hearer={Hearer}",
                     workerId, job.HearerGuid);
             }
@@ -431,6 +457,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
     {
         if (!_bridge.BotStates.TryGetValue(job.HearerGuid, out var state))
         {
+            CircuitTrace.Hit(job.HearerGuid, "chat: reactive drop, no bot state");
             _logger.LogWarning("[CHAT-COORD] dropped hearer={Hearer} reason=no-bot-state", job.HearerGuid);
             return;
         }
@@ -457,11 +484,12 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             Activity: ActivityOf(state));
 
         var rawReply = await _engine.ComposeReplyAsync(chatJob, ct);
-        if (rawReply == null) return;
+        if (rawReply == null) { CircuitTrace.Hit(job.HearerGuid, "chat: engine returned no reply"); return; }
 
         var (line, discardReason) = _postPass.Apply(persona.Card, state.Name, rawReply);
         if (line == null)
         {
+            CircuitTrace.HitNote(job.HearerGuid, "chat: post-pass discarded line", discardReason ?? "");
             _logger.LogInformation("[CHAT-ENGINE] discard bot={Bot} reason={Reason}", state.Name, discardReason);
             return;
         }
@@ -495,16 +523,16 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
     /// </summary>
     private static ChatActivity ActivityOf(BotState state)
     {
-        if (state.IsDead) return ChatActivity.Dead;
-        if (state.InCombat) return ChatActivity.Fighting;
+        if (state.IsDead) { CircuitTrace.Hit(state.Guid, "chat: activity framed as dead"); return ChatActivity.Dead; }
+        if (state.InCombat) { CircuitTrace.Hit(state.Guid, "chat: activity framed as fighting"); return ChatActivity.Fighting; }
         return (state.TaskActivity ?? "").ToLowerInvariant() switch
         {
-            "traveling" or "travelling" => ChatActivity.Travelling,
-            "searching" => ChatActivity.Grinding,
-            "engaged" => ChatActivity.Fighting,
-            "recovering" => ChatActivity.Recovering,
-            "blocked" => ChatActivity.Stuck,
-            _ => ChatActivity.Idle
+            "traveling" or "travelling" => CircuitTrace.Pass(ChatActivity.Travelling, state.Guid, "chat: activity framed as travelling"),
+            "searching" => CircuitTrace.Pass(ChatActivity.Grinding, state.Guid, "chat: activity framed as grinding"),
+            "engaged" => CircuitTrace.Pass(ChatActivity.Fighting, state.Guid, "chat: activity framed as engaged"),
+            "recovering" => CircuitTrace.Pass(ChatActivity.Recovering, state.Guid, "chat: activity framed as recovering"),
+            "blocked" => CircuitTrace.Pass(ChatActivity.Stuck, state.Guid, "chat: activity framed as stuck"),
+            _ => CircuitTrace.Pass(ChatActivity.Idle, state.Guid, "chat: activity framed as idle")
         };
     }
 
@@ -514,12 +542,12 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             : state.InCombat ? "fighting something"
             : (state.TaskActivity ?? "").ToLowerInvariant() switch
             {
-                "traveling" or "travelling" => "traveling somewhere",
-                "searching" => "out grinding mobs",
-                "engaged" => "fighting something",
-                "recovering" => "resting up after a fight",
-                "blocked" => "kind of stuck honestly",
-                _ => "just hanging out"
+                "traveling" or "travelling" => "traveling somewhere",   // cb:fold pure prose transform for prompt, activity probed in ActivityOf
+                "searching" => "out grinding mobs",   // cb:fold pure prose transform for prompt, activity probed in ActivityOf
+                "engaged" => "fighting something",   // cb:fold pure prose transform for prompt, activity probed in ActivityOf
+                "recovering" => "resting up after a fight",   // cb:fold pure prose transform for prompt, activity probed in ActivityOf
+                "blocked" => "kind of stuck honestly",   // cb:fold pure prose transform for prompt, activity probed in ActivityOf
+                _ => "just hanging out"   // cb:fold pure prose transform for prompt, activity probed in ActivityOf
             };
         var zone = ZoneNames.Get(state.ZoneId);
         return string.IsNullOrEmpty(zone)
@@ -539,6 +567,7 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             bool chatEnabled = _settings.GetBool(0, "global.chat_enabled", true);
             if (_lastChatEnabled && !chatEnabled)
             {
+                CircuitTrace.Hit(0, "chat: kill switch flipped off, cancelling pending");
                 int pending = _scheduler.PendingCount;
                 _scheduler.CancelAll();
                 lock (_foldGate) _folds.Clear();
@@ -547,13 +576,16 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             _lastChatEnabled = chatEnabled;
 
             if (chatEnabled)
+            {
+                CircuitTrace.Hit(0, "chat: housekeeping emitting due folds");
                 await EmitDueFoldsAsync(ct);
+            }
 
             _buckets.Refill();
 
             foreach (var send in _scheduler.DrainDue(DateTime.UtcNow))
             {
-                if (!chatEnabled) continue;
+                if (!chatEnabled) { CircuitTrace.Hit(send.BotGuid, "chat: due send suppressed, chat disabled"); continue; }
                 await _bridge.SendSayTextAsync(send.BotGuid, send.Text, send.ChatTypeWire, send.Target, send.Channel);
 
                 // Guard-2 bookkeeping + the cooldown clock, at ACTUAL send time
@@ -566,10 +598,14 @@ public class ChatCoordinator : BackgroundService, IChatCoordinator
             }
 
             if (sweepCounter % 5 == 4)
+            {
+                CircuitTrace.Hit(0, "chat: memory flush tick");
                 await _memory.FlushAsync();
+            }
 
             if (++sweepCounter >= 30)
             {
+                CircuitTrace.Hit(0, "chat: 30s sweep tick");
                 sweepCounter = 0;
                 _tracker.Sweep();
                 _chain.Sweep();

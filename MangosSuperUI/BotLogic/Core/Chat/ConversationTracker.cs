@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Coordinator;
 
@@ -43,7 +44,10 @@ public class ConversationTracker
     public IReadOnlyList<(string Speaker, string Line)> GetWindow(int botGuid, string counterpart, ChatKind kind)
     {
         if (!_windows.TryGetValue((botGuid, Normalize(counterpart), kind), out var w))
+        {
+            CircuitTrace.Hit(botGuid, "chat: no live window for counterpart");
             return Array.Empty<(string, string)>();
+        }
         lock (w) return w.Lines.ToArray();
     }
 
@@ -54,9 +58,9 @@ public class ConversationTracker
         var cp = Normalize(counterpart);
         foreach (var kv in _windows)
         {
-            if (kv.Key.BotGuid != botGuid || kv.Key.Counterpart != cp) continue;
+            if (kv.Key.BotGuid != botGuid || kv.Key.Counterpart != cp) continue;   // cb:fold per-window scan filter, active outcome probed below
             lock (kv.Value)
-                if (DateTime.UtcNow - kv.Value.LastUtc < ttl) return true;
+                if (DateTime.UtcNow - kv.Value.LastUtc < ttl) { CircuitTrace.Hit(botGuid, "chat: thread active with counterpart"); return true; }
         }
         return false;
     }
@@ -73,9 +77,9 @@ public class ConversationTracker
         int count = 0;
         foreach (var kv in _windows)
         {
-            if (!botGuids.Contains(kv.Key.BotGuid)) continue;
+            if (!botGuids.Contains(kv.Key.BotGuid)) continue;   // cb:fold per-window scan filter, count consumed by crosstalk gate probe
             lock (kv.Value)
-                if (now - kv.Value.LastUtc < ttl) count++;
+                if (now - kv.Value.LastUtc < ttl) { CircuitTrace.Hit(kv.Key.BotGuid, "chat: live thread counted for crosstalk gate"); count++; }
         }
         return count;
     }
@@ -89,7 +93,7 @@ public class ConversationTracker
         {
             bool expired;
             lock (kv.Value) expired = now - kv.Value.LastUtc > ttl;
-            if (expired) _windows.TryRemove(kv.Key, out _);
+            if (expired) { CircuitTrace.Hit(kv.Key.BotGuid, "chat: conversation window expired, swept"); _windows.TryRemove(kv.Key, out _); }
         }
     }
 

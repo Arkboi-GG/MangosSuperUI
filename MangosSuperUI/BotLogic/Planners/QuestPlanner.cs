@@ -1,5 +1,6 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Planners;
 
@@ -173,11 +174,17 @@ public sealed class QuestPlanner : IBotPlanner
         // We deliberately leave ctx.Quest untouched: when the stamp clears, the solo path resumes the
         // SAME batch from the live log (turning in anything the team just completed).
         if (ctx.GroupOrder.IsActive)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group order active -> drive group");
             return DriveGroup(ctx);
+        }
 
         // A negated/expired WAIT surfaced a failure -> recover (batch-aware).
         if (ctx.Failure != null)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: failure surfaced -> recover");
             return Recover(ctx);
+        }
 
         var q = ctx.Quest;
 
@@ -192,6 +199,7 @@ public sealed class QuestPlanner : IBotPlanner
             // truth right now — build straight off it. No sync handshake, no stale/empty-cache window: a goal
             // bounce (Training / level-up) returns here, BuildBatch resumes EVERY quest still in the C++ log,
             // and the collapse-to-one-quest is structurally impossible.
+            CircuitTrace.Hit(ctx.Guid, "quest: first entry, building batch");
             ctx.Quest = q = new QuestScratch();
             BuildBatch(ctx, q);
             RefreshActiveIds(q);
@@ -203,6 +211,7 @@ public sealed class QuestPlanner : IBotPlanner
         {
             case "obj_sync":
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: obj_sync tick");
                     // After an objective grind completes, wait for the NEXT STATE so ctx.QuestLog reflects the
                     // kills the server just credited before we re-derive — otherwise we'd re-pick a now-satisfied
                     // leg off pre-kill counts. Synced = a STATE landed since we entered this step (stamp is the
@@ -210,11 +219,15 @@ public sealed class QuestPlanner : IBotPlanner
                     // fallback if the heartbeat stalls. This replaces the old QUERY round-trip with the same
                     // freshness guarantee and no pull.
                     if (!Synced(ctx) && ctx.TimeInStepSec < StateFreshCapSec)
+                    {
+                        CircuitTrace.Hit(ctx.Guid, "quest: obj_sync awaiting fresh STATE", ctx.TimeInStepSec);
                         return StepResult.Wait();
+                    }
                     q.Active = null;      // fresh counts -> derive the next objective
                     break;
                 }
             case "to_giver":
+                CircuitTrace.Hit(ctx.Guid, "quest: to_giver travel ack");
                 // Gate the accept on ACTUAL proximity. The travel leg's TASK_COMPLETE can be a stale or
                 // duplicate ack (matches by type, no corr) that lands while the bot is still en route —
                 // firing the accept from far away returns npc_not_found. Not actually at the giver →
@@ -227,6 +240,7 @@ public sealed class QuestPlanner : IBotPlanner
                 // accepted, drop the leg, and re-derive straight to its objective/turn-in this same tick.
                 if (q.Active != null && ctx.QuestLog.ContainsKey(q.Active.QuestId))
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: to_giver aborted - already in log", q.Active.QuestId);
                     q.Active.Accepted = true;
                     _logger.LogDebug("[QUEST] {Name} to_giver aborted -- [{Id}] already in log, resuming (no re-accept walk)",
                         ctx.Name, q.Active.QuestId);
@@ -236,13 +250,16 @@ public sealed class QuestPlanner : IBotPlanner
                 }
                 if (q.Active?.Node.Giver is { } gv)
                 {
-                    if (AtNpc(ctx, gv)) { ctx.SetStep("accept"); return Interact(q.Active, accept: true); }
+                    CircuitTrace.Hit(ctx.Guid, "quest: to_giver leg live", q.Active.QuestId);
+                    if (AtNpc(ctx, gv)) { CircuitTrace.Hit(ctx.Guid, "quest: at giver, accepting"); ctx.SetStep("accept"); return Interact(q.Active, accept: true); }
                     return MoveTo(gv);
                 }
                 break;
             case "accept":
+                CircuitTrace.Hit(ctx.Guid, "quest: accept ack");
                 if (q.Active != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: accepted, gathering co-located quests", q.Active.QuestId);
                     q.Active.Accepted = true;
                     q.Active = null;
                     // We just accepted AT a giver, so any OTHER quest this giver (or
@@ -255,6 +272,7 @@ public sealed class QuestPlanner : IBotPlanner
                 }
                 break;
             case "to_objective":
+                CircuitTrace.Hit(ctx.Guid, "quest: enriched objective leg complete, syncing");
                 // §4 enriched objective: the MOVE_TO carried creature_entry/grind_radius/kill_count,
                 // so C++ engaged the mob on approach (ScanApproachTarget) and ground in place — its
                 // single TASK_COMPLETE ("GRIND finished" at kill_count) = THIS objective done. There
@@ -267,12 +285,14 @@ public sealed class QuestPlanner : IBotPlanner
                 ctx.SetStep("obj_sync");
                 return StepResult.Wait();   // wait for the next STATE (obj_sync re-derives on fresh counts) — pull retired
             case "grind_obj":
+                CircuitTrace.Hit(ctx.Guid, "quest: grind leg complete, syncing");
                 // TASK_COMPLETE = kill_count reached. Re-sync so opportunistic credit on the
                 // OTHER batched quests is seen, then derive the next objective / turn-in.
                 ctx.ClearObjective();   // grind leg done — drop Held so the obj_sync tick can't spuriously reconcile
                 ctx.SetStep("obj_sync");
                 return StepResult.Wait();   // wait for the next STATE (obj_sync re-derives on fresh counts) — pull retired
             case "detour":
+                CircuitTrace.Hit(ctx.Guid, "quest: detour kill done, snapping back to objective");
                 // The unstick detour's single kill just completed (TASK_COMPLETE "GRIND finished"). The freeze
                 // is broken (+1 kill, +XP, and the nearest mob was usually the quest mob itself → often quest
                 // credit too). Snap back to the objective: re-sync the log (so any credit the detour kill
@@ -284,18 +304,22 @@ public sealed class QuestPlanner : IBotPlanner
                 ctx.SetStep("obj_sync");
                 return StepResult.Wait();   // wait for the next STATE (obj_sync re-derives on fresh counts) — pull retired
             case "to_turnin":
+                CircuitTrace.Hit(ctx.Guid, "quest: to_turnin travel ack");
                 // Same proximity gate as to_giver: a stale/duplicate travel ack must not fire the turn-in
                 // from far away (npc_not_found). Re-travel if we're not actually at the ender.
                 if (q.Active != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: to_turnin leg live", q.Active.QuestId);
                     var npc = TurnInNpc(q.Active);
-                    if (AtNpc(ctx, npc)) { ctx.SetStep("turnin"); return Interact(q.Active, accept: false); }
+                    if (AtNpc(ctx, npc)) { CircuitTrace.Hit(ctx.Guid, "quest: at ender, turning in"); ctx.SetStep("turnin"); return Interact(q.Active, accept: false); }
                     return MoveTo(npc);
                 }
                 break;
             case "turnin":
+                CircuitTrace.Hit(ctx.Guid, "quest: turn-in ack");
                 if (q.Active != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: quest completed", q.Active.QuestId);
                     ctx.Identity?.CompletedQuestIds.Add(q.Active.QuestId);
                     ctx.Identity?.QuestDeferralCounts.Remove(q.Active.QuestId);
                     ctx.Identity?.QuestOverflowGrinds.Remove(q.Active.QuestId);
@@ -316,21 +340,25 @@ public sealed class QuestPlanner : IBotPlanner
                 }
                 break;
             case "to_cast":
+                CircuitTrace.Hit(ctx.Guid, "quest: to_cast travel ack");
                 // Arrived (or a stale/duplicate travel ack) at a cast objective's target. Gate on ACTUAL
                 // proximity like to_giver/to_turnin: not truly there -> re-travel; there -> start casting the
                 // resolved spell list on the target creature (QUEST_CAST).
                 if (q.Active != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: cast leg live", q.Active.QuestId);
                     var castObj = ObjectiveAt(q.Active, q.ActiveSlot);
                     if (castObj != null)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "quest: cast objective resolved");
                         var spells = CastSpellsFor(q.Active.Node, castObj, q.Active.QuestId);
                         var cp = NearestSpawnPoint(castObj.SpawnPositions, ctx.Pos.X, ctx.Pos.Y,
                             castObj.GrindX, castObj.GrindY, castObj.GrindZ);
                         var target = CastTarget(castObj.CreatureEntry, cp.X, cp.Y, cp.Z, castObj.GrindMap);
-                        if (!AtNpc(ctx, target)) return MoveTo(target);
+                        if (!AtNpc(ctx, target)) { CircuitTrace.Hit(ctx.Guid, "quest: not at cast target, re-travel"); return MoveTo(target); }
                         if (spells.Length > 0)
                         {
+                            CircuitTrace.Hit(ctx.Guid, "quest: casting quest spell", q.CastIndex);
                             ctx.SetStep("casting");
                             return CastSpell(castObj.CreatureEntry, spells[q.CastIndex], castObj.Count);
                         }
@@ -338,6 +366,7 @@ public sealed class QuestPlanner : IBotPlanner
                 }
                 break;
             case "casting":
+                CircuitTrace.Hit(ctx.Guid, "quest: cast fired (ack)");
                 // A QUEST_CAST_ACK cleared this WAIT -> the previous spell FIRED (an expired cast WAIT routes
                 // to Recover with Failure.CommandType=="QUEST_CAST" instead, so we only advance on a real ack).
                 // Fire the next spell in the kit, or -- once every required spell has landed -- wait for the
@@ -345,6 +374,7 @@ public sealed class QuestPlanner : IBotPlanner
                 // when the server flips the quest COMPLETE). Same tail as to_objective.
                 if (q.Active != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: advancing cast kit", q.CastIndex);
                     var castObj = ObjectiveAt(q.Active, q.ActiveSlot);
                     var spells = castObj != null
                         ? CastSpellsFor(q.Active.Node, castObj, q.Active.QuestId)
@@ -352,6 +382,7 @@ public sealed class QuestPlanner : IBotPlanner
                     q.CastIndex++;
                     if (castObj != null && q.CastIndex < spells.Length)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "quest: next kit spell", q.CastIndex);
                         ctx.SetStep("casting");
                         return CastSpell(castObj.CreatureEntry, spells[q.CastIndex], castObj.Count);
                     }
@@ -371,7 +402,7 @@ public sealed class QuestPlanner : IBotPlanner
     // ------------------------------------------------------------------------
     public bool IsProgressing(BotContext ctx, BotStateSnapshot snap)
     {
-        if (ctx.TimeInGoalSec < 30) return true;                 // arm grace on entering Questing
+        if (ctx.TimeInGoalSec < 30) return true;                 // arm grace on entering Questing   // cb:fold arm grace, no routing information
         return ctx.TimeSinceProgressSec < 300;                   // 5 min no progress + no WAIT => reselect
     }
 
@@ -391,15 +422,22 @@ public sealed class QuestPlanner : IBotPlanner
     public StepResult Rescan(BotContext ctx, BotStateSnapshot snap)
     {
         var q = ctx.Quest;
-        if (q == null) return StepResult.Wait();
+        if (q == null) { CircuitTrace.Hit(ctx.Guid, "quest: rescan - no scratch, wait"); return StepResult.Wait(); }
 
         // Throttle: only re-scan once the bot has crossed a gather boundary.
         if (ctx.Pos.Dist2D(q.LastGatherPos) <= GatherRescanYards)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: rescan throttled (no gather boundary)");
             return StepResult.Wait();
+        }
 
         bool added = GatherLocals(ctx, q);
         if (!added)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: rescan - nothing new, ride trek out");
             return StepResult.Wait();          // nothing new on the way -> ride the trek out
+        }
+        CircuitTrace.Hit(ctx.Guid, "quest: rescan preempts trek (new locals)");
 
         _logger.LogInformation("[QUEST] {Name} en-route rescan folded in new local quest(s) -- preempting trek",
             ctx.Name);
@@ -429,6 +467,7 @@ public sealed class QuestPlanner : IBotPlanner
             var greyAccepted = q.Batch.FirstOrDefault(b => b.Accepted && !b.TurnedIn && IsGrey(b.Node, ctx.Level));
             if (greyAccepted != null)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: grey drop (abandon)", greyAccepted.QuestId);
                 _logger.LogInformation("[QUEST] {Name} grey-drop [{Id}] \"{Title}\" (qlvl {Lvl}, bot {Bot})",
                     ctx.Name, greyAccepted.QuestId, greyAccepted.Node.Title,
                     QuestLevelOf(greyAccepted.Node), ctx.Level);
@@ -441,7 +480,10 @@ public sealed class QuestPlanner : IBotPlanner
 
             // En-route discovery: fold in new local givers once the bot has moved enough.
             if (ctx.Pos.Dist2D(q.LastGatherPos) > GatherRescanYards)
+            {
+                CircuitTrace.Hit(ctx.Guid, "quest: derive - gather boundary crossed");
                 GatherLocals(ctx, q);
+            }
 
             // In-log reconcile (re-accept march fix): flip any batch quest the C++ log already shows we
             // hold to Accepted=true so the accept phase never walks the bot to its giver for a redundant
@@ -453,11 +495,13 @@ public sealed class QuestPlanner : IBotPlanner
             var toAccept = q.Batch.Where(b => !b.Accepted && !b.Failed && b.Node.Giver != null).ToList();
             if (toAccept.Count > 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: accept phase", toAccept.Count);
                 var bq = Nearest(ctx, toAccept, b => (b.Node.Giver!.X, b.Node.Giver!.Y, b.Node.Giver!.Map));
                 if (bq != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: giver chosen", bq.QuestId);
                     q.Active = bq;
-                    if (AtNpc(ctx, bq.Node.Giver!)) { ctx.SetStep("accept"); return Interact(bq, accept: true); }
+                    if (AtNpc(ctx, bq.Node.Giver!)) { CircuitTrace.Hit(ctx.Guid, "quest: already at giver, accepting"); ctx.SetStep("accept"); return Interact(bq, accept: true); }
                     ctx.SetStep("to_giver");
                     return MoveTo(bq.Node.Giver!);
                 }
@@ -479,12 +523,14 @@ public sealed class QuestPlanner : IBotPlanner
                                                    && WithinTurnInCluster(ctx, b)).ToList();
             if (localComplete.Count > 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: local turn-in phase", localComplete.Count);
                 var bq = Nearest(ctx, localComplete, b => { var l = TurnInNpc(b); return (l.X, l.Y, l.Map); });
                 if (bq != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: local ender chosen", bq.QuestId);
                     q.Active = bq;
                     var npc = TurnInNpc(bq);
-                    if (AtNpc(ctx, npc)) { ctx.SetStep("turnin"); return Interact(bq, accept: false); }
+                    if (AtNpc(ctx, npc)) { CircuitTrace.Hit(ctx.Guid, "quest: at local ender, handing in"); ctx.SetStep("turnin"); return Interact(bq, accept: false); }
                     ctx.SetStep("to_turnin");
                     return MoveTo(npc);
                 }
@@ -502,17 +548,21 @@ public sealed class QuestPlanner : IBotPlanner
                                               && HasUnmetCast(ctx, b)).ToList();
             if (withCast.Count > 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: cast phase", withCast.Count);
                 (BatchQuest Q, CastLeg Leg)? bestCast = null;
                 float bestCastD = float.MaxValue;
                 foreach (var b in withCast)
                     foreach (var leg in UnmetCastLegs(ctx, b))
                     {
-                        if (leg.Map != ctx.MapId) continue;   // cross-map cast target rides the log
+                        if (leg.Map != ctx.MapId) continue;   // cross-map cast target rides the log   // cb:fold per-leg scan, chosen cast leg probed below
                         float d = Dist2(ctx.Pos.X, ctx.Pos.Y, leg.X, leg.Y);
-                        if (d < bestCastD) { bestCastD = d; bestCast = (b, leg); }
+                        if (d < bestCastD) { bestCastD = d; bestCast = (b, leg); }   // cb:fold min-tracking detail, chosen cast leg probed below
                     }
                 if (bestCast != null)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "quest: cast leg chosen, dispatching", bestCast.Value.Q.QuestId);
                     return DispatchCastLeg(ctx, q, bestCast.Value.Q, bestCast.Value.Leg);
+                }
             }
 
             // -- 2. NEAR OBJECTIVE -- nearest unmet GRIND LEG, taken ONLY if within the immediate cluster
@@ -533,12 +583,16 @@ public sealed class QuestPlanner : IBotPlanner
             (BatchQuest Quest, GrindLeg Leg)? nearMiss = null;
             if (candidates.Count > 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: near objective phase", candidates.Count);
                 TagOutliers(ctx, candidates);                       // red-deprioritize only now (no distance park)
                 var live = candidates.Where(b => !b.Deferred).ToList();
                 var pick = PriorityLeg(ctx, live, startedGlobal: false);   // near pick: within-band (band -> started -> level -> dist)
                 if (pick != null
                     && Dist2(ctx.Pos.X, ctx.Pos.Y, pick.Value.Leg.X, pick.Value.Leg.Y) <= BatchRadius)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "quest: near leg in cluster, dispatching", pick.Value.Quest.QuestId);
                     return DispatchObjectiveLeg(ctx, q, pick.Value);   // near → work it now
+                }
                 nearMiss = pick;   // null, or FAR → carried into phase 3's yield check; fall through (turn-ins, reprocess, then the phase-4b far trek)
             }
 
@@ -556,9 +610,11 @@ public sealed class QuestPlanner : IBotPlanner
                                            && !HasUnmetCast(ctx, b)).ToList();   // a pending cast is NOT a stale-count grind -- the CAST phase owns it (never overflow-grind a heal target)
             if (stuck.Count > 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: overflow phase (server incomplete past counts)", stuck.Count);
                 var oPick = NearestCreatureSlot(ctx, stuck);
                 if (oPick != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: overflow slot picked", oPick.Value.Quest.QuestId);
                     var bq = oPick.Value.Quest;
                     var o = oPick.Value.Obj;
                     var id = ctx.Identity;
@@ -566,6 +622,7 @@ public sealed class QuestPlanner : IBotPlanner
 
                     if (tries >= MaxOverflowGrinds)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "quest: overflow give-up, durable defer", tries);
                         id?.QuestOverflowGrinds.Remove(bq.QuestId);
                         id?.DeferQuest(bq.QuestId, TimeSpan.FromMinutes(OverflowDeferMinutes));
                         bq.Failed = true;   // carried in the log; resume skips it while deferred
@@ -575,7 +632,7 @@ public sealed class QuestPlanner : IBotPlanner
                         continue;
                     }
 
-                    if (id != null) id.QuestOverflowGrinds[bq.QuestId] = tries + 1;
+                    if (id != null) { CircuitTrace.Hit(ctx.Guid, "quest: overflow attempt recorded", tries + 1); id.QuestOverflowGrinds[bq.QuestId] = tries + 1; }
                     q.Active = bq;
                     q.ActiveSlot = oPick.Value.Slot;
                     ctx.SetStep("to_objective");
@@ -610,9 +667,11 @@ public sealed class QuestPlanner : IBotPlanner
                                               && (IsComplete(ctx, b) || !b.Node.HasObjectives)).ToList();
             if (complete.Count > 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: turn-in phase", complete.Count);
                 var bq = Nearest(ctx, complete, b => { var l = TurnInNpc(b); return (l.X, l.Y, l.Map); });
                 if (bq != null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: turn-in target chosen", bq.QuestId);
                     var npc = TurnInNpc(bq);
 
                     // YIELD CHECK: a turn-in does not jump the queue ahead of an unfinished objective
@@ -627,10 +686,12 @@ public sealed class QuestPlanner : IBotPlanner
                     // cap applies here.
                     if (nearMiss != null)
                     {
+                        CircuitTrace.Hit(ctx.Guid, "quest: yield check vs near-miss objective");
                         float turnInD = Dist2(ctx.Pos.X, ctx.Pos.Y, npc.X, npc.Y);
                         float objD = Dist2(ctx.Pos.X, ctx.Pos.Y, nearMiss.Value.Leg.X, nearMiss.Value.Leg.Y);
                         if (objD + TurnInYieldSlackYards < turnInD)
                         {
+                            CircuitTrace.Hit(ctx.Guid, "quest: turn-in yields to closer objective", objD);
                             _logger.LogInformation(
                                 "[QUEST] {Name} turn-in [{TurnId}] yields to closer unmet objective [{ObjId}] (obj d={ObjD:F0} < turnin d={TiD:F0})",
                                 ctx.Name, bq.QuestId, nearMiss.Value.Quest.QuestId, objD, turnInD);
@@ -639,7 +700,7 @@ public sealed class QuestPlanner : IBotPlanner
                     }
 
                     q.Active = bq;
-                    if (AtNpc(ctx, npc)) { ctx.SetStep("turnin"); return Interact(bq, accept: false); }
+                    if (AtNpc(ctx, npc)) { CircuitTrace.Hit(ctx.Guid, "quest: at ender, handing in"); ctx.SetStep("turnin"); return Interact(bq, accept: false); }
                     ctx.SetStep("to_turnin");
                     return MoveTo(npc);
                 }
@@ -652,6 +713,7 @@ public sealed class QuestPlanner : IBotPlanner
             bool added = GatherLocals(ctx, q);
             if (added)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: reprocess - new locals, re-derive");
                 foreach (var b in q.Batch) b.Deferred = false;
                 continue;
             }
@@ -667,6 +729,7 @@ public sealed class QuestPlanner : IBotPlanner
             var farPick = PriorityLeg(ctx, farObj, startedGlobal: true);    // far trek: started-global — finish a started quest before starting fresh far work
             if (farPick != null)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: far trek candidate", farPick.Value.Quest.QuestId);
                 // TREK DISTANCE CEILING (Tankftw, Dalaran-ish, 2026-08-21). PriorityLeg's only distance guard
                 // is the giver->leg RAIL, which is a property of the QUEST (leg-near-its-own-giver), NOT of
                 // where the bot stands -- so an accepted quest whose objective sits near its giver but
@@ -681,7 +744,11 @@ public sealed class QuestPlanner : IBotPlanner
                 float legDist = Dist2(ctx.Pos.X, ctx.Pos.Y, farPick.Value.Leg.X, farPick.Value.Leg.Y);
                 float trekCeiling = ZoneSafetyMap.GetMaxTravelDistance(ctx.Level, ctx.ZoneId, MaxReachTier);
                 if (legDist <= trekCeiling)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "quest: far trek within ceiling, dispatching", legDist);
                     return DispatchObjectiveLeg(ctx, q, farPick.Value);
+                }
+                CircuitTrace.Hit(ctx.Guid, "quest: far trek past ceiling, shelving", legDist);
                 _logger.LogWarning("[QUEST] {Name} far trek [{Id}] leg {D:F0}yd exceeds reach ceiling {Cap:F0}yd -- shelving (local content, not a cross-map death march)",
                     ctx.Name, farPick.Value.Quest.QuestId, legDist, trekCeiling);
                 DeferAcceptedQuest(ctx, farPick.Value.Quest, "too_far");
@@ -715,6 +782,7 @@ public sealed class QuestPlanner : IBotPlanner
             int workableId = WorkableInLog(ctx);
             if (workableId != 0)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: exhaust suppressed - workable in log", workableId);
                 // LIVELOCK BREAK (Orincat, Darkshore 2026-08-21): the carried set reads "workable in the
                 // log" (WorkableInLog has no reach cap) but produced NO dispatchable leg THIS sweep -- every
                 // carried objective is past the near-sweep radius and the far trek rejected it (too far /
@@ -729,15 +797,18 @@ public sealed class QuestPlanner : IBotPlanner
                 var seedId = ctx.Identity;
                 if (seedId != null && !q.Batch.Any(b => !b.Accepted && !b.Failed))   // no fresh pick already pending accept
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: carried set unworkable, trying fresh seed");
                     var seed = PickFor(ctx);
                     if (seed != null && !IsGrey(seed, seedId.Level) && !q.Batch.Any(b => b.QuestId == seed.QuestId))
                     {
+                        CircuitTrace.Hit(ctx.Guid, "quest: fresh reachable seed added, re-derive", seed.QuestId);
                         q.Batch.Add(new BatchQuest { QuestId = seed.QuestId, Node = seed, Accepted = false });
                         _logger.LogInformation("[QUEST] {Name} carried set unworkable here ([{Id}] workable-in-log but no dispatchable leg) -- seeding fresh reachable pick [{Seed}] \"{Title}\" to travel for new quests",
                             ctx.Name, workableId, seed.QuestId, seed.Title);
                         continue;   // re-derive: phase-1 accept dispatches the walk to the seed's giver
                     }
                 }
+                CircuitTrace.Hit(ctx.Guid, "quest: batch starvation, reselecting (no grind-lock)", workableId);
                 _logger.LogWarning("[QUEST] {Name} exhaust suppressed -- quest [{Id}] still workable in the log (batch starvation, not a real exhaust); reselecting instead of grind-lock",
                     ctx.Name, workableId);
                 ctx.Quest = null;
@@ -747,16 +818,19 @@ public sealed class QuestPlanner : IBotPlanner
             if (lockId != null && lockId.DeferredQuestIds.Count > 0
                 && !(lockId.GrindLockUntil is DateTime gl && DateTime.UtcNow < gl))
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: exhausted with deferrals, grind-lock stamped", lockId.DeferredQuestIds.Count);
                 lockId.GrindLockUntil = DateTime.UtcNow.AddMinutes(GrindLockMinutes);
                 _logger.LogInformation("[QUEST] {Name} batch exhausted with {N} deferred — grind-lock {Min}min (commit to leveling)",
                     ctx.Name, lockId.DeferredQuestIds.Count, GrindLockMinutes);
             }
+            CircuitTrace.Hit(ctx.Guid, "quest: batch exhausted, blocking to reselect");
             ctx.Quest = null;
             return StepResult.Block("no_quests");
         }
 
         // Pass cap hit -- a re-derive ran away (should not happen with the phase-4 gate). Exit to grind
         // rather than spin: any future loop-class regression becomes a logged no-op, never an SOE.
+        CircuitTrace.Hit(ctx.Guid, "quest: derive pass cap hit, exhaust to grind");
         _logger.LogWarning("[QUEST] {Name} derive exceeded {Max} passes -- exhausting to grind (recursion guard)",
             ctx.Name, MaxDerivePasses);
         ctx.Quest = null;
@@ -769,7 +843,7 @@ public sealed class QuestPlanner : IBotPlanner
         ctx.Failure = null;
         var q = ctx.Quest;
         var active = q?.Active;
-        if (q == null || active == null) return StepResult.Wait();   // unknown leg -> re-derive next tick
+        if (q == null || active == null) { CircuitTrace.Hit(ctx.Guid, "quest: recover - no active leg, re-derive"); return StepResult.Wait(); }   // unknown leg -> re-derive next tick
 
         bool lastLeg = ctx.DistToTarget >= 0 && ctx.DistToTarget < ForceRadius;
 
@@ -783,11 +857,18 @@ public sealed class QuestPlanner : IBotPlanner
         // failures start_isolated=1 (probe of the bot's own surroundings); skip them here.
         if (f.Reason is "no_path" or "empty_path" && f.Dest is { } npDest)
         {
+            CircuitTrace.HitNote(ctx.Guid, "quest: recover - no_path dest handling", f.Reason);
             if (f.StartIsolated)
+            {
+                CircuitTrace.Hit(ctx.Guid, "quest: recover - isolated start, not recorded");
                 _logger.LogInformation("[QUEST] {Name} no_path to ({X:F0},{Y:F0}) from an ISOLATED start — not recorded to the fleet no-path memory",
                     ctx.Name, npDest.X, npDest.Y);
+            }
             else
+            {
+                CircuitTrace.Hit(ctx.Guid, "quest: recover - no_path recorded to fleet memory");
                 _safety.RecordNoPathDest(npDest.Map, npDest.X, npDest.Y);
+            }
         }
 
         // no_path on the LAST LEG to a giver/turn-in = a WMO-interior NPC the navmesh
@@ -795,10 +876,11 @@ public sealed class QuestPlanner : IBotPlanner
         if (f.Reason == "no_path" && lastLeg && !active.ForceMode
             && (ctx.Step == "to_giver" || ctx.Step == "to_turnin"))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: recover - no_path last-leg, force interact", active.QuestId);
             active.ForceMode = true;
             _logger.LogInformation("[QUEST] {Name} no_path last-leg -> force {Step} [{Id}]",
                 ctx.Name, ctx.Step, active.QuestId);
-            if (ctx.Step == "to_giver") { ctx.SetStep("accept"); return Interact(active, accept: true); }
+            if (ctx.Step == "to_giver") { CircuitTrace.Hit(ctx.Guid, "quest: recover - force accept"); ctx.SetStep("accept"); return Interact(active, accept: true); }
             ctx.SetStep("turnin"); return Interact(active, accept: false);
         }
 
@@ -806,10 +888,15 @@ public sealed class QuestPlanner : IBotPlanner
         // drop it. Already accepted (committed) -> keep it in the log, shelve this sweep.
         if (f.Reason == "path_unsafe")
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: recover - path_unsafe route", active.QuestId);
             if (f.Dest.HasValue)
+            {
+                CircuitTrace.Hit(ctx.Guid, "quest: recover - blacklist unsafe dest");
                 ctx.Identity?.AddPathBlacklist(f.Dest.Value.X, f.Dest.Value.Y, f.DangerLevel);
+            }
             if (!active.Accepted)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: recover - unsafe pick level-deferred", active.QuestId);
                 ctx.Identity?.DeferQuestUntilLevel(active.QuestId, f.DangerLevel, SafetyMargin);
                 q.Batch.Remove(active);
                 _logger.LogInformation("[QUEST] {Name} deferring pick [{Id}] (path_unsafe, until lvl {Lvl})",
@@ -817,6 +904,7 @@ public sealed class QuestPlanner : IBotPlanner
             }
             else
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: recover - unsafe accepted quest shelved", active.QuestId);
                 // R21: durably level-defer too, so the BuildBatch resume loop skips it until
                 // the bot out-levels the danger. Without this the quest re-resumes every entry,
                 // re-walks the blacklisted route, re-fails — the path_unsafe churn flood.
@@ -850,6 +938,7 @@ public sealed class QuestPlanner : IBotPlanner
         // entry=K vs C++ echo entry=0 → spurious re-issue). Derive re-stamps Held when the objective resumes.
         if (f.Reason == "no_target")
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: recover - grind freeze, unstick detour", active.QuestId);
             ctx.ClearObjective();
             ctx.SetStep("detour");
 
@@ -878,6 +967,7 @@ public sealed class QuestPlanner : IBotPlanner
         if (f.CommandType == "QUEST_INTERACT" && ctx.Step == "turnin"
             && active.Accepted && !active.Node.HasObjectives)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: recover - abandon un-completable no-objective quest", active.QuestId);
             _logger.LogInformation("[QUEST] {Name} abandoning un-completable no-objective quest [{Id}] (turn-in refused: {Reason})",
                 ctx.Name, active.QuestId, f.Reason);
             ctx.Identity?.AbandonGrey(active.QuestId);   // permanent skip set (also excludes from resume)
@@ -897,6 +987,7 @@ public sealed class QuestPlanner : IBotPlanner
         // gate clears. (The QuestGraphLoader negative-group fix narrows most of these at the source.)
         if (f.Reason == "requirements_not_met" && !active.Accepted)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: recover - ineligible pick dropped (server-gated)", active.QuestId);
             ctx.Identity?.DeferQuest(active.QuestId, TimeSpan.FromMinutes(RequirementsRetryMinutes));
             ctx.Quest!.Batch.Remove(active);
             _logger.LogInformation("[QUEST] {Name} dropping ineligible pick [{Id}] (requirements_not_met -- server-gated; transient {Min}min, not a durable defer)",
@@ -914,11 +1005,13 @@ public sealed class QuestPlanner : IBotPlanner
         // QUEST_CAST_FAIL -> Recover path is a follow-up -- see the handover.)
         if (f.CommandType == "QUEST_CAST" && active.Accepted)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: recover - cast timed out", active.QuestId);
             var cid = ctx.Identity;
             int castStreak = cid?.QuestFailStreak.GetValueOrDefault(active.QuestId, 0) ?? 0;
             if (castStreak < QuestFailCap)
             {
-                if (cid != null) cid.QuestFailStreak[active.QuestId] = castStreak + 1;
+                CircuitTrace.Hit(ctx.Guid, "quest: recover - cast retry", castStreak + 1);
+                if (cid != null) cid.QuestFailStreak[active.QuestId] = castStreak + 1;   // cb:fold identity null-guard, retry probed above
                 q.CastIndex = 0;
                 _logger.LogInformation("[QUEST] {Name} cast retry [{Id}] (QUEST_CAST timed out, try {N}/{Cap})",
                     ctx.Name, active.QuestId, castStreak + 1, QuestFailCap);
@@ -930,9 +1023,15 @@ public sealed class QuestPlanner : IBotPlanner
         }
 
         if (!active.Accepted)
+        {
+            CircuitTrace.HitNote(ctx.Guid, "quest: recover - defer unaccepted pick", f.Reason);
             DeferPick(ctx, active, f.Reason);
+        }
         else
+        {
+            CircuitTrace.HitNote(ctx.Guid, "quest: recover - defer accepted quest", f.Reason);
             DeferAcceptedQuest(ctx, active, f.Reason);   // R21: durable escalating defer + Failed (carried)
+        }
         q.Active = null;
         ctx.SetStep("plan");          // clear the stale leg so next tick derives, never re-fires a sync QUERY
         return StepResult.Wait();
@@ -945,6 +1044,7 @@ public sealed class QuestPlanner : IBotPlanner
         var id = ctx.Identity;
         if (id != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "quest: pick deferred", reason);
             int prior = id.QuestDeferralCounts.GetValueOrDefault(bq.QuestId, 0);
             bool valuable = bq.Node.IsPartOfChain || bq.Node.HasItemReward;
             bool frustrated = !valuable && prior + 1 >= AbandonAfterDefers;
@@ -965,6 +1065,7 @@ public sealed class QuestPlanner : IBotPlanner
         var id = ctx.Identity;
         if (id != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "quest: shelving accepted quest", reason);
             // Unified fail streak: a hard MOVE failure on this quest's objective counts toward the
             // SAME durable shelve as an attributed death (MaintenancePlanner bumps the same map). At
             // the cap the quest is shelved for the long window so the bot stops re-resuming →
@@ -976,6 +1077,7 @@ public sealed class QuestPlanner : IBotPlanner
 
             if (fails >= QuestFailCap)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: fail cap hit, durable shelve", fails);
                 id.DeferQuest(bq.QuestId, TimeSpan.FromMinutes(DurableDeferMinutes));
                 id.QuestFailStreak.Remove(bq.QuestId);
                 _logger.LogInformation("[QUEST] {Name} shelving [{Id}] ({Reason}, durable {Min}min, kept accepted) — {N} fail(s)",
@@ -983,6 +1085,7 @@ public sealed class QuestPlanner : IBotPlanner
             }
             else
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: below fail cap, sweep defer", fails);
                 int prior = id.QuestDeferralCounts.GetValueOrDefault(bq.QuestId, 0);
                 bool valuable = bq.Node.IsPartOfChain || bq.Node.HasItemReward;
                 bool frustrated = !valuable && prior + 1 >= AbandonAfterDefers;
@@ -993,6 +1096,7 @@ public sealed class QuestPlanner : IBotPlanner
         }
         else
         {
+            CircuitTrace.HitNote(ctx.Guid, "quest: shelve without identity", reason);
             _logger.LogInformation("[QUEST] {Name} shelving [{Id}] ({Reason}, deferred, kept accepted)",
                 ctx.Name, bq.QuestId, reason);
         }
@@ -1007,7 +1111,7 @@ public sealed class QuestPlanner : IBotPlanner
         q.Batch.Clear();
         q.LastGatherPos = ctx.Pos;
         var id = ctx.Identity;
-        if (id == null || !_quests.IsLoaded) return;
+        if (id == null || !_quests.IsLoaded) { CircuitTrace.Hit(ctx.Guid, "quest: build - no identity or graph"); return; }
         id.PruneExpiredDeferrals();
         id.PrunePathBlacklist();
 
@@ -1021,10 +1125,10 @@ public sealed class QuestPlanner : IBotPlanner
         foreach (var kv in ctx.QuestLog)
         {
             var node = _quests.GetQuest(kv.Key);
-            if (node?.Giver == null) { skipped.Add($"{kv.Key}:giver-null"); continue; }
-            if (id.CompletedQuestIds.Contains(node.QuestId)) { skipped.Add($"{kv.Key}:completed"); continue; }     // already rewarded
-            if (id.AbandonedGreyQuestIds.Contains(node.QuestId)) { skipped.Add($"{kv.Key}:grey"); continue; }      // greyed out
-            if (id.DeferredQuestIds.ContainsKey(node.QuestId)) { skipped.Add($"{kv.Key}:deferred"); continue; }    // R21: backing off (level/time defer)
+            if (node?.Giver == null) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - giver null", kv.Key); skipped.Add($"{kv.Key}:giver-null"); continue; }
+            if (id.CompletedQuestIds.Contains(node.QuestId)) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - already completed", kv.Key); skipped.Add($"{kv.Key}:completed"); continue; }     // already rewarded
+            if (id.AbandonedGreyQuestIds.Contains(node.QuestId)) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - abandoned grey", kv.Key); skipped.Add($"{kv.Key}:grey"); continue; }      // greyed out
+            if (id.DeferredQuestIds.ContainsKey(node.QuestId)) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - deferred", kv.Key); skipped.Add($"{kv.Key}:deferred"); continue; }    // R21: backing off (level/time defer)
             // A server-COMPLETE or no-objective quest needs only a turn-in (no objective driving) -- carry
             // it regardless of objective drivability so it can be handed in. Otherwise it vanishes from the
             // planner's view and the batch reads "exhausted" while a ready quest sits in the log (the
@@ -1033,16 +1137,17 @@ public sealed class QuestPlanner : IBotPlanner
             bool actionableOnTurnIn = kv.Value.Status == QuestStatusComplete || !node.HasObjectives;
             if (!actionableOnTurnIn)
             {
-                if (node.Objectives.Any(o => o.TargetFriendly && !IsCastDrivable(o, node.QuestId))) { skipped.Add($"{kv.Key}:unworkable-obj"); continue; }   // Fix 5: kill objective on a FRIENDLY NPC -- undrivable UNLESS cast-drivable (column ReqSpellCast or a QuestCastKit heal), which the CAST phase completes
-                if (!node.Objectives.All(o => o.IsCreature)) { skipped.Add($"{kv.Key}:noncreature-obj"); continue; }          // GO-interact objectives: phase 2
-                if (!node.ItemObjectives.All(it => it.BestDropSource != null)) { skipped.Add($"{kv.Key}:item-unresolved"); continue; }  // GO-sourced/unresolved items: phase 2
+                CircuitTrace.Hit(ctx.Guid, "quest: resume - incomplete, drivability check", kv.Key);
+                if (node.Objectives.Any(o => o.TargetFriendly && !IsCastDrivable(o, node.QuestId))) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - undrivable friendly objective", kv.Key); skipped.Add($"{kv.Key}:unworkable-obj"); continue; }   // Fix 5: kill objective on a FRIENDLY NPC -- undrivable UNLESS cast-drivable (column ReqSpellCast or a QuestCastKit heal), which the CAST phase completes
+                if (!node.Objectives.All(o => o.IsCreature)) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - noncreature objective", kv.Key); skipped.Add($"{kv.Key}:noncreature-obj"); continue; }          // GO-interact objectives: phase 2
+                if (!node.ItemObjectives.All(it => it.BestDropSource != null)) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - unresolved item source", kv.Key); skipped.Add($"{kv.Key}:item-unresolved"); continue; }  // GO-sourced/unresolved items: phase 2
             }
-            if (q.Batch.Any(b => b.QuestId == node.QuestId)) { skipped.Add($"{kv.Key}:dup"); continue; }
+            if (q.Batch.Any(b => b.QuestId == node.QuestId)) { CircuitTrace.Hit(ctx.Guid, "quest: resume skip - duplicate", kv.Key); skipped.Add($"{kv.Key}:dup"); continue; }
             q.Batch.Add(new BatchQuest { QuestId = node.QuestId, Node = node, Accepted = true });
             carried.Add(node.QuestId);
         }
         if (ctx.QuestLog.Count > 0)
-            _logger.LogInformation("[QUEST] {Name} resume: cache=[{Cache}] carried=[{Carried}] skipped=[{Skipped}]",
+            _logger.LogInformation("[QUEST] {Name} resume: cache=[{Cache}] carried=[{Carried}] skipped=[{Skipped}]",   // cb:fold logging-only resume summary
                 ctx.Name, string.Join(",", ctx.QuestLog.Keys), string.Join(",", carried),
                 skipped.Count == 0 ? "none" : string.Join(" ", skipped));
         // 2. Fold in the local cluster around the bot; if nothing's accepted yet and no
@@ -1050,6 +1155,7 @@ public sealed class QuestPlanner : IBotPlanner
         GatherLocals(ctx, q);
         if (q.Batch.Count == 0)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: empty batch, seeding far pick");
             // [QUEST-DIAG] GatherLocals came up empty -> we are about to SEED a single far pick. Log
             // every available quest whose giver is near the bot and WHY it did or didn't make the
             // pickable cut, so a "bot skipped its starter quests" report can be read straight off the
@@ -1060,6 +1166,7 @@ public sealed class QuestPlanner : IBotPlanner
             var seed = PickFor(ctx);
             if (seed != null && !IsGrey(seed, id.Level))
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: batch seeded", seed.QuestId);
                 q.Batch.Add(new BatchQuest { QuestId = seed.QuestId, Node = seed, Accepted = false });
                 _logger.LogInformation("[QUEST] {Name} seeding batch on [{Id}] \"{Title}\"",
                     ctx.Name, seed.QuestId, seed.Title);
@@ -1074,7 +1181,7 @@ public sealed class QuestPlanner : IBotPlanner
     private bool GatherLocals(BotContext ctx, QuestScratch q)
     {
         var id = ctx.Identity;
-        if (id == null || !_quests.IsLoaded) return false;
+        if (id == null || !_quests.IsLoaded) { CircuitTrace.Hit(ctx.Guid, "quest: gather - no identity or graph"); return false; }
         id.PruneExpiredDeferrals();
         q.LastGatherPos = ctx.Pos;
 
@@ -1087,8 +1194,8 @@ public sealed class QuestPlanner : IBotPlanner
                      .Where(n => WithinBatch(ctx, n))
                      .OrderBy(n => Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver!.X, n.Giver!.Y)))
         {
-            if (q.Batch.Count >= BatchCap) break;
-            if (IsGrey(node, id.Level)) { id.AbandonGrey(node.QuestId); continue; }
+            if (q.Batch.Count >= BatchCap) { CircuitTrace.Hit(ctx.Guid, "quest: gather - batch cap, stop", q.Batch.Count); break; }
+            if (IsGrey(node, id.Level)) { CircuitTrace.Hit(ctx.Guid, "quest: gather - grey pick auto-abandoned", node.QuestId); id.AbandonGrey(node.QuestId); continue; }
             q.Batch.Add(new BatchQuest { QuestId = node.QuestId, Node = node, Accepted = false });
             added = true;
         }
@@ -1109,8 +1216,9 @@ public sealed class QuestPlanner : IBotPlanner
     {
         foreach (var b in q.Batch)
         {
-            if (b.Accepted || b.TurnedIn) continue;
-            if (!ctx.QuestLog.ContainsKey(b.QuestId)) continue;
+            if (b.Accepted || b.TurnedIn) continue;   // cb:fold per-item guard in per-pass reconcile, flip probed below
+            if (!ctx.QuestLog.ContainsKey(b.QuestId)) continue;   // cb:fold per-item guard in per-pass reconcile, flip probed below
+            CircuitTrace.Hit(ctx.Guid, "quest: reconcile - in-log quest marked accepted", b.QuestId);
             b.Accepted = true;
             _logger.LogDebug("[QUEST] {Name} already-in-log [{Id}] \"{Title}\" -- skip giver, resume from log (no re-accept walk)",
                 ctx.Name, b.QuestId, b.Node.Title);
@@ -1124,11 +1232,11 @@ public sealed class QuestPlanner : IBotPlanner
     private QuestNode? PickFor(BotContext ctx)
     {
         var id = ctx.Identity;
-        if (id == null || !_quests.IsLoaded) return null;
+        if (id == null || !_quests.IsLoaded) { CircuitTrace.Hit(ctx.Guid, "quest: pick - no identity or graph"); return null; }
         id.PruneExpiredDeferrals();
         var pickable = Pickable(_quests, id).ToList();
         int tier = ReachTier(pickable, id, ctx.Pos.X, ctx.Pos.Y, ctx.MapId, ctx.ZoneId);
-        if (tier < 0) return null;
+        if (tier < 0) { CircuitTrace.Hit(ctx.Guid, "quest: pick - nothing in reach at any tier"); return null; }
         float cap = ZoneSafetyMap.GetMaxTravelDistance(id.Level, ctx.ZoneId, tier);
         // Within the minimal reach tier: LOWEST quest level first, distance as the tiebreak
         // (2026-08-21). Pure nearest-giver seeded every fresh dwarf onto the L4 "Troll Cave" over
@@ -1188,25 +1296,25 @@ public sealed class QuestPlanner : IBotPlanner
     /// drift) — purely for logging why a starter quest was skipped.</summary>
     private static string? PickableReject(QuestNode q, BotIdentity id)
     {
-        if (q.Giver == null) return "giver-null";
-        if (!q.Objectives.All(o => o.IsCreature)) return "noncreature-obj(GO/talk/use)";
-        if (!q.Objectives.All(o => !o.TargetFriendly || IsCastDrivable(o, q.QuestId))) return "friendly-target";
+        if (q.Giver == null) return "giver-null";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (!q.Objectives.All(o => o.IsCreature)) return "noncreature-obj(GO/talk/use)";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (!q.Objectives.All(o => !o.TargetFriendly || IsCastDrivable(o, q.QuestId))) return "friendly-target";   // cb:fold pure predicate mirror of IsPickable, logging-only
         if (!q.ItemObjectives.All(it => it.BestDropSource != null))
-        {
+        {   // cb:fold pure predicate mirror of IsPickable, logging-only
             var missing = q.ItemObjectives.First(it => it.BestDropSource == null);
             return $"item-no-creature-dropsource(item {missing.ItemId}, {missing.DropSources.Count} loot rows, {missing.GoSources.Count} GO rows)";
         }
-        if (id.CompletedQuestIds.Contains(q.QuestId)) return "completed";
-        if (id.DeferredQuestIds.ContainsKey(q.QuestId)) return "deferred";
-        if (id.AbandonedGreyQuestIds.Contains(q.QuestId)) return "abandoned-grey";
-        if (IsGrey(q, id.Level)) return "grey";
-        if (IsRed(q, id.Level)) return "red(over-level)";
-        if (id.IsPathBlacklisted(q.Giver.X, q.Giver.Y)) return "giver-blacklisted";
-        if (!q.Objectives.All(o => !id.IsPathBlacklisted(o.GrindX, o.GrindY))) return "obj-blacklisted";
-        if (!q.Objectives.All(o => WithinObjectiveRail(q.Giver, o.GrindMap, o.GrindX, o.GrindY))) return "obj-drift-rail";
+        if (id.CompletedQuestIds.Contains(q.QuestId)) return "completed";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (id.DeferredQuestIds.ContainsKey(q.QuestId)) return "deferred";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (id.AbandonedGreyQuestIds.Contains(q.QuestId)) return "abandoned-grey";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (IsGrey(q, id.Level)) return "grey";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (IsRed(q, id.Level)) return "red(over-level)";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (id.IsPathBlacklisted(q.Giver.X, q.Giver.Y)) return "giver-blacklisted";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (!q.Objectives.All(o => !id.IsPathBlacklisted(o.GrindX, o.GrindY))) return "obj-blacklisted";   // cb:fold pure predicate mirror of IsPickable, logging-only
+        if (!q.Objectives.All(o => WithinObjectiveRail(q.Giver, o.GrindMap, o.GrindX, o.GrindY))) return "obj-drift-rail";   // cb:fold pure predicate mirror of IsPickable, logging-only
         foreach (var it in q.ItemObjectives)
         {
-            if (it.BestDropSource is not { } s || WithinObjectiveRail(q.Giver, s.GrindMap, s.GrindX, s.GrindY)) continue;
+            if (it.BestDropSource is not { } s || WithinObjectiveRail(q.Giver, s.GrindMap, s.GrindX, s.GrindY)) continue;   // cb:fold pure predicate mirror of IsPickable, logging-only
             return $"item-drift-rail(item {it.ItemId} via {s.CreatureEntry} {s.CreatureName} @ ({s.GrindX:F0},{s.GrindY:F0}) map{s.GrindMap}, {Dist2(q.Giver.X, q.Giver.Y, s.GrindX, s.GrindY):F0}yd from giver)";
         }
         return null;   // pickable
@@ -1218,7 +1326,7 @@ public sealed class QuestPlanner : IBotPlanner
     private void LogSeedDiagnostics(BotContext ctx)
     {
         var id = ctx.Identity;
-        if (id == null || !_quests.IsLoaded) return;
+        if (id == null || !_quests.IsLoaded) { CircuitTrace.Hit(ctx.Guid, "quest: seed diag - no identity or graph"); return; }
         int raceBit = QuestGraphLoader.RaceToBitmask(id.Race);
         int classBit = QuestGraphLoader.ClassToBitmask(id.ClassId);
         // Dist2 returns REAL yards (it sqrt's), so compare to the radius directly — the first cut
@@ -1232,6 +1340,7 @@ public sealed class QuestPlanner : IBotPlanner
             .ToList();
         if (near.Count == 0)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: seed diag - no available giver nearby");
             _logger.LogInformation("[QUEST-DIAG] {Name} seed @ {Pos} L{Lvl} zone={Z}: NO available quest giver within {R:F0}yd",
                 ctx.Name, ctx.Pos, id.Level, ctx.ZoneId, SeedDiagRadius);
             return;
@@ -1253,7 +1362,7 @@ public sealed class QuestPlanner : IBotPlanner
     /// </summary>
     public static bool InReach(QuestNode q, float botX, float botY, int botMap, float cap)
     {
-        if (q.Giver == null || q.Giver.Map != botMap) return false;
+        if (q.Giver == null || q.Giver.Map != botMap) return false;   // cb:fold pure predicate, outcome visible in caller's counts
         float dx = botX - q.Giver.X, dy = botY - q.Giver.Y;
         return dx * dx + dy * dy <= cap * cap;
     }
@@ -1276,7 +1385,7 @@ public sealed class QuestPlanner : IBotPlanner
             float cap = ZoneSafetyMap.GetMaxTravelDistance(id.Level, zoneId, tier);
             for (int i = 0; i < pickable.Count; i++)
                 if (InReach(pickable[i], botX, botY, botMap, cap))
-                    return tier;
+                    return tier;   // cb:fold pure predicate, outcome visible in caller's counts
         }
         return -1;
     }
@@ -1284,7 +1393,7 @@ public sealed class QuestPlanner : IBotPlanner
     // Giver within the batch CLUSTER radius of the bot (same map).
     private static bool WithinBatch(BotContext ctx, QuestNode n)
     {
-        if (n.Giver == null || n.Giver.Map != ctx.MapId) return false;
+        if (n.Giver == null || n.Giver.Map != ctx.MapId) return false;   // cb:fold per-quest filter predicate, outcome visible in gather adds
         return Dist2(ctx.Pos.X, ctx.Pos.Y, n.Giver.X, n.Giver.Y) <= BatchRadius;
     }
 
@@ -1294,7 +1403,7 @@ public sealed class QuestPlanner : IBotPlanner
     private static bool WithinTurnInCluster(BotContext ctx, BatchQuest b)
     {
         var npc = TurnInNpc(b);
-        if (npc.Map != ctx.MapId) return false;
+        if (npc.Map != ctx.MapId) return false;   // cb:fold per-quest filter predicate, outcome visible in phase-1b counts
         return Dist2(ctx.Pos.X, ctx.Pos.Y, npc.X, npc.Y) <= BatchRadius;
     }
 
@@ -1312,7 +1421,7 @@ public sealed class QuestPlanner : IBotPlanner
     private void TagOutliers(BotContext ctx, List<BatchQuest> candidates)
     {
         var id = ctx.Identity;
-        if (id == null) return;
+        if (id == null) { CircuitTrace.Hit(ctx.Guid, "quest: outliers - no identity"); return; }
 
         // (2026-06-29) The out-of-range DISTANCE PARK was REMOVED here. Distance no longer DEFERS an
         // objective — it only changes PHASE ORDER (near sweep = phase 2 ≤ BatchRadius; farther-but-reachable
@@ -1332,11 +1441,13 @@ public sealed class QuestPlanner : IBotPlanner
         var nonRedLive = candidates.Any(b => !b.Deferred && !IsRed(b.Node, id.Level));
         if (nonRedLive)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: red-deprioritize sweep (in-level work remains)");
             foreach (var b in candidates)
             {
-                if (b.Deferred) continue;
+                if (b.Deferred) continue;   // cb:fold per-item guard, red deprioritize probed below
                 if (IsRed(b.Node, id.Level))
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: red quest deprioritized", b.QuestId);
                     b.Deferred = true;
                     _logger.LogInformation("[QUEST] {Name} deprioritizing accepted red quest [{Id}] \"{Title}\" (qlvl {Lvl}, bot {Bot}) — working in-level quests first",
                         ctx.Name, b.QuestId, b.Node.Title, QuestLevelOf(b.Node), id.Level);
@@ -1380,25 +1491,25 @@ public sealed class QuestPlanner : IBotPlanner
     {
         foreach (var o in b.Node.Objectives)
         {
-            if (!o.IsCreature || o.Count <= 0) continue;
-            if (IsCastDrivable(o, b.QuestId)) continue;   // cast objective -- driven by the CAST phase (QUEST_CAST), never a grind leg
+            if (!o.IsCreature || o.Count <= 0) continue;   // cb:fold per-objective hot filter (HasUnmet/PriorityLeg), legs surface via dispatch probes
+            if (IsCastDrivable(o, b.QuestId)) continue;   // cast objective -- driven by the CAST phase (QUEST_CAST), never a grind leg   // cb:fold per-objective hot filter, legs surface via dispatch probes
             int rem = RawRemaining(ctx, b.QuestId, o);
-            if (rem <= 0) continue;
+            if (rem <= 0) continue;   // cb:fold per-objective hot filter, legs surface via dispatch probes
             // [FINDING_020] nearest spawn whose cell is NOT fleet-known no_path (null = every spawn of this
             // objective is blacklisted → no leg this tick; the quest re-competes when a cell lapses).
             var pp = NearestPathableSpawnPoint(o.GrindMap, o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
-            if (pp is not { } p) continue;
+            if (pp is not { } p) continue;   // cb:fold per-objective hot filter, legs surface via dispatch probes
             yield return new GrindLeg(o.CreatureEntry, p.X, p.Y, p.Z, o.GrindMap, rem);   // kill objective — no alt entries, ever
         }
         foreach (var it in b.Node.ItemObjectives)
         {
-            if (it.Count <= 0) continue;
+            if (it.Count <= 0) continue;   // cb:fold per-objective hot filter, legs surface via dispatch probes
             int rem = RawItemRemaining(ctx, b.QuestId, it);
-            if (rem <= 0) continue;
+            if (rem <= 0) continue;   // cb:fold per-objective hot filter, legs surface via dispatch probes
             var src = it.BestDropSource;                       // creature-sourced only (GO-sourced = phase 2)
-            if (src == null || src.SpawnCount <= 0) continue;
+            if (src == null || src.SpawnCount <= 0) continue;   // cb:fold per-objective hot filter, legs surface via dispatch probes
             var pp = NearestPathableSpawnPoint(src.GrindMap, src.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, src.GrindX, src.GrindY, src.GrindZ);   // [FINDING_020]
-            if (pp is not { } p) continue;
+            if (pp is not { } p) continue;   // cb:fold per-objective hot filter, legs surface via dispatch probes
             yield return new GrindLeg(src.CreatureEntry, p.X, p.Y, p.Z, src.GrindMap, rem, it.AltDropEntries);
         }
     }
@@ -1417,14 +1528,14 @@ public sealed class QuestPlanner : IBotPlanner
         float fallbackX, float fallbackY, float fallbackZ)
     {
         if (spawns == null || spawns.Count == 0)
-            return _safety.IsNoPathDest(mapId, fallbackX, fallbackY) ? null : (fallbackX, fallbackY, fallbackZ);
+            return _safety.IsNoPathDest(mapId, fallbackX, fallbackY) ? null : (fallbackX, fallbackY, fallbackZ);   // cb:fold spawn helper without bot ctx, outcome visible at dispatch/workability probes
         (float X, float Y, float Z)? best = null;
         float bestD = float.MaxValue;
         for (int i = 0; i < spawns.Count; i++)
         {
             float d = Dist2(fromX, fromY, spawns[i].X, spawns[i].Y);
-            if (d >= bestD) continue;
-            if (_safety.IsNoPathDest(mapId, spawns[i].X, spawns[i].Y)) continue;
+            if (d >= bestD) continue;   // cb:fold min-tracking detail without bot ctx
+            if (_safety.IsNoPathDest(mapId, spawns[i].X, spawns[i].Y)) continue;   // cb:fold spawn helper without bot ctx, outcome visible at dispatch/workability probes
             bestD = d; best = spawns[i];
         }
         return best;
@@ -1438,13 +1549,13 @@ public sealed class QuestPlanner : IBotPlanner
         IReadOnlyList<(float X, float Y, float Z)> spawns, float fromX, float fromY,
         float fallbackX, float fallbackY, float fallbackZ)
     {
-        if (spawns == null || spawns.Count == 0) return (fallbackX, fallbackY, fallbackZ);
+        if (spawns == null || spawns.Count == 0) return (fallbackX, fallbackY, fallbackZ);   // cb:fold pure helper without bot ctx
         var best = spawns[0];
         float bestD = Dist2(fromX, fromY, best.X, best.Y);
         for (int i = 1; i < spawns.Count; i++)
         {
             float d = Dist2(fromX, fromY, spawns[i].X, spawns[i].Y);
-            if (d < bestD) { bestD = d; best = spawns[i]; }
+            if (d < bestD) { bestD = d; best = spawns[i]; }   // cb:fold min-tracking detail without bot ctx
         }
         return best;
     }
@@ -1484,24 +1595,25 @@ public sealed class QuestPlanner : IBotPlanner
         {
             int started = HasProgress(ctx, b) ? 0 : 1;
             int level = QuestLevelOf(b.Node);
-            if (level <= 0) level = int.MaxValue;                       // unknown/scaling sorts last
+            if (level <= 0) level = int.MaxValue;                       // unknown/scaling sorts last   // cb:fold per-quest key detail, chosen key logged below
             foreach (var leg in UnmetLegs(ctx, b))
             {
-                if (leg.Map != ctx.MapId) continue;                     // cross-map legs ride the log (carry policy)
+                if (leg.Map != ctx.MapId) continue;                     // cross-map legs ride the log (carry policy)   // cb:fold per-leg scan, carry policy outcome visible in dispatch probes
                 if (!WithinObjectiveRail(b.Node.Giver, leg.Map, leg.X, leg.Y))
                 {
+                    CircuitTrace.Hit(ctx.Guid, "quest: drift rail blocks leg, rides the log", b.QuestId);
                     // Drift rail: the leg resolves anomalously far from its own giver -- never score or
                     // dispatch it (near pass AND far pass: a railed leg must not become the phase-4b trek
                     // and must not become nearMiss for the phase-3 yield check). It rides the log like a
                     // cross-map leg. Information only on the far pass -- that is the pass that would
                     // actually have walked it; the near pass could never dispatch it anyway (>BatchRadius).
                     if (startedGlobal)
-                        _logger.LogInformation("[QUEST-RAIL] {Name} rail blocks far trek [{Id}] entry {Entry} at ({X:F0},{Y:F0}) -- {D:F0}yd from its giver (cap {Cap:F0}); leg rides the log",
+                        _logger.LogInformation("[QUEST-RAIL] {Name} rail blocks far trek [{Id}] entry {Entry} at ({X:F0},{Y:F0}) -- {D:F0}yd from its giver (cap {Cap:F0}); leg rides the log",   // cb:fold logging-only branch, rail probe above carries the outcome
                             ctx.Name, b.QuestId, leg.CreatureEntry, leg.X, leg.Y,
                             b.Node.Giver == null ? -1f : Dist2(b.Node.Giver.X, b.Node.Giver.Y, leg.X, leg.Y),
                             ObjectiveGiverRailYards);
                     else
-                        _logger.LogDebug("[QUEST-RAIL] {Name} rail skips [{Id}] in near scoring", ctx.Name, b.QuestId);
+                        _logger.LogDebug("[QUEST-RAIL] {Name} rail skips [{Id}] in near scoring", ctx.Name, b.QuestId);   // cb:fold logging-only branch, rail probe above carries the outcome
                     continue;
                 }
                 float d = Dist2(ctx.Pos.X, ctx.Pos.Y, leg.X, leg.Y);
@@ -1510,12 +1622,12 @@ public sealed class QuestPlanner : IBotPlanner
                     $"[{b.QuestId}] st={started} lvl={(level == int.MaxValue ? -1 : level)} band={band} d={d:F0}"));
             }
         }
-        if (scored.Count == 0) return null;
+        if (scored.Count == 0) { CircuitTrace.Hit(ctx.Guid, "quest: no scoreable legs"); return null; }
         scored.Sort((a, c) => a.key.CompareTo(c.key));
         // Decision log (only on real contention, >=2 competing legs): the winning key vs the runner-up, so
         // an ordering question is answered from the log instead of inferred from snapshots.
         if (scored.Count >= 2)
-            _logger.LogInformation("[QUEST] {Name} PriorityLeg ({Mode}, started>level>band>dist) chose {Best} over {Next}",
+            _logger.LogInformation("[QUEST] {Name} PriorityLeg ({Mode}, started>level>band>dist) chose {Best} over {Next}",   // cb:fold logging-only decision log
                 ctx.Name, startedGlobal ? "far" : "near", scored[0].desc, scored[1].desc);
         return (scored[0].q, scored[0].leg);
     }
@@ -1525,9 +1637,9 @@ public sealed class QuestPlanner : IBotPlanner
     // train/level round-trip — exactly the case where the old pure-nearest pick abandoned in-progress work.
     private static bool HasProgress(BotContext ctx, BatchQuest b)
     {
-        if (!ctx.QuestLog.TryGetValue(b.QuestId, out var e)) return false;
-        foreach (var c in e.MobCounts) if (c > 0) return true;
-        foreach (var c in e.ItemCounts) if (c > 0) return true;
+        if (!ctx.QuestLog.TryGetValue(b.QuestId, out var e)) return false;   // cb:fold pure per-quest predicate, outcome visible in priority key
+        foreach (var c in e.MobCounts) if (c > 0) return true;   // cb:fold pure per-quest predicate, outcome visible in priority key
+        foreach (var c in e.ItemCounts) if (c > 0) return true;   // cb:fold pure per-quest predicate, outcome visible in priority key
         return false;
     }
 
@@ -1554,7 +1666,7 @@ public sealed class QuestPlanner : IBotPlanner
     private GrindLeg Scatter(GrindLeg leg)
     {
         var sp = _spawns.SampleScatterPoint(leg.CreatureEntry, leg.Map);
-        if (sp == null) return leg;                                  // no footprint → canonical
+        if (sp == null) return leg;                                  // no footprint → canonical   // cb:fold retired helper, not called on any path
         return leg with { X = sp.X, Y = sp.Y, Z = sp.Z };           // Z is a real spawn Z; C++ ReGroundZ snaps on arrival
     }
 
@@ -1573,12 +1685,12 @@ public sealed class QuestPlanner : IBotPlanner
             for (int i = 0; i < b.Node.Objectives.Length; i++)
             {
                 var o = b.Node.Objectives[i];
-                if (!o.IsCreature || o.Count <= 0) continue;
-                if (IsCastDrivable(o, b.QuestId)) continue;   // never overflow-GRIND a cast objective's creature (e.g. a heal-target NPC)
-                if (o.GrindMap != ctx.MapId) continue;
+                if (!o.IsCreature || o.Count <= 0) continue;   // cb:fold per-objective scan, overflow pick probed in derive 2b
+                if (IsCastDrivable(o, b.QuestId)) continue;   // never overflow-GRIND a cast objective's creature (e.g. a heal-target NPC)   // cb:fold per-objective scan, overflow pick probed in derive 2b
+                if (o.GrindMap != ctx.MapId) continue;   // cb:fold per-objective scan, overflow pick probed in derive 2b
                 var p = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
                 float d = Dist2(ctx.Pos.X, ctx.Pos.Y, p.X, p.Y);
-                if (d < bestD) { bestD = d; best = (b, i, o); }
+                if (d < bestD) { bestD = d; best = (b, i, o); }   // cb:fold min-tracking detail, overflow pick probed in derive 2b
             }
         }
         return best;
@@ -1603,52 +1715,52 @@ public sealed class QuestPlanner : IBotPlanner
     private int WorkableInLog(BotContext ctx)
     {
         var id = ctx.Identity;
-        if (id == null) return 0;
+        if (id == null) return 0;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
         foreach (var kv in ctx.QuestLog)
         {
             int qid = kv.Key;
-            if (id.CompletedQuestIds.Contains(qid)) continue;        // already rewarded
-            if (id.AbandonedGreyQuestIds.Contains(qid)) continue;    // abandoned
-            if (id.DeferredQuestIds.ContainsKey(qid)) continue;      // legitimately shelved (path_unsafe / durable)
+            if (id.CompletedQuestIds.Contains(qid)) continue;        // already rewarded   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+            if (id.AbandonedGreyQuestIds.Contains(qid)) continue;    // abandoned   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+            if (id.DeferredQuestIds.ContainsKey(qid)) continue;      // legitimately shelved (path_unsafe / durable)   // cb:fold per-quest workability scan, verdict probed at derive phase 5
             var node = _quests.GetQuest(qid);
-            if (node?.Giver == null) continue;
-            if (IsGrey(node, ctx.Level)) continue;                   // out-leveled -> will be dropped, not workable
+            if (node?.Giver == null) continue;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+            if (IsGrey(node, ctx.Level)) continue;                   // out-leveled -> will be dropped, not workable   // cb:fold per-quest workability scan, verdict probed at derive phase 5
             var e = kv.Value;
 
             // COMPLETE or no-objective -> a turn-in; workable iff the ender is on this map (phase 1b/3).
             if (e.Status == QuestStatusComplete || !node.HasObjectives)
-            {
+            {   // cb:fold per-quest workability scan, verdict probed at derive phase 5
                 var ender = node.TurnIn ?? node.Giver;
-                if (ender != null && ender.Map == ctx.MapId) return qid;
+                if (ender != null && ender.Map == ctx.MapId) return qid;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
                 continue;
             }
 
             // INCOMPLETE -> workable iff a drivable creature/item leg is unmet ON THIS MAP (phase 2/4b).
             foreach (var o in node.Objectives)
             {
-                if (!o.IsCreature || o.Count <= 0) continue;
-                if (o.TargetFriendly && !IsCastDrivable(o, node.QuestId)) continue;   // Fix 5: an unkillable friendly target is NOT workable -- UNLESS cast-drivable (the CAST phase can complete it), so it counts and the bot doesn't grind-lock while a cast is pending
-                if (o.GrindMap != ctx.MapId) continue;
-                if (!WithinObjectiveRail(node.Giver, o.GrindMap, o.GrindX, o.GrindY)) continue;   // drift rail: a railed leg is NOT workable -- MUST mirror PriorityLeg, or the phase-5 exhaust suppression livelocks (rail blocks the leg, this says workable, Block->reselect->rebuild->repeat)
+                if (!o.IsCreature || o.Count <= 0) continue;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+                if (o.TargetFriendly && !IsCastDrivable(o, node.QuestId)) continue;   // Fix 5: an unkillable friendly target is NOT workable -- UNLESS cast-drivable (the CAST phase can complete it), so it counts and the bot doesn't grind-lock while a cast is pending   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+                if (o.GrindMap != ctx.MapId) continue;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+                if (!WithinObjectiveRail(node.Giver, o.GrindMap, o.GrindX, o.GrindY)) continue;   // drift rail: a railed leg is NOT workable -- MUST mirror PriorityLeg, or the phase-5 exhaust suppression livelocks (rail blocks the leg, this says workable, Block->reselect->rebuild->repeat)   // cb:fold per-quest workability scan, verdict probed at derive phase 5
                 // [FINDING_020] Fleet no-path mirror — the SAME invariant as the rail line above, for the
                 // SAME reason: DispatchObjectiveLeg skips a leg whose dest cell is fleet-known no_path, so
                 // that leg must not count as workable here or phase 5 "exhaust suppressed" Blocks → Idle →
                 // Questing → identical batch → identical skip at ~1–2 Hz forever (518 bots, 131k skips /
                 // 10 min measured 2026-08-21). Resolve the SAME point the dispatch would walk to
                 // (NearestSpawnPoint, as UnmetLegs does) so the two verdicts cannot disagree.
-                if (NearestPathableSpawnPoint(o.GrindMap, o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ) is null) continue;
+                if (NearestPathableSpawnPoint(o.GrindMap, o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ) is null) continue;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
                 int got = (o.Slot >= 1 && o.Slot <= e.MobCounts.Length) ? e.MobCounts[o.Slot - 1] : 0;
-                if (got < o.Count) return qid;
+                if (got < o.Count) return qid;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
             }
             foreach (var it in node.ItemObjectives)
             {
-                if (it.Count <= 0) continue;
+                if (it.Count <= 0) continue;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
                 var src = it.BestDropSource;                          // creature-sourced only (GO-sourced = phase 2)
-                if (src == null || src.GrindMap != ctx.MapId) continue;
-                if (!WithinObjectiveRail(node.Giver, src.GrindMap, src.GrindX, src.GrindY)) continue;   // drift rail mirror (see kill branch)
-                if (NearestPathableSpawnPoint(src.GrindMap, src.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, src.GrindX, src.GrindY, src.GrindZ) is null) continue;   // [FINDING_020] fleet no-path mirror (see kill branch)
+                if (src == null || src.GrindMap != ctx.MapId) continue;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+                if (!WithinObjectiveRail(node.Giver, src.GrindMap, src.GrindX, src.GrindY)) continue;   // drift rail mirror (see kill branch)   // cb:fold per-quest workability scan, verdict probed at derive phase 5
+                if (NearestPathableSpawnPoint(src.GrindMap, src.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, src.GrindX, src.GrindY, src.GrindZ) is null) continue;   // [FINDING_020] fleet no-path mirror (see kill branch)   // cb:fold per-quest workability scan, verdict probed at derive phase 5
                 int got = (it.Slot >= 1 && it.Slot <= e.ItemCounts.Length) ? e.ItemCounts[it.Slot - 1] : 0;
-                if (got < it.Count) return qid;
+                if (got < it.Count) return qid;   // cb:fold per-quest workability scan, verdict probed at derive phase 5
             }
         }
         return 0;
@@ -1658,7 +1770,7 @@ public sealed class QuestPlanner : IBotPlanner
     private static int RawRemaining(BotContext ctx, int questId, QuestObjective o)
     {
         if (ctx.QuestLog.TryGetValue(questId, out var e) && o.Slot >= 1 && o.Slot <= e.MobCounts.Length)
-            return o.Count - e.MobCounts[o.Slot - 1];
+            return o.Count - e.MobCounts[o.Slot - 1];   // cb:fold pure count reader in hot filter
         return o.Count;
     }
 
@@ -1667,7 +1779,7 @@ public sealed class QuestPlanner : IBotPlanner
     private static int RawItemRemaining(BotContext ctx, int questId, QuestItemReq it)
     {
         if (ctx.QuestLog.TryGetValue(questId, out var e) && it.Slot >= 1 && it.Slot <= e.ItemCounts.Length)
-            return it.Count - e.ItemCounts[it.Slot - 1];
+            return it.Count - e.ItemCounts[it.Slot - 1];   // cb:fold pure count reader in hot filter
         return it.Count;
     }
 
@@ -1679,7 +1791,7 @@ public sealed class QuestPlanner : IBotPlanner
     private static bool IsGrey(QuestNode n, int botLevel)
     {
         int ql = QuestLevelOf(n);
-        if (ql <= 0) return false;                    // scaling / unknown level -> never auto-drop
+        if (ql <= 0) return false;                    // scaling / unknown level -> never auto-drop   // cb:fold pure predicate without bot ctx
         return ql <= GrayLevel(botLevel);
     }
 
@@ -1699,9 +1811,9 @@ public sealed class QuestPlanner : IBotPlanner
     // Player::GetGrayLevel (vanilla). Target/quest is gray when its level <= this.
     private static int GrayLevel(int pl)
     {
-        if (pl <= 5) return 0;
-        if (pl <= 39) return pl - 5 - pl / 10;
-        if (pl <= 59) return pl - 1 - pl / 5;
+        if (pl <= 5) return 0;   // cb:fold pure formula without bot ctx
+        if (pl <= 39) return pl - 5 - pl / 10;   // cb:fold pure formula without bot ctx
+        if (pl <= 59) return pl - 1 - pl / 5;   // cb:fold pure formula without bot ctx
         return pl - 9;
     }
 
@@ -1711,7 +1823,7 @@ public sealed class QuestPlanner : IBotPlanner
     private static bool IsRed(QuestNode n, int botLevel)
     {
         int ql = QuestLevelOf(n);
-        if (ql <= 0) return false;                    // scaling / unknown level -> never block
+        if (ql <= 0) return false;                    // scaling / unknown level -> never block   // cb:fold pure predicate without bot ctx
         return ql > botLevel + RedMargin;
     }
 
@@ -1727,9 +1839,9 @@ public sealed class QuestPlanner : IBotPlanner
     // pickable quest has one -- BuildBatch and IsPickable both require it).
     private static bool WithinObjectiveRail(QuestNpcLocation? giver, int legMap, float legX, float legY)
     {
-        if (giver == null) return true;
-        if (legX == 0f && legY == 0f) return true;
-        if (legMap != giver.Map) return false;
+        if (giver == null) return true;   // cb:fold pure shared filter predicate without bot ctx
+        if (legX == 0f && legY == 0f) return true;   // cb:fold pure shared filter predicate without bot ctx
+        if (legMap != giver.Map) return false;   // cb:fold pure shared filter predicate without bot ctx
         return Dist2(giver.X, giver.Y, legX, legY) <= ObjectiveGiverRailYards;
     }
 
@@ -1749,9 +1861,9 @@ public sealed class QuestPlanner : IBotPlanner
         foreach (var b in set)
         {
             var p = loc(b);
-            if (p.Map != ctx.MapId) continue;
+            if (p.Map != ctx.MapId) continue;   // cb:fold per-item min-scan, chosen target probed at call sites
             float d = Dist2(ctx.Pos.X, ctx.Pos.Y, p.X, p.Y);
-            if (d < bestD) { bestD = d; best = b; }
+            if (d < bestD) { bestD = d; best = b; }   // cb:fold min-tracking detail, chosen target probed at call sites
         }
         return best;
     }
@@ -1793,6 +1905,7 @@ public sealed class QuestPlanner : IBotPlanner
         // to lapse. Exactly the outcome of walking there and failing, minus the walk.
         if (_safety.IsNoPathDest(pick.Leg.Map, pick.Leg.X, pick.Leg.Y))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: leg dest fleet-known no_path, skipping sweep", pick.Quest.QuestId);
             _logger.LogInformation(
                 "[QUEST] {Name} skipping leg [{Id}] @ ({X:F0},{Y:F0}) — fleet-known no_path dest",
                 ctx.Name, pick.Quest.QuestId, pick.Leg.X, pick.Leg.Y);
@@ -1880,14 +1993,14 @@ public sealed class QuestPlanner : IBotPlanner
     // per-quest QuestCastKit (script-credited). Empty = not drivable / no known spells (defensive).
     private static int[] CastSpellsFor(QuestNode node, QuestObjective o, int questId)
     {
-        if (o.RequiredSpellId != 0) return new[] { o.RequiredSpellId };
+        if (o.RequiredSpellId != 0) return new[] { o.RequiredSpellId };   // cb:fold pure helper without bot ctx
         return QuestCastKit.For(questId) ?? Array.Empty<int>();
     }
 
     // The objective at a given Slot (1-4) within a batched quest, or null.
     private static QuestObjective? ObjectiveAt(BatchQuest b, int slot)
     {
-        foreach (var o in b.Node.Objectives) if (o.Slot == slot) return o;
+        foreach (var o in b.Node.Objectives) if (o.Slot == slot) return o;   // cb:fold pure lookup without bot ctx
         return null;
     }
 
@@ -1909,10 +2022,10 @@ public sealed class QuestPlanner : IBotPlanner
     {
         foreach (var o in b.Node.Objectives)
         {
-            if (!IsCastDrivable(o, b.QuestId) || o.Count <= 0) continue;
-            if (RawRemaining(ctx, b.QuestId, o) <= 0) continue;
+            if (!IsCastDrivable(o, b.QuestId) || o.Count <= 0) continue;   // cb:fold per-objective cast scan in hot filter, chosen leg probed at dispatch
+            if (RawRemaining(ctx, b.QuestId, o) <= 0) continue;   // cb:fold per-objective cast scan in hot filter, chosen leg probed at dispatch
             var spells = CastSpellsFor(b.Node, o, b.QuestId);
-            if (spells.Length == 0) continue;   // no known spells -> can't drive (defensive)
+            if (spells.Length == 0) continue;   // no known spells -> can't drive (defensive)   // cb:fold per-objective cast scan in hot filter, chosen leg probed at dispatch
             var p = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
             yield return new CastLeg(o.Slot, o.CreatureEntry, p.X, p.Y, p.Z, o.GrindMap, o.Count, spells);
         }
@@ -1932,9 +2045,11 @@ public sealed class QuestPlanner : IBotPlanner
         var target = CastTarget(leg.CreatureEntry, leg.X, leg.Y, leg.Z, leg.Map);
         if (AtNpc(ctx, target))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: at cast target, casting first spell", bq.QuestId);
             ctx.SetStep("casting");
             return CastSpell(leg.CreatureEntry, leg.Spells[0], leg.Count);
         }
+        CircuitTrace.Hit(ctx.Guid, "quest: traveling to cast target", bq.QuestId);
         ctx.SetStep("to_cast");
         return MoveTo(target);
     }
@@ -1994,8 +2109,10 @@ public sealed class QuestPlanner : IBotPlanner
         // Recover for the full history. If it ever returns, add its reason here too.)
         if (ctx.Failure != null)
         {
+            CircuitTrace.HitNote(ctx.Guid, "quest: group - leg failed under order", ctx.Failure.Reason);
             if (ctx.Failure.CommandType == "GRIND" && ctx.Failure.Reason == "no_target")
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: group - grind freeze, unstick detour");
                 string grsn = ctx.Failure.Reason;
                 ctx.Failure = null;
                 ctx.ClearObjective();   // mirrors solo Recover:675 -- the committed task is the detour, not the objective
@@ -2017,6 +2134,7 @@ public sealed class QuestPlanner : IBotPlanner
                     "TASK_COMPLETE", DetourDeadline);
             }
 
+            CircuitTrace.Hit(ctx.Guid, "quest: group - failure cleared, fresh leg next tick");
             ctx.Failure = null;
             ctx.LastGroupOrder = GroupOrder.None;   // force a fresh leg next tick
             return StepResult.Wait();
@@ -2030,35 +2148,51 @@ public sealed class QuestPlanner : IBotPlanner
         // self-synced and the default (Forming) case synced; hoisting the SAME cadence here covers
         // every phase, so no group decision is ever made off a pre-accept snapshot.
         if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group - log stale, re-query");
             return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+        }
 
         switch (o.Phase)
         {
             case GroupPhase.TravelToGiver:
             case GroupPhase.TravelToTurnIn:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - travel phase");
                 return GroupTravel(ctx, o);
             case GroupPhase.Accept:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - accept phase");
                 return GroupAccept(ctx, o);
             case GroupPhase.Objective:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - shared objective phase");
                 return GroupObjective(ctx, o);
             case GroupPhase.TurnIn:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - turn-in phase");
                 return GroupTurnIn(ctx, o);
             case GroupPhase.HoldAtAnchor:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - hold-at-anchor phase");
                 return GroupHold(ctx, o);
             case GroupPhase.GroupGrind:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - grind-together phase");
                 return GroupGrindTogether(ctx, o);
             case GroupPhase.GroupDefend:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - defend-point phase");
                 return GroupDefendPoint(ctx, o);
             case GroupPhase.GroupTrain:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - train-hold phase");
                 return GroupTrainHold(ctx, o);
             case GroupPhase.GroupVendor:
+                CircuitTrace.Hit(ctx.Guid, "quest: group - vendor errand phase");
                 return GroupVendorErrand(ctx, o);
             default:
                 // Forming (transient) or a phase this v1 executor doesn't drive: keep the log fresh on a
                 // cadence so the coordinator's gates see server truth, then idle until it stamps a
                 // concrete phase. Never a hard wait that could strand the bot.
+                CircuitTrace.Hit(ctx.Guid, "quest: group - forming/unhandled phase, idle refresh");
                 if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "quest: group - forming, log stale, re-query");
                     return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+                }
                 return StepResult.Wait();
         }
     }
@@ -2069,7 +2203,10 @@ public sealed class QuestPlanner : IBotPlanner
     {
         var npc = NpcOf(o);
         if (AtNpc(ctx, npc))
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group travel - arrived, waiting for team");
             return StepResult.Wait();          // arrived; the coordinator advances the phase next tick
+        }
         ctx.SetStep("grp_travel");
         return MoveTo(npc);
     }
@@ -2082,11 +2219,13 @@ public sealed class QuestPlanner : IBotPlanner
         var npc = NpcOf(o);
         if (!AtNpc(ctx, npc))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group accept - closing to giver");
             ctx.SetStep("grp_travel");
             return MoveTo(npc);                // close the last yards individually
         }
         if (NextAcceptableAtGiver(ctx, o.TargetNpcEntry) is int qid)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group accept - accepting quest", qid);
             ctx.SetStep("grp_accept");
             return GroupInteract(qid, o.TargetNpcEntry, accept: true);
         }
@@ -2101,9 +2240,13 @@ public sealed class QuestPlanner : IBotPlanner
     private StepResult GroupObjective(BotContext ctx, GroupOrder o)
     {
         if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group objective - log stale, re-query");
             return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
+        }
         if (o != ctx.LastGroupOrder || ctx.Step != "grp_obj")
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group objective - (re)engaging shared grind");
             ctx.SetStep("grp_obj");
             ctx.LastGroupOrder = o;
             return GroupObjectiveLeg(o.Objective);
@@ -2118,11 +2261,13 @@ public sealed class QuestPlanner : IBotPlanner
         var npc = NpcOf(o);
         if (!AtNpc(ctx, npc))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group turn-in - closing to ender");
             ctx.SetStep("grp_travel");
             return MoveTo(npc);
         }
         if (NextCompleteAtEnder(ctx, o.TargetNpcEntry) is int qid)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group turn-in - handing in", qid);
             ctx.SetStep("grp_turnin");
             return GroupInteract(qid, o.TargetNpcEntry, accept: false);
         }
@@ -2134,10 +2279,16 @@ public sealed class QuestPlanner : IBotPlanner
     private StepResult GroupHold(BotContext ctx, GroupOrder o)
     {
         if (o.Objective.IsActive)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group hold - grinding latched objective");
             return GroupObjective(ctx, o);     // grind the latched mob (change-guarded)
+        }
         var anchor = NpcOf(o);                 // TargetPos carries the anchor coords (NpcEntry 0)
         if (AtNpc(ctx, anchor))
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group hold - at anchor, waiting");
             return StepResult.Wait();
+        }
         ctx.SetStep("grp_hold");
         return MoveTo(anchor);
     }
@@ -2158,9 +2309,11 @@ public sealed class QuestPlanner : IBotPlanner
 
         if (o != ctx.LastGroupOrder)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group grind - new order");
             ctx.LastGroupOrder = o;
             if (!AtNpc2D(ctx, point, GroupGrindConvergeYards))
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: group grind - converging first");
                 ctx.SetStep("grp_gconverge");
                 return MoveTo(point);
             }
@@ -2171,6 +2324,7 @@ public sealed class QuestPlanner : IBotPlanner
         // Order unchanged: a converging member that has now arrived arms the grind once.
         if (ctx.Step == "grp_gconverge" && AtNpc2D(ctx, point, GroupGrindArriveYards))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group grind - converged, arming grind");
             ctx.SetStep("grp_grind");
             return FireGroupGrind(ctx, point);
         }
@@ -2205,9 +2359,11 @@ public sealed class QuestPlanner : IBotPlanner
 
         if (o != ctx.LastGroupOrder)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group defend - new order");
             ctx.LastGroupOrder = o;
             if (!AtNpc2D(ctx, point, GroupDefendArriveYards))
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: group defend - converging to point");
                 ctx.SetStep("grp_dconverge");
                 return MoveTo(point);
             }
@@ -2218,6 +2374,7 @@ public sealed class QuestPlanner : IBotPlanner
         // Order unchanged: a converging member that has now arrived goes to guard once.
         if (ctx.Step == "grp_dconverge" && AtNpc2D(ctx, point, GroupDefendArriveYards))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group defend - converged, standing guard");
             ctx.SetStep("grp_defend");
             return StepResult.Fire(new BridgeCommand("SET_TASK", new { task = "IDLE" }));
         }
@@ -2240,9 +2397,13 @@ public sealed class QuestPlanner : IBotPlanner
         // SET_TASK GRIND at the member's own position; the KILL stream is the liveness signal.
         // Step-guarded so it fires once per round, not per tick.
         if (o.Objective.IsActive)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group train-hold - legacy latched objective");
             return GroupObjective(ctx, o);     // legacy path (latch shouldn't reach here anymore; harmless if it does)
+        }
         if (ctx.Step != "grp_train_grind")
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group train-hold - arming filler grind");
             ctx.SetStep("grp_train_grind");
             ctx.ClearObjective();              // the filler grind is not a committed objective (mirrors GrindPlanner)
             return StepResult.Fire(new BridgeCommand("SET_TASK", new
@@ -2276,6 +2437,7 @@ public sealed class QuestPlanner : IBotPlanner
         // whole group's arrival loosely; this is the per-member final approach, like GroupAccept).
         if (!AtNpc2D(ctx, npc, GroupVendorArriveYards))
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group vendor - traveling to shared vendor");
             ctx.SetStep("grp_vendor_travel");
             return MoveTo(npc);
         }
@@ -2288,8 +2450,10 @@ public sealed class QuestPlanner : IBotPlanner
         // between stamp and now (it can't via selling, but be defensive), the sell was enough -> hold.
         if (ctx.Step == "grp_vendor_sell")
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group vendor - sold, checking repair");
             if (ctx.Durability < GroupVendorRepairBelowDurability)
             {
+                CircuitTrace.Hit(ctx.Guid, "quest: group vendor - repairing", ctx.Durability);
                 ctx.SetStep("grp_vendor_repair");
                 return StepResult.Send(
                     new BridgeCommand("REPAIR_AT_NPC", new { npc_entry = o.TargetNpcEntry }),
@@ -2298,7 +2462,10 @@ public sealed class QuestPlanner : IBotPlanner
             return StepResult.Wait();   // sold, nothing more to do here -> hold with the team
         }
         if (ctx.Step == "grp_vendor_repair")
+        {
+            CircuitTrace.Hit(ctx.Guid, "quest: group vendor - repair done, holding");
             return StepResult.Wait();   // repair ack (or its deadline) landed -> done, hold
+        }
 
         // Fresh arrival. Does THIS member actually need the vendor? (Same thresholds the coordinator
         // gated the whole group on -- a member that's fine just holds so the team stays together.)
@@ -2306,6 +2473,7 @@ public sealed class QuestPlanner : IBotPlanner
         bool needsRepair = ctx.Durability < GroupVendorRepairBelowDurability;
         if (needsSell || needsRepair)
         {
+            CircuitTrace.Hit(ctx.Guid, "quest: group vendor - selling first");
             // Always sell first (frees slots AND is the natural lead-in; SellStep in the solo path
             // repairs afterward off the same arrival). keep_quality matches the solo trip.
             ctx.SetStep("grp_vendor_sell");
@@ -2337,13 +2505,16 @@ public sealed class QuestPlanner : IBotPlanner
     private int? NextAcceptableAtGiver(BotContext ctx, int giverEntry)
     {
         var id = ctx.Identity;
-        if (id == null) return null;
+        if (id == null) { CircuitTrace.Hit(ctx.Guid, "quest: group accept scan - no identity"); return null; }
         int raceBit = QuestGraphLoader.RaceToBitmask(id.Race);
         int classBit = QuestGraphLoader.ClassToBitmask(id.ClassId);
         var active = new HashSet<int>(ctx.QuestLog.Keys);
         foreach (var q in _quests.GetAvailableQuests(raceBit, classBit, id.Level, id.CompletedQuestIds, active))
             if (q.Giver?.NpcEntry == giverEntry)
+            {
+                CircuitTrace.Hit(ctx.Guid, "quest: group accept scan - eligible quest at giver", q.QuestId);
                 return q.QuestId;
+            }
         return null;
     }
 
@@ -2352,11 +2523,14 @@ public sealed class QuestPlanner : IBotPlanner
     {
         foreach (var kv in ctx.QuestLog)
         {
-            if (kv.Value.Status != QuestStatusComplete) continue;
+            if (kv.Value.Status != QuestStatusComplete) continue;   // cb:fold per-quest log guard, match probed below
             var q = _quests.GetQuest(kv.Key);
             var ender = q?.TurnIn ?? q?.Giver;
             if (ender != null && ender.NpcEntry == enderEntry)
+            {
+                CircuitTrace.Hit(ctx.Guid, "quest: group turn-in scan - complete quest at ender", kv.Key);
                 return kv.Key;
+            }
         }
         return null;
     }

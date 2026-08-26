@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Coordinator;
 
@@ -36,7 +37,10 @@ public class ChainGuard
     {
         if (_lastEmission.TryGetValue(senderBotName.Trim(), out var e) &&
             DateTime.UtcNow - e.Utc < Memory)
+        {
+            CircuitTrace.Hit(0, "chat: chain depth inherited from recent emission", e.Depth);
             return e.Depth;
+        }
         return 1;   // bot spoke outside the coordinator's knowledge — still a bot line
     }
 
@@ -45,6 +49,6 @@ public class ChainGuard
     {
         var cutoff = DateTime.UtcNow - Memory;
         foreach (var kv in _lastEmission)
-            if (kv.Value.Utc < cutoff) _lastEmission.TryRemove(kv.Key, out _);
+            if (kv.Value.Utc < cutoff) { CircuitTrace.Hit(0, "chat: chain emission memory swept"); _lastEmission.TryRemove(kv.Key, out _); }
     }
 }

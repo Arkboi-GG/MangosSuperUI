@@ -1,6 +1,7 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Planners;   // reuse QuestPlanner.ReachTier/InReach (match solo, don't reimplement)
+using MangosSuperUI.BotLogic.Tracking;
 using Microsoft.Extensions.Logging;
 
 namespace MangosSuperUI.BotLogic.Brain;
@@ -89,17 +90,17 @@ public static class GroupCoordinator
                      || now == GroupPhase.GroupGrind    // grinding windows keep the ~15s heartbeat (the countdown lines)
                      || now == GroupPhase.GroupDefend;  // ...and so do defensive stands (corpse/heal guards)
         if (!changed)
-        {
-            if (!stuck) return;
+        {   // cb:fold log throttle, logging only
+            if (!stuck) return;   // cb:fold log throttle, logging only
             if (_lastEmit.TryGetValue(anchorGuid, out var last)
-                && (DateTime.UtcNow - last).TotalSeconds < EmitHeartbeatSec) return;
+                && (DateTime.UtcNow - last).TotalSeconds < EmitHeartbeatSec) return;   // cb:fold log throttle, logging only
         }
         _lastEmit[anchorGuid] = DateTime.UtcNow;
         var who = string.Join(" ", members.Select(m =>
             $"[{m.Guid}:L{m.Level} hp{(int)(m.HpPct * 100)} dead={m.Dead} prog{(int)m.TimeSinceProgressSec}s]"));
         var line = $"[GROUP] anchor={anchorGuid} {prev}->{now} {detail} | {who}";
-        if (Log != null) Log.LogInformation(line);
-        else Console.WriteLine(line);
+        if (Log != null) Log.LogInformation(line);   // cb:fold logging only
+        else Console.WriteLine(line);   // cb:fold logging only
     }
 
     // Rare, decision-changing events (the Fix-4 exhaust ladder; the Fix-1 virtual deadline) must
@@ -113,8 +114,8 @@ public static class GroupCoordinator
         var who = string.Join(" ", members.Select(m =>
             $"[{m.Guid}:L{m.Level} hp{(int)(m.HpPct * 100)} dead={m.Dead} prog{(int)m.TimeSinceProgressSec}s]"));
         var line = $"[GROUP] anchor={anchorGuid} {prev}->{now} {detail} | {who}";
-        if (Log != null) Log.LogInformation(line);
-        else Console.WriteLine(line);
+        if (Log != null) Log.LogInformation(line);   // cb:fold logging only
+        else Console.WriteLine(line);   // cb:fold logging only
     }
 
     /// <summary>
@@ -148,12 +149,15 @@ public static class GroupCoordinator
         // Mode Off disbands all groups, so GetAllGroups() is empty and the None pass is the whole
         // story. The explicit guard makes the off-switch obvious + cheap.
         if (groups.Mode == GroupingMode.Off)
-        {
+        {   // cb:fold fleet-level off switch, per-bot outcome probed on the clear below
             // Grouping off → drop any coordinator-assigned held objective so each bot reverts fully to
             // solo (its own producers own Held). Self-solo objectives are left untouched. (§6.)
             foreach (var ctx in contexts.Values)
                 if (ctx.Held is { Source: ObjectiveSource.Coordinator })
+                {
+                    CircuitTrace.Hit(ctx.Guid, "group: mode off, coordinator objective dropped");
                     ctx.ClearObjective();
+                }
             return;
         }
 
@@ -170,11 +174,17 @@ public static class GroupCoordinator
             var members = new List<BotContext>(group.MemberGuids.Count);
             foreach (var guid in group.MemberGuids)
                 if (contexts.TryGetValue(guid, out var ctx) && !ctx.Conscripted)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "group: member present this tick");
                     members.Add(ctx);
+                }
 
             // Need >=2 PRESENT members to act as a team; otherwise leave None (solo).
             if (members.Count < 2)
+            {
+                CircuitTrace.Hit(members.Count == 1 ? members[0].Guid : 0, "group: sub-quorum, members stay solo", members.Count);
                 continue;
+            }
 
             int anchorGuid = ElectAnchor(members);
 
@@ -189,7 +199,10 @@ public static class GroupCoordinator
             // executor from the bot's own log). Without the graph we can't drive questing, but
             // combat assist still stands; leave GroupOrder.None so members solo-grind.
             if (!quests.IsLoaded)
+            {
+                CircuitTrace.Hit(anchorGuid, "group: quest graph not loaded, assist only");
                 continue;
+            }
 
             var order = DriveGroup(group.Plan, members, anchorGuid, quests, safety, spawns, questPlanner, zoneData);
             foreach (var ctx in members)
@@ -206,7 +219,10 @@ public static class GroupCoordinator
         // re-stamps the clock on a CHANGE). §6.
         foreach (var ctx in contexts.Values)
             if (!groupedGuids.Contains(ctx.Guid) && ctx.Held is { Source: ObjectiveSource.Coordinator })
+            {
+                CircuitTrace.Hit(ctx.Guid, "group: left active group, stale objective cleared");
                 ctx.ClearObjective();
+            }
     }
 
     // Mirror the assigned GroupOrder as the bot's held strategic objective (§3/§6) — the reconcile /
@@ -218,17 +234,20 @@ public static class GroupCoordinator
         switch (o.Phase)
         {
             case GroupPhase.Objective:
+                CircuitTrace.Hit(ctx.Guid, "group: held mirrors shared kill objective");
                 var d = o.Objective;
                 ctx.SetObjective(Objective.Grind(ObjectiveSource.Coordinator, d.CreatureEntry,
                     d.X, d.Y, d.Z, d.Map, 0, d.QuestId, d.Slot));   // killCount 0 = indefinite (coordinator gate owns completion)
                 break;
             case GroupPhase.GroupDefend:
+                CircuitTrace.Hit(ctx.Guid, "group: held mirrors defensive stand");
                 // Axiom 2 hardened: passive guard at the point. Objective.Hold is never reconciled
                 // (a C++ Idle echo is the CORRECT state here), so the reconcile can't re-issue
                 // anything into a defensive stand.
                 ctx.SetObjective(Objective.Hold(o.TargetPos));
                 break;
             case GroupPhase.GroupGrind:
+                CircuitTrace.Hit(ctx.Guid, "group: held mirrors clump grind");
                 // Axiom 1: an indefinite entry-0 grind at the clump point. Reconcilable: echo Grind
                 // (any entry) or MoveTo toward the point both match; Idle mismatches and re-issues —
                 // the self-heal for a dropped C++ grind, with the Fix-3 streak backoff preventing a
@@ -237,43 +256,52 @@ public static class GroupCoordinator
                     o.TargetPos.X, o.TargetPos.Y, o.TargetPos.Z, o.TargetPos.Map, 0));
                 break;
             case GroupPhase.HoldAtAnchor:
+                CircuitTrace.Hit(ctx.Guid, "group: held mirrors hold-at-anchor");
                 if (o.Objective.IsActive)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "group: hold keeps latched grind");
                     var h = o.Objective;
                     ctx.SetObjective(Objective.Grind(ObjectiveSource.Coordinator, h.CreatureEntry,
                         h.X, h.Y, h.Z, h.Map, 0, h.QuestId, h.Slot));
                 }
                 else
                 {
+                    CircuitTrace.Hit(ctx.Guid, "group: hold at anchor point, nothing latched");
                     ctx.SetObjective(Objective.Hold(o.TargetPos));
                 }
                 break;
             case GroupPhase.GroupTrain:
+                CircuitTrace.Hit(ctx.Guid, "group: held mirrors train window");
                 // No NPC target (each trainee routes to its OWN class trainer) -- unlike HoldAtAnchor,
                 // there's no anchor coord to fall back to when nothing's latched, so a member with no
                 // mob to grind gets no committed objective at all (the reconcile has nothing to defend,
                 // exactly like Forming/None below).
                 if (o.Objective.IsActive)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "group: train window keeps latched grind");
                     var t = o.Objective;
                     ctx.SetObjective(Objective.Grind(ObjectiveSource.Coordinator, t.CreatureEntry,
                         t.X, t.Y, t.Z, t.Map, 0, t.QuestId, t.Slot));
                 }
                 else
                 {
+                    CircuitTrace.Hit(ctx.Guid, "group: train window, no committed objective");
                     ctx.ClearObjective();
                 }
                 break;
             case GroupPhase.TravelToGiver:
             case GroupPhase.TravelToTurnIn:
+                CircuitTrace.Hit(ctx.Guid, "group: held mirrors travel to NPC");
                 ctx.SetObjective(Objective.Travel(ObjectiveSource.Coordinator,
                     o.TargetPos.X, o.TargetPos.Y, o.TargetPos.Z, o.TargetPos.Map, o.TargetNpcEntry));
                 break;
             case GroupPhase.Accept:
             case GroupPhase.TurnIn:
+                CircuitTrace.Hit(ctx.Guid, "group: held passive hold at interact NPC");
                 ctx.SetObjective(Objective.Hold(o.TargetPos));   // at the NPC interacting — passive, not reconciled
                 break;
             default:
+                CircuitTrace.Hit(ctx.Guid, "group: no committed objective this tick");
                 ctx.ClearObjective();   // Forming (transient) / None / unhandled → no committed objective this tick
                 break;
         }
@@ -302,6 +330,7 @@ public static class GroupCoordinator
         // (§4) -- any of the three means this member is off running its OWN planner right now.
         if (AnyRecovering(members))
         {
+            CircuitTrace.Hit(anchorGuid, "group: member recovering, peel protocol");
             var peeled = string.Join(",", members
                 .Where(m => m.Dead || m.Goal == Goal.Maintenance || m.Goal == Goal.Training)
                 .Select(m => $"{m.Guid}({(m.Dead ? $"dead,hp{(int)(m.HpPct * 100)}" : m.Goal.ToString().ToLowerInvariant())})"));
@@ -319,6 +348,7 @@ public static class GroupCoordinator
             var deadMember = members.FirstOrDefault(m => m.Dead);
             if (deadMember != null)
             {
+                CircuitTrace.Hit(deadMember.Guid, "group: defend at dead member's corpse");
                 var cp = new Vec4(
                     MathF.Round(deadMember.Pos.X / 5f) * 5f,
                     MathF.Round(deadMember.Pos.Y / 5f) * 5f,
@@ -339,14 +369,17 @@ public static class GroupCoordinator
                 !m.Dead && m.Maintenance is { RezSent: true, HealDone: false });
             if (healingMember != null)
             {
+                CircuitTrace.Hit(healingMember.Guid, "group: guard the healing member");
                 Vec4 hp;
                 if (plan.HasGrindPoint
                     && (plan.Phase == GroupPhase.GroupDefend || plan.Phase == GroupPhase.GroupGrind))
                 {
+                    CircuitTrace.Hit(healingMember.Guid, "group: guard keeps memoized point");
                     hp = plan.GrindPoint;
                 }
                 else
                 {
+                    CircuitTrace.Hit(healingMember.Guid, "group: guard at healing member position");
                     hp = new Vec4(
                         MathF.Round(healingMember.Pos.X / 5f) * 5f,
                         MathF.Round(healingMember.Pos.Y / 5f) * 5f,
@@ -379,9 +412,11 @@ public static class GroupCoordinator
         // calm window) -> the retreat leg is skipped and only the shelve applies.
         if (plan.RetreatPending)
         {
+            CircuitTrace.Hit(anchorGuid, "group: meat-grinder retreat consumed");
             plan.RetreatPending = false;
             if (plan.HasLastSafePoint)
             {
+                CircuitTrace.Hit(anchorGuid, "group: retreat begins toward safe point");
                 plan.RetreatUntil = DateTime.UtcNow.AddSeconds(RetreatHoldSec);
                 EmitForce(anchorGuid, prevPhase, GroupPhase.GroupGrind,
                     $"MEAT-GRINDER retreat begins -> ({plan.LastSafePoint.X:F0},{plan.LastSafePoint.Y:F0}) for {RetreatHoldSec}s", members);
@@ -389,8 +424,10 @@ public static class GroupCoordinator
         }
         if (plan.RetreatUntil is DateTime ru)
         {
+            CircuitTrace.Hit(anchorGuid, "group: retreat window standing");
             if (DateTime.UtcNow < ru && plan.HasLastSafePoint)
             {
+                CircuitTrace.Hit(anchorGuid, "group: retreat holds at safe point", (ru - DateTime.UtcNow).TotalSeconds);
                 plan.GrindPoint = plan.LastSafePoint;
                 plan.HasGrindPoint = true;
                 plan.SetPhase(GroupPhase.GroupGrind);
@@ -420,15 +457,20 @@ public static class GroupCoordinator
         // seeded baseline is always >= 1, so the gate (baseline+2) can never be satisfied by a L1
         // member -- no separate "skip at level 1" special-case needed.
         if (plan.TrainBaselineLevel == 0)
+        {
+            CircuitTrace.Hit(anchorGuid, "group: train baseline first seed");
             plan.TrainBaselineLevel = members.Min(m => m.Level);
+        }
 
         // Every present member must have cleared TrainBaselineLevel + GroupTrainLevelGap; if nobody
         // actually owes a visit (HasUnlearnedSpells) the level bar is met for nothing to do, so just
         // advance the baseline without forcing a trip.
         if (members.All(m => m.Level >= plan.TrainBaselineLevel + GroupTrainLevelGap))
         {
+            CircuitTrace.Hit(anchorGuid, "group: train level bar cleared", plan.TrainBaselineLevel);
             if (members.Any(m => m.Identity is { HasUnlearnedSpells: true }))
             {
+                CircuitTrace.Hit(anchorGuid, "group: train window opens");
                 plan.TrainBaselineLevel = members.Min(m => m.Level);   // lock the floor for this round
                 plan.SetPhase(GroupPhase.GroupTrain);
                 Emit(anchorGuid, prevPhase, GroupPhase.GroupTrain,
@@ -478,14 +520,17 @@ public static class GroupCoordinator
 
         if (prevPhase == GroupPhase.GroupVendor && plan.VendorNpcEntry != 0)
         {
+            CircuitTrace.Hit(anchorGuid, "group: vendor window standing, review memo");
             if (anyNeedsVendor && plan.TimeInPhaseSec < GroupVendorWindowCapSec)
             {
+                CircuitTrace.Hit(anchorGuid, "group: vendor order re-stamped from memo", plan.TimeInPhaseSec);
                 // Re-stamp from the memo -- no re-lookup, no re-log.
                 return GroupOrder.ToNpc(GroupPhase.GroupVendor, anchorGuid, plan.VendorNpcEntry, plan.VendorPos);
             }
 
             if (anyNeedsVendor)
             {
+                CircuitTrace.Hit(anchorGuid, "group: vendor window capped, force release", plan.TimeInPhaseSec);
                 // Wall-clock cap tripped -- the group must never be hostage to one member's errand.
                 plan.VendorWindowCooldownUntil = DateTime.UtcNow.AddSeconds(GroupVendorCooldownSec);
                 Emit(anchorGuid, prevPhase, prevPhase,
@@ -499,11 +544,13 @@ public static class GroupCoordinator
 
         if (anyNeedsVendor && !vendorOnCooldown)
         {
+            CircuitTrace.Hit(anchorGuid, "group: vendor needed, shared lookup runs");
             bool anyNeedsRepair = members.Any(m => m.Durability < GroupRepairRequiredBelowDurability);
             var vendor = zoneData.GetNearestVendor(anchor.ZoneId, anchor.MapId, anchor.Pos.X, anchor.Pos.Y,
                                                    members.Min(m => m.Level), anyNeedsRepair);
             if (vendor != null)
             {
+                CircuitTrace.HitNote(anchorGuid, "group: shared vendor chosen, window opens", vendor.NpcName);
                 var vpos = new Vec4(vendor.X, vendor.Y, vendor.Z, vendor.MapId);
                 plan.SetVendorTarget(vendor.NpcEntry, vpos);   // memoize -- one lookup for the whole window
                 plan.SetPhase(GroupPhase.GroupVendor);
@@ -601,9 +648,11 @@ public static class GroupCoordinator
         // window) -> nothing to shelve; the retreat leg alone applies.
         if (plan.PendingGrinderDefer)
         {
+            CircuitTrace.Hit(vctx.Guid, "group: meat-grinder shelve consumed");
             plan.PendingGrinderDefer = false;
             if (vctx.Quest?.Active != null)
             {
+                CircuitTrace.Hit(vctx.Guid, "group: active quest shelved via synthetic failure");
                 vctx.Pending = null;
                 vctx.Failure = new WaitFailure { CommandType = "MOVE_TO", Reason = "meat_grinder", Utc = DateTime.UtcNow };
             }
@@ -640,23 +689,35 @@ public static class GroupCoordinator
         if (vctx.Identity?.GrindLockUntil is DateTime vglLadder && DateTime.UtcNow < vglLadder
             && plan.GrindLockWeakestLevel == 0)
         {
+            CircuitTrace.Hit(vctx.Guid, "group: fresh grind-lock, exhaust ladder check");
             string fp = string.Join(",", vctx.Identity.DeferredQuestIds.Keys.OrderBy(k => k));
-            if (fp.Length > 0 && fp == plan.LastExhaustSet) plan.ExhaustCycles++;
-            else { plan.ExhaustCycles = 1; plan.LastExhaustSet = fp; }
+            if (fp.Length > 0 && fp == plan.LastExhaustSet)
+            {
+                CircuitTrace.Hit(vctx.Guid, "group: exhaust set unchanged, cycle repeats", plan.ExhaustCycles + 1);
+                plan.ExhaustCycles++;
+            }
+            else
+            {
+                CircuitTrace.Hit(vctx.Guid, "group: fresh exhaust set, ladder reset");
+                plan.ExhaustCycles = 1; plan.LastExhaustSet = fp;
+            }
 
             if (plan.ExhaustCycles >= 2)
             {
+                CircuitTrace.Hit(vctx.Guid, "group: exhaust ladder escalates", plan.ExhaustCycles);
                 bool expireLevel = plan.ExhaustCycles >= 3;
                 int cleared = ForceExpireDeferrals(vctx, members, expireLevel);
                 string widened = plan.ExhaustCycles >= 4 ? " + widened pick radius" : "";
                 if (cleared > 0)
                 {
+                    CircuitTrace.Hit(vctx.Guid, "group: defers force-expired, re-derive now", cleared);
                     vctx.Identity.GrindLockUntil = null;   // re-derive NOW with the defers cleared
                     EmitForce(anchorGuid, prevPhase, prevPhase,
                         $"exhaust cycle={plan.ExhaustCycles} unchanged set=[{fp}] -> force-expired {cleared} defer(s){(expireLevel ? " incl level-gated" : "")}{widened} -- re-deriving now", members);
                 }
                 else
                 {
+                    CircuitTrace.Hit(vctx.Guid, "group: nothing expirable on ladder");
                     EmitForce(anchorGuid, prevPhase, prevPhase,
                         $"exhaust cycle={plan.ExhaustCycles} unchanged set=[{fp}] -> nothing expirable{widened}", members);
                 }
@@ -665,6 +726,7 @@ public static class GroupCoordinator
 
         if (vctx.Identity?.GrindLockUntil is DateTime vgl && DateTime.UtcNow < vgl)
         {
+            CircuitTrace.Hit(vctx.Guid, "group: virtual grind-lock active");
             // BREAK THE LOCK ON A WEAKEST LEVEL-UP (2026-07-03): a path_unsafe grind-lock waits ONLY on the
             // weakest member's level -- the shelved quests are LEVEL-deferred (requiredLevel = danger -
             // margin), and RefreshVirtualEligibility above has already pruned any the current weakest clears.
@@ -677,14 +739,19 @@ public static class GroupCoordinator
             // a level a ding resolves, a different animal.)
             if (plan.GrindLockWeakestLevel != 0 && vctx.Level > plan.GrindLockWeakestLevel)
             {
+                CircuitTrace.Hit(vctx.Guid, "group: weakest dinged, lock dropped", vctx.Level);
                 vctx.Identity.GrindLockUntil = null;
                 plan.GrindLockWeakestLevel = 0;
                 // fall through -- the Pending resolve + PlanNext below re-derive at the new weakest level.
             }
             else
             {
+                CircuitTrace.Hit(vctx.Guid, "group: lock holds, grind-together window");
                 if (plan.GrindLockWeakestLevel == 0)
+                {
+                    CircuitTrace.Hit(vctx.Guid, "group: lock stamps weakest level", vctx.Level);
                     plan.GrindLockWeakestLevel = vctx.Level;   // stamp the weakest level this lock began at
+                }
 
                 // NEVER solo-grind in a group (Nico, 2026-07-03) — and NEVER latch a single mob for
                 // the window (Nico, 2026-07-04 / Axiom 1: the old latched hold camped Garrick's empty
@@ -702,6 +769,7 @@ public static class GroupCoordinator
         }
         else
         {
+            CircuitTrace.Hit(vctx.Guid, "group: no grind-lock, weakest capture reset");
             plan.GrindLockWeakestLevel = 0;   // no lock active -> reset so the next lock captures fresh
         }
 
@@ -722,8 +790,10 @@ public static class GroupCoordinator
         // (DeferAcceptedQuest — durable, carried); only an unresolved, unexpired WAIT re-stamps.
         if (vctx.Pending != null && !TryResolveVirtualWait(plan, vctx, members, quests))
         {
+            CircuitTrace.Hit(vctx.Guid, "group: virtual WAIT unresolved");
             if (vctx.Pending is { Expired: true })
             {
+                CircuitTrace.Hit(vctx.Guid, "group: virtual WAIT deadline expired -> shelve");
                 vctx.Failure ??= new WaitFailure { CommandType = vctx.Pending.CommandType, Reason = "deadline", Utc = DateTime.UtcNow };
                 vctx.Pending = null;
                 EmitForce(anchorGuid, prevPhase, prevPhase,
@@ -732,6 +802,7 @@ public static class GroupCoordinator
             }
             else
             {
+                CircuitTrace.Hit(vctx.Guid, "group: virtual WAIT outstanding, re-stamp order");
                 return BuildGroupOrderFromVirtual(plan, vctx, anchor, anchorGuid, members, safety, prevPhase);
             }
         }
@@ -741,10 +812,12 @@ public static class GroupCoordinator
         switch (step)
         {
             case StepResult.Issue issue:
+                CircuitTrace.HitNote(vctx.Guid, "group: virtual issues command, WAIT armed", issue.Command.Type);
                 ArmVirtualPending(plan, vctx, issue.Command, issue.ExpectedEvent, issue.Deadline);
                 break;
             case StepResult.Blocked:
             case StepResult.Done:
+                CircuitTrace.Hit(vctx.Guid, "group: no shared quest -> grind together");
                 // No workable SHARED quest this tick -> the group stays TOGETHER (Nico, 2026-07-03: a
                 // group NEVER splits to solo-grind) and, per Axiom 1 (2026-07-04), it GRINDS — nearby
                 // level-appropriate mobs at the clump point, never a latched single mob and never an
@@ -770,6 +843,7 @@ public static class GroupCoordinator
     {
         if (plan.Virtual == null)
         {
+            CircuitTrace.Hit(-1, "group: virtual member created");   // -1 IS the virtual bot's guid
             var vctx = new BotContext { Guid = -1, Name = "<virtual>" };
             vctx.Identity = new BotIdentity { Guid = -1, Name = "<virtual>" };
             plan.Virtual = vctx;
@@ -797,6 +871,7 @@ public static class GroupCoordinator
             {
                 if (!merged.TryGetValue(kv.Key, out var e))
                 {
+                    CircuitTrace.Hit(m.Guid, "group: quest first seen in union log");
                     merged[kv.Key] = new QuestLogEntry
                     {
                         Status = kv.Value.Status,
@@ -806,6 +881,7 @@ public static class GroupCoordinator
                 }
                 else
                 {
+                    CircuitTrace.Hit(m.Guid, "group: union takes min slot counts");
                     // UNION OF NEEDS (2026-07-03): per-slot progress is the MINIMUM across holders --
                     // the group's objective is only as done as its LEAST-progressed owing member. MAX
                     // (the old read) let the FASTEST looter's count stand in for the whole group, so Derive
@@ -830,6 +906,7 @@ public static class GroupCoordinator
             foreach (var m in members)
                 if (m.QuestLog.TryGetValue(kv.Key, out var he) && he.Status != QuestStatusComplete)
                 {
+                    CircuitTrace.Hit(m.Guid, "group: holder incomplete, union status stays incomplete");
                     allComplete = false;
                     break;
                 }
@@ -868,14 +945,21 @@ public static class GroupCoordinator
         foreach (var m in members)
         {
             var id = m.Identity;
-            if (id == null) continue;
+            if (id == null) { CircuitTrace.Hit(m.Guid, "group: member identity missing, skip union"); continue; }
             foreach (var qid in id.CompletedQuestIds) vid.CompletedQuestIds.Add(qid);
             foreach (var qid in id.AbandonedGreyQuestIds) vid.AbandonedGreyQuestIds.Add(qid);
             foreach (var kv in id.DeferredQuestIds)
-                if (!vid.DeferredQuestIds.ContainsKey(kv.Key)) vid.DeferredQuestIds[kv.Key] = kv.Value;
+                if (!vid.DeferredQuestIds.ContainsKey(kv.Key))
+                {
+                    CircuitTrace.Hit(m.Guid, "group: member defer unioned group-wide", kv.Key);
+                    vid.DeferredQuestIds[kv.Key] = kv.Value;
+                }
             foreach (var kv in id.PathBlacklist)
                 if (!vid.PathBlacklist.TryGetValue(kv.Key, out var d) || kv.Value > d)
+                {
+                    CircuitTrace.Hit(m.Guid, "group: member path blacklist unioned");
                     vid.PathBlacklist[kv.Key] = kv.Value;
+                }
         }
         vid.PruneExpiredDeferrals();
         vid.PrunePathBlacklist();
@@ -906,38 +990,41 @@ public static class GroupCoordinator
         foreach (var qid in vid.AbandonedGreyQuestIds)
         {
             if (!QuestPlanner.IsQuestGreyForLevel(quests, qid, vctx.Level))
+            {
+                CircuitTrace.Hit(vctx.Guid, "group: grey only above weakest, not pushed", qid);
                 continue;   // a higher member's pre-group solo grey, still green for the weakest -> don't propagate
+            }
             foreach (var m in members)
                 m.Identity?.AbandonedGreyQuestIds.Add(qid);
         }
 
-        if (!quests.IsLoaded) return;
+        if (!quests.IsLoaded) { CircuitTrace.Hit(vctx.Guid, "group: graph unloaded, no injection"); return; }
         var q = vctx.Quest;
-        if (q == null) return;   // BuildBatch hasn't run yet this cycle (first-ever tick) -- nothing to inject into
+        if (q == null) { CircuitTrace.Hit(vctx.Guid, "group: no batch yet, nothing to inject into"); return; }   // BuildBatch hasn't run yet this cycle (first-ever tick)
         var have = q.Batch.Select(b => b.QuestId).ToHashSet();
         int injected = 0;
 
         foreach (var m in members)
         {
-            if (q.Batch.Count >= GroupInjectCap || injected >= GroupInjectCap) break;
+            if (q.Batch.Count >= GroupInjectCap || injected >= GroupInjectCap) { CircuitTrace.Hit(vctx.Guid, "group: inject cap reached", injected); break; }
             var id = m.Identity;
-            if (id == null) continue;
+            if (id == null) { CircuitTrace.Hit(m.Guid, "group: member identity missing, skip inject"); continue; }
             int raceBit = QuestGraphLoader.RaceToBitmask(id.Race);
             int classBit = QuestGraphLoader.ClassToBitmask(id.ClassId);
             var active = new HashSet<int>(m.QuestLog.Keys);
             foreach (var node in quests.GetAvailableQuests(raceBit, classBit, id.Level, id.CompletedQuestIds, active))
             {
-                if (q.Batch.Count >= GroupInjectCap || injected >= GroupInjectCap) break;
-                if (have.Contains(node.QuestId)) continue;
-                if (!QuestPlanner.IsPickable(node, id)) continue;               // THIS member's own eligibility (grey/red/blacklist/etc for them)
-                if (vid.DeferredQuestIds.ContainsKey(node.QuestId)) continue;    // group-level defer (any member) still applies
-                if (vid.AbandonedGreyQuestIds.Contains(node.QuestId)) continue;
-                if (node.Giver == null || node.Giver.Map != vctx.MapId) continue;
+                if (q.Batch.Count >= GroupInjectCap || injected >= GroupInjectCap) { CircuitTrace.Hit(vctx.Guid, "group: inject cap reached mid-scan", injected); break; }
+                if (have.Contains(node.QuestId)) { CircuitTrace.Hit(m.Guid, "group: quest already in batch"); continue; }
+                if (!QuestPlanner.IsPickable(node, id)) { CircuitTrace.Hit(m.Guid, "group: not pickable for this member"); continue; }               // THIS member's own eligibility (grey/red/blacklist/etc for them)
+                if (vid.DeferredQuestIds.ContainsKey(node.QuestId)) { CircuitTrace.Hit(m.Guid, "group: group-deferred, skip inject"); continue; }    // group-level defer (any member) still applies
+                if (vid.AbandonedGreyQuestIds.Contains(node.QuestId)) { CircuitTrace.Hit(m.Guid, "group: group-grey, skip inject"); continue; }
+                if (node.Giver == null || node.Giver.Map != vctx.MapId) { CircuitTrace.Hit(m.Guid, "group: giver missing or off-map, skip inject"); continue; }
                 // Fix 4 rung 4: a group stuck in identical exhaust cycles widens its reach so
                 // acquisition can seed the NEXT hub (Goldshire -> Westbrook / the Westfall border
                 // givers) instead of re-locking on a drained one forever.
                 float injectRadius = plan.ExhaustCycles >= 4 ? GroupInjectRadiusWideYards : GroupInjectRadiusYards;
-                if (Dist2(vctx.Pos.X, vctx.Pos.Y, node.Giver.X, node.Giver.Y) > injectRadius) continue;
+                if (Dist2(vctx.Pos.X, vctx.Pos.Y, node.Giver.X, node.Giver.Y) > injectRadius) { CircuitTrace.Hit(m.Guid, "group: giver beyond inject radius"); continue; }
 
                 q.Batch.Add(new BatchQuest { QuestId = node.QuestId, Node = node, Accepted = false });
                 have.Add(node.QuestId);
@@ -952,14 +1039,15 @@ public static class GroupCoordinator
     private static bool TryResolveVirtualWait(GroupPlan plan, BotContext vctx, List<BotContext> members, QuestGraphLoader quests)
     {
         var p = vctx.Pending;
-        if (p == null) return true;
+        if (p == null) { CircuitTrace.Hit(vctx.Guid, "group: no pending WAIT, trivially resolved"); return true; }
         var active = vctx.Quest?.Active;
 
         if (p.CommandType == "MOVE_TO" && p.IsObjectiveGrind)
         {
-            if (active == null || plan.LastVirtualCommand == null) { vctx.Pending = null; return true; }
+            CircuitTrace.Hit(vctx.Guid, "group: resolving objective-grind WAIT");
+            if (active == null || plan.LastVirtualCommand == null) { CircuitTrace.Hit(vctx.Guid, "group: WAIT resolves, no active quest or command"); vctx.Pending = null; return true; }
             if (!TryExtractCoords(plan.LastVirtualCommand, out _, out _, out _, out _, out int creatureEntry, out _, out _, out _))
-            { vctx.Pending = null; return true; }
+            { CircuitTrace.Hit(vctx.Guid, "group: WAIT resolves, coords unreadable"); vctx.Pending = null; return true; }
 
             // Which objective/item slot(s) does this creature_entry actually satisfy? (ActiveSlot is
             // NOT usable here -- DispatchObjectiveLeg hardcodes it to 0 for the normal dispatch path;
@@ -971,7 +1059,7 @@ public static class GroupCoordinator
                                     it.BestDropSource?.CreatureEntry == creatureEntry ||
                                     (it.AltDropEntries?.Contains(creatureEntry) ?? false))
                                                    .Select(it => it.Slot).ToList();
-            if (killSlots.Count == 0 && itemSlots.Count == 0) { vctx.Pending = null; return true; }   // can't identify the leg -- don't wedge
+            if (killSlots.Count == 0 && itemSlots.Count == 0) { CircuitTrace.Hit(vctx.Guid, "group: WAIT resolves, leg unidentifiable"); vctx.Pending = null; return true; }   // can't identify the leg -- don't wedge
 
             bool reachableStillOwes = false;
             bool quarantinedStillOwes = false;
@@ -984,41 +1072,45 @@ public static class GroupCoordinator
                 // member still owes the work; it is a proven route FAILURE, not successful completion. Let
                 // reachable holders finish, then surface no_path into the virtual planner so Recover shelves
                 // this objective for the whole group instead of false-advancing to obj_sync.
-                if (m.Dead) continue;
-                if (!m.QuestLog.TryGetValue(active.QuestId, out var e)) continue;   // not a holder
-                if (e.Status == QuestStatusComplete) continue;
+                if (m.Dead) { CircuitTrace.Hit(m.Guid, "group: dead member skipped in owes check"); continue; }
+                if (!m.QuestLog.TryGetValue(active.QuestId, out var e)) { CircuitTrace.Hit(m.Guid, "group: not a holder of this quest"); continue; }   // not a holder
+                if (e.Status == QuestStatusComplete) { CircuitTrace.Hit(m.Guid, "group: holder already complete"); continue; }
                 bool owes = false;
                 foreach (var slot in killSlots)
                 {
-                    if (slot < 1 || slot > e.MobCounts.Length) continue;
+                    if (slot < 1 || slot > e.MobCounts.Length) { CircuitTrace.Hit(m.Guid, "group: kill slot out of range", slot); continue; }
                     var obj = active.Node.Objectives.First(o => o.Slot == slot);
-                    if (obj.Count > e.MobCounts[slot - 1]) { owes = true; break; }
+                    if (obj.Count > e.MobCounts[slot - 1]) { CircuitTrace.Hit(m.Guid, "group: member still owes kills", e.MobCounts[slot - 1]); owes = true; break; }
                 }
                 if (!owes)
                 {
+                    CircuitTrace.Hit(m.Guid, "group: kills clear, checking item slots");
                     foreach (var slot in itemSlots)
                     {
-                        if (slot < 1 || slot > e.ItemCounts.Length) continue;
+                        if (slot < 1 || slot > e.ItemCounts.Length) { CircuitTrace.Hit(m.Guid, "group: item slot out of range", slot); continue; }
                         var it = active.Node.ItemObjectives.First(x => x.Slot == slot);
-                        if (it.Count > e.ItemCounts[slot - 1]) { owes = true; break; }
+                        if (it.Count > e.ItemCounts[slot - 1]) { CircuitTrace.Hit(m.Guid, "group: member still owes items", e.ItemCounts[slot - 1]); owes = true; break; }
                     }
                 }
 
-                if (!owes) continue;
+                if (!owes) { CircuitTrace.Hit(m.Guid, "group: member owes nothing on this leg"); continue; }
                 if (m.NoPathQuarantinedOrder is { } quarantined && quarantined == m.GroupOrder)
                 {
+                    CircuitTrace.Hit(m.Guid, "group: owing member quarantined no-path");
                     quarantinedStillOwes = true;
                     quarantinedDest ??= m.NoPathQuarantinedDest;
                 }
                 else
                 {
+                    CircuitTrace.Hit(m.Guid, "group: reachable member still owes, WAIT gates");
                     reachableStillOwes = true;
                 }
             }
 
-            if (reachableStillOwes) return false;
+            if (reachableStillOwes) { CircuitTrace.Hit(vctx.Guid, "group: WAIT unresolved, reachable member owes"); return false; }
             if (quarantinedStillOwes)
             {
+                CircuitTrace.Hit(vctx.Guid, "group: only quarantined owe, surface no_path");
                 vctx.Pending = null;
                 vctx.Failure = new WaitFailure
                 {
@@ -1038,10 +1130,11 @@ public static class GroupCoordinator
 
         if (p.CommandType == "MOVE_TO")
         {
+            CircuitTrace.Hit(vctx.Guid, "group: resolving travel WAIT");
             // Plain travel (to_giver / to_turnin): resolved once the WHOLE present group has arrived.
             var npc = vctx.Step == "to_giver" ? active?.Node.Giver : (active?.Node.TurnIn ?? active?.Node.Giver);
-            if (npc == null) { vctx.Pending = null; return true; }
-            if (!AllWithinReach(members, npc, ArrivalReachYards)) return false;
+            if (npc == null) { CircuitTrace.Hit(vctx.Guid, "group: travel WAIT resolves, no NPC target"); vctx.Pending = null; return true; }
+            if (!AllWithinReach(members, npc, ArrivalReachYards)) { CircuitTrace.Hit(vctx.Guid, "group: travel WAIT gates, not all arrived"); return false; }
             vctx.Pending = null;
             vctx.MarkProgress();
             plan.ExhaustCycles = 0; plan.LastExhaustSet = "";   // Fix 4: real progress resets the ladder
@@ -1050,16 +1143,18 @@ public static class GroupCoordinator
 
         if (p.CommandType == "QUEST_INTERACT")
         {
+            CircuitTrace.Hit(vctx.Guid, "group: resolving quest-interact WAIT");
             int? qid = p.QuestId;
-            if (qid == null) { vctx.Pending = null; return true; }
+            if (qid == null) { CircuitTrace.Hit(vctx.Guid, "group: interact WAIT resolves, no quest id"); vctx.Pending = null; return true; }
             bool accept = p.ExpectedEvent == "QUEST_ACCEPT_ACK";
             bool anyoneStillOwes = members.Any(m =>
             {
                 var id = m.Identity;
-                if (id == null) return false;
+                if (id == null) { CircuitTrace.Hit(m.Guid, "group: no identity, never owes interact"); return false; }
                 if (accept)
                 {
-                    if (m.QuestLog.ContainsKey(qid.Value)) return false;
+                    CircuitTrace.Hit(m.Guid, "group: accept-side owes check");
+                    if (m.QuestLog.ContainsKey(qid.Value)) { CircuitTrace.Hit(m.Guid, "group: member already holds quest"); return false; }
                     int raceBit = QuestGraphLoader.RaceToBitmask(id.Race);
                     int classBit = QuestGraphLoader.ClassToBitmask(id.ClassId);
                     var activeIds = new HashSet<int>(m.QuestLog.Keys);
@@ -1072,7 +1167,7 @@ public static class GroupCoordinator
                 }
                 return m.QuestLog.TryGetValue(qid.Value, out var e) && e.Status == QuestStatusComplete;
             });
-            if (anyoneStillOwes) return false;
+            if (anyoneStillOwes) { CircuitTrace.Hit(vctx.Guid, "group: interact WAIT gates, someone still owes"); return false; }
             vctx.Pending = null;
             vctx.MarkProgress();
             plan.ExhaustCycles = 0; plan.LastExhaustSet = "";   // Fix 4: real progress resets the ladder
@@ -1092,7 +1187,10 @@ public static class GroupCoordinator
         bool objectiveGrind = cmd.Type == "MOVE_TO" && cmd.Payload.ContainsKey("creature_entry");
         int? questId = null;
         if (cmd.Type == "QUEST_INTERACT" && cmd.Payload.TryGetValue("quest_id", out var qo) && qo is IConvertible)
+        {
+            CircuitTrace.Hit(vctx.Guid, "group: pending interact carries quest id");
             questId = Convert.ToInt32(qo);
+        }
 
         vctx.Pending = new Outstanding
         {
@@ -1123,9 +1221,11 @@ public static class GroupCoordinator
         {
             case "to_giver" when active?.Node.Giver != null:
                 {
+                    CircuitTrace.Hit(vctx.Guid, "group: virtual step to-giver");
                     var npc = active.Node.Giver;
                     if (!PathSafeForWeakest(members, anchor, npc, safety))
                     {
+                        CircuitTrace.Hit(anchorGuid, "group: giver path unsafe for weakest -> defer + grind");
                         RouteVirtualUnsafe(vctx, npc, anchor, safety);
                         Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"virtual: giver={npc.NpcEntry} unsafe -> path_unsafe defer; grind together", members);
                         return GroupGrindAt(plan, anchor, anchorGuid);
@@ -1136,6 +1236,7 @@ public static class GroupCoordinator
                     // own per-member AtNpc/MoveTo already covers the last few individual yards regardless).
                     if (AllWithinReach(members, npc, ArrivalReachYards))
                     {
+                        CircuitTrace.Hit(anchorGuid, "group: all at giver -> accept phase");
                         Emit(anchorGuid, prevPhase, GroupPhase.Accept, $"virtual: giver={npc.NpcEntry} q=[{active.QuestId}] allInReach=T", members);
                         return ToNpc(plan, GroupPhase.Accept, anchorGuid, npc);
                     }
@@ -1145,15 +1246,18 @@ public static class GroupCoordinator
 
             case "to_turnin" when active != null && (active.Node.TurnIn ?? active.Node.Giver) != null:
                 {
+                    CircuitTrace.Hit(vctx.Guid, "group: virtual step to-turnin");
                     var npc = active.Node.TurnIn ?? active.Node.Giver!;
                     if (!PathSafeForWeakest(members, anchor, npc, safety))
                     {
+                        CircuitTrace.Hit(anchorGuid, "group: turn-in path unsafe for weakest -> defer + grind");
                         RouteVirtualUnsafe(vctx, npc, anchor, safety);
                         Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"virtual: ender={npc.NpcEntry} unsafe -> path_unsafe defer; grind together", members);
                         return GroupGrindAt(plan, anchor, anchorGuid);
                     }
                     if (AllWithinReach(members, npc, ArrivalReachYards))
                     {
+                        CircuitTrace.Hit(anchorGuid, "group: all at ender -> turn-in phase");
                         Emit(anchorGuid, prevPhase, GroupPhase.TurnIn, $"virtual: ender={npc.NpcEntry} q=[{active.QuestId}] allInReach=T", members);
                         return ToNpc(plan, GroupPhase.TurnIn, anchorGuid, npc);
                     }
@@ -1164,9 +1268,11 @@ public static class GroupCoordinator
             case "to_objective" when active != null && plan.LastVirtualCommand != null
                                       && TryExtractCoords(plan.LastVirtualCommand, out float x, out float y, out float z, out int map, out int creatureEntry, out int alt1, out int alt2, out int alt3):
                 {
+                    CircuitTrace.Hit(vctx.Guid, "group: virtual step to-objective");
                     var dest = new QuestNpcLocation { NpcEntry = 0, X = x, Y = y, Z = z, Map = map };
                     if (!PathSafeForWeakest(members, anchor, dest, safety))
                     {
+                        CircuitTrace.Hit(anchorGuid, "group: objective path unsafe for weakest -> defer + grind");
                         RouteVirtualUnsafe(vctx, dest, anchor, safety);
                         Emit(anchorGuid, prevPhase, GroupPhase.GroupGrind, $"virtual: objective cre={creatureEntry} unsafe -> path_unsafe defer; grind together", members);
                         return GroupGrindAt(plan, anchor, anchorGuid);
@@ -1188,6 +1294,7 @@ public static class GroupCoordinator
             // is what a "totally stalled immediately" fresh group was hitting on the very first accept.
             case "accept" when active?.Node.Giver != null:
                 {
+                    CircuitTrace.Hit(vctx.Guid, "group: virtual step accept at giver");
                     var npc = active.Node.Giver;
                     Emit(anchorGuid, prevPhase, GroupPhase.Accept, $"virtual: accept giver={npc.NpcEntry} q=[{active.QuestId}]", members);
                     return ToNpc(plan, GroupPhase.Accept, anchorGuid, npc);
@@ -1195,12 +1302,14 @@ public static class GroupCoordinator
 
             case "turnin" when active != null && (active.Node.TurnIn ?? active.Node.Giver) != null:
                 {
+                    CircuitTrace.Hit(vctx.Guid, "group: virtual step turnin at ender");
                     var npc = active.Node.TurnIn ?? active.Node.Giver!;
                     Emit(anchorGuid, prevPhase, GroupPhase.TurnIn, $"virtual: turnin ender={npc.NpcEntry} q=[{active.QuestId}]", members);
                     return ToNpc(plan, GroupPhase.TurnIn, anchorGuid, npc);
                 }
 
             default:
+                CircuitTrace.HitNote(vctx.Guid, "group: virtual step unhandled -> hold", vctx.Step);
                 // Genuine between-leg transients (obj_sync / detour / grind_obj / plan -- PlanNext
                 // returned Continue and will re-derive once external state catches up, e.g. obj_sync
                 // waiting for the next STATE heartbeat), OR an ABANDON_QUEST grey-drop tick. The grey-drop
@@ -1251,13 +1360,13 @@ public static class GroupCoordinator
     {
         x = y = z = 0; map = 0; creatureEntry = 0; alt1 = 0; alt2 = 0; alt3 = 0;
         if (!cmd.Payload.TryGetValue("x", out var xo) || !cmd.Payload.TryGetValue("y", out var yo) || !cmd.Payload.TryGetValue("z", out var zo))
-            return false;
+            return false;   // cb:fold pure helper, outcome probed at caller
         x = ToFloat(xo); y = ToFloat(yo); z = ToFloat(zo);
-        if (cmd.Payload.TryGetValue("mapId", out var mo)) map = ToInt(mo);
-        if (cmd.Payload.TryGetValue("creature_entry", out var ceo)) creatureEntry = ToInt(ceo);
-        if (cmd.Payload.TryGetValue("alt_entry1", out var a1o)) alt1 = ToInt(a1o);
-        if (cmd.Payload.TryGetValue("alt_entry2", out var a2o)) alt2 = ToInt(a2o);
-        if (cmd.Payload.TryGetValue("alt_entry3", out var a3o)) alt3 = ToInt(a3o);
+        if (cmd.Payload.TryGetValue("mapId", out var mo)) map = ToInt(mo);   // cb:fold pure helper, parse detail
+        if (cmd.Payload.TryGetValue("creature_entry", out var ceo)) creatureEntry = ToInt(ceo);   // cb:fold pure helper, parse detail
+        if (cmd.Payload.TryGetValue("alt_entry1", out var a1o)) alt1 = ToInt(a1o);   // cb:fold pure helper, parse detail
+        if (cmd.Payload.TryGetValue("alt_entry2", out var a2o)) alt2 = ToInt(a2o);   // cb:fold pure helper, parse detail
+        if (cmd.Payload.TryGetValue("alt_entry3", out var a3o)) alt3 = ToInt(a3o);   // cb:fold pure helper, parse detail
         return true;
     }
 
@@ -1293,7 +1402,10 @@ public static class GroupCoordinator
     private static Vec4 EnsureGrindPoint(GroupPlan plan, BotContext anchor)
     {
         if (plan.Phase == GroupPhase.GroupGrind && plan.HasGrindPoint)
+        {
+            CircuitTrace.Hit(anchor.Guid, "group: grind point memo reused");
             return plan.GrindPoint;
+        }
         var p = new Vec4(
             MathF.Round(anchor.Pos.X / 5f) * 5f,
             MathF.Round(anchor.Pos.Y / 5f) * 5f,
@@ -1318,6 +1430,7 @@ public static class GroupCoordinator
         {
             if (!plan.LastDeadGuids.Contains(g))
             {
+                CircuitTrace.Hit(g, "group: new death recorded in window");
                 plan.RecentDeaths.Enqueue(now);
                 plan.LastDeathUtc = now;
             }
@@ -1331,11 +1444,11 @@ public static class GroupCoordinator
         // camp that killed it; it waits (capped) for the defend protocol's converge to arrive.
         foreach (var dm in members)
         {
-            if (!dm.Dead) continue;
+            if (!dm.Dead) { CircuitTrace.Hit(dm.Guid, "group: rez-guard scan skips living member"); continue; }
             bool guarded = members.Any(o => o.Guid != dm.Guid && !o.Dead
                 && o.MapId == dm.MapId
                 && Dist2(o.Pos.X, o.Pos.Y, dm.Pos.X, dm.Pos.Y) <= GroupGuardYards);
-            if (guarded) dm.GroupGuardNearUtc = now;
+            if (guarded) { CircuitTrace.Hit(dm.Guid, "group: corpse guarded by teammate"); dm.GroupGuardNearUtc = now; }
         }
 
         while (plan.RecentDeaths.Count > 0
@@ -1346,6 +1459,7 @@ public static class GroupCoordinator
         // (LastDeathUtc default = MinValue, so a fresh group's spawn point qualifies immediately.)
         if (deadNow.Count == 0 && (now - plan.LastDeathUtc).TotalSeconds > SafePointCalmSec)
         {
+            CircuitTrace.Hit(anchor.Guid, "group: calm window, safe point captured");
             plan.LastSafePoint = new Vec4(
                 MathF.Round(anchor.Pos.X / 5f) * 5f,
                 MathF.Round(anchor.Pos.Y / 5f) * 5f,
@@ -1356,6 +1470,7 @@ public static class GroupCoordinator
         bool retreatActive = plan.RetreatUntil is DateTime r && now < r;
         if (plan.RecentDeaths.Count >= MeatGrinderDeaths && !plan.RetreatPending && !retreatActive)
         {
+            CircuitTrace.Hit(anchor.Guid, "group: meat-grinder breaker armed", plan.RecentDeaths.Count);
             plan.RetreatPending = true;
             plan.PendingGrinderDefer = true;
             EmitForce(anchorGuid, prevPhase, prevPhase,
@@ -1374,7 +1489,7 @@ public static class GroupCoordinator
     private static int ForceExpireDeferrals(BotContext vctx, List<BotContext> members, bool includeLevel)
     {
         var vid = vctx.Identity;
-        if (vid == null) return 0;
+        if (vid == null) { CircuitTrace.Hit(vctx.Guid, "group: no virtual identity, nothing to expire"); return 0; }
 
         var toClear = vid.DeferredQuestIds
             .Where(kv => kv.Value.ExpiresAt.HasValue || (includeLevel && kv.Value.RequiredLevel.HasValue))
@@ -1389,7 +1504,7 @@ public static class GroupCoordinator
             foreach (var m in members)
             {
                 var id = m.Identity;
-                if (id == null) continue;
+                if (id == null) { CircuitTrace.Hit(m.Guid, "group: member identity missing, skip expire"); continue; }
                 id.DeferredQuestIds.Remove(qid);
                 id.QuestFailStreak.Remove(qid);
                 id.QuestDeferralCounts.Remove(qid);
@@ -1437,9 +1552,9 @@ public static class GroupCoordinator
     {
         foreach (var m in members)
         {
-            if (IsStuck(m)) continue;
-            if (m.MapId != npc.Map) return false;
-            if (Dist2(m.Pos.X, m.Pos.Y, npc.X, npc.Y) > reach) return false;
+            if (IsStuck(m)) { CircuitTrace.Hit(m.Guid, "group: stuck member ignored by arrival gate"); continue; }
+            if (m.MapId != npc.Map) { CircuitTrace.Hit(m.Guid, "group: member off-map, group not arrived"); return false; }
+            if (Dist2(m.Pos.X, m.Pos.Y, npc.X, npc.Y) > reach) { CircuitTrace.Hit(m.Guid, "group: member out of reach, group not arrived"); return false; }
         }
         return true;
     }
@@ -1456,17 +1571,17 @@ public static class GroupCoordinator
     // (RouteVirtualUnsafe reads GetMaxCreatureLevelOnPath), unchanged.
     private static bool PathSafeForWeakest(List<BotContext> members, BotContext anchor, QuestNpcLocation target, ZoneSafetyMap safety)
     {
-        if (target.Map != anchor.MapId) return false;   // cross-map travel is per-bot, later
-        if (!safety.IsLoaded) return true;
+        if (target.Map != anchor.MapId) { CircuitTrace.Hit(anchor.Guid, "group: cross-map target, not group-travelable"); return false; }   // cross-map travel is per-bot, later
+        if (!safety.IsLoaded) { CircuitTrace.Hit(anchor.Guid, "group: safety grid unloaded, degrade open"); return true; }
         int weakest = members.Min(m => m.Level);
         int threshold = weakest + TravelSafetyMargin;
         // A group is single-faction — the anchor's team is the group's team (FINDING_002).
         var threat = safety.GetPathThreat(anchor.MapId, anchor.Pos.X, anchor.Pos.Y, target.X, target.Y, threshold,
                                           ZoneSafetyMap.TeamFromFaction(anchor.Identity?.Faction));
-        if (threat.OverCount == 0) return true;
-        if (threat.MaxCellOver >= PathClusterCellVeto) return false;
-        if (threat.OverCount >= PathClusterTotalVeto) return false;
-        if (threat.MaxCellDeep >= PathDeepPairVeto) return false;
+        if (threat.OverCount == 0) { CircuitTrace.Hit(anchor.Guid, "group: corridor clean for weakest", threshold); return true; }
+        if (threat.MaxCellOver >= PathClusterCellVeto) { CircuitTrace.Hit(anchor.Guid, "group: camp cluster on line, veto", threat.MaxCellOver); return false; }
+        if (threat.OverCount >= PathClusterTotalVeto) { CircuitTrace.Hit(anchor.Guid, "group: corridor blanketed over-band, veto", threat.OverCount); return false; }
+        if (threat.MaxCellDeep >= PathDeepPairVeto) { CircuitTrace.Hit(anchor.Guid, "group: deep-red pocket on line, veto", threat.MaxCellDeep); return false; }
         return true;
     }
 
@@ -1483,14 +1598,17 @@ public static class GroupCoordinator
         var anchor = members[0];
         foreach (var ctx in members)
             if (ctx.Level > anchor.Level || (ctx.Level == anchor.Level && ctx.Guid < anchor.Guid))
+            {
+                CircuitTrace.Hit(ctx.Guid, "group: anchor candidate wins election");
                 anchor = ctx;
+            }
         return anchor.Guid;
     }
 
     private static BotContext AnchorOf(List<BotContext> members, int anchorGuid)
     {
         foreach (var m in members)
-            if (m.Guid == anchorGuid) return m;
+            if (m.Guid == anchorGuid) return m;   // cb:fold pure lookup, anchor identity probed at election
         return members[0];
     }
 

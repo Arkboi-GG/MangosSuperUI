@@ -1,4 +1,5 @@
 using System.Text.Json;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Core;
 
@@ -72,36 +73,44 @@ public class BotQuirk
             {
                 // Economy domain
                 case "Economy.AHVisitWeight":
+                    CircuitTrace.Hit(bot.Guid, "quirk: economy AH-visit weight mod");
                     ModWeight(weights, ActivityType.AuctionHouse, kv.Value.GetSingle());
                     break;
                 case "Economy.VendorUrgency":
+                    CircuitTrace.Hit(bot.Guid, "quirk: economy vendor-urgency weight mod");
                     ModWeight(weights, ActivityType.Vendoring, kv.Value.GetSingle());
                     break;
 
                 // Social domain
                 case "Social.TownLoiterWeight":
+                    CircuitTrace.Hit(bot.Guid, "quirk: social town-loiter weight mod");
                     ModWeight(weights, ActivityType.Socializing, kv.Value.GetSingle());
                     ModWeight(weights, ActivityType.Loitering, kv.Value.GetSingle());
                     break;
 
                 // Questing domain
                 case "Questing.QuestWeight":
+                    CircuitTrace.Hit(bot.Guid, "quirk: questing quest weight mod");
                     ModWeight(weights, ActivityType.Questing, kv.Value.GetSingle());
                     break;
                 case "Questing.GrindPreference":
+                    CircuitTrace.Hit(bot.Guid, "quirk: questing grind-preference weight mod");
                     ModWeight(weights, ActivityType.Grinding, kv.Value.GetSingle());
                     break;
 
                 // Exploration
                 case "Exploration.RandomWanderChance":
+                    CircuitTrace.Hit(bot.Guid, "quirk: exploration wander chance (domain-read, no-op here)");
                     // Handled by ExplorationDomain directly — stored in quirk for domain to read
                     break;
 
                 // Trait overrides (set the trait value directly)
                 case "Efficiency":
+                    CircuitTrace.Hit(bot.Guid, "quirk: efficiency trait override");
                     bot.Personality.Efficiency = Math.Clamp(kv.Value.GetSingle(), 0f, 1f);
                     break;
                 case "Aggression":
+                    CircuitTrace.Hit(bot.Guid, "quirk: aggression trait override");
                     bot.Personality.Aggression = Math.Clamp(kv.Value.GetSingle(), 0f, 1f);
                     break;
             }
@@ -114,7 +123,7 @@ public class BotQuirk
     public float GetFloat(string key, float defaultValue = 0f)
     {
         if (Modifiers.TryGetValue(key, out var el) && el.ValueKind == JsonValueKind.Number)
-            return el.GetSingle();
+            return el.GetSingle();   // cb:fold pure accessor, no guid in reach
         return defaultValue;
     }
 
@@ -124,16 +133,16 @@ public class BotQuirk
     public bool GetBool(string key, bool defaultValue = false)
     {
         if (Modifiers.TryGetValue(key, out var el))
-        {
-            if (el.ValueKind == JsonValueKind.True) return true;
-            if (el.ValueKind == JsonValueKind.False) return false;
+        {   // cb:fold pure accessor, no guid in reach
+            if (el.ValueKind == JsonValueKind.True) return true;   // cb:fold pure accessor, no guid in reach
+            if (el.ValueKind == JsonValueKind.False) return false;   // cb:fold pure accessor, no guid in reach
         }
         return defaultValue;
     }
 
     private static void ModWeight(Dictionary<ActivityType, float> w, ActivityType t, float multiplier)
     {
-        if (w.ContainsKey(t)) w[t] *= multiplier;
+        if (w.ContainsKey(t)) w[t] *= multiplier;   // cb:fold trivial data-shape guard, outcome carried by the case probe
     }
 }
 
@@ -163,7 +172,7 @@ public static class PersonalityRoller
 
         // Quirks — roll 0 to 3
         if (availableQuirks != null && availableQuirks.Count > 0)
-        {
+        {   // cb:fold pre-identity personality roll, no guid in reach
             var (quirkCount, _) = WeightedRoller.Roll(new Dictionary<int, float>
             {
                 { 0, 0.30f },

@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using Dapper;
+using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Models;
 
 namespace MangosSuperUI.Services;
@@ -139,7 +140,10 @@ public sealed class BotCombatLoadoutService
         try
         {
             if (!_bridge.Connections.TryGetValue(guid, out BotConnection? session))
+            {
+                CircuitTrace.Hit(guid, "loadout: apply rejected, bot offline");
                 throw Error(409, "bot_offline", "The bot must be online to change its combat loadout.");
+            }
             await _rotations.WaitForHelloHydrationAsync(session, cancellationToken);
             PreparedCombatLoadout plan = await PrepareRequestAsync(
                 guid,
@@ -147,8 +151,11 @@ public sealed class BotCombatLoadoutService
                 requireReadyRuntime: true,
                 cancellationToken);
             if (!ReferenceEquals(plan.Connection, session))
+            {
+                CircuitTrace.Hit(guid, "loadout: apply rejected, session changed during prepare");
                 throw Error(409, "session_changed",
                     "The bot reconnected while its saved rotation was being restored. Refresh before applying this build.");
+            }
             ManagedBotRow bot = plan.Bot;
             BotTalentProfileOption profile = plan.Profile;
             BotState runtime = plan.Runtime!;
@@ -157,6 +164,7 @@ public sealed class BotCombatLoadoutService
             if (expectedSessionAt.HasValue
                 && Math.Abs((expectedSessionAt.Value - runtime.ConnectedAt).TotalMilliseconds) >= 10)
             {
+                CircuitTrace.Hit(guid, "loadout: apply rejected, queued session mismatch");
                 throw Error(409, "session_changed",
                     "The bot reconnected after this build was queued. Review its live state and queue the change again.");
             }
@@ -169,6 +177,7 @@ public sealed class BotCombatLoadoutService
                     actualRotationFingerprint,
                     StringComparison.OrdinalIgnoreCase))
             {
+                CircuitTrace.Hit(guid, "loadout: apply rejected, rotation fingerprint changed since queue");
                 throw Error(409, "rotation_changed",
                     "The selected custom rotation changed after it was queued. Review it and queue the build again.");
             }
@@ -177,8 +186,11 @@ public sealed class BotCombatLoadoutService
                 ? Guid.NewGuid().ToString("N")
                 : operationRequestId.Trim().ToLowerInvariant();
             if (!Guid.TryParseExact(requestId, "N", out _))
+            {
+                CircuitTrace.Hit(guid, "loadout: apply rejected, invalid request id format");
                 throw Error(400, "request_id_invalid",
                     "Combat-loadout operation request ids must be GUIDs in N format.");
+            }
             var command = new CombatLoadoutBridgeCommand
             {
                 RequestId = requestId,
@@ -207,45 +219,64 @@ public sealed class BotCombatLoadoutService
                 }
                 catch (CombatLoadoutOutcomeUnknownException ex)
                 {
+                    CircuitTrace.Hit(guid, "loadout: core outcome unknown after send");
                     throw Error(504, "outcome_unknown",
                         ex.Message + " Refresh live talents and rotation before making another change.");
                 }
                 catch (BotNotConnectedException ex)
                 {
+                    CircuitTrace.Hit(guid, "loadout: bot disconnected during apply");
                     throw Error(409, "bot_offline", ex.Message);
                 }
                 catch (CombatLoadoutAckTimeoutException ex)
                 {
+                    CircuitTrace.Hit(guid, "loadout: core ack timed out");
                     throw Error(504, "ack_timeout", ex.Message);
                 }
                 catch (IOException ex)
                 {
+                    CircuitTrace.Hit(guid, "loadout: bridge send failed, io error");
                     throw Error(409, "bridge_send_failed", $"The bot connection failed while sending the build: {ex.Message}");
                 }
                 catch (SocketException ex)
                 {
+                    CircuitTrace.Hit(guid, "loadout: bridge send failed, socket error");
                     throw Error(409, "bridge_send_failed", $"The bot connection failed while sending the build: {ex.Message}");
                 }
                 catch (ObjectDisposedException ex)
                 {
+                    CircuitTrace.Hit(guid, "loadout: bridge connection disposed mid-send");
                     throw Error(409, "bridge_send_failed", $"The bot connection closed while sending the build: {ex.Message}");
                 }
 
                 if (!ack.Success)
+                {
+                    CircuitTrace.Hit(guid, "loadout: core rejected the build");
                     throw CoreRejected(ack);
+                }
                 if (ack.SpecTab != request.SpecTab || ack.ActiveRole != request.ActiveRole)
+                {
+                    CircuitTrace.Hit(guid, "loadout: ack final build mismatch");
                     throw Error(409, "ack_state_mismatch",
                         $"The core acknowledged a different final build (spec {ack.SpecTab}, role {ack.ActiveRole}).");
+                }
 
                 try
                 {
                     if (mode == "custom")
+                    {
+                        CircuitTrace.Hit(guid, "loadout: committing custom rotation assignment");
                         _rotations.CommitAssignmentWithoutPush(bot.Name, prepared!.Name);
+                    }
                     else
+                    {
+                        CircuitTrace.Hit(guid, "loadout: clearing rotation assignment to spec default");
                         _rotations.ClearAssignmentWithoutPush(bot.Name);
+                    }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
+                    CircuitTrace.Hit(guid, "loadout: rotation assignment persistence failed post-apply");
                     _logger.LogCritical(ex,
                         "[COMBAT-LOADOUT] core applied request {RequestId} to {Bot}, but rotation assignment persistence failed",
                         requestId, bot.Name);
@@ -263,6 +294,7 @@ public sealed class BotCombatLoadoutService
 
             if (!convergence.Converged)
             {
+                CircuitTrace.Hit(guid, "loadout: read model still pending after apply");
                 _logger.LogWarning(convergence.LastError,
                     "[COMBAT-LOADOUT] core applied request {RequestId} to {Bot}, but the persisted read model did not converge within {TimeoutMs} ms; last observation: {Observation}",
                     requestId,
@@ -304,8 +336,11 @@ public sealed class BotCombatLoadoutService
         try
         {
             if (!_bridge.Connections.TryGetValue(guid, out BotConnection? session))
+            {
+                CircuitTrace.Hit(guid, "loadout: queue validation rejected, bot offline");
                 throw Error(409, "bot_offline",
                     "The bot must be online so the queued build can be bound to its current live combat session.");
+            }
             await _rotations.WaitForHelloHydrationAsync(session, cancellationToken);
             PreparedCombatLoadout plan = await PrepareRequestAsync(
                 guid,
@@ -313,11 +348,17 @@ public sealed class BotCombatLoadoutService
                 requireReadyRuntime: false,
                 cancellationToken);
             if (plan.Runtime == null || plan.Connection == null)
+            {
+                CircuitTrace.Hit(guid, "loadout: queue validation rejected, runtime missing");
                 throw Error(409, "bot_offline",
                     "The bot must be online so the queued build can be bound to its current live combat session.");
+            }
             if (!ReferenceEquals(plan.Connection, session))
+            {
+                CircuitTrace.Hit(guid, "loadout: queue validation rejected, session changed");
                 throw Error(409, "session_changed",
                     "The bot reconnected while its saved rotation was being restored. Refresh before queueing this build.");
+            }
 
             return new BotCombatLoadoutQueueValidation
             {
@@ -366,44 +407,78 @@ public sealed class BotCombatLoadoutService
                 $"Specialization slot {request.SpecTab} is not available for class {bot.ClassId}.");
 
         if (request.ActiveRole is < 1 or > 4)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, active role out of range");
             throw Error(400, "active_role_invalid", "Active role must be between 1 and 4.");
+        }
         if (!profile.AllowedRoles.Contains(request.ActiveRole))
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, role not allowed by profile");
             throw Error(422, "role_not_allowed",
                 $"Role {request.ActiveRole} ({BotTalentVisibilityService.RoleName(request.ActiveRole)}) is not allowed by {profile.Id}.");
+        }
 
         string mode = NormalizeRotationMode(request.RotationMode);
         bool specChanged = bot.SpecTab != request.SpecTab;
         if (specChanged && !request.ResetTalents)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, spec change needs talent reset");
             throw Error(409, "talent_reset_required",
                 $"Changing from specialization slot {bot.SpecTab} to {request.SpecTab} requires a talent rebuild.");
+        }
         if (request.ResetTalents && !request.ConfirmReset)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, reset not confirmed");
             throw Error(409, "reset_confirmation_required",
                 "Talent rebuild was requested but its destructive confirmation was not supplied.");
+        }
         if (!request.ExpectedRevision.HasValue)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, expected revision missing");
             throw Error(400, "expected_revision_required",
                 "The combat loadout revision shown by the page is required.");
+        }
 
         bool online = _bridge.Connections.TryGetValue(guid, out BotConnection? connection);
         BotState? runtime = connection?.State;
         if (requireReadyRuntime && (!online || runtime == null))
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, bot offline");
             throw Error(409, "bot_offline", "The bot must be online to change its combat loadout.");
+        }
         if (requireReadyRuntime && !runtime!.HasReceivedState)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, runtime hydrating");
             throw Error(409, "runtime_hydrating",
                 "The bot's first live state has not arrived yet. Refresh shortly before applying the build.");
+        }
         if (requireReadyRuntime && DateTime.UtcNow - runtime!.LastUpdate > MaximumRuntimeStateAge)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, runtime stale");
             throw Error(409, "runtime_stale",
                 "The bot's live state is stale. Refresh shortly before applying the build.");
+        }
         if (runtime != null && request.ExpectedRevision.Value != runtime.CombatConfigRevision)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, revision stale", runtime.CombatConfigRevision);
             throw Error(409, "stale_revision",
                 $"The bot's combat loadout changed from revision {request.ExpectedRevision.Value} to {runtime.CombatConfigRevision}. Refresh before applying.");
+        }
         if (requireReadyRuntime && runtime!.IsDead)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, bot dead");
             throw Error(409, "bot_dead", "The bot must be alive before its combat loadout can be changed.");
+        }
         if (requireReadyRuntime && runtime!.InCombat)
+        {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, bot in combat");
             throw Error(409, "bot_in_combat", "The bot must leave combat before its combat loadout can be changed.");
+        }
 
         RotationService.PreparedRotation? prepared = null;
         if (mode == "custom")
         {
+            CircuitTrace.Hit(guid, "loadout: preparing custom rotation");
             try
             {
                 prepared = _rotations.PrepareForBot(
@@ -414,11 +489,13 @@ public sealed class BotCombatLoadoutService
             }
             catch (RotationService.RotationValidationException ex)
             {
+                CircuitTrace.HitNote(guid, "loadout: custom rotation validation failed", ex.Code);
                 throw Error(422, ex.Code, ex.Message);
             }
         }
         else if (!string.IsNullOrWhiteSpace(request.RotationProfile))
         {
+            CircuitTrace.Hit(guid, "loadout: prepare rejected, rotation profile given with spec_default");
             throw Error(400, "rotation_profile_not_allowed",
                 "rotationProfile must be empty when rotationMode is spec_default.");
         }
@@ -432,16 +509,21 @@ public sealed class BotCombatLoadoutService
         {
             var profiles = _talents.GetProfileOptions(classId);
             if (profiles.Count != 3)
+            {
+                CircuitTrace.Hit(0, "loadout: talent catalog wrong profile count", profiles.Count);
                 throw Error(409, "talent_catalog_unavailable",
                     $"Class {classId} resolved {profiles.Count} talent profiles; expected 3.");
+            }
             return profiles;
         }
         catch (BotCombatLoadoutException)
         {
+            CircuitTrace.Hit(0, "loadout: talent catalog error passthrough");
             throw;
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "loadout: talent catalog unavailable");
             _logger.LogError(ex, "Combat loadout: talent catalog failed for class {ClassId}", classId);
             throw Error(409, "talent_catalog_unavailable",
                 "The validated build-5875 talent catalog is unavailable.");
@@ -472,7 +554,10 @@ public sealed class BotCombatLoadoutService
             cancellationToken.ThrowIfCancellationRequested();
             TimeSpan remaining = deadline - DateTime.UtcNow;
             if (remaining <= TimeSpan.Zero)
+            {
+                CircuitTrace.Hit(guid, "loadout: convergence budget exhausted before read");
                 break;
+            }
 
             try
             {
@@ -482,14 +567,19 @@ public sealed class BotCombatLoadoutService
                 lastError = null;
                 lastObservation = DescribeReadModel(last);
                 if (ReadModelMatches(last, request, expectedProfile, ack))
+                {
+                    CircuitTrace.Hit(guid, "loadout: read model converged with ack");
                     return new ReadModelConvergence(true, last, lastObservation, null);
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
+                CircuitTrace.Hit(guid, "loadout: convergence read cancelled by caller");
                 throw;
             }
             catch (OperationCanceledException ex)
             {
+                CircuitTrace.Hit(guid, "loadout: convergence budget expired mid-read");
                 // The private convergence budget expired. The core ACK is still a
                 // success; surface an explicit pending projection below.
                 lastError = ex;
@@ -497,6 +587,7 @@ public sealed class BotCombatLoadoutService
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(guid, "loadout: convergence read failed, retrying read only");
                 // A post-ACK read failure must not turn a committed destructive
                 // operation into an apparent apply failure. Retry only the read.
                 lastError = ex;
@@ -505,7 +596,10 @@ public sealed class BotCombatLoadoutService
 
             remaining = deadline - DateTime.UtcNow;
             if (remaining <= TimeSpan.Zero)
+            {
+                CircuitTrace.Hit(guid, "loadout: convergence budget exhausted after read");
                 break;
+            }
             await Task.Delay(
                 remaining < ReadModelPollInterval ? remaining : ReadModelPollInterval,
                 cancellationToken);
@@ -530,14 +624,14 @@ public sealed class BotCombatLoadoutService
             || !string.Equals(current.Talents.Profile?.Id, expectedProfile.Id, StringComparison.OrdinalIgnoreCase)
             || current.CombatConfigRevision != ack.Revision
             || current.Rotation.Revision != ack.Revision)
-        {
+        {   // cb:fold pure read-model predicate without guid, convergence outcome probed at caller
             return false;
         }
 
         string expectedSource = NormalizeRuntimeRotationSource(true, ack.RotationSource);
         if (!string.Equals(current.Rotation.Source, expectedSource, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(current.Rotation.Profile, ack.RotationProfile, StringComparison.OrdinalIgnoreCase))
-        {
+        {   // cb:fold pure read-model predicate without guid, convergence outcome probed at caller
             return false;
         }
 
@@ -550,7 +644,7 @@ public sealed class BotCombatLoadoutService
                 || current.Talents.Points?.Spent != ack.LearnedPoints
                 || !current.Compatibility.MatchesLevelPlan
                 || !current.Talents.Compatibility.MatchesLevelPlan))
-        {
+        {   // cb:fold pure read-model predicate without guid, convergence outcome probed at caller
             return false;
         }
 
@@ -568,7 +662,10 @@ public sealed class BotCombatLoadoutService
     private async Task<ManagedBotRow> LoadManagedBotAsync(int guid, CancellationToken cancellationToken)
     {
         if (guid <= 0)
+        {
+            CircuitTrace.Hit(0, "loadout: bot lookup rejected, invalid guid");
             throw Error(400, "guid_invalid", "A positive bot guid is required.");
+        }
 
         using var conn = _db.Characters();
         await conn.OpenAsync(cancellationToken);
@@ -589,23 +686,26 @@ public sealed class BotCombatLoadoutService
         string mode = (value ?? "").Trim().ToLowerInvariant();
         return mode switch
         {
-            "spec_default" => mode,
-            "custom" => mode,
-            _ => throw Error(400, "rotation_mode_invalid",
-                "rotationMode must be 'spec_default' or 'custom'.")
+            "spec_default" => CircuitTrace.Pass(mode, 0, "loadout: rotation mode spec_default"),
+            "custom" => CircuitTrace.Pass(mode, 0, "loadout: rotation mode custom"),
+            _ => throw CircuitTrace.Pass(Error(400, "rotation_mode_invalid",
+                "rotationMode must be 'spec_default' or 'custom'."), 0, "loadout: rotation mode invalid")
         };
     }
 
     private static string NormalizeRuntimeRotationSource(bool online, string? value)
     {
         if (!online)
+        {
+            CircuitTrace.Hit(0, "loadout: rotation source resolved offline");
             return "offline";
+        }
         string source = (value ?? "").Trim().ToLowerInvariant();
         return source switch
         {
-            "custom" => "custom",
-            "spec" or "builtin" or "builtin_spec" => "builtin_spec",
-            _ => "legacy"
+            "custom" => CircuitTrace.Pass("custom", 0, "loadout: rotation source custom"),
+            "spec" or "builtin" or "builtin_spec" => CircuitTrace.Pass("builtin_spec", 0, "loadout: rotation source builtin spec"),
+            _ => CircuitTrace.Pass("legacy", 0, "loadout: rotation source legacy")
         };
     }
 

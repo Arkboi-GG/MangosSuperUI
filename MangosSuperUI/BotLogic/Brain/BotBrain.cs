@@ -1,6 +1,7 @@
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Planners;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Brain;
 
@@ -121,12 +122,17 @@ public sealed class BotBrain
         //       politeness plus timer hygiene, not the only wall.
         if (ctx.Conscripted)
         {
+            CircuitTrace.Hit(ctx.Guid, "tick: conscripted - planner stands down");
             if (ctx.Goal != Goal.Idle)
+            {
+                CircuitTrace.Hit(ctx.Guid, "tick: conscripted park to idle");
                 await EnterGoalAsync(ctx, Goal.Idle);
+            }
             ctx.GoalReason = "conscripted";
             ctx.MarkProgress();
             if (ctx.Identity is { } enlisted)
             {
+                CircuitTrace.Hit(ctx.Guid, "tick: conscripted still-anchor refresh");
                 enlisted.StillAnchorX = ctx.Pos.X;
                 enlisted.StillAnchorY = ctx.Pos.Y;
                 enlisted.StillSinceUtc = DateTime.UtcNow;
@@ -142,28 +148,29 @@ public sealed class BotBrain
         //     so it runs ahead of the wedge/goal machinery and regardless of any in-flight leg.
         if (ctx.CombatDirective != ctx.LastEmittedCombat)
         {
+            CircuitTrace.Hit(ctx.Guid, "tick: combat directive changed, emit to C++");
             await _executor.IssueNoWaitAsync(ctx, BridgeCommand.Combat(ctx.CombatDirective));
             ctx.LastEmittedCombat = ctx.CombatDirective;
         }
 
         // 1b. A repeated group no-path is quarantined until the coordinator
         //     changes the order. It never becomes a teleport-to-destination.
-        if (await TryQuarantineUnreachableGroupLegAsync(ctx)) return;
+        if (await TryQuarantineUnreachableGroupLegAsync(ctx)) { CircuitTrace.Hit(ctx.Guid, "tick: spent by group-leg quarantine"); return; }
 
         // 1b-1. [STUCK-STILL] Ground truth: if the bot hasn't physically MOVED in the still-window,
         //       it is stuck — full stop — regardless of what goal/why it is cycling. A walking,
         //       questing or grinding bot always moves, so this never touches a bot mid-trek. Checked
         //       before the outcome-based wedge/streak machinery so a frozen bot ejects on the first
         //       window instead of after 6 wedges.
-        if (await TryEjectIfPhysicallyStuckAsync(ctx)) return;
+        if (await TryEjectIfPhysicallyStuckAsync(ctx)) { CircuitTrace.Hit(ctx.Guid, "tick: spent by physical-stuck eject"); return; }
 
         // 1b-2. [FINDING_020] Island escape. A bot whose OWN start cannot path anywhere (core-tagged
         //       start_isolated on N consecutive fails from one spot) has no move that can succeed —
         //       port it to its level-band home. Before the wedge breaker, which such a bot never trips.
-        if (await TryEscapeIslandAsync(ctx)) return;
+        if (await TryEscapeIslandAsync(ctx)) { CircuitTrace.Hit(ctx.Guid, "tick: spent by island escape"); return; }
 
         // 1c. No-progress circuit breaker. Fires before goal/plan so a wedged bot is parked, not driven.
-        if (await TryBreakWedgeAsync(ctx)) return;
+        if (await TryBreakWedgeAsync(ctx)) { CircuitTrace.Hit(ctx.Guid, "tick: spent by wedge breaker"); return; }
 
         // 1d. Reconcile the held objective against C++'s reported task (Held-Objective build §3).
         //     ctx.Held is the committed strategic objective; ctx.HeldTask is what C++ says it is
@@ -179,12 +186,16 @@ public sealed class BotBrain
         //    goal scratch, clear any WAIT, stamp the new goal.
         var goal = _selector.Select(ctx, snap);
         if (goal != ctx.Goal)
+        {
+            CircuitTrace.HitNote(ctx.Guid, "tick: goal changed, entering new goal", ctx.GoalReason);
             await EnterGoalAsync(ctx, goal);
+        }
 
         // 3. Resolve the planner for the active goal. No planner (e.g. Idle) → run
         //    the deadline rule and stop.
         if (!_planners.TryGetValue(ctx.Goal, out var planner))
         {
+            CircuitTrace.Hit(ctx.Guid, "tick: no planner for goal (idle) - deadline check only");
             _supervisor.Check(ctx, snap);
             return;
         }
@@ -196,6 +207,7 @@ public sealed class BotBrain
         //     defer/force/repick). Grind never arms a WAIT, so this is inert for it.
         if (ctx.Pending != null && ctx.Pending.Expired)
         {
+            CircuitTrace.Hit(ctx.Guid, "tick: WAIT deadline expired -> failure for recovery");
             ctx.Failure ??= new WaitFailure
             {
                 CommandType = ctx.Pending.CommandType,
@@ -216,16 +228,21 @@ public sealed class BotBrain
         var p = ctx.Pending;
         if (p != null && ctx.Failure == null && p.RescanAtUtc is DateTime due && DateTime.UtcNow >= due)
         {
+            CircuitTrace.Hit(ctx.Guid, "tick: soft re-plan rescan due");
             var rescan = planner.Rescan(ctx, snap);
             if (rescan is StepResult.Issue or StepResult.Dispatch)
             {
+                CircuitTrace.Hit(ctx.Guid, "tick: rescan preempted the in-flight leg");
                 _executor.ClearPending(ctx);
                 await DispatchStepAsync(ctx, rescan);
                 _supervisor.Check(ctx, snap);
                 return;
             }
             if (ctx.Pending != null)
+            {
+                CircuitTrace.Hit(ctx.Guid, "tick: rescan kept waiting, next rescan pushed");
                 ctx.Pending.RescanAtUtc = DateTime.UtcNow + RescanInterval;
+            }
         }
 
         // 4. Act only when nothing is outstanding. A pending failure (a negated or
@@ -235,17 +252,26 @@ public sealed class BotBrain
         //    failure signal → OnStall. A Blocked step (e.g. no_quests) routes to OnStall.
         if (ctx.Pending == null)
         {
+            CircuitTrace.Hit(ctx.Guid, "tick: act block entered (no WAIT outstanding)");
             if (ctx.Failure == null && !planner.IsProgressing(ctx, snap))
             {
+                CircuitTrace.Hit(ctx.Guid, "tick: not progressing -> stall handler");
                 await HandleStallAsync(ctx, planner.OnStall(ctx));
             }
             else
             {
+                CircuitTrace.Hit(ctx.Guid, "tick: plan next step");
                 var step = planner.PlanNext(ctx, snap);
                 if (step is StepResult.Blocked)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "tick: planner blocked -> stall handler");
                     await HandleStallAsync(ctx, planner.OnStall(ctx));
+                }
                 else
+                {
+                    CircuitTrace.Hit(ctx.Guid, "tick: dispatch planned step");
                     await DispatchStepAsync(ctx, step);
+                }
             }
         }
 
@@ -268,13 +294,18 @@ public sealed class BotBrain
         // [CONSCRIPTED] An enlisted bot idles by ORDER — never a wedge, never a
         // streak, never a stranded port. (Unreachable today via the TickAsync
         // gate; kept as a wall against call-order drift.)
-        if (ctx.Conscripted) return false;
+        if (ctx.Conscripted) { CircuitTrace.Hit(ctx.Guid, "wedge: conscripted exempt"); return false; }
         var id = ctx.Identity;
         if (id?.WedgeBackoffUntil is DateTime parked && DateTime.UtcNow < parked)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: already parked, backoff holds");
             return false;   // already parked — let the backoff hold; GoalSelector keeps it Idle
+        }
 
         bool wedged = ctx.TimeSinceProgressSec > WedgeCeilingSec || ctx.ConsecutiveFailures >= WedgeFailCap;
-        if (!wedged) return false;
+        if (!wedged) { CircuitTrace.Hit(ctx.Guid, "wedge: no wedge (progress fresh)"); return false; }
+        CircuitTrace.Hit(ctx.Guid, "wedge: TRIPPED", ctx.TimeSinceProgressSec);
+        CircuitTrace.RequestDump(ctx.Guid, "wedge");   // R8: flush this bot's recent ring even if nobody armed it
 
         double noProg = ctx.TimeSinceProgressSec;
         int fails = ctx.ConsecutiveFailures;
@@ -284,7 +315,10 @@ public sealed class BotBrain
         ctx.ConsecutiveFailures = 0;
         id?.ClearGrindRelocate();
         if (ctx.Goal == Goal.Grinding)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: dead grind cell recorded");
             ctx.RecordDeadGrindCell(ctx.Pos.X, ctx.Pos.Y);   // don't drop back onto this dead spot
+        }
 
         // A wedge while routing to a trainer is the L1 bum-rush loop: with HasUnlearnedSpells set, the
         // GoalSelector training trigger re-fires on every reselect and the bot bee-lines the (unreachable /
@@ -295,10 +329,14 @@ public sealed class BotBrain
         // the bot still owes the training, it's deferred, not abandoned. This also destaggers a crowd: each
         // bot cools down at a slightly different time and drifts off to quest, thinning the trainer pileup.
         if (ctx.Goal == Goal.Training && id != null)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: trainer-route wedge, training trigger cooled");
             id.TrainCooldownUntil = DateTime.UtcNow.AddSeconds(TrainWedgeCooldownSec);
+        }
 
         if (id != null)
         {
+            CircuitTrace.Hit(ctx.Guid, "wedge: parked with backoff", id.WedgeStreak + 1);
             id.WedgeBackoffUntil = DateTime.UtcNow.AddSeconds(WedgeBackoffSec);
             // Future-stamp the progress clock to the park END so the bot gets a fresh full window on
             // resume (the idle park itself isn't "no progress" to be punished for).
@@ -311,6 +349,7 @@ public sealed class BotBrain
             id.WedgeStreak++;
             if (id.WedgeStreak >= StrandedWedgeCap && !ctx.Dead && !ctx.InCombat && !ctx.InPlayerParty)
             {
+                CircuitTrace.Hit(ctx.Guid, "wedge: stranded escalation (streak at cap)", id.WedgeStreak);
                 // [ESCAPE-BANDS] Level-appropriate escape: the LOWEST band whose range holds the bot's
                 // level, rolling a same-faction spot that is NOT the pocket it's stuck in (so a bot
                 // stuck in its own starter rolls a different same-faction starter — valid at 1-5). This
@@ -320,17 +359,20 @@ public sealed class BotBrain
                     PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
                 if (dest is null)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "wedge: no banded escape, trying HomeFor fallback");
                     var home = BotIdentity.HomeFor(id.Race, id.Level);
-                    if (home.Map >= 0) dest = home;
+                    if (home.Map >= 0) { CircuitTrace.Hit(ctx.Guid, "wedge: HomeFor fallback valid"); dest = home; }
                 }
 
                 if (dest is { } d)
                 {
+                    CircuitTrace.Hit(ctx.Guid, "wedge: stranded escape port issued");
                     await IssueEscapePortAsync(ctx, id, d,
                         $"STRANDED (wedge streak {StrandedWedgeCap}, goal {ctx.Goal}, L{id.Level})");
                 }
                 else
                 {
+                    CircuitTrace.Hit(ctx.Guid, "wedge: no escape town at all, streak reset + local park");
                     // No alternate town on this map at all (shouldn't happen for a live bot) — reset
                     // and let the wedge ladder keep shuffling it locally.
                     id.WedgeStreak = 0;
@@ -381,13 +423,15 @@ public sealed class BotBrain
         // fresh the moment the bot becomes eligible again.
         if (id == null || ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted)
         {
-            if (id != null) { id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow; }
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible state, window reset");
+            if (id != null) { CircuitTrace.Hit(ctx.Guid, "stuck-still: anchor refreshed while ineligible"); id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow; }
             return false;
         }
 
         // First sight this session: seed the anchor.
         if (id.StillSinceUtc == default)
         {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: first sight, anchor seeded");
             id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow;
             return false;
         }
@@ -396,6 +440,7 @@ public sealed class BotBrain
         float dx = ctx.Pos.X - id.StillAnchorX, dy = ctx.Pos.Y - id.StillAnchorY;
         if (dx * dx + dy * dy > StuckStillRadius * StuckStillRadius)
         {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: moved, window restarted");
             id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow;
             return false;
         }
@@ -403,11 +448,18 @@ public sealed class BotBrain
         // Still landing real kills → productive in-place grind, not stuck. (LastKillUtc advances only
         // on REAL kills — trash/grey kills don't count — so a chicken farmer still reads as stuck.)
         if ((DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds < StuckStillSeconds)
+        {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: productive in-place grind (recent kill)");
             return false;
+        }
 
         // Not yet frozen for the whole window.
         if ((DateTime.UtcNow - id.StillSinceUtc).TotalSeconds < StuckStillSeconds)
+        {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: window not yet elapsed");
             return false;
+        }
+        CircuitTrace.Hit(ctx.Guid, "stuck-still: FROZEN whole window", (DateTime.UtcNow - id.StillSinceUtc).TotalSeconds);
 
         // Physically frozen for the whole window → eject to a level-appropriate friendly hub.
         // [ESCAPE-BANDS] lowest band containing the level, same-faction, never the pocket we're in.
@@ -415,12 +467,14 @@ public sealed class BotBrain
             PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
         if (dest is null)
         {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: no banded escape, trying HomeFor fallback");
             var home = BotIdentity.HomeFor(id.Race, id.Level);
-            if (home.Map >= 0) dest = home;
+            if (home.Map >= 0) { CircuitTrace.Hit(ctx.Guid, "stuck-still: HomeFor fallback valid"); dest = home; }
         }
 
         if (dest is not { } d)
         {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: nowhere to send, window restarted");
             // Nowhere friendly to send (shouldn't happen for a live bot) — restart the window so we
             // don't re-evaluate every tick, and let the wedge ladder remain the fallback.
             id.StillSinceUtc = DateTime.UtcNow;
@@ -500,21 +554,21 @@ public sealed class BotBrain
     {
         (float X, float Y, float Z, int Map, Team Team)[]? spots = null;
         foreach (var band in EscapeBands)
-            if (level >= band.Min && level <= band.Max) { spots = band.Spots; break; }
-        if (spots == null) return null;
+            if (level >= band.Min && level <= band.Max) { CircuitTrace.Hit(ctx.Guid, "escape-bands: band matched level", level); spots = band.Spots; break; }
+        if (spots == null) { CircuitTrace.Hit(ctx.Guid, "escape-bands: level outside every band", level); return null; }
 
         var pool = new List<(float X, float Y, float Z, int Map)>(spots.Length);
         var near = new List<(float X, float Y, float Z, int Map)>(spots.Length);   // excluded "stuck pocket" spots
         foreach (var s in spots)
         {
-            if (s.Team != team) continue;
+            if (s.Team != team) { CircuitTrace.Hit(ctx.Guid, "escape-bands: spot skipped (enemy faction)"); continue; }
             float dx = s.X - ctx.Pos.X, dy = s.Y - ctx.Pos.Y;
             bool sameMapNear = s.Map == ctx.MapId && (dx * dx + dy * dy) < EscapeSpreadYards * EscapeSpreadYards;
-            if (sameMapNear) near.Add((s.X, s.Y, s.Z, s.Map));
-            else pool.Add((s.X, s.Y, s.Z, s.Map));
+            if (sameMapNear) { CircuitTrace.Hit(ctx.Guid, "escape-bands: spot excluded (the stuck pocket)"); near.Add((s.X, s.Y, s.Z, s.Map)); }
+            else { CircuitTrace.Hit(ctx.Guid, "escape-bands: spot pooled"); pool.Add((s.X, s.Y, s.Z, s.Map)); }
         }
-        if (pool.Count == 0) pool = near;   // every spot was the pocket (shouldn't happen cross-map) — port anyway
-        if (pool.Count == 0) return null;
+        if (pool.Count == 0) { CircuitTrace.Hit(ctx.Guid, "escape-bands: every spot was the pocket, using near pool"); pool = near; }
+        if (pool.Count == 0) { CircuitTrace.Hit(ctx.Guid, "escape-bands: no candidate at all"); return null; }
         int idx = (int)(((uint)ctx.Guid + (uint)rotation) % (uint)pool.Count);
         return pool[idx];
     }
@@ -558,9 +612,9 @@ public sealed class BotBrain
     private async Task<bool> TryEscapeIslandAsync(BotContext ctx)
     {
         var id = ctx.Identity;
-        if (id == null || id.IslandStreak < IslandEscapeCap) return false;
-        if (ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted) return false;
-        if (id.IslandEscapeCooldownUntil is DateTime cd && DateTime.UtcNow < cd) return false;
+        if (id == null || id.IslandStreak < IslandEscapeCap) { CircuitTrace.Hit(ctx.Guid, "island: no isolation streak"); return false; }
+        if (ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted) { CircuitTrace.Hit(ctx.Guid, "island: ineligible state"); return false; }
+        if (id.IslandEscapeCooldownUntil is DateTime cd && DateTime.UtcNow < cd) { CircuitTrace.Hit(ctx.Guid, "island: escape cooling down"); return false; }
 
         // [ESCAPE-BANDS] Level-appropriate destination: lowest band containing the level, same-faction,
         // never the pocket the bot is islanded in. HomeFor is the fallback if the level is off every band.
@@ -568,20 +622,23 @@ public sealed class BotBrain
             PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
         if (dest is null)
         {
+            CircuitTrace.Hit(ctx.Guid, "island: no banded escape, trying HomeFor fallback");
             var home = BotIdentity.HomeFor(id.Race, id.Level);
-            if (home.Map < 0) { id.IslandStreak = 0; return false; }
+            if (home.Map < 0) { CircuitTrace.Hit(ctx.Guid, "island: no home either, streak reset"); id.IslandStreak = 0; return false; }
             dest = home;
         }
 
         id.IslandEscapeCooldownUntil = DateTime.UtcNow.AddSeconds(IslandEscapeCooldownSec);
         if (dest is not { } d)
         {
+            CircuitTrace.Hit(ctx.Guid, "island: no destination, cooled + streak reset");
             // no alternate town on this map — cool down and let the wedge ladder handle it
             id.IslandStreak = 0;
             return false;
         }
 
         int streak = id.IslandStreak;
+        CircuitTrace.Hit(ctx.Guid, "island: escape port issued", streak);
         await IssueEscapePortAsync(ctx, id, d, $"ISOLATED start (x{streak} start_isolated fails, goal {ctx.Goal})");
         return true;
     }
@@ -598,43 +655,65 @@ public sealed class BotBrain
 
         if (ctx.NoPathQuarantinedOrder is { } quarantined)
         {
+            CircuitTrace.Hit(ctx.Guid, "quarantine: existing quarantine present");
             bool sameOrder = !ctx.Dead && ctx.GroupOrder.IsActive && ctx.GroupOrder == quarantined;
             if (sameOrder)
+            {
+                CircuitTrace.Hit(ctx.Guid, "quarantine: same order still stamped, holding");
                 return true;
+            }
 
             if (ctx.NoPathQuarantinedDest is { } oldDest)
+            {
+                CircuitTrace.Hit(ctx.Guid, "quarantine: order changed, quarantine lifted");
                 id?.ClearNoPathStreak(oldDest.Map, oldDest.X, oldDest.Y);
+            }
             ctx.NoPathQuarantinedOrder = null;
             ctx.NoPathQuarantinedDest = null;
         }
 
         if (id == null || ctx.Dead || ctx.Goal != Goal.Questing || !ctx.GroupOrder.IsActive)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quarantine: not applicable this tick");
             return false;
+        }
 
         Vec4? orderTarget = GroupOrderPathTarget(ctx.GroupOrder);
         if (orderTarget is not { } expected || !IsFinitePathDestination(expected))
+        {
+            CircuitTrace.Hit(ctx.Guid, "quarantine: order has no finite path target");
             return false;
+        }
 
         Vec4? candidate = null;
         if (ctx.Failure is { CommandType: "MOVE_TO", Reason: "no_path", Dest: { } failed }
             && SamePathDestination(failed, expected))
         {
+            CircuitTrace.Hit(ctx.Guid, "quarantine: no_path failure matches the order dest");
             candidate = failed;
         }
         else if (ctx.GroupOrder.Objective.IsActive
                  && id.GetNoPathStreak(expected.Map, expected.X, expected.Y) >= NoPathQuarantineStreakCount)
         {
+            CircuitTrace.Hit(ctx.Guid, "quarantine: durable no-path streak on fire-and-forget objective");
             // Fire-and-forget group objectives have no WAIT/Failure; their
             // bridge-level durable streak is the only failure signal.
             candidate = expected;
         }
 
         if (candidate is not { } dest || !IsFinitePathDestination(dest))
+        {
+            CircuitTrace.Hit(ctx.Guid, "quarantine: no candidate destination");
             return false;
+        }
 
         int streak = id.GetNoPathStreak(dest.Map, dest.X, dest.Y);
         if (streak < NoPathQuarantineStreakCount)
+        {
+            CircuitTrace.Hit(ctx.Guid, "quarantine: streak below cap", streak);
             return false;
+        }
+        CircuitTrace.Hit(ctx.Guid, "quarantine: ENGAGED, parking until order changes", streak);
 
         _logger.LogWarning(
             "[BRAIN] {Name} GROUP LEG QUARANTINED — {N} consecutive no_path to {Dest}; " +
@@ -653,19 +732,21 @@ public sealed class BotBrain
 
     private static Vec4? GroupOrderPathTarget(GroupOrder order)
     {
+        // Pure helper without a bot context — every arm folds into the caller's probes
+        // (the quarantine's "no finite path target" probe reads the outcome).
         if (!order.IsActive)
-            return null;
+            return null;   // cb:fold pure helper, outcome probed at caller
 
         if (order.Objective.IsActive)
-            return new Vec4(order.Objective.X, order.Objective.Y, order.Objective.Z, order.Objective.Map);
+            return new Vec4(order.Objective.X, order.Objective.Y, order.Objective.Z, order.Objective.Map);   // cb:fold pure helper, outcome probed at caller
 
         return order.Phase switch
         {
-            GroupPhase.TravelToGiver or GroupPhase.Accept or
+            GroupPhase.TravelToGiver or GroupPhase.Accept or   // cb:fold pure helper, outcome probed at caller
             GroupPhase.TravelToTurnIn or GroupPhase.TurnIn or
             GroupPhase.GroupVendor or GroupPhase.HoldAtAnchor or
             GroupPhase.GroupGrind or GroupPhase.GroupDefend => order.TargetPos,
-            _ => null
+            _ => null   // cb:fold pure helper, outcome probed at caller
         };
     }
 
@@ -704,7 +785,7 @@ public sealed class BotBrain
     /// </summary>
     private void ReconcileHeldObjective(BotContext ctx)
     {
-        if (ctx.Held is not { } held || !held.NeedsActuation) return;   // nothing reconcilable held
+        if (ctx.Held is not { } held || !held.NeedsActuation) { CircuitTrace.Hit(ctx.Guid, "reconcile: nothing held"); return; }
 
         // Only reconcile while the bot is actually PURSUING the objective. Both a solo quest objective and a
         // group shared objective are worked under Goal.Questing (GoalSelector routes an active GroupOrder there,
@@ -713,12 +794,12 @@ public sealed class BotBrain
         // stale-by-context — re-issuing into another planner would clobber its in-flight WAIT (e.g. knock out a
         // RESURRECT mid-rez). Gate it. The strand case is untouched: the parked bot this exists to rescue is
         // still Goal.Questing (the 31,043 Questing/enter park).
-        if (ctx.Goal != Goal.Questing) return;
+        if (ctx.Goal != Goal.Questing) { CircuitTrace.Hit(ctx.Guid, "reconcile: not questing, held stale-by-context"); return; }
 
         var echo = ctx.HeldTask;
-        if (!echo.IsKnown) return;                                       // no readback → degrade to ctx.Pending inference
-        if (ctx.TimeSinceObjectiveSec < ReconcileGraceSec) return;       // just (re)committed — let C++ adopt it first
-        if (held.MatchedBy(echo)) return;                                // C++ is on it → §5 progress checks own the rest
+        if (!echo.IsKnown) { CircuitTrace.Hit(ctx.Guid, "reconcile: no C++ echo yet"); return; }                // no readback → degrade to ctx.Pending inference
+        if (ctx.TimeSinceObjectiveSec < ReconcileGraceSec) { CircuitTrace.Hit(ctx.Guid, "reconcile: within adoption grace"); return; }   // just (re)committed — let C++ adopt it first
+        if (held.MatchedBy(echo)) { CircuitTrace.Hit(ctx.Guid, "reconcile: C++ is on the held objective"); return; }   // C++ is on it → §5 progress checks own the rest
 
         // Re-fire cooldown (2026-07-03, the reconcile-storm fix — see ReconcileRefireCooldownSec's
         // docstring). LastReconcileUtc compared against ObjectiveSinceUtc, not used as a bare
@@ -727,16 +808,20 @@ public sealed class BotBrain
         // above already governs its first fire).
         bool coolingDown = ctx.LastReconcileUtc >= ctx.ObjectiveSinceUtc
                             && (DateTime.UtcNow - ctx.LastReconcileUtc).TotalSeconds < ReconcileRefireCooldownSec;
-        if (coolingDown) return;
+        if (coolingDown) { CircuitTrace.Hit(ctx.Guid, "reconcile: refire cooling down"); return; }
 
         // A coordinator objective at the durable threshold is owned by the
         // step-1b quarantine. Do not metronome-reissue underneath it. Solo
         // planners retain their normal failure/defer recovery path.
         if (held.Source == ObjectiveSource.Coordinator && ctx.Identity is { } rid
             && rid.GetNoPathStreak(held.Target.Map, held.Target.X, held.Target.Y) >= NoPathQuarantineStreakCount)
+        {
+            CircuitTrace.Hit(ctx.Guid, "reconcile: owned by quarantine, no reissue");
             return;
+        }
 
         ctx.LastReconcileUtc = DateTime.UtcNow;
+        CircuitTrace.Hit(ctx.Guid, "reconcile: MISMATCH, re-issuing held leg");
 
         // Mismatch: C++ is idle / on a stale or different task while we hold this objective. Clear the in-flight
         // WAIT + any stale failure, then force the OWNING planner to re-issue the realizing leg this tick. The
@@ -748,9 +833,15 @@ public sealed class BotBrain
         _executor.ClearPending(ctx);
         ctx.Failure = null;
         if (held.Source == ObjectiveSource.Coordinator)
+        {
+            CircuitTrace.Hit(ctx.Guid, "reconcile: cleared group change-guard for re-issue");
             ctx.LastGroupOrder = GroupOrder.None;   // force QuestPlanner.DriveGroup to re-issue the group leg
+        }
         else
+        {
+            CircuitTrace.Hit(ctx.Guid, "reconcile: forced solo re-derive (step=plan)");
             ctx.SetStep("plan");                    // force QuestPlanner to RE-DERIVE the solo leg (not advance/defer)
+        }
         _logger.LogInformation(
             "[BRAIN] {Name} RECONCILE — C++ task {Echo} != held {Held} (cre={Cre}, src={Src}) — re-issuing",
             ctx.Name, echo.Kind, held.Kind, held.CreatureEntry, held.Source);
@@ -768,7 +859,10 @@ public sealed class BotBrain
         // quest whose leg armed the in-flight WAIT — set throughout a to_objective trek — so it's
         // the killer. No Active (died between legs) → no blame, never a false attribution.
         if (goal == Goal.Maintenance && ctx.Dead && ctx.Goal == Goal.Questing && ctx.Quest?.Active is { } dying)
+        {
+            CircuitTrace.Hit(ctx.Guid, "goal-change: death blamed on active quest", dying.QuestId);
             ctx.DeathBlameQuestId = dying.QuestId;
+        }
 
         // Stop a leaving C++ grind patrol so the next goal can actually drive the bot. BOTH
         // Grinding AND Questing run the autonomous C++ grind/objective patrol (an enriched
@@ -778,11 +872,14 @@ public sealed class BotBrain
         // in 120s while killing the same mobs, then tripped its leg deadline → giveup). SET_TASK
         // IDLE clears the patrol; the new goal re-arms its own task in PlanNext.
         if (ctx.Goal == Goal.Grinding || ctx.Goal == Goal.Questing)
+        {
+            CircuitTrace.Hit(ctx.Guid, "goal-change: SET_TASK IDLE stops the leaving patrol");
             await _executor.IssueNoWaitAsync(ctx, IdleTask());   // stop the autonomous patrol
+        }
 
         ctx.SetGoal(goal, "enter");
         ResetScratch(ctx);                                       // each goal re-arms its own scratch in PlanNext
-        if (goal != Goal.Grinding) ctx.Identity?.ClearGrindRelocate();   // a half-done relocate doesn't survive a goal change
+        if (goal != Goal.Grinding) { CircuitTrace.Hit(ctx.Guid, "goal-change: grind relocate cleared"); ctx.Identity?.ClearGrindRelocate(); }   // a half-done relocate doesn't survive a goal change
         _executor.ClearPending(ctx);
         ctx.Failure = null;                                      // stale negative outcome doesn't carry across goals
     }
@@ -793,20 +890,24 @@ public sealed class BotBrain
         switch (step)
         {
             case StepResult.Issue issue:
+                CircuitTrace.Hit(ctx.Guid, "dispatch: issue command with WAIT");
                 await _executor.IssueAsync(ctx, issue.Command, issue.ExpectedEvent, issue.Deadline);
                 break;
 
             case StepResult.Dispatch dispatch:
+                CircuitTrace.Hit(ctx.Guid, "dispatch: fire-and-forget command");
                 await _executor.IssueNoWaitAsync(ctx, dispatch.Command);
                 break;
 
             case StepResult.Done:
+                CircuitTrace.Hit(ctx.Guid, "dispatch: goal done -> idle reselect");
                 // Goal achieved — drop to Idle so the next tick reselects.
                 await EnterGoalAsync(ctx, Goal.Idle);
                 break;
 
             case StepResult.Continue:
             default:
+                CircuitTrace.Hit(ctx.Guid, "dispatch: continue (nothing this tick)");
                 break;   // Continue → nothing this tick. Blocked is intercepted in TickAsync → OnStall.
         }
     }
@@ -817,6 +918,7 @@ public sealed class BotBrain
         switch (action.Kind)
         {
             case StallActionKind.ReselectGoal:
+                CircuitTrace.Hit(ctx.Guid, "stall: reselect goal", ctx.ConsecutiveReselects + 1);
                 // Track reselect churn: a reselect with no real progress (kill/quest/level) since the last
                 // one is the bot recomputing the SAME dead answer. MarkProgress zeroes this, so a streak
                 // only builds while the bot is genuinely stuck — the physical-stuck ejector reads it to
@@ -831,6 +933,7 @@ public sealed class BotBrain
                 break;
 
             default:
+                CircuitTrace.Hit(ctx.Guid, "stall: unhandled stall kind (no phase-2 handler)");
                 // Reroute/Defer/Abandon/ForceInteract/EscalateRez/GiveUpStop land with
                 // their planners in P3+. No Phase-2 planner emits them.
                 _logger.LogDebug("[BRAIN] {Name} {Goal} stall {Kind}: {Detail} (no Phase-2 handler)",

@@ -50,19 +50,19 @@ public static class ChatWire
     /// <summary>Reply routing (§9.3): whisper→whisper, say→say, channel→same channel, party→party.</summary>
     public static int WireTypeFor(ChatKind kind) => kind switch
     {
-        ChatKind.Whisper => WireWhisper,
-        ChatKind.Channel => WireChannel,
-        ChatKind.Party => WireParty,
-        _ => WireSay
+        ChatKind.Whisper => WireWhisper,   // cb:fold pure wire mapping, no guid in reach
+        ChatKind.Channel => WireChannel,   // cb:fold pure wire mapping, no guid in reach
+        ChatKind.Party => WireParty,   // cb:fold pure wire mapping, no guid in reach
+        _ => WireSay   // cb:fold pure wire mapping, no guid in reach
     };
 
     /// <summary>Parse the CHAT_RECV `chat_type` wire string. Unknown → Say (safest kind).</summary>
     public static ChatKind ParseKind(string? s) => (s ?? "").Trim().ToLowerInvariant() switch
     {
-        "whisper" => ChatKind.Whisper,
-        "channel" => ChatKind.Channel,
-        "party" => ChatKind.Party,
-        _ => ChatKind.Say
+        "whisper" => ChatKind.Whisper,   // cb:fold parse detail, kind consumed by coordinator probes
+        "channel" => ChatKind.Channel,   // cb:fold parse detail, kind consumed by coordinator probes
+        "party" => ChatKind.Party,   // cb:fold parse detail, kind consumed by coordinator probes
+        _ => ChatKind.Say   // cb:fold parse detail, kind consumed by coordinator probes
     };
 }
 
@@ -76,13 +76,13 @@ public static class Chattiness
 {
     public static float FromChatStyle(string? chatStyle) => (chatStyle ?? "").Trim().ToLowerInvariant() switch
     {
-        "terse" => 0.15f,     // says little, replies short
-        "veteran" => 0.35f,   // seen it all, talks when it matters
-        "casual" => 0.50f,    // the baseline player
-        "rp" => 0.55f,        // talkative in flavor, not spammy
-        "newbie" => 0.65f,    // asks questions, reacts to everything
-        "leetspeak" => 0.70f, // loud presence
-        "chatty" => 0.90f,    // never shuts up
-        _ => 0.50f
+        "terse" => 0.15f,     // says little, replies short   // cb:fold content table lookup, urge term probed at scorer
+        "veteran" => 0.35f,   // seen it all, talks when it matters   // cb:fold content table lookup, urge term probed at scorer
+        "casual" => 0.50f,    // the baseline player   // cb:fold content table lookup, urge term probed at scorer
+        "rp" => 0.55f,        // talkative in flavor, not spammy   // cb:fold content table lookup, urge term probed at scorer
+        "newbie" => 0.65f,    // asks questions, reacts to everything   // cb:fold content table lookup, urge term probed at scorer
+        "leetspeak" => 0.70f, // loud presence   // cb:fold content table lookup, urge term probed at scorer
+        "chatty" => 0.90f,    // never shuts up   // cb:fold content table lookup, urge term probed at scorer
+        _ => 0.50f   // cb:fold content table lookup, urge term probed at scorer
     };
 }

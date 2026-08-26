@@ -3,6 +3,7 @@ using System.Text;
 using Dapper;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Memory;
 
@@ -78,9 +79,9 @@ public class ChatMemoryStore
         bool mentionsBotName, bool isQuestion)
     {
         int salience;
-        if (mentionsBotName) salience = 2;
-        else if (isQuestion && Random.Shared.NextDouble() < _settings.GetFloat(0, "memory.overhear_log_chance", 0.15f)) salience = 1;
-        else return;   // not memorable — never buffered
+        if (mentionsBotName) { CircuitTrace.Hit(botGuid, "chat: overheard name-mention, salience 2"); salience = 2; }
+        else if (isQuestion && Random.Shared.NextDouble() < _settings.GetFloat(0, "memory.overhear_log_chance", 0.15f)) { CircuitTrace.Hit(botGuid, "chat: overheard question logged on roll"); salience = 1; }
+        else { CircuitTrace.Hit(botGuid, "chat: overheard not memorable, dropped"); return; }   // not memorable — never buffered
 
         Enqueue(new PendingLog(DateTime.UtcNow, botGuid, Norm(counterpart), counterpartGuid,
             "in", KindStr(kind), channelName, zoneId, message, salience, Participated: false));
@@ -97,8 +98,10 @@ public class ChatMemoryStore
 
         if (!log.Participated)
         {
+            CircuitTrace.Hit(log.BotGuid, "chat: overheard write hits hourly valve check", count);
             if ((count > cap && log.Salience <= 1) || count > cap * 3 / 2)
             {
+                CircuitTrace.Hit(log.BotGuid, "chat: hourly valve dropped overheard write", count);
                 _logger.LogDebug("[CHAT-MEM] valve drop bot={Bot} sal={Sal} ({Count}/{Cap} this hour)",
                     log.BotGuid, log.Salience, count, cap);
                 return;
@@ -106,6 +109,7 @@ public class ChatMemoryStore
         }
         else if (count == cap + 1)
         {
+            CircuitTrace.Hit(log.BotGuid, "chat: tier1 hourly cap reached", cap);
             _logger.LogInformation("[CHAT-MEM] Tier-1 cap hit for bot={Bot} ({Cap}/hr) — overheard writes now dropping",
                 log.BotGuid, cap);
         }
@@ -117,11 +121,11 @@ public class ChatMemoryStore
 
     public async Task FlushAsync()
     {
-        if (_buffer.IsEmpty) return;
+        if (_buffer.IsEmpty) { CircuitTrace.Hit(0, "chat: memory flush skipped, buffer empty"); return; }
 
         var rows = new List<PendingLog>();
         while (rows.Count < 500 && _buffer.TryDequeue(out var r)) rows.Add(r);
-        if (rows.Count == 0) return;
+        if (rows.Count == 0) { CircuitTrace.Hit(0, "chat: memory flush found no rows"); return; }
 
         try
         {
@@ -133,7 +137,7 @@ public class ChatMemoryStore
             var p = new DynamicParameters();
             for (int i = 0; i < rows.Count; i++)
             {
-                if (i > 0) sql.Append(',');
+                if (i > 0) sql.Append(',');   // cb:fold sql text build detail, flush outcome probed below
                 sql.Append($"(@u{i},@b{i},@c{i},@g{i},@d{i},@k{i},@ch{i},@z{i},@m{i},@s{i})");
                 var r = rows[i];
                 p.Add($"u{i}", r.Utc); p.Add($"b{i}", r.BotGuid); p.Add($"c{i}", r.Counterpart);
@@ -184,13 +188,14 @@ public class ChatMemoryStore
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "chat: memory flush failed, rows lost", rows.Count);
             _logger.LogError(ex, "[CHAT-MEM] flush failed — {Count} rows lost this pass", rows.Count);
         }
 
         // Retire stale valve buckets so the dictionary doesn't grow forever
         long currentHour = DateTime.UtcNow.Ticks / TimeSpan.TicksPerHour;
         foreach (var key in _hourCounts.Keys)
-            if (key.Hour < currentHour - 1) _hourCounts.TryRemove(key, out _);
+            if (key.Hour < currentHour - 1) { CircuitTrace.Hit(key.Bot, "chat: stale valve bucket retired"); _hourCounts.TryRemove(key, out _); }
     }
 
     // ==================== Prompt-facing read ====================
@@ -212,13 +217,14 @@ public class ChatMemoryStore
                 WHERE bot_guid=@botGuid AND counterpart_name=@cp",
                 new { botGuid, cp = Norm(counterpart) });
 
-            if (row == null || row.InteractCount == 0) return "";
-            if (!string.IsNullOrWhiteSpace(row.Summary)) return row.Summary;   // C8's compacted summary wins
+            if (row == null || row.InteractCount == 0) { CircuitTrace.Hit(botGuid, "chat: no relationship history"); return ""; }
+            if (!string.IsNullOrWhiteSpace(row.Summary)) { CircuitTrace.Hit(botGuid, "chat: compacted relationship summary used"); return row.Summary; }   // C8's compacted summary wins
 
             return $"You've talked with them {row.InteractCount} times before; last time {Ago(row.LastUtc)}.";
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(botGuid, "chat: relationship read failed");
             _logger.LogWarning("[CHAT-MEM] relationship read failed for bot={Bot}/{Cp}: {Error}",
                 botGuid, counterpart, ex.Message);
             return "";
@@ -235,7 +241,7 @@ public class ChatMemoryStore
                 "SELECT strength FROM chat_relationship WHERE bot_guid=@b AND counterpart_name=@c",
                 new { b = botGuid, c = Norm(counterpart) }) ?? 0f;
         }
-        catch { return 0f; }
+        catch { CircuitTrace.Hit(botGuid, "chat: strength read failed, stranger assumed"); return 0f; }
     }
 
     // ==================== internals ====================
@@ -243,7 +249,7 @@ public class ChatMemoryStore
     private bool IsFirstMeeting(int botGuid, string counterpart)
     {
         var key = (botGuid, Norm(counterpart));
-        if (_knownPairs.ContainsKey(key)) return false;
+        if (_knownPairs.ContainsKey(key)) { CircuitTrace.Hit(botGuid, "chat: pair already known (cache)"); return false; }
 
         // Lazy one-time check against the table (cheap PK lookup, once per pair per boot)
         try
@@ -252,9 +258,9 @@ public class ChatMemoryStore
             var exists = conn.QuerySingleOrDefault<int?>(
                 "SELECT 1 FROM chat_relationship WHERE bot_guid=@b AND counterpart_name=@c",
                 new { b = botGuid, c = key.Item2 });
-            if (exists != null) { _knownPairs[key] = 1; return false; }
+            if (exists != null) { CircuitTrace.Hit(botGuid, "chat: pair known in db"); _knownPairs[key] = 1; return false; }
         }
-        catch { /* on DB hiccup, assume known — a missed salience-3 is harmless */ return false; }
+        catch { CircuitTrace.Hit(botGuid, "chat: first-meeting check db hiccup, assume known"); /* on DB hiccup, assume known — a missed salience-3 is harmless */ return false; }
 
         _knownPairs[key] = 1;   // mark now; the flush creates the row
         return true;
@@ -263,9 +269,9 @@ public class ChatMemoryStore
     private static string Ago(DateTime utc)
     {
         var span = DateTime.UtcNow - utc;
-        if (span.TotalMinutes < 30) return "just now";
-        if (span.TotalHours < 20) return "earlier today";
-        if (span.TotalHours < 44) return "yesterday";
+        if (span.TotalMinutes < 30) return "just now";   // cb:fold pure prose transform for prompt, no guid in reach
+        if (span.TotalHours < 20) return "earlier today";   // cb:fold pure prose transform for prompt, no guid in reach
+        if (span.TotalHours < 44) return "yesterday";   // cb:fold pure prose transform for prompt, no guid in reach
         return $"{Math.Max(2, (int)span.TotalDays)} days ago";
     }
 
@@ -273,10 +279,10 @@ public class ChatMemoryStore
 
     private static string KindStr(ChatKind kind) => kind switch
     {
-        ChatKind.Whisper => "whisper",
-        ChatKind.Channel => "channel",
-        ChatKind.Party => "party",
-        _ => "say"
+        ChatKind.Whisper => "whisper",   // cb:fold pure kind-to-string mapping, no guid in reach
+        ChatKind.Channel => "channel",   // cb:fold pure kind-to-string mapping, no guid in reach
+        ChatKind.Party => "party",   // cb:fold pure kind-to-string mapping, no guid in reach
+        _ => "say"   // cb:fold pure kind-to-string mapping, no guid in reach
     };
 
     private sealed class RelRow

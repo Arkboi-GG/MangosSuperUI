@@ -95,7 +95,14 @@ public class BotBrainService : BackgroundService
         _zoneData = zoneData;
         _fallRecorder = fallRecorder;
         _groupManager = new GroupManager(_db, loggerFactory.CreateLogger<GroupManager>());
+        _circuit = new CircuitTraceHost(_db, loggerFactory.CreateLogger<CircuitTraceHost>());
     }
+
+    // Circuit-board trace host (CIRCUIT_BOARD.md Phase 2): settings + JSONL flush for
+    // the CircuitTrace probes. Created here like GroupManager (no DI churn); the
+    // controller reaches it through this property.
+    private readonly CircuitTraceHost _circuit;
+    public CircuitTraceHost Circuit => _circuit;
 
     // ==================== Public API (controller / hub) ====================
 
@@ -120,6 +127,7 @@ public class BotBrainService : BackgroundService
 
             if (!value)
             {
+                CircuitTrace.Hit(0, "host: driving disabled, roster cleared", _contexts.Count);
                 var count = _contexts.Count;
                 _bots.Clear();
                 _contexts.Clear();
@@ -152,6 +160,7 @@ public class BotBrainService : BackgroundService
         _disconnectedAt.TryRemove(guid, out _);
         _tracker.Remove(guid);
         _fallRecorder.Forget(guid);
+        CircuitTrace.Forget(guid);
     }
 
     /// <summary>
@@ -165,9 +174,9 @@ public class BotBrainService : BackgroundService
         var affected = new List<int>();
         foreach (var kvp in _bots)
         {
-            if (targets != null && targets.Count > 0 && !targets.Contains(kvp.Key)) continue;
+            if (targets != null && targets.Count > 0 && !targets.Contains(kvp.Key)) continue;   // cb:fold iteration filter
             var rider = kvp.Value.Story;
-            if (rider == null) continue;
+            if (rider == null) continue;   // cb:fold iteration filter
             rider.Enabled = on;
             affected.Add(kvp.Key);
         }
@@ -182,7 +191,7 @@ public class BotBrainService : BackgroundService
         foreach (var kvp in _bots)
         {
             var rider = kvp.Value.Story;
-            if (rider == null) continue;
+            if (rider == null) continue;   // cb:fold iteration filter
             list.Add(new
             {
                 guid = kvp.Key,
@@ -201,7 +210,7 @@ public class BotBrainService : BackgroundService
     /// </summary>
     public object? GetBotBrainSummary(int guid)
     {
-        if (!_bots.TryGetValue(guid, out var bot)) return null;
+        if (!_bots.TryGetValue(guid, out var bot)) return null;   // cb:fold read-only dashboard projection
         var bs = _bridge.GetBotState(guid);
         return new
         {
@@ -340,7 +349,7 @@ public class BotBrainService : BackgroundService
     private static object ProjectScratch(BotContext c, DateTime now)
     {
         if (c.Maintenance is { } m)
-        {
+        {   // cb:fold read-only dashboard projection
             string phase =
                 !m.RezSent ? "rez-wait"
                 : c.Dead ? "resurrecting"
@@ -365,7 +374,7 @@ public class BotBrainService : BackgroundService
         }
 
         if (c.Service is { } sv && sv.Phase != VendorPhase.None)
-        {
+        {   // cb:fold read-only dashboard projection
             return new
             {
                 kind = "vendor",
@@ -378,7 +387,7 @@ public class BotBrainService : BackgroundService
         }
 
         if (c.Quest is { } q && q.Batch.Count > 0)
-        {
+        {   // cb:fold read-only dashboard projection
             return new
             {
                 kind = "quest",
@@ -400,7 +409,7 @@ public class BotBrainService : BackgroundService
         }
 
         if (c.Grind is { } g)
-        {
+        {   // cb:fold read-only dashboard projection
             return new
             {
                 kind = "grind",
@@ -423,7 +432,7 @@ public class BotBrainService : BackgroundService
     {
         var aq = c.Quest?.Active;
         var node = aq?.Node;
-        if (aq == null || node == null) return null;
+        if (aq == null || node == null) return null;   // cb:fold read-only dashboard projection
 
         c.QuestLog.TryGetValue(aq.QuestId, out var log);
         var objectives = new List<object>();
@@ -506,6 +515,7 @@ public class BotBrainService : BackgroundService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "host: grouping mode persist failed");
             _logger.LogError(ex, "BotBrain: failed to persist grouping mode");
         }
     }
@@ -514,12 +524,13 @@ public class BotBrainService : BackgroundService
     public async Task<BotGroup?> FormGroupAsync(int leaderGuid, params int[] followerGuids)
     {
         var group = _groupManager.FormGroup(leaderGuid, followerGuids);
-        if (group == null) return null;
+        if (group == null) { CircuitTrace.Hit(leaderGuid, "host: form group refused by manager"); return null; }
 
         foreach (var guid in group.MemberGuids)
             if (_bots.TryGetValue(guid, out var bot))
-                _groupManager.EnrichBotIdentity(bot);
+                _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
 
+        CircuitTrace.Hit(leaderGuid, "host: FORM_GROUP sent to leader");
         await _bridge.SendToBotAsync(leaderGuid, "FORM_GROUP", new
         {
             member_guids = group.GetFollowers()
@@ -533,7 +544,7 @@ public class BotBrainService : BackgroundService
     public async Task DisbandGroupAsync(int groupId)
     {
         var group = _groupManager.GetAllGroups().FirstOrDefault(g => g.GroupId == groupId);
-        if (group == null) return;
+        if (group == null) { CircuitTrace.Hit(0, "host: disband refused, group not found"); return; }
 
         int leaderGuid = group.LeaderGuid;
         var members = group.MemberGuids.ToList();
@@ -541,8 +552,9 @@ public class BotBrainService : BackgroundService
         _groupManager.DisbandGroup(groupId);
         foreach (var guid in members)
             if (_bots.TryGetValue(guid, out var bot))
-                _groupManager.EnrichBotIdentity(bot);
+                _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
 
+        CircuitTrace.Hit(leaderGuid, "host: DISBAND_GROUP sent to leader");
         await _bridge.SendToBotAsync(leaderGuid, "DISBAND_GROUP", new { });
         await _groupManager.SaveGroupsToDbAsync();
     }
@@ -560,16 +572,19 @@ public class BotBrainService : BackgroundService
         {
             int leaderGuid = group.LeaderGuid;
             var members = group.MemberGuids.ToList();
-            if (!_groupManager.DisbandGroup(group.GroupId)) continue;
+            if (!_groupManager.DisbandGroup(group.GroupId)) continue;   // cb:fold iteration filter
             disbanded++;
             foreach (var guid in members)
                 if (_bots.TryGetValue(guid, out var bot))
-                    _groupManager.EnrichBotIdentity(bot);
+                    _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
             try { await _bridge.SendToBotAsync(leaderGuid, "DISBAND_GROUP", new { }); }
-            catch (Exception ex) { _logger.LogWarning(ex, "BotBrain: DISBAND_GROUP send failed for leader {Guid}", leaderGuid); }
+            catch (Exception ex) { CircuitTrace.Hit(leaderGuid, "host: DISBAND_GROUP send failed"); _logger.LogWarning(ex, "BotBrain: DISBAND_GROUP send failed for leader {Guid}", leaderGuid); }
         }
         if (disbanded > 0)
+        {
+            CircuitTrace.Hit(0, "host: all groups disbanded", disbanded);
             await _groupManager.SaveGroupsToDbAsync();
+        }
         return disbanded;
     }
 
@@ -582,15 +597,19 @@ public class BotBrainService : BackgroundService
         {
             foreach (var guid in group.MemberGuids)
                 if (_bots.TryGetValue(guid, out var bot))
-                    _groupManager.EnrichBotIdentity(bot);
+                    _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
 
+            CircuitTrace.Hit(group.LeaderGuid, "host: auto-form FORM_GROUP sent to leader");
             await _bridge.SendToBotAsync(group.LeaderGuid, "FORM_GROUP", new
             {
                 member_guids = group.GetFollowers()
             });
         }
         if (formed.Count > 0)
+        {
+            CircuitTrace.Hit(0, "host: auto-formed groups", formed.Count);
             await _groupManager.SaveGroupsToDbAsync();
+        }
         return formed;
     }
 
@@ -606,6 +625,7 @@ public class BotBrainService : BackgroundService
     {
         if (evt.EventType == "LEVEL_UP" && evt.NewLevel > 0 && _bots.TryGetValue(guid, out var bot))
         {
+            CircuitTrace.Hit(guid, "host: level-up reflags training", evt.NewLevel);
             bot.Level = evt.NewLevel;
             // A level-up unlocks new class spells → flag the bot to visit a trainer (gold-gated in
             // GoalSelector). Clear any training cooldown so a fresh level justifies a retry even if a
@@ -616,7 +636,10 @@ public class BotBrainService : BackgroundService
         }
 
         if (_contexts.TryGetValue(guid, out var ctx))
+        {
+            CircuitTrace.Hit(guid, "host: event handed to spine driver");
             _driver.OnEvent(ctx, evt);
+        }
 
         return Task.CompletedTask;
     }
@@ -640,6 +663,9 @@ public class BotBrainService : BackgroundService
         // Personality quirk tables (load/roll on connect).
         _quirkLoader.Load();
 
+        // Circuit-board trace toggle state (mode + armed guids) from bot_settings.
+        await _circuit.LoadSettingsAsync();
+
         // Groups + grouping mode from DB.
         await _groupManager.LoadGroupsFromDbAsync();
         await LoadGroupingModeAsync();
@@ -657,16 +683,22 @@ public class BotBrainService : BackgroundService
                 // 2. Drive the spine (sense always; drive+supervise when enabled).
                 await RunBrainTicksAsync();
 
+                // 2b. Circuit-board pump: flush armed bots' sealed trace segments +
+                //     any wedge auto-dump requests to the daily JSONL.
+                _circuit.Tick();
+
                 // 3. Print the fleet picture on an interval.
                 if (_contexts.Count > 0 &&
                     (DateTime.UtcNow - _lastFleetLog).TotalSeconds >= FLEET_LOG_INTERVAL_SEC)
-                {
+                {   // cb:fold fleet-report logging cadence
+
                     _lastFleetLog = DateTime.UtcNow;
                     _logger.LogInformation("BotBrain fleet:\n{Report}", GetFleetReport());
                 }
             }
             catch (Exception ex)
             {
+                CircuitTrace.Hit(0, "host: main loop error");
                 _logger.LogError(ex, "BotBrain: main loop error");
             }
 
@@ -689,18 +721,19 @@ public class BotBrainService : BackgroundService
             int guid = kvp.Key;
             var bs = kvp.Value;
 
-            if (bs.TaskState == "DISCONNECTED") continue;
+            if (bs.TaskState == "DISCONNECTED") continue;   // cb:fold iteration filter
 
             bool alreadyInit;
             lock (_initializedGuidsLock) { alreadyInit = _initializedGuids.Contains(guid); }
 
             if (!alreadyInit)
             {
+                CircuitTrace.Hit(guid, "host: new bot on bridge, initializing");
                 await InitializeBotAsync(guid, bs);
                 lock (_initializedGuidsLock) { _initializedGuids.Add(guid); }
             }
             else if (_bots.TryGetValue(guid, out var bot))
-            {
+            {   // cb:fold mirror refresh, no decision
                 bot.Level = bs.Level;
                 _tracker.UpdatePosition(guid, bs.ZoneId, bs.MapId, bs.X, bs.Y, bs.Z);
             }
@@ -722,6 +755,7 @@ public class BotBrainService : BackgroundService
             if (_disconnectedAt.TryGetValue(guid, out var dcTime) &&
                 (DateTime.UtcNow - dcTime).TotalSeconds >= EVICT_DISCONNECT_SEC)
             {
+                CircuitTrace.Hit(guid, "host: stale bot evicted");
                 _groupManager.RemoveFromGroup(guid);
                 _bots.TryRemove(guid, out _);
                 _contexts.TryRemove(guid, out _);
@@ -729,6 +763,7 @@ public class BotBrainService : BackgroundService
                 _disconnectedAt.TryRemove(guid, out _);
                 _tracker.Remove(guid);
                 _fallRecorder.Forget(guid);   // drop the bot's fall-ring so evicted guids don't leak memory
+                CircuitTrace.Forget(guid);    // drop the bot's circuit ring likewise
                 _logger.LogInformation("BotBrain: evicted stale bot {Guid} (disconnected {Sec}s+)", guid, (int)EVICT_DISCONNECT_SEC);
             }
         }
@@ -757,25 +792,38 @@ public class BotBrainService : BackgroundService
         // decision+stamp -- it issues NO commands; the spine emits COMBAT_DIRECTIVE on change (BotBrain
         // step 1a) and the QuestPlanner consults the exec stamp. Only when driving; sensing-only skips it.
         if (_brainEnabled)
-            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety, _spawns, _driver.QuestPlanner, _zoneData);
+            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety, _spawns, _driver.QuestPlanner, _zoneData);   // cb:fold god-bot pre-pass, probed inside GroupCoordinator
 
         foreach (var kvp in _contexts)
         {
             var bs = _bridge.GetBotState(kvp.Key);
-            if (bs == null || bs.TaskState == "DISCONNECTED") continue;
+            if (bs == null || bs.TaskState == "DISCONNECTED") continue;   // cb:fold iteration filter
 
             // Gate on the first real STATE; HELLO carries placeholder health/position.
-            if (!bs.HasReceivedState) continue;
+            if (!bs.HasReceivedState) { CircuitTrace.Hit(kvp.Key, "host: awaiting first STATE, not ticked"); continue; }
 
             var snap = BotStateSnapshot.FromBridgeState(bs);
 
-            if (_brainEnabled)
-                await _driver.TickAsync(kvp.Value, snap);   // runs Sense → hold Idle → Supervise
-            else
-                kvp.Value.Sense(snap);                        // disabled: still sense so FleetReport stays live
+            // Circuit-board tick bracket (R10): every probe between Begin and End lands in
+            // one per-tick segment; EndTick stamps the bot's world position for the map view.
+            CircuitTrace.BeginTick(kvp.Key);
+            try
+            {
+                if (_brainEnabled)
+                    await _driver.TickAsync(kvp.Value, snap);   // cb:fold spine tick, probed throughout BotBrain
+                else
+                {
+                    CircuitTrace.Hit(kvp.Key, "host: sense only (driving disabled)");
+                    kvp.Value.Sense(snap);                        // disabled: still sense so FleetReport stays live
+                }
 
-            // Always-on void/fall black box: ctx.Pos is fresh (post-Sense) either way. Cheap; flushes only on a fall.
-            _fallRecorder.Observe(kvp.Value);
+                // Always-on void/fall black box: ctx.Pos is fresh (post-Sense) either way. Cheap; flushes only on a fall.
+                _fallRecorder.Observe(kvp.Value);
+            }
+            finally
+            {
+                CircuitTrace.EndTick(kvp.Key, snap.MapId, snap.ZoneId, snap.X, snap.Y, snap.Z);
+            }
         }
     }
 
@@ -798,6 +846,7 @@ public class BotBrainService : BackgroundService
 
             if (row != null)
             {
+                CircuitTrace.Hit(guid, "host: persisted personality loaded");
                 personality = new BotPersonality
                 {
                     Patience = (float)row.patience,
@@ -818,12 +867,14 @@ public class BotBrainService : BackgroundService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "host: personality load failed, will roll new");
             _logger.LogWarning(ex, "BotBrain: failed to load personality for bot {Guid} — will roll new", guid);
         }
 
         // Roll a new personality if none persisted.
         if (personality == null)
         {
+            CircuitTrace.Hit(guid, "host: new personality rolled");
             personality = PersonalityRoller.Roll(_quirkLoader.AllQuirks.ToList());
             await PersistPersonalityAsync(guid, personality);
             _logger.LogInformation("BotBrain: rolled new personality for {Name} (guid={Guid})", bs.Name, guid);
@@ -867,11 +918,13 @@ public class BotBrainService : BackgroundService
                 new { Guid = guid });
             foreach (var qid in rewarded)
                 bot.CompletedQuestIds.Add(qid);
+            CircuitTrace.Hit(guid, "host: completed quests hydrated", bot.CompletedQuestIds.Count);
             _logger.LogInformation("BotBrain: hydrated {Count} completed quests for {Name} (guid={Guid})",
                 bot.CompletedQuestIds.Count, bs.Name, guid);
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "host: completed-quest hydration failed");
             _logger.LogWarning(ex, "BotBrain: failed to hydrate completed quests for bot {Guid}", guid);
         }
 
@@ -907,6 +960,7 @@ public class BotBrainService : BackgroundService
                 new { Guid = guid });
             if (realOwner != null)
             {
+                CircuitTrace.Hit(guid, "host: REAL character detected, NOT registered as bot");
                 _logger.LogWarning(
                     "BotBrain: NOT registering {Name} (guid={Guid}) — real character on account {Account}",
                     bs.Name, guid, realOwner);
@@ -930,6 +984,7 @@ public class BotBrainService : BackgroundService
 
             if (existing == null)
             {
+                CircuitTrace.Hit(guid, "host: auto-registered in playerbot table");
                 await charConn.ExecuteAsync(@"
                     INSERT INTO playerbot (char_guid, chance, ai, name, race, `class`, level, map, position_x, position_y, position_z, spec_tab, active_role)
                     VALUES (@Guid, 100, 'AiBotAI', @Name, @Race, @Class, @Level, @Map, @X, @Y, @Z, @SpecTab, @ActiveRole)",
@@ -951,6 +1006,7 @@ public class BotBrainService : BackgroundService
             }
             else
             {
+                CircuitTrace.Hit(guid, "host: playerbot row refreshed");
                 await charConn.ExecuteAsync(@"
                     UPDATE playerbot SET name=@Name, level=@Level, map=@Map,
                            position_x=@X, position_y=@Y, position_z=@Z,
@@ -972,6 +1028,7 @@ public class BotBrainService : BackgroundService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "host: playerbot auto-register failed");
             _logger.LogWarning(ex, "BotBrain: failed to auto-register bot {Guid} in playerbot table", guid);
         }
     }
@@ -988,16 +1045,19 @@ public class BotBrainService : BackgroundService
 
             if (value != null && int.TryParse(value, out int mode) && Enum.IsDefined(typeof(GroupingMode), mode))
             {
+                CircuitTrace.Hit(0, "host: grouping mode loaded from DB", mode);
                 _groupManager.Mode = (GroupingMode)mode;
                 _logger.LogInformation("BotBrain: loaded grouping mode from DB: {Mode}", _groupManager.Mode);
             }
             else
             {
+                CircuitTrace.Hit(0, "host: grouping mode defaulted to Off");
                 _groupManager.Mode = GroupingMode.Off;
             }
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "host: grouping mode load failed, defaulting to Off");
             _logger.LogWarning(ex, "BotBrain: failed to load grouping mode, defaulting to Off");
             _groupManager.Mode = GroupingMode.Off;
         }
@@ -1042,6 +1102,7 @@ public class BotBrainService : BackgroundService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(guid, "host: personality persist failed");
             _logger.LogWarning(ex, "BotBrain: failed to persist personality for bot {Guid}", guid);
         }
     }
@@ -1085,7 +1146,7 @@ public class BotBrainService : BackgroundService
             foreach (var (name, ddl) in columns)
             {
                 if (await ColumnExistsAsync(conn, "playerbot", name))
-                    continue;
+                    continue;   // cb:fold schema check detail
 
                 await conn.ExecuteAsync($"ALTER TABLE playerbot ADD COLUMN {ddl}");
                 added++;
@@ -1093,7 +1154,7 @@ public class BotBrainService : BackgroundService
             }
 
             if (added > 0)
-                _logger.LogInformation("BotBrain: playerbot schema self-heal added {Count} column(s)", added);
+                _logger.LogInformation("BotBrain: playerbot schema self-heal added {Count} column(s)", added);   // cb:fold logging only
 
             // Identity migration is deliberately left to the core talent planner. It
             // can distinguish a fresh zero-point bot (safe round-robin assignment)
@@ -1102,6 +1163,7 @@ public class BotBrainService : BackgroundService
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "host: playerbot schema self-heal failed");
             // Non-fatal: log loudly. If this fails (e.g. permissions), bot load will fail
             // later with the same 1054 and the operator gets a second, pointed signal.
             _logger.LogError(ex, "BotBrain: failed to self-heal characters.playerbot schema — bot load may fail with unknown-column errors until the identity columns exist");
@@ -1123,24 +1185,24 @@ public class BotBrainService : BackgroundService
 
     private static int ResolveDefaultBotRole(int guid, int classId, int specTab) => (classId, specTab) switch
     {
-        (1, 2) => 3,                    // Protection Warrior
-        (1, _) => 1,
-        (2, 0) => 4,                    // Holy Paladin
-        (2, 1) => 3,                    // Protection Paladin
-        (2, _) => 1,
-        (3, _) => 2,
-        (4, _) => 1,
-        (5, 0 or 1) => 4,
-        (5, _) => 2,
-        (7, 0) => 2,
-        (7, 1) => 1,
-        (7, _) => 4,
-        (8, _) => 2,
-        (9, _) => 2,
-        (11, 0) => 2,
-        (11, 1) => ((guid / 3) % 2 == 0 ? 1 : 3), // Feral Cat/Bear alternation
-        (11, _) => 4,
-        _ => 0
+        (1, 2) => 3,                    // Protection Warrior   // cb:fold pure role lookup
+        (1, _) => 1,   // cb:fold pure role lookup
+        (2, 0) => 4,                    // Holy Paladin   // cb:fold pure role lookup
+        (2, 1) => 3,                    // Protection Paladin   // cb:fold pure role lookup
+        (2, _) => 1,   // cb:fold pure role lookup
+        (3, _) => 2,   // cb:fold pure role lookup
+        (4, _) => 1,   // cb:fold pure role lookup
+        (5, 0 or 1) => 4,   // cb:fold pure role lookup
+        (5, _) => 2,   // cb:fold pure role lookup
+        (7, 0) => 2,   // cb:fold pure role lookup
+        (7, 1) => 1,   // cb:fold pure role lookup
+        (7, _) => 4,   // cb:fold pure role lookup
+        (8, _) => 2,   // cb:fold pure role lookup
+        (9, _) => 2,   // cb:fold pure role lookup
+        (11, 0) => 2,   // cb:fold pure role lookup
+        (11, 1) => ((guid / 3) % 2 == 0 ? 1 : 3), // Feral Cat/Bear alternation   // cb:fold pure role lookup
+        (11, _) => 4,   // cb:fold pure role lookup
+        _ => 0   // cb:fold pure role lookup
     };
 
     private sealed class PlayerbotIdentityRow

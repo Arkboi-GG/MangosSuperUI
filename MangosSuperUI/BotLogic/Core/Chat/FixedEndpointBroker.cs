@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using Dapper;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Chat.Core;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Chat.Capacity;
 
@@ -53,7 +54,7 @@ public sealed class InferenceLease : IDisposable
 
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _released, 1) == 0) _release();
+        if (Interlocked.Exchange(ref _released, 1) == 0) { CircuitTrace.Hit(0, "chat: inference lease released"); _release(); }
     }
 }
 
@@ -122,16 +123,17 @@ public class FixedEndpointBroker : IInferenceBroker
             flavor = _apiFlavor;
             model = cls switch
             {
-                TrafficClass.Ambient => _modelAmbient,
+                TrafficClass.Ambient => CircuitTrace.Pass(_modelAmbient, 0, "chat: ambient model chosen for lease"),
                 // Batch prefers model_batch; manual runs (voice build button) fall back
                 // to the reactive tag when batch is unset — the operator clicked, honor it.
-                TrafficClass.Batch => string.IsNullOrEmpty(_modelBatch) ? _modelReactive : _modelBatch,
-                _ => _modelReactive
+                TrafficClass.Batch => CircuitTrace.Pass(string.IsNullOrEmpty(_modelBatch) ? _modelReactive : _modelBatch, 0, "chat: batch model chosen for lease"),
+                _ => CircuitTrace.Pass(_modelReactive, 0, "chat: reactive model chosen for lease")
             };
         }
-        if (string.IsNullOrEmpty(endpoint)) return null;
+        if (string.IsNullOrEmpty(endpoint)) { CircuitTrace.Hit(0, "chat: acquire failed, no endpoint configured"); return null; }
         if (string.IsNullOrEmpty(model))
         {
+            CircuitTrace.Hit(0, "chat: acquire failed, no model tag for class");
             _logger.LogWarning("[CHAT-CAP] no model tag for {Class} on profile '{Name}' — check the Capacity page", cls, _profileName);
             return null;
         }
@@ -139,19 +141,19 @@ public class FixedEndpointBroker : IInferenceBroker
         // The voice library is the fleet's ONLY diversity source and it is written once.
         // If Batch is silently running on the small reactive model, say so out loud.
         if (cls == TrafficClass.Batch && string.IsNullOrEmpty(_modelBatch))
-            _logger.LogWarning("[CHAT-CAP] Batch has no model_batch tag on profile '{Name}' — falling back to the " +
+            _logger.LogWarning("[CHAT-CAP] Batch has no model_batch tag on profile '{Name}' — falling back to the " +   // cb:fold logging only, fallback carried by batch model lease probe
                                "REACTIVE model '{Model}'. The voice library is generated once and every persona " +
                                "descends from it; set model_batch to the largest model you can serve.",
                                _profileName, model);
 
         bool got;
         try { got = await slots.WaitAsync(maxWait, ct); }
-        catch (OperationCanceledException) { return null; }
-        if (!got) return null;
+        catch (OperationCanceledException) { CircuitTrace.Hit(0, "chat: lease wait cancelled"); return null; }
+        if (!got) { CircuitTrace.Hit(0, "chat: lease wait timed out, no slot"); return null; }
 
         return new InferenceLease(cls, model, endpoint, flavor, () =>
         {
-            try { slots.Release(); } catch (ObjectDisposedException) { /* profile swapped */ }
+            try { slots.Release(); } catch (ObjectDisposedException) { CircuitTrace.Hit(0, "chat: lease release hit swapped semaphore"); /* profile swapped */ }
         });
     }
 
@@ -198,15 +200,17 @@ public class FixedEndpointBroker : IInferenceBroker
 
             if (string.IsNullOrEmpty(result?.Response))
             {
+                CircuitTrace.Hit(0, "chat: ollama generation returned empty");
                 _logger.LogWarning("[CHAT-ENGINE] generation fail — empty response (model={Model}, {Ms} ms)", lease.Model, sw.ElapsedMilliseconds);
                 return null;
             }
             _logger.LogInformation("[CHAT-ENGINE] generation ok — {Class} model={Model} latency={Ms} ms", lease.Class, lease.Model, sw.ElapsedMilliseconds);
             return result.Response;
         }
-        catch (OperationCanceledException) { return null; }
+        catch (OperationCanceledException) { CircuitTrace.Hit(0, "chat: ollama generation cancelled"); return null; }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "chat: ollama generation failed");
             _logger.LogWarning("[CHAT-ENGINE] generation fail — {Error} (model={Model}, {Ms} ms)", ex.Message, lease.Model, sw.ElapsedMilliseconds);
             return null;
         }
@@ -254,15 +258,17 @@ public class FixedEndpointBroker : IInferenceBroker
             var text = result?.Choices?.FirstOrDefault()?.Message?.Content;
             if (string.IsNullOrEmpty(text))
             {
+                CircuitTrace.Hit(0, "chat: openai generation returned empty");
                 _logger.LogWarning("[CHAT-ENGINE] generation fail — empty openai response (model={Model}, {Ms} ms)", lease.Model, sw.ElapsedMilliseconds);
                 return null;
             }
             _logger.LogInformation("[CHAT-ENGINE] generation ok — {Class} openai model={Model} latency={Ms} ms", lease.Class, lease.Model, sw.ElapsedMilliseconds);
             return text;
         }
-        catch (OperationCanceledException) { return null; }
+        catch (OperationCanceledException) { CircuitTrace.Hit(0, "chat: openai generation cancelled"); return null; }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "chat: openai generation failed");
             _logger.LogWarning("[CHAT-ENGINE] generation fail — {Error} (openai model={Model}, {Ms} ms)", ex.Message, lease.Model, sw.ElapsedMilliseconds);
             return null;
         }
@@ -281,7 +287,7 @@ public class FixedEndpointBroker : IInferenceBroker
     {
         lock (_gate)
         {
-            if (DateTime.UtcNow - _profileUtc < TimeSpan.FromSeconds(60)) return;
+            if (DateTime.UtcNow - _profileUtc < TimeSpan.FromSeconds(60)) { CircuitTrace.Hit(0, "chat: profile fresh, refresh skipped"); return; }
             _profileUtc = DateTime.UtcNow;
         }
         try
@@ -295,6 +301,7 @@ public class FixedEndpointBroker : IInferenceBroker
                 FROM chat_inference_profile WHERE active=1 LIMIT 1");
             if (p == null)
             {
+                CircuitTrace.Hit(0, "chat: no active inference profile");
                 _logger.LogWarning("[CHAT-CAP] no ACTIVE inference profile — chat generation disabled until one is activated");
                 return;
             }
@@ -302,16 +309,19 @@ public class FixedEndpointBroker : IInferenceBroker
             // (vLLM exposes exactly one model on /v1/models).
             if (string.Equals(p.ApiFlavor?.Trim(), "openai", StringComparison.OrdinalIgnoreCase) && (string.IsNullOrEmpty(p.ModelReactive) || string.IsNullOrEmpty(p.ModelAmbient) || string.IsNullOrEmpty(p.ModelBatch)))
             {
+                CircuitTrace.Hit(0, "chat: openai profile has empty tags, probing served model");
                 var served = ResolveServedModel(p.Endpoint);
                 if (served != null)
                 {
-                    if (string.IsNullOrEmpty(p.ModelReactive)) p.ModelReactive = served;
-                    if (string.IsNullOrEmpty(p.ModelAmbient)) p.ModelAmbient = served;
-                    if (string.IsNullOrEmpty(p.ModelBatch)) p.ModelBatch = served;
+                    CircuitTrace.Hit(0, "chat: served model auto-resolved into empty tags");
+                    if (string.IsNullOrEmpty(p.ModelReactive)) p.ModelReactive = served;   // cb:fold tag fill-in detail, resolution probed above
+                    if (string.IsNullOrEmpty(p.ModelAmbient)) p.ModelAmbient = served;   // cb:fold tag fill-in detail, resolution probed above
+                    if (string.IsNullOrEmpty(p.ModelBatch)) p.ModelBatch = served;   // cb:fold tag fill-in detail, resolution probed above
                     _logger.LogInformation("[CHAT-CAP] profile '{Name}' auto-resolved served model → '{Model}'", p.Name, served);
                 }
                 else
                 {
+                    CircuitTrace.Hit(0, "chat: served model unreachable, tags stay empty");
                     _logger.LogWarning("[CHAT-CAP] profile '{Name}' has empty model tags and /v1/models is unreachable", p.Name);
                 }
             }
@@ -321,6 +331,7 @@ public class FixedEndpointBroker : IInferenceBroker
                 var v = p;
                 if (v.Name != _profileName || v.Concurrency != _concurrency)
                 {
+                    CircuitTrace.Hit(0, "chat: profile changed, semaphore rebuilt", v.Concurrency);
                     _logger.LogInformation("[CHAT-CAP] profile in use → '{Name}' ({Endpoint}, concurrency {Conc}, ctx {Ctx})",
                         v.Name, v.Endpoint, v.Concurrency, v.CtxBudget);
                     _slots = new SemaphoreSlim(Math.Max(1, v.Concurrency), Math.Max(1, v.Concurrency));
@@ -337,6 +348,7 @@ public class FixedEndpointBroker : IInferenceBroker
         }
         catch (Exception ex)
         {
+            CircuitTrace.Hit(0, "chat: profile refresh failed");
             _logger.LogError(ex, "[CHAT-CAP] profile refresh failed");
         }
     }
@@ -361,7 +373,7 @@ public class FixedEndpointBroker : IInferenceBroker
             var models = JsonSerializer.Deserialize<OpenAiModelList>(json, JsonOpts);
             return models?.Data?.FirstOrDefault()?.Id;
         }
-        catch { return null; }
+        catch { CircuitTrace.Hit(0, "chat: /v1/models probe failed"); return null; }
     }
 
     // ---------- OpenAI-compatible DTOs (vLLM /v1/chat/completions + /v1/models) ----------
