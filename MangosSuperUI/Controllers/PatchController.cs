@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
 using Dapper;
@@ -2109,6 +2109,7 @@ public partial class PatchController : Controller
                 // BLPs, geometry M2s) persisted from an MSUIClient design session
                 PerPathPatchedM2s = CompleterStore.LoadPerPathM2s(_env.WebRootPath, config.SpellName),
                 ExtraMpqFiles = CompleterStore.LoadExtraFiles(_env.WebRootPath, config.SpellName),
+                CustomAudio = CompleterStore.LoadAudio(_env.WebRootPath, config.SpellName),
                 // Session 45: R1 gameplay fields for DBC accuracy
                 ManaCost = r1Fields != null ? (int?)Convert.ToInt32(r1Fields.manaCost ?? 0) : null,
                 EffectBasePoints0 = r1Fields != null ? (int?)Convert.ToInt32(r1Fields.effectBasePoints1 ?? 0) : null,

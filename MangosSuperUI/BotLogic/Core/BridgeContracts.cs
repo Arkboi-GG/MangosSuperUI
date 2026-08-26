@@ -29,18 +29,6 @@ public class BridgeCommand
     }
 
     /// <summary>
-    /// Story correlation stamp (BotStoryRider). Writes the corr onto the wire payload
-    /// so the C++ outcome can echo it and the story merger can link this command to
-    /// its result. Additive and passive: a null corr is a no-op; nothing else changes.
-    /// Usage: new BridgeCommand("MOVE_TO", payload).WithCorr(bot.Story?.Intent(...));
-    /// </summary>
-    public BridgeCommand WithCorr(string? corr)
-    {
-        if (corr != null) Payload["corr"] = corr;   // cb:fold trivial data-shape guard, wire value object with no guid in reach
-        return this;
-    }
-
-    /// <summary>
     /// COMBAT_DIRECTIVE -- the per-member combat seam (grouping §3.6). Stamps a follower
     /// to ASSIST the god-bot-nominated anchor's live victim (GUID-lock focus-fire), or
     /// clears the seam (mode=none). Fire-and-forget like SET_TASK: no corr, no ack -- the

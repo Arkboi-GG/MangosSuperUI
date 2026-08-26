@@ -30,6 +30,9 @@ public class CircuitTraceController : Controller
         _brain = brain;
     }
 
+    /// <summary>The Circuit Board viewer page (Bot Development → Circuit Board).</summary>
+    public IActionResult Index() => View();
+
     [HttpGet]
     public IActionResult Status() => Json(_brain.Circuit.Status());
 

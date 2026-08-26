@@ -140,8 +140,13 @@ public static class CircuitTrace
         public readonly object Lock = new();
         public TickSegment? Open;
         public readonly Queue<TickSegment> Sealed = new();
+        // View cache: sealed segments ALSO land here and survive DrainSealed, so
+        // /Peek can show an armed bot whose flush queue is drained every 250ms.
+        // Same objects, references only — the memory is the segments themselves.
+        public readonly Queue<TickSegment> Recent = new();
         public long Dropped;   // segments evicted unflushed (shadow ring overwrite)
     }
+    private const int RecentViewCap = 512;
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, BotRing> _rings = new();
     private static long _seq;
@@ -184,6 +189,8 @@ public static class CircuitTrace
         open.EndUtc = DateTime.UtcNow;
         ring.Sealed.Enqueue(open);
         while (ring.Sealed.Count > SegmentRingCap) { ring.Sealed.Dequeue(); ring.Dropped++; }
+        ring.Recent.Enqueue(open);
+        while (ring.Recent.Count > RecentViewCap) ring.Recent.Dequeue();
     }
 
     /// <summary>Move a bot's sealed segments out (host flush). Oldest first.</summary>
@@ -198,13 +205,15 @@ public static class CircuitTrace
         }
     }
 
-    /// <summary>Copy (without clearing) a bot's sealed segments — the API read path.</summary>
+    /// <summary>Copy (without clearing) a bot's recent segments — the API read path.
+    /// Reads the view cache, which flushing does NOT drain, so it works for both
+    /// shadow and armed bots.</summary>
     public static List<TickSegment> PeekSegments(int guid, int maxSegments = 256)
     {
         if (!_rings.TryGetValue(guid, out var ring)) return new List<TickSegment>();
         lock (ring.Lock)
         {
-            return ring.Sealed.Skip(Math.Max(0, ring.Sealed.Count - maxSegments)).ToList();
+            return ring.Recent.Skip(Math.Max(0, ring.Recent.Count - maxSegments)).ToList();
         }
     }
 

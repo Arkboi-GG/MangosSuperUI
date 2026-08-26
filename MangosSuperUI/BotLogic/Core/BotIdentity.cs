@@ -380,14 +380,6 @@ public class BotIdentity
 
 
     /// <summary>
-    /// Per-bot causal story emitter (BotStoryRider). Carried here so any code path
-    /// holding the bot can emit its story without threading a ref through every
-    /// signature. Created in BotBrainService.InitializeBotAsync. Nullable + invoked
-    /// null-conditionally at call sites (bot.Story?.Intent(...)) so it is a safe
-    /// no-op before init or when absent. Passive: read + emit only, never alters flow.
-    /// </summary>
-    public Tracking.BotStoryRider? Story { get; set; }
-    /// <summary>
     /// Clear expired deferrals. Called during quest selection.
     /// Time-gated deferrals expire by clock. Level-gated deferrals expire
     /// when bot reaches the required level (dangerLevel - SAFETY_MARGIN).

@@ -27,8 +27,9 @@ namespace MangosSuperUI.Services;
 ///
 /// Retained for the dashboard / grouping (carved out in their own phases):
 ///   GroupManager + group endpoints, BotIdentity roster (AllBots), personality
-///   load/roll/persist, story-rider toggles (demoted — superseded by FleetReport),
-///   GetBotBrainSummary, BrainEnabled.
+///   load/roll/persist, GetBotBrainSummary, BrainEnabled. (The old flight
+///   recorder + story rider were removed 2026-08-26 — the circuit board
+///   [CIRCUIT_BOARD.md, CircuitTrace/CircuitTraceHost] replaces both.)
 /// Shed: DecisionEngine + all domains as the driver, the grouping batch/errand
 ///   fan-out, known-good destinations, in-flight MOVE_TO recovery, fleet
 ///   diagnostics, and the flight recorder.
@@ -161,47 +162,6 @@ public class BotBrainService : BackgroundService
         _tracker.Remove(guid);
         _fallRecorder.Forget(guid);
         CircuitTrace.Forget(guid);
-    }
-
-    /// <summary>
-    /// Story-rider toggle (demoted: superseded by FleetReport, kept for the dashboard).
-    /// Flips each listed bot's rider Enabled flag (null/empty = whole fleet) and returns
-    /// the guids affected. Passive — sets a flag only; nothing emits in the rebuild.
-    /// </summary>
-    public IReadOnlyList<int> SetStoryEnabled(IEnumerable<int>? guids, bool on)
-    {
-        var targets = guids?.ToList();
-        var affected = new List<int>();
-        foreach (var kvp in _bots)
-        {
-            if (targets != null && targets.Count > 0 && !targets.Contains(kvp.Key)) continue;   // cb:fold iteration filter
-            var rider = kvp.Value.Story;
-            if (rider == null) continue;   // cb:fold iteration filter
-            rider.Enabled = on;
-            affected.Add(kvp.Key);
-        }
-        _logger.LogInformation("BotBrain: story rider {State} on {Count} bot(s)", on ? "ENABLED" : "DISABLED", affected.Count);
-        return affected;
-    }
-
-    /// <summary>Read-only story-rider status for the dashboard.</summary>
-    public IReadOnlyList<object> GetStoryStatus()
-    {
-        var list = new List<object>();
-        foreach (var kvp in _bots)
-        {
-            var rider = kvp.Value.Story;
-            if (rider == null) continue;   // cb:fold iteration filter
-            list.Add(new
-            {
-                guid = kvp.Key,
-                name = kvp.Value.Name,
-                enabled = rider.Enabled,
-                dropped = rider.DroppedRecords,
-                lastError = rider.LastError
-            });
-        }
-        return list;
     }
 
     /// <summary>
@@ -902,7 +862,6 @@ public class BotBrainService : BackgroundService
             // train pre-quest.
             HasUnlearnedSpells = bs.Level > 1
         };
-        bot.Story = new BotStoryRider(bot);   // demoted: toggleable but inert in the rebuild
 
         // Hydrate the durable completed-quest set from the character DB so a restart does NOT
         // re-offer already-rewarded quests (which inflates `av`, re-seeds finished content, and

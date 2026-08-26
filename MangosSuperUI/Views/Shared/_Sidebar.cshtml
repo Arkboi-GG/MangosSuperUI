@@ -379,13 +379,19 @@
             </ul>
         </div>
 
-        <!-- Development -->
+        <!-- Bot Development -->
         <div class="sidebar-section" data-group="devtools" data-section="devdata">
             <div class="sidebar-section-title" data-toggle-group="devtools">
-                <span>Development</span>
+                <span>Bot Development</span>
                 <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
             </div>
             <ul class="sidebar-nav sidebar-nav-collapsible">
+                <li class="sidebar-nav-item" data-nav-key="circuittrace">
+                    <a asp-controller="CircuitTrace" asp-action="Index" class="@NavClass("CircuitTrace")">
+                        <i class="fa-solid fa-microchip"></i>
+                        Circuit Board
+                    </a>
+                </li>
             </ul>
         </div>
 

@@ -1,4 +1,4 @@
-using MangosSuperUI.Models;
+﻿using MangosSuperUI.Models;
 
 namespace MangosSuperUI.Services;
 
@@ -138,6 +138,56 @@ public class PatchBuilderService
     // All three use 10000 as a single unified floor (well above all vanilla maximums)
     private const uint CUSTOM_VISUAL_FLOOR = 10000;
 
+    // SoundEntries.dbc — vanilla 1.12 tops out in the low five figures, so 30000
+    // leaves generous headroom before the custom range starts.
+    private const uint CUSTOM_SOUND_FLOOR = 30000;
+
+    // ── SoundEntries.dbc layout, build 5875 ──
+    //
+    // Taken from MSUIClient's SoundEntriesCatalog, which parses this table to
+    // actually PLAY these sounds — a loader that works is the only field map
+    // worth trusting. 29 fields: id, type, name, ten file stringrefs, ten
+    // frequencies, the directory stringref, then volume/flags/distances/EAX.
+    private const int SOUND_FIELD_TYPE = 1;
+    private const int SOUND_FIELD_NAME = 2;
+    private const int SOUND_FIELD_FILE0 = 3;
+    private const int SOUND_FIELD_FREQ0 = 13;
+    private const int SOUND_FIELD_DIRECTORY = 23;
+    private const int SOUND_FIELD_VOLUME = 24;
+    private const int SOUND_FIELD_FLAGS = 25;
+    private const int SOUND_FIELD_MIN_DISTANCE = 26;
+    private const int SOUND_FIELD_CUTOFF = 27;
+    private const int SOUND_FIELD_EAX = 28;
+    private const int SOUND_FIELD_COUNT = 29;
+
+    private const uint SOUND_FLAG_LOOPING = 0x200;
+    private const uint SOUND_FLAG_NO_DUPLICATES = 0x20;
+
+    // ── Where a phase's sound is written ──
+    //
+    // SpellVisual field -> the SpellVisualKit for that stage; the kit's field 13
+    // is its SoundEntries id. Both indices come from MSUIClient's
+    // SpellVisualCatalog, which is byte-verified against build 5875 and checked
+    // against tools/spellvis/spellvis.py.
+    //
+    // NOTE this disagrees with the field map documented in SpellVisualCloner:
+    // that comment calls SpellVisual[5] StateDone and [6] Channel, and puts the
+    // kit sound at [11]. Per the client, [5] IS channel, [6] is the never-read
+    // missile gate, and kit [11] is the ninth EFFECT slot — writing a sound id
+    // there would silently replace an effect model.
+    private const int KIT_FIELD_SOUND = 13;
+    private const int VISUAL_FIELD_MISSILE_SOUND = 10;
+
+    private static readonly Dictionary<string, int> AudioCueToVisualKitField =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["precast"] = 1,
+            ["cast"]    = 2,
+            ["impact"]  = 3,
+            ["state"]   = 4,
+            ["channel"] = 5,
+        };
+
     // ── Per-DBC scrub floor map ──
     // When reading server DBCs, scrub custom entries above these floors
     // NOTE: SkillLineAbility.dbc is NOT in this map — it uses a custom scrub
@@ -149,6 +199,7 @@ public class PatchBuilderService
         { "SpellVisualEffectName.dbc",  CUSTOM_VISUAL_FLOOR },
         { "Spell.dbc",                  CUSTOM_SPELL_FLOOR },
         { "SpellIcon.dbc",              CUSTOM_ICON_FLOOR },
+        { "SoundEntries.dbc",           CUSTOM_SOUND_FLOOR },
     };
 
     private string DbcPath => _config["Vmangos:DbcPath"]
@@ -236,6 +287,29 @@ public class PatchBuilderService
                 "PatchBuilder: Loaded clean DBCs — Spell:{S} Visual:{V} Kit:{K} Effect:{E} SLA:{SLA} Icon:{I}",
                 spellDbc.RecordCount, visualDbc.RecordCount, kitDbc.RecordCount,
                 effectNameDbc.RecordCount, skillLineAbilityDbc.RecordCount, spellIconDbc.RecordCount);
+
+            // SoundEntries is only touched when a spell actually carries custom audio:
+            // most rebuilds have none, and a setup without the file on disk must keep
+            // building patches exactly as before rather than failing at the read.
+            DbcWriterService? soundDbc = null;
+            if (spells.Any(s => s.CustomAudio is { Count: > 0 }))
+            {
+                try
+                {
+                    soundDbc = ReadCleanDbc("DBFilesClient\\SoundEntries.dbc");
+                    if (soundDbc.FieldCount < SOUND_FIELD_COUNT)
+                    {
+                        result.Errors.Add($"SoundEntries.dbc has {soundDbc.FieldCount} fields, " +
+                            $"expected at least {SOUND_FIELD_COUNT} — custom spell audio skipped");
+                        soundDbc = null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "PatchBuilder: SoundEntries.dbc unavailable — custom audio skipped");
+                    result.Errors.Add($"SoundEntries.dbc could not be read ({ex.Message}) — custom spell audio skipped");
+                }
+            }
 
             var mpqBuilder = new MpqBuilderService(_logger as ILogger<MpqBuilderService>);
             int totalM2s = 0;
@@ -567,6 +641,11 @@ public class PatchBuilderService
                                     "PatchBuilder: [{Name}] Added completer file {Path} ({Bytes} bytes)",
                                     request.SpellName, extraPath, extraBytes.Length);
                             }
+
+                    // ── Spell Completer custom phase audio ──
+                    if (request.CustomAudio is { Count: > 0 } && soundDbc is not null)
+                        ApplyCustomAudio(request, soundDbc, visualDbc, kitDbc,
+                            cloneResult.NewVisualId, mpqBuilder, extraMpqFilesAdded, result);
 
                     // Add custom BLP
                     if (customBlpBytes != null && customBlpMpqPath != null)
@@ -1007,6 +1086,12 @@ public class PatchBuilderService
             mpqBuilder.AddFile("DBFilesClient\\SkillLineAbility.dbc", slaDbcBytes);
             mpqBuilder.AddFile("DBFilesClient\\SpellIcon.dbc", iconDbcBytes);
 
+            // Only present when a spell brought its own audio, so an ordinary
+            // rebuild never ships a megabyte of unchanged sound table.
+            byte[]? soundDbcBytes = soundDbc?.Write();
+            if (soundDbcBytes is not null)
+                mpqBuilder.AddFile("DBFilesClient\\SoundEntries.dbc", soundDbcBytes);
+
             // ── Step 4: Write server DBCs ──
             try
             {
@@ -1016,6 +1101,8 @@ public class PatchBuilderService
                 File.WriteAllBytes(Path.Combine(DbcPath, "SpellVisualEffectName.dbc"), efnDbcBytes);
                 File.WriteAllBytes(Path.Combine(DbcPath, "SkillLineAbility.dbc"), slaDbcBytes);
                 File.WriteAllBytes(Path.Combine(DbcPath, "SpellIcon.dbc"), iconDbcBytes);
+                if (soundDbcBytes is not null)
+                    File.WriteAllBytes(Path.Combine(DbcPath, "SoundEntries.dbc"), soundDbcBytes);
                 _logger.LogInformation("PatchBuilder: Updated ALL server DBCs");
             }
             catch (Exception ex)
@@ -1494,6 +1581,122 @@ public class PatchBuilderService
     /// extension; the client appends it automatically when loading the texture.
     /// Returns the new SpellIcon.dbc ID for use in Spell.dbc field [117].
     /// </summary>
+    /// <summary>
+    /// Give one completed spell its custom phase sounds.
+    ///
+    /// Dropping the audio file into the MPQ is the easy third of this: a sound
+    /// only reaches the player if SoundEntries.dbc describes it AND the spell's
+    /// visual points at that description. Both halves land on rows this spell
+    /// already owns — SpellVisualCloner gave it private kit rows — so nothing
+    /// here can change how any vanilla spell sounds.
+    ///
+    /// A cue whose stage the source spell never had (an impact sound on a spell
+    /// with no impact kit) is reported and skipped, not forced somewhere it
+    /// would be wrong.
+    /// </summary>
+    private void ApplyCustomAudio(
+        SpellPatchRequest request,
+        DbcWriterService soundDbc,
+        DbcWriterService visualDbc,
+        DbcWriterService kitDbc,
+        uint newVisualId,
+        MpqBuilderService mpqBuilder,
+        HashSet<string> mpqFilesAdded,
+        UnifiedPatchResult result)
+    {
+        uint[]? visualRow = visualDbc.GetRow(newVisualId);
+        if (visualRow is null)
+        {
+            result.Errors.Add($"{request.SpellName}: visual {newVisualId} vanished before audio wiring");
+            return;
+        }
+
+        foreach (CustomAudioTrack track in request.CustomAudio!)
+        {
+            if (track.Bytes.Length == 0 || track.MpqPath.Length == 0) continue;
+
+            // Where does this cue's id go? Missile has its own SpellVisual field;
+            // every other cue lives on the kit for its stage.
+            bool isMissile = string.Equals(track.Cue, "missile", StringComparison.OrdinalIgnoreCase);
+            uint targetKitId = 0;
+            if (!isMissile)
+            {
+                if (!AudioCueToVisualKitField.TryGetValue(track.Cue, out int kitField))
+                {
+                    result.Errors.Add($"{request.SpellName}: unknown audio cue '{track.Cue}' — skipped");
+                    continue;
+                }
+                uint raw = kitField < visualRow.Length ? visualRow[kitField] : 0;
+                // Both 0 and 0xFFFFFFFF mean "no kit" in these tables.
+                if (raw is 0 or uint.MaxValue)
+                {
+                    result.Errors.Add($"{request.SpellName}: the source spell has no {track.Cue} " +
+                        "stage, so its custom sound has nothing to attach to — skipped");
+                    continue;
+                }
+                targetKitId = raw;
+            }
+
+            // ── The MPQ file ──
+            // Split by hand: this service runs on Linux, where Path.GetDirectoryName
+            // does not treat a backslash as a separator and would hand back "".
+            string mpqPath = track.MpqPath.Replace('/', '\\');
+            int cut = mpqPath.LastIndexOf('\\');
+            string directory = cut > 0 ? mpqPath[..cut] : "";
+            string fileName = cut >= 0 ? mpqPath[(cut + 1)..] : mpqPath;
+            if (fileName.Length == 0)
+            {
+                result.Errors.Add($"{request.SpellName}: the {track.Cue} sound has no file name — skipped");
+                continue;
+            }
+            if (mpqFilesAdded.Add(mpqPath.ToLowerInvariant()))
+                mpqBuilder.AddFile(mpqPath, track.Bytes);
+
+            // ── The SoundEntries row ──
+            uint soundId = Math.Max(soundDbc.GetMaxId() + 1, CUSTOM_SOUND_FLOOR);
+            var fields = new uint[soundDbc.RecordSize / 4];
+            fields[0] = soundId;
+            fields[SOUND_FIELD_TYPE] = track.SoundType;
+            fields[SOUND_FIELD_NAME] = soundDbc.AddString(
+                $"{SanitizeName(request.SpellName)}_{track.Cue}");
+            // One variant. The creator imports a single file per phase; the other
+            // nine slots stay empty, which the client reads as "no variant".
+            fields[SOUND_FIELD_FILE0] = soundDbc.AddString(fileName);
+            fields[SOUND_FIELD_FREQ0] = 1;
+            fields[SOUND_FIELD_DIRECTORY] = soundDbc.AddString(directory);
+            fields[SOUND_FIELD_VOLUME] = DbcWriterService.FloatToUint(track.Volume);
+            fields[SOUND_FIELD_FLAGS] = track.ExtraFlags
+                | (track.Looping ? SOUND_FLAG_LOOPING : 0u)
+                | (track.NoDuplicates ? SOUND_FLAG_NO_DUPLICATES : 0u);
+            fields[SOUND_FIELD_MIN_DISTANCE] = DbcWriterService.FloatToUint(track.MinDistance);
+            fields[SOUND_FIELD_CUTOFF] = DbcWriterService.FloatToUint(track.CutoffDistance);
+            fields[SOUND_FIELD_EAX] = track.Eax;
+
+            try
+            {
+                soundDbc.AddRow(fields);
+                if (isMissile)
+                    visualDbc.PatchRow(newVisualId, VISUAL_FIELD_MISSILE_SOUND, soundId);
+                else
+                    kitDbc.PatchRow(targetKitId, KIT_FIELD_SOUND, soundId);
+            }
+            catch (Exception ex)
+            {
+                // The file is already in the archive; without its row it is just an
+                // unreferenced blob, so the patch stays valid and only this cue is lost.
+                _logger.LogWarning(ex, "PatchBuilder: [{Name}] {Cue} sound could not be wired",
+                    request.SpellName, track.Cue);
+                result.Errors.Add($"{request.SpellName}: the {track.Cue} sound could not be wired ({ex.Message})");
+                continue;
+            }
+
+            _logger.LogInformation(
+                "PatchBuilder: [{Name}] {Cue} sound -> SoundEntries #{Sound} at {Path} ({Bytes} bytes){Target}",
+                request.SpellName, track.Cue, soundId, mpqPath, track.Bytes.Length,
+                isMissile ? " on the missile" : $" on kit {targetKitId}");
+        }
+    }
+
     private uint PatchSpellIconDbc(DbcWriterService spellIconDbc, string sanitizedSpellName)
     {
         string textureBase = $@"Interface\Icons\CustomSpell_{sanitizedSpellName}";
@@ -1890,6 +2093,14 @@ public class SpellPatchRequest
     public Dictionary<string, byte[]>? ExtraMpqFiles { get; set; }
 
     /// <summary>
+    /// Spell Completer: replacement sounds for this spell's phases, designed in
+    /// MSUIClient's creator mode. Each gets a fresh SoundEntries.dbc row and is
+    /// attached to the spell's OWN cloned visual, so vanilla spells sharing the
+    /// original sound are untouched.
+    /// </summary>
+    public List<CustomAudioTrack>? CustomAudio { get; set; }
+
+    /// <summary>
     /// Session 33: Additional rank entries that need Spell.dbc + SkillLineAbility.dbc patching.
     /// These are ranks 2+ from GenerateRankChainAsync — they exist in spell_template (server)
     /// but not in the client DBCs. Each rank clones its Spell.dbc row from the corresponding
@@ -1916,6 +2127,28 @@ public class SpellPatchRequest
 /// <summary>Spell Completer: one effect slot's structure, mirrored SQL → DBC.
 /// Slot is 0-based here (DBC array index); null field = keep the cloned value.
 /// DieSides uses the DB convention (max-min) — the +1 lands at write time.</summary>
+/// <summary>One phase's custom sound: the audio itself plus the SoundEntries.dbc
+/// row that has to describe it.</summary>
+public class CustomAudioTrack
+{
+    /// <summary>precast, cast, missile, impact, state or channel.</summary>
+    public string Cue { get; set; } = "";
+    /// <summary>Full MPQ path the file is written to, backslash-separated.</summary>
+    public string MpqPath { get; set; } = "";
+    public byte[] Bytes { get; set; } = Array.Empty<byte>();
+    /// <summary>SoundEntries id the source spell used for this cue — provenance
+    /// only; the completed spell always gets its own row.</summary>
+    public uint SourceSoundId { get; set; }
+    public float Volume { get; set; } = 1f;
+    public bool Looping { get; set; }
+    public bool NoDuplicates { get; set; }
+    public uint SoundType { get; set; } = 1;
+    public uint ExtraFlags { get; set; }
+    public uint Eax { get; set; }
+    public float MinDistance { get; set; }
+    public float CutoffDistance { get; set; }
+}
+
 public class EffectStructurePatch
 {
     public int Slot { get; set; }

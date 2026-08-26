@@ -1,0 +1,205 @@
+@{
+    ViewData["Title"] = "Circuit Board";
+}
+
+@section Styles {
+    <style>
+        /* ---- Circuit Board viewer (v1: live decoded trace; map layer lands in Phase 5) ---- */
+        .cb-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            padding: 12px;
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            background: var(--bg-card-alt);
+            margin-bottom: 12px;
+        }
+
+            .cb-toolbar select, .cb-toolbar button {
+                padding: 6px 12px;
+                border: 1px solid var(--border-light);
+                border-radius: var(--radius-md);
+                background: var(--bg-card);
+                color: var(--text-primary);
+                font-size: 12.5px;
+                cursor: pointer;
+            }
+
+                .cb-toolbar button:hover { border-color: var(--accent); }
+                .cb-toolbar button.cb-active { border-color: var(--accent); color: var(--accent); }
+
+        .cb-status { font-size: 12px; color: var(--text-secondary); margin-left: auto; }
+
+        .cb-trace {
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            background: var(--bg-card);
+            font-family: var(--font-mono, ui-monospace, monospace);
+            font-size: 12px;
+            max-height: calc(100vh - 240px);
+            overflow-y: auto;
+        }
+
+        .cb-seg {
+            padding: 6px 12px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+            .cb-seg.cb-inter { opacity: 0.8; }
+
+        .cb-seg-head {
+            color: var(--text-secondary);
+            margin-bottom: 3px;
+            font-size: 11px;
+        }
+
+            .cb-seg-head .cb-kind { color: var(--accent); font-weight: 600; margin-right: 8px; }
+            .cb-seg-head .cb-pos { margin-left: 8px; }
+
+        .cb-hit { padding: 1px 0 1px 16px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+            .cb-hit .cb-id { display: inline-block; min-width: 44px; color: var(--text-secondary); }
+            .cb-hit .cb-val { color: var(--accent); margin-left: 6px; }
+            .cb-hit .cb-note { color: var(--warning, #e0af68); margin-left: 6px; }
+            .cb-hit.cb-repeat { color: var(--text-secondary); }
+
+        .cb-cycle {
+            border-left: 3px solid var(--danger, #f7768e);
+        }
+
+        .cb-empty { padding: 30px; text-align: center; color: var(--text-secondary); font-size: 13px; }
+    </style>
+}
+
+<div class="cb-toolbar">
+    <label for="cbBot" style="font-size:12.5px;color:var(--text-secondary)">Bot</label>
+    <select id="cbBot"><option value="0">— pick a bot —</option></select>
+    <button id="cbArm" title="Write this bot's trace to the daily file continuously">Arm</button>
+    <button id="cbDisarm" title="Stop writing (ring keeps recording in shadow)">Disarm</button>
+    <button id="cbDump" title="Flush this bot's whole ring to the daily file now">Dump ring</button>
+    <button id="cbShadow" title="Global: shadow rings record every bot in memory">Shadow: ?</button>
+    <button id="cbPause" title="Freeze the view (recording continues)">Pause</button>
+    <span class="cb-status" id="cbStatus">—</span>
+</div>
+
+<div class="cb-trace" id="cbTrace">
+    <div class="cb-empty">Pick a bot. Shadow mode must be on for anything to record; a repeating
+        tick path is rendered once with a ×count so a wedge reads as one loud line, not a wall.</div>
+</div>
+
+@section Scripts {
+    <script>
+        (function () {
+            var sites = {};          // id -> {file, line, desc}
+            var guid = 0;
+            var paused = false;
+            var lastMode = '?';
+
+            function loadSites() {
+                return $.getJSON('/CircuitTrace/Sites', function (list) {
+                    (list || []).forEach(function (s) { sites[s.id] = s; });
+                });
+            }
+
+            function loadBots() {
+                $.getJSON('/Bots/States', function (d) {
+                    var bots = (d && d.bots) || d || [];
+                    var sel = $('#cbBot');
+                    var cur = sel.val();
+                    sel.find('option:not(:first)').remove();
+                    bots.sort(function (a, b) { return (a.name || '').localeCompare(b.name || ''); })
+                        .forEach(function (b) {
+                            sel.append($('<option>').val(b.guid).text(b.name + ' (' + b.guid + ')'));
+                        });
+                    if (cur && cur !== '0') sel.val(cur);
+                });
+            }
+
+            function refreshStatus() {
+                $.getJSON('/CircuitTrace/Status', function (d) {
+                    if (!d) return;
+                    lastMode = d.mode;
+                    $('#cbShadow').text('Shadow: ' + d.mode).toggleClass('cb-active', d.mode === 'shadow');
+                    var mine = guid > 0 && (d.armed || []).indexOf(guid) >= 0;
+                    $('#cbArm').toggleClass('cb-active', mine);
+                    $('#cbStatus').text(d.mode + ' · ' + (d.armed || []).length + ' armed · ' +
+                        d.ringBots + ' bots ringing · ' + d.sites + ' sites');
+                });
+            }
+
+            function hitKey(h) { return h.join(''); }
+            function pathKey(seg) { return (seg.h || []).map(hitKey).join(''); }
+
+            function renderHit(h) {
+                var s = sites[h[0]];
+                var desc = s ? s.desc : ('site #' + h[0] + ' (unknown — refresh sites)');
+                var row = '<div class="cb-hit"><span class="cb-id">' + h[0] + '</span>' + $('<i>').text(desc).html();
+                if (h.length > 1 && h[1] !== null && h[1] !== undefined) row += '<span class="cb-val">' + h[1] + '</span>';
+                if (h.length > 2 && h[2]) row += '<span class="cb-note">' + $('<i>').text(h[2]).html() + '</span>';
+                return row + '</div>';
+            }
+
+            function render(segs) {
+                if (!segs.length) {
+                    $('#cbTrace').html('<div class="cb-empty">No segments yet for this bot. Is shadow mode on?</div>');
+                    return;
+                }
+                // Collapse consecutive segments with the IDENTICAL hit path into one row with a
+                // repeat count — a wedge cycle then reads as one loud entry instead of a wall.
+                var html = '';
+                var i = 0;
+                while (i < segs.length) {
+                    var seg = segs[i];
+                    var key = pathKey(seg);
+                    var run = 1;
+                    while (i + run < segs.length && segs[i + run].k === seg.k && pathKey(segs[i + run]) === key) run++;
+
+                    var t = (seg.t1 || seg.t0 || '').replace('T', ' ').substring(11, 23);
+                    var head = '<div class="cb-seg-head"><span class="cb-kind">' + seg.k +
+                        (run > 1 ? ' ×' + run : '') + '</span>' + t;
+                    if (seg.pos) head += '<span class="cb-pos">map ' + seg.pos.map + ' · zone ' + seg.pos.zone +
+                        ' · (' + seg.pos.x.toFixed(0) + ', ' + seg.pos.y.toFixed(0) + ')</span>';
+                    head += '</div>';
+
+                    html += '<div class="cb-seg' + (seg.k === 'inter' ? ' cb-inter' : '') + (run >= 8 ? ' cb-cycle' : '') + '">' +
+                        head + (seg.h || []).map(renderHit).join('') + '</div>';
+                    i += run;
+                }
+                var box = $('#cbTrace');
+                var stick = box[0].scrollHeight - box.scrollTop() - box.height() < 60;
+                box.html(html);
+                if (stick) box.scrollTop(box[0].scrollHeight);
+            }
+
+            function poll() {
+                if (paused || guid <= 0) return;
+                $.getJSON('/CircuitTrace/Peek?guid=' + guid + '&maxSegments=256', function (d) {
+                    var segs = (d && d.segments) || [];
+                    // any unknown site ids? refresh the manifest once, then render
+                    var unknown = segs.some(function (s) { return (s.h || []).some(function (h) { return !sites[h[0]]; }); });
+                    if (unknown) loadSites().always(function () { render(segs); });
+                    else render(segs);
+                });
+            }
+
+            $('#cbBot').on('change', function () { guid = parseInt($(this).val(), 10) || 0; $('#cbTrace').empty(); poll(); refreshStatus(); });
+            $('#cbArm').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Arm?guid=' + guid).done(refreshStatus); });
+            $('#cbDisarm').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Disarm?guid=' + guid).done(refreshStatus); });
+            $('#cbDump').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Dump?guid=' + guid); });
+            $('#cbShadow').on('click', function () {
+                var next = lastMode === 'shadow' ? 'off' : 'shadow';
+                $.post('/CircuitTrace/Mode?mode=' + next).done(refreshStatus);
+            });
+            $('#cbPause').on('click', function () { paused = !paused; $(this).text(paused ? 'Resume' : 'Pause').toggleClass('cb-active', paused); });
+
+            loadSites();
+            loadBots();
+            refreshStatus();
+            setInterval(poll, 1500);
+            setInterval(refreshStatus, 5000);
+            setInterval(loadBots, 30000);
+        })();
+    </script>
+}

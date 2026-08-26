@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace MangosSuperUI.Services;
 
@@ -26,6 +26,12 @@ namespace MangosSuperUI.Services;
 ///                               cannot be re-pointed). These override the art
 ///                               globally — same semantics as the creator's own
 ///                               patch-4.MPQ export.
+///   completer_audio_{i}.bin   — one phase's custom WAV/MP3. Unlike the two
+///                               above these are not just dropped into the MPQ:
+///                               each also needs a SoundEntries.dbc row and the
+///                               cloned SpellVisualKit for its phase pointed at
+///                               it, so the manifest carries the full DBC field
+///                               set (volume, flags, distances, EAX) with them.
 /// </summary>
 public static class CompleterStore
 {
@@ -38,6 +44,7 @@ public static class CompleterStore
         public string ExportedAtUtc { get; set; } = "";
         public List<ManifestModel> Models { get; set; } = new();
         public List<ManifestExtra> ExtraFiles { get; set; } = new();
+        public List<ManifestAudio> AudioTracks { get; set; } = new();
     }
 
     public sealed class ManifestModel
@@ -52,6 +59,30 @@ public static class CompleterStore
         /// <summary>MPQ path the bytes are written to verbatim.</summary>
         public string MpqPath { get; set; } = "";
         public string File { get; set; } = "";
+    }
+
+    /// <summary>One phase's replacement sound, with everything SoundEntries.dbc
+    /// needs to describe it. Field names mirror the creator's session schema so a
+    /// v2 audio entry maps across one-for-one.</summary>
+    public sealed class ManifestAudio
+    {
+        /// <summary>Which spell phase this replaces: precast, cast, missile,
+        /// impact, state, channel or area.</summary>
+        public string Cue { get; set; } = "";
+        /// <summary>MPQ path the audio file is written to.</summary>
+        public string MpqPath { get; set; } = "";
+        public string File { get; set; } = "";
+        /// <summary>The SoundEntries id the SOURCE spell used for this cue, kept
+        /// for provenance — the completed spell always gets a fresh row.</summary>
+        public uint SourceSoundId { get; set; }
+        public float Volume { get; set; } = 1f;
+        public bool Looping { get; set; }
+        public bool NoDuplicates { get; set; }
+        public uint SoundType { get; set; } = 1;
+        public uint ExtraFlags { get; set; }
+        public uint Eax { get; set; }
+        public float MinDistance { get; set; }
+        public float CutoffDistance { get; set; }
     }
 
     /// <summary>Same sanitization the texture cache and LoadPatchedM2s use.</summary>
@@ -75,7 +106,8 @@ public static class CompleterStore
     /// completer artifacts for this spell (re-completing is idempotent).</summary>
     public static void Save(string webRoot, string spellName, Manifest manifestMeta,
         List<(string originalPath, byte[] bytes)> models,
-        List<(string mpqPath, byte[] bytes)> extraFiles)
+        List<(string mpqPath, byte[] bytes)> extraFiles,
+        List<(ManifestAudio meta, byte[] bytes)>? audioTracks = null)
     {
         string dir = DirFor(webRoot, spellName);
         Directory.CreateDirectory(dir);
@@ -100,6 +132,14 @@ public static class CompleterStore
             string file = $"completer_extra_{i}.bin";
             File.WriteAllBytes(Path.Combine(dir, file), extraFiles[i].bytes);
             manifest.ExtraFiles.Add(new ManifestExtra { MpqPath = extraFiles[i].mpqPath, File = file });
+        }
+        for (int i = 0; i < (audioTracks?.Count ?? 0); i++)
+        {
+            string file = $"completer_audio_{i}.bin";
+            File.WriteAllBytes(Path.Combine(dir, file), audioTracks![i].bytes);
+            ManifestAudio meta = audioTracks[i].meta;
+            meta.File = file;
+            manifest.AudioTracks.Add(meta);
         }
 
         File.WriteAllText(Path.Combine(dir, ManifestName),
@@ -133,6 +173,39 @@ public static class CompleterStore
             string file = Path.Combine(dir, model.File);
             if (File.Exists(file))
                 result[NormalizeM2Key(model.OriginalPath)] = File.ReadAllBytes(file);
+        }
+        return result.Count > 0 ? result : null;
+    }
+
+    /// <summary>This spell's custom phase audio, for SpellPatchRequest.CustomAudio.
+    /// Null when it has none. A track whose blob went missing is dropped rather
+    /// than returned empty — the patch builder would otherwise mint a
+    /// SoundEntries row pointing at a file the MPQ never receives.</summary>
+    public static List<CustomAudioTrack>? LoadAudio(string webRoot, string spellName)
+    {
+        var manifest = LoadManifest(webRoot, spellName);
+        if (manifest is null || manifest.AudioTracks.Count == 0) return null;
+        string dir = DirFor(webRoot, spellName);
+        var result = new List<CustomAudioTrack>();
+        foreach (var track in manifest.AudioTracks)
+        {
+            string file = Path.Combine(dir, track.File);
+            if (!File.Exists(file)) continue;
+            result.Add(new CustomAudioTrack
+            {
+                Cue = track.Cue,
+                MpqPath = track.MpqPath,
+                Bytes = File.ReadAllBytes(file),
+                SourceSoundId = track.SourceSoundId,
+                Volume = track.Volume,
+                Looping = track.Looping,
+                NoDuplicates = track.NoDuplicates,
+                SoundType = track.SoundType,
+                ExtraFlags = track.ExtraFlags,
+                Eax = track.Eax,
+                MinDistance = track.MinDistance,
+                CutoffDistance = track.CutoffDistance,
+            });
         }
         return result.Count > 0 ? result : null;
     }

@@ -168,7 +168,6 @@ public class GroupManager
         _logger.LogInformation("[BOT-GROUP] Formed group {GroupId}: leader={Leader}, members=[{Members}]",
             group.GroupId, leaderGuid, string.Join(",", allMembers));
 
-        BotTrace.GroupEvent("form", group.GroupId, leaderGuid, allMembers);
 
         return group;
     }
@@ -191,7 +190,6 @@ public class GroupManager
         _logger.LogInformation("[BOT-GROUP] Disbanded group {GroupId} (was: [{Members}])",
             groupId, string.Join(",", group.MemberGuids));
 
-        BotTrace.GroupEvent("disband", groupId, group.LeaderGuid, group.MemberGuids);
 
         return true;
     }
@@ -207,8 +205,6 @@ public class GroupManager
 
         _logger.LogInformation("[BOT-GROUP] Removed bot {Guid} from group {GroupId}", botGuid, group.GroupId);
 
-        BotTrace.GroupEvent("remove", group.GroupId, group.LeaderGuid, group.MemberGuids,
-            detail: $"removed={botGuid} remaining=[{string.Join(",", group.MemberGuids)}]");
 
         // If only 1 member left, disband
         if (group.MemberGuids.Count <= 1)
@@ -223,8 +219,6 @@ public class GroupManager
             group.LeaderGuid = group.MemberGuids.Min();
             _logger.LogInformation("[BOT-GROUP] New leader for group {GroupId}: {NewLeader}",
                 group.GroupId, group.LeaderGuid);
-            BotTrace.GroupEvent("promote_leader", group.GroupId, group.LeaderGuid, group.MemberGuids,
-                detail: $"oldLeader={botGuid} newLeader={group.LeaderGuid} — followers must re-enrich");
         }
 
         return true;
@@ -526,8 +520,6 @@ public class GroupManager
                         "[BOT-GROUP] No-bot-left-behind: added {Name}({Guid}) to group {GroupId} (now {Size} members)",
                         stray.Name, stray.Guid, bestGroup.GroupId, bestGroup.Size);
 
-                    BotTrace.GroupEvent("add_stray", bestGroup.GroupId, bestGroup.LeaderGuid, bestGroup.MemberGuids,
-                        detail: $"added={stray.Guid} ({stray.Name}) now {bestGroup.Size} members");
                 }
             }
         }
@@ -555,9 +547,6 @@ public class GroupManager
     /// </summary>
     public void EnrichBotIdentity(BotIdentity bot)
     {
-        var prevGroup = bot.GroupId;
-        var prevLeader = bot.GroupLeaderGuid;
-
         var group = GetGroup(bot.Guid);
         if (group != null)
         {
@@ -570,21 +559,6 @@ public class GroupManager
             CircuitTrace.Hit(bot.Guid, "groupmgr: enrich stamps solo state");
             bot.GroupId = null;
             bot.GroupLeaderGuid = null;
-        }
-
-        // STORY: per-bot grouping arc — emitted only on an actual change, since this
-        // runs every tick for every bot. The null-narrowing local keeps the disabled
-        // path to two field reads + a bool check (no string work, no nullable warning).
-        var story = bot.Story;
-        if (story != null && story.Enabled
-            && (bot.GroupId != prevGroup || bot.GroupLeaderGuid != prevLeader))
-        {   // cb:fold logging-only branch (story narration)
-            if (bot.GroupId == null)
-                story.Note($"left group {prevGroup} (now solo)");   // cb:fold logging only, narration wording
-            else if (prevGroup == null)
-                story.Note($"joined group {bot.GroupId} as {(bot.IsGroupLeader ? "leader" : "follower")} (leader={bot.GroupLeaderGuid})");   // cb:fold logging only, narration wording
-            else
-                story.Note($"group {bot.GroupId}: now {(bot.IsGroupLeader ? "leader" : "follower")} (leader {prevLeader}→{bot.GroupLeaderGuid})");   // cb:fold logging only, narration wording
         }
     }
 

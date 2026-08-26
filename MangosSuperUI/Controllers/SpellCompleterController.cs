@@ -1,3 +1,4 @@
+﻿using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.Models;
 using MangosSuperUI.Services;
@@ -372,11 +373,225 @@ public class SpellCompleterController : Controller
         return Json(_refsCache);
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // PUSH INBOX — spells sent straight from MSUIClient creator mode
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Ingest a design pushed by MSUIClient's creator mode, so the spell shows up
+    /// on this page without anyone carrying spell-session.json across by hand.
+    ///
+    /// Accepts EITHER shape the creator can produce: one session entry (has
+    /// tempName), or a whole session document (format "msui-spell-session" with a
+    /// spells array) — the latter so the very same file the drop-zone takes can
+    /// also be curl'd up. Pushing a temp name that already exists replaces it,
+    /// matching the creator's own rule for its session file.
+    ///
+    /// The payload carries base64 M2s, BLPs and audio, so it dwarfs a normal form
+    /// post; the size limit is raised here rather than globally, keeping every
+    /// other endpoint on Kestrel's 30 MB default.
+    /// </summary>
+    [HttpPost]
+    [RequestSizeLimit(268_435_456)]   // 256 MB — a fully-tuned multi-model spell with audio
+    public IActionResult Push([FromBody] JsonObject? body)
+    {
+        if (body is null)
+            return Json(new { success = false, error = "Empty push body." });
+
+        // One entry, or the whole session document.
+        var entries = new List<JsonObject>();
+        if (body["spells"] is JsonArray spells)
+        {
+            foreach (JsonNode? node in spells)
+                if (node is JsonObject entry) entries.Add(entry);
+            if (entries.Count == 0)
+                return Json(new { success = false, error = "Session document carries no spells." });
+        }
+        else if (body["tempName"] is not null)
+        {
+            entries.Add(body);
+        }
+        else
+        {
+            return Json(new
+            {
+                success = false,
+                error = "Not an MSUIClient design push — expected a session entry (tempName) " +
+                        "or a session document (spells[]).",
+            });
+        }
+
+        var saved = new List<SpellSessionInbox.ItemSummary>();
+        var rejected = new List<string>();
+        foreach (JsonObject entry in entries)
+        {
+            string tempName = entry["tempName"]?.GetValue<string>() ?? "";
+            if (SpellSessionInbox.SafeId(tempName).Length == 0)
+            {
+                rejected.Add($"'{tempName}' has no letters or digits to name it by");
+                continue;
+            }
+            // A design with nothing in it would create an inbox card that cannot be
+            // completed into anything — reject at the door rather than downstream.
+            int modelCount = (entry["models"] as JsonArray)?.Count ?? 0;
+            int audioCount = (entry["audio"] as JsonArray)?.Count ?? 0;
+            if (modelCount == 0 && audioCount == 0)
+            {
+                rejected.Add($"'{tempName}' carries no models and no audio");
+                continue;
+            }
+            try
+            {
+                if (SpellSessionInbox.Save(_env.ContentRootPath, entry) is { } summary)
+                    saved.Add(summary);
+                else
+                    rejected.Add($"'{tempName}' could not be stored");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Completer: push of '{Temp}' failed to store", tempName);
+                rejected.Add($"'{tempName}': {ex.Message}");
+            }
+        }
+
+        if (saved.Count == 0)
+            return Json(new { success = false, error = string.Join("; ", rejected) });
+
+        _logger.LogInformation("Completer: push accepted {Count} spell(s) — {Names}",
+            saved.Count, string.Join(", ", saved.Select(s => s.TempName)));
+
+        return Json(new
+        {
+            success = true,
+            accepted = saved.Count,
+            spells = saved,
+            rejected,
+        });
+    }
+
+    /// <summary>Everything waiting in the inbox. Each item carries the FULL design
+    /// metadata the page renders from (tuning dials, texture edits, phases) but
+    /// none of the embedded bytes — listing a dozen spells must not mean shipping
+    /// a dozen patched models to the browser.</summary>
+    [HttpGet]
+    public IActionResult Pending()
+    {
+        try
+        {
+            var items = SpellSessionInbox.List(_env.ContentRootPath);
+            var spells = new List<JsonObject>();
+            foreach (var item in items)
+                if (SpellSessionInbox.LoadMeta(_env.ContentRootPath, item.Id) is { } meta)
+                    spells.Add(meta);
+            return Json(new { success = true, items, spells });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Completer: listing the push inbox failed");
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>Drop a pushed design. Only removes the inbox copy — a spell already
+    /// completed from it keeps its SQL rows and its stored design bytes.</summary>
+    [HttpPost]
+    public IActionResult DiscardPending(string id)
+    {
+        try
+        {
+            bool removed = SpellSessionInbox.Delete(_env.ContentRootPath, id ?? "");
+            return Json(removed
+                ? new { success = true, error = (string?)null }
+                : new { success = false, error = $"No pushed design '{id}' in the inbox." });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Completer: discarding pushed design '{Id}' failed", id);
+            return Json(new { success = false, error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Fill a completion request's design payload from the inbox when it names a
+    /// pushed item. The browser then never re-uploads the bytes it was shown — it
+    /// posts an id and the form fields, and the megabytes stay on this machine.
+    ///
+    /// Returns an error string, or null on success. An inline payload (the file
+    /// drop-zone path) is left exactly as posted.
+    /// </summary>
+    private string? ResolvePendingDesign(CompleteSpellRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.PendingId)) return null;
+
+        JsonObject? entry = SpellSessionInbox.LoadFull(_env.ContentRootPath, req.PendingId);
+        if (entry is null)
+            return $"Pushed design '{req.PendingId}' is no longer in the inbox — re-push it from the creator.";
+
+        req.TempName ??= entry["tempName"]?.GetValue<string>();
+        req.ExportedAtUtc ??= entry["exportedAtUtc"]?.GetValue<string>();
+        // The source spell is the design's own property, never the form's — a
+        // mistyped field must not clone the wrong spell.
+        if (JsonInt(entry["sourceSpellId"]) is > 0 and int sourceId)
+            req.SourceSpellEntry = sourceId;
+
+        req.Models = (entry["models"] as JsonArray)?.Select(node => new CompleterModelDto
+        {
+            Path = node?["path"]?.GetValue<string>() ?? "",
+            Phases = node?["phases"]?.GetValue<string>(),
+            M2Base64 = node?["m2Base64"]?.GetValue<string>(),
+        }).ToList() ?? new List<CompleterModelDto>();
+
+        req.TintedBlps = (entry["tintedBlps"] as JsonArray)?.Select(node => new CompleterBlpDto
+        {
+            Path = node?["path"]?.GetValue<string>() ?? "",
+            BlpBase64 = node?["blpBase64"]?.GetValue<string>(),
+        }).ToList() ?? new List<CompleterBlpDto>();
+
+        req.Audio = (entry["audio"] as JsonArray)?.Select(node => new CompleterAudioDto
+        {
+            Cue = node?["cue"]?.GetValue<string>() ?? "",
+            MpqPath = node?["mpqPath"]?.GetValue<string>() ?? "",
+            SourceFile = node?["sourceFile"]?.GetValue<string>(),
+            SourceSoundId = (uint)JsonNum(node?["sourceSoundId"], 0f),
+            Volume = JsonNum(node?["volume"], 1f),
+            Looping = node?["looping"]?.GetValue<bool>() ?? false,
+            NoDuplicates = node?["noDuplicates"]?.GetValue<bool>() ?? false,
+            SoundType = (uint)JsonNum(node?["soundType"], 1f),
+            ExtraFlags = (uint)JsonNum(node?["extraFlags"], 0f),
+            Eax = (uint)JsonNum(node?["eax"], 0f),
+            MinDistance = JsonNum(node?["minDistance"], 0f),
+            CutoffDistance = JsonNum(node?["cutoffDistance"], 0f),
+            FileBase64 = node?["fileBase64"]?.GetValue<string>(),
+        }).ToList() ?? new List<CompleterAudioDto>();
+
+        return null;
+    }
+
+    /// <summary>The creator writes volume as a float and the flags as integers, and
+    /// GetValue&lt;float&gt; throws on an integer token (and vice versa) — every
+    /// numeric read out of a pushed design goes through this tolerant pair.</summary>
+    private static float JsonNum(JsonNode? node, float fallback)
+    {
+        if (node is null) return fallback;
+        try { return node.GetValue<float>(); }
+        catch (Exception) { }
+        try { return node.GetValue<int>(); }
+        catch (Exception) { return fallback; }
+    }
+
+    private static int JsonInt(JsonNode? node) => (int)JsonNum(node, 0f);
+
     /// <summary>Complete one spell from an uploaded MSUIClient session: create the
     /// SQL rows, persist the design bytes, save the rebuild config.</summary>
     [HttpPost]
     public async Task<IActionResult> Complete([FromBody] CompleteSpellRequest req)
     {
+        // A pushed design supplies its own bytes and its own source spell, so this
+        // runs BEFORE validation — the request that names one arrives with no
+        // models, no BLPs and no sourceSpellEntry at all.
+        if (ResolvePendingDesign(req) is { } pendingError)
+            return Json(new { success = false, error = pendingError });
+
         if (string.IsNullOrWhiteSpace(req.SpellName))
             return Json(new { success = false, error = "Spell name is required." });
         if (CompleterStore.SafeName(req.SpellName).Length == 0)
@@ -781,6 +996,60 @@ public class SpellCompleterController : Controller
                 extraFiles.Add((blp.Path, bytes));
             }
 
+            // Custom phase audio. The bytes ride into the MPQ like any other
+            // extra file, but they also need a SoundEntries.dbc row and the
+            // phase's cloned visual kit pointed at it, so they are stored as
+            // their own kind rather than folded into extraFiles.
+            var audioTracks = new List<(CompleterStore.ManifestAudio meta, byte[] bytes)>();
+            foreach (var track in req.Audio ?? new List<CompleterAudioDto>())
+            {
+                if (string.IsNullOrEmpty(track.FileBase64) || string.IsNullOrEmpty(track.Cue)) continue;
+                byte[] bytes;
+                try { bytes = Convert.FromBase64String(track.FileBase64); }
+                catch
+                {
+                    await LogCompletionAsync(req, ip, newEntry, ranks, pathM2s.Count, extraFiles.Count,
+                        null, warnings,
+                        success: false, error: $"Bad fileBase64 for the {track.Cue} sound — spell rows were already created and are now orphaned");
+                    return Json(new { success = false, error = $"Bad fileBase64 for the {track.Cue} sound" });
+                }
+
+                // The creator names the MPQ path from the SOURCE spell's sound, so two
+                // custom spells cloned from the same original would fight over one file.
+                // Re-home every track under this spell's own directory instead.
+                string safe = CompleterStore.SafeName(req.SpellName);
+                string ext = Path.GetExtension(track.MpqPath is { Length: > 0 } mp ? mp : track.SourceFile ?? "");
+                if (ext.Length == 0) ext = ".wav";
+                string mpqPath = $@"Sound\Spells\Custom\{safe}_{track.Cue}{ext}";
+
+                audioTracks.Add((new CompleterStore.ManifestAudio
+                {
+                    Cue = track.Cue,
+                    MpqPath = mpqPath,
+                    SourceSoundId = track.SourceSoundId,
+                    Volume = track.Volume,
+                    Looping = track.Looping,
+                    NoDuplicates = track.NoDuplicates,
+                    SoundType = track.SoundType,
+                    ExtraFlags = track.ExtraFlags,
+                    Eax = track.Eax,
+                    MinDistance = track.MinDistance,
+                    CutoffDistance = track.CutoffDistance,
+                }, bytes));
+            }
+
+            // The area cue has nowhere to land: SpellVisualCloner clones the six
+            // stage kits, and the area kit (SpellVisual field 13) is not among
+            // them — patching the source's area kit would change every spell that
+            // shares it. Say so rather than storing bytes that silently do nothing.
+            foreach (var orphan in audioTracks.Where(t =>
+                         string.Equals(t.meta.Cue, "area", StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+                audioTracks.Remove(orphan);
+                warnings.Add("the area sound was dropped — area visuals are not cloned per spell, " +
+                             "so wiring it would change the sound for every spell sharing that area kit");
+            }
+
             CompleterStore.Save(_env.WebRootPath, req.SpellName,
                 new CompleterStore.Manifest
                 {
@@ -788,7 +1057,7 @@ public class SpellCompleterController : Controller
                     SourceSpellEntry = req.SourceSpellEntry,
                     ExportedAtUtc = req.ExportedAtUtc ?? "",
                 },
-                pathM2s, extraFiles);
+                pathM2s, extraFiles, audioTracks);
 
             // ── 5: the config row that makes rebuilds reproduce this spell ──
             // Icon: "custom" reuses one of the user's generated PNGs (the same
@@ -830,12 +1099,20 @@ public class SpellCompleterController : Controller
                 IconPath = iconPath,
             });
 
+            // The design came out of the inbox, so record where it ended up. Purely
+            // bookkeeping — the item stays until the user discards it, so a botched
+            // completion can simply be redone from the same push.
+            if (!string.IsNullOrWhiteSpace(req.PendingId))
+                SpellSessionInbox.MarkCompleted(_env.ContentRootPath, req.PendingId, newEntry);
+
             _logger.LogInformation(
-                "Completer: '{Temp}' -> #{Entry} {Name} ({M2s} per-path M2(s), {Extra} extra file(s), {Ranks} rank(s))",
-                req.TempName, newEntry, req.SpellName, pathM2s.Count, extraFiles.Count, ranks?.Count ?? 1);
+                "Completer: '{Temp}' -> #{Entry} {Name} ({M2s} per-path M2(s), {Extra} extra file(s), " +
+                "{Audio} sound(s), {Ranks} rank(s))",
+                req.TempName, newEntry, req.SpellName, pathM2s.Count, extraFiles.Count,
+                audioTracks.Count, ranks?.Count ?? 1);
 
             await LogCompletionAsync(req, ip, newEntry, ranks, pathM2s.Count, extraFiles.Count,
-                iconSource, warnings, success: true);
+                iconSource, warnings, success: true, audioCount: audioTracks.Count);
 
             return Json(new
             {
@@ -844,6 +1121,7 @@ public class SpellCompleterController : Controller
                 ranksGenerated = ranks?.Count ?? 0,
                 m2Count = pathM2s.Count,
                 extraFileCount = extraFiles.Count,
+                audioCount = audioTracks.Count,
                 warnings,
             });
         }
@@ -876,7 +1154,8 @@ public class SpellCompleterController : Controller
         string? iconSource,
         List<string> warnings,
         bool success,
-        string? error = null)
+        string? error = null,
+        int audioCount = 0)
     {
         var summary = new
         {
@@ -893,6 +1172,7 @@ public class SpellCompleterController : Controller
             ranks = ranks?.Select(r => new { rank = r.rank, entry = r.entry }).ToList(),
             m2Count,
             extraFileCount,
+            audioCount,
             iconSource,
             warnings,
             error,
@@ -904,7 +1184,8 @@ public class SpellCompleterController : Controller
 
         var notes = success
             ? $"Completed '{req.SpellName}' as #{entry} from source #{req.SourceSpellEntry} — " +
-              $"{ranks?.Count ?? 1} rank(s), {m2Count} per-path M2(s), {extraFileCount} extra file(s). " +
+              $"{ranks?.Count ?? 1} rank(s), {m2Count} per-path M2(s), {extraFileCount} extra file(s), " +
+              $"{audioCount} custom sound(s). " +
               "Patch rebuild required." + tail
             : $"Completion of '{req.SpellName}' from source #{req.SourceSpellEntry} failed: {error}" + tail;
 
@@ -936,6 +1217,12 @@ public class SpellCompleterController : Controller
 
 public class CompleteSpellRequest
 {
+    /// <summary>Names a design already pushed to the inbox by MSUIClient. When
+    /// set, the models, tinted BLPs, audio and source spell are loaded server-side
+    /// from the stored push and anything the browser sent for them is ignored —
+    /// the page posts a form, not megabytes of base64 it was never shown.</summary>
+    public string? PendingId { get; set; }
+
     public string? TempName { get; set; }
     public int SourceSpellEntry { get; set; }
     public string? ExportedAtUtc { get; set; }
@@ -969,6 +1256,11 @@ public class CompleteSpellRequest
 
     public List<CompleterModelDto>? Models { get; set; }
     public List<CompleterBlpDto>? TintedBlps { get; set; }
+
+    /// <summary>Custom per-phase sounds from the creator's Audio section. Only
+    /// ever populated from a pushed design — the file drop-zone path has never
+    /// carried audio and still does not.</summary>
+    public List<CompleterAudioDto>? Audio { get; set; }
 }
 
 public class CompleterEffectDto
@@ -1005,4 +1297,27 @@ public class CompleterBlpDto
 {
     public string Path { get; set; } = "";
     public string? BlpBase64 { get; set; }
+}
+
+/// <summary>One replaced phase sound, mirroring the creator session's audio
+/// entry. Every field past the bytes is a SoundEntries.dbc column.</summary>
+public class CompleterAudioDto
+{
+    /// <summary>precast, cast, missile, impact, state, channel or area.</summary>
+    public string Cue { get; set; } = "";
+    /// <summary>Path the creator played it from; only its extension survives —
+    /// the completed spell re-homes the file under its own name.</summary>
+    public string MpqPath { get; set; } = "";
+    public string? SourceFile { get; set; }
+    /// <summary>SoundEntries id the source spell used for this cue.</summary>
+    public uint SourceSoundId { get; set; }
+    public float Volume { get; set; } = 1f;
+    public bool Looping { get; set; }
+    public bool NoDuplicates { get; set; }
+    public uint SoundType { get; set; } = 1;
+    public uint ExtraFlags { get; set; }
+    public uint Eax { get; set; }
+    public float MinDistance { get; set; }
+    public float CutoffDistance { get; set; }
+    public string? FileBase64 { get; set; }
 }

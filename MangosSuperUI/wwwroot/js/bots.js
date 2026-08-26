@@ -5401,28 +5401,31 @@ $(function () {
 
         // --- diagnostics ---------------------------------------------------------------
         var dg = '<div class="bc-row">' +
-            bcBtn('bcTraceOn', 'fa-record-vinyl', 'Trace on') + bcBtn('bcTraceOff', 'fa-stop', 'Trace off') +
-            bcBtn('bcStoryOn', 'fa-book-open', 'Story on') + bcBtn('bcStoryOff', 'fa-stop', 'Story off') +
+            bcBtn('bcCircuitArm', 'fa-record-vinyl', 'Circuit arm') + bcBtn('bcCircuitDisarm', 'fa-stop', 'Circuit disarm') +
+            bcBtn('bcCircuitDump', 'fa-file-export', 'Dump ring') +
             (bcGuid > 0 ? bcBtn('bcReport', 'fa-bolt', 'Bot report') : '') +
-            '</div><div class="bc-row"><span class="bc-lbl" id="bcTraceState">trace: —</span></div>';
-        html += bcCard('fa-microscope', 'Diagnostics', dg, 'per-guid flight recorder + causal story log');
+            '</div><div class="bc-row">' +
+            bcBtn('bcCircuitShadow', 'fa-toggle-on', 'Shadow on/off') +
+            '<a class="btn-sm" href="/CircuitTrace" target="_blank" style="text-decoration:none"><i class="fa-solid fa-diagram-project"></i> Viewer</a>' +
+            '</div><div class="bc-row"><span class="bc-lbl" id="bcCircuitState">circuit: —</span></div>';
+        html += bcCard('fa-microchip', 'Circuit Board', dg, 'decision trace: shadow rings every bot in memory; arm writes this bot to disk');
 
         html += '</div>';
 
         $('#bmBody').html(html);
         updateBotDropdown();
         $('#bcChatCustom').hide();
-        refreshTraceState();
+        refreshCircuitState();
     }
 
-    function refreshTraceState() {
-        $.getJSON('/Bots/TraceStatus', function (d) {
+    function refreshCircuitState() {
+        $.getJSON('/CircuitTrace/Status', function (d) {
             if (!d) return;
-            var targets = d.targets || [];
-            var mine = bcGuid > 0 ? (targets.indexOf(bcGuid) >= 0) : false;
-            $('#bcTraceState').text('trace: ' + (d.enabled ? 'enabled' : 'disabled') +
-                ' \u00b7 ' + targets.length + ' target(s)' + (bcGuid > 0 ? (mine ? ' \u00b7 this bot IS traced' : ' \u00b7 this bot is not traced') : ''));
-        }).fail(function () { $('#bcTraceState').text('trace: status unavailable'); });
+            var armed = d.armed || [];
+            var mine = bcGuid > 0 && armed.indexOf(bcGuid) >= 0;
+            $('#bcCircuitState').text('circuit: ' + d.mode + ' · ' + armed.length + ' armed' +
+                (bcGuid > 0 ? (mine ? ' · this bot IS armed' : ' · this bot is not armed') : ''));
+        }).fail(function () { $('#bcCircuitState').text('circuit: status unavailable'); });
     }
 
     // ---- control handlers (delegated — the modal body is rebuilt on every open)
@@ -5530,16 +5533,32 @@ $(function () {
     });
     $(document).on('click', '#bcAutoForm', function () { $('#autoFormGroups').click(); });
 
-    function bcDiag(url, enabled, verb) {
+    function bcCircuit(action, verb) {
         var targets = bcTargets();
-        $.ajax({ url: url, type: 'POST', contentType: 'application/json', data: JSON.stringify({ enabled: enabled, guids: targets }) })
-            .done(function () { showToast(verb + ' \u2192 ' + targets.length + ' bot(s)'); refreshTraceState(); })
-            .fail(function (x) { showToast(verb + ' failed (' + x.status + ')', true); });
+        if (!targets.length) { showToast('no bot selected', true); return; }
+        var done = 0, fail = 0;
+        targets.forEach(function (g) {
+            $.post('/CircuitTrace/' + action + '?guid=' + g)
+                .done(function () { done++; finish(); })
+                .fail(function () { fail++; finish(); });
+        });
+        function finish() {
+            if (done + fail < targets.length) return;
+            showToast(verb + ' → ' + done + ' bot(s)' + (fail ? (', ' + fail + ' failed') : ''), fail > 0);
+            refreshCircuitState();
+        }
     }
-    $(document).on('click', '#bcTraceOn', function () { bcDiag('/Bots/SetTrace', true, 'trace on'); });
-    $(document).on('click', '#bcTraceOff', function () { bcDiag('/Bots/SetTrace', false, 'trace off'); });
-    $(document).on('click', '#bcStoryOn', function () { bcDiag('/Bots/SetStory', true, 'story on'); });
-    $(document).on('click', '#bcStoryOff', function () { bcDiag('/Bots/SetStory', false, 'story off'); });
+    $(document).on('click', '#bcCircuitArm', function () { bcCircuit('Arm', 'circuit arm'); });
+    $(document).on('click', '#bcCircuitDisarm', function () { bcCircuit('Disarm', 'circuit disarm'); });
+    $(document).on('click', '#bcCircuitDump', function () { bcCircuit('Dump', 'ring dump'); });
+    $(document).on('click', '#bcCircuitShadow', function () {
+        $.getJSON('/CircuitTrace/Status', function (d) {
+            var next = (d && d.mode === 'shadow') ? 'off' : 'shadow';
+            $.post('/CircuitTrace/Mode?mode=' + next)
+                .done(function () { showToast('circuit mode → ' + next); refreshCircuitState(); })
+                .fail(function (x) { showToast('mode change failed (' + x.status + ')', true); });
+        });
+    });
     $(document).on('click', '#bcReport', function () {
         var st = bcGuid ? botStates[bcGuid] : null;
         if (!st || !st.name) return;

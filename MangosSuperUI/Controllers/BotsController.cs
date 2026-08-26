@@ -14,7 +14,6 @@ public partial class BotsController : Controller
     private readonly BotBrainService _brain;
     private readonly ConnectionFactory _db;
     private readonly DbcService _dbc;
-    private readonly BotFlightRecorder _recorder;
     private readonly BotLogBuffer _log;
     private readonly RaService _ra;
     private readonly BotSpawnService _spawner;
@@ -28,7 +27,6 @@ public partial class BotsController : Controller
         BotBrainService brain,
         ConnectionFactory db,
         DbcService dbc,
-        BotFlightRecorder recorder,
         BotLogBuffer log,
         RaService ra,
         BotSpawnService spawner,
@@ -41,7 +39,6 @@ public partial class BotsController : Controller
         _brain = brain;
         _db = db;
         _dbc = dbc;
-        _recorder = recorder;
         _log = log;
         _ra = ra;
         _spawner = spawner;
@@ -818,46 +815,6 @@ public partial class BotsController : Controller
         });
     }
 
-    // ==================== Flight Recorder API ====================
-
-    /// <summary>
-    /// Toggle verbose lifecycle tracing for a specific set of bot GUIDs.
-    /// Tracing is per-guid: only the listed bots emit timeline records. Persisted to
-    /// bot_settings so it survives a restart. POST {"enabled":true,"guids":[4,5,6,7,8]}.
-    /// </summary>
-    [HttpPost]
-    public async Task<IActionResult> SetTrace([FromBody] SetTraceRequest req)
-    {
-        var guids = (req.Guids ?? Array.Empty<int>()).ToList();
-        await _recorder.SetTargetsAsync(guids, req.Enabled);
-        return Json(new { success = true, enabled = _recorder.Enabled, targets = _recorder.Targets });
-    }
-
-    [HttpGet]
-    public IActionResult TraceStatus()
-    {
-        return Json(new { enabled = _recorder.Enabled, targets = _recorder.Targets });
-    }
-
-    // ==================== Story Rider API (StoryRider I4) ====================
-    // Per-bot causal story log. Unlike trace (recorder-owned, DB-persisted), the rider
-    // is per-bot and in-memory, so these route through the brain service. POST
-    // {"enabled":true,"guids":[9]} enables one bot's story_<guid>_<name>.jsonl.
-
-    [HttpPost]
-    public IActionResult SetStory([FromBody] SetStoryRequest req)
-    {
-        var guids = req.Guids ?? Array.Empty<int>();
-        var affected = _brain.SetStoryEnabled(guids, req.Enabled);
-        return Json(new { success = true, enabled = req.Enabled, targets = affected });
-    }
-
-    [HttpGet]
-    public IActionResult StoryStatus()
-    {
-        return Json(new { bots = _brain.GetStoryStatus() });
-    }
-
     // ==================== Grouping API (Session 31) ====================
 
     [HttpPost]
@@ -1260,18 +1217,6 @@ public class FormGroupRequest
 public class DisbandGroupRequest
 {
     public int GroupId { get; set; }
-}
-
-public class SetTraceRequest
-{
-    public bool Enabled { get; set; }
-    public int[] Guids { get; set; } = Array.Empty<int>();
-}
-
-public class SetStoryRequest
-{
-    public bool Enabled { get; set; }
-    public int[] Guids { get; set; } = Array.Empty<int>();
 }
 
 public class AddBotsRequest
