@@ -3469,6 +3469,10 @@ $(function () {
         '.bm-kick-btn:disabled { opacity:0.4;cursor:default; }' +
         '.bm-kick-btn:disabled:hover { color:#e0af68;background:rgba(224,175,104,0.1);border-color:rgba(224,175,104,0.4); }' +
         '.bm-kick-btn + .bm-delete-btn { margin-left:0; }' +
+        // Connect occupies the same slot as Kick — one of the two shows, never both.
+        '.bm-connect-btn { margin-left:auto;align-self:center;margin-right:8px;padding:5px 14px;font-size:12px;font-weight:600;color:#9ece6a;background:rgba(158,206,106,0.1);border:1px solid rgba(158,206,106,0.4);border-radius:4px;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px; }' +
+        '.bm-connect-btn:hover { color:#1a1b26;background:#9ece6a;border-color:#9ece6a; }' +
+        '.bm-connect-btn + .bm-delete-btn { margin-left:0; }' +
         '.bm-body { flex:1;overflow-y:auto;padding:16px 20px; }' +
         '.bdc-overlay { display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:10001;align-items:center;justify-content:center; }' +
         '.bdc-overlay.active { display:flex; }' +
@@ -3517,6 +3521,7 @@ $(function () {
         '<div class="bm-tab" data-tab="gear"><i class="fa-solid fa-shield-halved" style="margin-right:5px;"></i>Gear</div>' +
         '<div class="bm-tab" data-tab="brain"><i class="fa-solid fa-brain" style="margin-right:5px;"></i>Brain</div>' +
         '<button type="button" class="bm-kick-btn" id="bmKickBtn"><i class="fa-solid fa-right-from-bracket" style="margin-right:5px;"></i>Kick</button>' +
+        '<button type="button" class="bm-connect-btn" id="bmConnectBtn" style="display:none;"><i class="fa-solid fa-plug" style="margin-right:5px;"></i>Connect</button>' +
         '<button type="button" class="bm-delete-btn" id="bmDeleteBtn"><i class="fa-solid fa-trash" style="margin-right:5px;"></i>Delete</button>' +
         '</div>' +
         '<div class="bm-body" id="bmBody"></div>' +
@@ -3605,6 +3610,20 @@ $(function () {
             'The bot stays in the roster and can be brought back with Load SuperUI Bots.</div>');
         $('#bdcConfirm').text('Kick');
         $('#bdcOverlay').data({ mode: 'kick', guid: guid }).addClass('active');
+    });
+
+    // Same endpoint as the Re-add picker, addressed by guid — the name is resolved
+    // server-side, so nothing the browser holds reaches the RA console.
+    $(document).on('click', '#bmConnectBtn', function () {
+        var guid = parseInt($('#botModal').data('guid'), 10) || 0;
+        if (guid <= 0) return;
+        var s = botStates[guid];
+        var name = s ? s.name : ('bot ' + guid);
+        $('#bdcMsg').html('Bring ' + esc(name) + ' back online?' +
+            '<div style="margin-top:8px;font-size:12px;color:var(--text-muted, #787c99);">' +
+            'Re-adds it to the world and waits for it to reconnect to the brain.</div>');
+        $('#bdcConfirm').text('Connect');
+        $('#bdcOverlay').data({ mode: 'readd', guid: guid }).addClass('active');
     });
 
     $(document).on('click', '#bmMassKickBtn', function () {
@@ -3711,6 +3730,27 @@ $(function () {
                 .fail(function (x, textStatus) {
                     bdcDone();
                     showToast(bdcFailMsg('Delete', x, textStatus), true);
+                });
+            return;
+        }
+
+        if (mode === 'readd') {
+            var rguid = parseInt($('#bdcOverlay').data('guid'), 10) || 0;
+            if (rguid <= 0) return;
+            bdcBusy('Connecting...');
+            $.ajax({ url: '/Bots/ConnectBot', type: 'POST', contentType: 'application/json', timeout: 60000, data: JSON.stringify({ guid: rguid }) })
+                .done(function (r) {
+                    bdcDone();
+                    if (r && r.success) {
+                        $('#botModal').removeClass('active');
+                        showToast('Re-added ' + (r.name || 'bot'));
+                    } else {
+                        showToast((r && r.error) || 'Connect failed', true);
+                    }
+                })
+                .fail(function (x, textStatus) {
+                    bdcDone();
+                    showToast(bdcFailMsg('Connect', x, textStatus), true);
                 });
             return;
         }
@@ -4527,7 +4567,7 @@ $(function () {
         // The server waits for the bot to log in AND dial the brain, so this is a
         // tens-of-seconds request. Lock just this row, not the whole modal.
         $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin" style="margin-right:5px;"></i>Adding');
-        $.ajax({ url: '/Bots/AddBot', type: 'POST', contentType: 'application/json', timeout: 60000, data: JSON.stringify({ guid: guid }) })
+        $.ajax({ url: '/Bots/ConnectBot', type: 'POST', contentType: 'application/json', timeout: 60000, data: JSON.stringify({ guid: guid }) })
             .done(function (r) {
                 if (r && r.success) {
                     $row.remove();
@@ -4759,6 +4799,7 @@ $(function () {
             $('.bm-tab[data-tab="danger"]').show();
             $('#bmDeleteBtn').hide();
             $('#bmKickBtn').hide();
+            $('#bmConnectBtn').hide();
             tab = 'control';
         } else {
             var className = CLASS_NAMES[s.classId] || '?';
@@ -4771,12 +4812,14 @@ $(function () {
             $('.bm-tab').show();
             $('.bm-tab[data-tab="danger"]').hide();
             $('#bmDeleteBtn').show();
-            // Kick only means anything while the bot's bridge socket is up. Offline
+            // Kick and Connect share one slot: exactly one applies at a time. Offline
             // bots stay listed (BotStates is a last-seen cache that survives the
-            // disconnect), so gate on the same DISCONNECTED marker the roster uses.
+            // disconnect), so gate on the same DISCONNECTED marker the roster uses —
+            // which means the bot you are already looking at is one click from
+            // coming back, without going through the Re-add picker.
             var isOffline = s.taskState === 'DISCONNECTED';
-            $('#bmKickBtn').show().prop('disabled', isOffline)
-                .attr('title', isOffline ? 'Bot is already offline' : '');
+            $('#bmKickBtn').toggle(!isOffline);
+            $('#bmConnectBtn').toggle(isOffline);
         }
 
         $('#botModal').data('guid', guid).addClass('active');
@@ -5320,6 +5363,22 @@ $(function () {
 
         html += '<div class="bc-grid">';
 
+        // --- session ------------------------------------------------------------------
+        // Deliberately always clickable, never gated on taskState. The header
+        // Kick/Connect pair keys off the client's last-seen state, which is a cache —
+        // if it goes stale (bridge dropped without the state catching up) that button
+        // vanishes and the modal offers no way back. Here the SERVER decides: /Bots/ConnectBot
+        // rejects an already-online bot by name, so the worst case is a clear error
+        // instead of a control that silently isn't there.
+        if (bcGuid > 0) {
+            var sess = '<div class="bc-row">' +
+                bcBtn('bcConnect', 'fa-plug', 'Connect bot', 'primary') +
+                '<span class="bc-lbl" style="font-size:11px;color:var(--text-muted,#787c99);align-self:center;">' +
+                (s && s.taskState === 'DISCONNECTED' ? 'offline — re-add it to the world' : 'appears online') +
+                '</span></div>';
+            html += bcCard('fa-plug', 'Session', sess, '.bot add — brings a persisted bot back; leaves the DB untouched');
+        }
+
         // --- movement -----------------------------------------------------------------
         var mv = '<div class="bc-row">' +
             bcNum('bcMap', 'map', s ? (s.mapId || 0) : 0, 62) +
@@ -5559,6 +5618,24 @@ $(function () {
                 .fail(function (x) { showToast('mode change failed (' + x.status + ')', true); });
         });
     });
+    // Control-tab twin of #bmConnectBtn. Routes through the same confirm dialog so it
+    // inherits the busy lock, spinner and timeout handling, and through the same
+    // guid-addressed endpoint so no client-held name reaches the RA console.
+    $(document).on('click', '#bcConnect', function () {
+        if (!bcGuid) { showToast('No bot selected', true); return; }
+        var s = botStates[bcGuid];
+        var name = s ? s.name : ('bot ' + bcGuid);
+        var looksOnline = !s || s.taskState !== 'DISCONNECTED';
+        $('#bdcMsg').html('Bring ' + esc(name) + ' back online?' +
+            '<div style="margin-top:8px;font-size:12px;color:var(--text-muted, #787c99);">' +
+            (looksOnline
+                ? 'This bot appears to be online already — the server will refuse if it really is.'
+                : 'Re-adds it to the world and waits for it to reconnect to the brain.') +
+            '</div>');
+        $('#bdcConfirm').text('Connect');
+        $('#bdcOverlay').data({ mode: 'readd', guid: bcGuid }).addClass('active');
+    });
+
     $(document).on('click', '#bcReport', function () {
         var st = bcGuid ? botStates[bcGuid] : null;
         if (!st || !st.name) return;

@@ -26,7 +26,9 @@ namespace MangosSuperUI.Controllers;
 //      DeleteBot      one bot offline, then purged from the DB
 //      DeleteAllBots  whole fleet offline, then purged
 //      OfflineRoster  the persisted bots that are not currently connected
-//      AddBot         bring one of them back (the mass form is AddAll elsewhere)
+//      ConnectBot     bring one of them back (the mass form is AddAll elsewhere).
+//                     NOT to be confused with BotsController.AddBots, which
+//                     SPAWNS new bots via `.bot addai`.
 //
 //  ── Which console command does what (their names are misleading) ────────────
 //  `.bot delete <name>`  does NOT delete. PlayerBotMgr::DeleteBot only sets
@@ -37,7 +39,7 @@ namespace MangosSuperUI.Controllers;
 //  `.kick <name>`        is the destructive one. It sets requestRemoval and
 //      PlayerBotMgr::Update then ERASES the entry from m_bots (SuperUI bots are
 //      customBot=true, set in PlayerBotMgr::Load whenever playerbot.ai is
-//      "AiBotAI"). Re-adding afterwards falls into AddBot's no-entry branch,
+//      "AiBotAI"). Re-adding afterwards falls into PlayerBotMgr::AddBot's no-entry branch,
 //      which builds a plain PlayerBotAI with no SuperUI brain — only
 //      `.bot reload` or a restart restores it. Harmless when we are about to
 //      purge the row anyway, so that is DELETE here — and it is not merely
@@ -182,7 +184,7 @@ public partial class BotsController
     // registered, which is the normal case: Kick (`.bot delete`), Kick All
     // (`.bot stop`) and a server restart all leave the entry parked with its
     // AiBotAI. But if the entry was ERASED — anything that went through `.kick`,
-    // e.g. a console kick outside this UI — AddBot falls into its no-entry branch
+    // e.g. a console kick outside this UI — PlayerBotMgr::AddBot falls into its no-entry branch
     // and builds a bare `new PlayerBotAI(nullptr)` with customBot=false. The bot
     // then logs in with no SuperUI brain at all.
     //
@@ -195,7 +197,7 @@ public partial class BotsController
     // PlayerBotMgr::Load opens with DeleteAll(), so it would kick the entire fleet
     // offline. That call is the operator's to make.
     [HttpPost]
-    public async Task<IActionResult> AddBot([FromBody] DeleteBotRequest req)
+    public async Task<IActionResult> ConnectBot([FromBody] DeleteBotRequest req)
     {
         string? name, error;
         using (var conn = _db.Characters())
@@ -238,7 +240,7 @@ public partial class BotsController
         return Json(new { success = true, name });
     }
 
-    /// <summary>Waits for a re-added bot's brain socket to appear — see AddBot.</summary>
+    /// <summary>Waits for a re-added bot's brain socket to appear — see ConnectBot.</summary>
     private async Task<bool> WaitForBridgeAsync(uint guid)
     {
         var deadline = DateTime.UtcNow.AddMilliseconds(BridgeWaitMs);
