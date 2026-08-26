@@ -57,8 +57,12 @@ public class CircuitTraceController : Controller
                 t0 = s.StartUtc,
                 t1 = s.EndUtc,
                 pos = s.HasPos ? new { map = s.MapId, zone = s.ZoneId, x = s.X, y = s.Y, z = s.Z } : null,
+                // 4th element = a foreign context id (see CircuitTraceHost.FlushSegments):
+                // hits from another thread that landed in this segment. The viewer
+                // refuses to draw an edge across a context change.
                 h = s.Hits.Select(h =>
-                    h.Note != null ? new object?[] { h.SiteId, h.Value, h.Note }
+                    h.Ctx != (s.Hits.Count > 0 ? s.Hits[0].Ctx : 0) ? new object?[] { h.SiteId, h.Value, h.Note, h.Ctx }
+                    : h.Note != null ? new object?[] { h.SiteId, h.Value, h.Note }
                     : h.Value != null ? new object?[] { h.SiteId, h.Value }
                     : new object?[] { h.SiteId })
             })
@@ -94,7 +98,7 @@ public class CircuitTraceController : Controller
     [HttpPost]
     public IActionResult Dump(int guid)
     {
-        CircuitTrace.RequestDump(guid, "manual");
+        CircuitTrace.RequestDumpForced(guid, "manual");   // operator asked for THIS bot — never rate-limited
         return Json(new { ok = true, note = "queued; the brain loop flushes it within ~250ms" });
     }
 }

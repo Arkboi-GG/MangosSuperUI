@@ -41,8 +41,17 @@ public static class CircuitTrace
 {
     public enum TraceMode { Off = 0, Shadow = 1 }
 
-    /// <summary>One recorded probe firing. Seq is global and monotonic — the merge/order key.</summary>
-    public readonly record struct ProbeHit(int SiteId, long Seq, string? Note, double? Value);
+    /// <summary>One recorded probe firing. Seq is global and monotonic — the merge/order key.
+    /// Ctx is the recording thread: the brain tick, the bridge socket and the chat loop all
+    /// write into the SAME open segment, so two adjacent hits are only genuinely
+    /// control-flow adjacent when their Ctx matches. Without it the board draws edges that
+    /// never happened and the teleport checker cries wolf (found by the first Layer 3 scan,
+    /// 2026-08-26: 51,663 "teleports" in one bot-hour, most of them thread interleaving).</summary>
+    public readonly record struct ProbeHit(int SiteId, long Seq, string? Note, double? Value, int Ctx);
+
+    /// <summary>Ctx value for hits that came from the C++ side: one batch is one
+    /// core-side update, so the whole segment shares a context by construction.</summary>
+    public const int RemoteCtx = -1;
 
     /// <summary>One registered call site. Session-scoped; the generated Map joins on File:Line.</summary>
     public sealed record ProbeSite(int Id, string File, int Line, string Description);
@@ -265,7 +274,7 @@ public static class CircuitTrace
             X = x, Y = y, Z = z,
         };
         foreach (var h in hits)
-            seg.Hits.Add(new ProbeHit(RemoteSiteBase + h.RemoteId, Interlocked.Increment(ref _seq), h.Note, h.Value));
+            seg.Hits.Add(new ProbeHit(RemoteSiteBase + h.RemoteId, Interlocked.Increment(ref _seq), h.Note, h.Value, RemoteCtx));
 
         var ring = _rings.GetOrAdd(guid, static _ => new BotRing());
         lock (ring.Lock)
@@ -282,9 +291,66 @@ public static class CircuitTrace
     // to disk even though the bot was never armed. The host drains this queue.
     private static readonly System.Collections.Concurrent.ConcurrentQueue<(int Guid, string Reason)> _dumpRequests = new();
 
+    // R8 promises the instrument catches wedges nobody was watching. At fleet
+    // scale that promise bites: the wedge breaker trips for hundreds of bots and
+    // every trip flushes that bot's ENTIRE ring. Measured on the live fleet
+    // 2026-08-26: 9,872 auto-dumps in one afternoon → 8.1M lines / 1.6 GB in the
+    // daily file. That is not a black box, it is a landfill — and it buries the
+    // one bot you actually wanted to read.
+    //
+    // So dumps are rate-limited: one per bot per cooldown, plus a fleet-wide
+    // hourly ceiling. Suppressions are COUNTED and reported in Status, because a
+    // throttle that hides what it dropped is worse than no throttle.
+    private const int DumpCooldownSec = 300;    // one dump per bot per 5 minutes
+    private const int DumpsPerHourCap = 120;    // fleet-wide ceiling
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, DateTime> _lastDumpAt = new();
+    private static long _dumpsAccepted, _dumpsSuppressedBot, _dumpsSuppressedFleet;
+    private static readonly object _dumpWindowLock = new();
+    private static DateTime _dumpWindowStart = DateTime.UtcNow;
+    private static int _dumpsThisWindow;
+
     public static void RequestDump(int guid, string reason)
     {
         if (_mode == (int)TraceMode.Off) return;
+
+        var now = DateTime.UtcNow;
+        if (_lastDumpAt.TryGetValue(guid, out var last) && (now - last).TotalSeconds < DumpCooldownSec)
+        {
+            Interlocked.Increment(ref _dumpsSuppressedBot);
+            return;
+        }
+
+        lock (_dumpWindowLock)
+        {
+            if ((now - _dumpWindowStart).TotalHours >= 1) { _dumpWindowStart = now; _dumpsThisWindow = 0; }
+            if (_dumpsThisWindow >= DumpsPerHourCap)
+            {
+                Interlocked.Increment(ref _dumpsSuppressedFleet);
+                return;
+            }
+            _dumpsThisWindow++;
+        }
+
+        _lastDumpAt[guid] = now;
+        Interlocked.Increment(ref _dumpsAccepted);
+        _dumpRequests.Enqueue((guid, reason));
+    }
+
+    /// <summary>Auto-dump accounting for Status — accepted vs. suppressed, so the
+    /// rate limit is always visible rather than silently eating evidence.</summary>
+    public static (long Accepted, long SuppressedBot, long SuppressedFleet, int ThisHour) DumpStats()
+        => (Interlocked.Read(ref _dumpsAccepted),
+            Interlocked.Read(ref _dumpsSuppressedBot),
+            Interlocked.Read(ref _dumpsSuppressedFleet),
+            Volatile.Read(ref _dumpsThisWindow));
+
+    /// <summary>Manual dumps from the UI bypass the rate limit — an operator
+    /// asking for a specific bot is never noise.</summary>
+    public static void RequestDumpForced(int guid, string reason)
+    {
+        if (_mode == (int)TraceMode.Off) return;
+        _lastDumpAt[guid] = DateTime.UtcNow;
+        Interlocked.Increment(ref _dumpsAccepted);
         _dumpRequests.Enqueue((guid, reason));
     }
 
@@ -332,7 +398,8 @@ public static class CircuitTrace
 
     private static void Record(int guid, string file, int line, string desc, string? note, double? value)
     {
-        var hit = new ProbeHit(SiteId(file, line, desc), Interlocked.Increment(ref _seq), note, value);
+        var hit = new ProbeHit(SiteId(file, line, desc), Interlocked.Increment(ref _seq), note, value,
+                               Environment.CurrentManagedThreadId);
         var ring = _rings.GetOrAdd(guid, static _ => new BotRing());
         lock (ring.Lock)
         {

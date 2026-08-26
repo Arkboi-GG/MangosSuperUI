@@ -57,6 +57,64 @@
 
         .cb-band { fill: var(--bg-card-alt); fill-opacity: 0.45; stroke: var(--border-light); stroke-width: 1; }
 
+        /* ── the two programs, told apart at a glance ──────────────────────
+           C# keeps the house accent; C++ gets its own hue, so a wedge whose
+           cause lives on the far side of the wire is visible from across the
+           room. Both are theme variables with literal fallbacks. */
+        .cb-band.cb-side-cpp { fill: var(--info, #7aa2f7); fill-opacity: 0.10; stroke: var(--info, #7aa2f7); stroke-opacity: 0.35; }
+        .cb-lane-head.cb-side-cpp { fill: var(--info, #7aa2f7); }
+        .cb-node.cb-side-cpp .cb-rect { fill: var(--info, #7aa2f7); stroke: var(--info, #7aa2f7); stroke-opacity: 0.45; }
+        .cb-node.cb-side-cpp .cb-rect.cb-on { stroke: var(--info, #7aa2f7); stroke-opacity: 1; stroke-width: 2; }
+
+        .cb-sec-head {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 1.2px;
+            text-transform: uppercase;
+            fill: var(--text-secondary);
+            pointer-events: none;
+        }
+
+            .cb-sec-head.cb-side-cpp { fill: var(--info, #7aa2f7); }
+
+        /* The wire itself: the boundary the whole instrument was built to see across. */
+        .cb-wire { fill: var(--accent); fill-opacity: 0.14; stroke: var(--accent); stroke-opacity: 0.5; stroke-dasharray: 6 4; }
+
+            .cb-wire.cb-wire-quiet { fill: var(--text-secondary); fill-opacity: 0.06; stroke: var(--text-secondary); stroke-opacity: 0.3; }
+
+        .cb-wire-head {
+            fill: var(--accent);
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1.5px;
+            text-anchor: middle;
+            pointer-events: none;
+        }
+
+            .cb-wire-head.cb-wire-quiet-head { fill: var(--text-secondary); font-weight: 600; letter-spacing: 0.5px; }
+
+        /* A chain link — the same command seen from both sides. */
+        .cb-edge.cb-chain { stroke: var(--warning, #e0af68); stroke-opacity: 0.9; stroke-dasharray: 5 4; }
+
+        .cb-chain-tag {
+            fill: var(--warning, #e0af68);
+            font-size: 10px;
+            font-weight: 700;
+            text-anchor: middle;
+            pointer-events: none;
+        }
+
+        #cbSides { font-weight: 700; white-space: nowrap; }
+
+        .cb-two-sided { color: var(--info, #7aa2f7); }
+        .cb-one-sided { color: var(--text-secondary); }
+
+        .cb-seg.cb-side-cpp { border-left: 3px solid var(--info, #7aa2f7); }
+
+        /* A hit another thread wrote into this segment: present in the recording,
+           but NOT a step in this path. Shown, dimmed, never joined by an edge. */
+        .cb-hit.cb-foreign { opacity: 0.55; font-style: italic; }
+
         #cbSteady { color: var(--text-secondary); font-weight: 700; min-width: 34px; }
 
         .cb-stage { position: relative; }
@@ -215,6 +273,7 @@
 <div class="cb-footer">
     <span class="cb-now-label">this tick</span>
     <span id="cbSteady"></span>
+    <span id="cbSides" title="Whether this window actually contains BOTH programs"></span>
     <span id="cbNow">pick a bot — shadow mode must be on for anything to record</span>
     <span id="cbPos"></span>
 </div>

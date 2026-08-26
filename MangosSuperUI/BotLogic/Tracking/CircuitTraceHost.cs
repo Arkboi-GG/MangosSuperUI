@@ -138,8 +138,17 @@ public sealed class CircuitTraceHost
         armed = CircuitTrace.ArmedGuids(),
         sites = CircuitTrace.Sites.Count,
         ringBots = CircuitTrace.RingCount,
-        traceDir = TRACE_DIR
+        traceDir = TRACE_DIR,
+        autoDumps = DumpStatsForStatus()
     };
+
+    /// <summary>Wedge auto-dump accounting. Surfaced so the rate limit is visible:
+    /// a throttle that silently eats evidence would undermine the instrument.</summary>
+    private static object DumpStatsForStatus()
+    {
+        var d = CircuitTrace.DumpStats();
+        return new { accepted = d.Accepted, suppressedBot = d.SuppressedBot, suppressedFleet = d.SuppressedFleet, thisHour = d.ThisHour };
+    }
 
     // ── the per-loop pump ───────────────────────────────────────────────────
 
@@ -181,11 +190,20 @@ public sealed class CircuitTraceHost
         EmitNewSites();
         foreach (var s in segs)
         {
+            // A segment can contain hits from more than one thread (brain tick,
+            // bridge socket, chat loop all write into whichever segment is open),
+            // so each hit that did NOT come from the segment's own context carries
+            // its context id as a 4th element. Readers treat "no 4th element" as
+            // the segment's own context; two hits are control-flow adjacent only
+            // when their contexts match. Absent that, the board draws edges that
+            // never happened. Cost: nothing for the common case.
+            int primaryCtx = s.Hits.Count > 0 ? s.Hits[0].Ctx : 0;
             var hits = new object?[s.Hits.Count][];
             for (int i = 0; i < s.Hits.Count; i++)
             {
                 var h = s.Hits[i];
-                hits[i] = h.Note != null ? new object?[] { h.SiteId, h.Value, h.Note }
+                hits[i] = h.Ctx != primaryCtx ? new object?[] { h.SiteId, h.Value, h.Note, h.Ctx }
+                        : h.Note != null ? new object?[] { h.SiteId, h.Value, h.Note }
                         : h.Value != null ? new object?[] { h.SiteId, h.Value }
                         : new object?[] { h.SiteId };
             }
