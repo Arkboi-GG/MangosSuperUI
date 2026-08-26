@@ -1709,4 +1709,16 @@ public class BotBridgeService : BackgroundService
 
     public int ConnectedCount => Connections.Count;
     public int TotalTracked => BotStates.Count;
+
+    /// <summary>
+    /// Drop a bot's last-known state, e.g. after a DB-level delete. BotStates is a
+    /// last-seen-per-guid cache that nothing else ever purges from (disconnect just
+    /// removes the live Connections entry, not BotStates) — without this, a deleted
+    /// bot lingers forever in /Bots/States and the IBot Monitor page.
+    /// </summary>
+    public void RemoveBotState(int guid)
+    {
+        BotStates.TryRemove(guid, out _);
+        Connections.TryRemove(guid, out _);
+    }
 }

@@ -3457,7 +3457,21 @@ $(function () {
         '.bm-tab { padding:8px 16px;font-size:12px;font-weight:600;color:var(--text-muted, #5f6b7a);cursor:pointer;border-bottom:2px solid transparent;text-transform:uppercase;letter-spacing:0.5px; }' +
         '.bm-tab:hover { color:var(--text-secondary, #a9b1d6); }' +
         '.bm-tab.active { color:var(--accent, #7aa2f7);border-bottom-color:var(--accent, #7aa2f7); }' +
+        '.bm-tab-danger { color:#f7768e; }' +
+        '.bm-tab-danger:hover { color:#ff8fa3; }' +
+        '.bm-tab-danger.active { color:#f7768e;border-bottom-color:#f7768e; }' +
+        '.bm-delete-btn { margin-left:auto;align-self:center;padding:5px 14px;font-size:12px;font-weight:600;color:#f7768e;background:rgba(247,118,142,0.1);border:1px solid rgba(247,118,142,0.4);border-radius:4px;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px; }' +
+        '.bm-delete-btn:hover { color:#fff;background:#f7768e;border-color:#f7768e; }' +
         '.bm-body { flex:1;overflow-y:auto;padding:16px 20px; }' +
+        '.bdc-overlay { display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:10001;align-items:center;justify-content:center; }' +
+        '.bdc-overlay.active { display:flex; }' +
+        '.bdc-box { background:var(--bg-secondary, #1a1b26);border:1px solid var(--border-light, #414868);border-radius:8px;padding:20px;width:340px;box-shadow:0 8px 24px rgba(0,0,0,0.4); }' +
+        '.bdc-msg { color:var(--text-primary, #c0caf5);font-size:14px;margin-bottom:18px;line-height:1.4; }' +
+        '.bdc-actions { display:flex;justify-content:flex-end;gap:8px; }' +
+        '.bdc-cancel { padding:6px 14px;font-size:12px;font-weight:600;color:var(--text-secondary, #a9b1d6);background:transparent;border:1px solid var(--border-light, #414868);border-radius:4px;cursor:pointer; }' +
+        '.bdc-cancel:hover { color:var(--text-primary, #c0caf5);border-color:var(--text-secondary, #a9b1d6); }' +
+        '.bdc-confirm { padding:6px 14px;font-size:12px;font-weight:600;color:#fff;background:#f7768e;border:1px solid #f7768e;border-radius:4px;cursor:pointer; }' +
+        '.bdc-confirm:hover { background:#db5a75;border-color:#db5a75; }' +
 
         '.bq-zone-group { margin-bottom:16px; }' +
         '.bq-zone-header { font-size:13px;font-weight:700;color:var(--text-secondary, #a9b1d6);margin-bottom:8px;display:flex;align-items:center;gap:8px; }' +
@@ -3491,11 +3505,26 @@ $(function () {
         '</div>' +
         '<div class="bm-tabs">' +
         '<div class="bm-tab active" data-tab="control"><i class="fa-solid fa-sliders" style="margin-right:5px;"></i>Control</div>' +
+        '<div class="bm-tab bm-tab-danger" data-tab="danger" style="display:none;"><i class="fa-solid fa-triangle-exclamation" style="margin-right:5px;"></i>Danger Zone</div>' +
         '<div class="bm-tab" data-tab="quests"><i class="fa-solid fa-scroll" style="margin-right:5px;"></i>Quests</div>' +
         '<div class="bm-tab" data-tab="gear"><i class="fa-solid fa-shield-halved" style="margin-right:5px;"></i>Gear</div>' +
         '<div class="bm-tab" data-tab="brain"><i class="fa-solid fa-brain" style="margin-right:5px;"></i>Brain</div>' +
+        '<button type="button" class="bm-delete-btn" id="bmDeleteBtn"><i class="fa-solid fa-trash" style="margin-right:5px;"></i>Delete</button>' +
         '</div>' +
         '<div class="bm-body" id="bmBody"></div>' +
+        '</div>' +
+        '</div>'
+    );
+
+    // Inject delete-confirmation dialog
+    $('body').append(
+        '<div class="bdc-overlay" id="bdcOverlay">' +
+        '<div class="bdc-box">' +
+        '<div class="bdc-msg" id="bdcMsg"></div>' +
+        '<div class="bdc-actions">' +
+        '<button type="button" class="bdc-cancel" id="bdcCancel">Cancel</button>' +
+        '<button type="button" class="bdc-confirm" id="bdcConfirm">Delete</button>' +
+        '</div>' +
         '</div>' +
         '</div>'
     );
@@ -3515,6 +3544,95 @@ $(function () {
         $('.bm-tab').removeClass('active');
         $(this).addClass('active');
         loadModalTab(tab);
+    });
+
+    // ===================== BOT DELETE (single + mass, confirmation) =====================
+
+    // Drops a deleted bot from every client-side cache/DOM row, mirroring the
+    // BotDisconnected 30s auto-remove cleanup above.
+    function removeDeletedBot(guid) {
+        delete botStates[guid];
+        delete botBrains[guid];
+        delete decisionLog[guid];
+        delete inventoryCache[guid];
+        $('#roster-' + guid).remove();
+        rosterDirty = true;
+
+        if (selectedGuid === guid) {
+            selectedGuid = null;
+            $('#detailEmpty').show();
+            $('#detailPanel').empty();
+            stopBrainPoll();
+            stopLivePoll();
+        }
+    }
+
+    $(document).on('click', '#bmDeleteBtn', function () {
+        var guid = parseInt($('#botModal').data('guid'), 10) || 0;
+        if (guid <= 0) return;
+        var s = botStates[guid];
+        var name = s ? s.name : ('bot ' + guid);
+        $('#bdcMsg').text('Are you sure you want to delete ' + name + '?');
+        $('#bdcOverlay').data({ mode: 'single', guid: guid }).addClass('active');
+    });
+
+    $(document).on('click', '#bmMassDeleteBtn', function () {
+        var total = $('#bmBody').data('rosterTotal') || 0;
+        if (total <= 0) return;
+        $('#bdcMsg').text('Are you sure you want to delete ' + total + ' bot' + (total === 1 ? '' : 's') + '?');
+        $('#bdcOverlay').data({ mode: 'mass' }).addClass('active');
+    });
+
+    $(document).on('click', '#bdcCancel', function () {
+        $('#bdcOverlay').removeClass('active');
+    });
+
+    $('#bdcOverlay').on('click', function (e) {
+        if (e.target === this) $(this).removeClass('active');
+    });
+
+    $(document).on('click', '#bdcConfirm', function () {
+        var mode = $('#bdcOverlay').data('mode');
+
+        if (mode === 'single') {
+            var guid = parseInt($('#bdcOverlay').data('guid'), 10) || 0;
+            if (guid <= 0) return;
+            $.ajax({ url: '/Bots/DeleteBot', type: 'POST', contentType: 'application/json', data: JSON.stringify({ guid: guid }) })
+                .done(function (r) {
+                    if (r && r.success) {
+                        $('#bdcOverlay').removeClass('active');
+                        $('#botModal').removeClass('active');
+                        removeDeletedBot(guid);
+                        showToast('Bot deleted');
+                    } else {
+                        $('#bdcOverlay').removeClass('active');
+                        showToast((r && r.error) || 'Delete failed', true);
+                    }
+                })
+                .fail(function (x) {
+                    $('#bdcOverlay').removeClass('active');
+                    showToast('Delete failed (HTTP ' + x.status + ')', true);
+                });
+            return;
+        }
+
+        if (mode === 'mass') {
+            $.ajax({ url: '/Bots/DeleteAllBots', type: 'POST' })
+                .done(function (r) {
+                    $('#bdcOverlay').removeClass('active');
+                    if (r && r.success) {
+                        $('#botModal').removeClass('active');
+                        Object.keys(botStates).forEach(function (g) { removeDeletedBot(parseInt(g, 10)); });
+                        showToast(r.deleted + ' bot' + (r.deleted === 1 ? '' : 's') + ' deleted');
+                    } else {
+                        showToast((r && r.error) || 'Mass delete failed', true);
+                    }
+                })
+                .fail(function (x) {
+                    $('#bdcOverlay').removeClass('active');
+                    showToast('Mass delete failed (HTTP ' + x.status + ')', true);
+                });
+        }
     });
 
     // ===================== BOT REPORT (quantized, on-the-spot) =====================
@@ -4386,6 +4504,8 @@ $(function () {
             $('#bmTitle').html('<span style="color:var(--text-primary);">Fleet control</span>' +
                 ' <span style="font-weight:400;font-size:12px;color:var(--text-muted);">every connected bot</span>');
             $('.bm-tab[data-tab!="control"]').hide();
+            $('.bm-tab[data-tab="danger"]').show();
+            $('#bmDeleteBtn').hide();
             tab = 'control';
         } else {
             var className = CLASS_NAMES[s.classId] || '?';
@@ -4396,6 +4516,8 @@ $(function () {
                 ' \u00b7 ' + esc(zoneKeyLabel(botZoneKey(guid))) + '</span>'
             );
             $('.bm-tab').show();
+            $('.bm-tab[data-tab="danger"]').hide();
+            $('#bmDeleteBtn').show();
         }
 
         $('#botModal').data('guid', guid).addClass('active');
@@ -4409,6 +4531,7 @@ $(function () {
         guid = parseInt(guid, 10) || 0;
 
         if (tab === 'control') { renderControlTab(guid); return; }
+        if (tab === 'danger') { renderDangerZoneTab(); return; }
         if (guid === 0) { renderControlTab(0); return; }
 
         switch (tab) {
@@ -4422,6 +4545,35 @@ $(function () {
                 renderBrainTab(guid);
                 break;
         }
+    }
+
+    // ===================== DANGER ZONE (mass delete) =====================
+    // Targets the entire persisted bot roster (characters.playerbot) — independent of
+    // the Control tab's "Apply to" scope, which only covers currently-connected bots.
+    function renderDangerZoneTab() {
+        var $body = $('#bmBody');
+        $body.html('<div class="bq-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading roster...</div>');
+
+        $.getJSON('/Bots/RosterSummary', function (data) {
+            var total = data.total || 0;
+            var online = data.online || 0;
+            var html = '<div class="bc-card"><div class="bc-card-h"><i class="fa-solid fa-skull-crossbones"></i>Mass Delete' +
+                '<span class="bc-note">permanently deletes bots from the database</span></div>' +
+                '<div class="bc-card-b">' +
+                '<div style="margin-bottom:12px;color:var(--text-secondary, #a9b1d6);font-size:13px;">' +
+                'Targets the entire bot roster: <b>' + total + '</b> bot' + (total === 1 ? '' : 's') + '.' +
+                (online > 0
+                    ? ' <span style="color:#f7768e;">' + online + ' still online — disconnect them first, the whole batch is blocked otherwise.</span>'
+                    : '') +
+                '</div>' +
+                '<button type="button" class="bm-delete-btn" id="bmMassDeleteBtn" style="margin-left:0;"' +
+                (total === 0 ? ' disabled' : '') + '><i class="fa-solid fa-trash" style="margin-right:5px;"></i>Delete All Bots</button>' +
+                '</div></div>';
+            $body.html(html);
+            $body.data('rosterTotal', total);
+        }).fail(function () {
+            $body.html('<div style="color:#f7768e;padding:16px;">Failed to load roster summary</div>');
+        });
     }
 
     function loadQuestTab(guid) {
