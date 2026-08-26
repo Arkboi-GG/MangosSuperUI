@@ -36,9 +36,9 @@ PASS=0
 WARN=0
 FAIL=0
 
-pass() { ok "$1"; ((PASS++)); }
-warning() { warn "$1"; ((WARN++)); }
-failure() { fail "$1"; ((FAIL++)); }
+pass() { ok "$1"; PASS=$((PASS + 1)); }
+warning() { warn "$1"; WARN=$((WARN + 1)); }
+failure() { fail "$1"; FAIL=$((FAIL + 1)); }
 
 # ── Config ──
 INSTALL_DIR="/opt/mangossuperui"
@@ -125,6 +125,58 @@ check_db_conn "Characters" "$CONN_CHARS"
 check_db_conn "Realmd" "$CONN_REALMD"
 check_db_conn "Logs" "$CONN_LOGS"
 check_db_conn "Admin" "$CONN_ADMIN"
+
+check_admin_schema() {
+    local conn="$1"
+    local host port user pass db index_count
+
+    if [ -z "$conn" ]; then
+        return
+    fi
+
+    host=$(echo "$conn" | grep -oP 'Server=\K[^;]+')
+    port=$(echo "$conn" | grep -oP 'Port=\K[^;]+')
+    db=$(echo "$conn" | grep -oP 'Database=\K[^;]+')
+    user=$(echo "$conn" | grep -oP 'User=\K[^;]+')
+    pass=$(echo "$conn" | grep -oP 'Password=\K[^;]+')
+
+    if [[ ! "$db" =~ ^[A-Za-z0-9_]+$ ]]; then
+        failure "Admin schema: unsafe or malformed database name '$db'"
+        return
+    fi
+
+    if ! MYSQL_PWD="$pass" mysql \
+        --host="$host" \
+        --port="${port:-3306}" \
+        --user="$user" \
+        --batch --skip-column-names \
+        -e "SELECT bot_guid, bot_name, queue_id, status, payload_json, spec_tab, profile_id, profile_name, active_role, active_role_name, rotation_mode, rotation_profile, rotation_name, rotation_fingerprint, reset_talents, expected_revision, observed_session_at, request_id, claim_owner, claim_expires_at, attempt_count, queued_by, queued_from, created_at, updated_at, next_attempt_at, dispatched_at, completed_at, last_code, last_message FROM \`${db}\`.bot_combat_loadout_queue LIMIT 0;" \
+        &>/dev/null; then
+        failure "Admin schema: bot_combat_loadout_queue is missing or incomplete"
+        info "Run setup-mangossuperui.sh from the current release to apply sql/vmangos_admin_schema.sql."
+        return
+    fi
+
+    if ! index_count=$(MYSQL_PWD="$pass" mysql \
+        --host="$host" \
+        --port="${port:-3306}" \
+        --user="$user" \
+        --batch --skip-column-names \
+        -e "SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='${db}' AND TABLE_NAME='bot_combat_loadout_queue' AND INDEX_NAME IN ('PRIMARY', 'uq_bot_combat_loadout_queue_id', 'idx_bot_combat_loadout_queue_due');"); then
+        failure "Admin schema: could not inspect combat-loadout queue indexes"
+        return
+    fi
+
+    if [ "$index_count" -ne 3 ]; then
+        failure "Admin schema: bot_combat_loadout_queue is missing required indexes"
+        info "Run setup-mangossuperui.sh from the current release to apply sql/vmangos_admin_schema.sql."
+        return
+    fi
+
+    pass "Admin schema: combat-loadout queue table and indexes are ready"
+}
+
+check_admin_schema "$CONN_ADMIN"
 
 # ============================================================================
 header "3. VMaNGOS Server Paths"

@@ -861,6 +861,14 @@ public sealed class CustomWeaponBuildService
         long BuyPrice, long SellPrice, int ItemClass, int Subclass, int InventoryType, string? Family, string FamilyLabel,
         float DamageMin, float DamageMax, int DamageType, int DelayMs, int Sheath, int AmmoType, int RangeModPercent,
         int Armor, int Block, int MaxDurability, int Bonding, int AllowableClass,
+        // Every field below is one the Configure modal ALWAYS submits (collectItemConfig emits
+        // allowableRace and the six required* values unconditionally, defaulting to 0). If the
+        // pre-fill cannot see the source's value it cannot put it back in the form, so the clone
+        // shipped with the restriction stripped: a race-locked, rank-gated or reputation-gated
+        // weapon quietly became equippable by anyone. allowable_class already round-tripped; these
+        // are the rest of the same contract.
+        int AllowableRace, int RequiredSkill, int RequiredSkillRank, int RequiredSpell,
+        int RequiredHonorRank, int RequiredReputationFaction, int RequiredReputationRank,
         int HolyRes, int FireRes, int NatureRes, int FrostRes, int ShadowRes, int ArcaneRes,
         IReadOnlyList<(int Type, int Value)> Stats,
         IReadOnlyList<(int SpellId, int Trigger, int Charges, float PpmRate, int CooldownMs, int Category, int CategoryCooldownMs)> Spells);
@@ -939,7 +947,9 @@ public sealed class CustomWeaponBuildService
     /// is missing or is not a weapon/shield.</summary>
     public async Task<VanillaWeaponSourceDto?> ReadVanillaWeaponSourceAsync(uint entry)
     {
-        var d = await ReadItemRowAsync(entry);
+        // propagate: a world-DB outage must reach the controller's catch as an outage, not arrive here
+        // disguised as "no such row" and get reported to the operator as a fact about their item.
+        var d = await ReadItemRowAsync(entry, propagate: true);
         if (d is null) return null;
 
         int I(string k) => d.TryGetValue(k, out var v) && v != null ? Convert.ToInt32(v) : 0;
@@ -971,6 +981,8 @@ public sealed class CustomWeaponBuildService
             L("buy_price"), L("sell_price"), cls, sub, I("inventory_type"), famKey, FamilyLabel(famKey, sub),
             F("dmg_min1"), F("dmg_max1"), I("dmg_type1"), I("delay"), I("sheath"), I("ammo_type"), I("range_mod"),
             I("armor"), I("block"), I("max_durability"), I("bonding"), I("allowable_class"),
+            I("allowable_race"), I("required_skill"), I("required_skill_rank"), I("required_spell"),
+            I("required_honor_rank"), I("required_reputation_faction"), I("required_reputation_rank"),
             I("holy_res"), I("fire_res"), I("nature_res"), I("frost_res"), I("shadow_res"), I("arcane_res"),
             stats, spells);
     }
@@ -1024,6 +1036,14 @@ public sealed class CustomWeaponBuildService
             : !string.IsNullOrWhiteSpace(gameplay?.Name) ? gameplay!.Name!.Trim()
             : sourceName;
 
+        // A transaction around the copy AND the operator's overrides — plus a compensating delete,
+        // because on this schema the transaction alone is not enough. VMaNGOS ships item_template as
+        // ENGINE=MyISAM (WEAPON_GEN.md's DDL, and the owner's own schema dump in
+        // wwwroot/data/curated-relationships.json records mangos.item_template as MyISAM). MyISAM
+        // ignores START TRANSACTION: the INSERT is committed the moment it runs and ROLLBACK answers
+        // warning 1196 rather than undoing anything. The transaction is kept because an InnoDB fork
+        // DOES honour it; the catch below is what actually cleans up here.
+        await using var tx = await conn.BeginTransactionAsync();
         try
         {
             // Schema-agnostic column list so this keeps working on forks that add item_template
@@ -1032,17 +1052,41 @@ public sealed class CustomWeaponBuildService
             // config modal can express and all of which must match the display the clone reuses.
             var cols = (await conn.QueryAsync<string>(
                 @"SELECT COLUMN_NAME FROM information_schema.COLUMNS
-                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item_template' ORDER BY ORDINAL_POSITION")).ToList();
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item_template' ORDER BY ORDINAL_POSITION",
+                transaction: tx)).ToList();
             if (cols.Count == 0) throw new InvalidOperationException("item_template schema could not be read.");
 
             string colList = string.Join(",", cols.Select(c => $"`{c}`"));
             string selList = string.Join(",", cols.Select(c =>
-                c.Equals("entry", StringComparison.OrdinalIgnoreCase) ? "@newEntry" : $"`{c}`"));
-            // ORDER BY patch DESC LIMIT 1: a multi-patch source would otherwise insert once per
-            // patch row and collide on the new entry's key.
-            await conn.ExecuteAsync(
+                c.Equals("entry", StringComparison.OrdinalIgnoreCase) ? "@newEntry"
+                // patch 0, matching DonorItemTemplateFixture (every forged weapon is patch 0). The
+                // core loads, per entry, the highest patch row NOT ABOVE the server's content-patch
+                // setting; inheriting the source's patch left the clone invisible on any server
+                // configured below it, which is exactly the case a clone of a late-patch item hits.
+                : c.Equals("patch", StringComparison.OrdinalIgnoreCase) ? "0"
+                // These name OTHER item entries — the faction mirror, the quest a book starts, the
+                // gift a wrapper produces. Copied verbatim they hand the clone the source's
+                // relationships: an Alliance clone still pointing at the Horde original, a second
+                // item handing out the same quest.
+                : c.Equals("other_team_entry", StringComparison.OrdinalIgnoreCase) ? "0"
+                : c.Equals("start_quest", StringComparison.OrdinalIgnoreCase) ? "0"
+                : c.Equals("wrapped_gift", StringComparison.OrdinalIgnoreCase) ? "0"
+                // set_id joins the item to a stock item set. Riding it across silently makes the clone
+                // count toward that set's bonuses — a gameplay change nobody asked for.
+                : c.Equals("set_id", StringComparison.OrdinalIgnoreCase) ? "0"
+                : $"`{c}`"));
+            // ORDER BY patch DESC LIMIT 1 is load-bearing, not tidiness. A source revised across
+            // content patches has one row per patch, and because the projection above pins every copy
+            // to patch 0, an unqualified SELECT would try to insert them ALL as (newEntry, 0) and die
+            // on the (entry, patch) primary key with ER_DUP_ENTRY.
+            int inserted = await conn.ExecuteAsync(
                 $"INSERT INTO item_template ({colList}) SELECT {selList} FROM item_template WHERE entry=@src ORDER BY patch DESC LIMIT 1",
-                new { newEntry, src = sourceEntry });
+                new { newEntry, src = sourceEntry }, tx);
+            // Never fell through before: a zero-row insert reported a perfectly successful clone of
+            // nothing, and the reserved id was marked committed against a row that does not exist.
+            if (inserted != 1)
+                throw new InvalidOperationException(
+                    $"clone INSERT affected {inserted} rows (expected 1) copying item {sourceEntry}.");
 
             // Name + the validated gameplay overrides on top of the cloned row.
             var sets = new List<string> { "name=@nm" };
@@ -1072,10 +1116,34 @@ public sealed class CustomWeaponBuildService
                     }
                 }
             }
-            await conn.ExecuteAsync($"UPDATE item_template SET {string.Join(",", sets)} WHERE entry=@e", dp);
+            int updated = await conn.ExecuteAsync(
+                $"UPDATE item_template SET {string.Join(",", sets)} WHERE entry=@e", dp, tx);
+            if (updated != 1)
+                throw new InvalidOperationException(
+                    $"clone UPDATE affected {updated} rows (expected 1) for new entry {newEntry}.");
+
+            await tx.CommitAsync();
         }
         catch (Exception ex)
         {
+            try { await tx.RollbackAsync(); }
+            catch (Exception rollbackEx) { _logger.LogWarning(rollbackEx, "WeaponForge: clone rollback failed for entry {Entry}", newEntry); }
+
+            // On MyISAM the rollback above did nothing, so remove the copy by hand before the id goes
+            // back in the pool. Releasing the id without this leaves a live, unedited duplicate of the
+            // source under a custom entry that nothing points at and nothing records.
+            bool cleaned;
+            try
+            {
+                await conn.ExecuteAsync("DELETE FROM item_template WHERE entry=@e", new { e = newEntry });
+                cleaned = true;
+            }
+            catch (Exception cleanupEx)
+            {
+                cleaned = false;
+                _logger.LogWarning(cleanupEx, "WeaponForge: clone cleanup delete failed for entry {Entry}", newEntry);
+            }
+
             await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id);
             result.Ok = false;
             result.Message = "clone failed: " + ex.Message;
@@ -1085,9 +1153,11 @@ public sealed class CustomWeaponBuildService
                 TargetId = newEntry is > 0 and <= int.MaxValue ? (int)newEntry : null,
                 StateAfter = JsonSerializer.Serialize(new { buildId, sourceEntry, itemEntry = newEntry, displayId, family = famKey }),
                 IsReversible = false, RevertKind = RevertKind.None, Success = false,
-                Notes = $"Vanilla weapon clone {sourceEntry} → {newEntry} FAILED: {ex.Message} — the id was released, but the " +
-                        $"INSERT and the override UPDATE are separate statements, so if the first one landed the row is still " +
-                        $"there as an unedited copy of {sourceEntry}. Check with: SELECT * FROM item_template WHERE entry = {newEntry};",
+                Notes = $"Vanilla weapon clone {sourceEntry} → {newEntry} FAILED: {ex.Message}. The id was returned to the pool. " +
+                        (cleaned
+                            ? $"item_template row {newEntry} was removed."
+                            : $"THE CLEANUP DELETE ALSO FAILED — a partial copy of {sourceEntry} may still be live under entry " +
+                              $"{newEntry}. Check with: SELECT * FROM item_template WHERE entry = {newEntry};"),
             });
             return result;
         }
@@ -1181,7 +1251,12 @@ public sealed class CustomWeaponBuildService
     /// <summary>The whole item_template row, for the audit trail's state_before. Schema-agnostic
     /// (SELECT *), so it keeps working across core forks that add columns. Best-effort: a delete is
     /// never blocked by a snapshot that could not be taken, it just loses the forensics.</summary>
-    private async Task<IDictionary<string, object>?> ReadItemRowAsync(long entry)
+    /// <summary><paramref name="propagate"/> decides what a database failure means to the caller. The
+    /// delete path wants the swallow — a missing snapshot must not stop a delete. The clone pre-fill
+    /// does NOT: swallowing there turned "the world DB is down" into a null row, which the caller then
+    /// reported as "item N is not a stock weapon or shield" — a statement about the item, when the item
+    /// was never read.</summary>
+    private async Task<IDictionary<string, object>?> ReadItemRowAsync(long entry, bool propagate = false)
     {
         try
         {
@@ -1196,6 +1271,7 @@ public sealed class CustomWeaponBuildService
         }
         catch (Exception ex)
         {
+            if (propagate) throw;
             _logger.LogWarning(ex, "WeaponForge: snapshot of item_template {Entry} failed (delete continues)", entry);
             return null;
         }

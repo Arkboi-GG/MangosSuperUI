@@ -40,6 +40,7 @@ public class WeaponForgeController : Controller
     private readonly LegacyImportSources _sources;
     private readonly ConnectionFactory _db;
     private readonly DbcService _dbc;
+    private readonly ItemTextureService _itemTextures;
     private readonly VanillaItemSpellCatalog _itemSpells;
     private readonly ItemBudgetGenerator _itemize;
     private readonly PaletteSwapService _palette;
@@ -67,7 +68,8 @@ public class WeaponForgeController : Controller
     public WeaponForgeController(MpqReaderService mpq, WeaponPreviewService preview,
         CustomWeaponBuildService builder, GlbWeaponImporter glbImporter, WeaponDonorResolver donors,
         LegacyImportSources sources, ConnectionFactory db, DbcService dbc,
-        VanillaItemSpellCatalog itemSpells, ItemBudgetGenerator itemize, PaletteSwapService palette,
+        ItemTextureService itemTextures, VanillaItemSpellCatalog itemSpells,
+        ItemBudgetGenerator itemize, PaletteSwapService palette,
         ILogger<WeaponForgeController> logger)
     {
         _mpq = mpq;
@@ -78,6 +80,7 @@ public class WeaponForgeController : Controller
         _sources = sources;
         _db = db;
         _dbc = dbc;
+        _itemTextures = itemTextures;
         _itemSpells = itemSpells;
         _itemize = itemize;
         _palette = palette;
@@ -2209,6 +2212,45 @@ public class WeaponForgeController : Controller
         }
     }
 
+    /// <summary>GET /WeaponForge/VanillaPreview?displayId= — render a STOCK weapon's own display in
+    /// the forge viewer.
+    ///
+    /// The other two lanes preview by re-emitting foreign art (<c>{Tbc|Wotlk}PreviewWeapon</c>) and a
+    /// forged weapon previews from its stored bytes (<c>PreviewForged</c>). A clone has neither: it
+    /// packages nothing and keeps the source display, so the model, texture and enchant glow are
+    /// already in the mounted 1.12 client. <see cref="ItemTextureService.EnsureGlb"/> is the exact
+    /// pipeline the Items page 3D view uses for a stock display — same <c>GlbWriter</c>, same
+    /// <c>suiFx</c> manifest, same resolved <c>ItemVisual</c> effect models — so the vanilla lane gets
+    /// the same viewer treatment (blend suffixes, env-map matcap, m2fx, item rig) for free. The result
+    /// is the version-stamped on-demand cache under <c>wwwroot/item_models</c>, not a throwaway file.
+    /// </summary>
+    [HttpGet]
+    public IActionResult VanillaPreview(uint displayId)
+    {
+        if (displayId == 0) return BadRequest(new { ok = false, error = "displayId is required." });
+        try
+        {
+            string? webPath = _itemTextures.EnsureGlb(displayId);
+            if (string.IsNullOrEmpty(webPath))
+                return Json(new
+                {
+                    ok = false,
+                    error = $"Display {displayId} has no renderable model in the mounted 1.12 client " +
+                            "(ItemDisplayInfo row missing, or the item has no ObjectComponents M2 — " +
+                            "quivers, ammo pouches and a few off-hand tomes are like this). The clone " +
+                            "itself still works; only the 3D preview is unavailable.",
+                });
+
+            uint visualId = _dbc.GetItemModelInfo(displayId)?.ItemVisualId ?? 0;
+            return Json(new { ok = true, previewGlbWebPath = webPath, displayId, itemVisual = visualId });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "WeaponForge: vanilla preview for display {DisplayId} failed", displayId);
+            return Json(new { ok = false, error = ex.Message });
+        }
+    }
+
     /// <summary>GET /WeaponForge/VanillaWeaponSource?entry= — the source weapon's real gameplay, to
     /// pre-fill the Configure modal. NOT optional for weapons: the modal always submits a full
     /// override set and its defaults are a 2–4 damage trinket, so a clone without this pre-fill
@@ -2216,8 +2258,20 @@ public class WeaponForgeController : Controller
     [HttpGet]
     public async Task<IActionResult> VanillaWeaponSource(uint entry)
     {
-        var s = await _builder.ReadVanillaWeaponSourceAsync(entry);
-        if (s is null) return NotFound(new { ok = false, error = $"Item {entry} is not a stock weapon or shield." });
+        CustomWeaponBuildService.VanillaWeaponSourceDto? s;
+        try
+        {
+            s = await _builder.ReadVanillaWeaponSourceAsync(entry);
+        }
+        catch (Exception ex)
+        {
+            // Same { ok, error } envelope VanillaWeapons uses. An unhandled throw here became a 500
+            // with an HTML body, and the caller's `await r.json()` then reported the operator's world
+            // DB outage as "SyntaxError: Unexpected token '<'".
+            _logger.LogWarning(ex, "WeaponForge: vanilla weapon source {Entry} failed", entry);
+            return Json(new { ok = false, error = "Could not read the world database: " + ex.Message });
+        }
+        if (s is null) return Json(new { ok = false, error = $"Item {entry} is not a stock weapon or shield." });
         return Json(new
         {
             ok = true,
@@ -2229,7 +2283,10 @@ public class WeaponForgeController : Controller
             damageMin = s.DamageMin, damageMax = s.DamageMax, damageType = s.DamageType, delayMs = s.DelayMs,
             sheath = s.Sheath, ammoType = s.AmmoType, rangeMod = s.RangeModPercent,
             armor = s.Armor, block = s.Block, maxDurability = s.MaxDurability, bonding = s.Bonding,
-            allowableClass = s.AllowableClass,
+            allowableClass = s.AllowableClass, allowableRace = s.AllowableRace,
+            requiredSkill = s.RequiredSkill, requiredSkillRank = s.RequiredSkillRank,
+            requiredSpell = s.RequiredSpell, requiredHonorRank = s.RequiredHonorRank,
+            requiredReputationFaction = s.RequiredReputationFaction, requiredReputationRank = s.RequiredReputationRank,
             holyRes = s.HolyRes, fireRes = s.FireRes, natureRes = s.NatureRes,
             frostRes = s.FrostRes, shadowRes = s.ShadowRes, arcaneRes = s.ArcaneRes,
             stats = s.Stats.Select(t => new { type = t.Type, value = t.Value }),

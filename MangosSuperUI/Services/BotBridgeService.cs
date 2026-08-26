@@ -59,6 +59,35 @@ public class BotHelloPayload
     [JsonPropertyName("z")]
     public float Z { get; set; }
 
+    // Persistent bot identity from characters.playerbot. Old core binaries omit
+    // these and deserialize to the migration-safe sentinels below.
+    [JsonPropertyName("specTab")]
+    public int SpecTab { get; set; } = 255;
+
+    [JsonPropertyName("specProfile")]
+    public string SpecProfile { get; set; } = "";
+
+    [JsonPropertyName("activeRole")]
+    public int ActiveRole { get; set; } = 0;
+
+    [JsonPropertyName("talentProfileState")]
+    public string TalentProfileState { get; set; } = "unchecked";
+
+    [JsonPropertyName("rotationSource")]
+    public string RotationSource { get; set; } = "legacy";
+
+    [JsonPropertyName("rotationProfile")]
+    public string RotationProfile { get; set; } = "";
+
+    [JsonPropertyName("rotationInstructionCount")]
+    public int RotationInstructionCount { get; set; }
+
+    [JsonPropertyName("rotationCastableCount")]
+    public int RotationCastableCount { get; set; }
+
+    [JsonPropertyName("combatConfigRevision")]
+    public uint CombatConfigRevision { get; set; }
+
 }
 
 public class BotStatePayload
@@ -80,6 +109,33 @@ public class BotStatePayload
 
     [JsonPropertyName("level")]
     public int Level { get; set; }
+
+    [JsonPropertyName("specTab")]
+    public int SpecTab { get; set; } = 255;
+
+    [JsonPropertyName("specProfile")]
+    public string SpecProfile { get; set; } = "";
+
+    [JsonPropertyName("activeRole")]
+    public int ActiveRole { get; set; } = 0;
+
+    [JsonPropertyName("talentProfileState")]
+    public string TalentProfileState { get; set; } = "unchecked";
+
+    [JsonPropertyName("rotationSource")]
+    public string RotationSource { get; set; } = "legacy";
+
+    [JsonPropertyName("rotationProfile")]
+    public string RotationProfile { get; set; } = "";
+
+    [JsonPropertyName("rotationInstructionCount")]
+    public int RotationInstructionCount { get; set; }
+
+    [JsonPropertyName("rotationCastableCount")]
+    public int RotationCastableCount { get; set; }
+
+    [JsonPropertyName("combatConfigRevision")]
+    public uint CombatConfigRevision { get; set; }
 
     [JsonPropertyName("mapId")]
     public int MapId { get; set; }
@@ -318,6 +374,15 @@ public class BotState
     public int Race { get; set; }
     public int ClassId { get; set; }
     public int Level { get; set; }
+    public int SpecTab { get; set; } = 255;
+    public string SpecProfile { get; set; } = "";
+    public int ActiveRole { get; set; } = 0;
+    public string TalentProfileState { get; set; } = "unchecked";
+    public string RotationSource { get; set; } = "legacy";
+    public string RotationProfile { get; set; } = "";
+    public int RotationInstructionCount { get; set; }
+    public int RotationCastableCount { get; set; }
+    public uint CombatConfigRevision { get; set; }
     public int Health { get; set; }
     public int MaxHealth { get; set; }
     public int Mana { get; set; }
@@ -379,6 +444,88 @@ public class BotConnection
     public NetworkStream Stream { get; set; } = null!;
     public CancellationTokenSource Cts { get; set; } = new();
     public BotState State { get; set; } = new();
+    /// <summary>NetworkStream does not support concurrent writers.</summary>
+    public SemaphoreSlim SendGate { get; } = new(1, 1);
+}
+
+public sealed class CombatLoadoutBridgeCommand
+{
+    public string RequestId { get; init; } = "";
+    public uint ExpectedRevision { get; init; }
+    public int SpecTab { get; init; }
+    public int ActiveRole { get; init; }
+    public bool ResetTalents { get; init; }
+    /// <summary>Wire values are SPEC or CUSTOM.</summary>
+    public string RotationMode { get; init; } = "SPEC";
+    public string RotationProfile { get; init; } = "";
+    public string RotationData { get; init; } = "";
+}
+
+public sealed class CombatLoadoutAck
+{
+    public int Guid { get; init; }
+    public string RequestId { get; init; } = "";
+    public string Status { get; init; } = "error";
+    public string Code { get; init; } = "unknown";
+    public uint Revision { get; init; }
+    public int SpecTab { get; init; } = 255;
+    public string TalentProfile { get; init; } = "";
+    public int ActiveRole { get; init; }
+    public string TalentProfileState { get; init; } = "unchecked";
+    public int LearnedPoints { get; init; }
+    public string RotationSource { get; init; } = "legacy";
+    public string RotationProfile { get; init; } = "";
+    public int LoadedInstructions { get; init; }
+    public int SkippedInstructions { get; init; }
+    public bool Reset { get; init; }
+
+    public bool Success => Status.Equals("ok", StringComparison.OrdinalIgnoreCase)
+        || Status.Equals("success", StringComparison.OrdinalIgnoreCase)
+        || Status.Equals("applied", StringComparison.OrdinalIgnoreCase);
+}
+
+public sealed class BotNotConnectedException : InvalidOperationException
+{
+    public BotNotConnectedException(int guid)
+        : base($"Bot {guid} is not connected to the bridge.")
+    {
+        Guid = guid;
+    }
+
+    public int Guid { get; }
+}
+
+public sealed class CombatLoadoutAckTimeoutException : TimeoutException
+{
+    public CombatLoadoutAckTimeoutException(int guid, string requestId, TimeSpan timeout)
+        : base($"Bot {guid} did not acknowledge combat loadout request {requestId} within {timeout.TotalSeconds:0} seconds.")
+    {
+        Guid = guid;
+        RequestId = requestId;
+    }
+
+    public int Guid { get; }
+    public string RequestId { get; }
+}
+
+/// <summary>
+/// The bridge started writing a destructive combat-loadout request, but lost the
+/// socket or waiter before a correlated ACK arrived. Callers must refresh live
+/// state and must never retry automatically.
+/// </summary>
+public sealed class CombatLoadoutOutcomeUnknownException : IOException
+{
+    public CombatLoadoutOutcomeUnknownException(int guid, string requestId, Exception? inner = null)
+        : base(
+            $"Bot {guid} lost its bridge connection after combat loadout request {requestId} began sending; the outcome is unknown.",
+            inner)
+    {
+        Guid = guid;
+        RequestId = requestId;
+    }
+
+    public int Guid { get; }
+    public string RequestId { get; }
 }
 
 // ======================== BotBridgeService ========================
@@ -400,6 +547,26 @@ public class BotConnection
 /// </summary>
 public class BotBridgeService : BackgroundService
 {
+    private static readonly TimeSpan CombatLoadoutAckTimeout = TimeSpan.FromSeconds(15);
+
+    private sealed class PendingCombatLoadout
+    {
+        public PendingCombatLoadout(
+            int guid,
+            BotConnection connection,
+            TaskCompletionSource<CombatLoadoutAck> completion)
+        {
+            Guid = guid;
+            Connection = connection;
+            Completion = completion;
+        }
+
+        public int Guid { get; }
+        public BotConnection Connection { get; }
+        public TaskCompletionSource<CombatLoadoutAck> Completion { get; }
+        public int SendAttempted;
+    }
+
     private readonly ILogger<BotBridgeService> _logger;
     private readonly IHubContext<BotBridgeHub> _hub;
     private TcpListener? _listener;
@@ -418,6 +585,11 @@ public class BotBridgeService : BackgroundService
 
     // Snapshot of all bot states (survives brief disconnects for UI display)
     public ConcurrentDictionary<int, BotState> BotStates { get; } = new();
+
+    // Admin build changes use a correlated request registry independent of
+    // BotBrain's singular, event-type-only planner WAIT.
+    private readonly ConcurrentDictionary<string, PendingCombatLoadout> _pendingCombatLoadouts
+        = new(StringComparer.Ordinal);
 
     // [HUB-ERRAND] How long a "do your rounds" run token stays live. The GoalSelector
     // auto-reverts to the follow hold at expiry regardless of errand progress, so this is
@@ -534,6 +706,16 @@ public class BotBridgeService : BackgroundService
             try { kvp.Value.Client.Dispose(); } catch { }
         }
         Connections.Clear();
+        foreach (var pending in _pendingCombatLoadouts.ToArray())
+        {
+            if (_pendingCombatLoadouts.TryRemove(pending.Key, out var removed))
+            {
+                Exception error = Volatile.Read(ref removed.SendAttempted) == 0
+                    ? new BotNotConnectedException(removed.Guid)
+                    : new CombatLoadoutOutcomeUnknownException(removed.Guid, pending.Key);
+                removed.Completion.TrySetException(error);
+            }
+        }
 
         await base.StopAsync(cancellationToken);
     }
@@ -582,13 +764,23 @@ public class BotBridgeService : BackgroundService
         {
             if (conn != null && conn.Guid != 0)
             {
-                Connections.TryRemove(conn.Guid, out _);
+                // A fast relog can replace the dictionary entry before this old
+                // socket's finally runs. Only tear down state/requests if this is
+                // still the active connection for the guid.
+                bool removedActive = Connections.TryGetValue(conn.Guid, out var active)
+                    && ReferenceEquals(active, conn)
+                    && Connections.TryRemove(conn.Guid, out _);
+                // Pending requests belong to a concrete socket session, not just
+                // a guid. Fail this connection's request even if a fast relog has
+                // already replaced it in Connections.
+                FailPendingCombatLoadoutsForConnection(conn);
                 // Mark state as disconnected but keep it for UI
-                if (BotStates.TryGetValue(conn.Guid, out var state))
+                if (removedActive && BotStates.TryGetValue(conn.Guid, out var state))
                     state.TaskState = "DISCONNECTED";
 
                 _logger.LogInformation("BotBridge: bot {Guid} ({Name}) disconnected", conn.Guid, conn.State.Name);
-                await _hub.Clients.All.SendAsync("BotDisconnected", conn.Guid);
+                if (removedActive)
+                    await _hub.Clients.All.SendAsync("BotDisconnected", conn.Guid);
             }
 
             try { client.Dispose(); } catch { }
@@ -632,6 +824,15 @@ public class BotBridgeService : BackgroundService
             Race = hello.Race,
             ClassId = hello.ClassId,
             Level = hello.Level,
+            SpecTab = hello.SpecTab,
+            SpecProfile = hello.SpecProfile?.Trim() ?? "",
+            ActiveRole = hello.ActiveRole,
+            TalentProfileState = NormalizeRuntimeToken(hello.TalentProfileState, "unchecked"),
+            RotationSource = NormalizeRuntimeToken(hello.RotationSource, "legacy"),
+            RotationProfile = hello.RotationProfile?.Trim() ?? "",
+            RotationInstructionCount = Math.Max(0, hello.RotationInstructionCount),
+            RotationCastableCount = Math.Max(0, hello.RotationCastableCount),
+            CombatConfigRevision = hello.CombatConfigRevision,
             MapId = hello.MapId,
             ZoneId = hello.ZoneId,
             X = hello.X,
@@ -644,18 +845,31 @@ public class BotBridgeService : BackgroundService
             LastUpdate = DateTime.UtcNow
         };
 
-        Connections[hello.Guid] = conn;
-        BotStates[hello.Guid] = conn.State;
+        // Register the exact-connection hydration barrier before making this
+        // socket discoverable. Any loadout request that can see the connection
+        // can therefore also see and await its persisted rotation replay.
+        RotationService.HelloHydrationRegistration? rotationHydration =
+            _rotations?.RegisterHelloHydration(conn, hello.Name);
+        try
+        {
+            Connections[hello.Guid] = conn;
+            BotStates[hello.Guid] = conn.State;
+        }
+        finally
+        {
+            // Always settle a registration. If publication failed, the exact
+            // writer will reject this inactive connection and completion still
+            // releases any waiter instead of stranding it forever.
+            if (rotationHydration != null)
+                _rotations!.StartHelloHydration(rotationHydration);
+        }
 
         _logger.LogInformation("BotBridge: HELLO from {Name} (guid={Guid}, class={Class}, level={Level})",
             hello.Name, hello.Guid, hello.ClassId, hello.Level);
 
+        // Publish to web clients only after the hydration replay has been
+        // registered and started for this exact socket.
         await _hub.Clients.All.SendAsync("BotConnected", conn.State);
-
-        // [ROTATION] Re-push this bot's persisted rotation assignment, if any — fire and
-        // forget so a slow push can never delay the HELLO handshake. Failures log inside.
-        if (_rotations != null)
-            _ = _rotations.OnBotHelloAsync(hello.Guid, hello.Name);
 
         // [RAID-PLAN] Same law for the raid plan: the persisted assignment re-pushes
         // on every HELLO, fire-and-forget, failures log inside (PLAN_19 M-B).
@@ -674,6 +888,15 @@ public class BotBridgeService : BackgroundService
         bs.Mana = state.Mana;
         bs.MaxMana = state.MaxMana;
         bs.Level = state.Level;
+        if (state.SpecTab is >= 0 and <= 2) bs.SpecTab = state.SpecTab;
+        bs.SpecProfile = state.SpecProfile?.Trim() ?? "";
+        if (state.ActiveRole is >= 1 and <= 4) bs.ActiveRole = state.ActiveRole;
+        bs.TalentProfileState = NormalizeRuntimeToken(state.TalentProfileState, "unchecked");
+        bs.RotationSource = NormalizeRuntimeToken(state.RotationSource, "legacy");
+        bs.RotationProfile = state.RotationProfile?.Trim() ?? "";
+        bs.RotationInstructionCount = Math.Max(0, state.RotationInstructionCount);
+        bs.RotationCastableCount = Math.Max(0, state.RotationCastableCount);
+        bs.CombatConfigRevision = state.CombatConfigRevision;
         bs.MapId = state.MapId;
         bs.ZoneId = state.ZoneId;
         bs.X = state.X;
@@ -740,6 +963,96 @@ public class BotBridgeService : BackgroundService
 
         switch (eventType)
         {
+            case "COMBAT_LOADOUT_ACK":
+                {
+                    var values = ParsePipeDelimited(evt.Data ?? "");
+                    string requestId = values.GetValueOrDefault("requestId", "").Trim();
+                    var ack = new CombatLoadoutAck
+                    {
+                        Guid = conn.Guid,
+                        RequestId = requestId,
+                        Status = values.GetValueOrDefault("status", "error"),
+                        Code = values.GetValueOrDefault("code", "unknown"),
+                        Revision = ParseUInt(values.GetValueOrDefault("revision")),
+                        SpecTab = ParseInt(values.GetValueOrDefault("specTab"), 255),
+                        TalentProfile = values.GetValueOrDefault("profile", ""),
+                        ActiveRole = ParseInt(values.GetValueOrDefault("role")),
+                        TalentProfileState = NormalizeRuntimeToken(
+                            values.GetValueOrDefault("talentState"), "unchecked"),
+                        LearnedPoints = Math.Max(0, ParseInt(values.GetValueOrDefault("learned"))),
+                        RotationSource = NormalizeRuntimeToken(
+                            values.GetValueOrDefault("rotationSource"), "legacy"),
+                        RotationProfile = values.GetValueOrDefault("rotationProfile", ""),
+                        LoadedInstructions = Math.Max(0, ParseInt(values.GetValueOrDefault("loaded"))),
+                        SkippedInstructions = Math.Max(0, ParseInt(values.GetValueOrDefault("skipped"))),
+                        Reset = ParseBool(values.GetValueOrDefault("reset"))
+                    };
+
+                    if (!Connections.TryGetValue(conn.Guid, out BotConnection? activeConnection)
+                        || !ReferenceEquals(activeConnection, conn))
+                    {
+                        if (requestId.Length > 0
+                            && _pendingCombatLoadouts.TryGetValue(requestId, out PendingCombatLoadout? inactivePending)
+                            && ReferenceEquals(inactivePending.Connection, conn))
+                        {
+                            inactivePending.Completion.TrySetException(
+                                new CombatLoadoutOutcomeUnknownException(conn.Guid, requestId));
+                        }
+                        _logger.LogWarning(
+                            "[COMBAT-LOADOUT] ignored ACK from superseded connection for {Name}: requestId={RequestId}; live outcome requires refresh",
+                            conn.State.Name, requestId.Length == 0 ? "(missing)" : requestId);
+                        return;
+                    }
+
+                    // The ACK describes final runtime truth on both success and a
+                    // verified rollback. Copy every well-formed field before waking
+                    // the HTTP request so its follow-up GET sees the same revision.
+                    if (ack.SpecTab is >= 0 and <= 2) conn.State.SpecTab = ack.SpecTab;
+                    conn.State.SpecProfile = ack.TalentProfile.Trim();
+                    if (ack.ActiveRole is >= 1 and <= 4) conn.State.ActiveRole = ack.ActiveRole;
+                    conn.State.TalentProfileState = ack.TalentProfileState;
+                    conn.State.RotationSource = ack.RotationSource;
+                    conn.State.RotationProfile = ack.RotationProfile.Trim();
+                    conn.State.RotationInstructionCount = ack.LoadedInstructions + ack.SkippedInstructions;
+                    conn.State.RotationCastableCount = ack.LoadedInstructions;
+                    conn.State.CombatConfigRevision = ack.Revision;
+                    conn.State.LastUpdate = DateTime.UtcNow;
+                    BotStates[conn.Guid] = conn.State;
+
+                    bool matched = false;
+                    if (requestId.Length > 0
+                        && _pendingCombatLoadouts.TryGetValue(requestId, out var pending)
+                        && pending.Guid == conn.Guid
+                        && ReferenceEquals(pending.Connection, conn))
+                    {
+                        matched = pending.Completion.TrySetResult(ack);
+                    }
+
+                    if (ack.Success)
+                        _logger.LogInformation(
+                            "[COMBAT-LOADOUT] {Name} ACK {RequestId}: revision={Revision} spec={Spec} role={Role} rotation={Source}/{Profile} loaded={Loaded} skipped={Skipped}",
+                            conn.State.Name, requestId, ack.Revision, ack.SpecTab, ack.ActiveRole,
+                            ack.RotationSource, ack.RotationProfile, ack.LoadedInstructions, ack.SkippedInstructions);
+                    else
+                        _logger.LogWarning(
+                            "[COMBAT-LOADOUT] {Name} rejected {RequestId}: status={Status} code={Code} revision={Revision}",
+                            conn.State.Name, requestId, ack.Status, ack.Code, ack.Revision);
+
+                    if (!matched)
+                        _logger.LogWarning(
+                            "[COMBAT-LOADOUT] late or uncorrelated ACK from {Name}: requestId={RequestId}",
+                            conn.State.Name, requestId.Length == 0 ? "(missing)" : requestId);
+
+                    await _hub.Clients.All.SendAsync("BotCombatLoadoutChanged", new
+                    {
+                        guid = conn.Guid,
+                        state = conn.State,
+                        ack,
+                        timestamp = DateTime.UtcNow
+                    });
+                    return;
+                }
+
             case "ROTATION_ACK":
                 {
                     // [ROTATION] C++ resolved the pushed slate. skipped>0 = the profile names
@@ -1067,18 +1380,156 @@ public class BotBridgeService : BackgroundService
             return;
         }
 
-        var envelope = new { type, payload };
-        var json = JsonSerializer.Serialize(envelope, JsonOpts) + "\n";
-        var bytes = Encoding.UTF8.GetBytes(json);
-
         try
         {
-            await conn.Stream.WriteAsync(bytes);
-            await conn.Stream.FlushAsync();
+            await WriteEnvelopeAsync(conn, type, payload, CancellationToken.None);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "BotBridge: send to bot {Guid} failed", guid);
+        }
+    }
+
+    /// <summary>
+    /// Send only to the supplied live connection. HELLO hydration uses this so a
+    /// delayed replay from an older socket can never resolve the guid again and
+    /// overwrite a newer session's rotation.
+    /// </summary>
+    public async Task SendToBotConnectionAsync(
+        BotConnection expectedConnection,
+        string type,
+        object payload,
+        CancellationToken cancellationToken = default)
+    {
+        int guid = expectedConnection.Guid;
+        await expectedConnection.SendGate.WaitAsync(cancellationToken);
+        try
+        {
+            // Recheck after acquiring the writer gate; replacement may have
+            // happened while an earlier message held the stream.
+            if (!Connections.TryGetValue(guid, out BotConnection? active)
+                || !ReferenceEquals(active, expectedConnection))
+            {
+                throw new BotNotConnectedException(guid);
+            }
+
+            var envelope = new { type, payload };
+            byte[] bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOpts) + "\n");
+            await expectedConnection.Stream.WriteAsync(bytes, cancellationToken);
+            await expectedConnection.Stream.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            expectedConnection.SendGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Send one destructive combat-build operation and await only its correlated
+    /// core acknowledgement. A timeout/disconnect is returned to the caller and
+    /// is never converted into a blind retry (the late ACK can still update live
+    /// state, but repeating a talent reset would be unsafe).
+    /// </summary>
+    public async Task<CombatLoadoutAck> ApplyCombatLoadoutAsync(
+        int guid,
+        CombatLoadoutBridgeCommand command,
+        BotConnection expectedConnection,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Connections.TryGetValue(guid, out var conn)
+            || !ReferenceEquals(conn, expectedConnection))
+            throw new BotNotConnectedException(guid);
+        if (!Guid.TryParseExact(command.RequestId, "N", out _))
+            throw new ArgumentException("Combat loadout request ids must be GUIDs in N format.", nameof(command));
+        if (command.SpecTab is < 0 or > 2)
+            throw new ArgumentOutOfRangeException(nameof(command), "Specialization slot must be 0-2.");
+        if (command.ActiveRole is < 1 or > 4)
+            throw new ArgumentOutOfRangeException(nameof(command), "Active role must be 1-4.");
+
+        string rotationMode = (command.RotationMode ?? "").Trim().ToUpperInvariant();
+        if (rotationMode is not ("SPEC" or "CUSTOM"))
+            throw new ArgumentException("Rotation mode must be SPEC or CUSTOM.", nameof(command));
+        if (rotationMode == "CUSTOM"
+            && (string.IsNullOrWhiteSpace(command.RotationProfile) || string.IsNullOrWhiteSpace(command.RotationData)))
+            throw new ArgumentException("Custom rotations require profile and data.", nameof(command));
+
+        var completion = new TaskCompletionSource<CombatLoadoutAck>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pending = new PendingCombatLoadout(guid, conn, completion);
+        if (!_pendingCombatLoadouts.TryAdd(
+                command.RequestId,
+                pending))
+            throw new InvalidOperationException($"Combat loadout request {command.RequestId} is already pending.");
+
+        try
+        {
+            // Honor cancellation and then mark the pending request before the
+            // final active-socket check. The local check can still prove a
+            // no-write bot_offline result, while any concurrent disconnect after
+            // this point fails the waiter as outcome_unknown.
+            cancellationToken.ThrowIfCancellationRequested();
+            Volatile.Write(ref pending.SendAttempted, 1);
+
+            // Keep the exact captured connection: a disconnect/relog between the
+            // registration and write must fail this request, not deliver it to a
+            // different session and ambiguously await the old one.
+            if (!Connections.TryGetValue(guid, out var active) || !ReferenceEquals(active, conn))
+                throw new BotNotConnectedException(guid);
+
+            // Once a destructive write begins we keep the correlated
+            // waiter alive for its bounded ACK window even if the browser or
+            // host request goes away.
+            try
+            {
+                await WriteEnvelopeAsync(conn, "APPLY_COMBAT_LOADOUT", new
+                {
+                    requestId = command.RequestId,
+                    expectedRevision = command.ExpectedRevision,
+                    specTab = command.SpecTab,
+                    activeRole = command.ActiveRole,
+                    resetTalents = command.ResetTalents,
+                    rotationMode,
+                    rotationProfile = rotationMode == "CUSTOM" ? command.RotationProfile : "",
+                    rotationData = rotationMode == "CUSTOM" ? command.RotationData : ""
+                }, CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+            {
+                throw new CombatLoadoutOutcomeUnknownException(guid, command.RequestId, ex);
+            }
+
+            try
+            {
+                return await completion.Task.WaitAsync(CombatLoadoutAckTimeout, CancellationToken.None);
+            }
+            catch (TimeoutException)
+            {
+                throw new CombatLoadoutAckTimeoutException(guid, command.RequestId, CombatLoadoutAckTimeout);
+            }
+        }
+        finally
+        {
+            _pendingCombatLoadouts.TryRemove(command.RequestId, out _);
+        }
+    }
+
+    private static async Task WriteEnvelopeAsync(
+        BotConnection conn,
+        string type,
+        object payload,
+        CancellationToken cancellationToken)
+    {
+        var envelope = new { type, payload };
+        byte[] bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOpts) + "\n");
+
+        await conn.SendGate.WaitAsync(cancellationToken);
+        try
+        {
+            await conn.Stream.WriteAsync(bytes, cancellationToken);
+            await conn.Stream.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            conn.SendGate.Release();
         }
     }
 
@@ -1200,6 +1651,45 @@ public class BotBridgeService : BackgroundService
                 result[segment[..eq].Trim()] = segment[(eq + 1)..].Trim();
         }
         return result;
+    }
+
+    private static string NormalizeRuntimeToken(string? value, string fallback)
+    {
+        string token = (value ?? "").Trim().ToLowerInvariant();
+        return token.Length == 0 ? fallback : token;
+    }
+
+    private static int ParseInt(string? value, int fallback = 0)
+        => int.TryParse(value, System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out int parsed)
+            ? parsed
+            : fallback;
+
+    private static uint ParseUInt(string? value, uint fallback = 0)
+        => uint.TryParse(value, System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out uint parsed)
+            ? parsed
+            : fallback;
+
+    private static bool ParseBool(string? value)
+        => value != null && (value.Equals("1", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("yes", StringComparison.OrdinalIgnoreCase));
+
+    private void FailPendingCombatLoadoutsForConnection(BotConnection connection)
+    {
+        foreach (var entry in _pendingCombatLoadouts.ToArray())
+        {
+            if (!ReferenceEquals(entry.Value.Connection, connection))
+                continue;
+            if (_pendingCombatLoadouts.TryRemove(entry.Key, out var removed))
+            {
+                Exception error = Volatile.Read(ref removed.SendAttempted) == 0
+                    ? new BotNotConnectedException(connection.Guid)
+                    : new CombatLoadoutOutcomeUnknownException(connection.Guid, entry.Key);
+                removed.Completion.TrySetException(error);
+            }
+        }
     }
 
     // ==================== Query ====================

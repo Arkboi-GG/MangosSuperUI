@@ -114,6 +114,9 @@ $(function () {
         5: 'Reagent', 6: 'Projectile', 7: 'Trade Goods', 9: 'Recipe',
         11: 'Quiver', 12: 'Quest', 13: 'Key', 15: 'Miscellaneous'
     };
+    var COMBAT_ROLE_NAMES = {
+        1: 'Melee DPS', 2: 'Ranged DPS', 3: 'Tank', 4: 'Healer'
+    };
 
     // ===================== STATE =====================
     var connection = null;
@@ -127,6 +130,24 @@ $(function () {
     var engineEnabled = false;
     var maxTimelineEntries = 100;
     var inventoryCache = {};  // guid → inventory data from /Bots/Inventory
+    // The combat-loadout endpoint keeps the existing flat talent projection and adds
+    // authoritative rotation state plus the guarded build-change catalog. It remains
+    // deliberately lazy: only the selected bot ever causes a request.
+    var combatLoadoutCache = {};     // guid → { data, fetchedAt }
+    var combatLoadoutLoading = {};   // guid → true while GET is in flight
+    var combatLoadoutApplying = {};  // guid → true while POST is awaiting the core
+    var combatLoadoutQueueBusy = {}; // guid → 'saving' | 'cancelling' while queue state mutates
+    var combatLoadoutRefreshPending = {}; // guid → refetch after an in-flight GET settles
+    var combatLoadoutNotices = {};   // guid → last structured apply error/status for the editor
+
+    // Spellbook: a read-only character_spell projection (Spell/SkillLine DBC resolved,
+    // grouped into the client's own spellbook tabs). Cached per bot and fetched only for
+    // the selected one, exactly like the combat loadout. It is invalidated by the events
+    // that can actually change a learned set — connect, level up, applied build — and
+    // NOT by the combat/death transitions that merely unlock the build editor.
+    var spellbookCache = {};     // guid → { data, fetchedAt }
+    var spellbookLoading = {};   // guid → true while GET is in flight
+    var spellbookView = {};      // guid → { q, topOnly, hidePassive, classOnly, collapsed:{} }
 
     // Cockpit (fleet census + roster ordering). liveFleet is the /Bots/LiveFleet projection
     // keyed by guid — it carries zoneId/goal/step, which bridge STATE does not, and is the only
@@ -151,7 +172,7 @@ $(function () {
     var cockpitFilter = null;       // { kind:'zone'|'level'|'class'|'activity'|'group'|'flag', key }
 
     // Live tab (real-time BotContext feed)
-    var detailTab = 'overview';   // 'overview' | 'live'
+    var detailTab = 'overview';   // 'overview' | 'talents' | 'spellbook' | 'live'
     var livePollTimer = null;     // 5s server poll
     var liveTickTimer = null;     // 1s client-side age ticker
     var liveData = null;          // last /Bots/LiveState payload
@@ -188,6 +209,12 @@ $(function () {
                     delete botBrains[g];
                     delete decisionLog[g];
                     delete inventoryCache[g];
+                    delete combatLoadoutCache[g];
+                    delete combatLoadoutLoading[g];
+                    delete combatLoadoutApplying[g];
+                    delete combatLoadoutQueueBusy[g];
+                    delete combatLoadoutRefreshPending[g];
+                    delete combatLoadoutNotices[g];
                     $('#roster-' + g).remove();
                 }
             }
@@ -209,6 +236,8 @@ $(function () {
 
         connection.on('BotConnected', function (state) {
             botStates[state.guid] = state;
+            invalidateCombatLoadout(state.guid, selectedGuid === state.guid && detailTab === 'talents');
+            invalidateSpellbook(state.guid);
             // NOT renderRoster() — during a mass spawn this fires once per bot, and a full
             // rebuild per arrival is quadratic. rosterResortIfNeeded picks the new bot up on
             // its next tick; updateStats has its own 5s timer.
@@ -230,6 +259,15 @@ $(function () {
                         delete botBrains[guid];
                         delete decisionLog[guid];
                         delete inventoryCache[guid];
+                        delete combatLoadoutCache[guid];
+                        delete combatLoadoutLoading[guid];
+                        delete combatLoadoutApplying[guid];
+                        delete combatLoadoutQueueBusy[guid];
+                        delete combatLoadoutRefreshPending[guid];
+                        delete combatLoadoutNotices[guid];
+                        delete spellbookCache[guid];
+                        delete spellbookLoading[guid];
+                        delete spellbookView[guid];
                         $('#roster-' + guid).remove();
                         rosterDirty = true;
 
@@ -243,9 +281,11 @@ $(function () {
                     }
                 }, 30000);
             }
+            invalidateCombatLoadout(guid, selectedGuid === parseInt(guid) && detailTab === 'talents');
         });
 
         connection.on('BotStateUpdate', function (state) {
+            var previous = botStates[state.guid];
             botStates[state.guid] = state;
             // Card repaint is coalesced (see flushDirtyCards): a bot reports every
             // BRIDGE_STATE_INTERVAL, so at fleet scale this fires hundreds of times a second and
@@ -253,14 +293,25 @@ $(function () {
             // scans the whole fleet and already runs on its own 5s timer.
             dirtyCards[state.guid] = true;
             // The selected bot is a single row, so keep it live.
-            if (selectedGuid === state.guid) updateEconomyStrip(state);
+            if (selectedGuid === state.guid) {
+                updateEconomyStrip(state);
+                // Combat/death are build-mutation blockers. Refresh only on the
+                // transition so the editor unlocks promptly without turning the
+                // normal STATE heartbeat into a loadout query loop.
+                if (detailTab === 'talents' && (!previous || previous.inCombat !== state.inCombat || previous.isDead !== state.isDead))
+                    invalidateCombatLoadout(state.guid, true);
+            }
         });
 
         connection.on('BotEvent', function (evt) {
             var cls = 'bt-tl-event';
             var text = evt.eventType;
             if (evt.eventType === 'KILL') text += ' creature=' + evt.creatureEntry;
-            else if (evt.eventType === 'LEVEL_UP') { text += ' → L' + evt.newLevel; cls = 'bt-tl-switch'; }
+            else if (evt.eventType === 'LEVEL_UP') {
+                text += ' → L' + evt.newLevel; cls = 'bt-tl-switch';
+                invalidateCombatLoadout(evt.guid, detailTab === 'talents' && selectedGuid === evt.guid);
+                invalidateSpellbook(evt.guid);   // the core trains new ranks on level up
+            }
             else if (evt.eventType === 'QUEST_UPDATE') text += ' quest=' + evt.questId + ' ' + evt.status;
             else if (evt.eventType === 'SELL_ACK') { text += ' ' + (evt.data || ''); cls = 'bt-tl-switch'; }
             else if (evt.eventType === 'EQUIP') { text += ' ' + (evt.data || ''); }
@@ -309,6 +360,33 @@ $(function () {
         });
 
         connection.on('CommandAck', function () { /* silent */ });
+
+        // A successful build mutation can originate from this page now and from
+        // MSUIClient later. Either way, discard the selected bot's read model and
+        // ask the authoritative endpoint for the post-commit state.
+        connection.on('BotCombatLoadoutChanged', function (evt) {
+            var rawGuid = evt && evt.guid != null ? evt.guid : evt;
+            var guid = parseInt(rawGuid);
+            if (!guid) return;
+            invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
+        });
+
+        // Server-backed one-deep queue changes may originate here or from a
+        // future MSUIClient. Refresh the authoritative projection either way.
+        connection.on('BotCombatLoadoutQueueChanged', function (evt) {
+            var rawGuid = evt && evt.guid != null ? evt.guid : evt;
+            var guid = parseInt(rawGuid);
+            if (!guid) return;
+            invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
+
+            // The initiating AJAX path already owns its toast. Only announce
+            // external queue changes so one action never produces two messages.
+            if (!combatLoadoutQueueBusy[guid] && !combatLoadoutApplying[guid] && evt && evt.message) {
+                var status = String(evt.status || (evt.queue && evt.queue.status) || '').toLowerCase();
+                var failed = evt.success === false || status === 'error' || status === 'failed' || status === 'uncertain';
+                showToast(evt.message, failed);
+            }
+        });
 
         // Add Bots batch progress (BotSpawnService) — the handler lives with the Add Bots modal below.
         connection.on('SpawnProgress', function (job) { abOnSpawnProgress(job); });
@@ -888,11 +966,15 @@ $(function () {
         var s = botStates[selectedGuid];
         if (!s) return;
 
-        // Tab scaffold — Overview keeps everything that was here; Live is the real-time feed.
+        // Talents are loaded only for the selected bot; there is no fleet-sized DB fan-out.
         var scaffold =
             '<div class="bt-detail-tabs">' +
             '<div class="bt-detail-tab' + (detailTab === 'overview' ? ' active' : '') + '" data-dtab="overview">' +
             '<i class="fa-solid fa-id-card" style="margin-right:5px;"></i>Overview</div>' +
+            '<div class="bt-detail-tab' + (detailTab === 'talents' ? ' active' : '') + '" data-dtab="talents">' +
+            '<i class="fa-solid fa-diagram-project" style="margin-right:5px;"></i>Talents &amp; Rotation</div>' +
+            '<div class="bt-detail-tab' + (detailTab === 'spellbook' ? ' active' : '') + '" data-dtab="spellbook">' +
+            '<i class="fa-solid fa-book-sparkles" style="margin-right:5px;"></i>Spellbook</div>' +
             '<div class="bt-detail-tab' + (detailTab === 'live' ? ' active' : '') + '" data-dtab="live">' +
             '<i class="fa-solid fa-satellite-dish" style="margin-right:5px;"></i>Live' +
             '<span class="bt-live-dot"></span></div>' +
@@ -913,12 +995,973 @@ $(function () {
             renderLiveTab(s);
             return;
         }
+        if (detailTab === 'talents') {
+            renderTalentsTab(s);
+            return;
+        }
+        if (detailTab === 'spellbook') {
+            renderSpellbookTab(s);
+            return;
+        }
         var brain = botBrains[selectedGuid];
         try { renderDetailInner(s, brain); }
         catch (ex) {
             console.error('renderDetail crashed for guid ' + selectedGuid + ':', ex);
-            $('#detailTabBody').html('<div style="color:#f7768e;padding:16px;">Detail render error: ' + esc(ex.message) + '</div>');
+            $('#detailTabBody').html('<div class="bt-talent-error"><i class="fa-solid fa-triangle-exclamation"></i><div><b>Detail render error</b><span>' + esc(ex.message) + '</span></div></div>');
         }
+    }
+
+    // ===================== COMBAT LOADOUT TAB =====================
+    // Persisted profile + exact DBC ranks, effective runtime rotation, and the
+    // guarded build editor. Fetches remain selected-bot-only.
+
+    function renderTalentsTab(s) {
+        var g = selectedGuid;
+        var cached = combatLoadoutCache[g];
+        if (!cached) {
+            $('#detailTabBody').html('<div class="bt-talent-loading"><i class="fa-solid fa-spinner fa-spin"></i> Reading talents, build policy, and live rotation…</div>');
+            fetchCombatLoadout(g, false);
+            return;
+        }
+
+        renderCombatLoadoutData(cached.data, s);
+        if (Date.now() - cached.fetchedAt > 15000) fetchCombatLoadout(g, true);
+    }
+
+    function invalidateCombatLoadout(guid, refetch) {
+        guid = parseInt(guid);
+        if (!guid) return;
+        delete combatLoadoutCache[guid];
+        if (combatLoadoutLoading[guid]) {
+            if (refetch) combatLoadoutRefreshPending[guid] = true;
+            return;
+        }
+        if (refetch && selectedGuid === guid && detailTab === 'talents')
+            fetchCombatLoadout(guid, true);
+    }
+
+    function fetchCombatLoadout(guid, force) {
+        guid = parseInt(guid);
+        if (!guid || combatLoadoutLoading[guid]) return;
+        var cached = combatLoadoutCache[guid];
+        if (!force && cached && Date.now() - cached.fetchedAt <= 15000) return;
+
+        combatLoadoutLoading[guid] = true;
+        $.getJSON('/Bots/CombatLoadout/' + guid)
+            .done(function (data) {
+                data = normalizeCombatLoadout(data);
+                combatLoadoutCache[guid] = { data: data, fetchedAt: Date.now() };
+                if (selectedGuid === guid && detailTab === 'talents') renderCombatLoadoutData(data, botStates[guid]);
+            })
+            .fail(function (xhr) {
+                var body = xhr.responseJSON || {};
+                var problem = parseCombatLoadoutProblem(xhr);
+                var data = {
+                    guid: guid,
+                    errorCode: body.errorCode || body.code || 'request_failed',
+                    error: (typeof body.error === 'string' && body.error) ||
+                        (typeof body.message === 'string' && body.message) || problem.message
+                };
+                combatLoadoutCache[guid] = { data: data, fetchedAt: Date.now() };
+                if (selectedGuid === guid && detailTab === 'talents') renderCombatLoadoutData(data, botStates[guid]);
+            })
+            .always(function () {
+                delete combatLoadoutLoading[guid];
+                if (combatLoadoutRefreshPending[guid]) {
+                    delete combatLoadoutRefreshPending[guid];
+                    delete combatLoadoutCache[guid];
+                    if (selectedGuid === guid && detailTab === 'talents') fetchCombatLoadout(guid, true);
+                }
+            });
+    }
+
+    // ===================== SPELLBOOK TAB =====================
+    // Read-only /Bots/Spellbook/{guid}: every enabled character_spell row resolved
+    // against build-5875 Spell.dbc, grouped by the client's own skill-line tabs, with
+    // the highest known rank of each chain marked. The rank marking is the point --
+    // an unusable rotation instruction is almost always a stale RANK, not a missing
+    // spell, and a loaded/skipped count can never show that.
+
+    function spellbookState(guid) {
+        if (!spellbookView[guid])
+            spellbookView[guid] = { q: '', topOnly: true, hidePassive: false, classOnly: false, collapsed: {} };
+        return spellbookView[guid];
+    }
+
+    function renderSpellbookTab(s) {
+        var g = selectedGuid;
+        var cached = spellbookCache[g];
+        if (!cached) {
+            $('#detailTabBody').html('<div class="bt-talent-loading"><i class="fa-solid fa-spinner fa-spin"></i> Reading learned spells…</div>');
+            fetchSpellbook(g, false);
+            return;
+        }
+        renderSpellbookData(cached.data);
+        if (Date.now() - cached.fetchedAt > 60000) fetchSpellbook(g, true);
+    }
+
+    function invalidateSpellbook(guid) {
+        guid = parseInt(guid);
+        if (!guid) return;
+        delete spellbookCache[guid];
+        if (selectedGuid === guid && detailTab === 'spellbook') fetchSpellbook(guid, true);
+    }
+
+    function fetchSpellbook(guid, force) {
+        guid = parseInt(guid);
+        if (!guid || spellbookLoading[guid]) return;
+        var cached = spellbookCache[guid];
+        if (!force && cached && Date.now() - cached.fetchedAt <= 60000) return;
+
+        spellbookLoading[guid] = true;
+        $.getJSON('/Bots/Spellbook/' + guid)
+            .done(function (data) {
+                spellbookCache[guid] = { data: data, fetchedAt: Date.now() };
+                if (selectedGuid === guid && detailTab === 'spellbook') renderSpellbookData(data);
+            })
+            .fail(function (xhr) {
+                var body = xhr.responseJSON || {};
+                var data = {
+                    guid: guid,
+                    errorCode: body.errorCode || 'request_failed',
+                    error: (typeof body.error === 'string' && body.error) || 'The spellbook could not be read.'
+                };
+                spellbookCache[guid] = { data: data, fetchedAt: Date.now() };
+                if (selectedGuid === guid && detailTab === 'spellbook') renderSpellbookData(data);
+            })
+            .always(function () { delete spellbookLoading[guid]; });
+    }
+
+    function renderSpellbookData(d) {
+        var guid = d.guid || selectedGuid;
+        if (d.errorCode) {
+            $('#detailTabBody').html('<div class="bt-talent-error"><i class="fa-solid fa-triangle-exclamation"></i><div><b>Spellbook unavailable</b>' +
+                '<span>' + esc(d.error || d.errorCode) + '</span><small>Code: ' + esc(d.errorCode) + '</small></div></div>');
+            return;
+        }
+
+        var view = spellbookState(guid);
+        var sum = d.summary || {};
+        var groups = d.groups || [];
+
+        var html = '<div class="bt-talent-summary">' +
+            talentSummaryCard('Known spells', safeInt(sum.known, 0),
+                safeInt(sum.castable, 0) + ' castable · ' + safeInt(sum.passive, 0) + ' passive', 'fa-book') +
+            talentSummaryCard('Top ranks', safeInt(sum.highestRank, 0),
+                safeInt(sum.superseded, 0) + ' superseded rank(s) still known', 'fa-arrow-up-9-1') +
+            talentSummaryCard('Class skills', safeInt(sum.classSkills, 0),
+                safeInt(sum.fromTalents, 0) + ' granted by talents', 'fa-hat-wizard') +
+            talentSummaryCard('Spellbook tabs', groups.length,
+                (safeInt(sum.disabled, 0) + safeInt(sum.unresolved, 0)) > 0
+                    ? safeInt(sum.disabled, 0) + ' disabled · ' + safeInt(sum.unresolved, 0) + ' unresolved'
+                    : 'Every learned id resolved', 'fa-layer-group') +
+            '</div>';
+
+        html += renderSpellbookRotationBanner(d.rotation || {});
+
+        html += '<div class="bt-spell-toolbar">' +
+            '<div class="bt-spell-search"><i class="fa-solid fa-magnifying-glass"></i>' +
+            '<input type="text" id="btSpellSearch" class="form-input" placeholder="Filter by name or spell id…" value="' + escAttr(view.q) + '" /></div>' +
+            '<label><input type="checkbox" class="bt-spell-toggle" data-sbtoggle="topOnly"' + (view.topOnly ? ' checked' : '') + ' /> Top ranks only</label>' +
+            '<label><input type="checkbox" class="bt-spell-toggle" data-sbtoggle="hidePassive"' + (view.hidePassive ? ' checked' : '') + ' /> Hide passives</label>' +
+            '<label><input type="checkbox" class="bt-spell-toggle" data-sbtoggle="classOnly"' + (view.classOnly ? ' checked' : '') + ' /> Class skills only</label>' +
+            '</div>';
+
+        var needle = (view.q || '').trim().toLowerCase();
+        var shown = 0, total = 0;
+        var body = '';
+
+        for (var gi = 0; gi < groups.length; gi++) {
+            var grp = groups[gi];
+            var spells = grp.spells || [];
+            if (view.classOnly && !grp.isClassSkill) { total += spells.length; continue; }
+
+            var visible = [];
+            for (var si = 0; si < spells.length; si++) {
+                var sp = spells[si];
+                total++;
+                if (view.topOnly && !sp.highestKnownRank) continue;
+                if (view.hidePassive && sp.passive) continue;
+                if (needle && (sp.name || '').toLowerCase().indexOf(needle) < 0 &&
+                    String(sp.spellId).indexOf(needle) < 0) continue;
+                visible.push(sp);
+            }
+            if (!visible.length) continue;
+            shown += visible.length;
+
+            var collapsed = !!view.collapsed[grp.skillLineId];
+            body += '<section class="bt-spell-group' + (collapsed ? ' collapsed' : '') + '">' +
+                '<header data-sbgroup="' + escAttr(String(grp.skillLineId)) + '">' +
+                '<i class="fa-solid ' + (collapsed ? 'fa-chevron-right' : 'fa-chevron-down') + '"></i>' +
+                '<b>' + esc(grp.name) + '</b><span>' + esc(grp.categoryName) + '</span>' +
+                '<strong>' + visible.length + (visible.length !== spells.length ? ' / ' + spells.length : '') + '</strong>' +
+                '</header>';
+            if (!collapsed) {
+                body += '<div class="bt-spell-list">';
+                for (var vi = 0; vi < visible.length; vi++) body += renderSpellRow(visible[vi]);
+                body += '</div>';
+            }
+            body += '</section>';
+        }
+
+        html += '<div class="bt-spell-count">Showing ' + shown + ' of ' + total + ' learned spell(s)</div>';
+        html += body || '<div class="bt-talent-warning"><i class="fa-solid fa-circle-info"></i>No learned spell matches the current filter.</div>';
+        html += '<div class="bt-talent-source"><i class="fa-solid fa-database"></i> Learned set: <code>character_spell</code> · names, ranks, icons and the PASSIVE flag: build-5875 <code>Spell.dbc</code> · grouping and rank chains: <code>SkillLineAbility</code>/<code>SkillLine</code> · talent provenance: <code>Talent.dbc</code></div>';
+
+        $('#detailTabBody').html(html);
+    }
+
+    function renderSpellRow(sp) {
+        var classes = ['bt-spell-row'];
+        if (!sp.highestKnownRank) classes.push('old');
+        if (sp.passive) classes.push('passive');
+        if (sp.inRotation) classes.push('rot');
+
+        var meta = [];
+        if (sp.rank) meta.push(esc(sp.rank));
+        if (safeInt(sp.level, 0) > 0) meta.push('Level ' + safeInt(sp.level, 0));
+        if (safeInt(sp.chainLength, 0) > 1) meta.push('rank ' + safeInt(sp.rankIndex, 0) + ' of ' + safeInt(sp.chainLength, 0) + ' known');
+
+        var tags = '';
+        if (sp.inRotation) tags += '<span class="bt-spell-tag rot" title="Named by the assigned custom rotation">P' + safeInt(sp.rotationPriority, 0) + '</span>';
+        if (sp.fromTalent) tags += '<span class="bt-spell-tag talent" title="Granted by talent ' + escAttr(String(sp.talentId)) + '">' + esc(sp.talentTree || 'Talent') + '</span>';
+        if (sp.passive) tags += '<span class="bt-spell-tag passive">Passive</span>';
+        if (!sp.highestKnownRank) tags += '<span class="bt-spell-tag old" title="A higher rank of this spell is also known">Superseded by ' + safeInt(sp.supersededBySpellId, 0) + '</span>';
+        if (!sp.resolved) tags += '<span class="bt-spell-tag bad" title="No Spell.dbc row for this id">Unresolved</span>';
+        else if (sp.hidden) tags += '<span class="bt-spell-tag muted" title="Spell.dbc HIDDEN_CLIENTSIDE">Hidden</span>';
+
+        return '<div class="' + classes.join(' ') + '">' +
+            '<div class="bt-spell-icon"><img src="' + escAttr(sp.iconUrl) + '" alt="" loading="lazy" /></div>' +
+            '<div class="bt-spell-main"><b>' + esc(sp.name) + '</b><small>' + meta.join(' · ') + '</small></div>' +
+            '<div class="bt-spell-tags">' + tags + '</div>' +
+            '<button type="button" class="bt-spell-id" data-sbcopy="' + escAttr(String(sp.spellId)) + '" title="Copy spell id">' +
+            sp.spellId + '</button>' +
+            '</div>';
+    }
+
+    // The assigned custom rotation is a PROFILE fact, not a runtime one. The core can
+    // only report how many instructions it skipped; only the profile knows which spell
+    // that was, and only the spellbook knows the bot outgrew a rank it still can cast.
+    function renderSpellbookRotationBanner(r) {
+        if (!r.assigned)
+            return '<div class="bt-talent-compat ok"><i class="fa-solid fa-circle-check"></i><div>' +
+                '<b>No custom rotation assigned</b><span>In-combat casting follows the built-in spec policy, or the legacy class AI when the talent profile is not usable.</span></div></div>';
+
+        if (!r.profileFound)
+            return '<div class="bt-talent-error"><i class="fa-solid fa-triangle-exclamation"></i><div>' +
+                '<b>Assigned rotation is missing</b><span>This bot is assigned <code>' + esc(r.profileName) + '</code>, but no such profile file exists. Nothing is pushed on its next login.</span></div></div>';
+
+        var missing = r.missingSpells || [];
+        var stale = r.staleRankSpells || [];
+        var cls = missing.length ? 'bad' : (stale.length ? 'warn' : 'ok');
+        var icon = missing.length ? 'fa-triangle-exclamation' : (stale.length ? 'fa-circle-exclamation' : 'fa-circle-check');
+        var head = missing.length
+            ? missing.length + ' rotation instruction(s) name a spell this bot does not know'
+            : (stale.length ? stale.length + ' rotation instruction(s) name an outgrown rank' : 'Every rotation instruction is castable at its best known rank');
+
+        var html = '<div class="bt-talent-compat ' + cls + '"><i class="fa-solid ' + icon + '"></i><div>' +
+            '<b>' + esc(r.profileName) + '</b><span>' + esc(head) + '</span>' +
+            '<small>' + safeInt(r.coveredCount, 0) + ' of ' + safeInt(r.instructionCount, 0) +
+            ' instruction spell(s) known' + (r.description ? ' · ' + esc(r.description) : '') + '</small></div></div>';
+
+        for (var i = 0; i < missing.length; i++)
+            html += '<div class="bt-talent-warning"><i class="fa-solid fa-ban"></i>Priority ' + safeInt(missing[i].priority, 0) +
+                ' — <b>' + esc(missing[i].name) + '</b> ' + esc(missing[i].rank) + ' (id ' + missing[i].spellId + ') is not learned; the core skips it.</div>';
+        for (var j = 0; j < stale.length; j++)
+            html += '<div class="bt-talent-warning"><i class="fa-solid fa-arrow-up"></i>Priority ' + safeInt(stale[j].priority, 0) +
+                ' — <b>' + esc(stale[j].name) + '</b> ' + esc(stale[j].rank) + ' (id ' + stale[j].spellId + ') casts, but ' +
+                esc(stale[j].betterRank || 'a higher rank') + ' (id ' + stale[j].betterSpellId + ') is also known.</div>';
+
+        return html;
+    }
+
+    // The public contract is a flat extension of the talent read model. During
+    // rollout, accept the service's earlier nested names too so a web/core deploy
+    // cannot temporarily blank the tab while the two processes are restarted.
+    function normalizeCombatLoadout(data) {
+        if (!data || typeof data !== 'object' || data.error) return data;
+        var talents = data.talents && typeof data.talents === 'object' ? data.talents : null;
+        if (talents) {
+            var talentKeys = ['name', 'classId', 'className', 'level', 'specTab', 'profile', 'points',
+                'trees', 'nextPlannedPurchase', 'compatibility', 'asOfUtc'];
+            for (var i = 0; i < talentKeys.length; i++) {
+                var key = talentKeys[i];
+                if (data[key] === undefined && talents[key] !== undefined) data[key] = talents[key];
+            }
+            // The wrapper's legacy ActiveRole is an integer; the flat talent model
+            // carries the display object the UI needs.
+            if (talents.activeRole && typeof talents.activeRole === 'object') data.activeRole = talents.activeRole;
+        }
+        if (!data.activeRole || typeof data.activeRole !== 'object') {
+            var roleId = safeInt(data.activeRole, 0);
+            data.activeRole = { id: roleId, name: COMBAT_ROLE_NAMES[roleId] || 'Unassigned' };
+        }
+
+        if (!Array.isArray(data.availableProfiles)) data.availableProfiles = data.profileOptions || [];
+        if (!Array.isArray(data.availableRotations)) data.availableRotations = data.customRotations || [];
+        // Older profile summaries used Name as both identity and label.
+        for (var pi = 0; pi < data.availableRotations.length; pi++) {
+            var option = data.availableRotations[pi];
+            if (option && !option.id && option.name) option.id = option.name;
+        }
+        if (data.applyBlockedReason === undefined) data.applyBlockedReason = data.applyBlocker || null;
+        if (data.canQueue === undefined) data.canQueue = data.online !== false;
+        if (!data.queuedChange || typeof data.queuedChange !== 'object') data.queuedChange = null;
+
+        data.rotation = data.rotation || {};
+        var r = data.rotation;
+        if (!r.source) r.source = r.effectiveSource || (data.online === false ? 'offline' : 'legacy');
+        if (!r.profile && r.effectiveProfile) r.profile = r.effectiveProfile;
+        if (!r.persistedProfile && r.desiredProfile) r.persistedProfile = r.desiredProfile;
+        if (!r.talentProfileState) r.talentProfileState = data.talentProfileState || 'unknown';
+        if (r.revision === undefined) r.revision = data.combatConfigRevision;
+        return data;
+    }
+
+    function renderCombatLoadoutData(d, s) {
+        d = normalizeCombatLoadout(d);
+        if (!d) return;
+        if (d.error) {
+            $('#detailTabBody').html(
+                '<div class="bt-talent-error"><i class="fa-solid fa-triangle-exclamation"></i><div><b>Combat loadout unavailable</b>' +
+                '<span>' + esc(d.error) + '</span>' +
+                (d.errorCode ? '<small>' + esc(d.errorCode) + '</small>' : '') + '</div></div>');
+            return;
+        }
+
+        var p = d.profile;
+        var pts = d.points || { earned: 0, spent: 0, available: 0, overspent: 0 };
+        var compat = d.compatibility || { status: 'unknown', compatible: false, message: '' };
+        var statusClass = compat.status === 'compatible' ? 'ok' :
+            (compat.status === 'compatible_incomplete' || compat.status === 'unassigned' ? 'warn' : 'bad');
+        var profileName = p ? p.name : 'Unassigned';
+        var profileId = p ? p.id : 'spec_tab ' + d.specTab;
+        var roleName = d.activeRole ? d.activeRole.name : 'Unassigned';
+        var rotationView = combatRotationView(d);
+        var html = '';
+
+        html += '<div class="bt-talent-summary">' +
+            talentSummaryCard('Specialization', profileName, profileId, 'fa-diagram-project') +
+            talentSummaryCard('Active role', roleName, p ? humanPolicy(p.rolePolicy) : 'No profile policy', 'fa-people-group') +
+            talentSummaryCard('Talent points', pts.spent + ' / ' + pts.earned,
+                pts.available + ' available' + (pts.overspent ? ' · ' + pts.overspent + ' overspent' : ''), 'fa-star') +
+            talentSummaryCard('Effective rotation', rotationView.name, rotationView.shortNote, 'fa-arrows-spin') +
+            '</div>';
+
+        html += renderEffectiveRotation(d, rotationView);
+        html += renderBuildWorkshop(d, rotationView);
+
+        html += '<div class="bt-talent-compat ' + statusClass + '">' +
+            '<i class="fa-solid ' + (statusClass === 'ok' ? 'fa-circle-check' : statusClass === 'warn' ? 'fa-circle-exclamation' : 'fa-triangle-exclamation') + '"></i>' +
+            '<div><b>' + esc(humanPolicy(compat.status)) + '</b><span>' + esc(compat.message || '') + '</span></div>' +
+            '</div>';
+
+        var warnings = compat.warnings || [];
+        for (var wi = 0; wi < warnings.length; wi++)
+            html += '<div class="bt-talent-warning"><i class="fa-solid fa-circle-info"></i>' + esc(warnings[wi]) + '</div>';
+
+        if (d.nextPlannedPurchase) {
+            var n = d.nextPlannedPurchase;
+            html += '<div class="bt-talent-next' + (n.dueNow ? ' due' : '') + '">' +
+                '<i class="fa-solid fa-forward-step"></i><div><span>Next planned purchase</span>' +
+                '<b>' + esc(n.name) + ' · Rank ' + n.rank + '</b>' +
+                '<small>' + (n.dueNow ? 'Due now' : 'Level ' + n.requiredLevel) + ' · TalentID ' + n.talentId +
+                (n.spellId ? ' · Spell ' + n.spellId : '') + '</small></div></div>';
+        } else if (p && pts.spent >= 51) {
+            html += '<div class="bt-talent-next complete"><i class="fa-solid fa-trophy"></i><div><span>Talent plan</span><b>Complete</b><small>All 51 planned purchases are present.</small></div></div>';
+        }
+
+        html += '<div class="bt-talent-trees">';
+        var trees = d.trees || [];
+        for (var ti = 0; ti < trees.length; ti++) {
+            var tree = trees[ti];
+            html += '<section class="bt-talent-tree"><header><div><b>' + esc(tree.name) + '</b>' +
+                '<span>Tree ' + (tree.order + 1) + '</span></div><strong>' + tree.points +
+                '<small> / ' + tree.plannedPoints + '</small></strong></header>' +
+                '<div class="bt-talent-grid">';
+
+            var talents = tree.talents || [];
+            for (var xi = 0; xi < talents.length; xi++) {
+                var t = talents[xi];
+                var classes = [];
+                if (t.currentRank > 0) classes.push('learned');
+                if (t.plannedRank > 0) classes.push('planned');
+                if (t.currentRank < t.plannedRankAtLevel) classes.push('missing');
+                if (t.isUnexpected) classes.push('conflict');
+                if (d.nextPlannedPurchase && d.nextPlannedPurchase.talentId === t.talentId) classes.push('next');
+                var tip = t.name + ' — current ' + t.currentRank + '/' + t.maxRank +
+                    (t.plannedRank ? ', profile target ' + t.plannedRank : ', not in profile') +
+                    ' — TalentID ' + t.talentId;
+                html += '<div class="bt-talent-node ' + classes.join(' ') + '" style="grid-column:' + (t.column + 1) + ';grid-row:' + (t.row + 1) + '" title="' + escAttr(tip) + '">' +
+                    '<div class="bt-talent-icon"><img src="' + escAttr(t.iconUrl) + '" alt="" loading="lazy" />' +
+                    '<em>' + t.currentRank + '/' + t.maxRank + '</em></div>' +
+                    '<span>' + esc(t.name) + '</span>' +
+                    (t.plannedRank ? '<small>target ' + t.plannedRank + '</small>' : '') +
+                    '</div>';
+            }
+            html += '</div><footer>Now ' + tree.points + ' · planned through level ' + d.level + ' ' + tree.plannedPointsAtLevel +
+                ' · final ' + tree.plannedPoints + '</footer></section>';
+        }
+        html += '</div>';
+
+        html += '<div class="bt-talent-source"><i class="fa-solid fa-database"></i> Profile and role: <code>playerbot</code> · ranks: exact <code>character_spell</code> ↔ build-5875 <code>Talent.dbc</code> mapping · rotation: live core state</div>';
+        $('#detailTabBody').html(html);
+        refreshBuildWorkshopState(d);
+    }
+
+    function combatRotationView(d) {
+        var r = d.rotation || {};
+        var raw = String(r.source || (!d.online ? 'offline' : 'legacy')).toLowerCase().replace(/[\s-]+/g, '_');
+        var kind = raw.indexOf('custom') >= 0 ? 'custom' :
+            (raw.indexOf('offline') >= 0 || raw.indexOf('unavailable') >= 0) ? 'offline' :
+            raw.indexOf('legacy') >= 0 ? 'legacy' : 'builtin';
+        var currentProfile = d.profile && d.profile.name ? d.profile.name : 'selected spec';
+        var customName = r.profile || r.persistedProfile || 'Custom rotation';
+        var name = kind === 'custom' ? customName :
+            kind === 'offline' ? 'Offline' :
+            kind === 'legacy' ? 'Legacy class AI' : currentProfile + ' built-in';
+        var instructionCount = safeInt(r.instructionCount, 0);
+        var castableCount = safeInt(r.castableCount, 0);
+        var shortNote = kind === 'custom' ? castableCount + ' / ' + instructionCount + ' castable' :
+            kind === 'offline' ? 'No live runtime state' :
+            kind === 'legacy' ? 'Spec policy unavailable' : 'Hardcoded spec policy';
+        return {
+            kind: kind,
+            name: String(name),
+            shortNote: shortNote,
+            instructionCount: instructionCount,
+            castableCount: castableCount,
+            profileState: r.talentProfileState || 'unknown',
+            revision: r.revision,
+            persistedProfile: r.persistedProfile || ''
+        };
+    }
+
+    function renderEffectiveRotation(d, view) {
+        var icon = view.kind === 'custom' ? 'fa-sliders' :
+            view.kind === 'offline' ? 'fa-plug-circle-xmark' :
+            view.kind === 'legacy' ? 'fa-shield-halved' : 'fa-code-branch';
+        var detail = view.kind === 'custom'
+            ? view.castableCount + ' of ' + view.instructionCount + ' instructions are castable by this bot.'
+            : view.kind === 'builtin'
+                ? 'The core is using the hardcoded rotation selected by this bot\'s usable specialization profile.'
+                : view.kind === 'legacy'
+                    ? 'The specialization policy is not usable, so the inherited class AI is the safe fallback.'
+                    : 'The bot is offline, so no live rotation can be confirmed.';
+        var meta = 'Talent profile state: ' + humanPolicy(view.profileState);
+        if (view.revision != null) meta += ' · revision ' + view.revision;
+        if (view.persistedProfile && view.kind !== 'custom') meta += ' · persisted custom profile ' + view.persistedProfile;
+        return '<section class="bt-rotation-card source-' + view.kind + '">' +
+            '<div class="bt-rotation-icon"><i class="fa-solid ' + icon + '"></i></div>' +
+            '<div class="bt-rotation-copy"><span>Effective live rotation</span><b>' + esc(view.name) + '</b>' +
+            '<p>' + esc(detail) + '</p><small>' + esc(meta) + '</small></div>' +
+            '<span class="bt-rotation-badge">' + esc(humanPolicy(view.kind)) + '</span></section>';
+    }
+
+    function renderBuildWorkshop(d, rotationView) {
+        var profiles = d.availableProfiles || [];
+        var rotations = d.availableRotations || [];
+        var queued = d.queuedChange;
+        var currentRoleId = queued && queued.activeRole != null
+            ? safeInt(queued.activeRole, 0)
+            : d.activeRole && d.activeRole.id != null ? safeInt(d.activeRole.id, 0) : 0;
+        var requestedSpec = queued && queued.specTab != null ? queued.specTab : d.specTab;
+        var selectedProfile = findBuildProfile(d, queued && queued.profileId ? queued.profileId : requestedSpec);
+        var selectedSpecTab = selectedProfile ? safeInt(selectedProfile.specTab, safeInt(requestedSpec, 255)) : safeInt(requestedSpec, 255);
+        var applying = !!combatLoadoutApplying[d.guid];
+        var queueBusy = combatLoadoutQueueBusy[d.guid] || '';
+        var operationBusy = applying || !!queueBusy;
+        var canApplyNow = d.online !== false && d.canApply !== false;
+        var canQueue = d.online !== false && d.canQueue !== false;
+        var blockedReason = d.online === false ? 'Bot is offline. Bring it online before applying or queueing a live build.' :
+            (d.applyBlockedReason || (d.canApply === false ? 'The core reports that this build cannot be changed right now.' : ''));
+        if (blockedReason && !canApplyNow && canQueue && (!queued || queued.canReplace === true))
+            blockedReason += ' You can keep editing and queue one build for the next safe opportunity.';
+        var disabled = operationBusy ? ' disabled' : '';
+        var profileOptions = '';
+        for (var pi = 0; pi < profiles.length; pi++) {
+            var profile = profiles[pi] || {};
+            var specTab = safeInt(profile.specTab, -1);
+            if (specTab < 0 || specTab > 2) continue;
+            var label = profile.name || profile.spec || profile.id || ('Profile ' + specTab);
+            profileOptions += '<option value="' + specTab + '"' + (specTab === selectedSpecTab ? ' selected' : '') + '>' + esc(label) + '</option>';
+        }
+        if (!profileOptions)
+            profileOptions = '<option value="">No profiles available</option>';
+
+        var roleOptions = buildRoleOptions(selectedProfile, currentRoleId);
+        var queuedMode = queued ? normalizeRotationMode(queued.rotationMode) : '';
+        var activeCustomId = queued && queuedMode === 'custom'
+            ? String(queued.rotationProfile || '')
+            : rotationView.kind === 'custom'
+                ? String((d.rotation && (d.rotation.persistedProfile || d.rotation.profile)) || '') : '';
+        var rotationOptions = '<option value="spec_default"' + (!activeCustomId ? ' selected' : '') + '>Specialization default (built in)</option>';
+        var matchedActiveCustom = false;
+        for (var ri = 0; ri < rotations.length; ri++) {
+            var rotation = rotations[ri] || {};
+            var rotationId = String(rotation.id || rotation.name || '');
+            if (!rotationId) continue;
+            var selected = activeCustomId && rotationId.toLowerCase() === activeCustomId.toLowerCase();
+            if (selected) matchedActiveCustom = true;
+            rotationOptions += '<option value="custom:' + escAttr(rotationId) + '"' + (selected ? ' selected' : '') + '>' +
+                esc(rotation.name || rotationId) + ' (' + safeInt(rotation.instructionCount, 0) + ' steps)</option>';
+        }
+        if (activeCustomId && !matchedActiveCustom)
+            rotationOptions += '<option value="custom:' + escAttr(activeCustomId) + '" selected disabled>' + esc(activeCustomId) + ' (profile unavailable)</option>';
+
+        var state = applying ? 'applying' : queueBusy ? 'saving' : queued ? queueStateToken(queued) : canApplyNow ? 'ready' : 'blocked';
+        var statusClass = queued && !applying && !queueBusy ? queueStatusClass(queued) : state;
+        var statusText = applying ? 'Applying…' : queueBusy === 'cancelling' ? 'Cancelling…' : queueBusy ? 'Saving…' :
+            queued ? humanPolicy(queued.status || 'queued') : canApplyNow ? 'Ready' : canQueue ? 'Queue available' : 'Unavailable';
+        var showRestore = rotationView.kind === 'custom' || !!rotationView.persistedProfile;
+        return '<section class="bt-build-workshop' + (applying ? ' applying' : '') + '" data-guid="' + safeInt(d.guid, 0) + '" data-state="' + escAttr(state) + '" aria-busy="' + (operationBusy ? 'true' : 'false') + '">' +
+            '<header><div><i class="fa-solid fa-screwdriver-wrench"></i><span><b>Build Workshop</b><small>Choose one coherent talent, role, and rotation package.</small></span></div>' +
+            '<em class="bt-build-status ' + statusClass + '" aria-live="polite">' + esc(statusText) + '</em></header>' +
+            (blockedReason ? '<div class="bt-build-blocker"><i class="fa-solid fa-clock"></i><span>' + esc(blockedReason) + '</span></div>' : '') +
+            renderQueuedBuildSummary(queued, queueBusy) +
+            '<div class="bt-build-grid">' +
+            '<label><span>Talent profile</span><select id="btBuildSpec" class="form-input bt-build-select"' + disabled + '>' + profileOptions + '</select><small id="btBuildSpecHelp"></small></label>' +
+            '<label><span>Active role</span><select id="btBuildRole" class="form-input bt-build-select"' + disabled + '>' + roleOptions + '</select><small>Roles are constrained by the selected profile.</small></label>' +
+            '<label><span>Combat rotation</span><select id="btBuildRotation" class="form-input bt-build-select"' + disabled + '>' + rotationOptions + '</select><small id="btBuildRotationHelp"></small></label>' +
+            '</div>' +
+            '<div class="bt-build-preview"><div><span>Current</span><b id="btBuildBefore"></b></div><i class="fa-solid fa-arrow-right-long"></i><div><span id="btBuildAfterLabel">Requested build</span><b id="btBuildAfter"></b></div></div>' +
+            '<div class="bt-build-danger"><i class="fa-solid fa-triangle-exclamation"></i><div><b>This resets learned talents.</b><span id="btBuildDangerText">The core will remove the current talent build, buy the selected profile through this level, then activate the chosen rotation.</span></div></div>' +
+            '<label class="bt-build-confirm"><input type="checkbox" id="btBuildConfirm"' + disabled + ' /><span>I understand that this will erase and rebuild this bot\'s learned talents.</span></label>' +
+            '<div class="bt-build-notice" id="btBuildNotice" aria-live="polite" hidden></div>' +
+            '<footer><button type="button" class="btn-accent bt-build-apply" id="btBuildApply" disabled><i class="fa-solid fa-rotate"></i> Reset talents &amp; apply build</button>' +
+            (showRestore ? '<button type="button" class="bt-build-secondary" id="btRestoreSpecRotation"' + disabled + '><i class="fa-solid fa-rotate-left"></i> Restore spec rotation</button>' : '') +
+            '</footer></section>';
+    }
+
+    function renderQueuedBuildSummary(queue, queueBusy) {
+        if (!queue) return '';
+        var profile = queue.profileName || queue.profileId || ('Spec ' + safeInt(queue.specTab, 0));
+        var role = queue.activeRoleName || COMBAT_ROLE_NAMES[safeInt(queue.activeRole, 0)] || ('Role ' + safeInt(queue.activeRole, 0));
+        var rotation = queue.rotationName || queue.rotationProfile ||
+            (normalizeRotationMode(queue.rotationMode) === 'custom' ? 'Custom rotation' : 'Specialization default');
+        var statusToken = String(queue.status || 'waiting').trim().toLowerCase();
+        var status = humanPolicy(statusToken);
+        var meta = status + ' · ' + (queue.resetTalents ? 'talent rebuild' : 'rotation only');
+        if (queue.expectedRevision != null) meta += ' · revision ' + safeInt(queue.expectedRevision, 0);
+        if (queue.queuedAtUtc) meta += ' · queued ' + formatQueueTime(queue.queuedAtUtc);
+        if (queue.updatedAtUtc && queue.updatedAtUtc !== queue.queuedAtUtc) meta += ' · updated ' + formatQueueTime(queue.updatedAtUtc);
+        if (safeInt(queue.attemptCount, 0) > 0) meta += ' · ' + safeInt(queue.attemptCount, 0) + ' attempt' + (safeInt(queue.attemptCount, 0) === 1 ? '' : 's');
+        if (queue.lastCode) meta += ' · ' + queue.lastCode;
+        var heading = statusToken === 'failed' ? 'Queued build failed' :
+            statusToken === 'uncertain' ? 'Build outcome uncertain' :
+                statusToken === 'dispatching' ? 'Applying queued build' : 'Pending build';
+        var replaceNote = statusToken === 'failed'
+            ? 'Review the failure, then replace or cancel this entry.'
+            : statusToken === 'uncertain'
+                ? 'Refresh live state; automatic retry and replacement are disabled.'
+                : statusToken === 'dispatching'
+                    ? 'The core dispatch is already claimed and cannot be changed.'
+                    : 'This one-deep entry can be replaced before it is claimed.';
+        var cancelDisabled = queueBusy || !queue.canCancel ? ' disabled' : '';
+        var cancelLabel = statusToken === 'uncertain' ? 'Dismiss uncertain result' : 'Cancel queued build';
+        var cancelTitle = statusToken === 'uncertain'
+            ? 'Dismiss this record only after reviewing current live talents and rotation; this does not undo core state'
+            : queue.canCancel ? 'Remove this unsent queued build' : 'Only an unsent queued build can be cancelled';
+        return '<div class="bt-build-queue" id="btBuildQueue" data-queue-id="' + escAttr(queue.queueId || '') + '">' +
+            '<i class="fa-solid fa-clock-rotate-left"></i>' +
+            '<div class="bt-build-queue-copy"><b>' + esc(heading) + ' · ' + esc(profile) + '</b>' +
+            '<span>' + esc(role) + ' · ' + esc(rotation) + '</span>' +
+            '<small>' + esc(meta + ' · ' + replaceNote) + (queue.lastMessage ? ' · ' + esc(queue.lastMessage) : '') + '</small></div>' +
+            '<div class="bt-build-queue-actions"><button type="button" class="bt-build-secondary bt-build-cancel-queued" id="btBuildCancelQueued" title="' + escAttr(cancelTitle) + '"' + cancelDisabled + '>' +
+            '<i class="fa-solid fa-xmark"></i> ' + esc(cancelLabel) + '</button></div></div>';
+    }
+
+    function normalizeRotationMode(value) {
+        var mode = String(value || '').trim().toLowerCase();
+        return mode === 'custom' ? 'custom' : 'spec_default';
+    }
+
+    function queueStateToken(queue) {
+        var status = String(queue && queue.status || 'waiting').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+        return 'queue-' + (status || 'waiting');
+    }
+
+    function queueStatusClass(queue) {
+        var status = String(queue && queue.status || '').trim().toLowerCase();
+        if (status === 'dispatching') return 'applying';
+        if (status === 'uncertain' || status === 'failed') return 'blocked';
+        return 'queued';
+    }
+
+    function formatQueueTime(value) {
+        var date = new Date(value);
+        return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    }
+
+    function findBuildProfile(d, specOrId) {
+        var profiles = (d && d.availableProfiles) || [];
+        for (var i = 0; i < profiles.length; i++) {
+            var p = profiles[i] || {};
+            if (String(p.id) === String(specOrId) || safeInt(p.specTab, -1) === safeInt(specOrId, -2)) return p;
+        }
+        return null;
+    }
+
+    function buildRoleOptions(profile, selectedRoleId) {
+        var roles = profile && profile.allowedRoles ? profile.allowedRoles : [];
+        var html = '';
+        var selectedFound = false;
+        for (var i = 0; i < roles.length; i++) {
+            var role = roles[i];
+            var id = safeInt(typeof role === 'object' && role !== null ? role.id : role, 0);
+            if (!id) continue;
+            var selected = id === safeInt(selectedRoleId, 0);
+            if (selected) selectedFound = true;
+            var name = typeof role === 'object' && role !== null ? role.name : COMBAT_ROLE_NAMES[id];
+            html += '<option value="' + id + '"' + (selected ? ' selected' : '') + '>' + esc(name || ('Role ' + id)) + '</option>';
+        }
+        if (!html && selectedRoleId)
+            html = '<option value="' + safeInt(selectedRoleId, 0) + '" selected>' + safeInt(selectedRoleId, 0) + '</option>';
+        else if (html && !selectedFound)
+            html = html.replace('<option ', '<option selected ');
+        return html || '<option value="">No allowed roles</option>';
+    }
+
+    function refreshBuildWorkshopState(d) {
+        if (!d || !$('#btBuildSpec').length) return;
+        var profile = findBuildProfile(d, $('#btBuildSpec').val());
+        var roleId = safeInt($('#btBuildRole').val(), 0);
+        var roleName = $('#btBuildRole option:selected').text() || 'No role';
+        var rotationValue = String($('#btBuildRotation').val() || '');
+        var rotation = findAvailableRotation(d, rotationValue.indexOf('custom:') === 0 ? rotationValue.substring(7) : '');
+        var profileName = profile ? String(profile.name || profile.spec || profile.id) : 'No profile';
+        var rotationName = rotationValue === 'spec_default' ? profileName + ' built-in' :
+            rotation ? String(rotation.name || rotation.id) : 'Unavailable custom rotation';
+        var currentRotation = combatRotationView(d);
+        var before = (d.profile ? d.profile.name : 'Unassigned') + ' · ' +
+            (d.activeRole ? d.activeRole.name : 'Unassigned') + ' · ' + currentRotation.name;
+        var after = profileName + ' · ' + roleName + ' · ' + rotationName;
+        $('#btBuildBefore').text(before);
+        $('#btBuildAfter').text(after);
+
+        var treePoints = profile && profile.treePoints ? profile.treePoints.join(' / ') : '';
+        var profileHelp = profile ? humanPolicy(profile.rolePolicy) + (profile.gearPolicy ? ' · ' + humanPolicy(profile.gearPolicy) : '') +
+            (treePoints ? ' · ' + treePoints + ' points' : '') : 'Select a valid profile.';
+        $('#btBuildSpecHelp').text(profileHelp);
+        $('#btBuildRotationHelp').text(rotationValue === 'spec_default'
+            ? 'Uses the core\'s hardcoded policy for the selected specialization.'
+            : rotation ? (rotation.description || (safeInt(rotation.instructionCount, 0) + ' priority instructions.')) : 'This custom profile is not available.');
+
+        var applying = !!combatLoadoutApplying[d.guid];
+        var queueBusy = combatLoadoutQueueBusy[d.guid] || '';
+        var operationBusy = applying || !!queueBusy;
+        var canApplyNow = d.online !== false && d.canApply !== false;
+        var canQueue = d.online !== false && d.canQueue !== false;
+        var queued = d.queuedChange;
+        var queuesInstead = !canApplyNow || !!queued;
+        var valid = !!profile && !!roleId && (rotationValue === 'spec_default' || !!rotation);
+        var confirmed = $('#btBuildConfirm').is(':checked');
+        var queueReplaceAllowed = !queued || queued.canReplace === true;
+        var state = applying ? 'applying' : queueBusy ? 'saving' : queued ? queueStateToken(queued) : canApplyNow ? 'ready' : 'blocked';
+        var statusClass = queued && !applying && !queueBusy ? queueStatusClass(queued) : state;
+        var statusText = applying ? 'Applying…' : queueBusy === 'cancelling' ? 'Cancelling…' : queueBusy ? 'Saving…' :
+            queued ? humanPolicy(queued.status || 'queued') : canApplyNow ? 'Ready' : canQueue ? 'Queue available' : 'Unavailable';
+        var $workshop = $('.bt-build-workshop');
+        $workshop.toggleClass('applying', applying).attr('data-state', state).attr('aria-busy', operationBusy ? 'true' : 'false');
+        $('.bt-build-status').removeClass('ready blocked applying saving queued').addClass(statusClass).text(statusText);
+
+        var primaryHtml = applying ? '<i class="fa-solid fa-spinner fa-spin"></i> Applying build…' :
+            queueBusy ? '<i class="fa-solid fa-spinner fa-spin"></i> ' + (queueBusy === 'cancelling' ? 'Cancelling queue…' : 'Saving queue…') :
+                queued ? '<i class="fa-solid fa-pen-to-square"></i> Replace queued build' :
+                    !canApplyNow ? '<i class="fa-solid fa-clock"></i> Queue build' :
+                        '<i class="fa-solid fa-rotate"></i> Reset talents &amp; apply build';
+        $('#btBuildApply').html(primaryHtml).attr('data-mode', queuesInstead ? (queued ? 'replace-queue' : 'queue') : 'apply');
+        $('#btBuildApply').prop('disabled', operationBusy || !valid || !confirmed ||
+            (queuesInstead && (!canQueue || !queueReplaceAllowed)));
+        $('#btBuildConfirm, #btBuildSpec, #btBuildRole, #btBuildRotation').prop('disabled', operationBusy);
+        $('#btBuildCancelQueued').prop('disabled', operationBusy || !queued || queued.canCancel !== true);
+        $('#btRestoreSpecRotation').prop('disabled', operationBusy ||
+            (queuesInstead && (!canQueue || (!!queued && queued.canReplace !== true))));
+        $('#btBuildAfterLabel').text(queued ? 'Queued replacement' : canApplyNow ? 'After reset' : 'Queued build');
+
+        var dangerText = profile && safeInt(profile.specTab, -1) === safeInt(d.specTab, -2)
+            ? 'The current talents will still be erased and rebuilt from the beginning of this profile.'
+            : 'The current talents will be erased and rebuilt as ' + profileName + ' through level ' + safeInt(d.level, 0) + '.';
+        if (queuesInstead)
+            dangerText = 'When this queued request becomes safe to run, ' + dangerText.charAt(0).toLowerCase() + dangerText.slice(1);
+        $('#btBuildDangerText').text(dangerText);
+        renderBuildWorkshopNotice(combatLoadoutNotices[d.guid]);
+    }
+
+    function findAvailableRotation(d, id) {
+        if (!id) return null;
+        var rotations = (d && d.availableRotations) || [];
+        for (var i = 0; i < rotations.length; i++) {
+            var rotationId = rotations[i] && (rotations[i].id || rotations[i].name);
+            if (rotationId && String(rotationId).toLowerCase() === String(id).toLowerCase()) return rotations[i];
+        }
+        return null;
+    }
+
+    function repopulateBuildRoles() {
+        var cached = selectedGuid && combatLoadoutCache[selectedGuid];
+        if (!cached) return;
+        var d = cached.data;
+        var profile = findBuildProfile(d, $('#btBuildSpec').val());
+        var previous = safeInt($('#btBuildRole').val(), 0);
+        $('#btBuildRole').html(buildRoleOptions(profile, previous));
+        refreshBuildWorkshopState(d);
+    }
+
+    $(document).on('change', '#btBuildSpec', repopulateBuildRoles);
+    $(document).on('change', '#btBuildRole, #btBuildRotation, #btBuildConfirm', function () {
+        var cached = selectedGuid && combatLoadoutCache[selectedGuid];
+        if (cached) refreshBuildWorkshopState(cached.data);
+    });
+
+    $(document).on('click', '#btBuildApply', function () {
+        var guid = selectedGuid;
+        var cached = guid && combatLoadoutCache[guid];
+        if (!cached || combatLoadoutApplying[guid] || combatLoadoutQueueBusy[guid]) return;
+        if (!$('#btBuildConfirm').is(':checked')) {
+            showToast('Confirm the destructive talent reset first.', true);
+            return;
+        }
+        var d = cached.data;
+        var queued = d.queuedChange;
+        var canApplyNow = d.online !== false && d.canApply !== false;
+        var canQueue = d.online !== false && d.canQueue !== false;
+        var queuesInstead = !canApplyNow || !!queued;
+        if (queued && queued.canReplace !== true) {
+            showToast('This queued build has already been claimed and cannot be replaced.', true);
+            return;
+        }
+        if (queuesInstead && !canQueue) {
+            showToast('The bot must be online before a build can be queued.', true);
+            return;
+        }
+        var rotationValue = String($('#btBuildRotation').val() || '');
+        var custom = rotationValue.indexOf('custom:') === 0;
+        var payload = {
+            expectedQueueId: queued && queued.queueId ? queued.queueId : null,
+            expectedRevision: safeInt(d.rotation && d.rotation.revision, 0),
+            specTab: safeInt($('#btBuildSpec').val(), -1),
+            activeRole: safeInt($('#btBuildRole').val(), 0),
+            rotationMode: custom ? 'custom' : 'spec_default',
+            rotationProfile: custom ? rotationValue.substring(7) : null,
+            resetTalents: true,
+            confirmReset: true
+        };
+        if (queuesInstead)
+            postCombatLoadoutQueue(guid, payload, queued ? 'Queued build replaced' : 'Build queued');
+        else
+            postCombatLoadout(guid, payload, 'Build applied');
+    });
+
+    $(document).on('click', '#btRestoreSpecRotation', function () {
+        var guid = selectedGuid;
+        var cached = guid && combatLoadoutCache[guid];
+        if (!cached || combatLoadoutApplying[guid] || combatLoadoutQueueBusy[guid]) return;
+        var d = cached.data;
+        var queued = d.queuedChange;
+        var queuesInstead = d.online === false || d.canApply === false || !!queued;
+        if (queued && queued.canReplace !== true) {
+            showToast('This queued build has already been claimed and cannot be replaced.', true);
+            return;
+        }
+        if (queuesInstead && (d.online === false || d.canQueue === false)) {
+            showToast('The bot must be online before a rotation change can be queued.', true);
+            return;
+        }
+        var payload = {
+            expectedQueueId: queued && queued.queueId ? queued.queueId : null,
+            expectedRevision: safeInt(d.rotation && d.rotation.revision, 0),
+            specTab: safeInt(d.specTab, -1),
+            activeRole: d.activeRole ? safeInt(d.activeRole.id, 0) : 0,
+            rotationMode: 'spec_default',
+            rotationProfile: null,
+            resetTalents: false,
+            confirmReset: false
+        };
+        if (queuesInstead)
+            postCombatLoadoutQueue(guid, payload, queued ? 'Queued build replaced with the spec rotation' : 'Spec rotation change queued');
+        else
+            postCombatLoadout(guid, payload, 'Spec rotation restored');
+    });
+
+    $(document).on('click', '#btBuildCancelQueued', function () {
+        var guid = selectedGuid;
+        var cached = guid && combatLoadoutCache[guid];
+        var queue = cached && cached.data && cached.data.queuedChange;
+        if (!queue || queue.canCancel !== true || combatLoadoutApplying[guid] || combatLoadoutQueueBusy[guid]) return;
+        if (String(queue.status || '').toLowerCase() === 'uncertain' &&
+            !window.confirm('Dismiss this uncertain record? This does not undo a build that may have reached the core. Review the bot\'s live talents and rotation before making another change.')) return;
+        deleteCombatLoadoutQueue(guid);
+    });
+
+    function postCombatLoadout(guid, payload, successText) {
+        var shouldRefresh = false;
+        combatLoadoutApplying[guid] = true;
+        delete combatLoadoutNotices[guid];
+        var cached = combatLoadoutCache[guid];
+        if (cached) refreshBuildWorkshopState(cached.data);
+        $.ajax({
+            url: '/Bots/CombatLoadout/' + guid,
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload)
+        }).done(function (response) {
+            if (response && response.success === false) {
+                combatLoadoutNotices[guid] = { kind: 'error', title: 'Build rejected', message: response.error || response.message || 'The build was not applied.' };
+                showToast(combatLoadoutNotices[guid].message, true);
+                return;
+            }
+            shouldRefresh = true;
+            delete combatLoadoutNotices[guid];
+            showToast((response && (response.message || response.status)) || successText);
+        }).fail(function (xhr) {
+            var problem = parseCombatLoadoutProblem(xhr);
+            combatLoadoutNotices[guid] = { kind: problem.kind || 'error', title: problem.title, message: problem.message, code: problem.code };
+            showToast(problem.message, true);
+            shouldRefresh = problem.refresh;
+        }).always(function () {
+            delete combatLoadoutApplying[guid];
+            if (shouldRefresh) invalidateSpellbook(guid);
+            if (shouldRefresh) invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
+            else if (selectedGuid === guid && detailTab === 'talents' && combatLoadoutCache[guid])
+                refreshBuildWorkshopState(combatLoadoutCache[guid].data);
+        });
+    }
+
+    function postCombatLoadoutQueue(guid, payload, successText) {
+        var shouldRefresh = false;
+        combatLoadoutQueueBusy[guid] = 'saving';
+        delete combatLoadoutNotices[guid];
+        var cached = combatLoadoutCache[guid];
+        if (cached) refreshBuildWorkshopState(cached.data);
+        $.ajax({
+            url: '/Bots/CombatLoadout/' + guid + '/Queue',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload)
+        }).done(function (response) {
+            if (response && response.success === false) {
+                combatLoadoutNotices[guid] = { kind: 'error', title: 'Queue rejected', message: response.error || response.message || 'The build was not queued.' };
+                showToast(combatLoadoutNotices[guid].message, true);
+                return;
+            }
+            shouldRefresh = true;
+            if (cached && response && response.queue) cached.data.queuedChange = response.queue;
+            combatLoadoutNotices[guid] = {
+                kind: 'success',
+                title: 'Pending build saved',
+                message: (response && (response.message || response.status)) || successText
+            };
+            showToast(combatLoadoutNotices[guid].message);
+        }).fail(function (xhr) {
+            var problem = parseCombatLoadoutProblem(xhr);
+            combatLoadoutNotices[guid] = { kind: 'error', title: problem.title, message: problem.message, code: problem.code };
+            showToast(problem.message, true);
+            shouldRefresh = problem.refresh;
+        }).always(function () {
+            delete combatLoadoutQueueBusy[guid];
+            if (shouldRefresh) invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
+            else if (selectedGuid === guid && detailTab === 'talents' && combatLoadoutCache[guid])
+                refreshBuildWorkshopState(combatLoadoutCache[guid].data);
+        });
+    }
+
+    function deleteCombatLoadoutQueue(guid) {
+        var shouldRefresh = false;
+        combatLoadoutQueueBusy[guid] = 'cancelling';
+        delete combatLoadoutNotices[guid];
+        var cached = combatLoadoutCache[guid];
+        if (cached) refreshBuildWorkshopState(cached.data);
+        $.ajax({
+            url: '/Bots/CombatLoadout/' + guid + '/Queue?expectedQueueId=' + encodeURIComponent(
+                cached && cached.data && cached.data.queuedChange ? cached.data.queuedChange.queueId || '' : '') +
+                '&expectedStatus=' + encodeURIComponent(
+                    cached && cached.data && cached.data.queuedChange ? cached.data.queuedChange.status || '' : ''),
+            method: 'DELETE'
+        }).done(function (response) {
+            if (response && response.success === false) {
+                combatLoadoutNotices[guid] = { kind: 'error', title: 'Cancellation rejected', message: response.error || response.message || 'The queued build was not cancelled.' };
+                showToast(combatLoadoutNotices[guid].message, true);
+                return;
+            }
+            shouldRefresh = true;
+            if (cached) cached.data.queuedChange = null;
+            combatLoadoutNotices[guid] = {
+                kind: 'success',
+                title: response && response.status === 'dismissed' ? 'Uncertain result dismissed' : 'Queued build cancelled',
+                message: (response && (response.message || response.status)) || 'Queued build cancelled'
+            };
+            showToast(combatLoadoutNotices[guid].message);
+        }).fail(function (xhr) {
+            var problem = parseCombatLoadoutProblem(xhr);
+            combatLoadoutNotices[guid] = { kind: 'error', title: problem.title, message: problem.message, code: problem.code };
+            showToast(problem.message, true);
+            shouldRefresh = problem.refresh;
+        }).always(function () {
+            delete combatLoadoutQueueBusy[guid];
+            if (shouldRefresh) invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
+            else if (selectedGuid === guid && detailTab === 'talents' && combatLoadoutCache[guid])
+                refreshBuildWorkshopState(combatLoadoutCache[guid].data);
+        });
+    }
+
+    function parseCombatLoadoutProblem(xhr) {
+        var status = xhr ? xhr.status : 0;
+        var body = xhr && xhr.responseJSON ? xhr.responseJSON : {};
+        var code = body.errorCode || body.code || '';
+        var detail = typeof body.error === 'string' ? body.error :
+            body.error && typeof body.error.message === 'string' ? body.error.message :
+            typeof body.message === 'string' ? body.message :
+            typeof body.detail === 'string' ? body.detail : '';
+        if (!detail && body.errors && typeof body.errors === 'object') {
+            var pieces = [];
+            Object.keys(body.errors).forEach(function (key) {
+                var values = body.errors[key];
+                if (!Array.isArray(values)) values = [values];
+                for (var i = 0; i < values.length; i++) if (typeof values[i] === 'string') pieces.push(values[i]);
+            });
+            detail = pieces.join(' ');
+        }
+        var base = status === 400 ? { title: 'Invalid build request', message: 'Check the selected profile, role, and rotation.', refresh: false } :
+            status === 409 ? { title: 'Build state changed', message: 'The bot changed or is busy. Its current build is being refreshed.', refresh: true } :
+            status === 422 ? { title: 'Build cannot be applied', message: 'The core rejected this profile or rotation combination.', refresh: false } :
+            status === 504 ? { kind: 'uncertain', title: 'Core acknowledgement timed out', message: 'The result is uncertain. Current state is being refreshed before another attempt.', refresh: true } :
+            { title: 'Build change failed', message: 'The server could not apply this build (' + status + ').', refresh: false };
+        if (detail) base.message += ' ' + detail;
+        base.code = code;
+        return base;
+    }
+
+    function renderBuildWorkshopNotice(notice) {
+        var $notice = $('#btBuildNotice');
+        if (!$notice.length) return;
+        if (!notice) {
+            $notice.attr('hidden', true).removeAttr('data-kind').empty();
+            return;
+        }
+        var kind = notice.kind || 'success';
+        var icon = kind === 'error' ? 'fa-circle-xmark' :
+            kind === 'warning' || kind === 'uncertain' ? 'fa-triangle-exclamation' : 'fa-circle-check';
+        $notice.removeAttr('hidden').attr('data-kind', kind).empty();
+        $('<i>').addClass('fa-solid ' + icon).appendTo($notice);
+        var $copy = $('<div>').appendTo($notice);
+        $('<b>').text(notice.title || 'Build update').appendTo($copy);
+        $('<span>').text(notice.message || '').appendTo($copy);
+        if (notice.code) $('<small>').text(notice.code).appendTo($copy);
+    }
+
+    function talentSummaryCard(label, value, note, icon) {
+        return '<div class="bt-talent-summary-card"><i class="fa-solid ' + icon + '"></i><div><span>' + esc(label) + '</span><b>' + esc(value) + '</b><small>' + esc(note) + '</small></div></div>';
+    }
+
+    function humanPolicy(value) {
+        if (!value) return '';
+        return String(value).split('_').map(function (word) { return capitalize(word); }).join(' ');
+    }
+
+    function safeInt(value, fallback) {
+        var n = parseInt(value);
+        return Number.isFinite(n) ? n : fallback;
     }
 
     // ===================== LIVE TAB (real-time BotContext feed) =====================
@@ -2252,11 +3295,13 @@ $(function () {
     };
 
     function showToast(msg, isError) {
-        var $t = $('<div class="bt-toast">' + msg + '</div>').css({
+        var $t = $('<div class="bt-toast"></div>').text(msg == null ? '' : String(msg)).css({
             position: 'fixed', bottom: '20px', right: '20px', padding: '8px 16px',
-            background: isError ? '#f7768e' : '#9ece6a', color: '#1a1b26',
+            background: 'var(--bg-card)', color: 'var(--text-primary)',
+            border: '1px solid var(--border-light)',
+            borderLeft: '4px solid ' + (isError ? 'var(--status-error)' : 'var(--status-online)'),
             borderRadius: '6px', fontWeight: 600, fontSize: '13px', zIndex: 9999,
-            boxShadow: '0 2px 8px rgba(0,0,0,0.4)', opacity: 0
+            boxShadow: 'var(--shadow-md)', opacity: 0
         });
         $('body').append($t);
         $t.animate({ opacity: 1 }, 200).delay(2500).animate({ opacity: 0 }, 300, function () { $(this).remove(); });
@@ -2287,7 +3332,65 @@ $(function () {
         }
     });
 
-    // Detail-panel tab switching (Overview | Live)
+    // ===================== SPELLBOOK CONTROLS =====================
+    // Filtering is client-side over the already fetched projection: the read model is
+    // one bot's learned set, so re-querying on every keystroke would buy nothing.
+
+    function repaintSpellbook() {
+        var cached = spellbookCache[selectedGuid];
+        if (cached && detailTab === 'spellbook') renderSpellbookData(cached.data);
+    }
+
+    $(document).on('input', '#btSpellSearch', function () {
+        if (!selectedGuid) return;
+        var caret = this.selectionStart;
+        spellbookState(selectedGuid).q = this.value;
+        repaintSpellbook();
+        // The tab body is rebuilt wholesale, so put the operator back where they were.
+        var field = document.getElementById('btSpellSearch');
+        if (field) { field.focus(); try { field.setSelectionRange(caret, caret); } catch (e) { } }
+    });
+
+    $(document).on('change', '.bt-spell-toggle', function () {
+        if (!selectedGuid) return;
+        var key = $(this).data('sbtoggle');
+        if (!key) return;
+        spellbookState(selectedGuid)[key] = this.checked;
+        repaintSpellbook();
+    });
+
+    $(document).on('click', '.bt-spell-group > header', function () {
+        if (!selectedGuid) return;
+        var key = String($(this).data('sbgroup'));
+        var collapsed = spellbookState(selectedGuid).collapsed;
+        if (collapsed[key]) delete collapsed[key]; else collapsed[key] = true;
+        repaintSpellbook();
+    });
+
+    // Authoring a rotation instruction starts with its spell id, so make the id the
+    // one thing on the row that is trivially liftable.
+    $(document).on('click', '.bt-spell-id', function (e) {
+        e.stopPropagation();
+        var id = String($(this).data('sbcopy') || '');
+        if (!id) return;
+        var done = function () { showToast('Copied spell id ' + id); };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(id).then(done, function () { showToast('Could not copy ' + id, true); });
+            return;
+        }
+        var scratch = document.createElement('textarea');
+        scratch.value = id;
+        scratch.setAttribute('readonly', '');
+        scratch.style.position = 'fixed';
+        scratch.style.opacity = '0';
+        document.body.appendChild(scratch);
+        scratch.select();
+        try { document.execCommand('copy'); done(); }
+        catch (ex) { showToast('Could not copy ' + id, true); }
+        document.body.removeChild(scratch);
+    });
+
+    // Detail-panel tab switching (Overview | Talents & Rotation | Spellbook | Live)
     $(document).on('click', '.bt-detail-tab', function () {
         var t = $(this).data('dtab');
         if (t === detailTab) return;
@@ -2319,10 +3422,14 @@ $(function () {
     }
 
     function esc(s) {
-        if (!s) return '';
+        if (s === null || s === undefined) return '';
         var d = document.createElement('div');
-        d.textContent = s;
+        d.textContent = String(s);
         return d.innerHTML;
+    }
+
+    function escAttr(s) {
+        return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     function capitalize(s) {

@@ -1,0 +1,289 @@
+{
+  "schema_version": 1,
+  "client_build": 5875,
+  "target_level": 60,
+  "format": "Each chunk is [TalentID, consecutivePointCount]. Expand chunks in order and assign the resulting 51 purchases to levels 10 through 60.",
+  "tree_order": {
+    "warrior": ["arms", "fury", "protection"],
+    "paladin": ["holy", "protection", "retribution"],
+    "hunter": ["beast_mastery", "marksmanship", "survival"],
+    "rogue": ["assassination", "combat", "subtlety"],
+    "priest": ["discipline", "holy", "shadow"],
+    "shaman": ["elemental", "enhancement", "restoration"],
+    "mage": ["arcane", "fire", "frost"],
+    "warlock": ["affliction", "demonology", "destruction"],
+    "druid": ["balance", "feral_combat", "restoration"]
+  },
+  "profiles": [
+    {
+      "id": "warrior_arms",
+      "class_id": 1,
+      "class": "warrior",
+      "spec": "arms",
+      "tree_points": [31, 20, 0],
+      "role_policy": "melee_dps_with_backup_tank",
+      "gear_policy": "two_hand_axe_dps_one_hand_shield_tank",
+      "chunks": [[127, 3], [130, 3], [126, 2], [641, 2], [131, 2], [121, 3], [641, 3], [137, 1], [136, 1], [133, 1], [132, 5], [136, 4], [135, 1], [157, 5], [159, 5], [160, 1], [154, 4], [155, 5]]
+    },
+    {
+      "id": "warrior_fury",
+      "class_id": 1,
+      "class": "warrior",
+      "spec": "fury",
+      "tree_points": [20, 31, 0],
+      "role_policy": "melee_dps_with_rescue_tank",
+      "gear_policy": "two_hand_leveling",
+      "chunks": [[157, 5], [159, 5], [160, 1], [661, 3], [154, 1], [155, 5], [165, 1], [154, 4], [156, 5], [167, 1], [127, 3], [130, 2], [641, 5], [131, 1], [137, 1], [121, 3], [136, 5]]
+    },
+    {
+      "id": "warrior_protection",
+      "class_id": 1,
+      "class": "warrior",
+      "spec": "protection",
+      "tree_points": [11, 4, 36],
+      "role_policy": "tank",
+      "gear_policy": "one_hand_shield",
+      "chunks": [[1601, 5], [140, 5], [145, 1], [142, 2], [153, 1], [147, 1], [144, 5], [152, 1], [147, 2], [143, 2], [702, 5], [148, 1], [130, 5], [138, 5], [641, 5], [137, 1], [157, 4]]
+    },
+    {
+      "id": "paladin_holy",
+      "class_id": 2,
+      "class": "paladin",
+      "spec": "holy",
+      "tree_points": [35, 11, 5],
+      "role_policy": "healer_with_melee_fallback",
+      "gear_policy": "caster_one_hand_shield",
+      "chunks": [[1449, 5], [1432, 5], [1435, 1], [1444, 3], [1443, 1], [1461, 5], [1433, 1], [1446, 2], [1465, 2], [1627, 5], [1502, 1], [1443, 1], [1628, 2], [1465, 1], [1422, 5], [1630, 3], [1425, 2], [1442, 1], [1401, 5]]
+    },
+    {
+      "id": "paladin_protection",
+      "class_id": 2,
+      "class": "paladin",
+      "spec": "protection",
+      "tree_points": [11, 31, 9],
+      "role_policy": "tank",
+      "gear_policy": "one_hand_shield",
+      "chunks": [[1450, 5], [1463, 5], [1435, 1], [1421, 5], [1630, 3], [1423, 2], [1442, 1], [1501, 3], [1424, 3], [1423, 3], [1431, 1], [1425, 2], [1521, 2], [1429, 5], [1430, 1], [1407, 5], [1631, 2], [1403, 2]]
+    },
+    {
+      "id": "paladin_retribution",
+      "class_id": 2,
+      "class": "paladin",
+      "spec": "retribution",
+      "tree_points": [11, 8, 32],
+      "role_policy": "melee_dps_with_emergency_support",
+      "gear_policy": "slow_two_hand",
+      "chunks": [[1407, 5], [1631, 2], [1464, 3], [1481, 1], [1411, 5], [1634, 2], [1403, 3], [1409, 1], [1410, 3], [1402, 5], [1441, 1], [1450, 5], [1432, 5], [1435, 1], [1403, 1], [1422, 5], [1630, 3]]
+    },
+    {
+      "id": "hunter_beast_mastery",
+      "class_id": 3,
+      "class": "hunter",
+      "spec": "beast_mastery",
+      "tree_points": [31, 20, 0],
+      "role_policy": "ranged_dps_with_pet_tank",
+      "gear_policy": "ranged_weapon_and_durable_pet",
+      "chunks": [[1382, 5], [1395, 3], [1625, 2], [1384, 2], [1391, 1], [1396, 5], [1393, 2], [1387, 1], [1393, 3], [1388, 1], [1397, 5], [1386, 1], [1342, 5], [1344, 5], [1345, 1], [1352, 3], [1341, 1], [1349, 5]]
+    },
+    {
+      "id": "hunter_marksmanship",
+      "class_id": 3,
+      "class": "hunter",
+      "spec": "marksmanship",
+      "tree_points": [20, 31, 0],
+      "role_policy": "ranged_dps",
+      "gear_policy": "best_ranged_weapon",
+      "chunks": [[1342, 5], [1344, 5], [1345, 1], [1352, 3], [1343, 1], [1349, 5], [1353, 1], [1347, 3], [1343, 1], [1362, 5], [1361, 1], [1382, 5], [1625, 2], [1395, 3], [1391, 1], [1396, 5], [1393, 4]]
+    },
+    {
+      "id": "hunter_survival",
+      "class_id": 3,
+      "class": "hunter",
+      "spec": "survival",
+      "tree_points": [0, 20, 31],
+      "role_policy": "ranged_control_dps",
+      "gear_policy": "best_ranged_weapon",
+      "chunks": [[1623, 3], [1301, 3], [1311, 5], [1306, 2], [1622, 5], [1308, 1], [1310, 3], [1321, 3], [1303, 5], [1325, 1], [1342, 5], [1344, 5], [1345, 1], [1352, 3], [1343, 1], [1349, 5]]
+    },
+    {
+      "id": "rogue_assassination",
+      "class_id": 4,
+      "class": "rogue",
+      "spec": "assassination",
+      "tree_points": [31, 8, 12],
+      "role_policy": "melee_dps",
+      "gear_policy": "slow_main_hand_dagger_fast_offhand",
+      "chunks": [[270, 5], [276, 3], [273, 2], [281, 1], [269, 5], [682, 4], [280, 1], [682, 1], [268, 3], [283, 5], [382, 1], [201, 2], [203, 3], [202, 3], [261, 5], [244, 5], [247, 2]]
+    },
+    {
+      "id": "rogue_combat",
+      "class_id": 4,
+      "class": "rogue",
+      "spec": "combat",
+      "tree_points": [19, 32, 0],
+      "role_policy": "melee_dps",
+      "gear_policy": "slow_main_hand_weapon_flexible",
+      "chunks": [[201, 2], [203, 3], [187, 5], [301, 1], [204, 2], [222, 2], [181, 5], [223, 1], [221, 5], [1122, 3], [1703, 1], [205, 1], [1703, 1], [270, 5], [277, 3], [274, 2], [281, 1], [269, 5], [273, 3]]
+    },
+    {
+      "id": "rogue_subtlety",
+      "class_id": 4,
+      "class": "rogue",
+      "spec": "subtlety",
+      "tree_points": [21, 0, 30],
+      "role_policy": "melee_control_dps",
+      "gear_policy": "dagger_preferred_weapon_flexible_builder",
+      "chunks": [[261, 5], [244, 5], [303, 1], [263, 3], [247, 1], [1123, 3], [262, 2], [681, 1], [284, 1], [262, 1], [1701, 2], [1702, 5], [272, 2], [270, 5], [274, 2], [276, 1], [281, 1], [276, 2], [269, 5], [682, 2], [280, 1]]
+    },
+    {
+      "id": "priest_discipline",
+      "class_id": 5,
+      "class": "priest",
+      "spec": "discipline",
+      "tree_points": [31, 15, 5],
+      "role_policy": "healer_with_ranged_fallback",
+      "gear_policy": "caster_with_wand",
+      "chunks": [[465, 5], [345, 5], [343, 3], [344, 2], [352, 5], [348, 1], [347, 3], [341, 5], [1201, 5], [351, 1], [322, 1], [410, 2], [406, 3], [401, 5], [1181, 5]]
+    },
+    {
+      "id": "priest_holy",
+      "class_id": 5,
+      "class": "priest",
+      "spec": "holy",
+      "tree_points": [16, 30, 5],
+      "role_policy": "healer",
+      "gear_policy": "caster_with_wand",
+      "chunks": [[465, 5], [345, 5], [410, 2], [406, 3], [401, 5], [1181, 5], [442, 1], [361, 3], [408, 1], [403, 2], [408, 2], [402, 5], [404, 1], [343, 3], [344, 2], [348, 1], [347, 3], [352, 2]]
+    },
+    {
+      "id": "priest_shadow",
+      "class_id": 5,
+      "class": "priest",
+      "spec": "shadow",
+      "tree_points": [20, 0, 31],
+      "role_policy": "ranged_dps_with_emergency_healing",
+      "gear_policy": "caster_with_wand",
+      "chunks": [[465, 5], [482, 2], [463, 3], [501, 1], [464, 2], [542, 2], [881, 3], [461, 5], [541, 1], [484, 1], [462, 5], [521, 1], [345, 5], [343, 3], [344, 2], [348, 1], [347, 3], [352, 1], [341, 5]]
+    },
+    {
+      "id": "shaman_elemental",
+      "class_id": 7,
+      "class": "shaman",
+      "spec": "elemental",
+      "tree_points": [31, 0, 20],
+      "role_policy": "ranged_dps_with_off_healing",
+      "gear_policy": "caster_one_hand_shield_or_staff",
+      "chunks": [[564, 5], [561, 3], [563, 2], [574, 1], [562, 5], [1642, 3], [563, 1], [565, 1], [1641, 2], [563, 2], [721, 5], [573, 1], [586, 5], [589, 2], [595, 3], [583, 3], [582, 1], [595, 1], [594, 5]]
+    },
+    {
+      "id": "shaman_enhancement",
+      "class_id": 7,
+      "class": "shaman",
+      "spec": "enhancement",
+      "tree_points": [0, 31, 20],
+      "role_policy": "melee_dps_with_off_healing",
+      "gear_policy": "two_hand_axe_or_mace_after_20",
+      "chunks": [[612, 5], [613, 5], [617, 1], [607, 3], [601, 1], [602, 5], [616, 1], [611, 3], [601, 1], [1643, 5], [901, 1], [586, 5], [589, 2], [595, 3], [583, 3], [582, 1], [587, 5], [1646, 1]]
+    },
+    {
+      "id": "shaman_restoration",
+      "class_id": 7,
+      "class": "shaman",
+      "spec": "restoration",
+      "tree_points": [0, 5, 46],
+      "role_policy": "healer",
+      "gear_policy": "caster_one_hand_shield",
+      "chunks": [[586, 5], [593, 5], [581, 3], [595, 2], [588, 5], [591, 1], [583, 3], [582, 1], [592, 5], [590, 1], [595, 3], [587, 5], [1646, 3], [1648, 3], [594, 1], [614, 5]]
+    },
+    {
+      "id": "mage_arcane",
+      "class_id": 8,
+      "class": "mage",
+      "spec": "arcane",
+      "tree_points": [31, 0, 20],
+      "role_policy": "ranged_dps_and_control",
+      "gear_policy": "caster_with_wand",
+      "chunks": [[80, 5], [78, 2], [75, 5], [81, 3], [85, 1], [88, 2], [1142, 2], [86, 1], [77, 5], [421, 3], [1142, 1], [87, 1], [37, 5], [1649, 3], [73, 5], [61, 3], [69, 1], [66, 3]]
+    },
+    {
+      "id": "mage_fire",
+      "class_id": 8,
+      "class": "mage",
+      "spec": "fire",
+      "tree_points": [17, 31, 3],
+      "role_policy": "ranged_dps",
+      "gear_policy": "caster_with_wand",
+      "chunks": [[1649, 3], [26, 5], [30, 3], [34, 2], [29, 1], [23, 2], [34, 3], [1639, 3], [28, 1], [33, 3], [32, 1], [28, 1], [35, 5], [36, 1], [74, 2], [76, 5], [75, 5], [81, 3], [85, 1], [1142, 1]]
+    },
+    {
+      "id": "mage_frost",
+      "class_id": 8,
+      "class": "mage",
+      "spec": "frost",
+      "tree_points": [18, 0, 33],
+      "role_policy": "ranged_control_dps",
+      "gear_policy": "caster_with_wand",
+      "chunks": [[37, 5], [38, 3], [62, 2], [73, 5], [67, 5], [72, 1], [61, 3], [69, 1], [66, 3], [1649, 2], [71, 1], [1649, 1], [741, 1], [74, 2], [76, 4], [75, 5], [81, 3], [85, 1], [88, 2], [1142, 1]]
+    },
+    {
+      "id": "warlock_affliction",
+      "class_id": 9,
+      "class": "warlock",
+      "spec": "affliction",
+      "tree_points": [31, 20, 0],
+      "role_policy": "ranged_dot_dps",
+      "gear_policy": "caster_with_wand_and_pet",
+      "chunks": [[1003, 5], [1005, 3], [1007, 2], [1101, 2], [1004, 3], [1001, 5], [1041, 1], [1002, 2], [1021, 2], [1042, 5], [1022, 1], [1223, 5], [1225, 3], [1242, 5], [1226, 1], [1241, 4], [1227, 2]]
+    },
+    {
+      "id": "warlock_demonology",
+      "class_id": 9,
+      "class": "warlock",
+      "spec": "demonology",
+      "tree_points": [20, 31, 0],
+      "role_policy": "ranged_pet_dps",
+      "gear_policy": "caster_with_wand_and_pet",
+      "chunks": [[1003, 5], [1005, 2], [1223, 5], [1225, 3], [1242, 3], [1226, 1], [1241, 5], [1227, 2], [1262, 5], [1281, 1], [1244, 5], [1282, 1], [1005, 1], [1007, 2], [1101, 2], [1004, 3], [1001, 5]]
+    },
+    {
+      "id": "warlock_destruction",
+      "class_id": 9,
+      "class": "warlock",
+      "spec": "destruction",
+      "tree_points": [17, 0, 34],
+      "role_policy": "ranged_direct_damage",
+      "gear_policy": "caster_with_wand_and_imp",
+      "chunks": [[941, 5], [943, 5], [981, 5], [963, 1], [985, 2], [964, 2], [967, 1], [961, 5], [966, 4], [968, 1], [966, 1], [983, 2], [1003, 5], [1005, 3], [1007, 2], [1101, 2], [1284, 3], [1002, 2]]
+    },
+    {
+      "id": "druid_balance",
+      "class_id": 11,
+      "class": "druid",
+      "spec": "balance",
+      "tree_points": [31, 0, 20],
+      "role_policy": "ranged_dps_with_off_healing",
+      "gear_policy": "caster",
+      "chunks": [[761, 1], [921, 4], [763, 5], [764, 2], [762, 3], [792, 5], [789, 1], [783, 3], [762, 1], [790, 5], [793, 1], [821, 5], [824, 5], [827, 1], [829, 3], [823, 1], [843, 5]]
+    },
+    {
+      "id": "druid_feral_combat",
+      "class_id": 11,
+      "class": "druid",
+      "spec": "feral_combat",
+      "tree_points": [14, 32, 5],
+      "role_policy": "explicit_cat_dps_or_bear_tank",
+      "gear_policy": "feral_forms_weapon_stats_only",
+      "chunks": [[796, 5], [799, 5], [807, 2], [822, 4], [804, 1], [798, 3], [801, 2], [803, 3], [805, 2], [1162, 1], [800, 2], [808, 5], [809, 1], [822, 1], [761, 1], [921, 4], [791, 5], [788, 1], [781, 3]]
+    },
+    {
+      "id": "druid_restoration",
+      "class_id": 11,
+      "class": "druid",
+      "spec": "restoration",
+      "tree_points": [20, 0, 31],
+      "role_policy": "healer_with_ranged_fallback",
+      "gear_policy": "caster",
+      "chunks": [[821, 5], [824, 5], [827, 1], [829, 3], [823, 1], [843, 5], [831, 1], [828, 5], [830, 3], [825, 1], [844, 1], [762, 5], [761, 1], [921, 4], [763, 5], [764, 2], [784, 3]]
+    }
+  ]
+}

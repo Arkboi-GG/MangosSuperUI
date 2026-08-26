@@ -889,14 +889,26 @@ public class BotBrainService : BackgroundService
                 return;
             }
 
-            var existing = await charConn.QueryFirstOrDefaultAsync<int?>(
-                "SELECT char_guid FROM playerbot WHERE char_guid = @Guid", new { Guid = guid });
+            var existing = await charConn.QueryFirstOrDefaultAsync<PlayerbotIdentityRow>(
+                @"SELECT char_guid AS CharGuid, spec_tab AS SpecTab, active_role AS ActiveRole
+                  FROM playerbot WHERE char_guid = @Guid", new { Guid = guid });
+
+            int specTab = existing?.SpecTab is >= 0 and <= 2
+                ? existing.SpecTab
+                : bs.SpecTab is >= 0 and <= 2 ? bs.SpecTab : 255;
+            int activeRole = existing?.ActiveRole is >= 1 and <= 4
+                ? existing.ActiveRole
+                : bs.ActiveRole is >= 1 and <= 4
+                    ? bs.ActiveRole
+                    : specTab is >= 0 and <= 2 ? ResolveDefaultBotRole(guid, bs.ClassId, specTab) : 0;
+            bs.SpecTab = specTab;
+            bs.ActiveRole = activeRole;
 
             if (existing == null)
             {
                 await charConn.ExecuteAsync(@"
-                    INSERT INTO playerbot (char_guid, chance, ai, name, race, `class`, level, map, position_x, position_y, position_z)
-                    VALUES (@Guid, 100, 'AiBotAI', @Name, @Race, @Class, @Level, @Map, @X, @Y, @Z)",
+                    INSERT INTO playerbot (char_guid, chance, ai, name, race, `class`, level, map, position_x, position_y, position_z, spec_tab, active_role)
+                    VALUES (@Guid, 100, 'AiBotAI', @Name, @Race, @Class, @Level, @Map, @X, @Y, @Z, @SpecTab, @ActiveRole)",
                     new
                     {
                         Guid = guid,
@@ -907,7 +919,9 @@ public class BotBrainService : BackgroundService
                         Map = bs.MapId,
                         X = bs.X,
                         Y = bs.Y,
-                        Z = bs.Z
+                        Z = bs.Z,
+                        SpecTab = specTab,
+                        ActiveRole = activeRole
                     });
                 _logger.LogInformation("BotBrain: auto-registered {Name} (guid={Guid}) in playerbot table", bs.Name, guid);
             }
@@ -915,7 +929,8 @@ public class BotBrainService : BackgroundService
             {
                 await charConn.ExecuteAsync(@"
                     UPDATE playerbot SET name=@Name, level=@Level, map=@Map,
-                           position_x=@X, position_y=@Y, position_z=@Z
+                           position_x=@X, position_y=@Y, position_z=@Z,
+                           spec_tab=@SpecTab, active_role=@ActiveRole
                     WHERE char_guid = @Guid",
                     new
                     {
@@ -925,7 +940,9 @@ public class BotBrainService : BackgroundService
                         Map = bs.MapId,
                         X = bs.X,
                         Y = bs.Y,
-                        Z = bs.Z
+                        Z = bs.Z,
+                        SpecTab = specTab,
+                        ActiveRole = activeRole
                     });
             }
         }
@@ -1008,7 +1025,8 @@ public class BotBrainService : BackgroundService
     // ==================== Core schema self-heal ====================
 
     /// <summary>
-    /// Add the fork's identity columns to characters.playerbot if they're missing.
+    /// Add the fork's identity, specialization, and active-role columns to
+    /// characters.playerbot if they're missing.
     /// The base VMaNGOS table has only (char_guid, chance, ai); the fork reads/writes
     /// name/race/class/level/map/position_x/y/z. Each column is added independently and
     /// guarded against information_schema, so this is idempotent and survives a partial
@@ -1031,6 +1049,8 @@ public class BotBrainService : BackgroundService
             ("position_x", "`position_x` FLOAT NOT NULL DEFAULT 0"),
             ("position_y", "`position_y` FLOAT NOT NULL DEFAULT 0"),
             ("position_z", "`position_z` FLOAT NOT NULL DEFAULT 0"),
+            ("spec_tab",   "`spec_tab` TINYINT UNSIGNED NOT NULL DEFAULT 255"),
+            ("active_role","`active_role` TINYINT UNSIGNED NOT NULL DEFAULT 0"),
         };
 
         try
@@ -1050,6 +1070,11 @@ public class BotBrainService : BackgroundService
 
             if (added > 0)
                 _logger.LogInformation("BotBrain: playerbot schema self-heal added {Count} column(s)", added);
+
+            // Identity migration is deliberately left to the core talent planner. It
+            // can distinguish a fresh zero-point bot (safe round-robin assignment)
+            // from an existing compatible or conflicting build; SuperUI cannot safely
+            // infer that from the registry row alone.
         }
         catch (Exception ex)
         {
@@ -1070,5 +1095,34 @@ public class BotBrainService : BackgroundService
               WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table AND COLUMN_NAME = @column",
             new { table, column });
         return count > 0;
+    }
+
+    private static int ResolveDefaultBotRole(int guid, int classId, int specTab) => (classId, specTab) switch
+    {
+        (1, 2) => 3,                    // Protection Warrior
+        (1, _) => 1,
+        (2, 0) => 4,                    // Holy Paladin
+        (2, 1) => 3,                    // Protection Paladin
+        (2, _) => 1,
+        (3, _) => 2,
+        (4, _) => 1,
+        (5, 0 or 1) => 4,
+        (5, _) => 2,
+        (7, 0) => 2,
+        (7, 1) => 1,
+        (7, _) => 4,
+        (8, _) => 2,
+        (9, _) => 2,
+        (11, 0) => 2,
+        (11, 1) => ((guid / 3) % 2 == 0 ? 1 : 3), // Feral Cat/Bear alternation
+        (11, _) => 4,
+        _ => 0
+    };
+
+    private sealed class PlayerbotIdentityRow
+    {
+        public int CharGuid { get; set; }
+        public int SpecTab { get; set; } = 255;
+        public int ActiveRole { get; set; }
     }
 }

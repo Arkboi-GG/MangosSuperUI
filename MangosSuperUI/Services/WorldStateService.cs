@@ -39,6 +39,8 @@ public class WorldStateService
     private readonly ILogger<WorldStateService> _logger;
     private readonly WorldArtifactService _artifacts;
     private readonly RtsWorldCreationService _rtsWorlds;
+    private readonly DbInitializationService _dbInitialization;
+    private readonly WorldMaintenanceGate _worldMaintenance;
 
     private readonly SemaphoreSlim _registryLock = new(1, 1);
     private readonly SemaphoreSlim _jobLock = new(1, 1);
@@ -62,6 +64,8 @@ public class WorldStateService
         IConfiguration config,
         WorldArtifactService artifacts,
         RtsWorldCreationService rtsWorlds,
+        DbInitializationService dbInitialization,
+        WorldMaintenanceGate worldMaintenance,
         ILogger<WorldStateService> logger)
     {
         _db = db;
@@ -70,6 +74,8 @@ public class WorldStateService
         _config = config;
         _artifacts = artifacts;
         _rtsWorlds = rtsWorlds;
+        _dbInitialization = dbInitialization;
+        _worldMaintenance = worldMaintenance;
         _logger = logger;
     }
 
@@ -1934,13 +1940,31 @@ public class WorldStateService
                 var mangosPath = Path.Combine(dir, "world_mangos.sql.gz");
                 if (!File.Exists(mangosPath))
                     throw new FileNotFoundException("world_mangos.sql.gz missing from snapshot");
-
-                await RunMysqlRestore(host, port, user, pass, "mangos", mangosPath);
-
                 var adminPath = Path.Combine(dir, "world_vmangos_admin.sql.gz");
                 if (!File.Exists(adminPath))
                     throw new FileNotFoundException("world_vmangos_admin.sql.gz missing from snapshot");
+
+                // vmangos_admin carries queue intent as part of this snapshot. Block
+                // new queue work, drain work already in flight, and keep the lease
+                // through both destructive restores plus schema rebootstrap.
+                await using WorldMaintenanceGate.Lease maintenance =
+                    await _worldMaintenance.AcquireMaintenanceAsync();
+                await RunMysqlRestore(host, port, user, pass, "mangos", mangosPath);
                 await RunMysqlRestore(host, port, user, pass, "vmangos_admin", adminPath);
+
+                // A snapshot may predate the durable combat-loadout queue or carry an
+                // early table shape. The web process stays alive during world grafts,
+                // so startup bootstrap will not run on its own after this destructive
+                // database replacement. Recreate/migrate the admin schema now, before
+                // the restore step can be marked complete or materialized/live markers
+                // can be trusted again.
+                await _dbInitialization.InitializeAsync();
+                if (!_dbInitialization.AdminDbReady)
+                {
+                    throw new InvalidOperationException(
+                        "vmangos_admin was restored, but its required schema could not be initialized: " +
+                        (_dbInitialization.AdminDbError ?? "unknown initialization error"));
+                }
                 return "mangos + vmangos_admin";
             }
             case "players":

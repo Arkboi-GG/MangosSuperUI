@@ -119,7 +119,7 @@ if [ -n "$WORLD_RAW" ]; then
     ADMIN_USER=$(echo "$WORLD_RAW" | cut -d';' -f3)
     ADMIN_PASS=$(echo "$WORLD_RAW" | cut -d';' -f4)
     CONN_ADMIN="Server=$ADMIN_HOST;Port=$ADMIN_PORT;Database=vmangos_admin;User=$ADMIN_USER;Password=$ADMIN_PASS;"
-    ok "Admin: $ADMIN_USER@$ADMIN_HOST:$ADMIN_PORT/vmangos_admin (auto-created on first boot)"
+    ok "Admin: $ADMIN_USER@$ADMIN_HOST:$ADMIN_PORT/vmangos_admin (schema applied in Step 7)"
 else
     CONN_ADMIN=""
     warn "Admin: could not derive (World DB not found)"
@@ -328,8 +328,44 @@ if [ ! -f "$INSTALL_DIR/MangosSuperUI.dll" ]; then
 fi
 ok "MangosSuperUI.dll found in $INSTALL_DIR"
 
-# ── Step 7: Generate server-config.json ──
-header "Step 7: Generating server-config.json"
+# ── Step 7: Provision the base admin schema ──
+header "Step 7: Provisioning vmangos_admin schema"
+
+ADMIN_SCHEMA="$INSTALL_DIR/sql/vmangos_admin_schema.sql"
+
+if ! command -v mysql &>/dev/null; then
+    fail "The mysql client is required to provision vmangos_admin."
+    echo "  Install it (Ubuntu/Debian): sudo apt install mariadb-client" >&2
+    exit 1
+fi
+
+if [ -z "$CONN_ADMIN" ]; then
+    fail "Cannot provision vmangos_admin because WorldDatabase.Info was not found."
+    exit 1
+fi
+
+if [ ! -f "$ADMIN_SCHEMA" ]; then
+    fail "Canonical admin schema not found: $ADMIN_SCHEMA"
+    echo "  Deploy a current MangosSuperUI release; its publish contains sql/vmangos_admin_schema.sql." >&2
+    exit 1
+fi
+
+# MYSQL_PWD keeps the database password out of the process command line. The
+# CREATE statements are idempotent; startup migrations update existing tables.
+if MYSQL_PWD="$ADMIN_PASS" mysql \
+    --host="$ADMIN_HOST" \
+    --port="${ADMIN_PORT:-3306}" \
+    --user="$ADMIN_USER" \
+    < "$ADMIN_SCHEMA"; then
+    ok "Applied base schema: $ADMIN_SCHEMA"
+else
+    fail "Could not apply the vmangos_admin schema with the World DB credentials."
+    echo "  Confirm Step 12's database grant, then re-run this setup script." >&2
+    exit 1
+fi
+
+# ── Step 8: Generate server-config.json ──
+header "Step 8: Generating server-config.json"
 
 cat > /tmp/mangossuperui-config-generated.json << JSONEOF
 {
@@ -395,31 +431,82 @@ if [ -f "$CONFIG_FILE" ]; then
     warn "server-config.json already exists at $CONFIG_FILE"
     read -p "  Overwrite? [y/N]: " OVERWRITE
     if [[ ! "$OVERWRITE" =~ ^[Yy]$ ]]; then
-        info "Saved generated config to /tmp/mangossuperui-config-generated.json instead"
-        echo "  You can manually copy it: cp /tmp/mangossuperui-config-generated.json $CONFIG_FILE" >&2
-        exit 0
-    fi
-fi
-
-cp /tmp/mangossuperui-config-generated.json "$CONFIG_FILE"
-ok "Written to $CONFIG_FILE"
-
-# ── Step 8: Restart MangosSuperUI ──
-header "Step 8: Restarting MangosSuperUI"
-
-if systemctl is-active mangossuperui &>/dev/null; then
-    sudo systemctl restart mangossuperui
-    sleep 3
-    if systemctl is-active mangossuperui &>/dev/null; then
-        ok "MangosSuperUI restarted successfully"
+        info "Keeping the existing server-config.json"
+        info "Generated candidate remains at /tmp/mangossuperui-config-generated.json for comparison"
+        WRITE_CONFIG=false
     else
-        fail "MangosSuperUI failed to start after restart"
-        echo "  Check: sudo journalctl -u mangossuperui --no-pager -n 30" >&2
-        exit 1
+        WRITE_CONFIG=true
     fi
 else
-    info "MangosSuperUI service not running — start it with: sudo systemctl start mangossuperui"
+    WRITE_CONFIG=true
 fi
+
+if $WRITE_CONFIG; then
+    cp /tmp/mangossuperui-config-generated.json "$CONFIG_FILE"
+    ok "Written to $CONFIG_FILE"
+fi
+
+# ── Step 9: Start or restart MangosSuperUI ──
+header "Step 9: Starting MangosSuperUI"
+
+if systemctl is-active mangossuperui &>/dev/null; then
+    SERVICE_ACTION="restarted"
+else
+    SERVICE_ACTION="started"
+fi
+
+# `restart` also starts an inactive unit. This is intentional: on a true fresh
+# install Step 11 enables the unit but does not start it before this script.
+sudo systemctl restart mangossuperui
+sleep 3
+if systemctl is-active mangossuperui &>/dev/null; then
+    ok "MangosSuperUI $SERVICE_ACTION successfully"
+else
+    fail "MangosSuperUI failed to start"
+    echo "  Check: sudo journalctl -u mangossuperui --no-pager -n 30" >&2
+    exit 1
+fi
+
+# Verify after startup so DbInitializationService gets a chance to apply ALTER
+# migrations to an older queue table before we judge its shape.
+QUEUE_SCHEMA_READY=false
+for _ in {1..15}; do
+    if MYSQL_PWD="$ADMIN_PASS" mysql \
+        --host="$ADMIN_HOST" \
+        --port="${ADMIN_PORT:-3306}" \
+        --user="$ADMIN_USER" \
+        --batch --skip-column-names \
+        -e "SELECT bot_guid, bot_name, queue_id, status, payload_json, spec_tab, profile_id, profile_name, active_role, active_role_name, rotation_mode, rotation_profile, rotation_name, rotation_fingerprint, reset_talents, expected_revision, observed_session_at, request_id, claim_owner, claim_expires_at, attempt_count, queued_by, queued_from, created_at, updated_at, next_attempt_at, dispatched_at, completed_at, last_code, last_message FROM vmangos_admin.bot_combat_loadout_queue LIMIT 0;" \
+        &>/dev/null; then
+        QUEUE_SCHEMA_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if ! $QUEUE_SCHEMA_READY; then
+    fail "vmangos_admin.bot_combat_loadout_queue is missing or has an incomplete schema."
+    echo "  Check: sudo journalctl -u mangossuperui --no-pager -n 50" >&2
+    exit 1
+fi
+
+if ! QUEUE_INDEX_COUNT=$(MYSQL_PWD="$ADMIN_PASS" mysql \
+    --host="$ADMIN_HOST" \
+    --port="${ADMIN_PORT:-3306}" \
+    --user="$ADMIN_USER" \
+    --batch --skip-column-names \
+    -e "SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='vmangos_admin' AND TABLE_NAME='bot_combat_loadout_queue' AND INDEX_NAME IN ('PRIMARY', 'uq_bot_combat_loadout_queue_id', 'idx_bot_combat_loadout_queue_due');"); then
+    fail "Could not inspect the combat-loadout queue indexes."
+    echo "  Check the vmangos_admin grant and database service, then run setup again." >&2
+    exit 1
+fi
+
+if [ "$QUEUE_INDEX_COUNT" -ne 3 ]; then
+    fail "vmangos_admin.bot_combat_loadout_queue is missing one or more required indexes."
+    echo "  Re-deploy the current SQL schema and run setup again." >&2
+    exit 1
+fi
+ok "Combat-loadout queue table and indexes verified"
 
 # ── Done ──
 header "Setup Complete!"

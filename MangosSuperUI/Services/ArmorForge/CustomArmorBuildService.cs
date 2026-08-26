@@ -504,7 +504,16 @@ public sealed class CustomArmorBuildService
 
             // Everything below is after the commit — an audit row written inside that transaction
             // would survive its rollback, because AuditService writes on its own connection.
-            var stamp = await StampItemSetAsync(setId, request.MemberEntries);
+            // Union in the CLONED members before stamping. StampItemSetAsync clears set_id on every row
+            // NOT in the list it is given, and the bonuses editor builds its member checkboxes from the
+            // registry (custom_armor_display) — which a clone never writes to. So saving bonuses on a set
+            // that mixes imported and cloned pieces would submit only the imported ones and silently drop
+            // every cloned piece out of the set. A no-op for sets with no cloned members.
+            var stampEntries = request.MemberEntries.ToList();
+            var clonedForStamp = await ReadClonedSetMembersAsync(new[] { setId });
+            if (clonedForStamp.TryGetValue(setId, out var clonedStamp))
+                foreach (int e in clonedStamp) if (!stampEntries.Contains(e)) stampEntries.Add(e);
+            var stamp = await StampItemSetAsync(setId, stampEntries);
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, null);
             var deploy = DeployPatch(patch);
@@ -661,8 +670,12 @@ public sealed class CustomArmorBuildService
     // via .additem; no new display, no patch rebuild. A recolor performed in the config necessarily
     // takes the new-display path instead (Armor Forge recolor bake), because a recolor is new art.
 
+    /// <param name="SetId">The piece's own <c>item_template.set_id</c> — 0 for the loose browse, which
+    /// does not select it. This is what the SERVER counts for set bonuses, so the set cards union it
+    /// with the client DBC's member lists rather than trusting the DBC alone.</param>
     public sealed record VanillaArmorPieceDto(uint Entry, string Name, int Quality, int ItemLevel,
-        int DisplayId, int InventoryType, string Family, string FamilyLabel);
+        int DisplayId, int InventoryType, string Family, string FamilyLabel, ArmorRenderKind RenderKind,
+        int SetId = 0);
 
     public sealed record VanillaSourceConfigDto(string Name, int Quality, int ItemLevel, int RequiredLevel,
         long BuyPrice, long SellPrice, int Armor, int HolyRes, int FireRes, int NatureRes, int FrostRes,
@@ -680,8 +693,86 @@ public sealed class CustomArmorBuildService
         23 => ("held", "Held"), _ => ("other", "Other")
     };
 
+    /// <summary>How a slot actually renders, for the browse row's icon and note. The clone lane used to
+    /// report every piece as <see cref="ArmorRenderKind.Painted"/>, which is true of the body-atlas slots
+    /// and a lie about the three that carry geometry: a helm and a shoulder are attached models and a
+    /// cloak is the cape geoset plus a texture. "held" is not in <see cref="ArmorTypeCatalog"/> (the
+    /// import lanes cannot build one) but a clone needs no art, so it is offered and named honestly —
+    /// its model hangs off the off-hand attachment, so it is Modelled, not painted.</summary>
+    private static ArmorRenderKind RenderKindForInventory(int inv) => inv switch
+    {
+        1 or 3 => ArmorRenderKind.Modelled,
+        16 => ArmorRenderKind.Cloak,
+        23 => ArmorRenderKind.Modelled,
+        _ => ArmorRenderKind.Painted,
+    };
+
+    /// <summary>How many stock vanilla armor pieces the clone lane can offer. Doubles as the lane's
+    /// reachability probe for the status pill — it is the same predicate the browse uses, so a number
+    /// here means the browse below it will return rows.</summary>
+    public async Task<int> CountVanillaAsync()
+    {
+        await using var conn = _db.Mangos();
+        await conn.OpenAsync();
+        return await conn.ExecuteScalarAsync<int>(
+            @"SELECT COUNT(*) FROM item_template
+              WHERE patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)
+                AND class = 4 AND display_id > 0 AND inventory_type IN @slots
+                AND entry < @customFloor",
+            new { slots = VanillaArmorSlots.ToArray(), customFloor = WeaponIdReservationService.ItemEntryFloor });
+    }
+
     /// <summary>Browse existing vanilla (world-DB) armor pieces to clone. Class 4 with a display; filtered
     /// by name/entry and optional slot family.</summary>
+    /// <summary>Resolve specific entries to cloneable armor pieces — the set-card path, where membership
+    /// comes from <see cref="VanillaArmorSetCatalog"/> (the client's ItemSet.dbc) and only the gameplay
+    /// columns need looking up. Applies the same filters as the loose browse (max-patch row, class 4,
+    /// a wearable slot, a real display, stock entries only), so a set's non-armor members — the weapons
+    /// in <c>Dal'Rend's Arms</c>, the rings in a dungeon set — simply do not come back and the caller
+    /// can report how many were dropped.</summary>
+    public async Task<IReadOnlyList<VanillaArmorPieceDto>> ReadVanillaPiecesAsync(
+        IReadOnlyCollection<uint> entries, IReadOnlyCollection<int>? setIds = null)
+    {
+        bool hasSetIds = setIds is { Count: > 0 };
+        if (entries.Count == 0 && !hasSetIds) return Array.Empty<VanillaArmorPieceDto>();
+
+        await using var conn = _db.Mangos();
+        await conn.OpenAsync();
+        // Two membership sources, unioned. The DBC lists a set's items for the CLIENT tooltip; the
+        // SERVER counts item_template.set_id, and the WotLK lane already had to learn that the column
+        // wins when they disagree (ARMOR_FORGE.md §4b-ii — Blizzard's own T9 DBC rows are wrong). Stock
+        // 1.12 data agrees, but a DB with edited set_id values would otherwise show one membership on
+        // the card and count a different one in game.
+        var rows = await conn.QueryAsync(
+            @"SELECT entry, name, quality, item_level AS ItemLevel, display_id AS DisplayId,
+                     inventory_type AS InventoryType, set_id AS SetId
+              FROM item_template
+              WHERE (entry IN @entries OR (@hasSetIds = 1 AND set_id IN @setIds))
+                AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)
+                AND class = 4 AND display_id > 0 AND inventory_type IN @slots
+                AND entry < @customFloor",
+            new
+            {
+                entries = entries.Count > 0 ? entries.ToArray() : new uint[] { 0 },
+                setIds = hasSetIds ? setIds!.ToArray() : new[] { 0 },
+                hasSetIds = hasSetIds ? 1 : 0,
+                slots = VanillaArmorSlots.ToArray(),
+                customFloor = WeaponIdReservationService.ItemEntryFloor,
+            });
+
+        var list = new List<VanillaArmorPieceDto>();
+        foreach (var r in rows)
+        {
+            int inv = Convert.ToInt32(r.InventoryType);
+            var fam = FamilyForInventory(inv);
+            list.Add(new VanillaArmorPieceDto(
+                Convert.ToUInt32(r.entry), (string)r.name, Convert.ToInt32(r.quality),
+                Convert.ToInt32(r.ItemLevel), Convert.ToInt32(r.DisplayId), inv, fam.Key, fam.Label,
+                RenderKindForInventory(inv), Convert.ToInt32(r.SetId ?? 0)));
+        }
+        return list;
+    }
+
     public async Task<IReadOnlyList<VanillaArmorPieceDto>> BrowseVanillaAsync(string? search, string? family, int limit = 60)
     {
         limit = Math.Clamp(limit, 1, 200);
@@ -708,13 +799,27 @@ public sealed class CustomArmorBuildService
         await using var conn = _db.Mangos();
         await conn.OpenAsync();
         var rows = await conn.QueryAsync(
+            // Two predicates the weapon forge's vanilla browse already carries and this one did not
+            // (BrowseVanillaWeaponsAsync says as much in its own comment):
+            //   • max-patch scoping. item_template is keyed (entry, patch), so an item that Blizzard
+            //     revised across content patches has a row per patch and used to appear once per row —
+            //     duplicates that ate the LIMIT and made the list look arbitrarily short.
+            //   • excluding the custom range, or every piece this forge has already imported or cloned
+            //     comes back as a clone source. Cloning one of those points the copy at a CUSTOM display
+            //     that "Delete" can destroy later, leaving the clone rendering as a missing model.
             @"SELECT entry, name, quality, item_level AS ItemLevel, display_id AS DisplayId, inventory_type AS InventoryType
               FROM item_template
-              WHERE class = 4 AND display_id > 0 AND inventory_type IN @slots
+              WHERE patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)
+                AND class = 4 AND display_id > 0 AND inventory_type IN @slots
+                AND entry < @customFloor
                 AND (@noSearch = 1 OR name LIKE @like OR entry = @entryExact)
               ORDER BY item_level DESC, quality DESC, name
               LIMIT @limit",
-            new { slots, like, entryExact, noSearch = hasSearch ? 0 : 1, limit });
+            new
+            {
+                slots, like, entryExact, noSearch = hasSearch ? 0 : 1, limit,
+                customFloor = WeaponIdReservationService.ItemEntryFloor,
+            });
 
         var list = new List<VanillaArmorPieceDto>();
         foreach (var r in rows)
@@ -723,7 +828,8 @@ public sealed class CustomArmorBuildService
             var fam = FamilyForInventory(inv);
             list.Add(new VanillaArmorPieceDto(
                 Convert.ToUInt32(r.entry), (string)r.name, Convert.ToInt32(r.quality),
-                Convert.ToInt32(r.ItemLevel), Convert.ToInt32(r.DisplayId), inv, fam.Key, fam.Label));
+                Convert.ToInt32(r.ItemLevel), Convert.ToInt32(r.DisplayId), inv, fam.Key, fam.Label,
+                RenderKindForInventory(inv)));
         }
         return list;
     }
@@ -734,7 +840,12 @@ public sealed class CustomArmorBuildService
     {
         await using var conn = _db.Mangos();
         await conn.OpenAsync();
-        var row = await conn.QueryFirstOrDefaultAsync("SELECT * FROM item_template WHERE entry=@entry", new { entry });
+        // Highest patch row wins — the same predicate every other item_template read in this app uses.
+        // Without it Dapper handed back whichever row the storage engine returned first, so the Configure
+        // modal could pre-fill a pre-nerf version of the item and then write those stale numbers back as
+        // the clone's authoritative overrides.
+        var row = await conn.QueryFirstOrDefaultAsync(
+            "SELECT * FROM item_template WHERE entry=@entry ORDER BY patch DESC LIMIT 1", new { entry });
         if (row is null) return null;
         var d = (IDictionary<string, object>)row;
         int I(string k) => d.TryGetValue(k, out var v) && v != null ? Convert.ToInt32(v) : 0;
@@ -766,11 +877,44 @@ public sealed class CustomArmorBuildService
     }
 
     /// <summary>Clone an existing vanilla armor item into a new custom entry (reusing its display), then
-    /// apply the operator's gameplay edits. No new display/patch — usable via .additem after a reload.</summary>
+    /// apply the operator's gameplay edits. No new display/patch — usable via .additem after a reload.
+    ///
+    /// <paramref name="recolorRequested"/> / <paramref name="glowRequested"/> are not features here —
+    /// they are refusals. The Appearance panel can preview a recolor or a glow tint on a vanilla piece,
+    /// and the import lanes bake exactly that into the shipped BLPs. A clone cannot: it ships no art at
+    /// all, it reuses the SOURCE's display, and repainting that display would repaint the stock item for
+    /// every character wearing it. The lane used to accept those parameters at the controller and drop
+    /// them on the floor, so the operator was told "will bake on import" and got an unrecolored item
+    /// with nothing explaining why. Fail loudly instead.</summary>
     public async Task<CustomArmorBuildResult> CloneVanillaAsync(uint sourceEntry, string? nameOverride,
-        ValidatedVanillaItemBuildConfiguration? gameplay)
+        ValidatedVanillaItemBuildConfiguration? gameplay,
+        bool recolorRequested = false, bool glowRequested = false, int setId = 0, bool reload = true)
     {
         var result = new CustomArmorBuildResult { TbcEntry = sourceEntry, SourceExpansion = "vanilla" };
+
+        // Stock set ids are 1..551 (measured on the mounted 1.12 ItemSet.dbc); forged ids start at
+        // ArmorItemSetDbc.CustomSetIdFloor. Accepting a stock id here would re-create exactly the silent
+        // enrolment the set_id-to-0 projection exists to prevent, from the other direction.
+        if (setId != 0 && setId < ArmorItemSetDbc.CustomSetIdFloor)
+        {
+            result.Ok = false;
+            result.Message = $"Set id {setId} is a stock vanilla set. A clone may only join a FORGED set " +
+                             $"(id {ArmorItemSetDbc.CustomSetIdFloor} or above) — cloning a set creates one.";
+            return result;
+        }
+
+        if (recolorRequested || glowRequested)
+        {
+            result.Ok = false;
+            string what = recolorRequested && glowRequested ? "recolor and glow tint"
+                : recolorRequested ? "recolor" : "glow tint";
+            result.Message =
+                $"This clone cannot carry the previewed {what}. A clone reuses the source item's own display, " +
+                "and new art needs a new display plus a patch-6 rebuild — which is what the TBC and WotLK import " +
+                "lanes do. Either clear the Appearance panel and clone the piece as-is, or import the piece from " +
+                "an import lane, where the recolor and glow are baked into the shipped textures.";
+            return result;
+        }
 
         await using var conn = _db.Mangos();
         await conn.OpenAsync();
@@ -778,9 +922,20 @@ public sealed class CustomArmorBuildService
         var srcRow = await conn.QueryFirstOrDefaultAsync(
             @"SELECT entry, name, class AS ItemClass, subclass AS Subclass,
                      display_id AS DisplayId, inventory_type AS InventoryType
-              FROM item_template WHERE entry=@e",
+              FROM item_template WHERE entry=@e
+              ORDER BY patch DESC LIMIT 1",
             new { e = sourceEntry });
         if (srcRow is null) { result.Ok = false; result.Message = $"Vanilla item {sourceEntry} not found."; return result; }
+        // Cloning a piece this forge already made would point the copy at a CUSTOM display id, which a
+        // later "Delete" on the original destroys — leaving the clone rendering as a missing model with
+        // nothing recording why. The weapon lane refuses this; so does this one now.
+        if (sourceEntry >= WeaponIdReservationService.ItemEntryFloor)
+        {
+            result.Ok = false;
+            result.Message = $"Item {sourceEntry} is already a custom item — clone from a stock vanilla piece instead. " +
+                             "(A clone reuses the source's display, and a custom display can be deleted out from under it.)";
+            return result;
+        }
         if (Convert.ToInt32(srcRow.ItemClass) != 4) { result.Ok = false; result.Message = $"Item {sourceEntry} is not armor (class 4)."; return result; }
         // Shields are class-4 armor but they live in the Weapon Forge (WeaponTypeCatalog's "shield"
         // family, slot 14 — deliberately absent from VanillaArmorSlots). The browse never offers
@@ -807,30 +962,79 @@ public sealed class CustomArmorBuildService
             : !string.IsNullOrWhiteSpace(gameplay?.Name) ? gameplay!.Name!.Trim()
             : sourceName;
 
+        // A transaction around the copy AND the operator's overrides — plus a compensating delete,
+        // because on this schema the transaction alone is not enough. VMaNGOS ships item_template as
+        // ENGINE=MyISAM (WEAPON_GEN.md's DDL, and the owner's own schema dump in
+        // wwwroot/data/curated-relationships.json records mangos.item_template as MyISAM). MyISAM
+        // ignores START TRANSACTION: the INSERT is committed the moment it runs and ROLLBACK answers
+        // warning 1196 rather than undoing anything. The transaction is kept because an InnoDB fork
+        // DOES honour it; the catch below is what actually cleans up here.
+        await using var tx = await conn.BeginTransactionAsync();
         try
         {
             // Clone the exact source row into the new entry (schema-agnostic column list), reusing display_id.
             var cols = (await conn.QueryAsync<string>(
                 @"SELECT COLUMN_NAME FROM information_schema.COLUMNS
-                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item_template' ORDER BY ORDINAL_POSITION")).ToList();
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'item_template' ORDER BY ORDINAL_POSITION",
+                transaction: tx)).ToList();
             if (cols.Count == 0) throw new InvalidOperationException("item_template schema could not be read.");
 
             string colList = string.Join(",", cols.Select(c => $"`{c}`"));
             string selList = string.Join(",", cols.Select(c =>
-                c.Equals("entry", StringComparison.OrdinalIgnoreCase) ? "@newEntry" : $"`{c}`"));
-            await conn.ExecuteAsync(
-                $"INSERT INTO item_template ({colList}) SELECT {selList} FROM item_template WHERE entry=@src",
-                new { newEntry, src = sourceEntry });
+                c.Equals("entry", StringComparison.OrdinalIgnoreCase) ? "@newEntry"
+                // patch 0 — the convention every other custom item this forge makes already follows
+                // (DonorItemTemplateFixture's row is patch 0). The core loads, per entry, the highest
+                // patch row NOT ABOVE the server's content-patch setting, so a row inherited at the
+                // source's patch is invisible on any server configured below it. Zero always loads.
+                : c.Equals("patch", StringComparison.OrdinalIgnoreCase) ? "0"
+                // set_id is always cleared here and only ever re-stamped by the override UPDATE below.
+                // Never the SOURCE's: riding that across would make the clone count toward the stock
+                // tier set's bonuses, a silent gameplay change nobody asked for. Doing it in two steps
+                // fails in the safe direction — a failure between the INSERT and the UPDATE leaves an
+                // unjoined clone, not a piece silently enrolled in a set.
+                : c.Equals("set_id", StringComparison.OrdinalIgnoreCase) ? "0"
+                // These three name OTHER item entries (the faction mirror, the quest a book starts,
+                // the gift a wrapper produces). Copied verbatim they point the clone at the source's
+                // relationships, which is never what a re-itemized copy wants.
+                : c.Equals("other_team_entry", StringComparison.OrdinalIgnoreCase) ? "0"
+                : c.Equals("start_quest", StringComparison.OrdinalIgnoreCase) ? "0"
+                : c.Equals("wrapped_gift", StringComparison.OrdinalIgnoreCase) ? "0"
+                : $"`{c}`"));
+            // ORDER BY patch DESC LIMIT 1 is load-bearing, not tidiness. item_template is keyed
+            // (entry, patch), so a source revised across content patches has one row per patch — and
+            // because the projection above pins every copy to patch 0, an unqualified SELECT would try
+            // to insert them ALL as (newEntry, 0) and die on the primary key with ER_DUP_ENTRY. Take
+            // the newest row, which is the one the browse and the Configure pre-fill both showed.
+            int inserted = await conn.ExecuteAsync(
+                $"INSERT INTO item_template ({colList}) SELECT {selList} FROM item_template WHERE entry=@src ORDER BY patch DESC LIMIT 1",
+                new { newEntry, src = sourceEntry }, tx);
+            // A zero-row insert used to report a perfectly successful clone of nothing.
+            if (inserted != 1)
+                throw new InvalidOperationException(
+                    $"clone INSERT affected {inserted} rows (expected 1) copying item {sourceEntry}.");
 
             // Apply the name + validated gameplay overrides on top of the cloned row.
             var sets = new List<string> { "name=@nm" };
             var dp = new DynamicParameters();
             dp.Add("e", newEntry);
             dp.Add("nm", name);
+            // Set membership, when this clone is part of a cloned set. It is what the SERVER counts for
+            // bonuses, and — because a clone has no registry row — it is also the only record that this
+            // piece belongs to the set at all (see ReadClonedSetMembersAsync).
+            if (setId > 0) { sets.Add("set_id=@sid"); dp.Add("sid", setId); }
             if (gameplay?.Overrides is { Count: > 0 })
             {
                 foreach (var (col, literal) in gameplay.Overrides)
                 {
+                    // Belt and braces: the clone keeps the SOURCE's slot. Unlike the weapon modal, the
+                    // armor Configure modal has no slot control and never sends inventory_type today, so
+                    // this is unreachable — it is here because honouring a slot change would move (say) a
+                    // chest piece into the legs slot while it still wears the chest's display, and a
+                    // body-atlas item paints into the region its DISPLAY declares, so the piece would
+                    // render on the wrong part of the body. Slot changes belong to the import lanes,
+                    // which build art for the family they claim.
+                    if (col.Equals("inventory_type", StringComparison.OrdinalIgnoreCase)) continue;
+
                     if (col.Equals("description", StringComparison.OrdinalIgnoreCase))
                     {
                         sets.Add("description=@desc");
@@ -843,51 +1047,237 @@ public sealed class CustomArmorBuildService
                     }
                 }
             }
-            await conn.ExecuteAsync($"UPDATE item_template SET {string.Join(",", sets)} WHERE entry=@e", dp);
+            int updated = await conn.ExecuteAsync(
+                $"UPDATE item_template SET {string.Join(",", sets)} WHERE entry=@e", dp, tx);
+            if (updated != 1)
+                throw new InvalidOperationException(
+                    $"clone UPDATE affected {updated} rows (expected 1) for new entry {newEntry}.");
+
+            await tx.CommitAsync();
         }
         catch (Exception ex)
         {
+            try { await tx.RollbackAsync(); }
+            catch (Exception rollbackEx) { _logger.LogWarning(rollbackEx, "ArmorForge: clone rollback failed for entry {Entry}", newEntry); }
+
+            // On MyISAM the rollback above did nothing, so remove the copy by hand before the id goes
+            // back in the pool. Releasing the id without this leaves a live, unedited duplicate of the
+            // source under a custom entry that nothing points at and nothing records.
+            bool cleaned;
+            try
+            {
+                await conn.ExecuteAsync("DELETE FROM item_template WHERE entry=@e", new { e = newEntry });
+                cleaned = true;
+            }
+            catch (Exception cleanupEx)
+            {
+                cleaned = false;
+                _logger.LogWarning(cleanupEx, "ArmorForge: clone cleanup delete failed for entry {Entry}", newEntry);
+            }
+
             await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id);
             result.Ok = false;
             result.Message = "clone failed: " + ex.Message;
 
-            // The INSERT and the override UPDATE are not in one transaction, so a failure in the
-            // second leaves a live row carrying the SOURCE item's name and stats under a new entry.
-            // Releasing the id does not remove it. Without this row nothing records that it exists.
             await _audit.LogAsync(new AuditEntry
             {
-                Category = "armorforge", Action = "clone_vanilla", TargetType = "item", TargetName = name,
+                // "item_custom", not "item": ChangeGraphService.TargetTables has no mapping for "item",
+                // so the one row that exists to record a failed clone was the one row the Change Graph
+                // could not show. It matches the success audit and the weapon lane.
+                Category = "armorforge", Action = "clone_vanilla", TargetType = "item_custom", TargetName = name,
                 TargetId = newEntry is > 0 and <= int.MaxValue ? (int)newEntry : null,
                 StateAfter = JsonSerializer.Serialize(new { buildId, sourceEntry, itemEntry = newEntry, displayId, family = fam.Key }),
                 IsReversible = false, RevertKind = RevertKind.None, Success = false,
-                Notes = $"Vanilla clone {sourceEntry} → {newEntry} FAILED: {ex.Message} — the id was released, but if the row " +
-                        $"was already inserted it is still in item_template as an unedited copy of {sourceEntry}. " +
-                        $"Check with: SELECT * FROM item_template WHERE entry = {newEntry};",
+                Notes = $"Vanilla clone {sourceEntry} → {newEntry} FAILED: {ex.Message}. The id was returned to the pool. " +
+                        (cleaned
+                            ? $"item_template row {newEntry} was removed."
+                            : $"THE CLEANUP DELETE ALSO FAILED — a partial copy of {sourceEntry} may still be live under entry " +
+                              $"{newEntry}. Check with: SELECT * FROM item_template WHERE entry = {newEntry};"),
             });
             return result;
         }
 
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
 
-        var apply = new ServerApplyStatus { SqlApplied = true, SqlMessage = $"cloned entry {newEntry} (reuses display {displayId})" };
-        var reload = await ReloadItemTemplateAsync();
-        apply.Reloaded = reload.Ok; apply.ReloadMessage = reload.Message;
+        var apply = new ServerApplyStatus
+        {
+            SqlApplied = true,
+            SqlMessage = $"cloned entry {newEntry} (reuses display {displayId})",
+            PatchRequired = false, // nothing is packaged — there is no patch step to report on
+        };
+        // One reload per SET, not per piece: a 9-piece set clone was nine RA round-trips to the live
+        // core, which is the same pile-up the set DELETE path had to be fixed for (ARMOR_FORGE.md §7b).
+        // Defaults to true so the single-clone path is unchanged.
+        if (reload)
+        {
+            var reloadRes = await ReloadItemTemplateAsync();
+            apply.Reloaded = reloadRes.Ok; apply.ReloadMessage = reloadRes.Message;
+        }
+        else apply.ReloadMessage = "deferred to the end of the set";
 
         result.ItemEntry = newEntry; result.DisplayId = displayId; result.Name = name;
-        result.ArmorTypeKey = fam.Key; result.RenderKind = ArmorRenderKind.Painted; // reuses vanilla display; no forged art
+        result.ArmorTypeKey = fam.Key;
+        result.RenderKind = RenderKindForInventory(inv); // the source's own art — a helm is still Modelled
         result.Apply = apply; result.Ok = true;
         result.Message = $"Cloned vanilla {sourceEntry} → {newEntry} (reuses display {displayId}).";
 
         await _audit.LogAsync(new AuditEntry
         {
-            Category = "armorforge", Action = "clone_vanilla", TargetType = "item", TargetName = name,
+            Category = "armorforge", Action = "clone_vanilla",
+            // "item_custom" (not "item") is deliberate, and matches CloneVanillaWeaponAsync: it is the
+            // target type ChangeGraphService.RevertByDeletingAsync keys on, and it files the row under
+            // the Change Graph's items domain. A clone is the one Armor Forge output the graph can
+            // genuinely undo — there is no registry row and no patch member to strand, so deleting the
+            // item_template row restores the world exactly. Marking it IsReversible=false left the
+            // operator with no way to take a clone back at all.
+            TargetType = "item_custom", TargetName = name,
             TargetId = checked((int)newEntry),
             RaCommand = ".reload item_template", RaResponse = apply.ReloadMessage,
-            StateAfter = JsonSerializer.Serialize(new { buildId, sourceEntry, itemEntry = newEntry, displayId, family = fam.Key }),
-            IsReversible = false, Success = true,
+            StateAfter = JsonSerializer.Serialize(new
+            {
+                buildId, sourceEntry, sourceName, itemEntry = newEntry, displayId,
+                family = fam.Key, inventoryType = inv, overrides = gameplay?.Overrides,
+            }),
+            IsReversible = true, RevertKind = RevertKind.DeleteCustom, Success = true,
             Notes = $"Vanilla clone {sourceEntry} → {newEntry}, reuses display {displayId}. Reload: {apply.ReloadMessage}.",
         });
         return result;
+    }
+
+    /// <summary>Clone a whole stock vanilla set: every cloneable member into a new custom entry, all of
+    /// them joined to ONE newly reserved forged set id, with the operator's per-piece gameplay and set
+    /// bonuses.
+    ///
+    /// This is the one place the vanilla lane's "nothing is packaged" contract does not hold, and it
+    /// cannot: a set is not a property of its items, it is a row in <c>ItemSet.dbc</c>. The pieces still
+    /// ship no art — they reuse their sources' displays — but the set DEFINITION has to reach both the
+    /// client (patch-6, for the tooltip) and the server's own dbc directory (for the bonuses to fire),
+    /// and the core reads DBCs only at startup. So unlike a single clone this needs a patch rebuild, a
+    /// client restart and a mangosd restart, and the result message says so.
+    ///
+    /// Bonuses default to the SOURCE set's own — uniquely possible here, because a vanilla set's spells
+    /// exist in a vanilla core by definition. The TBC/WotLK lanes must ask the operator to pick vanilla
+    /// equivalents instead.</summary>
+    public async Task<ArmorSetImportResult> CloneVanillaSetAsync(
+        int sourceSetId,
+        IReadOnlyList<uint> memberEntries,
+        string setName,
+        IReadOnlyDictionary<uint, ValidatedVanillaItemBuildConfiguration>? perPieceGameplay = null,
+        IReadOnlyList<ArmorSetBonus>? bonuses = null,
+        int reqSkill = 0, int reqSkillRank = 0)
+    {
+        if (memberEntries.Count == 0)
+            throw new ArgumentException("A cloned set needs at least one cloneable armor member.", nameof(memberEntries));
+        if (string.IsNullOrWhiteSpace(setName))
+            throw new ArgumentException("A cloned set needs a name.", nameof(setName));
+        setName = setName.Trim();
+
+        // ItemSet.dbc holds 17 member slots. Refuse rather than silently dropping the tail.
+        if (memberEntries.Count > ArmorItemSetDbc.MaxItems)
+            throw new ArgumentException(
+                $"A set can hold at most {ArmorItemSetDbc.MaxItems} items; {memberEntries.Count} were selected.", nameof(memberEntries));
+
+        var validBonuses = (bonuses ?? new List<ArmorSetBonus>())
+            .Where(b => b.Threshold > 0 && b.SpellId > 0).OrderBy(b => b.Threshold).Take(ArmorItemSetDbc.MaxBonuses).ToList();
+
+        // Preflight the packaging path BEFORE anything is reserved or written. Unlike a single clone,
+        // this method has to build and deploy a patch at the end — and that step needs a mounted client
+        // to extract a base DBC from, plus a server dbc directory for the core to read the set from. It
+        // used to reach those requirements only after reserving a set id, inserting the set row and
+        // cloning every piece, so a missing mount left a half-built set behind and threw.
+        if (_mpq.ExtractFile(ArmorNaming.ItemSetMember, skipArchive: n => n.StartsWith("patch-6", StringComparison.OrdinalIgnoreCase)) is not { Length: > 0 })
+            throw new InvalidOperationException(
+                "Cloning a SET needs the 1.12 client mounted: unlike a single clone it ships an ItemSet.dbc " +
+                "row in patch-6, which is built by extending the client's own copy. Set Vmangos:ClientDataPath " +
+                "in Settings, or clone the pieces individually instead.");
+
+        // N+1 audit rows — one per cloned piece plus the set row — grouped into one named run, exactly
+        // as ImportSetAsync does for the import lanes.
+        using var batch = AuditBatch.Begin($"Armor Forge \u2014 clone vanilla set '{setName}'");
+
+        string buildId = "armclone-set-" + Guid.NewGuid().ToString("N")[..12];
+        int setId = 0;
+        try
+        {
+            long floor = await ComputeSetIdFloorAsync();
+            var res = await _ids.ReserveAsync(KindSet, floor, buildId, "set");
+            setId = checked((int)res.Id);
+            await _ids.MarkStateAsync(KindSet, res.Id, "committed");
+
+            await using (var conn = _db.Admin())
+            {
+                await conn.OpenAsync();
+                await conn.ExecuteAsync(
+                    @"INSERT INTO custom_armor_set (set_id, name, bonuses_json, req_skill, req_skill_rank, created_at)
+                      VALUES (@setId, @name, @bonuses, @skill, @rank, NOW())",
+                    new { setId, name = setName, bonuses = JsonSerializer.Serialize(validBonuses), skill = reqSkill, rank = reqSkillRank });
+            }
+
+            var result = new ArmorSetImportResult { SetId = setId, Name = setName };
+            foreach (var entry in memberEntries)
+            {
+                try
+                {
+                    ValidatedVanillaItemBuildConfiguration? pieceGameplay = null;
+                    perPieceGameplay?.TryGetValue(entry, out pieceGameplay);
+                    var piece = await CloneVanillaAsync(entry, null, pieceGameplay, setId: setId, reload: false);
+                    if (!piece.Ok) _logger.LogWarning("ArmorForge: vanilla set clone member {Entry} failed: {Msg}", entry, piece.Message);
+                    result.Pieces.Add(piece);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "ArmorForge: vanilla set {Set} member {Entry} failed", sourceSetId, entry);
+                    result.Pieces.Add(new CustomArmorBuildResult { TbcEntry = entry, SourceExpansion = "vanilla", Ok = false, Message = ex.Message });
+                }
+            }
+
+            // One reload and one rebuild for the whole set. The pieces contributed no art, so what the
+            // rebuild actually ships is the ItemSet.dbc row — which is the entire point.
+            var reload = await ReloadItemTemplateAsync();
+            var patch = await AssembleUnifiedPatchAsync();
+            WriteOutputs(buildId, patch, null);
+            var dep = DeployPatch(patch);
+            var serverDeploy = DeployItemSetToServer(patch);
+            result.PatchDeployed = dep.Ok;
+            result.ServerItemSetDeployed = serverDeploy.State == ItemSetDeployState.Deployed;
+            result.ServerItemSetMessage = serverDeploy.Message;
+
+            int okPieces = result.Pieces.Count(x => x.Ok);
+            result.Message = $"{okPieces}/{memberEntries.Count} pieces cloned into set {setId} '{setName}'"
+                + (validBonuses.Count > 0 ? $" with {validBonuses.Count} bonus(es)" : " (no bonuses)")
+                + $". Reload: {reload.Message}. {dep.Message} Server sets: {serverDeploy.Message}";
+
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "clone_vanilla_set", TargetType = "itemset",
+                TargetName = setName, TargetId = setId,
+                StateAfter = JsonSerializer.Serialize(new
+                {
+                    setId, sourceSetId, sourceExpansion = "vanilla",
+                    pieces = result.Pieces.Select(x => new { x.TbcEntry, x.Ok, x.ItemEntry, x.DisplayId }),
+                }),
+                IsReversible = true, RevertKind = RevertKind.Registry,
+                // A set that cloned none of its members is not a success just because the set row exists.
+                Success = okPieces > 0,
+                Notes = result.Message,
+            });
+            return result;
+        }
+        catch (Exception ex)
+        {
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "armorforge", Action = "clone_vanilla_set", TargetType = "itemset",
+                TargetName = setName, TargetId = setId > 0 ? setId : null,
+                StateAfter = JsonSerializer.Serialize(new { buildId, setId, sourceSetId, memberCount = memberEntries.Count }),
+                IsReversible = false, RevertKind = RevertKind.None, Success = false,
+                Notes = $"Vanilla set clone FAILED: {ex.Message}" +
+                        (setId > 0
+                            ? $" Set {setId} was already created and any members cloned before the failure are still there \u2014 delete the set to unwind."
+                            : " No set id was allocated."),
+            });
+            throw;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1100,7 +1490,13 @@ public sealed class CustomArmorBuildService
     public async Task<ArmorPatchResult?> AssembleUnifiedPatchAsync()
     {
         var rows = await LoadArmorRowsAsync();
-        if (rows.Count == 0) return null;
+        // Sets are resolved up front, not just at packaging time, because they can be the ONLY reason to
+        // build a patch. A cloned set writes no custom_armor_display rows at all, so `rows.Count == 0`
+        // used to mean "nothing to ship" and returned null — which on a clone-only install removed
+        // patch-6 from the client and restored the server's stock ItemSet.dbc, quietly unmaking the set
+        // that had just been created. Bail only when there is genuinely nothing.
+        var sets = await LoadSetsAsync(rows);
+        if (rows.Count == 0 && sets.Count == 0) return null;
 
         byte[] baseDbc = ResolveBaseDbc();
         var baseReader = DbcWriterService.ReadDbc(baseDbc, ArmorNaming.ItemDisplayInfoMember);
@@ -1209,7 +1605,6 @@ public sealed class CustomArmorBuildService
             catch (Exception ex) { _logger.LogWarning(ex, "ArmorForge: icon '{Stem}' shipped in this patch but could not be persisted", stem); }
         }
 
-        var sets = await LoadSetsAsync(rows);
         byte[]? baseItemSet = null;
         bool setsOmitted = false;
         if (sets.Count > 0)
@@ -1448,6 +1843,12 @@ public sealed class CustomArmorBuildService
             displays = (await conn.QueryAsync<long>("SELECT display_id FROM custom_armor_display WHERE set_id=@setId", new { setId })).ToList();
             setName = await conn.ExecuteScalarAsync<string?>("SELECT name FROM custom_armor_set WHERE set_id=@setId", new { setId });
         }
+        // CLONED members have no registry row — the display list above cannot see them — so their only
+        // record is item_template.set_id. Without this a cloned set deleted "successfully": the loop
+        // below never ran, so `complete` stayed true, the set row was dropped and its id released, while
+        // every cloned item stayed live stamped with a set id that had just been handed back to the pool.
+        var clonedBySet = await ReadClonedSetMembersAsync(new[] { setId });
+        var clonedEntries = clonedBySet.TryGetValue(setId, out var ce) ? ce : new List<int>();
 
         // Each piece writes its own delete row, and the patch rebuild at the end writes another.
         // The scope makes the whole unwind read as one run instead of a dozen loose deletions.
@@ -1475,6 +1876,20 @@ public sealed class CustomArmorBuildService
                 }
             }
 
+            // Cloned pieces: nothing to unpackage, so this is just the item row and its reserved id.
+            int clonedDeleted = 0;
+            foreach (int entry in clonedEntries)
+            {
+                var del = await DeleteItemRowAsync(entry);
+                if (del.Ok)
+                {
+                    clonedDeleted++;
+                    await _ids.ReleaseAsync(WeaponIdReservationService.KindItemEntry, entry);
+                }
+                else failures.Add($"cloned item {entry}: {del.Message}");
+            }
+            deleted += clonedDeleted;
+
             bool complete = failures.Count == 0;
             if (complete)
             {
@@ -1489,9 +1904,11 @@ public sealed class CustomArmorBuildService
             string rebuild = await RebuildPatchAsync($"delete set {setId}");
 
             string label = string.IsNullOrWhiteSpace(setName) ? $"set {setId}" : $"set {setId} '{setName}'";
+            int totalPieces = displays.Count + clonedEntries.Count;
             string message = complete
-                ? $"deleted {label} and all {deleted} piece(s). {rebuild}"
-                : $"deleted {deleted}/{displays.Count} piece(s) of {label}; {failures.Count} failed, so the set was KEPT so you can retry: {string.Join("; ", failures.Take(4))}. {rebuild}";
+                ? $"deleted {label} and all {deleted} piece(s)"
+                    + (clonedEntries.Count > 0 ? $" ({clonedEntries.Count} cloned)" : "") + $". {rebuild}"
+                : $"deleted {deleted}/{totalPieces} piece(s) of {label}; {failures.Count} failed, so the set was KEPT so you can retry: {string.Join("; ", failures.Take(4))}. {rebuild}";
 
             await _audit.LogAsync(new AuditEntry
             {
@@ -1607,10 +2024,23 @@ public sealed class CustomArmorBuildService
             await using var conn = _db.Admin();
             await conn.OpenAsync();
             var setRows = (await conn.QueryAsync("SELECT set_id, name, bonuses_json, req_skill, req_skill_rank FROM custom_armor_set")).ToList();
+
+            // A set has two kinds of member and only one of them is in the registry. An IMPORTED piece
+            // has a custom_armor_display row (it ships art). A CLONED piece has none — a clone reuses the
+            // source's display and writes nothing but an item_template row — so its membership exists
+            // ONLY as item_template.set_id. Without this union the patch builder saw a cloned set with
+            // zero members, dropped it, and shipped an ItemSet.dbc with no row for it; the core then
+            // zeroes the very set_id the clone just wrote (ARMOR_FORGE.md §10) and the set is inert.
+            var setIdList = new List<int>();
+            foreach (var x in setRows) setIdList.Add(Convert.ToInt32(x.set_id));
+            var clonedMembers = await ReadClonedSetMembersAsync(setIdList);
+
             foreach (var s in setRows)
             {
                 int setId = Convert.ToInt32(s.set_id);
-                var members = rows.Where(r => r.SetId == setId).Select(r => (int)r.ItemEntry).ToList();
+                var members = rows.Where(r => r.SetId == setId).Select(r => (int)r.ItemEntry)
+                    .Union(clonedMembers.TryGetValue(setId, out var cloned) ? cloned : Enumerable.Empty<int>())
+                    .Distinct().ToList();
                 if (members.Count == 0) continue;
                 var bonuses = new List<ArmorSetBonus>();
                 try { bonuses = JsonSerializer.Deserialize<List<ArmorSetBonus>>((string?)s.bonuses_json ?? "[]") ?? new(); } catch { }
@@ -1623,6 +2053,40 @@ public sealed class CustomArmorBuildService
         }
         catch (Exception ex) { _logger.LogWarning(ex, "ArmorForge: LoadSetsAsync failed"); }
         return sets;
+    }
+
+    /// <summary>Item entries that belong to a forged set purely by <c>item_template.set_id</c> — i.e.
+    /// the CLONED pieces, which have no registry row. Scoped to the custom entry range so a stock item
+    /// that happens to carry a colliding set_id can never be swept into a forged set.</summary>
+    private async Task<Dictionary<int, List<int>>> ReadClonedSetMembersAsync(IReadOnlyCollection<int> setIds)
+    {
+        var bySet = new Dictionary<int, List<int>>();
+        if (setIds.Count == 0) return bySet;
+        try
+        {
+            await using var conn = _db.Mangos();
+            await conn.OpenAsync();
+            var rows = await conn.QueryAsync(
+                @"SELECT entry, set_id AS SetId FROM item_template
+                  WHERE set_id IN @setIds
+                    AND entry >= @customFloor
+                    AND patch = (SELECT MAX(patch) FROM item_template it2 WHERE it2.entry = item_template.entry)
+                  ORDER BY entry",
+                new { setIds = setIds.ToArray(), customFloor = WeaponIdReservationService.ItemEntryFloor });
+            foreach (var r in rows)
+            {
+                int setId = Convert.ToInt32(r.SetId);
+                if (!bySet.TryGetValue(setId, out var list)) bySet[setId] = list = new List<int>();
+                list.Add(Convert.ToInt32(r.entry));
+            }
+        }
+        catch (Exception ex)
+        {
+            // The world DB is a separate failure domain from the registry. A set whose members are all
+            // imported must still package if this read fails.
+            _logger.LogWarning(ex, "ArmorForge: reading cloned set members failed; cloned pieces may be missing from patch-6");
+        }
+        return bySet;
     }
 
     public async Task<List<ArmorSetSummary>> ListSetsAsync()
@@ -1959,6 +2423,11 @@ public sealed class ServerApplyStatus
     public string ReloadMessage { get; set; } = "";
     public bool PatchDeployed { get; set; }
     public string PatchDeployMessage { get; set; } = "";
+    /// <summary>False when the operation ships no art and therefore has no patch step — a vanilla
+    /// clone reuses the source's own display. Without this the result panel rendered the untouched
+    /// <see cref="PatchDeployed"/>=false / empty-message pair as a red, blank "Deploy ✗" row on every
+    /// successful clone, which reads as a half-failed operation.</summary>
+    public bool PatchRequired { get; set; } = true;
     /// <summary>"NotNeeded" / "Deployed" / "Failed" — see <see cref="ItemSetDeployState"/>.</summary>
     public string ServerItemSetState { get; set; } = nameof(ItemSetDeployState.NotNeeded);
     public string ServerItemSetMessage { get; set; } = "";

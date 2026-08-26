@@ -111,7 +111,12 @@
             color: var(--text-muted); font-weight: 600; font-size: 11px; padding: 6px 10px;
             border-bottom: 1px solid var(--border-light); }
         .wf-modal-list td { padding: 5px 10px; color: var(--text-primary); border-bottom: 1px dashed var(--border-light); cursor: pointer; }
-        .wf-modal-list tr:hover td { background: #ffffff0d; }
+        /* Hover wash. Was a flat white alpha, which is invisible on the light theme the site ships;
+           the vanilla lane's list is permanently on-page, so a dead hover state shows there most. */
+        .wf-modal-list tr:hover td { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+        /* Selected source row. The vanilla lane previews on selection, so which row is live has to
+           read at a glance — and it has to read on a LIGHT theme too, which a flat white wash does not. */
+        .wf-modal-list tr.sel td { background: color-mix(in srgb, var(--accent) 18%, transparent); }
         .wf-modal-list td.muted { color: var(--text-muted); }
         .wf-modal-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 10px;
             font-size: 12px; color: var(--text-muted); }
@@ -1104,12 +1109,55 @@
         }
 
         const loader = new GLTFLoader();
-        function loadGlb(url) {
+
+        // One serial for the viewer, and a record of which lane's model is on screen.
+        //
+        // GLTFLoader.load is async and its success callback used to run unconditionally, so a load
+        // started before a deselect (or before a newer selection) still painted itself into the scene
+        // afterwards. That was theoretical while every preview needed a button press; the vanilla lane
+        // fires one on every row click, so it is routine. Both loadGlb and clearViewer bump the serial
+        // and the callbacks drop themselves when it has moved on.
+        //
+        // viewerOwner exists because the viewer is SHARED by four sources (the two import lanes, the
+        // GLB upload, the registry's View button and the vanilla lane). Only the source that put the
+        // model there may take it away.
+        let glbSerial = 0;
+        let viewerOwner = null;
+
+        // Empty the viewer and put the hint back. Extracted from loadGlb's teardown so a DESELECT can
+        // reach it: the vanilla lane previews on selection, and without this a cleared selection left
+        // the previous weapon on screen next to an empty "Selected" box and a greyed Configure button —
+        // the operator reading a stale model as the thing they were about to clone.
+        function clearViewer() {
+            ++glbSerial;                       // invalidate anything still in flight
+            if (current) { scene.remove(current); current = null; }
+            if (fx) { try { fx.dispose(); } catch { } fx = null; }
+            // The glow tint reschedules itself for as long as wfGlow.color is set; without this it kept
+            // writing into the materials of the model that was just removed, pinning it alive.
+            wfGlowWanted = null;
+            wfClearGlow();
+            wfGlow.mats = [];
+            lastGrip = null;
+            drawGripMarkers();
+            viewerOwner = null;
+            hint.style.display = '';
+        }
+
+        // Clear ONLY if the caller is the source whose model is showing. Lets a lane tidy up after
+        // itself without blanking a preview another lane put there.
+        function clearViewerOwnedBy(owner) { if (viewerOwner === owner) clearViewer(); }
+
+        function loadGlb(url, owner) {
             if (!url) return;
+            const serial = ++glbSerial;
             hint.style.display = 'none';
-            loader.load(url + '?t=' + Date.now(), (gltf) => {
+            // The on-demand item-GLB cache stamps its own `?source=` fingerprint onto the path, so the
+            // cache-buster has to join with the right separator or it lands inside that query value.
+            loader.load(url + (url.includes('?') ? '&' : '?') + 't=' + Date.now(), (gltf) => {
+                if (serial !== glbSerial) return;   // a newer load, or a clear, won the race
                 if (current) { scene.remove(current); }
                 if (fx) { try { fx.dispose(); } catch { } fx = null; }
+                viewerOwner = owner || null;
                 const model = gltf.scene;
                 // Keep the authored glTF material (including its sidedness and alpha mode), then
                 // restore the WoW-only blend/static-alpha state encoded in its material name.
@@ -1125,7 +1173,10 @@
                 frameObject(model);
                 drawGripMarkers();
                 wfGlowRefresh(); // re-apply the recolor group's glow tint to the fresh materials
-            }, undefined, (err) => setResult({ title: 'Preview failed', error: String(err) }));
+            }, undefined, (err) => {
+                if (serial !== glbSerial) return;
+                setResult({ title: 'Preview failed', error: String(err) });
+            });
         }
 
         // ---------- live glow/flame tint (Recolor group) ----------
@@ -1299,7 +1350,7 @@
                     ? `Live on the server. Fully restart the client(s), then .additem ${d.itemEntry}. If that entry was cached with older metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`
                     : 'One or more steps require manual action — see the lines above; the downloads contain the files. Then fully restart the client and .additem. If metadata is stale, close WoW and remove WDB\\itemcache.wdb or the whole WDB cache directory.'
             });
-            loadGlb(previewUrl(d));
+            loadGlb(previewUrl(d), 'forged');
             loadWeapons();
         }
 
@@ -1473,13 +1524,29 @@
             ibSetCoins('Buy', src.buyPrice || 0);
             ibSetCoins('Sell', src.sellPrice || 0);
 
-            // allowable_class: -1 (or 0) is "no restriction" and stays all-checked.
-            const bits = [...document.querySelectorAll('[data-mask="class"]')];
-            const mask = src.allowableClass;
-            if (Number.isInteger(mask) && mask > 0) {
+            // allowable_class / allowable_race: -1 (or 0) is "no restriction" and stays all-checked.
+            // Both masks have to be restored, not just class. collectItemConfig submits BOTH on every
+            // clone, so a mask the form never showed came back as "everyone" and silently unlocked a
+            // race- or class-locked weapon.
+            const restoreMask = (kind, mask) => {
+                const bits = [...document.querySelectorAll(`[data-mask="${kind}"]`)];
+                if (!bits.length || !Number.isInteger(mask) || mask <= 0) return;
                 bits.forEach(x => { x.checked = ((mask >> +x.dataset.bit) & 1) === 1; });
-                document.querySelector('[data-mask-all="class"]').checked = bits.every(b => b.checked);
-            }
+                const all = document.querySelector(`[data-mask-all="${kind}"]`);
+                if (all) all.checked = bits.every(b => b.checked);
+            };
+            restoreMask('class', src.allowableClass);
+            restoreMask('race', src.allowableRace);
+
+            // The six gating requirements. Same contract as the masks: the modal always submits them,
+            // so anything not put back here is written to the clone as 0 — a profession-gated,
+            // PvP-rank-gated or reputation-gated weapon loses its gate on the way through.
+            set('ibRequiredSkill', src.requiredSkill || 0);
+            set('ibRequiredSkillRank', src.requiredSkillRank || 0);
+            set('ibRequiredSpell', src.requiredSpell || 0);
+            set('ibRequiredHonorRank', src.requiredHonorRank || 0);
+            set('ibRequiredReputationFaction', src.requiredReputationFaction || 0);
+            set('ibRequiredReputationRank', src.requiredReputationRank || 0);
 
             document.querySelectorAll('#ibStats .wf-stat-row').forEach(r => r.remove());
             for (const s of src.stats || []) addItemStat(s.type, s.value);
@@ -2009,12 +2076,18 @@
                 // Capture the reviewed source and geometry controls before asynchronous spell validation.
                 const mode = itemBuildState.mode;
                 const familyKey = itemBuildState.familyKey;
+                let vanillaSource = null;
                 const fd = new FormData();
                 if (mode === 'vanilla') {
                     // Nothing to package: no file, no mesh controls, no glow or recolor bake. Just
                     // which stock weapon to copy and what the new item should be.
                     if (!VANILLA.sel) throw new Error('The selected vanilla weapon is no longer available.');
-                    fd.append('entry', VANILLA.sel.entry);
+                    // Snapshot it: two awaits follow (spell validation, then the POST) and a debounced
+                    // list repaint queued before the modal opened can null VANILLA.sel mid-flight. The
+                    // success renderer below reads the source name, so without this a clone that
+                    // actually landed reported a TypeError into an already-closed modal.
+                    vanillaSource = VANILLA.sel;
+                    fd.append('entry', vanillaSource.entry);
                 } else if (mode === 'glb') {
                     const file = document.getElementById('glbFile').files[0];
                     if (!file) throw new Error('The selected GLB is no longer available.');
@@ -2067,7 +2140,7 @@
                         kv: {
                             'Item entry': d.itemEntry,
                             'Name': d.name,
-                            'Cloned from': `${VANILLA.sel.name} (${d.sourceEntry})`,
+                            'Cloned from': `${(vanillaSource && vanillaSource.name) || d.sourceEntry} (${d.sourceEntry})`,
                             'Display': `${d.displayId} (source's own — nothing packaged)`,
                             'Slot': d.inventoryTypeLabel || d.inventoryType,
                             'Add in game': `.additem ${d.itemEntry}`,
@@ -2295,7 +2368,7 @@
                     note: [d.grip && d.grip.note, d.note].filter(Boolean).join(' '), error: d.error,
                 });
                 previewedOnce = true;
-                loadGlb(previewUrl(d));
+                loadGlb(previewUrl(d), 'glb');
             },
             async forgeGlb(btn) {
                 const f = document.getElementById('glbFile').files[0];
@@ -2457,7 +2530,7 @@
         // (status probe, paged MPQ browse, mesh preview, triangle budget, glow and recolor bakes).
         // The vanilla lane has none of those — it reads the live world DB and packages nothing — so
         // it gets its own small block rather than a lane object with most fields unused.
-        const VANILLA = { sel: null, searchTimer: null, rows: [] };
+        const VANILLA = { sel: null, searchTimer: null, rows: [], previewSerial: 0, searchSerial: 0, seeded: false, seedInFlight: false };
 
         function vanillaSetSelection(w) {
             VANILLA.sel = w;
@@ -2466,15 +2539,65 @@
                 : '';
             document.getElementById('vanillaCloneBtn').disabled = !w;
             document.querySelectorAll('#vanillaResults tr[data-entry]').forEach(tr =>
-                tr.style.background = (w && +tr.dataset.entry === +w.entry) ? '#ffffff14' : '');
+                tr.classList.toggle('sel', !!(w && +tr.dataset.entry === +w.entry)));
+            if (w) vanillaPreview(w);
+            else { ++VANILLA.previewSerial; clearViewerOwnedBy('vanilla'); }
         }
 
-        function vanillaRenderResults(rows, note) {
+        // Selecting a row previews the source's own display straight away — exactly what selectLane()
+        // does for the import lanes. There is no re-emitted mesh here to differ from the source, so
+        // this preview IS the cloned item: same display, same model, same texture, same enchant glow.
+        // /WeaponForge/VanillaPreview hands back the on-demand item-GLB cache path, which comes out of
+        // the same GlbWriter as every other preview on this page, so loadGlb's blend-suffix, env-map,
+        // m2fx and item-rig passes all apply unchanged.
+        async function vanillaPreview(w) {
+            const serial = ++VANILLA.previewSerial;
+            // Every bail-out below clears the lane's own model. vanillaSetSelection has ALREADY moved
+            // the readout, the Configure button and the row highlight to `w`, so leaving the previous
+            // weapon on screen puts the viewer and the selection in disagreement — which is exactly the
+            // state this preview was added to remove.
+            if (!w || !w.displayId) { clearViewerOwnedBy('vanilla'); return; }
+            lastGrip = null;        // a stock display carries no forge grip payload
+            wfGlowWanted = null;    // and renders its own baked colours, not a lane's live tint
+            try {
+                const d = await (await fetch('/WeaponForge/VanillaPreview?displayId=' + encodeURIComponent(w.displayId))).json();
+                if (serial !== VANILLA.previewSerial) return;   // a newer selection already won
+                // ok:false is an EXPECTED outcome (quivers, ammo pouches, a few off-hand tomes have no
+                // ObjectComponents M2), not just an error path — so it has to empty the viewer too.
+                if (!d.ok) { clearViewerOwnedBy('vanilla'); return setResult({ title: `No preview for ${w.name}`, error: d.error }); }
+                loadGlb(previewUrl(d), 'vanilla');
+                setResult({
+                    title: `Previewing ${w.name}`,
+                    kv: {
+                        'Source item': w.entry,
+                        'Display': `${w.displayId} (the clone keeps it)`,
+                        'Type': w.familyLabel || '—',
+                        'Equip slot': w.inventoryTypeLabel || '—',
+                        'Enchant glow': d.itemVisual ? `ItemVisual ${d.itemVisual}` : 'none',
+                    },
+                    note: 'This is the finished look — a clone packages no art, so nothing about the model changes. "Configure item…" sets the name, quality, damage, stats and effects of the new item.',
+                });
+            } catch (e) {
+                if (serial !== VANILLA.previewSerial) return;
+                clearViewerOwnedBy('vanilla');
+                setResult({ title: 'Preview failed', error: String(e) });
+            }
+        }
+
+        // isError styles the empty state as a failure rather than "nothing matched" — a dead world DB
+        // used to read as "No vanilla weapons matched.", the same sentence as a bad search term.
+        function vanillaRenderResults(rows, note, isError) {
             const host = document.getElementById('vanillaResults');
+            // Remember the picked entry across a re-render. The list repaints on every (debounced)
+            // keystroke and on every family change, and clearing the selection unconditionally meant
+            // one more character after picking a weapon silently greyed out Configure — and now that
+            // selection drives the preview, emptied the viewer with it.
+            const keep = VANILLA.sel && VANILLA.sel.entry;
             VANILLA.rows = rows || [];
-            vanillaSetSelection(null);
             if (!VANILLA.rows.length) {
-                host.innerHTML = `<div style="padding:14px;color:var(--text-muted);font-size:12px;">${esc(note || 'No vanilla weapons matched.')}</div>`;
+                if (keep) vanillaClearSelection();
+                const colour = isError ? '#b42318' : 'var(--text-muted)';
+                host.innerHTML = `<div style="padding:14px;color:${colour};font-size:12px;">${esc(note || 'No vanilla weapons matched.')}</div>`;
                 return;
             }
             let html = '<table><tr><th>Name</th><th>ilvl</th><th>Family</th><th>Slot</th><th>DPS</th><th>ID</th></tr>';
@@ -2494,10 +2617,36 @@
             host.innerHTML = html + '</table>';
             host.querySelectorAll('tr[data-entry]').forEach(tr => tr.addEventListener('click', () =>
                 vanillaSetSelection(VANILLA.rows.find(x => +x.entry === +tr.dataset.entry) || null)));
+            // Re-assert the previous pick AFTER the rows exist, so the highlight lands on live nodes.
+            // Done silently: it is the same weapon already in the viewer, so it needs no re-preview.
+            const survivor = keep ? VANILLA.rows.find(x => +x.entry === +keep) : null;
+            if (survivor) {
+                VANILLA.sel = survivor;
+                host.querySelectorAll('tr[data-entry]').forEach(tr =>
+                    tr.classList.toggle('sel', +tr.dataset.entry === +survivor.entry));
+            } else if (keep) {
+                vanillaClearSelection();
+            }
+        }
+
+        // Drop the selection and everything downstream of it: the readout, the Configure button and
+        // the viewer (which would otherwise keep showing a weapon that is no longer in the list).
+        function vanillaClearSelection() {
+            VANILLA.sel = null;
+            document.getElementById('vanillaSelected').value = '';
+            document.getElementById('vanillaCloneBtn').disabled = true;
+            ++VANILLA.previewSerial;
+            // Ownership, not merely "this lane had a selection": the operator may have previewed a TBC
+            // weapon since, and an empty vanilla search must not blank that.
+            clearViewerOwnedBy('vanilla');
         }
 
         async function vanillaSearch() {
             const host = document.getElementById('vanillaResults');
+            // Request serial, the same guard previewSerial gives the preview: the 350 ms debounce
+            // coalesces keystrokes but cannot cancel a request already in flight, so a slow "thunder"
+            // resolving after a fast "thunderfury" repainted the older, wider list over the newer one.
+            const serial = ++VANILLA.searchSerial;
             const q = new URLSearchParams({
                 search: document.getElementById('vanillaSearch').value.trim(),
                 family: document.getElementById('vanillaFamily').value || '',
@@ -2505,12 +2654,52 @@
             });
             host.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:12px;">Searching…</div>';
             try {
-                const d = await (await fetch('/WeaponForge/VanillaWeapons?' + q)).json();
-                if (!d.ok) return vanillaRenderResults([], d.error || 'Vanilla browse failed.');
+                const response = await fetch('/WeaponForge/VanillaWeapons?' + q);
+                const d = await response.json().catch(() => null);
+                if (serial !== VANILLA.searchSerial) return;
+                if (!response.ok || !d || !d.ok) {
+                    const msg = (d && d.error) || `Vanilla browse failed (HTTP ${response.status}).`;
+                    vanillaRenderResults([], msg, true);
+                    return vanillaSetState(null, msg);
+                }
+                VANILLA.seeded = true;   // a real payload arrived; the lazy seed is done
                 vanillaRenderResults(d.weapons || [], 'No vanilla weapons matched.');
+                vanillaSetState(d);
             } catch (e) {
-                vanillaRenderResults([], 'Vanilla browse failed: ' + e);
+                if (serial !== VANILLA.searchSerial) return;
+                vanillaRenderResults([], 'Vanilla browse failed: ' + e, true);
+                vanillaSetState(null, String(e));
             }
+        }
+
+        // #vanillaState was a dead id nothing ever wrote — the card's static blurb sat there whether the
+        // world DB answered or not. Give it the lane's real state, as the import lanes' status lines do
+        // for their archives.
+        function vanillaSetState(d, error) {
+            const el = document.getElementById('vanillaState');
+            if (!el) return;
+            if (error || !d) {
+                el.textContent = 'The vanilla clone lane reads the live world database, which is not answering: ' + (error || 'unknown error');
+                el.style.color = '#b42318';
+                return;
+            }
+            el.style.color = '';
+            el.textContent = (d.total || 0).toLocaleString() + ' stock weapon(s) and shield(s) match. A clone reuses the '
+                + 'source\u2019s own display \u2014 model, texture, icon, sheath, grip and sound are already in your client '
+                + '\u2014 so nothing is packaged: no patch, no download, no client restart. Usable via .additem as soon as '
+                + 'the core reloads.';
+        }
+
+        // Seeded on FIRST USE, not at page load: this is a live world-DB query and the card ships
+        // collapsed, so a bootstrap call would hit MySQL for a card nobody opened. Without it the list
+        // sat on "Search to browse vanilla weapons." until something was typed.
+        function seedVanillaLane() {
+            // VANILLA.seeded is set by vanillaSearch only on a SUCCESSFUL payload, so a first open that
+            // hits a dead world DB can be retried simply by closing and reopening the card. inFlight
+            // stops the focus and header-click triggers from firing two browses at once.
+            if (VANILLA.seeded || VANILLA.seedInFlight) return;
+            VANILLA.seedInFlight = true;
+            vanillaSearch().finally(() => { VANILLA.seedInFlight = false; });
         }
 
         // The family filter lists only the families the catalog knows. A clone needs no donor
@@ -2526,6 +2715,7 @@
             clearTimeout(VANILLA.searchTimer);
             VANILLA.searchTimer = setTimeout(vanillaSearch, 350);
         });
+        document.getElementById('vanillaSearch').addEventListener('focus', seedVanillaLane);
         document.getElementById('vanillaFamily').addEventListener('change', vanillaSearch);
         const seedVanillaFamilies = setInterval(() => {
             if (weaponTypeMeta.size) { clearInterval(seedVanillaFamilies); vanillaFillFamilies(); }
@@ -2725,7 +2915,7 @@
                 } : undefined,
                 diagnostics: d.diagnostics, note: d.grip && d.grip.note, error: d.error,
             });
-            loadGlb(previewUrl(d));
+            loadGlb(previewUrl(d), lane.key);
         }
 
         function laneForge(lane) {
@@ -2765,7 +2955,7 @@
                 if (!d.ok) return setResult({ title: 'Could not load weapon', error: d.error });
                 lastGrip = null; // stored-bytes view has no grip payload
                 wfGlowWanted = null; // a stored weapon shows its own baked colours, not the lane's live tint
-                loadGlb(previewUrl(d));
+                loadGlb(previewUrl(d), 'forged');
                 setResult({ title: `Viewing ${name}`, kv: { 'Display': id, 'Texture': d.hasTexture ? 'yes' : 'no' },
                     note: 'Rendered from the stored M2+BLP in the registry.' });
             } catch (e) { setResult({ title: 'Load failed', error: String(e) }); }
@@ -2848,6 +3038,16 @@
                 card.classList.toggle('collapsed');
             });
         });
+
+        // Seed the vanilla lane when its card is first opened. Registered AFTER the toggler above so
+        // this handler sees the state the click just produced, and after `collapsed` has been applied
+        // so nothing queries the world DB for a card that is still folded.
+        (function () {
+            const card = document.getElementById('vanillaSearch').closest('.wf-card');
+            if (!card) return;
+            const h3 = card.querySelector(':scope > h3');
+            if (h3) h3.addEventListener('click', () => { if (!card.classList.contains('collapsed')) seedVanillaLane(); });
+        })();
 
         initViewer();
         loadStatus();
