@@ -624,6 +624,8 @@ public class BotBrainService : BackgroundService
         _quirkLoader.Load();
 
         // Circuit-board trace toggle state (mode + armed guids) from bot_settings.
+        // Bridge attach lets Arm/Disarm/Mode forward CIRCUIT_TRACE to the C++ side (R6).
+        _circuit.AttachBridge(_bridge.SendToBotAsync, _bridge.SendToAllBotsAsync);
         await _circuit.LoadSettingsAsync();
 
         // Groups + grouping mode from DB.

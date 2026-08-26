@@ -223,6 +223,60 @@ public static class CircuitTrace
     /// <summary>Bots currently holding trace rings (for status display).</summary>
     public static int RingCount => _rings.Count;
 
+    // ── chains (R2) + the C++ side's remote sites / segments (R1, R3) ──────
+    // Chain ids stamp every outbound bridge envelope ("cbt"); both sides record
+    // the id as a probe VALUE ("chain: command sent" here, "cpp-chain: command
+    // adopted" over there), so the viewer stitches cause to effect by value.
+    private static long _chain;
+    public static long NextChain() => Interlocked.Increment(ref _chain);
+
+    // Remote (C++) probe sites live in their own id space (rule R3): shifted by
+    // RemoteSiteBase so they can never collide with local session ids.
+    public const int RemoteSiteBase = 100000;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, ProbeSite> _remoteSites = new();
+
+    public static void RegisterRemoteSite(int remoteId, string file, int line, string desc)
+    {
+        var site = new ProbeSite(RemoteSiteBase + remoteId, "cpp/" + file, line, desc);
+        if (!_remoteSites.TryAdd(remoteId, site)) return;   // idempotent across re-ships
+        lock (_siteList)
+        {
+            if (!_siteListIds.Contains(site.Id)) { _siteList.Add(site); _siteListIds.Add(site.Id); }
+        }
+    }
+
+    /// <summary>Merge one C++ CIRCUIT_BATCH into the bot's timeline as a sealed
+    /// "cpp" segment (position-stamped per R10). Hits get fresh global seqs at
+    /// arrival — ordering across the two sides is by arrival, which the 1s ship
+    /// cadence makes honest enough until chains take over.</summary>
+    public static void IngestRemoteSegment(int guid, int mapId, int zoneId, float x, float y, float z,
+        List<(int RemoteId, double? Value, string? Note)> hits, int drops)
+    {
+        if (_mode == (int)TraceMode.Off) return;
+        var seg = new TickSegment
+        {
+            Guid = guid,
+            Kind = drops > 0 ? "cpp-drops" : "cpp",
+            StartUtc = DateTime.UtcNow,
+            EndUtc = DateTime.UtcNow,
+            HasPos = true,
+            MapId = mapId,
+            ZoneId = zoneId,
+            X = x, Y = y, Z = z,
+        };
+        foreach (var h in hits)
+            seg.Hits.Add(new ProbeHit(RemoteSiteBase + h.RemoteId, Interlocked.Increment(ref _seq), h.Note, h.Value));
+
+        var ring = _rings.GetOrAdd(guid, static _ => new BotRing());
+        lock (ring.Lock)
+        {
+            ring.Sealed.Enqueue(seg);
+            while (ring.Sealed.Count > SegmentRingCap) { ring.Sealed.Dequeue(); ring.Dropped++; }
+            ring.Recent.Enqueue(seg);
+            while (ring.Recent.Count > RecentViewCap) ring.Recent.Dequeue();
+        }
+    }
+
     // ── wedge auto-dump requests (R8) ───────────────────────────────────────
     // Any code (the wedge breaker) may request that a bot's whole ring be flushed
     // to disk even though the bot was never armed. The host drains this queue.

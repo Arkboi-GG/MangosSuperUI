@@ -345,6 +345,20 @@ public class QuestCommandPayload
     public int QuestId { get; set; }
 }
 
+// QUEST_INTERACT payload — same shape the planners send via BridgeCommand
+// (BridgeHandleQuestInteract requires all three fields, npc_entry within 15yd).
+public class QuestInteractPayload
+{
+    [JsonPropertyName("action")]
+    public string Action { get; set; } = ""; // "accept" | "complete"
+
+    [JsonPropertyName("quest_id")]
+    public int QuestId { get; set; }
+
+    [JsonPropertyName("npc_entry")]
+    public int NpcEntry { get; set; }
+}
+
 public class LearnSpellPayload
 {
     [JsonPropertyName("spell_id")]
@@ -818,6 +832,40 @@ public class BotBridgeService : BackgroundService
                 await HandleEventAsync(msg.Payload, conn);
                 break;
 
+            case "CIRCUIT_SITE":   // cb:fold instrument plumbing, not bot routing
+                {
+                    var p = msg.Payload;
+                    CircuitTrace.RegisterRemoteSite(
+                        p.GetProperty("id").GetInt32(),
+                        p.GetProperty("file").GetString() ?? "?",
+                        p.GetProperty("line").GetInt32(),
+                        p.GetProperty("desc").GetString() ?? "?");
+                    break;
+                }
+
+            case "CIRCUIT_BATCH":   // cb:fold instrument plumbing, not bot routing
+                {
+                    var p = msg.Payload;
+                    var hits = new List<(int, double?, string?)>();
+                    foreach (var h in p.GetProperty("h").EnumerateArray())
+                    {
+                        int id = h[0].GetInt32();
+                        double? val = h.GetArrayLength() > 1 && h[1].ValueKind == System.Text.Json.JsonValueKind.Number ? h[1].GetDouble() : null;
+                        string? note = h.GetArrayLength() > 2 && h[2].ValueKind == System.Text.Json.JsonValueKind.String ? h[2].GetString() : null;
+                        hits.Add((id, val, note));
+                    }
+                    CircuitTrace.IngestRemoteSegment(
+                        p.GetProperty("guid").GetInt32(),
+                        p.GetProperty("map").GetInt32(),
+                        p.GetProperty("zone").GetInt32(),
+                        p.GetProperty("x").GetSingle(),
+                        p.GetProperty("y").GetSingle(),
+                        p.GetProperty("z").GetSingle(),
+                        hits,
+                        p.TryGetProperty("drops", out var dr) ? dr.GetInt32() : 0);
+                    break;
+                }
+
             default:
                 CircuitTrace.HitNote(conn.Guid, "bridge: unknown message type", msg.Type);
                 _logger.LogWarning("BotBridge: unknown message type '{Type}' from bot {Guid}", msg.Type, conn.Guid);
@@ -895,6 +943,15 @@ public class BotBridgeService : BackgroundService
         {
             CircuitTrace.Hit(conn.Guid, "bridge: raid-plan re-push queued");
             _ = _raidPlans.OnBotHelloAsync(hello.Guid, hello.Name);
+        }
+
+        // [CIRCUIT] Push the current recording state to the freshly-connected C++ side
+        // (R6 — one switch arms both probes; a reconnect must re-learn mode + ship).
+        if (CircuitTrace.Mode != CircuitTrace.TraceMode.Off)
+        {
+            CircuitTrace.Hit(conn.Guid, "bridge: circuit state pushed on hello");
+            _ = SendToBotAsync(hello.Guid, "CIRCUIT_TRACE",
+                new { mode = 1, ship = CircuitTrace.IsArmed(hello.Guid) ? 1 : 0 });
         }
     }
 
@@ -1459,7 +1516,9 @@ public class BotBridgeService : BackgroundService
                 throw new BotNotConnectedException(guid);
             }
 
-            var envelope = new { type, payload };
+            long cbt = CircuitTrace.NextChain();   // [CIRCUIT] chain id (R2) — C++ echoes it as a probe value
+            CircuitTrace.Hit(guid, "chain: command sent", cbt);
+            var envelope = new { type, payload, cbt };
             byte[] bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOpts) + "\n");
             await expectedConnection.Stream.WriteAsync(bytes, cancellationToken);
             await expectedConnection.Stream.FlushAsync(cancellationToken);
@@ -1567,7 +1626,9 @@ public class BotBridgeService : BackgroundService
         object payload,
         CancellationToken cancellationToken)
     {
-        var envelope = new { type, payload };
+        long cbt = CircuitTrace.NextChain();   // [CIRCUIT] chain id (R2) — C++ echoes it as a probe value
+        CircuitTrace.Hit(conn.Guid, "chain: command sent", cbt);
+        var envelope = new { type, payload, cbt };
         byte[] bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope, JsonOpts) + "\n");
 
         await conn.SendGate.WaitAsync(cancellationToken);
@@ -1616,14 +1677,18 @@ public class BotBridgeService : BackgroundService
 
     // --- Phase 2.5 commands ---
 
-    public Task SendAcceptQuestAsync(int guid, int questId)
+    // Manual accept/complete ride the same QUEST_INTERACT verb the planners use — the retired
+    // v2 ACCEPT_QUEST/COMPLETE_QUEST verbs have no C++ dispatch anymore. C++ requires the named
+    // npc_entry alive within 15yd of the bot; callers resolve it from the quest graph and a miss
+    // comes back as a QUEST_INTERACT_FAIL event, not a silent drop.
+    public Task SendAcceptQuestAsync(int guid, int questId, int npcEntry)
     {
-        return SendToBotAsync(guid, "ACCEPT_QUEST", new QuestCommandPayload { QuestId = questId });
+        return SendToBotAsync(guid, "QUEST_INTERACT", new QuestInteractPayload { Action = "accept", QuestId = questId, NpcEntry = npcEntry });
     }
 
-    public Task SendCompleteQuestAsync(int guid, int questId)
+    public Task SendCompleteQuestAsync(int guid, int questId, int npcEntry)
     {
-        return SendToBotAsync(guid, "COMPLETE_QUEST", new QuestCommandPayload { QuestId = questId });
+        return SendToBotAsync(guid, "QUEST_INTERACT", new QuestInteractPayload { Action = "complete", QuestId = questId, NpcEntry = npcEntry });
     }
 
     public Task SendAbandonQuestAsync(int guid, int questId)

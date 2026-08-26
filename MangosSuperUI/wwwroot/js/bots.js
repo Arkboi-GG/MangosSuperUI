@@ -5489,8 +5489,8 @@ $(function () {
         if (!qid) { showToast('Quest id required', true); return; }
         bcSend(url, function (g) { return { guid: g, questId: qid }; }, verb);
     }
-    $(document).on('click', '#bcQAccept', function () { bcQuest('/Bots/AcceptQuest', 'ACCEPT_QUEST'); });
-    $(document).on('click', '#bcQComplete', function () { bcQuest('/Bots/CompleteQuest', 'COMPLETE_QUEST'); });
+    $(document).on('click', '#bcQAccept', function () { bcQuest('/Bots/AcceptQuest', 'QUEST_INTERACT accept'); });
+    $(document).on('click', '#bcQComplete', function () { bcQuest('/Bots/CompleteQuest', 'QUEST_INTERACT complete'); });
     $(document).on('click', '#bcQAbandon', function () { bcQuest('/Bots/AbandonQuest', 'ABANDON_QUEST'); });
 
     $(document).on('click', '#bcLearn', function () {

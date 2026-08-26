@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Hosting;
 using MangosSuperUI.Services;
 using MangosSuperUI.Models;
+using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Tracking;
 using Dapper;
 using System.Text.RegularExpressions;
@@ -21,6 +22,7 @@ public partial class BotsController : Controller
     private readonly BotSpellbookVisibilityService _spellbook;
     private readonly BotCombatLoadoutService _combatLoadouts;
     private readonly BotCombatLoadoutQueueService _combatLoadoutQueue;
+    private readonly QuestGraphLoader _questGraph;
 
     public BotsController(
         BotBridgeService bridge,
@@ -33,7 +35,8 @@ public partial class BotsController : Controller
         BotTalentVisibilityService talents,
         BotSpellbookVisibilityService spellbook,
         BotCombatLoadoutService combatLoadouts,
-        BotCombatLoadoutQueueService combatLoadoutQueue)
+        BotCombatLoadoutQueueService combatLoadoutQueue,
+        QuestGraphLoader questGraph)
     {
         _bridge = bridge;
         _brain = brain;
@@ -46,6 +49,7 @@ public partial class BotsController : Controller
         _spellbook = spellbook;
         _combatLoadouts = combatLoadouts;
         _combatLoadoutQueue = combatLoadoutQueue;
+        _questGraph = questGraph;
     }
 
     public IActionResult Index()
@@ -447,18 +451,28 @@ public partial class BotsController : Controller
 
     // --- Phase 2.5 REST endpoints ---
 
+    // Manual accept/complete send QUEST_INTERACT (the only quest verb C++ still dispatches),
+    // which needs the giver/turn-in npc_entry alive within 15yd of the bot. We resolve the
+    // entry from the quest graph and refuse up front when it has no answer; a bot standing
+    // too far away is C++'s call and comes back as a QUEST_INTERACT_FAIL event.
     [HttpPost]
     public async Task<IActionResult> AcceptQuest([FromBody] QuestRequest req)
     {
-        await _bridge.SendAcceptQuestAsync(req.Guid, req.QuestId);
-        return Json(new { success = true, command = "ACCEPT_QUEST", req.Guid, req.QuestId });
+        var npcEntry = _questGraph.ResolveInteractNpc(req.QuestId, "accept", out var error);
+        if (npcEntry == null)
+            return Json(new { success = false, error });
+        await _bridge.SendAcceptQuestAsync(req.Guid, req.QuestId, npcEntry.Value);
+        return Json(new { success = true, command = "QUEST_INTERACT", action = "accept", req.Guid, req.QuestId, npcEntry });
     }
 
     [HttpPost]
     public async Task<IActionResult> CompleteQuest([FromBody] QuestRequest req)
     {
-        await _bridge.SendCompleteQuestAsync(req.Guid, req.QuestId);
-        return Json(new { success = true, command = "COMPLETE_QUEST", req.Guid, req.QuestId });
+        var npcEntry = _questGraph.ResolveInteractNpc(req.QuestId, "complete", out var error);
+        if (npcEntry == null)
+            return Json(new { success = false, error });
+        await _bridge.SendCompleteQuestAsync(req.Guid, req.QuestId, npcEntry.Value);
+        return Json(new { success = true, command = "QUEST_INTERACT", action = "complete", req.Guid, req.QuestId, npcEntry });
     }
 
     [HttpPost]

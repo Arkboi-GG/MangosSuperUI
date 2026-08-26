@@ -1,4 +1,14 @@
-# BotBridge Wire Protocol — v2
+# BotBridge Wire Protocol — v3
+
+> **v3 (2026-08-26, circuit board):** every C#→C++ envelope now carries a third
+> top-level field `"cbt"` (monotonic chain id, CIRCUIT_BOARD.md R2); C++ records
+> it as a probe value so traces stitch cause→effect across the boundary. New
+> messages: **CIRCUIT_TRACE** (C#→C++, `{"mode":0|1,"ship":0|1}` — global probe
+> mode + per-bot ship-to-disk flag; pushed on HELLO and on every toggle) and
+> **CIRCUIT_SITE** / **CIRCUIT_BATCH** (C++→C#, the probe-site manifest and the
+> 1 Hz position-stamped hit batches). Handled in AiBotCircuit.h/.cpp +
+> BridgeHandleCircuitTrace on the C++ side, BotBridgeService's CIRCUIT_* cases
+> on the C# side. Older binaries ignore `cbt` (flat key scan) — compatible.
 
 **Transport:** TCP on `127.0.0.1:3444`  
 **Encoding:** UTF-8, newline-delimited JSON (one JSON object per `\n`)  
@@ -463,37 +473,32 @@ Keepalive — no-op on C++ side.
 
 ### Phase 2.5 — Implemented, Testing In Progress
 
-#### ACCEPT_QUEST
+#### QUEST_INTERACT
+
+Accept or turn in a quest at a nearby NPC. This is the ONLY live accept/complete verb —
+the v2 `ACCEPT_QUEST` / `COMPLETE_QUEST` verbs were retired from the C++ dispatch, and the
+manual-quest endpoints (BotsController / hub) now send this too, resolving `npc_entry` from
+the quest graph (giver for accept, turn-in for complete) before sending.
 
 ```json
 {
-  "type": "ACCEPT_QUEST",
-  "payload": { "quest_id": 6 }
+  "type": "QUEST_INTERACT",
+  "payload": { "action": "accept", "quest_id": 6, "npc_entry": 823 }
 }
 ```
 
-**C++ behavior:**
-- Validates `CanTakeQuest()` + `CanAddQuest()`
-- Calls `me->AddQuest(pQuest, nullptr)`
-- Auto-calls `CompleteQuest()` if objectives already satisfied
-- Fires `QUEST_UPDATE` with status `"accepted"` on success
-- Fires `QUEST_FAILED` with reason on failure
+**Payload:** `action` is `"accept"` or `"complete"`; all three fields are required —
+`BridgeHandleQuestInteract` drops the command (log only) if any is missing.
 
-#### COMPLETE_QUEST
-
-```json
-{
-  "type": "COMPLETE_QUEST",
-  "payload": { "quest_id": 6 }
-}
-```
-
-**C++ behavior:**
-- Validates quest is in log (`GetQuestStatus != QUEST_STATUS_NONE`)
-- Calls `me->FullQuestComplete(questId)` — awards items, XP, reputation, money
-- Fires `QUEST_UPDATE` with status `"rewarded"`
-
-> **Note:** `FullQuestComplete` does NOT require proximity to the quest giver. This is by design for bot automation.
+**C++ behavior (`BridgeHandleQuestInteract`):**
+- Finds the named `npc_entry` alive within **15yd** of the bot; else fires
+  `QUEST_INTERACT_FAIL` with `npc_not_found`
+- Unknown quest id fires `QUEST_INTERACT_FAIL` with `quest_not_found`
+- `accept`: refuses an already-rewarded quest (`already_rewarded`); a quest already in the
+  log gets an idempotent `QUEST_ACCEPT_ACK`; else validates `CanTakeQuest()` +
+  `CanAddQuest()` (each failure fires `QUEST_INTERACT_FAIL` with a reason) and adds the quest
+- `complete`: validates the quest is in the log and `CanRewardQuest()` passes (else
+  `QUEST_INTERACT_FAIL`), then rewards it
 
 #### ABANDON_QUEST
 

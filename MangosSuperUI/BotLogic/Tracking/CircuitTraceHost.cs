@@ -32,6 +32,11 @@ public sealed class CircuitTraceHost
     private readonly ConnectionFactory _db;
     private readonly ILogger _log;
 
+    // [CIRCUIT Phase 3] toggles forward to the C++ side over the bridge (R6 — one
+    // switch arms both probes). Late-set by BotBrainService to avoid ctor cycles.
+    private Func<int, string, object, Task>? _sendToBot;
+    private Func<string, object, Task>? _sendToAll;
+
     private StreamWriter? _writer;
     private string _writerDate = "";
     private int _siteWatermark;
@@ -43,6 +48,12 @@ public sealed class CircuitTraceHost
         _log = log;
         try { Directory.CreateDirectory(TRACE_DIR); }
         catch (Exception ex) { _log.LogWarning(ex, "[CIRCUIT] cannot create trace dir {Dir} — flush disabled until it exists", TRACE_DIR); }
+    }
+
+    public void AttachBridge(Func<int, string, object, Task> sendToBot, Func<string, object, Task> sendToAll)
+    {
+        _sendToBot = sendToBot;
+        _sendToAll = sendToAll;
     }
 
     // ── settings ────────────────────────────────────────────────────────────
@@ -80,6 +91,8 @@ public sealed class CircuitTraceHost
     {
         CircuitTrace.Mode = mode;
         await SaveSettingAsync(KEY_MODE, mode == CircuitTrace.TraceMode.Shadow ? "shadow" : "off");
+        if (_sendToAll != null)
+            await _sendToAll("CIRCUIT_TRACE", new { mode = mode == CircuitTrace.TraceMode.Shadow ? 1 : 0 });
         _log.LogInformation("[CIRCUIT] mode set to {Mode}", mode);
     }
 
@@ -87,6 +100,8 @@ public sealed class CircuitTraceHost
     {
         CircuitTrace.Arm(guid);
         await SaveSettingAsync(KEY_GUIDS, string.Join(",", CircuitTrace.ArmedGuids()));
+        if (_sendToBot != null)
+            await _sendToBot(guid, "CIRCUIT_TRACE", new { mode = CircuitTrace.Mode == CircuitTrace.TraceMode.Shadow ? 1 : 0, ship = 1 });
         _log.LogInformation("[CIRCUIT] armed bot {Guid}", guid);
     }
 
@@ -96,6 +111,8 @@ public sealed class CircuitTraceHost
         // Flush whatever the bot recorded up to the disarm so the tail isn't lost.
         FlushSegments(CircuitTrace.DrainSealed(guid));
         await SaveSettingAsync(KEY_GUIDS, string.Join(",", CircuitTrace.ArmedGuids()));
+        if (_sendToBot != null)
+            await _sendToBot(guid, "CIRCUIT_TRACE", new { ship = 0 });
         _log.LogInformation("[CIRCUIT] disarmed bot {Guid}", guid);
     }
 

@@ -54,6 +54,40 @@ public class QuestGraphLoader
         _quests.TryGetValue(questId, out var q) ? q : null;
 
     /// <summary>
+    /// Resolve the NPC entry a QUEST_INTERACT must name: the quest's starter for "accept",
+    /// its ender for "complete". C++ (BridgeHandleQuestInteract) refuses any payload without
+    /// npc_entry and needs that NPC alive within 15yd of the bot, so a caller with only a
+    /// quest id (the operator manual-quest panel) resolves here first. Returns null with a
+    /// reason when the graph can't answer — item/GO-started quests have no starter NPC, and
+    /// callers surface the reason to the UI instead of sending a command C++ will reject.
+    /// </summary>
+    public int? ResolveInteractNpc(int questId, string action, out string? error)
+    {
+        error = null;
+        if (!_loaded)
+        {
+            error = "quest graph not loaded";
+            return null;
+        }
+        var quest = GetQuest(questId);
+        if (quest == null)
+        {
+            error = $"quest {questId} not in quest graph";
+            return null;
+        }
+
+        var npc = action == "accept" ? quest.Giver : quest.TurnIn;
+        if (npc == null)
+        {
+            error = action == "accept"
+                ? $"quest {questId} \"{quest.Title}\" has no known NPC quest giver (item- or object-started?)"
+                : $"quest {questId} \"{quest.Title}\" has no known NPC turn-in";
+            return null;
+        }
+        return npc.NpcEntry;
+    }
+
+    /// <summary>
     /// Get all quests a bot can currently accept given their race, class, level,
     /// and set of completed quest IDs. Respects PrevQuests chains (including
     /// reverse NextQuestId edges), ExclusiveGroup, race/class masks, and MinLevel.

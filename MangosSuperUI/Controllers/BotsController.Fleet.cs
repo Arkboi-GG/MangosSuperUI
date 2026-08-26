@@ -54,7 +54,7 @@ public partial class BotsController
     private static readonly Regex _fvWhy = new(@"\bwhy=([A-Za-z0-9_\-:]+)", RegexOptions.Compiled);
     private static readonly Regex _fvReason = new(@"\breason=([A-Za-z0-9_\-]+)", RegexOptions.Compiled);
     private static readonly Regex _fvGoal = new(@"\bGoal=([A-Za-z]+)", RegexOptions.Compiled);
-    private static readonly Regex _fvCmd = new(@"\b(MOVE_TO|MOVE_FAILED|SET_TASK(?:[ _]\w+)?|INTERACT_NPC|ATTACK_TARGET|ACCEPT_QUEST|COMPLETE_QUEST|ABANDON_QUEST|LEARN_SPELL|TAKE_FLIGHT|GRAVEYARD_PORT|HEARTH|GRIND)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex _fvCmd = new(@"\b(MOVE_TO|MOVE_FAILED|SET_TASK(?:[ _]\w+)?|INTERACT_NPC|ATTACK_TARGET|QUEST_INTERACT|ABANDON_QUEST|LEARN_SPELL|TAKE_FLIGHT|GRAVEYARD_PORT|HEARTH|GRIND)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex _fvTarget = new(@"\b(?:creature_entry|c_entry|creature_guid|entry|guid)\s*[=:]\s*\d+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex _fvFleet = new(@"\bFLEET\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 

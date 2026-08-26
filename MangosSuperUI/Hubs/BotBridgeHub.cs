@@ -1,5 +1,7 @@
 using Microsoft.AspNetCore.SignalR;
 using MangosSuperUI.Services;
+using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.Hubs;
 
@@ -22,11 +24,13 @@ namespace MangosSuperUI.Hubs;
 public class BotBridgeHub : Hub
 {
     private readonly BotBridgeService _bridge;
+    private readonly QuestGraphLoader _questGraph;
     private readonly ILogger<BotBridgeHub> _logger;
 
-    public BotBridgeHub(BotBridgeService bridge, ILogger<BotBridgeHub> logger)
+    public BotBridgeHub(BotBridgeService bridge, QuestGraphLoader questGraph, ILogger<BotBridgeHub> logger)
     {
         _bridge = bridge;
+        _questGraph = questGraph;
         _logger = logger;
     }
 
@@ -73,18 +77,35 @@ public class BotBridgeHub : Hub
 
     // --- Phase 2.5 commands ---
 
+    // Manual accept/complete send QUEST_INTERACT (the retired ACCEPT_QUEST/COMPLETE_QUEST verbs
+    // have no C++ dispatch); the giver/turn-in npc_entry is resolved from the quest graph and an
+    // unresolvable quest is refused in the ack instead of sent into the void.
     public async Task SendAcceptQuest(int guid, int questId)
     {
-        _logger.LogInformation("BotBridgeHub: ACCEPT_QUEST bot {Guid} quest={QuestId}", guid, questId);
-        await _bridge.SendAcceptQuestAsync(guid, questId);
-        await Clients.Caller.SendAsync("CommandAck", new { guid, command = "ACCEPT_QUEST", questId, success = true });
+        _logger.LogInformation("BotBridgeHub: QUEST_INTERACT accept bot {Guid} quest={QuestId}", guid, questId);
+        var npcEntry = _questGraph.ResolveInteractNpc(questId, "accept", out var error);
+        if (npcEntry == null)
+        {
+            CircuitTrace.HitNote(guid, "hub: manual quest accept unresolvable", error ?? "");
+            await Clients.Caller.SendAsync("CommandAck", new { guid, command = "QUEST_INTERACT", questId, success = false, error });
+            return;
+        }
+        await _bridge.SendAcceptQuestAsync(guid, questId, npcEntry.Value);
+        await Clients.Caller.SendAsync("CommandAck", new { guid, command = "QUEST_INTERACT", questId, success = true });
     }
 
     public async Task SendCompleteQuest(int guid, int questId)
     {
-        _logger.LogInformation("BotBridgeHub: COMPLETE_QUEST bot {Guid} quest={QuestId}", guid, questId);
-        await _bridge.SendCompleteQuestAsync(guid, questId);
-        await Clients.Caller.SendAsync("CommandAck", new { guid, command = "COMPLETE_QUEST", questId, success = true });
+        _logger.LogInformation("BotBridgeHub: QUEST_INTERACT complete bot {Guid} quest={QuestId}", guid, questId);
+        var npcEntry = _questGraph.ResolveInteractNpc(questId, "complete", out var error);
+        if (npcEntry == null)
+        {
+            CircuitTrace.HitNote(guid, "hub: manual quest complete unresolvable", error ?? "");
+            await Clients.Caller.SendAsync("CommandAck", new { guid, command = "QUEST_INTERACT", questId, success = false, error });
+            return;
+        }
+        await _bridge.SendCompleteQuestAsync(guid, questId, npcEntry.Value);
+        await Clients.Caller.SendAsync("CommandAck", new { guid, command = "QUEST_INTERACT", questId, success = true });
     }
 
     public async Task SendAbandonQuest(int guid, int questId)

@@ -45,7 +45,8 @@ $(function () {
     var userAdjusted = false;
 
     // Pipeline order — the mermaid reading, top to bottom.
-    var LANE_ORDER = ['bridge', 'host', 'event', 'tick', 'quarantine', 'stuck-still', 'island', 'wedge',
+    var LANE_ORDER = ['bridge', 'chain', 'cpp-chain', 'cpp-bridge', 'cpp-move', 'cpp-task', 'cpp-grind',
+        'cpp-combat', 'cpp-quest', 'host', 'event', 'tick', 'quarantine', 'stuck-still', 'island', 'wedge',
         'reconcile', 'goal', 'goal-change', 'grind', 'grind-relocate', 'grind-hub', 'quest', 'train',
         'maint', 'errand', 'escape-bands', 'group', 'groupmgr', 'plan', 'dispatch', 'stall', 'issue',
         'fire', 'negate', 'supervisor', 'spawn', 'chat', 'loadout', 'rotation', 'raidplan',
