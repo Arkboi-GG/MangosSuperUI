@@ -163,9 +163,7 @@ public sealed class CircuitTraceHost
             {
                 var segs = CircuitTrace.DrainSealed(dump.Guid);
                 if (segs.Count == 0) continue;
-                WriteLine(JsonSerializer.Serialize(new { k = "dump", g = dump.Guid, reason = dump.Reason, segs = segs.Count }));
-                FlushSegments(segs);
-                _log.LogWarning("[CIRCUIT] auto-dump for bot {Guid} ({Reason}): {Count} segments flushed", dump.Guid, dump.Reason, segs.Count);
+                WriteWedgeRecord(dump, segs);
             }
 
             foreach (var guid in CircuitTrace.ArmedGuids())
@@ -181,6 +179,68 @@ public sealed class CircuitTraceHost
                 _log.LogWarning(ex, "[CIRCUIT] flush failed (throttled log)");
             }
         }
+    }
+
+    // ── wedge auto-dump: a LEDGER, not a landfill ───────────────────────────
+    // R8 was written assuming a wedge is a rare event worth preserving whole.
+    // The live fleet says otherwise: ~30 wedge trips a minute across ~330 bots,
+    // and the first implementation flushed each bot's ENTIRE ring every time —
+    // 10,712 dumps, 5,016 of them the full 1,024 segments, 1.73 GB in one day,
+    // 98.5% of it from bots nobody armed. It buried the traces you asked for.
+    //
+    // The fix keeps R8's promise (catch the wedge nobody was watching) and drops
+    // its cost: EVERY wedge writes one compact ledger line, and the full ring is
+    // written only when it can teach us something new — the bot is armed (you
+    // asked for it), or this wedge SHAPE has not been seen before today. The
+    // hundredth repeat of a known shape adds a counter, not 165 KB.
+    private readonly Dictionary<string, int> _wedgeShapes = new();
+    private string _wedgeShapeDay = "";
+    private int _fullDumpsThisHour;
+    private DateTime _fullDumpHour = DateTime.UtcNow;
+    private const int FullDumpsPerHourCap = 20;
+
+    private void WriteWedgeRecord((int Guid, string Reason) dump, List<CircuitTrace.TickSegment> segs)
+    {
+        var today = DateTime.UtcNow.ToString("yyyyMMdd");
+        if (_wedgeShapeDay != today) { _wedgeShapes.Clear(); _wedgeShapeDay = today; }
+
+        // The wedge's SHAPE: the ordered probe path of the last recorded slice.
+        // Two wedges with the same shape are the same bug seen twice.
+        var last = segs.LastOrDefault(s => s.Hits.Count > 0);
+        var path = last?.Hits.Select(h => h.SiteId).ToArray() ?? Array.Empty<int>();
+        var shape = string.Join(",", path);
+
+        _wedgeShapes.TryGetValue(shape, out var seen);
+        _wedgeShapes[shape] = seen + 1;
+
+        if ((DateTime.UtcNow - _fullDumpHour).TotalHours >= 1) { _fullDumpHour = DateTime.UtcNow; _fullDumpsThisHour = 0; }
+        bool armed = CircuitTrace.IsArmed(dump.Guid);
+        bool novel = seen == 0 && _fullDumpsThisHour < FullDumpsPerHourCap;
+        bool full = armed || novel;
+
+        EnsureWriter();
+        EmitNewSites();
+        WriteLine(JsonSerializer.Serialize(new
+        {
+            k = "wedge",
+            g = dump.Guid,
+            t = DateTime.UtcNow.ToString("O"),
+            reason = dump.Reason,
+            shapeSeen = seen + 1,          // how many times this shape today
+            segs = segs.Count,             // what was in the ring
+            full,                          // whether the ring follows this line
+            map = last?.MapId ?? -1,
+            zone = last?.ZoneId ?? 0,
+            x = last?.X ?? 0f,
+            y = last?.Y ?? 0f,
+            path                           // the decoded-elsewhere probe path
+        }));
+
+        if (!full) return;
+        if (novel && !armed) _fullDumpsThisHour++;
+        FlushSegments(segs);
+        _log.LogWarning("[CIRCUIT] wedge dump for bot {Guid} ({Reason}): {Count} segments, shape #{Shape}",
+            dump.Guid, dump.Reason, segs.Count, seen + 1);
     }
 
     private void FlushSegments(List<CircuitTrace.TickSegment> segs)

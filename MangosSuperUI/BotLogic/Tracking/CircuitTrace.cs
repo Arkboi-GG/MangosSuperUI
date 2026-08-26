@@ -298,11 +298,18 @@ public static class CircuitTrace
     // daily file. That is not a black box, it is a landfill — and it buries the
     // one bot you actually wanted to read.
     //
-    // So dumps are rate-limited: one per bot per cooldown, plus a fleet-wide
-    // hourly ceiling. Suppressions are COUNTED and reported in Status, because a
-    // throttle that hides what it dropped is worse than no throttle.
-    private const int DumpCooldownSec = 300;    // one dump per bot per 5 minutes
-    private const int DumpsPerHourCap = 120;    // fleet-wide ceiling
+    // The real fix is in the host (CircuitTraceHost.WriteWedgeRecord): every
+    // wedge writes one small LEDGER line, and only a novel wedge shape — or an
+    // armed bot — costs a full ring. These two limits are just runaway backstops
+    // on top of that: a wedge breaker that trips every tick must not be able to
+    // spam even cheap lines, and nothing should ever queue without bound.
+    // Suppressions are COUNTED and reported in Status, because a throttle that
+    // hides what it dropped is worse than no throttle. They are set loose on
+    // purpose: at the observed rate (~1 wedge per bot per 11 minutes) they should
+    // suppress almost nothing — losing wedge COUNTS would cost us the fleet
+    // picture, and the counts are now the cheap part.
+    private const int DumpCooldownSec = 30;      // per bot: kills per-tick spam only
+    private const int DumpsPerHourCap = 5000;    // fleet-wide runaway backstop
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, DateTime> _lastDumpAt = new();
     private static long _dumpsAccepted, _dumpsSuppressedBot, _dumpsSuppressedFleet;
     private static readonly object _dumpWindowLock = new();
