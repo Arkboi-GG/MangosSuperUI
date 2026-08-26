@@ -32,6 +32,11 @@ public class DbInitializationService
     /// </summary>
     public async Task InitializeAsync()
     {
+        AdminDbReady = false;
+        AdminDbError = null;
+        InitializedAt = null;
+        TablesCreated = 0;
+        TablesExisted = 0;
         _logger.LogInformation("DbInitializationService: Starting vmangos_admin bootstrap...");
 
         try
@@ -107,6 +112,61 @@ public class DbInitializationService
                     await conn.ExecuteAsync(Sql_ScheduledActionsIndexes);
                     created++;
                     _logger.LogInformation("DbInitializationService: Created scheduled_actions table with indexes");
+                }
+
+                // --- bot_combat_loadout_queue ---
+                // One durable desired combat build per managed bot. Unlike the generic
+                // scheduled_actions scaffold, this table carries the GUID, optimistic
+                // revision, dispatch request id, retry state, and restart-safe outcome.
+                if (await TableExistsAsync(conn, dbName, "bot_combat_loadout_queue"))
+                {
+                    existed++;
+                    _logger.LogDebug("DbInitializationService: bot_combat_loadout_queue already exists");
+                }
+                else
+                {
+                    await conn.ExecuteAsync(Sql_BotCombatLoadoutQueue);
+                    created++;
+                    _logger.LogInformation("DbInitializationService: Created bot_combat_loadout_queue table");
+                }
+                if (!await ColumnExistsAsync(conn, dbName, "bot_combat_loadout_queue", "rotation_fingerprint"))
+                {
+                    await conn.ExecuteAsync(
+                        "ALTER TABLE bot_combat_loadout_queue ADD COLUMN rotation_fingerprint CHAR(64) NULL AFTER rotation_name");
+                    _logger.LogInformation(
+                        "DbInitializationService: Added bot_combat_loadout_queue.rotation_fingerprint");
+                }
+                if (!await ColumnExistsAsync(conn, dbName, "bot_combat_loadout_queue", "claim_owner"))
+                {
+                    await conn.ExecuteAsync(
+                        "ALTER TABLE bot_combat_loadout_queue ADD COLUMN claim_owner CHAR(32) NULL AFTER request_id");
+                    _logger.LogInformation("DbInitializationService: Added bot_combat_loadout_queue.claim_owner");
+                }
+                if (!await ColumnExistsAsync(conn, dbName, "bot_combat_loadout_queue", "claim_expires_at"))
+                {
+                    await conn.ExecuteAsync(
+                        "ALTER TABLE bot_combat_loadout_queue ADD COLUMN claim_expires_at DATETIME(3) NULL AFTER claim_owner");
+                    _logger.LogInformation("DbInitializationService: Added bot_combat_loadout_queue.claim_expires_at");
+                }
+                if (!await IndexExistsAsync(conn, dbName, "bot_combat_loadout_queue", "PRIMARY"))
+                {
+                    await conn.ExecuteAsync(
+                        "ALTER TABLE bot_combat_loadout_queue ADD PRIMARY KEY (bot_guid)");
+                    _logger.LogInformation("DbInitializationService: Added bot_combat_loadout_queue primary key");
+                }
+                if (!await IndexExistsAsync(conn, dbName, "bot_combat_loadout_queue", "uq_bot_combat_loadout_queue_id"))
+                {
+                    await conn.ExecuteAsync(
+                        "CREATE UNIQUE INDEX uq_bot_combat_loadout_queue_id ON bot_combat_loadout_queue (queue_id)");
+                    _logger.LogInformation(
+                        "DbInitializationService: Added bot_combat_loadout_queue queue-id index");
+                }
+                if (!await IndexExistsAsync(conn, dbName, "bot_combat_loadout_queue", "idx_bot_combat_loadout_queue_due"))
+                {
+                    await conn.ExecuteAsync(
+                        "CREATE INDEX idx_bot_combat_loadout_queue_due ON bot_combat_loadout_queue (status, next_attempt_at)");
+                    _logger.LogInformation(
+                        "DbInitializationService: Added bot_combat_loadout_queue due index");
                 }
 
                 // --- og_baseline_meta ---
@@ -504,6 +564,42 @@ public class DbInitializationService
     private const string Sql_ScheduledActionsIndexes = @"
         CREATE INDEX idx_execute_at ON scheduled_actions (execute_at);
         CREATE INDEX idx_status     ON scheduled_actions (status);";
+
+    private const string Sql_BotCombatLoadoutQueue = @"
+        CREATE TABLE bot_combat_loadout_queue (
+            bot_guid              INT UNSIGNED     NOT NULL PRIMARY KEY,
+            bot_name              VARCHAR(32)      NOT NULL,
+            queue_id              CHAR(32)         NOT NULL,
+            status                VARCHAR(24)      NOT NULL DEFAULT 'waiting',
+            payload_json          MEDIUMTEXT       NOT NULL,
+            spec_tab              TINYINT UNSIGNED NOT NULL,
+            profile_id            VARCHAR(63)      NOT NULL,
+            profile_name          VARCHAR(63)      NOT NULL,
+            active_role           TINYINT UNSIGNED NOT NULL,
+            active_role_name      VARCHAR(32)      NOT NULL,
+            rotation_mode         VARCHAR(16)      NOT NULL,
+            rotation_profile      VARCHAR(63)      NULL,
+            rotation_name         VARCHAR(96)      NOT NULL,
+            rotation_fingerprint  CHAR(64)         NULL,
+            reset_talents         TINYINT(1)       NOT NULL DEFAULT 0,
+            expected_revision     INT UNSIGNED     NOT NULL,
+            observed_session_at   DATETIME(3)      NULL,
+            request_id            CHAR(32)         NULL,
+            claim_owner           CHAR(32)         NULL,
+            claim_expires_at      DATETIME(3)      NULL,
+            attempt_count         INT UNSIGNED     NOT NULL DEFAULT 0,
+            queued_by             VARCHAR(64)      NOT NULL DEFAULT 'web',
+            queued_from           VARCHAR(64)      NULL,
+            created_at            DATETIME(3)      NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            updated_at            DATETIME(3)      NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+            next_attempt_at       DATETIME(3)      NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            dispatched_at         DATETIME(3)      NULL,
+            completed_at          DATETIME(3)      NULL,
+            last_code             VARCHAR(64)      NULL,
+            last_message          TEXT             NULL,
+            UNIQUE KEY uq_bot_combat_loadout_queue_id (queue_id),
+            KEY idx_bot_combat_loadout_queue_due (status, next_attempt_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;";
 
     // Tiny key/value table for migration bookkeeping — lets data migrations be versioned
     // and re-run when their logic is corrected, instead of firing once and never again.

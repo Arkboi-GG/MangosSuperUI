@@ -48,7 +48,8 @@
         .af-set-head .chev { font-size: 10px; color: var(--text-muted); width: 10px; }
         .af-set-body { display: none; border-top: 1px dashed var(--border-light); }
         .af-set.open .af-set-body { display: block; }
-        .af-piece { display: grid; grid-template-columns: 20px 1fr auto auto; align-items: center; gap: 8px; padding: 5px 12px; font-size: 12px; border-bottom: 1px dashed var(--border-light); color: var(--text-primary); }
+        /* icon · name · slot · Preview · Import|Clone — the fourth auto column is the Preview button. */
+        .af-piece { display: grid; grid-template-columns: 20px 1fr auto auto auto; align-items: center; gap: 8px; padding: 5px 12px; font-size: 12px; border-bottom: 1px dashed var(--border-light); color: var(--text-primary); }
         .af-piece:last-child { border-bottom: 0; }
         .af-piece .slot { font-size: 10.5px; color: var(--text-muted); min-width: 110px; text-align: right; }
         .af-piece .q0 { color: #9d9d9d; } .af-piece .q1 { color: var(--text-primary); } .af-piece .q2 { color: #1eff00; } .af-piece .q3 { color: #0070dd; } .af-piece .q4 { color: #a335ee; } .af-piece .q5 { color: #ff8000; }
@@ -132,13 +133,15 @@
             (they're grouped from the client's own set data so the pieces that belong together come across together), or a single piece.
             Painted pieces carry their body textures; helms &amp; shoulders are re-emitted as native vanilla models (all 16 race/gender
             variants, L/R shoulders); cloaks carry their cape texture. Ships in <code>patch-6.MPQ</code> — restart the client, then <code>.additem</code>.
-            Vanilla set bonuses are yours to define (optional) — nothing is imported.
+            Set bonuses are yours to define. The TBC and WotLK lanes cannot carry theirs across (their spell
+            ids belong to a later client), but a VANILLA set clone pre-fills the source set's own bonuses,
+            because those spells already exist in your core — edit or clear them like any other row.
         </div>
         <div class="af-pills">
             <span class="af-pill" id="pillFixture">fixture …</span>
             <span class="af-pill" id="pillTbc">TBC …</span>
             <span class="af-pill" id="pillWotlk">WotLK …</span>
-            <span class="af-pill" id="pillVanilla">Vanilla …</span>
+            <span class="af-pill" id="pillVanilla" title="Checked when you open the Clone Vanilla card — it is a live world-database query">Vanilla: clone</span>
             <span class="af-pill" id="pillPatch">patch …</span>
             <span class="af-pill" id="pillDeploy" title="Is the patch-6.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
             <span class="af-pill" id="pillItemSet" title="Set membership and n-piece bonuses need ItemSet.dbc in the SERVER's dbc directory, not just in the client patch. The core reads it once at startup and zeroes item_template.set_id for any set it cannot find — so a freshly deployed file does nothing until mangosd restarts.">sets …</span>
@@ -178,13 +181,14 @@
 
             <div class="af-card collapsed">
                 <h3><span class="phase">Clone</span> Vanilla armor</h3>
-                <p id="vanillaState">Clone an existing vanilla armor piece into a new custom item — it reuses the source's own model/textures (already in your client) and lets you re-itemize it (value, stats, effects). Usable via <code>.additem</code> after a reload; no patch needed unless you recolor.</p>
+                <p id="vanillaState">Clone an existing vanilla armor piece — or a whole stock set — into new custom items. Each piece reuses the source's own model/textures (already in your client) and can be re-itemized (value, stats, effects). <strong>A single piece packages nothing</strong>: no patch, no download, no client restart, usable via <code>.additem</code> as soon as the core reloads. <strong>Cloning a SET does package one thing</strong> — the set itself is a row in ItemSet.dbc, so it ships in patch-6 and needs a client restart plus a mangosd restart to take effect. A recolor or glow tint cannot ride along either way: new art needs a new display, which is what the import lanes build.</p>
                 <div class="af-search">
                     <input type="text" id="vanillaSearch" class="af-input" placeholder="Search vanilla armor by name, item id, or slot — e.g. Cenarion, 16795, boots…">
                     <select id="vanillaFamily" class="af-input" title="Filter by slot">
                         <option value="">All slots</option>
                     </select>
-                    <button type="button" class="af-btn secondary small af-other-btn" id="vanillaOtherBtn" style="display:none;">Other sets</button>
+                    <button type="button" class="af-btn secondary small af-other-btn" id="vanillaOtherBtn"
+                            title="Levelling greens, crafted sets, the small two- and three-piece sets, and anything below item level 63 — the client's ItemSet.dbc ships them all. Hidden by default so the tier and PvP sets are readable.">Other sets</button>
                 </div>
                 <div class="af-results" id="vanillaResults"><div class="af-empty">Search to browse vanilla armor.</div></div>
             </div>
@@ -252,6 +256,7 @@
                     </label>
                     <span id="apGlowNote" class="muted" style="font-size:11px;">Tints animated glow/particle effects on the previewed piece(s).</span>
                 </div>
+                <div id="apBakeNote" style="display:none;font-size:11px;margin-top:8px;padding:7px 9px;border-radius:6px;border:1px solid var(--border-light);background:color-mix(in srgb, var(--accent) 8%, transparent);color:var(--text-primary);"></div>
                 <div id="apStatus" class="muted" style="font-size:11px;margin-top:8px;"></div>
             </div>
 
@@ -593,7 +598,10 @@
     var LANES = {
         tbc: { key: 'tbc', label: 'TBC', pill: 'pillTbc', state: 'tbcState', search: 'tbcSearch', family: 'tbcFamily', results: 'tbcResults', other: 'tbcOtherBtn', showOther: false },
         wotlk: { key: 'wotlk', label: 'WotLK', pill: 'pillWotlk', state: 'wotlkState', search: 'wotlkSearch', family: 'wotlkFamily', results: 'wotlkResults', other: 'wotlkOtherBtn', showOther: false },
-        vanilla: { key: 'vanilla', label: 'Vanilla', pill: 'pillVanilla', state: 'vanillaState', search: 'vanillaSearch', family: 'vanillaFamily', results: 'vanillaResults', other: 'vanillaOtherBtn', showOther: false }
+        // looseIsPrimary: this lane has no set cards, so its pieces list IS the answer and must render
+        // expanded. TBC/WotLK leave it falsy and keep collapsing a browse-all (thousands of rows under
+        // the set cards that are the point of those lanes).
+        vanilla: { key: 'vanilla', label: 'Vanilla', pill: 'pillVanilla', state: 'vanillaState', search: 'vanillaSearch', family: 'vanillaFamily', results: 'vanillaResults', other: 'vanillaOtherBtn', showOther: false, looseIsPrimary: true }
     };
     var KIND_ICON = { Painted: 'fa-brush', Modelled: 'fa-cube', Cloak: 'fa-wind' };
 
@@ -612,9 +620,6 @@
                 st.innerHTML = ls.error ? lane.label + ': ' + esc(ls.error) : 'Set the <strong>' + lane.label + ' Data Path</strong> on the <a href="/Settings">Settings page</a> to enable import.';
             }
         });
-        // Vanilla clone reads the live world DB — always available, no client mount required.
-        var vp = $('pillVanilla'); vp.textContent = 'Vanilla: clone'; vp.className = 'af-pill ok';
-        $('vanillaSearch').disabled = false;
         applyDeployPills(s);
     });
 
@@ -669,6 +674,55 @@
         // stays instant and keeps its state across searches within the session.
         $(lane.other).addEventListener('click', function () { lane.showOther = !lane.showOther; applyOther(lane); });
     });
+    // The vanilla lane's browse is a live world-DB query, so it is seeded on FIRST USE rather than at
+    // page load — the TBC/WotLK lanes can seed eagerly because they read a mounted archive already in
+    // memory. Without this the card sat on "Search to browse vanilla armor." until something was typed,
+    // which is the whole reason the lane read as dead next to the other two.
+    // Latched only once a browse actually SUCCEEDS. Setting it up front meant a first open against a
+    // dead world DB left the card permanently stuck — both triggers were no-ops from then on, and the
+    // whole reason this lane is seeded lazily is that it depends on a database that fails intermittently.
+    var vanillaSeeded = false, vanillaSeedInFlight = false;
+    function seedVanillaLane() {
+        if (vanillaSeeded || vanillaSeedInFlight) return;
+        vanillaSeedInFlight = true;
+        loadVanillaStatus();
+        laneSearch(LANES.vanilla, '').then(function (ok) {
+            vanillaSeeded = !!ok;
+        }).finally(function () { vanillaSeedInFlight = false; });
+    }
+
+    // The vanilla lane's status is its OWN fetch, not part of /ArmorForge/Status. Status is a pure
+    // file/process probe and the TBC + WotLK search boxes are enabled inside its callback, so putting a
+    // world-DB round trip in it left two lanes that need no database disabled for the whole MySQL
+    // connect timeout whenever the DB was down.
+    function loadVanillaStatus() {
+        var vp = $('pillVanilla');
+        vp.textContent = 'Vanilla: checking…'; vp.className = 'af-pill';
+        fetch('/ArmorForge/VanillaStatus').then(function (r) { return r.json(); }).then(function (vs) {
+            if (vs.configured) {
+                vp.textContent = 'Vanilla: ' + (vs.pieces || 0).toLocaleString() + ' pieces';
+                vp.className = 'af-pill ok';
+                $('vanillaState').innerHTML = (vs.pieces || 0).toLocaleString() + ' stock armor pieces available to clone, grouped into their sets below. Each piece reuses the source’s own model/textures and can be re-itemized. <strong>A single piece packages nothing</strong> — no patch, no download, no client restart. <strong>Cloning a SET ships an ItemSet.dbc row in patch-6</strong>, so it needs a client restart and a mangosd restart to take effect. A recolor or glow tint cannot ride along either way.';
+                $('vanillaState').style.color = '';
+            } else {
+                vp.textContent = 'Vanilla: world DB unreachable';
+                vp.className = 'af-pill bad';
+                vp.title = vs.error || '';
+                $('vanillaState').textContent = 'The vanilla clone lane reads the live world database, which is not answering: ' + (vs.error || 'unknown error');
+                $('vanillaState').style.color = '#b42318';
+            }
+        }).catch(function (e) {
+            vp.textContent = 'Vanilla: status failed'; vp.className = 'af-pill bad'; vp.title = String(e);
+        });
+    }
+    $('vanillaSearch').addEventListener('focus', seedVanillaLane);
+    (function () {
+        var card = $('vanillaSearch').closest('.af-card');
+        if (!card) return;
+        var head = card.querySelector('h3');
+        if (head) head.addEventListener('click', function () { if (!card.classList.contains('collapsed')) seedVanillaLane(); });
+        if (!card.classList.contains('collapsed')) seedVanillaLane();
+    })();
 
     // Show/hide a lane's "other sets" drawer and keep the button's label + pressed look in sync.
     function applyOther(lane) {
@@ -680,25 +734,49 @@
         if (box) box.style.display = lane.showOther ? '' : 'none';
     }
 
+    // Returns a promise resolving to whether a usable payload arrived, so the vanilla lane's lazy seed
+    // can decide whether it is really seeded. Also catches: a rejected fetch (or a 500 — ImportBrowse
+    // can now answer one for an unrecognised lane key) used to leave the lane stuck on "Searching…".
     function laneSearch(lane, q) {
         var host = $(lane.results); host.innerHTML = '<div class="af-empty">Searching…</div>';
-        fetch('/ArmorForge/ImportBrowse?expansion=' + lane.key + '&search=' + encodeURIComponent(q) + '&family=' + encodeURIComponent($(lane.family).value))
+        return fetch('/ArmorForge/ImportBrowse?expansion=' + lane.key + '&search=' + encodeURIComponent(q) + '&family=' + encodeURIComponent($(lane.family).value))
             .then(function (r) { return r.json(); }).then(function (d) {
                 host.innerHTML = '';
                 var other = d.otherSets || [];
                 lane.otherCount = d.otherSetCount || other.length;
-                if (!d.sets.length && !other.length && !d.loose.length) { host.innerHTML = '<div class="af-empty">No matches.</div>'; applyOther(lane); return; }
+                // A failed browse used to be indistinguishable from an empty one: the vanilla branch
+                // returns { error } with three empty arrays, and this printed "No matches."
+                if (d.error) {
+                    host.innerHTML = '<div class="af-empty" style="color:#b42318;">Browse failed: ' + esc(d.error) + '</div>';
+                    applyOther(lane); return false;
+                }
+                if (!d.sets.length && !other.length && !d.loose.length) { host.innerHTML = '<div class="af-empty">No matches.</div>'; applyOther(lane); return true; }
 
                 if (d.sets.length) {
                     var fh = document.createElement('div'); fh.className = 'af-loose-h';
-                    fh.textContent = 'Tier & arena sets (' + d.sets.length + (d.featuredSetCount > d.sets.length ? ' of ' + d.featuredSetCount : '') + ')';
-                    fh.title = 'Epic sets at item level ' + d.featuredMinItemLevel + ' or above — the tier and arena sets of this expansion.';
+                    // Vanilla has no arenas; its headline group is the raid/dungeon tiers plus the PvP
+                    // rank sets, and it is selected on piece count as well as item level (see
+                    // VanillaArmorSetCatalog), so the caption has to match what the server actually did.
+                    var vanillaLane = lane.key === 'vanilla';
+                    fh.textContent = (vanillaLane ? 'Tier & PvP sets (' : 'Tier & arena sets (') + d.sets.length + (d.featuredSetCount > d.sets.length ? ' of ' + d.featuredSetCount : '') + ')';
+                    fh.title = vanillaLane
+                        ? 'Multi-piece sets at item level ' + d.featuredMinItemLevel + ' or above — Tier 0 through Tier 3 and the PvP rank sets. Smaller and lower sets are under "Other sets".'
+                        : 'Epic sets at item level ' + d.featuredMinItemLevel + ' or above — the tier and arena sets of this expansion.';
                     host.appendChild(fh);
                     d.sets.forEach(function (s) { host.appendChild(renderSet(s)); });
                 } else if (other.length) {
                     var none = document.createElement('div'); none.className = 'af-empty';
                     none.textContent = 'No tier or arena sets match — ' + other.length + ' other set(s) did. Use "Other sets".';
                     host.appendChild(none);
+                }
+
+                // The vanilla lane's set cards come from the client's ItemSet.dbc; with no mount there are
+                // no cards at all, and the loose list alone would read as the whole lane.
+                if (d.setsError) {
+                    var se = document.createElement('div'); se.className = 'af-empty';
+                    se.style.color = '#b42318';
+                    se.textContent = 'Sets unavailable: ' + d.setsError;
+                    host.appendChild(se);
                 }
 
                 // Everything that is not a current-expansion tier/arena set lives here, rendered but
@@ -723,7 +801,7 @@
                     box.appendChild(body); host.appendChild(box);
                     // Collapsed only for the browse-all view (the loose list is thousands of rows there).
                     // With a typed search the pieces ARE the answer — open them, or the search looks dead.
-                    var open = !!(q && q.trim());
+                    var open = !!(q && q.trim()) || !!lane.looseIsPrimary;
                     if (open) box.classList.add('open');
                     h.style.cursor = 'pointer';
                     h.title = 'Show / hide these pieces';
@@ -734,13 +812,23 @@
                     });
                 }
                 applyOther(lane);
+                return true;
+            })
+            .catch(function (e) {
+                host.innerHTML = '<div class="af-empty" style="color:#b42318;">Browse failed: ' + esc(String(e)) + '</div>';
+                applyOther(lane);
+                return false;
             });
     }
 
     function renderSet(s) {
         var box = document.createElement('div'); box.className = 'af-set';
         var head = document.createElement('div'); head.className = 'af-set-head';
-        head.innerHTML = '<span class="chev">▸</span><span class="nm">' + esc(s.name) + '</span><span class="cnt">' + (s.maxItemLevel ? 'ilvl ' + s.maxItemLevel + ' · ' : '') + s.pieces.length + ' pieces</span>';
+        // droppedMembers: the set's non-armor members (weapons, rings, trinkets) that this forge cannot
+        // clone. Stated on the card so a 5-of-8 set never reads as the whole thing.
+        var dropped = s.droppedMembers > 0 ? ' · ' + s.droppedMembers + ' non-armor' : '';
+        head.innerHTML = '<span class="chev">▸</span><span class="nm">' + esc(s.name) + '</span><span class="cnt">' + (s.maxItemLevel ? 'ilvl ' + s.maxItemLevel + ' · ' : '') + s.pieces.length + ' pieces' + dropped + '</span>';
+        if (s.droppedMembers > 0) head.title = s.droppedMembers + ' member(s) of this set are weapons, rings or trinkets — the Armor Forge clones armor only, so they are not included.';
         var imp = document.createElement('button'); imp.className = 'af-btn small'; imp.innerHTML = '<i class="fa-solid fa-download"></i> Import set';
         imp.title = 'Import every piece of this set as one forged set'; imp.addEventListener('click', function (e) { e.stopPropagation(); importSet(s, imp); });
         var prev = document.createElement('button'); prev.className = 'af-btn secondary small'; prev.textContent = 'Preview'; prev.title = 'Dress the character in this whole set (pre-import preview)';
@@ -764,6 +852,14 @@
         row.innerHTML = '<i class="fa-solid ' + (KIND_ICON[p.renderKind] || 'fa-circle') + ' ico" title="' + esc(p.renderKind) + '"></i>' +
             '<span class="q' + p.quality + '">' + esc(p.name) + ' <span class="muted" style="font-size:10px;color:var(--text-muted)">· ilvl ' + p.itemLevel + ' · ' + note + '</span></span>' +
             '<span class="slot">' + esc(p.familyLabel) + '</span>';
+        // Preview has always worked from a click on the item NAME, but the only visible button said
+        // Import/Clone — and the vanilla lane never renders a set card, whose header carries the only
+        // labelled Preview button on the page. So in that lane there was no visible way to preview at
+        // all. Every row now offers it explicitly; the name-click shortcut stays.
+        var prev = document.createElement('button'); prev.className = 'af-btn secondary small'; prev.textContent = 'Preview';
+        prev.title = 'Dress the character in this piece (over the default outfit)';
+        prev.addEventListener('click', function (e) { e.stopPropagation(); markPreviewing(row); previewPainted(p); });
+        row.appendChild(prev);
         var btn = document.createElement('button'); btn.className = 'af-btn secondary small'; btn.textContent = p.expansion === 'vanilla' ? 'Clone' : (set ? 'Import piece' : 'Import');
         btn.addEventListener('click', function (e) { e.stopPropagation(); importPiece(p, btn); });
         row.appendChild(btn);
@@ -798,7 +894,13 @@
     // Preview a whole set: the set's pieces alone (they cover the body; helm/shoulder geometry comes after import).
     function previewSet(s) {
         if (!window.afViewer) return;
-        var items = s.pieces.map(function (p) { return { tbc: true, expansion: p.expansion, entry: p.entry, displayId: p.displayId, inventoryType: p.inventoryType }; });
+        // tbc:true routes the piece to the lane-dressing endpoint, which only import lanes can serve.
+        // Hard-coding it was safe only while the vanilla browse returned no sets — derive it instead.
+        var items = s.pieces.map(function (p) {
+            return p.expansion === 'vanilla'
+                ? { displayId: p.displayId, itemId: p.entry }
+                : { tbc: true, expansion: p.expansion, entry: p.entry, displayId: p.displayId, inventoryType: p.inventoryType };
+        });
         window.afViewer.dressTbc(items);
         $('cvEquipped').textContent = 'preview: ' + s.name;
         apSetTarget({ pieces: s.pieces.map(function (p) { return { displayId: p.displayId, inventoryType: p.inventoryType, entry: p.entry, expansion: p.expansion }; }), items: items, name: s.name });
@@ -810,14 +912,29 @@
 
     function doImport(p, itemConfigJson) {
         var laneLabel = (LANES[p.expansion] || LANES.tbc).label;
-        var verbing = p.expansion === 'vanilla' ? 'Cloning ' : 'Importing ';
-        result('<div class="title">' + verbing + esc(p.name) + '…</div><div class="muted">' + (p.renderKind === 'Modelled' ? 'Re-emitting ' + laneLabel + ' model(s) as native vanilla, packaging patch-6…' : 'Packaging textures into patch-6…') + '</div>');
+        var vanilla = p.expansion === 'vanilla';
+        var verbing = vanilla ? 'Cloning ' : 'Importing ';
+        // A clone packages nothing, so neither patch-6 line is true of it.
+        var detail = vanilla
+            ? 'Copying the item row and applying your configuration — no art is packaged.'
+            : (p.renderKind === 'Modelled' ? 'Re-emitting ' + laneLabel + ' model(s) as native vanilla, packaging patch-6…' : 'Packaging textures into patch-6…');
+        result('<div class="title">' + verbing + esc(p.name) + '…</div><div class="muted">' + detail + '</div>');
         var fd = new FormData(); fd.append('expansion', p.expansion || 'tbc'); fd.append('entry', p.entry);
         if (itemConfigJson) fd.append('itemConfig', itemConfigJson);
-        if (apActive) { fd.append('recolorHue', apActive.hue); fd.append('recolorTheory', apActive.theory); fd.append('recolorTier', apActive.tier); }
-        if ($('apGlowOn').checked) fd.append('glowColor', $('apGlowColor').value); // bake flame/glow colour
-        var giPiece = +$('apGlowIntensity').value / 100;
-        if (Math.abs(giPiece - 1) > 0.01) fd.append('glowIntensity', giPiece); // bake glow strength
+        // Appearance is only sent when the target can actually carry it. A vanilla clone cannot (it
+        // reuses the source display), and sending it anyway is what the server now refuses outright —
+        // so a glow toggle left on from an earlier preview would have blocked an otherwise fine clone.
+        if (!vanilla) {
+            // ...and only when the previewed recolor is actually THIS piece's. showPiece re-dresses the
+            // character without re-targeting the panel, so a bake could otherwise outlive its subject
+            // and be baked into the next piece imported.
+            if (apActive && apActive.entries && apActive.entries.indexOf(+p.entry) >= 0) {
+                fd.append('recolorHue', apActive.hue); fd.append('recolorTheory', apActive.theory); fd.append('recolorTier', apActive.tier);
+            }
+            if ($('apGlowOn').checked) fd.append('glowColor', $('apGlowColor').value); // bake flame/glow colour
+            var giPiece = +$('apGlowIntensity').value / 100;
+            if (Math.abs(giPiece - 1) > 0.01) fd.append('glowIntensity', giPiece); // bake glow strength
+        }
         return post('/ArmorForge/Import', fd, true).then(function (r) { showPiece(r); return r; });
     }
     // Import set now opens the Set Configure modal (per-piece stats + set bonuses) first.
@@ -826,17 +943,26 @@
         if (!r.ok) { result('<div class="title bad">Import failed</div><div class="bad" style="white-space:pre-wrap;">' + esc(r.body) + '</div>'); return; }
         var d = JSON.parse(r.body), a = d.apply || {};
         function line(o, label) { return o ? ('<b>' + label + '</b><span class="' + (o.ok ? 'ok' : 'bad') + '">' + esc(o.msg) + '</span>') : ''; }
-        result('<div class="title ok">Imported: ' + esc(d.name) + '</div><div class="af-kv"><b>Item entry</b><span>' + d.itemEntry + '</span><b>Display id</b><span>' + d.displayId + '</span>' +
+        // A clone ships no art: no patch, no download, no client restart. Calling it "Imported" above a
+        // red empty Deploy row made a finished job read as a half-failed import. (The server now omits
+        // `deploy` entirely when there was no patch step, so line() renders nothing for it.)
+        var cloned = d.expansion === 'vanilla';
+        var tail = cloned
+            ? '<code>.additem ' + d.itemEntry + '</code> once the core reloads — no patch and no client restart, it reuses display ' + d.displayId + '.'
+            : 'Restart the client, then <code>.additem ' + d.itemEntry + '</code>.';
+        result('<div class="title ok">' + (cloned ? 'Cloned: ' : 'Imported: ') + esc(d.name) + '</div><div class="af-kv"><b>Item entry</b><span>' + d.itemEntry + '</span><b>Display id</b><span>' + d.displayId + (cloned ? ' (the source’s own)' : '') + '</span>' +
             '<b>Piece</b><span>' + esc(d.family) + ' (' + esc(d.renderKind) + ')' + (d.models ? ' · ' + d.models + ' model file(s)' : '') + (d.components ? ' · ' + d.components + ' texture(s)' : '') + '</span>' +
             line(a.sql, 'World DB') + line(a.reload, 'Reload') + line(a.deploy, 'Deploy') + line(a.serverSets, 'Server sets') + '</div>' +
             (d.diagnostics && d.diagnostics.length ? '<div class="af-diag">' + esc(d.diagnostics.slice(0, 20).join('\n')) + '</div>' : '') +
-            '<div class="muted" style="margin-top:6px;">Restart the client, then <code>.additem ' + d.itemEntry + '</code>.</div>');
+            '<div class="muted" style="margin-top:6px;">' + tail + '</div>');
         loadList();
         if (window.afViewer) {
             var items = window.afViewer.defaultOutfit.map(function (o) { return { displayId: o.displayId, itemId: o.itemId }; });
             items.push({ displayId: d.displayId, itemId: d.itemEntry });
             window.afViewer.dressTbc(items);
         }
+        // The import consumed the bake; drop it so it cannot attach itself to the next piece.
+        apSetTarget(null);
     }
 
     // ── Configure-item modal (gameplay parity + tier/spec generator) ──
@@ -868,8 +994,11 @@
                 syncGenClassFromMask(cfg.allowableClass);
             }
         });
-        if (p.expansion === 'vanilla') prefillFromSource(p);
+        // prefillFromSource resolves asynchronously and its only guard is "is this still the open
+        // piece", so with a saved config present it would land AFTER fillModalFromConfig and silently
+        // replace the operator's edits with the source's values. A stored config always wins.
         if (opts.prefill) fillModalFromConfig(opts.prefill);
+        else if (p.expansion === 'vanilla') prefillFromSource(p);
         $('cfgModal').classList.add('open');
     }
     function closeConfigure() { $('cfgModal').classList.remove('open'); cfg.piece = null; cfg.onSubmit = null; }
@@ -919,7 +1048,17 @@
     // Vanilla clones start from the source item's real gameplay (already on the vanilla curve).
     function prefillFromSource(p) {
         fetch('/ArmorForge/VanillaSource?entry=' + p.entry).then(function (r) { return r.json(); }).then(function (d) {
-            if (!d.ok || cfg.piece !== p) return;
+            if (cfg.piece !== p) return;
+            // A failed pre-fill is not cosmetic: the modal is authoritative for quality, stats, spells
+            // and the class lock, so submitting it un-prefilled writes ITS defaults over the clone. Say
+            // so where the operator is looking, rather than returning silently.
+            if (!d.ok) {
+                $('cfgError').textContent = 'Could not read the source item, so this form is NOT pre-filled from it — '
+                    + 'cloning now would overwrite the copy with the defaults shown. ' + (d.error || '');
+                $('cfgError').style.display = 'block';
+                $('cfgGenSummary').textContent = '';
+                return;
+            }
             $('cfgQuality').value = String(d.quality);
             $('cfgItemLevel').value = d.itemLevel || '';
             $('cfgReqLevel').value = d.requiredLevel || '';
@@ -1128,7 +1267,13 @@
             $('setNameInput').value = s.name || '';
             $('setGenLevel').value = 60; $('setGenTier').value = ''; $('setGenSummary').textContent = '';
             $('setClassRestrict').value = '';
-            $('setBonusRows').innerHTML = ''; addSetBonusRow();
+            $('setBonusRows').innerHTML = '';
+            // A VANILLA source's bonuses can be carried across as-is, which no other lane can do: the
+            // spell ids come from the same 1.12 client the server runs, so they already exist in the
+            // core. The TBC/WotLK lanes have to make the operator find vanilla equivalents by hand.
+            var seeded = (s.expansion === 'vanilla' && s.bonuses && s.bonuses.length)
+                ? seedSetBonuses(s.bonuses) : 0;
+            if (!seeded) addSetBonusRow();
         }
         $('setError').style.display = 'none';
         ensureSpecCatalog().then(function () {
@@ -1139,6 +1284,21 @@
         $('setModal').classList.add('open');
     }
     function closeSetConfigure() { $('setModal').classList.remove('open'); }
+
+    // Fill the bonus table from a stock set's own (spellId, threshold) pairs. The rows are ordinary
+    // bonus rows afterwards — editable, removable, and read back by collectBonuses exactly like typed
+    // ones — so this is a starting point, not a lock.
+    function seedSetBonuses(bonuses) {
+        var n = 0;
+        bonuses.slice(0, 8).forEach(function (b) {
+            if (!(b.threshold > 0) || !(b.spellId > 0)) return;
+            // addSetBonusRow already takes (threshold, spellId, label) and stamps .cfg-picked's
+            // dataset.spellid, which is what collectBonuses reads — so a seeded row is an ordinary row.
+            addSetBonusRow(b.threshold, b.spellId, b.name || ('Spell ' + b.spellId));
+            n++;
+        });
+        return n;
+    }
 
     function STAT_LABEL(t) { var m = { 3: 'Agi', 4: 'Str', 5: 'Int', 6: 'Spi', 7: 'Sta' }; return m[t] || ('#' + t); }
     function renderSetPieces() {
@@ -1286,13 +1446,23 @@
             if (setMask != null) c = Object.assign({}, c || {}, { allowableClass: setMask });
             return { entry: p.entry, itemConfig: c ? JSON.stringify(c) : null };
         });
+        var vanillaSet = s.expansion === 'vanilla';
         var body = { expansion: s.expansion || 'tbc', sourceSetId: s.setId, name: $('setNameInput').value.trim() || s.name, pieces: pieces, bonuses: bonuses.slice(), requiredSkill: 0, requiredSkillRank: 0 };
-        if (apActive) { body.recolorHue = apActive.hue; body.recolorTheory = apActive.theory; body.recolorTier = apActive.tier; }
-        if ($('apGlowOn').checked) body.glowColor = $('apGlowColor').value; // bake flame/glow colour
-        var giSet = +$('apGlowIntensity').value / 100;
-        if (Math.abs(giSet - 1) > 0.01) body.glowIntensity = giSet; // bake glow strength
+        // Appearance rides along only where it can be baked. A cloned set ships no art, and the server
+        // rejects the request outright if these arrive — so a glow toggle left on from an earlier
+        // preview would have blocked an otherwise fine set clone.
+        if (!vanillaSet) {
+            if (apActive) { body.recolorHue = apActive.hue; body.recolorTheory = apActive.theory; body.recolorTier = apActive.tier; }
+            if ($('apGlowOn').checked) body.glowColor = $('apGlowColor').value; // bake flame/glow colour
+            var giSet = +$('apGlowIntensity').value / 100;
+            if (Math.abs(giSet - 1) > 0.01) body.glowIntensity = giSet; // bake glow strength
+        }
         $('setError').style.display = 'none'; $('setSubmit').disabled = true;
-        result('<div class="title">Importing set ' + esc(s.name) + ' (' + s.pieces.length + ' pieces)…</div><div class="muted">Each piece is configured, reserved and persisted; patch-6 is rebuilt once.</div>');
+        result('<div class="title">' + (vanillaSet ? 'Cloning set ' : 'Importing set ') + esc(s.name) + ' (' + s.pieces.length + ' pieces)…</div><div class="muted">'
+            + (vanillaSet
+                ? 'Each piece is cloned with its configuration and stamped with the new set id; patch-6 is rebuilt once to ship the set definition.'
+                : 'Each piece is configured, reserved and persisted; patch-6 is rebuilt once.')
+            + '</div>');
         fetch('/ArmorForge/ImportSet', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
             .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, body: t }; }); })
             .then(function (r) {
@@ -1306,6 +1476,16 @@
         (d.pieces || []).forEach(function (p) { h += '<b class="' + (p.ok ? 'ok' : 'bad') + '">' + (p.ok ? '✓' : '✗') + ' ' + esc(p.name || p.tbcEntry) + '</b><span>' + (p.ok ? 'entry ' + p.itemEntry + ' · display ' + p.displayId : esc(p.message)) + '</span>'; });
         h += '<b class="' + (d.serverItemSetDeployed ? 'ok' : 'bad') + '">Server sets</b><span class="' + (d.serverItemSetDeployed ? 'ok' : 'bad') + '">' + esc(d.serverItemSetMessage || '') + '</span>';
         h += '</div>';
+        // The one place the lane's "nothing is packaged" promise does not hold, so say it plainly rather
+        // than leaving the operator to discover it: the PIECES ship no art, but the SET only exists as a
+        // row in ItemSet.dbc, which has to reach the client in patch-6 and the server in its dbc dir.
+        if (d.expansion === 'vanilla')
+            h += '<div class="muted" style="margin-top:6px;">The cloned pieces reuse their sources’ own art, so nothing was packaged for them — but the <strong>set itself</strong> is a row in ItemSet.dbc, which ships in patch-6. Close and restart the client to see the set block on the tooltips.</div>';
+        // A set that could not reach the server's dbc directory is not a working set: the core zeroes
+        // every member's set_id at load and writes one "has wrong ItemSet" line per piece to
+        // DBErrors.log. That used to be reported only as a green/red pair inside the af-kv table.
+        if (!d.serverItemSetDeployed)
+            h += '<div class="bad" style="margin-top:6px;white-space:pre-wrap;"><strong>This set will NOT work in game yet.</strong> The set definition did not reach the server’s own dbc directory, so the core will zero every member’s set_id when it loads: ' + esc(d.serverItemSetMessage || 'no server dbc directory resolved') + '\n\nSet <strong>ArmorForge:ServerDbcPath</strong> (or Vmangos:DbcPath) on the Settings page, then Rebuild patch.</div>';
         // Set membership and bonuses are BOTH gated on the core re-reading ItemSet.dbc.
         if (d.serverItemSetDeployed)
             h += '<div class="muted" style="margin-top:6px;"><strong>Restart mangosd</strong> to activate this set'
@@ -1327,6 +1507,20 @@
 
     // ── Appearance (live recolor of the previewed piece) ──
     var apCurrent = null, apTheory = 'fan', apActive = null; // apActive = the recolor to BAKE on import
+    // Whether the CURRENT preview target can carry its appearance into the shipped item. True for the
+    // import lanes, false for a vanilla clone (which ships no art at all). The preview still works
+    // either way — this only governs what the panel promises and what gets sent on submit.
+    var apBakeable = true;
+    function apSetBakeable(on) {
+        apBakeable = !!on;
+        var note = $('apBakeNote');
+        if (!note) return;
+        note.style.display = on ? 'none' : '';
+        note.textContent = 'Preview only for a vanilla clone. A clone reuses the source item’s own display, and new '
+            + 'art needs a new display plus a patch-6 rebuild — which is what the TBC and WotLK import lanes do. '
+            + 'Recolor and glow here to see how a piece could look, then import it from a lane to keep it.';
+        if (!on) apActive = null;
+    }
     var AP_THEORIES = [['fan', 'Fan'], ['identity', 'Shift'], ['analogous', 'Analogous'], ['accent', 'Accent'], ['luminance', 'Luminance'], ['bank', 'Palette']];
     // Body-atlas (painted) slots — colour detection must sample one of these, not a helm/shoulder model.
     var PAINTED_INV = [5, 20, 7, 10, 6, 9, 8, 16]; // chest, robe, legs, hands, waist, wrists, feet, back
@@ -1338,7 +1532,13 @@
     function apSetTarget(t) {
         apCurrent = t; apActive = null; // a fresh preview clears any pending bake
         var s = $('apStatus');
-        if (!t || !t.pieces || !t.pieces.length) { if (s) s.textContent = ''; return; }
+        if (!t || !t.pieces || !t.pieces.length) { if (s) s.textContent = ''; apSetBakeable(true); return; }
+        // A vanilla piece can be recolored in the PREVIEW — the retexture engine repaints its display's
+        // textures on the fly — but a clone cannot ship that recolor: it reuses the source's display,
+        // and new art needs a new display plus a patch rebuild, which only the import lanes do. The
+        // panel used to say "will bake on import" here regardless, the clone endpoint silently dropped
+        // the colour, and the operator got the original art with nothing explaining why.
+        apSetBakeable(!t.pieces.some(function (p) { return p.expansion === 'vanilla'; }));
         if (s) s.textContent = 'Reading ' + (t.name || 'piece') + '’s colours…';
         // Seed the primary-colour picker from the item's own majority colour. Foreign (pre-import)
         // pieces sample their extracted source atlas; vanilla/forged pieces use the retexture engine.
@@ -1377,9 +1577,16 @@
         $('apStatus').textContent = 'Recoloring…';
         function done(ok, n) {
             apBusy = false;
-            if (ok) apActive = { hue: Math.round(hue), theory: apTheory, tier: tier }; // remember to bake on import
+            // Only remember a bake the shipped item can actually carry — see apSetBakeable — and record
+            // WHICH pieces it belongs to, so it cannot ride along on a different piece imported later.
+            if (ok && apBakeable) apActive = {
+                hue: Math.round(hue), theory: apTheory, tier: tier,
+                entries: (apCurrent && apCurrent.pieces || []).map(function (x) { return +x.entry; }),
+            };
             if (apPending) { apApply(); return; } // a newer colour/theory arrived mid-run — apply it once
-            $('apStatus').textContent = ok ? ('Applied ' + apTheory + ' at ' + Math.round(hue) + '°' + (n != null ? ' to ' + n + ' piece(s)' : '') + ' — will bake on import.') : 'No recolorable textures on this item.';
+            $('apStatus').textContent = ok
+                ? ('Applied ' + apTheory + ' at ' + Math.round(hue) + '°' + (n != null ? ' to ' + n + ' piece(s)' : '') + (apBakeable ? ' — will bake on import.' : ' — preview only, see above.'))
+                : 'No recolorable textures on this item.';
             // Re-apply glow overrides after a re-equip rebuilt the emitter materials.
             if ($('apGlowOn').checked || Math.abs(+$('apGlowIntensity').value / 100 - 1) > 0.01) apGlowApply();
         }

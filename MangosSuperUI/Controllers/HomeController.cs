@@ -304,12 +304,55 @@ public class HomeController : Controller
                 await conn.OpenAsync();
                 var tableCount = await conn.ExecuteScalarAsync<int>(
                     "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()");
+
+                if (connName == "Admin")
+                {
+                    try
+                    {
+                        await conn.ExecuteAsync(@"
+                            SELECT bot_guid, bot_name, queue_id, status, payload_json,
+                                   spec_tab, profile_id, profile_name, active_role, active_role_name,
+                                   rotation_mode, rotation_profile, rotation_name, rotation_fingerprint,
+                                   reset_talents, expected_revision, observed_session_at, request_id,
+                                   claim_owner, claim_expires_at, attempt_count, queued_by, queued_from,
+                                   created_at, updated_at, next_attempt_at, dispatched_at, completed_at,
+                                   last_code, last_message
+                              FROM bot_combat_loadout_queue
+                             LIMIT 0");
+                        var queueIndexCount = await conn.ExecuteScalarAsync<int>(@"
+                            SELECT COUNT(DISTINCT INDEX_NAME)
+                              FROM information_schema.STATISTICS
+                             WHERE TABLE_SCHEMA = DATABASE()
+                               AND TABLE_NAME = 'bot_combat_loadout_queue'
+                               AND INDEX_NAME IN
+                                   ('PRIMARY', 'uq_bot_combat_loadout_queue_id',
+                                    'idx_bot_combat_loadout_queue_due')");
+                        if (queueIndexCount != 3)
+                            throw new InvalidOperationException(
+                                "bot_combat_loadout_queue is missing one or more required indexes.");
+                    }
+                    catch (Exception ex)
+                    {
+                        checks.Add(new DiagnosticCheck
+                        {
+                            Category = "database",
+                            Name = "Database: vmangos_admin queue schema",
+                            Status = "error",
+                            Detail = ex.Message,
+                            Fix = "Run /opt/mangossuperui/Scripts/setup-mangossuperui.sh from the current release."
+                        });
+                        continue;
+                    }
+                }
+
                 checks.Add(new DiagnosticCheck
                 {
                     Category = "database",
                     Name = $"Database: {label}",
                     Status = "ok",
-                    Detail = $"Connected ({tableCount} tables)"
+                    Detail = connName == "Admin"
+                        ? $"Connected ({tableCount} tables); combat-loadout queue schema ready"
+                        : $"Connected ({tableCount} tables)"
                 });
             }
             catch (MySqlConnector.MySqlException ex) when (ex.ErrorCode == MySqlConnector.MySqlErrorCode.AccessDenied)

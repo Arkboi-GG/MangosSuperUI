@@ -9,6 +9,25 @@
 	<ItemGroup>
 		<Content Include="Controllers\BaselineController.cs" />
 		<Content Include="Services\BodyAtlasTextureService.cs" />
+		<!-- One canonical talent-profile manifest feeds both the research validator and
+		     SuperUI's read-only visibility service. Embedding it prevents a publish from
+		     silently losing the level-by-level plan. -->
+		<EmbeddedResource Include="..\docs\bot-spec-research\talent_profiles.json"
+		                  Link="BotLogic\Talents\talent_profiles.json"
+		                  LogicalName="MangosSuperUI.BotLogic.Talents.talent_profiles.json" />
+	</ItemGroup>
+
+	<!-- Ship the canonical admin schema with every publish. The Linux setup script
+	     applies it before the first service start, while DbInitializationService
+	     remains the upgrade/self-healing path for existing installations. -->
+	<ItemGroup>
+		<None Update="sql\vmangos_admin_schema.sql">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+		</None>
+		<None Update="Scripts\*.sh">
+			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+		</None>
 	</ItemGroup>
 
 	<ItemGroup>
@@ -70,6 +89,13 @@
 	<ItemGroup>
 		<Compile Remove="BotLogic\Domains\**" />
 		<Content Remove="BotLogic\Domains\**" />
+		<!-- A legacy local deployment snapshot lives under publish/. It is not
+		     application source and includes an old server-config.json; never nest
+		     that tree (or its secrets and generated binaries) inside a fresh publish. -->
+		<Compile Remove="publish\**" />
+		<Content Remove="publish\**" />
+		<EmbeddedResource Remove="publish\**" />
+		<None Remove="publish\**" />
 		<Content Remove="wwwroot\item_models\**" />
 		<Content Remove="wwwroot\minimap\**" />
 		<Content Remove="wwwroot\models\**" />

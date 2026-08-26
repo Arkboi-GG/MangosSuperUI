@@ -1,5 +1,8 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace MangosSuperUI.Services;
 
@@ -26,11 +29,21 @@ namespace MangosSuperUI.Services;
 // ============================================================================
 public class RotationService
 {
+    private const int MaxProfileIdUtf8Bytes = 63;
+    private const int MaxWireDataUtf8Bytes = 2047;
+    private const int MaxInstructions = 64;
+    private static readonly Regex SafeProfileId = new(
+        "^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
     private readonly BotBridgeService _bridge;
     private readonly ILogger<RotationService> _logger;
     private readonly string _dir;
     private readonly string _assignmentsPath;
     private readonly object _gate = new();
+    private readonly ConcurrentDictionary<BotConnection, HelloHydrationRegistration> _helloHydrations
+        = new(ReferenceEqualityComparer.Instance);
+    private readonly ConcurrentDictionary<int, SemaphoreSlim> _assignmentGates = new();
 
     // bot name (case-insensitive) -> profile name. Persisted; pushed on HELLO.
     private Dictionary<string, string> _assignments = new(StringComparer.OrdinalIgnoreCase);
@@ -62,6 +75,14 @@ public class RotationService
     {
         public string Name { get; set; } = "";
         public string? Description { get; set; }
+        /// <summary>
+        /// Required for assignments made through the combat-loadout API. Legacy
+        /// profiles without compatibility metadata remain readable by the old
+        /// curl endpoints, but cannot be selected for a destructive build change.
+        /// </summary>
+        public int ClassId { get; set; }
+        public int[] AllowedSpecTabs { get; set; } = Array.Empty<int>();
+        public int[] AllowedRoles { get; set; } = Array.Empty<int>();
         public List<RotationInstruction> Instructions { get; set; } = new();
     }
 
@@ -86,6 +107,62 @@ public class RotationService
         _ => 1   // unknown kinds degrade to CURRENT_TARGET; the profile lists valid names
     };
 
+    public sealed record PreparedRotation(
+        string Name,
+        string? Description,
+        string WireData,
+        int InstructionCount,
+        int ClassId,
+        IReadOnlyList<int> AllowedSpecTabs,
+        IReadOnlyList<int> AllowedRoles);
+
+    public sealed record RotationProfileSummary(
+        string Name,
+        string? Description,
+        int InstructionCount,
+        int ClassId,
+        IReadOnlyList<int> AllowedSpecTabs,
+        IReadOnlyList<int> AllowedRoles);
+
+    /// <summary>
+    /// Two-phase HELLO replay token. The bridge registers it before publishing the
+    /// connection, then starts it immediately afterward. Identity is the concrete
+    /// socket, never merely the bot guid.
+    /// </summary>
+    public sealed class HelloHydrationRegistration
+    {
+        internal HelloHydrationRegistration(BotConnection connection, string name)
+        {
+            Connection = connection;
+            Name = name;
+        }
+
+        public BotConnection Connection { get; }
+        public string Name { get; }
+        internal TaskCompletionSource<bool> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal int Started;
+    }
+
+    private sealed class AssignmentGateReleaser : IDisposable
+    {
+        private SemaphoreSlim? _gate;
+
+        public AssignmentGateReleaser(SemaphoreSlim gate) => _gate = gate;
+
+        public void Dispose() => Interlocked.Exchange(ref _gate, null)?.Release();
+    }
+
+    public sealed class RotationValidationException : Exception
+    {
+        public RotationValidationException(string code, string message) : base(message)
+        {
+            Code = code;
+        }
+
+        public string Code { get; }
+    }
+
     // ---------------------------------------------------------------- profiles
 
     /// <summary>All profiles on disk, read fresh (hot-reload by construction).</summary>
@@ -99,7 +176,7 @@ public class RotationService
             try
             {
                 var p = JsonSerializer.Deserialize<RotationProfile>(File.ReadAllText(file), JsonOpts);
-                if (p == null || string.IsNullOrWhiteSpace(p.Name) || p.Instructions.Count == 0)
+                if (p == null || string.IsNullOrWhiteSpace(p.Name) || p.Instructions == null || p.Instructions.Count == 0)
                 {
                     _logger.LogWarning("[ROTATION] profile file '{File}' is empty/nameless — ignored", file);
                     continue;
@@ -117,6 +194,89 @@ public class RotationService
     public RotationProfile? FindProfile(string name)
         => LoadProfiles().FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
 
+    /// <summary>
+    /// Validate and serialize one custom rotation before the core is asked to
+    /// mutate talents. This is deliberately stricter than the legacy assign API:
+    /// a loadout change may not destroy a build and only then discover that the
+    /// replacement slate was malformed or intended for another class/spec/role.
+    /// </summary>
+    public PreparedRotation PrepareForBot(string profileName, int classId, int specTab, int activeRole)
+    {
+        string requested = (profileName ?? "").Trim();
+        if (requested.Length == 0)
+            throw new RotationValidationException("rotation_profile_required", "A custom rotation profile is required.");
+
+        var matches = LoadProfiles()
+            .Where(p => string.Equals(p.Name, requested, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (matches.Length == 0)
+            throw new RotationValidationException("rotation_profile_not_found", $"Rotation profile '{requested}' was not found.");
+        if (matches.Length > 1)
+            throw new RotationValidationException("rotation_profile_ambiguous", $"Rotation profile id '{requested}' is defined more than once.");
+        var profile = matches[0];
+
+        string name = profile.Name.Trim();
+        if (!SafeProfileId.IsMatch(name) || Encoding.UTF8.GetByteCount(name) > MaxProfileIdUtf8Bytes)
+            throw new RotationValidationException("rotation_profile_id_invalid",
+                "Rotation profile ids must be 1-63 ASCII letters, digits, dots, underscores, or hyphens.");
+        if (profile.ClassId != classId)
+            throw new RotationValidationException("rotation_class_mismatch",
+                $"Rotation '{name}' is for class {profile.ClassId}, not class {classId}.");
+        int[] allowedSpecTabs = profile.AllowedSpecTabs ?? Array.Empty<int>();
+        int[] allowedRoles = profile.AllowedRoles ?? Array.Empty<int>();
+        if (allowedSpecTabs.Length == 0 || !allowedSpecTabs.Contains(specTab))
+            throw new RotationValidationException("rotation_spec_mismatch",
+                $"Rotation '{name}' does not allow specialization slot {specTab}.");
+        if (allowedRoles.Length == 0 || !allowedRoles.Contains(activeRole))
+            throw new RotationValidationException("rotation_role_mismatch",
+                $"Rotation '{name}' does not allow combat role {activeRole}.");
+        if (profile.Instructions.Count == 0 || profile.Instructions.Count > MaxInstructions)
+            throw new RotationValidationException("rotation_instruction_count_invalid",
+                $"Rotation '{name}' must contain between 1 and {MaxInstructions} instructions.");
+
+        for (int index = 0; index < profile.Instructions.Count; index++)
+        {
+            var instruction = profile.Instructions[index];
+            string label = $"Rotation '{name}' instruction {index + 1}";
+            if (instruction.SpellId == 0)
+                throw new RotationValidationException("rotation_spell_invalid", $"{label} has no spell id.");
+            if (instruction.Priority is < 0 or > 10000)
+                throw new RotationValidationException("rotation_priority_invalid", $"{label} has priority outside 0-10000.");
+            if (instruction.HpMin is < 0 or > 100 || instruction.HpMax is < 0 or > 100 || instruction.HpMin > instruction.HpMax)
+                throw new RotationValidationException("rotation_health_window_invalid", $"{label} has an invalid health window.");
+
+            string target = (instruction.Target ?? "").Trim().ToUpperInvariant();
+            if (target is not ("SELF" or "CURRENT_TARGET" or "LOWEST_HP_PARTY"))
+                throw new RotationValidationException("rotation_target_invalid", $"{label} has unsupported target '{instruction.Target}'.");
+        }
+
+        string data = BuildWireData(profile);
+        if (Encoding.UTF8.GetByteCount(data) > MaxWireDataUtf8Bytes)
+            throw new RotationValidationException("rotation_payload_too_large",
+                $"Rotation '{name}' exceeds the bridge payload limit of {MaxWireDataUtf8Bytes} UTF-8 bytes.");
+
+        return new PreparedRotation(
+            name,
+            profile.Description,
+            data,
+            profile.Instructions.Count,
+            profile.ClassId,
+            allowedSpecTabs,
+            allowedRoles);
+    }
+
+    public IReadOnlyList<RotationProfileSummary> GetProfileSummaries()
+        => LoadProfiles()
+            .Select(p => new RotationProfileSummary(
+                p.Name,
+                p.Description,
+                p.Instructions.Count,
+                p.ClassId,
+                p.AllowedSpecTabs ?? Array.Empty<int>(),
+                p.AllowedRoles ?? Array.Empty<int>()))
+            .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
     /// <summary>The pipe payload BridgeHandleLoadRotation parses — pre-sorted by priority.</summary>
     private static string BuildWireData(RotationProfile profile)
         => string.Join("|", profile.Instructions
@@ -133,6 +293,75 @@ public class RotationService
             {
                 LoadAssignments();
                 return new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase);
+            }
+        }
+    }
+
+    public bool TryGetAssignment(string botName, out string profileName)
+    {
+        lock (_gate)
+        {
+            LoadAssignments();
+            return _assignments.TryGetValue(botName.Trim(), out profileName!);
+        }
+    }
+
+    /// <summary>
+    /// Persist an assignment after APPLY_COMBAT_LOADOUT has already been
+    /// acknowledged. It intentionally does not send LOAD_ROTATION again.
+    /// </summary>
+    public void CommitAssignmentWithoutPush(string botName, string profileName)
+    {
+        string bot = (botName ?? "").Trim();
+        string profile = (profileName ?? "").Trim();
+        if (bot.Length == 0)
+            throw new ArgumentException("A bot name is required.", nameof(botName));
+        if (!SafeProfileId.IsMatch(profile))
+            throw new ArgumentException("The rotation profile id is invalid.", nameof(profileName));
+
+        lock (_gate)
+        {
+            LoadAssignments(throwOnError: true);
+            var before = new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase);
+            _assignments[bot] = profile;
+            try
+            {
+                SaveAssignments();
+            }
+            catch
+            {
+                _assignments = before;
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Remove the persisted override after the core has acknowledged its return
+    /// to the built-in spec rotation. No second bridge command is emitted.
+    /// </summary>
+    public bool ClearAssignmentWithoutPush(string botName)
+    {
+        string bot = (botName ?? "").Trim();
+        if (bot.Length == 0)
+            throw new ArgumentException("A bot name is required.", nameof(botName));
+
+        lock (_gate)
+        {
+            LoadAssignments(throwOnError: true);
+            var before = new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase);
+            bool removed = _assignments.Remove(bot);
+            if (!removed)
+                return false;
+            try
+            {
+                SaveAssignments();
+                return true;
+            }
+            catch
+            {
+                _assignments = before;
+                throw;
             }
         }
     }
@@ -207,11 +436,85 @@ public class RotationService
     }
 
     /// <summary>
-    /// HELLO hook (called by BotBridgeService): re-push the persisted assignment so restarts
-    /// and relogs never silently lose the slate. Fire-and-forget from the bridge's side.
+    /// Register a HELLO replay synchronously before the bridge publishes the
+    /// connection. Registration intentionally performs no file or socket I/O.
     /// </summary>
-    public async Task OnBotHelloAsync(int guid, string name)
+    public HelloHydrationRegistration RegisterHelloHydration(
+        BotConnection connection,
+        string name)
     {
+        ArgumentNullException.ThrowIfNull(connection);
+        var registration = new HelloHydrationRegistration(connection, name?.Trim() ?? "");
+        _helloHydrations[connection] = registration;
+        return registration;
+    }
+
+    /// <summary>Start a previously registered exact-connection replay once.</summary>
+    public void StartHelloHydration(HelloHydrationRegistration registration)
+    {
+        ArgumentNullException.ThrowIfNull(registration);
+        if (Interlocked.Exchange(ref registration.Started, 1) != 0)
+            return;
+        _ = CompleteHelloHydrationAsync(registration);
+    }
+
+    /// <summary>
+    /// Serialize persisted-assignment replay with the ACK-to-assignment-commit
+    /// window of an atomic combat loadout. Callers must acquire this only after
+    /// awaiting any existing HELLO hydration for their captured connection.
+    /// </summary>
+    public async Task<IDisposable> AcquireAssignmentGateAsync(
+        int guid,
+        CancellationToken cancellationToken)
+    {
+        SemaphoreSlim gate = _assignmentGates.GetOrAdd(guid, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken);
+        return new AssignmentGateReleaser(gate);
+    }
+
+    /// <summary>
+    /// Wait until the persisted HELLO rotation replay has either been written or
+    /// failed. Combat-loadout writes call this so an older fire-and-forget replay
+    /// can never arrive after and overwrite the newly selected rotation.
+    /// </summary>
+    public async Task WaitForHelloHydrationAsync(
+        BotConnection connection,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        if (_helloHydrations.TryGetValue(connection, out HelloHydrationRegistration? hydration))
+            await hydration.Completion.Task.WaitAsync(cancellationToken);
+    }
+
+    private async Task CompleteHelloHydrationAsync(HelloHydrationRegistration registration)
+    {
+        try
+        {
+            using (await AcquireAssignmentGateAsync(
+                registration.Connection.Guid,
+                CancellationToken.None))
+            {
+                await HydrateBotHelloAsync(registration);
+            }
+        }
+        catch (Exception ex)
+        {
+            // A failed replay must be observed, but it must also settle so a new
+            // atomic loadout can safely replace it rather than waiting forever.
+            _logger.LogError(ex,
+                "[ROTATION] persisted HELLO rotation replay failed for {Bot} (guid={Guid})",
+                registration.Name, registration.Connection.Guid);
+        }
+        finally
+        {
+            registration.Completion.TrySetResult(true);
+            _helloHydrations.TryRemove(registration.Connection, out _);
+        }
+    }
+
+    private async Task HydrateBotHelloAsync(HelloHydrationRegistration registration)
+    {
+        string name = registration.Name;
         string? profileName;
         lock (_gate)
         {
@@ -227,7 +530,7 @@ public class RotationService
             _logger.LogWarning("[ROTATION] {Bot} is assigned '{Profile}' but no such profile file exists — nothing pushed", name, profileName);
             return;
         }
-        await PushAsync(guid, name, profile);
+        await PushAsync(registration.Connection, name, profile);
     }
 
     // --------------------------------------------------------------- internals
@@ -238,6 +541,19 @@ public class RotationService
         await _bridge.SendToBotAsync(guid, "LOAD_ROTATION", new { profile = profile.Name, data });
         _logger.LogInformation("[ROTATION] pushed '{Profile}' to {Bot} (guid={Guid}, {Count} instructions) — watch for ROTATION_ACK",
             profile.Name, name, guid, profile.Instructions.Count);
+    }
+
+    private async Task PushAsync(BotConnection connection, string name, RotationProfile profile)
+    {
+        string data = BuildWireData(profile);
+        await _bridge.SendToBotConnectionAsync(
+            connection,
+            "LOAD_ROTATION",
+            new { profile = profile.Name, data },
+            CancellationToken.None);
+        _logger.LogInformation(
+            "[ROTATION] replayed '{Profile}' to {Bot} (guid={Guid}, {Count} instructions) on its exact HELLO connection — watch for ROTATION_ACK",
+            profile.Name, name, connection.Guid, profile.Instructions.Count);
     }
 
     private (int guid, string name)? FindOnlineBot(string botName)

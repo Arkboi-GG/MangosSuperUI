@@ -35,7 +35,22 @@ public sealed class ArmorImportSources
     public ArmorImportLane Wotlk { get; }
     public IReadOnlyList<ArmorImportLane> All { get; }
 
-    /// <summary>Lane by key; unknown/blank keys fall back to TBC (the original lane).</summary>
-    public ArmorImportLane Get(string? key) =>
-        string.Equals(key, WotlkMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase) ? Wotlk : Tbc;
+    /// <summary>Lane by key. Blank falls back to TBC (the original lane, and what the pre-lane callers
+    /// meant); an unrecognised key throws.
+    ///
+    /// The fallback used to swallow EVERY unknown key, "vanilla" included — and because the 2.4.3
+    /// client contains almost every vanilla item, a vanilla entry id routed here resolved against the
+    /// TBC archive and produced plausible art from the wrong client with no error anywhere. The vanilla
+    /// clone lane has no client archive at all: it reads the world database. Callers that can receive
+    /// "vanilla" must branch on it before asking for a lane, and this throw is what makes forgetting
+    /// that a visible 500 in the log instead of silently wrong textures on a preview.</summary>
+    public ArmorImportLane Get(string? key)
+    {
+        if (string.IsNullOrWhiteSpace(key)) return Tbc;
+        if (string.Equals(key, WotlkMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase)) return Wotlk;
+        if (string.Equals(key, TbcMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase)) return Tbc;
+        throw new ArgumentOutOfRangeException(nameof(key), key,
+            $"'{key}' is not an Armor Forge import lane. Import lanes are '{TbcMpqSource.SourceKey}' and " +
+            $"'{WotlkMpqSource.SourceKey}'; the vanilla clone lane reads the world database and has no client archive.");
+    }
 }

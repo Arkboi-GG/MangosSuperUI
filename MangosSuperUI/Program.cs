@@ -47,10 +47,12 @@ builder.Services.AddHttpContextAccessor();            // lets AuditService stamp
 builder.Services.AddSingleton<AuditService>();
 builder.Services.AddSingleton<WorldArtifactService>();
 builder.Services.AddSingleton<RtsWorldCreationService>();
+builder.Services.AddSingleton<WorldMaintenanceGate>();
 builder.Services.AddSingleton<WorldStateService>();   // world suspend/resume — registry lives on disk, not in a swappable DB
 builder.Services.AddSingleton<ChangeGraphService>();  // audit_log as a drillable graph, with entry/batch undo
 builder.Services.AddSingleton<DivergenceService>();   // live drift vs og_* baselines — the state view behind the graph
 builder.Services.AddSingleton<DbcService>();
+builder.Services.AddSingleton<BotTalentVisibilityService>();
 builder.Services.AddSingleton<HeightMapService>();
 builder.Services.AddSingleton<BotBridgeService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BotBridgeService>());
@@ -140,6 +142,9 @@ builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.TbcArmorImporter
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.WotlkArmorCatalog>();
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.WotlkArmorImporter>();
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.ArmorImportSources>();
+// Vanilla clone lane: the stock sets come from the mounted 1.12 client's own ItemSet.dbc, not from a
+// later-client archive, so this sits outside ArmorImportSources (which pairs the two IMPORT lanes).
+builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.VanillaArmorSetCatalog>();
 
 // NPC dev window (spawn / pathing / aggro) commit + audit path.
 builder.Services.AddScoped<NpcDevApplyService>();
@@ -176,6 +181,14 @@ builder.Services.AddSingleton<IBotPlanner, HubErrandPlanner>();  // Goal.Vendori
 // push (2026-07-16). Self-wires into BotBridgeService for the HELLO re-push; the activation
 // line after Build() below is what actually constructs it before the first bot connects.
 builder.Services.AddSingleton<RotationService>();
+builder.Services.AddSingleton<BotCombatLoadoutService>();
+builder.Services.AddSingleton<BotCombatLoadoutQueueService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BotCombatLoadoutQueueService>());
+
+// Read-only spellbook projection for the Bot Monitor. It rides on RotationService so a
+// learned-spell view can also say which instructions of the assigned custom slate the
+// bot cannot actually cast; nothing here mutates character or core state.
+builder.Services.AddSingleton<BotSpellbookVisibilityService>();
 
 // [RAID-PLAN] Raid plan documents (the Encounter Lab's exports) — storage, assignment
 // persistence, LOAD_RAID_PLAN push (PLAN_19 M-B). Same self-wire + eager-construction

@@ -1,19 +1,21 @@
 -- ============================================================================
 -- MangosSuperUI — vmangos_admin schema
 -- ============================================================================
--- These tables are created automatically by DbInitializationService on first
--- boot. This file is provided for reference and manual setup only.
+-- This is the base fresh-install schema. It is shipped in every publish and
+-- applied by setup-mangossuperui.sh before the first service start. Runtime
+-- initialization then migrates these core tables and creates feature-specific
+-- registries as their owning services need them.
 --
 -- Tables prefixed og_baseline_* are NOT included here — they are 1:1 structural
 -- copies of VMaNGOS tables (items, creatures, game objects, loot, etc.) and are
 -- auto-created at runtime when baseline snapshots are taken.
 --
 -- Usage (if creating manually):
---   mysql -u mangos -pmangos vmangos_admin < vmangos_admin_schema.sql
+--   mysql -u mangos -pmangos < vmangos_admin_schema.sql
 -- ============================================================================
 
 CREATE DATABASE IF NOT EXISTS `vmangos_admin`
-  DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 
 USE `vmangos_admin`;
 
@@ -96,6 +98,48 @@ CREATE TABLE IF NOT EXISTS `scheduled_actions` (
   KEY `idx_execute_at` (`execute_at`),
   KEY `idx_status` (`status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------------------------
+-- bot_combat_loadout_queue
+-- One durable, replaceable combat-build intent per bot. A row is claimed and
+-- assigned its core request id before the TCP command is sent. Dispatches with
+-- an unknown outcome are retained as uncertain and are never retried blindly.
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `bot_combat_loadout_queue` (
+  `bot_guid` int(10) unsigned NOT NULL,
+  `bot_name` varchar(32) NOT NULL,
+  `queue_id` char(32) NOT NULL,
+  `status` varchar(24) NOT NULL DEFAULT 'waiting',
+  `payload_json` mediumtext NOT NULL,
+  `spec_tab` tinyint(3) unsigned NOT NULL,
+  `profile_id` varchar(63) NOT NULL,
+  `profile_name` varchar(63) NOT NULL,
+  `active_role` tinyint(3) unsigned NOT NULL,
+  `active_role_name` varchar(32) NOT NULL,
+  `rotation_mode` varchar(16) NOT NULL,
+  `rotation_profile` varchar(63) DEFAULT NULL,
+  `rotation_name` varchar(96) NOT NULL,
+  `rotation_fingerprint` char(64) DEFAULT NULL,
+  `reset_talents` tinyint(1) NOT NULL DEFAULT 0,
+  `expected_revision` int(10) unsigned NOT NULL,
+  `observed_session_at` datetime(3) DEFAULT NULL,
+  `request_id` char(32) DEFAULT NULL,
+  `claim_owner` char(32) DEFAULT NULL,
+  `claim_expires_at` datetime(3) DEFAULT NULL,
+  `attempt_count` int(10) unsigned NOT NULL DEFAULT 0,
+  `queued_by` varchar(64) NOT NULL DEFAULT 'web',
+  `queued_from` varchar(64) DEFAULT NULL,
+  `created_at` datetime(3) NOT NULL DEFAULT current_timestamp(3),
+  `updated_at` datetime(3) NOT NULL DEFAULT current_timestamp(3) ON UPDATE current_timestamp(3),
+  `next_attempt_at` datetime(3) NOT NULL DEFAULT current_timestamp(3),
+  `dispatched_at` datetime(3) DEFAULT NULL,
+  `completed_at` datetime(3) DEFAULT NULL,
+  `last_code` varchar(64) DEFAULT NULL,
+  `last_message` text DEFAULT NULL,
+  PRIMARY KEY (`bot_guid`),
+  UNIQUE KEY `uq_bot_combat_loadout_queue_id` (`queue_id`),
+  KEY `idx_bot_combat_loadout_queue_due` (`status`,`next_attempt_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- --------------------------------------------------------------------------
 -- lootifier_generated_items

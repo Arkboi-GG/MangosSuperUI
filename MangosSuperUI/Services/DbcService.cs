@@ -802,7 +802,7 @@ public partial class DbcService
     /// Spell.dbc — 173 fields, 692 bytes per record (vanilla 1.12.1 build 5875).
     /// Only parses the fields needed for source-spell search and item-effect validation:
     ///   [0]   ID
-    ///   [6]   Attributes (check HIDDEN bit 0x80)
+    ///   [6]   Attributes (PASSIVE bit 0x40, HIDDEN bit 0x80)
     ///   [28]  SpellLevel
     ///   [115] SpellVisualID[0]
     ///   [117] SpellIconID
@@ -828,6 +828,7 @@ public partial class DbcService
             uint attributes = BitConverter.ToUInt32(records, o + 6 * 4);
 
             bool hidden = (attributes & 0x80) != 0;
+            bool passive = (attributes & 0x40) != 0;
 
             uint spellLevel = BitConverter.ToUInt32(records, o + 28 * 4);
             uint spellVisual1 = BitConverter.ToUInt32(records, o + 115 * 4);
@@ -841,7 +842,7 @@ public partial class DbcService
             string description = ReadString(stringBlock, descOffset);
 
             dict[id] = new SpellDbcEntry(id, name, subtext, 0, spellVisual1, spellIconId,
-                spellLevel, description, hidden);
+                spellLevel, description, hidden, passive);
         }
 
         LoadedCounts["Spell"] = dict.Count;
@@ -1423,7 +1424,8 @@ public record SpellDbcEntry(
     uint SpellIconId,
     uint SpellLevel,
     string Description = "",
-    bool Hidden = false
+    bool Hidden = false,
+    bool Passive = false
 );
 
 /// <summary>

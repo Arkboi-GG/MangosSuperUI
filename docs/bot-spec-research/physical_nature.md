@@ -147,7 +147,7 @@ Purchase order:
 
 - 10–11 Improved Sinister Strike; 12–14 Improved Gouge; 15–19 Deflection; 20 Riposte (14251).
 - 21–22 Endurance; 23–24 Improved Sprint; 25–29 Precision; 30 Blade Flurry (13877); 31–35 Dual Wield Specialization.
-- 36–38 Aggression; 39–40 Weapon Expertise; 41 Adrenaline Rush (13750).
+- 36–38 Aggression; 39 Weapon Expertise rank 1; 40 Adrenaline Rush (13750); 41 Weapon Expertise rank 2.
 - 42–46 Malice; 47–49 Improved Slice and Dice; 50–51 Murder; 52 Relentless Strikes; 53–57 Lethality; 58–60 Ruthlessness.
 
 Spec priority additions:

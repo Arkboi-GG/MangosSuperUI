@@ -18,8 +18,24 @@ public partial class BotsController : Controller
     private readonly BotLogBuffer _log;
     private readonly RaService _ra;
     private readonly BotSpawnService _spawner;
+    private readonly BotTalentVisibilityService _talents;
+    private readonly BotSpellbookVisibilityService _spellbook;
+    private readonly BotCombatLoadoutService _combatLoadouts;
+    private readonly BotCombatLoadoutQueueService _combatLoadoutQueue;
 
-    public BotsController(BotBridgeService bridge, BotBrainService brain, ConnectionFactory db, DbcService dbc, BotFlightRecorder recorder, BotLogBuffer log, RaService ra, BotSpawnService spawner)
+    public BotsController(
+        BotBridgeService bridge,
+        BotBrainService brain,
+        ConnectionFactory db,
+        DbcService dbc,
+        BotFlightRecorder recorder,
+        BotLogBuffer log,
+        RaService ra,
+        BotSpawnService spawner,
+        BotTalentVisibilityService talents,
+        BotSpellbookVisibilityService spellbook,
+        BotCombatLoadoutService combatLoadouts,
+        BotCombatLoadoutQueueService combatLoadoutQueue)
     {
         _bridge = bridge;
         _brain = brain;
@@ -29,6 +45,10 @@ public partial class BotsController : Controller
         _log = log;
         _ra = ra;
         _spawner = spawner;
+        _talents = talents;
+        _spellbook = spellbook;
+        _combatLoadouts = combatLoadouts;
+        _combatLoadoutQueue = combatLoadoutQueue;
     }
 
     public IActionResult Index()
@@ -210,6 +230,208 @@ public partial class BotsController : Controller
         if (state == null)
             return NotFound(new { error = $"Bot {id} not found" });
         return Json(state);
+    }
+
+    /// <summary>
+    /// Authoritative talent visibility for one character. The selected profile and
+    /// active role come from characters.playerbot; learned ranks come only from exact
+    /// character_spell -> Talent.dbc RankID matches. The endpoint is deliberately
+    /// lazy/per-bot so opening the cockpit never creates a fleet-sized query storm.
+    /// </summary>
+    [HttpGet("Bots/Talents/{guid:int}")]
+    public async Task<IActionResult> Talents(int guid)
+    {
+        var result = await _talents.GetAsync(guid, HttpContext.RequestAborted);
+        return result.ErrorCode == "not_found" ? NotFound(result) : Json(result);
+    }
+
+    /// <summary>
+    /// Authoritative spellbook for one character: every enabled character_spell row
+    /// resolved against build-5875 Spell/SkillLine DBCs, grouped into the client's own
+    /// spellbook tabs, with the highest known rank of each chain marked. It also
+    /// cross-references the bot's persisted custom rotation so an instruction naming an
+    /// unlearned or outgrown rank is visible here rather than only as a skipped count.
+    /// Read-only, and lazy per-bot for the same reason the talent endpoint is.
+    /// </summary>
+    [HttpGet("Bots/Spellbook/{guid:int}")]
+    public async Task<IActionResult> Spellbook(int guid)
+    {
+        var result = await _spellbook.GetAsync(guid, HttpContext.RequestAborted);
+        return result.ErrorCode == "not_found" ? NotFound(result) : Json(result);
+    }
+
+    /// <summary>
+    /// Unified persisted talent + effective runtime rotation projection. Unlike
+    /// the legacy Talents endpoint, this requires a managed playerbot row and
+    /// reports what the connected core says it is actually executing.
+    /// </summary>
+    [HttpGet("Bots/CombatLoadout/{guid:int}")]
+    public async Task<IActionResult> CombatLoadout(int guid)
+    {
+        try
+        {
+            BotCombatLoadoutView view = await _combatLoadouts.GetAsync(guid, HttpContext.RequestAborted);
+            view.QueuedChange = await _combatLoadoutQueue.GetAsync(guid, HttpContext.RequestAborted);
+            return Json(view);
+        }
+        catch (BotCombatLoadoutException ex)
+        {
+            return StatusCode(ex.StatusCode, new { errorCode = ex.Code, error = ex.Message });
+        }
+        catch (BotCombatLoadoutQueueException ex)
+        {
+            return StatusCode(ex.StatusCode, new { errorCode = ex.Code, error = ex.Message });
+        }
+        catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            return new EmptyResult();
+        }
+        catch
+        {
+            return StatusCode(500, new
+            {
+                errorCode = "combat_loadout_unavailable",
+                error = "Combat loadout data is temporarily unavailable."
+            });
+        }
+    }
+
+    /// <summary>
+    /// Apply talents, active role, and rotation as one correlated core command.
+    /// The HTTP request completes only after COMBAT_LOADOUT_ACK or a bounded
+    /// timeout; it never retries a destructive talent reset.
+    /// </summary>
+    [HttpPost("Bots/CombatLoadout/{guid:int}")]
+    public async Task<IActionResult> ApplyCombatLoadout(
+        int guid,
+        [FromBody] BotCombatLoadoutRequest? request)
+    {
+        if (request == null)
+            return BadRequest(new { errorCode = "request_required", error = "A combat loadout request body is required." });
+
+        try
+        {
+            try
+            {
+                return Json(await _combatLoadoutQueue.ApplyDirectAsync(
+                    guid,
+                    request,
+                    HttpContext.RequestAborted,
+                    User.Identity?.Name ?? "web",
+                    HttpContext.Connection.RemoteIpAddress?.ToString()));
+            }
+            catch (BotCombatLoadoutException ex)
+                when (BotCombatLoadoutQueueService.CanQueueAfterDirectRejection(ex.Code))
+            {
+                // The page can become stale between GET and POST, and several core
+                // safety gates (casting, taxi, teleport, possession, battleground)
+                // are only known authoritatively at dispatch time. Their rejection
+                // occurs before mutation, so preserve the user's exact intent in the
+                // one-deep queue instead of making them submit the same build again.
+                BotCombatLoadoutQueueMutationResult queued = await _combatLoadoutQueue.EnqueueAsync(
+                    guid,
+                    request,
+                    User.Identity?.Name ?? "web",
+                    HttpContext.Connection.RemoteIpAddress?.ToString(),
+                    HttpContext.RequestAborted);
+                return Accepted(queued);
+            }
+        }
+        catch (BotCombatLoadoutException ex)
+        {
+            return StatusCode(ex.StatusCode, new { errorCode = ex.Code, error = ex.Message });
+        }
+        catch (BotCombatLoadoutQueueException ex)
+        {
+            return StatusCode(ex.StatusCode, new { errorCode = ex.Code, error = ex.Message });
+        }
+        catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            return new EmptyResult();
+        }
+        catch
+        {
+            return StatusCode(500, new
+            {
+                errorCode = "combat_loadout_apply_failed",
+                error = "The combat loadout could not be applied. Refresh runtime state before trying again."
+            });
+        }
+    }
+
+    /// <summary>
+    /// Save or replace the one pending combat build for an online bot. The worker
+    /// dispatches only in the same live session once the bot is alive and out of
+    /// combat. The queued request is never auto-retried after an uncertain send.
+    /// </summary>
+    [HttpPost("Bots/CombatLoadout/{guid:int}/Queue")]
+    public async Task<IActionResult> QueueCombatLoadout(
+        int guid,
+        [FromBody] BotCombatLoadoutRequest? request)
+    {
+        if (request == null)
+            return BadRequest(new { errorCode = "request_required", error = "A combat loadout request body is required." });
+
+        try
+        {
+            BotCombatLoadoutQueueMutationResult result = await _combatLoadoutQueue.EnqueueAsync(
+                guid,
+                request,
+                User.Identity?.Name ?? "web",
+                HttpContext.Connection.RemoteIpAddress?.ToString(),
+                HttpContext.RequestAborted);
+            return Accepted(result);
+        }
+        catch (BotCombatLoadoutException ex)
+        {
+            return StatusCode(ex.StatusCode, new { errorCode = ex.Code, error = ex.Message });
+        }
+        catch (BotCombatLoadoutQueueException ex)
+        {
+            return StatusCode(ex.StatusCode, new { errorCode = ex.Code, error = ex.Message });
+        }
+        catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            return new EmptyResult();
+        }
+        catch
+        {
+            return StatusCode(500, new
+            {
+                errorCode = "combat_loadout_queue_failed",
+                error = "The combat loadout could not be queued. Nothing was sent to the bot."
+            });
+        }
+    }
+
+    /// <summary>Cancel an unsent queued combat build.</summary>
+    [HttpDelete("Bots/CombatLoadout/{guid:int}/Queue")]
+    public async Task<IActionResult> CancelQueuedCombatLoadout(
+        int guid,
+        [FromQuery] string? expectedQueueId,
+        [FromQuery] string? expectedStatus)
+    {
+        try
+        {
+            return Json(await _combatLoadoutQueue.CancelAsync(
+                guid, expectedQueueId, expectedStatus, HttpContext.RequestAborted));
+        }
+        catch (BotCombatLoadoutQueueException ex)
+        {
+            return StatusCode(ex.StatusCode, new { errorCode = ex.Code, error = ex.Message });
+        }
+        catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            return new EmptyResult();
+        }
+        catch
+        {
+            return StatusCode(500, new
+            {
+                errorCode = "combat_loadout_cancel_failed",
+                error = "The queued combat loadout could not be cancelled. Refresh its state before trying again."
+            });
+        }
     }
 
     [HttpPost]

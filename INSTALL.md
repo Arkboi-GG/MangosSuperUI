@@ -29,8 +29,9 @@ These are owned and documented by the **SuperUI-Core** repository, not here:
 
 > **See [SuperUI-Core `INSTALL.md`](https://github.com/Yafrovon/SuperUI-Core/blob/development/INSTALL.md) → "Apply the SuperUI-Core schema deltas".**
 > It covers the `playerbot` 12-column fix (fresh installs get it from `sql/characters.sql`;
-> existing DBs apply `sql/migrations/20260820120000_characters.sql`) and the boot-critical
-> `vmangos_admin.lootifier_generated_items` table.
+> existing DBs apply `sql/migrations/20260820120000_characters.sql`) and the shared
+> `vmangos_admin` prerequisite tables, including boot-critical
+> `lootifier_generated_items` and MangosSuperUI's durable bot combat-loadout queue.
 
 **If your SuperUI-Core server already logs in and plays, you have already done this** — skip
 ahead. If mangosd is terminating during startup, do the SuperUI-Core steps first, then return here.
@@ -548,9 +549,9 @@ sudo systemctl enable mangossuperui
 
 ### Step 12: Prepare the Admin Database
 
-MangosSuperUI uses its own database called `vmangos_admin` for audit logs, config history, baseline snapshots, and scheduled actions. On first boot, MangosSuperUI's `DbInitializationService` automatically creates the tables and indexes inside this database — but it cannot create the database itself or grant its own permissions. The default SuperUI-Core database user (`mangos`) only has grants on the core databases, not server-level `CREATE` privileges.
+MangosSuperUI uses its own database called `vmangos_admin` for audit logs, config history, baseline snapshots, scheduled actions, and the durable bot combat-loadout queue. The setup script applies the base schema before the service starts; startup initialization then migrates core tables and creates feature-specific registries as needed. The application cannot grant its own permissions, so prepare the database access first.
 
-> **If you followed [Step 0b](#0b-create-the-vmangos_admin-database-and-its-schema-required-by-the-core-at-world-load), this is already done.** The compiled core reads `vmangos_admin.lootifier_generated_items` at world-load, so you created the database and loaded its schema back in Part 1. This step then becomes a no-op verification — the web app finds the tables already present and creates nothing. It's kept here as the canonical reference for the grant and for installs where the admin DB somehow isn't present yet.
+> **If you followed Step 0 / SuperUI-Core's database instructions, the database and grant are already present.** The compiled core reads `vmangos_admin.lootifier_generated_items` at world-load, and the current `sql/superui/03_vmangos_admin_lootifier.sql` also pre-creates the bot combat-loadout queue. This step remains the canonical grant check for installations where the admin database is not present yet.
 
 You must create the database and grant access **before MangosSuperUI starts for the first time:**
 
@@ -574,7 +575,7 @@ mysql -u mangos -pmangos -e "USE vmangos_admin; SELECT 'OK';"
 
 You should see `OK`. If you get "Access denied", double-check the username and re-run the grant command.
 
-> **What happens on first boot:** When MangosSuperUI starts, `DbInitializationService` connects to `vmangos_admin` and runs `CREATE TABLE IF NOT EXISTS` for four tables: `audit_log`, `config_history`, `scheduled_actions`, and `og_baseline_meta` — all with their indexes. This is automatic and silent. If the database doesn't exist or the user lacks permission, the dashboard will show the Admin database as red, but the rest of MangosSuperUI still functions.
+> **What happens during setup and first boot:** Step 13 imports `/opt/mangossuperui/sql/vmangos_admin_schema.sql` idempotently before starting the service. It includes `bot_combat_loadout_queue` and its dispatch indexes. On startup, `DbInitializationService` creates any missing core admin tables and applies column migrations for upgrades. If the database is inaccessible, setup stops with the grant to check instead of leaving a partially configured installation.
 
 ---
 
@@ -582,16 +583,17 @@ You should see `OK`. If you get "Access denied", double-check the username and r
 
 MangosSuperUI needs a `server-config.json` file that tells it how to connect to your databases, where your SuperUI-Core files are, and your RA credentials. Rather than filling this out manually, the setup script auto-discovers everything from your `mangosd.conf`.
 
-**Download the setup script:**
+The setup script is included in the published release. Run it directly:
+
+```bash
+sudo bash /opt/mangossuperui/Scripts/setup-mangossuperui.sh
+```
+
+If you installed an older package that does not contain `Scripts/`, download the current standalone script instead:
 
 ```bash
 cd ~
 wget https://github.com/Yafrovon/MangosSuperUI/releases/latest/download/setup-mangossuperui.sh
-```
-
-**Run it:**
-
-```bash
 sudo bash ~/setup-mangossuperui.sh
 ```
 
@@ -609,9 +611,11 @@ The script will:
 
 6. **Test RA connectivity** — quick TCP check to confirm the RA port is reachable.
 
-7. **Generate `server-config.json`** — writes the config file to `/opt/mangossuperui/server-config.json` and shows you a summary of everything it discovered.
+7. **Provision `vmangos_admin`** — imports the published `sql/vmangos_admin_schema.sql`, including the durable `bot_combat_loadout_queue` table and indexes.
 
-8. **Start MangosSuperUI** — starts (or restarts) the service so the new configuration takes effect. This is the first real boot.
+8. **Generate `server-config.json`** — writes the config file to `/opt/mangossuperui/server-config.json` and shows you a summary of everything it discovered.
+
+9. **Start MangosSuperUI and verify the queue schema** — starts or restarts the service, lets runtime migrations finish, then checks every required queue column and index.
 
 **Example output from a successful run:**
 
@@ -624,7 +628,7 @@ Step 2: Reading database connections from mangosd.conf
   ✓ Characters: mangos@127.0.0.1:3306/characters
   ✓ Realmd: mangos@127.0.0.1:3306/realmd
   ✓ Logs: mangos@127.0.0.1:3306/logs
-  ✓ Admin: mangos@127.0.0.1:3306/vmangos_admin (auto-created on first boot)
+  ✓ Admin: mangos@127.0.0.1:3306/vmangos_admin
 
 Step 3: Discovering SuperUI-Core paths
   ✓ Config directory: /home/nicholas/vmangos/run/etc
@@ -654,7 +658,10 @@ Step 5: Testing RA connectivity
 Step 6: Verifying MangosSuperUI installation
   ✓ MangosSuperUI.dll found in /opt/mangossuperui
 
-Step 7: Generating server-config.json
+Step 7: Provisioning vmangos_admin schema
+  ✓ Applied base schema: /opt/mangossuperui/sql/vmangos_admin_schema.sql
+
+Step 8: Generating server-config.json
 
 Configuration Summary
 
@@ -684,8 +691,9 @@ Configuration Summary
 
   ✓ Written to /opt/mangossuperui/server-config.json
 
-Step 8: Starting MangosSuperUI
+Step 9: Starting MangosSuperUI
   ✓ MangosSuperUI started successfully
+  ✓ Combat-loadout queue table and indexes verified
 
 Setup Complete!
 
@@ -715,7 +723,7 @@ The Dashboard should show:
 - **realmd**: green (running)
 - **RA**: green (connected)
 - **All five databases**: green (reachable)
-- **vmangos_admin**: initialized (tables created automatically on first connection)
+- **vmangos_admin**: initialized, including the durable combat-loadout queue
 - **Players Online**, **Uptime**, and **Core Revision**: showing live data from the RA connection
 
 If all indicators are green, your MangosSuperUI installation is fully operational.
@@ -897,7 +905,7 @@ Open the Dashboard in your browser at `http://YOUR_SERVER_IP:5000` and confirm:
 - realmd: green (running)
 - RA: green (connected)
 - All five databases: green (reachable)
-- vmangos_admin: initialized (tables created automatically)
+- vmangos_admin: initialized, including the durable combat-loadout queue
 - Players Online / Uptime / Core Revision: showing live data
 
 If all indicators are green, your MangosSuperUI installation is complete.

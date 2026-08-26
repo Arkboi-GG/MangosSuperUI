@@ -20,6 +20,7 @@ public class ArmorForgeController : Controller
 {
     private readonly CustomArmorBuildService _armor;
     private readonly ArmorImportSources _lanes;
+    private readonly VanillaArmorSetCatalog _vanillaSets;
     private readonly DbcService _dbc;
     private readonly ItemConfigurationParser _itemConfig;
     private readonly ItemBudgetGenerator _itemize;
@@ -33,9 +34,9 @@ public class ArmorForgeController : Controller
     private const string ArmorInventoryTypeError =
         "inventoryType must be a wearable Vanilla armor slot: 1 head, 3 shoulder, 5 chest, 6 waist, 7 legs, 8 feet, 9 wrists, 10 hands, 16 back, 20 robe, 23 held.";
 
-    public ArmorForgeController(CustomArmorBuildService armor, ArmorImportSources lanes, DbcService dbc, ItemConfigurationParser itemConfig, ItemBudgetGenerator itemize, PaletteSwapService palette, BlpWriterService blp, ProcessManagerService processes, IWebHostEnvironment env, ILogger<ArmorForgeController> logger)
+    public ArmorForgeController(CustomArmorBuildService armor, ArmorImportSources lanes, VanillaArmorSetCatalog vanillaSets, DbcService dbc, ItemConfigurationParser itemConfig, ItemBudgetGenerator itemize, PaletteSwapService palette, BlpWriterService blp, ProcessManagerService processes, IWebHostEnvironment env, ILogger<ArmorForgeController> logger)
     {
-        _armor = armor; _lanes = lanes; _dbc = dbc; _itemConfig = itemConfig; _itemize = itemize; _palette = palette; _blp = blp; _processes = processes; _env = env; _logger = logger;
+        _armor = armor; _lanes = lanes; _vanillaSets = vanillaSets; _dbc = dbc; _itemConfig = itemConfig; _itemize = itemize; _palette = palette; _blp = blp; _processes = processes; _env = env; _logger = logger;
     }
 
     public IActionResult Index() => View();
@@ -64,6 +65,28 @@ public class ArmorForgeController : Controller
             deployedPatch = DeployedPatchJson(),
             serverItemSet = ServerItemSetJson(),
         });
+    }
+
+    /// <summary>GET /ArmorForge/VanillaStatus — reachability + row count for the vanilla clone lane.
+    ///
+    /// Deliberately NOT part of <see cref="Status"/>. Everything Status reports is a file or process
+    /// probe, and the view enables the TBC and WotLK search boxes inside that one fetch's callback — so
+    /// folding a world-DB round trip into it made two lanes that need no database sit disabled for the
+    /// full MySQL connect timeout whenever the database was unreachable. This lane's card is seeded
+    /// lazily anyway, so its status is fetched on the same trigger.</summary>
+    [HttpGet]
+    public async Task<IActionResult> VanillaStatus()
+    {
+        try
+        {
+            var pieces = await _armor.CountVanillaAsync();
+            return Json(new { expansion = "vanilla", label = "Vanilla", configured = true, error = (string?)null, pieces, sets = 0 });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ArmorForge: vanilla lane status failed");
+            return Json(new { expansion = "vanilla", label = "Vanilla", configured = false, error = ex.Message, pieces = 0, sets = 0 });
+        }
     }
 
     private object DeployedPatchJson()
@@ -117,24 +140,17 @@ public class ArmorForgeController : Controller
     {
         if (string.Equals(expansion, "vanilla", StringComparison.OrdinalIgnoreCase))
         {
-            try
-            {
-                var pieces = await _armor.BrowseVanillaAsync(search, family, limit);
-                var loose = pieces.Select(p => new
-                {
-                    entry = p.Entry, name = p.Name, quality = p.Quality, itemLevel = p.ItemLevel,
-                    displayId = p.DisplayId, inventoryType = p.InventoryType,
-                    family = p.Family, familyLabel = p.FamilyLabel, renderKind = "Painted", expansion = "vanilla",
-                });
-                return Json(new { sets = Array.Empty<object>(), otherSets = Array.Empty<object>(), otherSetCount = 0, loose, total = pieces.Count });
-            }
+            try { return await VanillaBrowseAsync(search, family, limit); }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "ArmorForge: vanilla browse failed");
                 return Json(new { sets = Array.Empty<object>(), otherSets = Array.Empty<object>(), otherSetCount = 0, loose = Array.Empty<object>(), total = 0, error = ex.Message });
             }
         }
-        return LaneBrowse(_lanes.Get(expansion), search, family, limit);
+        var browseLane = TryImportLane(expansion, out var browseError);
+        return browseLane is null
+            ? Json(new { sets = Array.Empty<object>(), otherSets = Array.Empty<object>(), otherSetCount = 0, loose = Array.Empty<object>(), total = 0, error = browseError })
+            : LaneBrowse(browseLane, search, family, limit);
     }
 
     /// <summary>GET /ArmorForge/VanillaSource?entry=… — the source item's real gameplay, to pre-fill the
@@ -142,8 +158,20 @@ public class ArmorForgeController : Controller
     [HttpGet]
     public async Task<IActionResult> VanillaSource(uint entry)
     {
-        var s = await _armor.ReadVanillaSourceAsync(entry);
-        if (s is null) return NotFound(new { ok = false, error = "Not a vanilla armor item." });
+        CustomArmorBuildService.VanillaSourceConfigDto? s;
+        try
+        {
+            s = await _armor.ReadVanillaSourceAsync(entry);
+        }
+        catch (Exception ex)
+        {
+            // { ok, error } rather than an unhandled 500 — prefillFromSource does `r.json()` on the
+            // response, so a world-DB outage surfaced as a parse error in the console and a silently
+            // un-prefilled Configure modal, which then wrote its blank defaults over the clone.
+            _logger.LogWarning(ex, "ArmorForge: vanilla source {Entry} failed", entry);
+            return Json(new { ok = false, error = "Could not read the world database: " + ex.Message });
+        }
+        if (s is null) return Json(new { ok = false, error = "Not a vanilla armor item." });
         return Json(new
         {
             ok = true, name = s.Name, quality = s.Quality, itemLevel = s.ItemLevel, requiredLevel = s.RequiredLevel,
@@ -155,6 +183,124 @@ public class ArmorForgeController : Controller
             spells = s.Spells.Select(x => new { spellId = x.SpellId, trigger = x.Trigger, charges = x.Charges, ppmRate = x.PpmRate, cooldownMs = x.CooldownMs, category = x.Category, categoryCooldownMs = x.CategoryCooldownMs }),
         });
     }
+
+    /// <summary>One vanilla set card: the stock set plus the members that survived the armor filter.</summary>
+    private sealed record VanillaSetCard(
+        VanillaSetInfo Set,
+        IReadOnlyList<CustomArmorBuildService.VanillaArmorPieceDto> Members,
+        int MaxItemLevel,
+        int MaxQuality,
+        bool Featured);
+
+    /// <summary>The vanilla lane's browse, grouped exactly like <see cref="LaneBrowse"/>: the tier sets
+    /// first, the rest of the stock sets behind the "other sets" toggle, then loose pieces.
+    ///
+    /// The two halves come from different places, which is the whole reason this is not LaneBrowse.
+    /// Set IDENTITY (name, membership, bonuses) is in the mounted client's ItemSet.dbc — measured on a
+    /// real 1.12 mount: 172 sets, every one of them listing its members, so the DBC alone is sufficient
+    /// and nothing has to be grouped by <c>item_template.set_id</c>. Everything the cards SHOW about a
+    /// piece (name, quality, item level, display, slot) is live world-DB data, because that is what a
+    /// clone actually copies. A set whose members include weapons or rings loses them to the armor
+    /// filter, and the card reports the count it dropped rather than pretending to be complete.</summary>
+    private async Task<IActionResult> VanillaBrowseAsync(string? search, string? family, int limit)
+    {
+        string q = (search ?? "").Trim();
+        bool Match(string? text) => q.Length == 0 || (text ?? "").Contains(q, StringComparison.OrdinalIgnoreCase);
+        bool hasFamily = !string.IsNullOrWhiteSpace(family);
+
+        // One round trip for every set member on the mount, then group in memory. Measured worst case is
+        // 172 sets x at most 17 members, so this is one IN-list of ~1,000 entries, not a per-set query.
+        var stockSets = _vanillaSets.Sets();
+        var allMembers = stockSets.SelectMany(x => x.MemberEntries).Distinct().ToArray();
+        var stockSetIds = stockSets.Select(x => x.SetId).ToArray();
+        var memberPieces = stockSets.Count > 0
+            ? await _armor.ReadVanillaPiecesAsync(allMembers, stockSetIds)
+            : (IReadOnlyList<CustomArmorBuildService.VanillaArmorPieceDto>)Array.Empty<CustomArmorBuildService.VanillaArmorPieceDto>();
+        var pieceByEntry = memberPieces.ToDictionary(x => x.Entry);
+        // Membership by the column the SERVER counts, for the union below.
+        var byColumn = memberPieces.Where(x => x.SetId > 0)
+            .GroupBy(x => x.SetId)
+            .ToDictionary(g => g.Key, g => g.Select(x => x.Entry).ToHashSet());
+
+        var cards = new List<VanillaSetCard>();
+        foreach (var set in stockSets)
+        {
+            // DBC membership (what the client tooltip shows) unioned with item_template.set_id (what the
+            // core counts). They agree on stock data; on an edited world DB the card must not promise a
+            // set the server will count differently.
+            var entries = new List<uint>(set.MemberEntries);
+            if (byColumn.TryGetValue(set.SetId, out var columnEntries))
+                foreach (var e in columnEntries) if (!entries.Contains(e)) entries.Add(e);
+
+            var members = entries.Where(pieceByEntry.ContainsKey).Select(e => pieceByEntry[e])
+                .OrderBy(m => SlotOrder(m.InventoryType)).ToList();
+            if (members.Count == 0) continue;                       // a weapons-only set: not ours to clone
+            if (hasFamily && !members.Any(m => m.Family.Equals(family, StringComparison.OrdinalIgnoreCase))) continue;
+            if (!(Match(set.Name) || members.Any(m => Match(m.Name)) || (q.Length > 0 && set.SetId.ToString() == q))) continue;
+
+            int maxIlvl = members.Max(m => m.ItemLevel), maxQuality = members.Max(m => m.Quality);
+            // Vanilla's own predicate, not the import lanes' — see VanillaArmorSetCatalog for the
+            // measurements behind both numbers, and for why quality is not part of it here.
+            cards.Add(new VanillaSetCard(set, members, maxIlvl, maxQuality,
+                members.Count >= VanillaArmorSetCatalog.FeaturedMinArmorPieces
+                && maxIlvl >= VanillaArmorSetCatalog.FeaturedMinItemLevel));
+        }
+
+        var ordered = cards.OrderByDescending(c => c.MaxItemLevel)
+                           .ThenBy(c => c.Set.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        var featuredAll = ordered.Where(c => c.Featured).ToList();
+        var otherAll = ordered.Where(c => !c.Featured).OrderBy(c => c.Set.Name, StringComparer.OrdinalIgnoreCase).ToList();
+
+        // Loose pieces: the ordinary browse minus anything a card above already shows.
+        var loosePieces = await _armor.BrowseVanillaAsync(search, family, limit);
+        var shown = ordered.SelectMany(c => c.Members).Select(m => m.Entry).ToHashSet();
+        var loose = loosePieces.Where(x => !shown.Contains(x.Entry)).Select(VanillaPieceDto).ToList();
+
+        bool slotSearch = q.Length > 0 && !hasFamily && ArmorTypeCatalog.FamilyForSlotWord(q) != null;
+        return Json(new
+        {
+            expansion = "vanilla", label = "Vanilla",
+            sets = featuredAll.Take(limit * 4).Select(VanillaSetDto).ToList(),
+            otherSets = otherAll.Take(limit * 8).Select(VanillaSetDto).ToList(),
+            featuredSetCount = featuredAll.Count, otherSetCount = otherAll.Count,
+            featuredMinItemLevel = VanillaArmorSetCatalog.FeaturedMinItemLevel,
+            loose, total = loosePieces.Count, slotSearch,
+            setsError = _vanillaSets.Error,
+        });
+    }
+
+    private object VanillaSetDto(VanillaSetCard c) => new
+    {
+        setId = c.Set.SetId, name = c.Set.Name, expansion = "vanilla",
+        featured = c.Featured, maxItemLevel = c.MaxItemLevel, maxQuality = c.MaxQuality,
+        pieces = c.Members.Select(VanillaPieceDto).ToList(),
+        // Unique to this lane: a vanilla set's bonus spells exist in a vanilla core by definition, so the
+        // Set Configure modal can offer the source's own table as the starting point instead of making
+        // the operator retype it. The import lanes cannot — their spell ids belong to a later client.
+        // Names resolved here, from the same Spell.dbc the core reads. The modal's effect SEARCH cannot
+        // do it: that endpoint only lists spells used by stock ITEMS, and a set bonus is a set spell.
+        bonuses = c.Set.Bonuses.Select(b => new
+        {
+            spellId = b.SpellId,
+            threshold = b.Threshold,
+            name = _dbc.AllSpellEntries.TryGetValue((uint)b.SpellId, out var sp) && !string.IsNullOrWhiteSpace(sp.Name)
+                ? sp.Name : $"Spell {b.SpellId}",
+        }).ToList(),
+        requiredSkill = c.Set.RequiredSkill, requiredSkillRank = c.Set.RequiredSkillRank,
+        // Members the armor filter dropped — weapons, rings, trinkets. Shown on the card so a 5-of-8
+        // set never looks like the whole thing.
+        droppedMembers = Math.Max(0, c.Set.MemberEntries.Count - c.Members.Count),
+    };
+
+    private static object VanillaPieceDto(CustomArmorBuildService.VanillaArmorPieceDto p) => new
+    {
+        entry = p.Entry, name = p.Name, quality = p.Quality, itemLevel = p.ItemLevel,
+        displayId = p.DisplayId, inventoryType = p.InventoryType,
+        family = p.Family, familyLabel = p.FamilyLabel,
+        // Was hard-coded "Painted", which made every helm, shoulder and cloak in the clone list render
+        // with the paintbrush icon and the "painted" note. The slot decides.
+        renderKind = p.RenderKind.ToString(), expansion = "vanilla",
+    };
 
     private IActionResult LaneBrowse(ArmorImportLane lane, string? search, string? family, int limit)
     {
@@ -240,9 +386,35 @@ public class ArmorForgeController : Controller
     [HttpGet]
     public Task<IActionResult> WotlkDressing(uint entry, string race = "Human", string gender = "Male") => LaneDressing(_lanes.Wotlk, entry, race, gender);
 
-    /// <summary>GET /ArmorForge/ImportDressing?expansion=tbc|wotlk&amp;entry=… — lane-keyed form.</summary>
+    /// <summary>Resolve a lane key for the endpoints that only an IMPORT lane can serve. Returns null
+    /// and fills <paramref name="error"/> for "vanilla" (a clone has no client archive to read art from)
+    /// and for anything unrecognised, so the caller answers 400 with a sentence instead of throwing —
+    /// or, as before this existed, instead of quietly serving 2.4.3 art for a vanilla entry id.</summary>
+    private ArmorImportLane? TryImportLane(string? expansion, out string error)
+    {
+        error = "";
+        try { return _lanes.Get(expansion); }
+        catch (ArgumentOutOfRangeException)
+        {
+            // Compose the operator-facing sentence here rather than surfacing the exception text,
+            // which appends ArgumentOutOfRangeException's "(Parameter 'key') Actual value was …".
+            error = string.Equals(expansion, "vanilla", StringComparison.OrdinalIgnoreCase)
+                ? "The vanilla clone lane has no client archive — it reads the world database, and its pieces " +
+                  "already have a real display, so they dress through /Items/ItemDressing like any other item."
+                : $"'{expansion}' is not an Armor Forge import lane. The import lanes are 'tbc' and 'wotlk'.";
+            return null;
+        }
+    }
+
+    /// <summary>GET /ArmorForge/ImportDressing?expansion=tbc|wotlk&amp;entry=… — lane-keyed form.
+    /// Import lanes only: a vanilla piece already has a real display and dresses through the ordinary
+    /// <c>/Items/ItemDressing</c>, which is what the forge's own viewer calls for it.</summary>
     [HttpGet]
-    public Task<IActionResult> ImportDressing(string? expansion, uint entry, string race = "Human", string gender = "Male") => LaneDressing(_lanes.Get(expansion), entry, race, gender);
+    public Task<IActionResult> ImportDressing(string? expansion, uint entry, string race = "Human", string gender = "Male")
+    {
+        var lane = TryImportLane(expansion, out var error);
+        return lane is null ? Task.FromResult<IActionResult>(BadRequest(new { success = false, error })) : LaneDressing(lane, entry, race, gender);
+    }
 
     private async Task<IActionResult> LaneDressing(ArmorImportLane lane, uint entry, string race, string gender)
     {
@@ -527,7 +699,8 @@ public class ArmorForgeController : Controller
     public async Task<IActionResult> RecolorDressing(string? expansion, uint entry, float hue,
         string theory = "fan", string tier = "improved", string race = "Human", string gender = "Male")
     {
-        var lane = _lanes.Get(expansion);
+        var lane = TryImportLane(expansion, out var laneError);
+        if (lane is null) return BadRequest(new { success = false, error = laneError });
         var payload = await BuildDressingAsync(lane, entry, race, gender, hue, theory, tier);
         return payload is null ? Json(new { success = false, error = "not found" }) : Json(payload);
     }
@@ -537,7 +710,8 @@ public class ArmorForgeController : Controller
     [HttpGet]
     public IActionResult PrimaryColor(string? expansion, uint entry, string race = "Human", string gender = "Male")
     {
-        var lane = _lanes.Get(expansion);
+        var lane = TryImportLane(expansion, out var laneError);
+        if (lane is null) return BadRequest(new { success = false, error = laneError });
         var ext = ExtractDressingSlots(lane, entry, race, gender);
         if (ext is null || ext.Value.SlotDisks.Count == 0) return Json(new { success = false, error = "no sampleable texture" });
 
@@ -610,8 +784,26 @@ public class ArmorForgeController : Controller
         float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", string? glowColor = null,
         float glowIntensity = 1f) =>
         string.Equals(expansion, "vanilla", StringComparison.OrdinalIgnoreCase)
-            ? VanillaClone(entry, name, itemConfig)
-            : LaneImport(_lanes.Get(expansion), entry, name, setId, itemConfig, recolorHue, recolorTheory, recolorTier, HexToRgb255(glowColor), glowIntensity);
+            // The recolor/glow arguments are forwarded, not dropped. A clone cannot bake either of
+            // them, and dropping them here is what made the Appearance panel's "will bake on import"
+            // a lie: the operator picked a colour, watched the preview change, cloned, and got the
+            // original art with nothing said. CloneVanillaAsync refuses the job instead.
+            ? VanillaClone(entry, name, itemConfig,
+                recolorRequested: recolorHue.HasValue,
+                glowRequested: !string.IsNullOrWhiteSpace(glowColor) || Math.Abs(glowIntensity - 1f) > 0.01f)
+            : ImportOnLane(expansion, entry, name, setId, itemConfig, recolorHue, recolorTheory, recolorTier, glowColor, glowIntensity);
+
+    // Split out so an unrecognised lane key answers 400 with a sentence. ArmorImportSources.Get now
+    // throws rather than silently falling back to TBC, and an expression-bodied action had nowhere to
+    // catch it — the throw would have escaped as a 500 whose HTML body the result panel renders raw.
+    private Task<IActionResult> ImportOnLane(string? expansion, uint entry, string? name, int setId, string? itemConfig,
+        float? recolorHue, string recolorTheory, string recolorTier, string? glowColor, float glowIntensity)
+    {
+        var lane = TryImportLane(expansion, out var error);
+        return lane is null
+            ? Task.FromResult<IActionResult>(BadRequest(error))
+            : LaneImport(lane, entry, name, setId, itemConfig, recolorHue, recolorTheory, recolorTier, HexToRgb255(glowColor), glowIntensity);
+    }
 
     // "#rrggbb" → RGB 0..255 vector for the emitter colour track; null when unset/malformed.
     private static Vector3? HexToRgb255(string? hex)
@@ -626,7 +818,8 @@ public class ArmorForgeController : Controller
             ? new Vector3(r, g, b) : null;
     }
 
-    private async Task<IActionResult> VanillaClone(uint entry, string? name, string? itemConfig)
+    private async Task<IActionResult> VanillaClone(uint entry, string? name, string? itemConfig,
+        bool recolorRequested = false, bool glowRequested = false)
     {
         try
         {
@@ -635,7 +828,7 @@ public class ArmorForgeController : Controller
             if (cfgErrors.Count > 0)
                 return BadRequest(string.Join("\n", cfgErrors));
 
-            var r = await _armor.CloneVanillaAsync(entry, name, gameplay);
+            var r = await _armor.CloneVanillaAsync(entry, name, gameplay, recolorRequested, glowRequested);
             return r.Ok ? Json(ResultDto(r)) : BadRequest(r.Message);
         }
         catch (Exception ex) { _logger.LogWarning(ex, "ArmorForge: vanilla clone {Entry} failed", entry); return BadRequest(ex.Message); }
@@ -667,7 +860,13 @@ public class ArmorForgeController : Controller
     public async Task<IActionResult> ImportSet([FromBody] ImportSetDto dto)
     {
         if (dto is null) return BadRequest("Missing body.");
-        var lane = _lanes.Get(dto.Expansion);
+        bool vanilla = string.Equals(dto.Expansion, "vanilla", StringComparison.OrdinalIgnoreCase);
+        ArmorImportLane? lane = null;
+        if (!vanilla)
+        {
+            lane = TryImportLane(dto.Expansion, out var laneError);
+            if (lane is null) return BadRequest(laneError);
+        }
         try
         {
             var perPiece = new Dictionary<uint, ValidatedVanillaItemBuildConfiguration>();
@@ -685,19 +884,72 @@ public class ArmorForgeController : Controller
             var bonuses = (dto.Bonuses ?? new List<BonusDto>()).Select(b => new ArmorSetBonus(b.Threshold, b.SpellId)).ToList();
             var entries = dto.Entries is { Count: > 0 } ? dto.Entries : null;
 
-            var r = await _armor.ImportSetAsync(lane, dto.SourceSetId, entries, perPiece, bonuses,
+            if (vanilla) return await VanillaCloneSetAsync(dto, entries, perPiece, bonuses);
+
+            var r = await _armor.ImportSetAsync(lane!, dto.SourceSetId, entries, perPiece, bonuses,
                 dto.RequiredSkill, dto.RequiredSkillRank, dto.Name,
                 dto.RecolorHue, dto.RecolorTheory ?? "fan", dto.RecolorTier ?? "improved", HexToRgb255(dto.GlowColor),
                 dto.GlowIntensity is { } gi && gi > 0f ? gi : 1f);
             return Json(new
             {
-                ok = true, expansion = lane.Key, setId = r.SetId, name = r.Name, message = r.Message, patchDeployed = r.PatchDeployed,
+                ok = true, expansion = lane!.Key, setId = r.SetId, name = r.Name, message = r.Message, patchDeployed = r.PatchDeployed,
                 serverItemSetDeployed = r.ServerItemSetDeployed, serverItemSetMessage = r.ServerItemSetMessage,
                 bonusCount = bonuses.Count(b => b.Threshold > 0 && b.SpellId > 0),
                 pieces = r.Pieces.Select(ResultDto),
             });
         }
         catch (Exception ex) { _logger.LogWarning(ex, "ArmorForge: set import {Set} failed", dto.SourceSetId); return BadRequest(ex.Message); }
+    }
+
+    /// <summary>The vanilla arm of <see cref="ImportSet"/>: clone a stock set's cloneable armor members
+    /// into one new forged set.
+    ///
+    /// Membership comes from the client's ItemSet.dbc rather than a lane catalog, and it is re-derived
+    /// here rather than trusted from the browser — the request only NARROWS it. Recolor and glow are
+    /// refused for the same reason a single clone refuses them: a clone ships no art.</summary>
+    private async Task<IActionResult> VanillaCloneSetAsync(
+        ImportSetDto dto,
+        List<uint>? entries,
+        Dictionary<uint, ValidatedVanillaItemBuildConfiguration> perPiece,
+        List<ArmorSetBonus> bonuses)
+    {
+        if (dto.RecolorHue.HasValue || !string.IsNullOrWhiteSpace(dto.GlowColor)
+            || (dto.GlowIntensity is { } g && Math.Abs(g - 1f) > 0.01f))
+            return BadRequest(
+                "A cloned set cannot carry a recolor or glow tint — its pieces reuse the source items' own " +
+                "displays, and new art needs new displays plus a patch-6 rebuild. Import the set from the " +
+                "TBC or WotLK lane if you want the appearance baked in.");
+
+        var source = _vanillaSets.Get((int)dto.SourceSetId);
+        if (source is null) return BadRequest($"Vanilla set {dto.SourceSetId} is not in the mounted client's ItemSet.dbc.");
+
+        // Re-resolve the members server-side; the request may only narrow the set, never extend it.
+        var cloneable = await _armor.ReadVanillaPiecesAsync(source.MemberEntries.ToArray());
+        var chosen = cloneable
+            .Where(x => entries is null || entries.Contains(x.Entry))
+            .OrderBy(x => SlotOrder(x.InventoryType))
+            .Select(x => x.Entry)
+            .ToList();
+        if (chosen.Count == 0)
+            return BadRequest($"'{source.Name}' has no cloneable armor pieces (its members are weapons, rings or trinkets).");
+
+        string name = string.IsNullOrWhiteSpace(dto.Name) ? source.Name : dto.Name!.Trim();
+
+        var r = await _armor.CloneVanillaSetAsync(
+            source.SetId, chosen, name, perPiece, bonuses, dto.RequiredSkill, dto.RequiredSkillRank);
+
+        return Json(new
+        {
+            ok = true, expansion = "vanilla", setId = r.SetId, name = r.Name, message = r.Message,
+            patchDeployed = r.PatchDeployed,
+            serverItemSetDeployed = r.ServerItemSetDeployed, serverItemSetMessage = r.ServerItemSetMessage,
+            bonusCount = bonuses.Count(b => b.Threshold > 0 && b.SpellId > 0),
+            pieces = r.Pieces.Select(ResultDto),
+            // A cloned SET, unlike a single clone, does ship something: the ItemSet.dbc row that makes it
+            // a set at all. The UI has to say so, because every other message in this lane says the
+            // opposite.
+            requiresRestart = true,
+        });
     }
 
     public sealed class ImportSetDto
@@ -728,7 +980,11 @@ public class ArmorForgeController : Controller
         {
             sql = new { ok = r.Apply.SqlApplied, msg = r.Apply.SqlMessage },
             reload = new { ok = r.Apply.Reloaded, msg = r.Apply.ReloadMessage },
-            deploy = new { ok = r.Apply.PatchDeployed, msg = r.Apply.PatchDeployMessage },
+            // Null when there is no patch step at all, using the same "omit it rather than report a
+            // false failure" idiom as serverSets below. A vanilla clone ships no art, so the untouched
+            // PatchDeployed=false / empty-message pair used to render as a red, blank "Deploy ✗" row on
+            // every successful clone — the operator reading a completed job as half-broken.
+            deploy = r.Apply.PatchRequired ? new { ok = r.Apply.PatchDeployed, msg = r.Apply.PatchDeployMessage } : null,
             serverSets = r.Apply.ServerItemSetState == nameof(ItemSetDeployState.NotNeeded) ? null : new
             {
                 ok = r.Apply.ServerItemSetState == nameof(ItemSetDeployState.Deployed),
