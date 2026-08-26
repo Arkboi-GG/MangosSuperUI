@@ -9,42 +9,68 @@ namespace MangosSuperUI.Services;
 ///       → SpellVisualEffectName.dbc rows (headEffect, chestEffect, baseEffect, leftHandEffect, etc.)
 ///         → M2 file paths (the actual particle/effect models)
 ///
-/// SpellVisual.dbc layout (16 fields, 64 bytes per record):
-///   EMPIRICALLY VERIFIED (April 2026, rows 67=Fireball, 64=ShadowBolt):
+/// FIELD MAP SOURCE OF TRUTH
+///   These indices are the client's, taken from MSUIClient's
+///   Formats/SpellVisualCatalog.cs — byte-verified against build 5875 and
+///   cross-checked by tools/spellvis/spellvis.py, which is the documented oracle
+///   for this layout. A loader that actually RENDERS these rows is the only field
+///   map worth trusting; the numbers below were re-confirmed against our own
+///   dbc/patch MPQs before being written down.
+///
+/// SpellVisual.dbc layout (16 fields, 64 bytes per record, all u32):
 ///   [0]  ID
 ///   [1]  PrecastKit          → SpellVisualKit ID
 ///   [2]  CastKit             → SpellVisualKit ID
 ///   [3]  ImpactKit           → SpellVisualKit ID
 ///   [4]  StateKit            → SpellVisualKit ID (0 for bolt spells)
-///   [5]  StateDoneKit        → SpellVisualKit ID (0 for bolt spells)
-///   [6]  ChannelKit          → SpellVisualKit ID
-///   [7]  HasMissile          → SpellVisualEffectName ID (NOT a boolean!)
+///   [5]  ChannelKit          → SpellVisualKit ID (set on 127 of 2165 rows)
+///   [6]  HasMissile          → a GATE, not a foreign key. Only ever 0 or 1 on
+///                               the shipped table (228 rows carry 1). The client
+///                               never reads it — the real missile gate is
+///                               Spell.dbc Speed > 0. DO NOT clone this as a kit:
+///                               1 is also the id of the dummy SpellVisualKit row,
+///                               so treating it as a kit clones that sentinel (and
+///                               the dead zzOLD__FireShield_Cast_Base effect it
+///                               points at) and overwrites the gate with a kit id.
+///   [7]  MissileEffect       → SpellVisualEffectName ID for the projectile model
 ///                               Fireball=365 "Fireball Missile Low", ShadowBolt=151
-///   [8]  MissileModel        (always 0 for these spells — missile comes from HasMissile)
-///   [9]  MissilePathType     (1 = standard arc)
-///   [10] MissileDestX        (Fireball=3011, ShadowBolt=3015)
-///   [11] MissileDestY        (0)
-///   [12] MissileDestZ        (0)
-///   [13] MissileSound        (0)
-///   [14] AnimEventSoundID    (0)
-///   [15] Flags               (0)
+///   [8]  (unmapped — 0 on every row we have looked at)
+///   [9]  MissileAttachOrdinal  ORDINAL into the client's MissileAttachTable,
+///                               NOT an attachment id (Fireball=1)
+///   [10] MissileSound        → SoundEntries ID, the in-flight loop (Fireball=3011)
+///   [11] AreaGate
+///   [12] AreaEffect          → SpellVisualEffectName ID (DynamicObject centre model)
+///   [13] AreaKit             → SpellVisualKit ID (its type-9 CharProcs rate the
+///                               area shards). NOT cloned per spell — see the note
+///                               in SpellCompleterController: patching a shared
+///                               area kit would change every spell that uses it.
+///   [14] StrikeSound         → SoundEntries ID
+///   [15] (unmapped)
 ///
 /// SpellVisualKit.dbc layout (35 fields, 140 bytes per record):
 ///   [0]  ID
 ///   [1]  StartAnimID
-///   [2]  AnimID              (53 = directed cast for both Fire and Shadow)
-///   [3]  HeadEffect          → SpellVisualEffectName ID (0xFFFFFFFF = none)
+///   [2]  AnimID              → AnimationData.dbc (53 = directed cast for Fire and Shadow)
+///   [3]  HeadEffect          → SpellVisualEffectName ID (0 AND 0xFFFFFFFF = none)
 ///   [4]  ChestEffect         → SpellVisualEffectName ID
 ///   [5]  BaseEffect          → SpellVisualEffectName ID
 ///   [6]  LeftHandEffect      → SpellVisualEffectName ID
 ///   [7]  RightHandEffect     → SpellVisualEffectName ID
 ///   [8]  BreathEffect        → SpellVisualEffectName ID
-///   [9]  LeftWeaponEffect    → SpellVisualEffectName ID
-///   [10] RightWeaponEffect   → SpellVisualEffectName ID
-///   [11] SoundID             → SoundEntries ID (0xFFFFFFFF = none)
-///   [12] ShakeID
-///   [13] CharacterProcedure  SoundEntries ID (Fireball cast=1484, impact=1507)
-///   [14-34] Additional fields
+///   [9]  Special1Effect      → SpellVisualEffectName ID
+///   [10] Special2Effect      → SpellVisualEffectName ID
+///   [11] Special3Effect      → SpellVisualEffectName ID — the NINTH slot. The
+///                               client reads nine slots at [3..11]; it is empty on
+///                               all 1772 shipped kits, but it is an EFFECT slot,
+///                               so nothing else may be written there.
+///   [12] (unmapped)
+///   [13] SoundID             → SoundEntries ID (Fireball cast=1484, impact=1507)
+///   [15-18] CharProc types, [19-34] their parameters (four lanes, transposed)
+///
+/// THE NONE-SENTINEL
+///   "No value" is written as EITHER 0 OR 0xFFFFFFFF, inconsistently, on the same
+///   table (of 15948 kit effect slots: 8 zeros, 14087 0xFFFFFFFF). Every foreign
+///   key read here folds BOTH, matching SpellVisualCatalog.Fk().
 ///
 /// SpellVisualEffectName.dbc layout — CORRECTED Session 8:
 ///   [0]  ID
@@ -79,21 +105,40 @@ public class SpellVisualCloner
         public string OriginalM2Path { get; set; } = "";  // Derived M2 path (e.g. "Spells\\Fire_Cast_Hand.m2")
         public string CustomName { get; set; } = "";      // New DBC effect name (e.g. "Voidstrike Cast Hand")
         public string CustomM2Path { get; set; } = "";    // New M2 path (e.g. "Spells\\Voidstrike_Cast_Hand.m2")
-        public string EffectRole { get; set; } = "";      // "cast_leftHand", "missile", "impact_chest", etc.
+        public string EffectRole { get; set; } = "";      // "<stage>_<slot>": "cast_leftHand", "channel_base",
+                                                          // "impact_chest", or the bare "missile".
+                                                          // Stage is one of precast/cast/impact/state/channel;
+                                                          // callers split on '_' to key per-phase params.
     }
 
-    // Kit field indices that point to SpellVisualEffectName IDs
-    // 0xFFFFFFFF means "none" (not 0)
-    private static readonly int[] KitEffectFields = { 3, 4, 5, 6, 7, 8, 9, 10 };
+    /// <summary>
+    /// The NINE kit field indices that point to SpellVisualEffectName IDs.
+    /// The client reads [3..11]; slot names follow its KitAttachmentIds order
+    /// (Head, Chest, Base, LeftHand, RightHand, Breath, Special1..3).
+    /// Either 0 or 0xFFFFFFFF means "none" — see <see cref="IsNone"/>.
+    /// </summary>
+    private static readonly int[] KitEffectFields = { 3, 4, 5, 6, 7, 8, 9, 10, 11 };
     private static readonly string[] KitEffectNames = {
-        "head", "chest", "base", "leftHand", "rightHand", "breath", "leftWeapon", "rightWeapon"
+        "head", "chest", "base", "leftHand", "rightHand", "breath",
+        "special1", "special2", "special3"
     };
 
-    // SpellVisual field indices that point to SpellVisualKit IDs
-    private static readonly int[] VisualKitFields = { 1, 2, 3, 4, 5, 6 };
+    /// <summary>
+    /// SpellVisual field indices that point to SpellVisualKit IDs — the FIVE
+    /// stage kits, [1..5]. Field [6] is the never-read missile gate and is NOT a
+    /// kit reference; there is no "stateDone" stage on this table.
+    /// </summary>
+    private static readonly int[] VisualKitFields = { 1, 2, 3, 4, 5 };
     private static readonly string[] VisualKitNames = {
-        "precast", "cast", "impact", "state", "stateDone", "channel"
+        "precast", "cast", "impact", "state", "channel"
     };
+
+    /// <summary>
+    /// Fold BOTH none-sentinels. The shipped tables write "no value" as either 0
+    /// or 0xFFFFFFFF, inconsistently, on the same column. Mirrors
+    /// SpellVisualCatalog.Fk() in the client.
+    /// </summary>
+    private static bool IsNone(uint id) => id == 0 || id == 0xFFFFFFFF;
 
     /// <summary>
     /// Derive the M2 file path from a SpellVisualEffectName display name.
@@ -164,7 +209,7 @@ public class SpellVisualCloner
         {
             int fieldIdx = VisualKitFields[i];
             uint oldKitId = visualRow[fieldIdx];
-            if (oldKitId == 0) continue;
+            if (IsNone(oldKitId)) continue;
 
             uint newKitId = nextKitId++;
             result.KitIdMap[oldKitId] = newKitId;
@@ -177,7 +222,7 @@ public class SpellVisualCloner
             {
                 int effectFieldIdx = KitEffectFields[j];
                 uint oldEffectId = kitRow[effectFieldIdx];
-                if (oldEffectId == 0 || oldEffectId == 0xFFFFFFFF) continue;
+                if (IsNone(oldEffectId)) continue;
 
                 if (!result.EffectNameIdMap.TryGetValue(oldEffectId, out uint newEffectId))
                 {
@@ -225,11 +270,10 @@ public class SpellVisualCloner
         }
 
         // ── Step 4: Handle missile effect ──
-        // CRITICAL FIX: Missile is field 7 (HasMissile), NOT field 8 (MissileModel).
-        // Field 7 contains the SpellVisualEffectName ID for the missile M2.
-        // Field 8 is always 0 for these spells.
-        uint oldMissileEffectId = visualRow[7]; // HasMissile = EffectName ID
-        if (oldMissileEffectId != 0)
+        // Field 7 is the missile's SpellVisualEffectName ID (Fireball=365).
+        // Field 6 is only the gate and field 8 is unmapped/zero — neither is cloned.
+        uint oldMissileEffectId = visualRow[7];
+        if (!IsNone(oldMissileEffectId))
         {
             if (!result.EffectNameIdMap.TryGetValue(oldMissileEffectId, out uint newMissileEffectId))
             {
@@ -264,7 +308,7 @@ public class SpellVisualCloner
             }
 
             result.MissileEffectId = newMissileEffectId;
-            spellVisualDbc.PatchRow(newVisualId, 7, newMissileEffectId); // Field 7, not 8
+            spellVisualDbc.PatchRow(newVisualId, 7, newMissileEffectId);
         }
 
         return result;

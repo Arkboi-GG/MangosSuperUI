@@ -502,7 +502,7 @@ public class SpellCompleterController : Controller
             bool removed = SpellSessionInbox.Delete(_env.ContentRootPath, id ?? "");
             return Json(removed
                 ? new { success = true, error = (string?)null }
-                : new { success = false, error = $"No pushed design '{id}' in the inbox." });
+                : new { success = false, error = (string?)$"No pushed design '{id}' in the inbox." });
         }
         catch (Exception ex)
         {
@@ -531,8 +531,8 @@ public class SpellCompleterController : Controller
         req.ExportedAtUtc ??= entry["exportedAtUtc"]?.GetValue<string>();
         // The source spell is the design's own property, never the form's — a
         // mistyped field must not clone the wrong spell.
-        if (JsonInt(entry["sourceSpellId"]) is > 0 and int sourceId)
-            req.SourceSpellEntry = sourceId;
+        int sourceId = JsonInt(entry["sourceSpellId"]);
+        if (sourceId > 0) req.SourceSpellEntry = sourceId;
 
         req.Models = (entry["models"] as JsonArray)?.Select(node => new CompleterModelDto
         {
@@ -1038,17 +1038,16 @@ public class SpellCompleterController : Controller
                 }, bytes));
             }
 
-            // The area cue has nowhere to land: SpellVisualCloner clones the six
-            // stage kits, and the area kit (SpellVisual field 13) is not among
-            // them — patching the source's area kit would change every spell that
-            // shares it. Say so rather than storing bytes that silently do nothing.
-            foreach (var orphan in audioTracks.Where(t =>
-                         string.Equals(t.meta.Cue, "area", StringComparison.OrdinalIgnoreCase)).ToList())
-            {
-                audioTracks.Remove(orphan);
-                warnings.Add("the area sound was dropped — area visuals are not cloned per spell, " +
-                             "so wiring it would change the sound for every spell sharing that area kit");
-            }
+            // The area cue has nowhere to land: SpellVisualCloner clones the stage
+            // kits, and the area kit (SpellVisual field 13) is not among them —
+            // patching the source's area kit would change every spell that shares
+            // it. Say so rather than storing bytes that silently do nothing.
+            int areaTracks = audioTracks.RemoveAll(t =>
+                string.Equals(t.meta.Cue, "area", StringComparison.OrdinalIgnoreCase));
+            if (areaTracks > 0)
+                warnings.Add($"{areaTracks} area sound(s) dropped — area visuals are not cloned " +
+                             "per spell, so wiring one would change the sound for every spell " +
+                             "sharing that area kit");
 
             CompleterStore.Save(_env.WebRootPath, req.SpellName,
                 new CompleterStore.Manifest

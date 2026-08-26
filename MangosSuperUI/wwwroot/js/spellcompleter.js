@@ -1,12 +1,22 @@
-// Spell Completer — upload an MSUIClient design session (spell-session.json),
-// finalize each spell's data (name, icon, class tab, damage, mechanics, ranks),
-// and rebuild the unified patch. Design phase lives in MSUIClient; this page is
-// the data phase. Every field is PREFILLED from the inherited source spell
-// (/SpellCompleter/SourceInfo); only what the user changes diverges from it.
+﻿// Spell Completer — finalize a design from MSUIClient (name, icon, class tab,
+// damage, mechanics, ranks) and rebuild the unified patch. Design phase lives in
+// MSUIClient; this page is the data phase. Every field is PREFILLED from the
+// inherited source spell (/SpellCompleter/SourceInfo); only what the user changes
+// diverges from it.
+//
+// Designs arrive two ways:
+//   PUSHED  — the creator posted them to /SpellCompleter/Push and they are sitting
+//             in the inbox. These carry an id; completing one sends that id and the
+//             form, and the server reads the patched models, recolored images and
+//             audio off its own disk. The bytes never enter this browser.
+//   DROPPED — a spell-session.json handed over by file, parsed here. The fallback
+//             for a creator that cannot reach this server. Its embedded base64 has
+//             to make the round trip back up on Complete, and it carries no audio.
 (function () {
     'use strict';
 
-    let session = null;          // parsed spell-session.json
+    let session = null;          // parsed spell-session.json (dropped designs)
+    let pending = [];            // pushed designs, newest first (each has .id)
     let skillTabs = {};          // key -> {skillId, classMask, spellFamilyName}
     let refs = { durations: [], castTimes: [], ranges: [] };
     let customIcons = [];        // [{name, fileName, path, webPath}]
@@ -32,6 +42,16 @@
         { id: 26, label: 'Root' },
         { id: 7, label: 'Fear' }
     ];
+
+    // ── the spell list ──────────────────────────────────────────────────────
+
+    // Pushed designs first — they are the live path, and a dropped file is
+    // usually someone reconciling an older export.
+    function allSpells() {
+        return pending.concat(session ? session.spells : []);
+    }
+
+    function isPushed(spell) { return !!(spell && spell.id); }
 
     // ── session upload ──────────────────────────────────────────────────────
 
@@ -89,15 +109,53 @@
     }
 
     function loadSourceInfoThenRender() {
-        const entries = session.spells.map(function (s) { return s.sourceSpellId; });
-        let pending = entries.length;
+        // Distinct source spells across BOTH lists — several designs commonly share
+        // one original, and each prefill costs a query.
+        const entries = allSpells()
+            .map(function (s) { return s.sourceSpellId; })
+            .filter(function (e, i, arr) { return e && arr.indexOf(e) === i; });
+        let outstanding = entries.length;
         entries.forEach(function (entry) {
-            if (sourceInfo[entry]) { if (--pending === 0) renderSpells(); return; }
+            if (sourceInfo[entry]) { if (--outstanding === 0) renderSpells(); return; }
             $.getJSON('/SpellCompleter/SourceInfo', { entry: entry })
                 .done(function (res) { if (res.success) sourceInfo[entry] = res; })
-                .always(function () { if (--pending === 0) renderSpells(); });
+                .always(function () { if (--outstanding === 0) renderSpells(); });
         });
         if (entries.length === 0) renderSpells();
+    }
+
+    // ── the push inbox ──────────────────────────────────────────────────────
+
+    function loadPending(then) {
+        $.getJSON('/SpellCompleter/Pending')
+            .done(function (res) { pending = (res && res.success && res.spells) ? res.spells : []; })
+            .fail(function () { pending = []; })
+            .always(function () {
+                renderInbox();
+                if (then) then();
+            });
+    }
+
+    function renderInbox() {
+        const el = document.getElementById('scInboxSummary');
+        if (!el) return;
+        if (pending.length === 0) {
+            el.className = 'text-muted';
+            el.textContent = 'Nothing pushed yet — in the creator’s Session section, ' +
+                'name the spell and click "Push to Completer".';
+            return;
+        }
+        el.className = 'sc-done';
+        el.innerHTML = '<i class="fa-solid fa-inbox"></i> ' + pending.length +
+            ' pushed design' + (pending.length !== 1 ? 's' : '') + ' waiting.';
+    }
+
+    function discardPending(id, tempName) {
+        if (!window.confirm('Discard the pushed design "' + tempName + '"?\n\n' +
+                'This only removes it from the inbox. A spell already created from it keeps ' +
+                'its database rows and its stored design.')) return;
+        $.ajax({ url: '/SpellCompleter/DiscardPending', method: 'POST', data: { id: id } })
+            .always(function () { loadPending(renderSpells); });
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -135,6 +193,7 @@
         if (tints) parts.push(tints + ' tint(s)');
         if (swaps) parts.push(swaps + ' texture swap(s)');
         if ((spell.tintedBlps || []).length) parts.push((spell.tintedBlps || []).length + ' recolored BLP(s)');
+        if ((spell.audio || []).length) parts.push((spell.audio || []).length + ' custom sound(s)');
         return parts.join(' · ');
     }
 
@@ -214,35 +273,41 @@
 
     function renderSpells() {
         const list = document.getElementById('scSpellList');
+        const spells = allSpells();
         list.innerHTML = '';
-        document.getElementById('scSpellsCard').style.display = '';
-        document.getElementById('scBuildCard').style.display = '';
+        // Nothing to complete yet: leave the page on step 1 rather than showing
+        // two empty cards.
+        const anything = spells.length > 0;
+        document.getElementById('scSpellsCard').style.display = anything ? '' : 'none';
+        document.getElementById('scBuildCard').style.display = anything ? '' : 'none';
 
-        session.spells.forEach(function (spell, i) {
+        spells.forEach(function (spell, i) {
             const src = sourceInfo[spell.sourceSpellId] || {};
             const card = document.createElement('div');
             card.className = 'sc-spell';
             card.dataset.index = i;
-            card.innerHTML = buildCardHtml(spell, src);
+            // A pushed design and a dropped one can share a temp name, and radio
+            // groups keyed on that name would then control each other's cards.
+            card.innerHTML = buildCardHtml(spell, src, 'c' + i);
             list.appendChild(card);
             wireEffectRows(card, src);
         });
     }
 
-    function buildCardHtml(spell, src) {
+    function buildCardHtml(spell, src, uid) {
         const tabOptions = [{ id: '', label: '(auto — tab matching the chosen school)' }]
             .concat(Object.keys(skillTabs).map(function (k) { return { id: k, label: tabLabel(k) }; }));
         const schoolOptions = SCHOOLS.map(function (s, idx) { return { id: idx, label: s }; });
 
         // ── icon picker: source icon (default) / school fallback / custom PNGs ──
         let iconHtml =
-            '<label class="sc-icon-opt"><input type="radio" name="icon-' + spell.tempName +
+            '<label class="sc-icon-opt"><input type="radio" name="icon-' + uid +
             '" data-f="iconSource" value="source" checked /> Source icon' +
             (src.spellIconId ? ' (#' + src.spellIconId + ')' : '') + '</label>' +
-            '<label class="sc-icon-opt"><input type="radio" name="icon-' + spell.tempName +
+            '<label class="sc-icon-opt"><input type="radio" name="icon-' + uid +
             '" data-f="iconSource" value="school" /> School icon</label>';
         if (customIcons.length > 0) {
-            iconHtml += '<label class="sc-icon-opt"><input type="radio" name="icon-' + spell.tempName +
+            iconHtml += '<label class="sc-icon-opt"><input type="radio" name="icon-' + uid +
                 '" data-f="iconSource" value="custom" /> Custom:</label>' +
                 '<div class="sc-icon-grid">' +
                 customIcons.map(function (ic) {
@@ -278,11 +343,30 @@
             ? 'Generate all ' + src.rankCount + ' ranks (scaled from your Rank 1)'
             : 'Generate all ranks';
 
+        // Where this design came from, and whether it has already been built once.
+        let originHtml;
+        if (isPushed(spell)) {
+            originHtml = '<span class="sc-origin sc-origin-push" title="Pushed from MSUIClient — ' +
+                'the design bytes are already on the server">' +
+                '<i class="fa-solid fa-inbox"></i> pushed</span>' +
+                (spell.completedEntry
+                    ? '<span class="sc-origin sc-origin-done" title="Already completed once. ' +
+                      'Completing again creates a SECOND spell.">' +
+                      '<i class="fa-solid fa-check"></i> created #' + spell.completedEntry + '</span>'
+                    : '') +
+                '<button class="sc-discard" data-act="discard" title="Remove from the inbox">' +
+                '<i class="fa-solid fa-xmark"></i> discard</button>';
+        } else {
+            originHtml = '<span class="sc-origin" title="Parsed from an uploaded session file">' +
+                '<i class="fa-solid fa-file-import"></i> from file</span>';
+        }
+
         return '' +
             '<div class="sc-spell-head">' +
                 '<span class="sc-temp"><i class="fa-solid fa-wand-sparkles"></i> ' + escapeHtml(spell.tempName) + '</span>' +
                 '<span class="text-muted">designed from #' + spell.sourceSpellId + ' ' +
                     escapeHtml(spell.sourceSpellName || src.name || '') + '</span>' +
+                originHtml +
             '</div>' +
             '<div class="sc-mods">' + escapeHtml(modSummary(spell)) + '</div>' +
 
@@ -371,9 +455,15 @@
     // ── completing a spell ──────────────────────────────────────────────────
 
     document.getElementById('scSpellList').addEventListener('click', function (e) {
+        const card = e.target.closest('.sc-spell');
+        if (!card) return;
+        if (e.target.closest('button[data-act="discard"]')) {
+            const spell = allSpells()[parseInt(card.dataset.index, 10)];
+            if (spell) discardPending(spell.id, spell.tempName);
+            return;
+        }
         const btn = e.target.closest('button[data-act="complete"]');
-        if (!btn) return;
-        completeSpell(btn.closest('.sc-spell'), btn);
+        if (btn) completeSpell(card, btn);
     });
 
     function val(card, key) { const el = card.querySelector('[data-f="' + key + '"]'); return el ? el.value.trim() : ''; }
@@ -411,7 +501,7 @@
     }
 
     function completeSpell(card, btn) {
-        const spell = session.spells[parseInt(card.dataset.index, 10)];
+        const spell = allSpells()[parseInt(card.dataset.index, 10)];
         const src = sourceInfo[spell.sourceSpellId] || {};
         const status = card.querySelector('[data-f="status"]');
         const name = val(card, 'name');
@@ -426,6 +516,10 @@
         const iconSource = iconRadio ? iconRadio.value : 'source';
 
         const body = {
+            // A pushed design names itself; the server then loads its models, images,
+            // audio and source spell straight off disk. Only a dropped file has to
+            // hand the bytes back, in the models/tintedBlps fields below.
+            pendingId: isPushed(spell) ? spell.id : null,
             tempName: spell.tempName,
             sourceSpellEntry: spell.sourceSpellId,
             exportedAtUtc: spell.exportedAtUtc,
@@ -451,10 +545,10 @@
             iconSource: iconSource,
             iconPath: iconSource === 'custom' && selectedIcon ? selectedIcon.dataset.iconPath : null,
             effects: changedEffects(card),
-            models: (spell.models || []).map(function (m) {
+            models: isPushed(spell) ? null : (spell.models || []).map(function (m) {
                 return { path: m.path, phases: m.phases, m2Base64: m.m2Base64 || null };
             }),
-            tintedBlps: (spell.tintedBlps || []).map(function (b) {
+            tintedBlps: isPushed(spell) ? null : (spell.tintedBlps || []).map(function (b) {
                 return { path: b.path, blpBase64: b.blpBase64 || null };
             })
         };
@@ -481,6 +575,7 @@
                 status.innerHTML = '<i class="fa-solid fa-check"></i> Created as #' + res.spellEntry +
                     (res.ranksGenerated ? ' with ' + res.ranksGenerated + ' rank(s)' : '') +
                     ' — ' + res.m2Count + ' patched model(s), ' + res.extraFileCount + ' extra file(s), ' +
+                    (res.audioCount ? res.audioCount + ' custom sound(s), ' : '') +
                     body.effects.length + ' mechanic override(s) stored. ' +
                     '<b>Restart the world server</b> (spell/trainer tables load at startup) and delete ' +
                     'the client’s WDB cache after installing the rebuilt patch.' +
@@ -494,6 +589,13 @@
                         : '');
                 status.className = 'sc-row-status sc-done';
                 document.getElementById('btnRebuildPatch').disabled = false;
+                // Re-read the inbox so the card picks up its "created #N" marker,
+                // but keep this card's rendered status by deferring the redraw.
+                if (isPushed(spell))
+                    $.getJSON('/SpellCompleter/Pending').done(function (res) {
+                        pending = (res && res.success && res.spells) ? res.spells : pending;
+                        renderInbox();
+                    });
             } else {
                 status.textContent = res.error || 'Failed.';
                 status.className = 'sc-row-status sc-err';
@@ -543,8 +645,14 @@
 
     // ── boot: reference data, then render whenever the session is ready ─────
 
-    let bootPending = 3;
-    function bootDone() { if (--bootPending === 0 && session) renderSpells(); }
+    let bootPending = 4;
+    function bootDone() { if (--bootPending === 0) loadSourceInfoThenRender(); }
+
+    const btnRefreshInbox = document.getElementById('btnRefreshInbox');
+    if (btnRefreshInbox)
+        btnRefreshInbox.addEventListener('click', function () {
+            loadPending(loadSourceInfoThenRender);
+        });
 
     $.getJSON('/Patch/SkillTabMap').done(function (res) {
         skillTabs = {};
@@ -558,4 +666,6 @@
     $.getJSON('/Patch/CustomIcons').done(function (res) {
         customIcons = (res && res.icons) ? res.icons : [];
     }).always(bootDone);
+
+    loadPending(bootDone);
 })();

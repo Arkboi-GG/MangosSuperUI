@@ -117,7 +117,7 @@
         world: { name: 'World & Maps', icon: 'fa-map-location-dot' },
         bots: { name: 'Bots', icon: 'fa-robot' },
         data: { name: 'Data', icon: 'fa-database' },
-        devtools: { name: 'Development', icon: 'fa-code' },
+        devtools: { name: 'Bot Development', icon: 'fa-code' },
         gamedev: { name: 'Game Development', icon: 'fa-hammer' },
         wiki: { name: 'Documentation', icon: 'fa-book' },
         superui: { name: 'App', icon: 'fa-toolbox' }
@@ -142,7 +142,7 @@
             world: ['worldmap', 'worldeditor'],
             bots: ['bots-dashboard', 'bots-fleet', 'bots-map', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
-            devtools: [],
+            devtools: ['circuittrace'],
             gamedev: ['weaponforge', 'armorforge'],
             wiki: ['wiki-code', 'wiki-lua'],
             superui: ['downloads-page', 'settings']
@@ -522,6 +522,7 @@
             'bots-chatcapacity': { icon: 'fa-server', label: 'Chat Capacity' },
             database: { icon: 'fa-database', label: 'Database Explorer' },
             sourcemap: { icon: 'fa-sitemap', label: 'Source Map' },
+            circuittrace: { icon: 'fa-microchip', label: 'Circuit Board' },
             'wiki-code': { icon: 'fa-book', label: 'C++ SuperUI Docs' },
             'wiki-lua': { icon: 'fa-code', label: 'Lua & UI Docs' }
         };

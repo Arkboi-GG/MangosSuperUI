@@ -170,11 +170,12 @@ public class PatchBuilderService
     // SpellVisualCatalog, which is byte-verified against build 5875 and checked
     // against tools/spellvis/spellvis.py.
     //
-    // NOTE this disagrees with the field map documented in SpellVisualCloner:
-    // that comment calls SpellVisual[5] StateDone and [6] Channel, and puts the
-    // kit sound at [11]. Per the client, [5] IS channel, [6] is the never-read
-    // missile gate, and kit [11] is the ninth EFFECT slot — writing a sound id
-    // there would silently replace an effect model.
+    // SpellVisualCloner used to disagree with this — its comment called
+    // SpellVisual[5] StateDone and [6] Channel, and put the kit sound at [11].
+    // It now carries the client's map: [5] IS channel, [6] is the never-read
+    // missile gate (not a kit), and kit [11] is the ninth EFFECT slot — writing a
+    // sound id there would silently replace an effect model. The stage names the
+    // cloner stamps into EffectRole match the cue keys below.
     private const int KIT_FIELD_SOUND = 13;
     private const int VISUAL_FIELD_MISSILE_SOUND = 10;
 

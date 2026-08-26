@@ -4,17 +4,17 @@
 
 @section Styles {
     <style>
-        /* ---- Circuit Board viewer (v1: live decoded trace; map layer lands in Phase 5) ---- */
+        /* ---- Circuit Board viewer: the live schematic ---- */
         .cb-toolbar {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
             flex-wrap: wrap;
-            padding: 12px;
+            padding: 10px 12px;
             border: 1px solid var(--border-light);
             border-radius: var(--radius-md);
             background: var(--bg-card-alt);
-            margin-bottom: 12px;
+            margin-bottom: 10px;
         }
 
             .cb-toolbar select, .cb-toolbar button {
@@ -32,174 +32,193 @@
 
         .cb-status { font-size: 12px; color: var(--text-secondary); margin-left: auto; }
 
-        .cb-trace {
+        /* overlay — absolutely positioned over the board so showing/hiding NEVER shifts layout */
+        .cb-wedge {
+            display: none;
+            position: absolute;
+            top: 8px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 5;
+            max-width: 90%;
+            padding: 7px 14px;
+            border: 1px solid var(--danger, #f7768e);
+            border-radius: var(--radius-md);
+            color: var(--danger, #f7768e);
+            background: var(--bg-card-alt);
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+            font-size: 13px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            pointer-events: none;
+        }
+
+        .cb-band { fill: var(--bg-card-alt); fill-opacity: 0.45; stroke: var(--border-light); stroke-width: 1; }
+
+        #cbSteady { color: var(--text-secondary); font-weight: 700; min-width: 34px; }
+
+        .cb-stage { position: relative; }
+
+        .cb-board {
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            background: var(--bg-card);
+            height: calc(100vh - 265px);
+            min-height: 420px;
+            overflow: hidden;
+            cursor: grab;
+        }
+
+            .cb-board:active { cursor: grabbing; }
+
+            .cb-board svg { width: 100%; height: 100%; display: block; }
+
+        .cb-lane-head {
+            fill: var(--accent);
+            font-size: 13px;
+            font-weight: 700;
+            text-anchor: middle;
+            cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .cb-rect {
+            fill: var(--accent);
+            fill-opacity: 0;
+            stroke: var(--border-light);
+            stroke-width: 1;
+        }
+
+            .cb-rect.cb-on { stroke: var(--accent); stroke-width: 2; }
+            .cb-rect.cb-sel { stroke: var(--warning, #e0af68); stroke-width: 2.5; }
+
+        .cb-node { cursor: pointer; }
+
+            .cb-node text {
+                fill: var(--text-primary);
+                font-family: var(--font-mono, ui-monospace, monospace);
+                font-size: 10.5px;
+                pointer-events: none;
+            }
+
+        .cb-dim { opacity: 0.25; }
+
+        .cb-edge {
+            fill: none;
+            stroke: var(--text-secondary);
+            stroke-opacity: 0.30;
+            stroke-linecap: round;
+        }
+
+            .cb-edge.cb-edge-on { stroke: var(--accent); stroke-opacity: 0.95; }
+
+        .cb-detail {
+            display: none;
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 270px;
+            padding: 12px;
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            background: var(--bg-card-alt);
+            font-size: 12px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+        }
+
+            .cb-detail .cbd-lane { color: var(--accent); font-weight: 700; text-transform: uppercase; font-size: 11px; }
+            .cb-detail .cbd-desc { margin: 4px 0 8px; color: var(--text-primary); font-weight: 600; }
+            .cb-detail .cbd-row { color: var(--text-secondary); margin: 2px 0; }
+            .cb-detail .cbd-close { margin-top: 8px; color: var(--text-secondary); font-size: 10.5px; font-style: italic; }
+
+        .cb-footer {
+            display: flex;
+            gap: 14px;
+            align-items: baseline;
+            padding: 8px 12px;
+            margin-top: 8px;
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            background: var(--bg-card-alt);
+            font-family: var(--font-mono, ui-monospace, monospace);
+            font-size: 11.5px;
+        }
+
+            .cb-footer .cb-now-label { color: var(--accent); font-weight: 700; white-space: nowrap; }
+            .cb-footer #cbNow { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+            .cb-footer #cbPos { color: var(--text-secondary); white-space: nowrap; }
+
+        /* feed tab (the opt-in raw wall) */
+        .cb-feed {
+            display: none;
             border: 1px solid var(--border-light);
             border-radius: var(--radius-md);
             background: var(--bg-card);
             font-family: var(--font-mono, ui-monospace, monospace);
             font-size: 12px;
-            max-height: calc(100vh - 240px);
+            height: calc(100vh - 265px);
+            min-height: 420px;
             overflow-y: auto;
         }
 
-        .cb-seg {
-            padding: 6px 12px;
-            border-bottom: 1px solid var(--border-light);
-        }
+        .cb-seg { padding: 6px 12px; border-bottom: 1px solid var(--border-light); }
 
-            .cb-seg.cb-inter { opacity: 0.8; }
-
-        .cb-seg-head {
-            color: var(--text-secondary);
-            margin-bottom: 3px;
-            font-size: 11px;
-        }
+        .cb-seg-head { color: var(--text-secondary); margin-bottom: 3px; font-size: 11px; }
 
             .cb-seg-head .cb-kind { color: var(--accent); font-weight: 600; margin-right: 8px; }
-            .cb-seg-head .cb-pos { margin-left: 8px; }
 
-        .cb-hit { padding: 1px 0 1px 16px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .cb-hit { padding: 1px 0 1px 16px; color: var(--text-primary); }
 
-            .cb-hit .cb-id { display: inline-block; min-width: 44px; color: var(--text-secondary); }
-            .cb-hit .cb-val { color: var(--accent); margin-left: 6px; }
-            .cb-hit .cb-note { color: var(--warning, #e0af68); margin-left: 6px; }
-            .cb-hit.cb-repeat { color: var(--text-secondary); }
+            .cb-hit b { color: var(--accent); }
 
-        .cb-cycle {
-            border-left: 3px solid var(--danger, #f7768e);
-        }
+        .cb-cycle { border-left: 3px solid var(--danger, #f7768e); }
 
         .cb-empty { padding: 30px; text-align: center; color: var(--text-secondary); font-size: 13px; }
     </style>
 }
 
 <div class="cb-toolbar">
-    <label for="cbBot" style="font-size:12.5px;color:var(--text-secondary)">Bot</label>
     <select id="cbBot"><option value="0">— pick a bot —</option></select>
     <button id="cbArm" title="Write this bot's trace to the daily file continuously">Arm</button>
     <button id="cbDisarm" title="Stop writing (ring keeps recording in shadow)">Disarm</button>
-    <button id="cbDump" title="Flush this bot's whole ring to the daily file now">Dump ring</button>
+    <button id="cbDump" title="Flush this bot's whole ring to the daily file now">Dump</button>
     <button id="cbShadow" title="Global: shadow rings record every bot in memory">Shadow: ?</button>
-    <button id="cbPause" title="Freeze the view (recording continues)">Pause</button>
+    <span style="width:1px;height:20px;background:var(--border-light)"></span>
+    <button id="cbTabBoard" class="cb-active" title="The schematic: lanes light up as the bot decides">Board</button>
+    <button id="cbTabFeed" title="Raw decoded segment feed">Feed</button>
+    <button id="cbAllLanes" title="Show every registered lane, not just active ones">All lanes</button>
+    <button id="cbFit" title="Fit the board to the window width">Fit</button>
+    <button id="cbPause">Pause</button>
+    <button id="cbPacket" title="Download the whole decoded window as a markdown packet — paste it to an LLM">Packet ⭳</button>
     <span class="cb-status" id="cbStatus">—</span>
 </div>
 
-<div class="cb-trace" id="cbTrace">
-    <div class="cb-empty">Pick a bot. Shadow mode must be on for anything to record; a repeating
-        tick path is rendered once with a ×count so a wedge reads as one loud line, not a wall.</div>
+<div class="cb-stage">
+    <div class="cb-wedge" id="cbWedge"></div>
+    <div class="cb-board" id="cbBoardWrap">
+        <div id="cbBoard" style="width:100%;height:100%">
+            <svg id="cbSvg" xmlns="http://www.w3.org/2000/svg">
+                <g id="cbBands"></g>
+                <g id="cbEdges"></g>
+                <g id="cbHeads"></g>
+                <g id="cbNodes"></g>
+            </svg>
+        </div>
+    </div>
+    <div class="cb-feed" id="cbFeed"></div>
+    <div class="cb-detail" id="cbDetail"></div>
+</div>
+
+<div class="cb-footer">
+    <span class="cb-now-label">this tick</span>
+    <span id="cbSteady"></span>
+    <span id="cbNow">pick a bot — shadow mode must be on for anything to record</span>
+    <span id="cbPos"></span>
 </div>
 
 @section Scripts {
-    <script>
-        (function () {
-            var sites = {};          // id -> {file, line, desc}
-            var guid = 0;
-            var paused = false;
-            var lastMode = '?';
-
-            function loadSites() {
-                return $.getJSON('/CircuitTrace/Sites', function (list) {
-                    (list || []).forEach(function (s) { sites[s.id] = s; });
-                });
-            }
-
-            function loadBots() {
-                $.getJSON('/Bots/States', function (d) {
-                    var bots = (d && d.bots) || d || [];
-                    var sel = $('#cbBot');
-                    var cur = sel.val();
-                    sel.find('option:not(:first)').remove();
-                    bots.sort(function (a, b) { return (a.name || '').localeCompare(b.name || ''); })
-                        .forEach(function (b) {
-                            sel.append($('<option>').val(b.guid).text(b.name + ' (' + b.guid + ')'));
-                        });
-                    if (cur && cur !== '0') sel.val(cur);
-                });
-            }
-
-            function refreshStatus() {
-                $.getJSON('/CircuitTrace/Status', function (d) {
-                    if (!d) return;
-                    lastMode = d.mode;
-                    $('#cbShadow').text('Shadow: ' + d.mode).toggleClass('cb-active', d.mode === 'shadow');
-                    var mine = guid > 0 && (d.armed || []).indexOf(guid) >= 0;
-                    $('#cbArm').toggleClass('cb-active', mine);
-                    $('#cbStatus').text(d.mode + ' · ' + (d.armed || []).length + ' armed · ' +
-                        d.ringBots + ' bots ringing · ' + d.sites + ' sites');
-                });
-            }
-
-            function hitKey(h) { return h.join(''); }
-            function pathKey(seg) { return (seg.h || []).map(hitKey).join(''); }
-
-            function renderHit(h) {
-                var s = sites[h[0]];
-                var desc = s ? s.desc : ('site #' + h[0] + ' (unknown — refresh sites)');
-                var row = '<div class="cb-hit"><span class="cb-id">' + h[0] + '</span>' + $('<i>').text(desc).html();
-                if (h.length > 1 && h[1] !== null && h[1] !== undefined) row += '<span class="cb-val">' + h[1] + '</span>';
-                if (h.length > 2 && h[2]) row += '<span class="cb-note">' + $('<i>').text(h[2]).html() + '</span>';
-                return row + '</div>';
-            }
-
-            function render(segs) {
-                if (!segs.length) {
-                    $('#cbTrace').html('<div class="cb-empty">No segments yet for this bot. Is shadow mode on?</div>');
-                    return;
-                }
-                // Collapse consecutive segments with the IDENTICAL hit path into one row with a
-                // repeat count — a wedge cycle then reads as one loud entry instead of a wall.
-                var html = '';
-                var i = 0;
-                while (i < segs.length) {
-                    var seg = segs[i];
-                    var key = pathKey(seg);
-                    var run = 1;
-                    while (i + run < segs.length && segs[i + run].k === seg.k && pathKey(segs[i + run]) === key) run++;
-
-                    var t = (seg.t1 || seg.t0 || '').replace('T', ' ').substring(11, 23);
-                    var head = '<div class="cb-seg-head"><span class="cb-kind">' + seg.k +
-                        (run > 1 ? ' ×' + run : '') + '</span>' + t;
-                    if (seg.pos) head += '<span class="cb-pos">map ' + seg.pos.map + ' · zone ' + seg.pos.zone +
-                        ' · (' + seg.pos.x.toFixed(0) + ', ' + seg.pos.y.toFixed(0) + ')</span>';
-                    head += '</div>';
-
-                    html += '<div class="cb-seg' + (seg.k === 'inter' ? ' cb-inter' : '') + (run >= 8 ? ' cb-cycle' : '') + '">' +
-                        head + (seg.h || []).map(renderHit).join('') + '</div>';
-                    i += run;
-                }
-                var box = $('#cbTrace');
-                var stick = box[0].scrollHeight - box.scrollTop() - box.height() < 60;
-                box.html(html);
-                if (stick) box.scrollTop(box[0].scrollHeight);
-            }
-
-            function poll() {
-                if (paused || guid <= 0) return;
-                $.getJSON('/CircuitTrace/Peek?guid=' + guid + '&maxSegments=256', function (d) {
-                    var segs = (d && d.segments) || [];
-                    // any unknown site ids? refresh the manifest once, then render
-                    var unknown = segs.some(function (s) { return (s.h || []).some(function (h) { return !sites[h[0]]; }); });
-                    if (unknown) loadSites().always(function () { render(segs); });
-                    else render(segs);
-                });
-            }
-
-            $('#cbBot').on('change', function () { guid = parseInt($(this).val(), 10) || 0; $('#cbTrace').empty(); poll(); refreshStatus(); });
-            $('#cbArm').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Arm?guid=' + guid).done(refreshStatus); });
-            $('#cbDisarm').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Disarm?guid=' + guid).done(refreshStatus); });
-            $('#cbDump').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Dump?guid=' + guid); });
-            $('#cbShadow').on('click', function () {
-                var next = lastMode === 'shadow' ? 'off' : 'shadow';
-                $.post('/CircuitTrace/Mode?mode=' + next).done(refreshStatus);
-            });
-            $('#cbPause').on('click', function () { paused = !paused; $(this).text(paused ? 'Resume' : 'Pause').toggleClass('cb-active', paused); });
-
-            loadSites();
-            loadBots();
-            refreshStatus();
-            setInterval(poll, 1500);
-            setInterval(refreshStatus, 5000);
-            setInterval(loadBots, 30000);
-        })();
-    </script>
+    <script src="~/js/circuittrace.js" asp-append-version="true"></script>
 }

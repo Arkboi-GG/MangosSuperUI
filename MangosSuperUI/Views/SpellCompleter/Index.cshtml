@@ -1,4 +1,4 @@
-@{
+﻿@{
     ViewData["Title"] = "Spell Completer";
 }
 
@@ -9,7 +9,7 @@
         <div class="content-header d-flex align-items-start justify-content-between">
             <div>
                 <h1><i class="fa-solid fa-flag-checkered" style="color: var(--accent);"></i> Spell Completer</h1>
-                <p>Upload an MSUIClient design session &mdash; name the spells, pick class &amp; damage, build the patch</p>
+                <p>Designs pushed from MSUIClient creator mode &mdash; name the spells, pick class &amp; damage, build the patch</p>
             </div>
             <div class="d-flex gap-2">
                 <button class="btn-sm btn-outline-subtle" id="btnRebuildPatch" disabled>
@@ -20,20 +20,39 @@
 
         <div class="content-body">
 
-            <!-- ═══════════ Step 1: upload the session file ═══════════ -->
+            <!-- ═══════════ Step 1: designs arriving from MSUIClient ═══════════ -->
             <div class="card mb-3">
-                <div class="card-header">
-                    <strong>1 &middot; Session file</strong>
-                    <span class="text-muted ms-2">spell-session.json from the directory MSUIClient was launched from</span>
+                <div class="card-header d-flex align-items-center justify-content-between">
+                    <div>
+                        <strong>1 &middot; Designs from MSUIClient</strong>
+                        <span class="text-muted ms-2">pushed straight out of creator mode</span>
+                    </div>
+                    <button class="btn-sm btn-outline-subtle" id="btnRefreshInbox">
+                        <i class="fa-solid fa-rotate"></i> Refresh
+                    </button>
                 </div>
                 <div class="card-body">
-                    <div id="scDropZone" class="sc-drop">
-                        <i class="fa-solid fa-file-import"></i>
-                        <span>Drop <code>spell-session.json</code> here, or</span>
-                        <label class="pt-link" for="scFileInput" style="cursor:pointer;">browse&hellip;</label>
-                        <input type="file" id="scFileInput" accept=".json,application/json" style="display:none;" />
-                    </div>
-                    <div id="scSessionSummary" class="text-muted mt-2" style="display:none;"></div>
+                    <div id="scInboxSummary" class="text-muted">Checking for pushed designs&hellip;</div>
+
+                    <!-- The fallback. A creator that cannot reach this server still
+                         writes spell-session.json next to itself, and that file is
+                         hand-carried in here. Same designs, one extra step, and no
+                         custom audio - only a push carries the sound files. -->
+                    <details class="sc-fallback mt-3">
+                        <summary>Upload a session file instead</summary>
+                        <p class="text-muted mt-2 mb-2">
+                            For a creator that can&rsquo;t reach this server. Drop the
+                            <code>spell-session.json</code> written next to MSUIClient.
+                            Note that a file upload carries no custom audio &mdash; only a push does.
+                        </p>
+                        <div id="scDropZone" class="sc-drop">
+                            <i class="fa-solid fa-file-import"></i>
+                            <span>Drop <code>spell-session.json</code> here, or</span>
+                            <label class="pt-link" for="scFileInput" style="cursor:pointer;">browse&hellip;</label>
+                            <input type="file" id="scFileInput" accept=".json,application/json" style="display:none;" />
+                        </div>
+                        <div id="scSessionSummary" class="text-muted mt-2" style="display:none;"></div>
+                    </details>
                 </div>
             </div>
 
@@ -86,6 +105,16 @@
     .sc-spell { border: 1px solid var(--border-color, #333); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
     .sc-spell-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
     .sc-spell-head .sc-temp { font-weight: 600; font-size: 1.05em; }
+    .sc-fallback > summary { cursor: pointer; color: var(--text-muted, #999); font-size: .9em; }
+    /* Where a design came from, and whether it has already been built once. Both
+       change what a second click of "Create this spell" would do. */
+    .sc-origin { font-size: .78em; padding: 1px 7px; border-radius: 10px; white-space: nowrap;
+                 border: 1px solid var(--border-color, #333); color: var(--text-muted, #999); }
+    .sc-origin-push { border-color: var(--accent, #7aa2f7); color: var(--accent, #7aa2f7); }
+    .sc-origin-done { border-color: var(--status-success, #6c6); color: var(--status-success, #6c6); }
+    .sc-discard { background: none; border: none; padding: 1px 4px; cursor: pointer; font-size: .78em;
+                  color: var(--text-muted, #999); }
+    .sc-discard:hover { color: var(--status-error, #e66); }
     .sc-mods { font-size: .85em; color: var(--text-muted, #999); margin-bottom: 10px; }
     .sc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px 14px; margin-bottom: 10px; }
     .sc-grid label { display: block; font-size: .8em; color: var(--text-muted, #999); margin-bottom: 2px; }
