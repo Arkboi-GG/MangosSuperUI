@@ -621,7 +621,7 @@ The script will:
 
 ```
 Step 1: Locating mangosd.conf
-  ✓ Found: /home/nicholas/vmangos/run/etc/mangosd.conf
+  ✓ Found: /home/YOU/vmangos/run/etc/mangosd.conf
 
 Step 2: Reading database connections from mangosd.conf
   ✓ World (mangos): mangos@127.0.0.1:3306/mangos
@@ -631,16 +631,16 @@ Step 2: Reading database connections from mangosd.conf
   ✓ Admin: mangos@127.0.0.1:3306/vmangos_admin
 
 Step 3: Discovering SuperUI-Core paths
-  ✓ Config directory: /home/nicholas/vmangos/run/etc
-  ✓ Bin directory: /home/nicholas/vmangos/run/bin
+  ✓ Config directory: /home/YOU/vmangos/run/etc
+  ✓ Bin directory: /home/YOU/vmangos/run/bin
   ✓ mangosd binary: mangosd
   ✓ realmd binary: realmd
   → mangosd not running — using binary name as process name: mangosd
   → realmd not running — using binary name as process name: realmd
-  ✓ DataDir: /home/nicholas/vmangos/run/data
-  ✓ DBC path: /home/nicholas/vmangos/run/data/5875/dbc (158 .dbc files)
-  ✓ Maps path: /home/nicholas/vmangos/run/data/maps (2429 .map files)
-  ✓ Log directory: /home/nicholas/vmangos/run/bin
+  ✓ DataDir: /home/YOU/vmangos/run/data
+  ✓ DBC path: /home/YOU/vmangos/run/data/5875/dbc (158 .dbc files)
+  ✓ Maps path: /home/YOU/vmangos/run/data/maps (2429 .map files)
+  ✓ Log directory: /home/YOU/vmangos/run/bin
 
 Step 4: Remote Access (RA) configuration
   ✓ RA port: 3443
@@ -673,12 +673,12 @@ Configuration Summary
     Admin:       Server=127.0.0.1;Port=3306;Database=vmangos_admin;User=mangos;Password=mangos;
 
   SuperUI-Core Paths:
-    Bin Dir:     /home/nicholas/vmangos/run/bin
-    Log Dir:     /home/nicholas/vmangos/run/bin
-    Config Dir:  /home/nicholas/vmangos/run/etc
-    Conf Path:   /home/nicholas/vmangos/run/etc/mangosd.conf
-    DBC Path:    /home/nicholas/vmangos/run/data/5875/dbc
-    Maps Path:   /home/nicholas/vmangos/run/data/maps
+    Bin Dir:     /home/YOU/vmangos/run/bin
+    Log Dir:     /home/YOU/vmangos/run/bin
+    Config Dir:  /home/YOU/vmangos/run/etc
+    Conf Path:   /home/YOU/vmangos/run/etc/mangosd.conf
+    DBC Path:    /home/YOU/vmangos/run/data/5875/dbc
+    Maps Path:   /home/YOU/vmangos/run/data/maps
 
   Process Names:
     mangosd:     mangosd
