@@ -20,11 +20,13 @@ namespace MangosSuperUI.Controllers;
 // The difference from the old flow is that we now bring the bot offline
 // ourselves instead of refusing and telling the operator to do it.
 //
-//  ── The four operations this file exposes ───────────────────────────────────
+//  ── The operations this file exposes ────────────────────────────────────────
 //      KickBot        one bot offline, stays in the DB and the core's roster
 //      KickAllBots    whole fleet offline, same
 //      DeleteBot      one bot offline, then purged from the DB
 //      DeleteAllBots  whole fleet offline, then purged
+//      OfflineRoster  the persisted bots that are not currently connected
+//      AddBot         bring one of them back (the mass form is AddAll elsewhere)
 //
 //  ── Which console command does what (their names are misleading) ────────────
 //  `.bot delete <name>`  does NOT delete. PlayerBotMgr::DeleteBot only sets
@@ -71,6 +73,10 @@ public partial class BotsController
     // Ceiling for the whole-roster wait (see DeleteAllBots): 300+ logouts land over
     // many world ticks, but a wedged core must still fail rather than hang forever.
     private const int MassOfflineWaitMaxMs = 180000;
+    // Re-add is slower than a kick: PlayerBotMgr::Update has to pick the entry up,
+    // the session logs in and loads the character, and only then does
+    // UpdateBridgeTick -> BridgeConnect dial the brain (with its own retry backoff).
+    private const int BridgeWaitMs = 45000;
 
     [HttpGet]
     public async Task<IActionResult> RosterSummary()
@@ -156,6 +162,93 @@ public partial class BotsController
         }
 
         return Json(new { success = true, kicked = online.Count });
+    }
+
+    // ==================== Re-add one persisted bot ====================
+    // The offline half of the roster, for the single-bot re-add picker.
+    [HttpGet]
+    public async Task<IActionResult> OfflineRoster()
+    {
+        using var conn = _db.Characters();
+        var rows = (await conn.QueryAsync<OfflineBotRow>(
+            "SELECT `char_guid` AS Guid, `name` AS Name, `race` AS RaceId, `class` AS ClassId, " +
+            "`level` AS Level, `ai` AS Ai FROM `playerbot` ORDER BY `name`")).ToList();
+
+        var offline = rows.Where(r => !_bridge.Connections.ContainsKey((int)r.Guid)).ToList();
+        return Json(new { total = rows.Count, offline });
+    }
+
+    // `.bot add <name>` reuses the bot's existing PlayerBotEntry when one is still
+    // registered, which is the normal case: Kick (`.bot delete`), Kick All
+    // (`.bot stop`) and a server restart all leave the entry parked with its
+    // AiBotAI. But if the entry was ERASED — anything that went through `.kick`,
+    // e.g. a console kick outside this UI — AddBot falls into its no-entry branch
+    // and builds a bare `new PlayerBotAI(nullptr)` with customBot=false. The bot
+    // then logs in with no SuperUI brain at all.
+    //
+    // There is no console command that reports per-bot registration, so we test the
+    // outcome instead of predicting it: only an AiBotAI dials the C# brain, so a
+    // bridge connection appearing for this guid IS the proof it came back with its
+    // AI. No connection inside the window means it came back brainless.
+    //
+    // The remedy for that is `.bot reload`, which we deliberately do NOT run here:
+    // PlayerBotMgr::Load opens with DeleteAll(), so it would kick the entire fleet
+    // offline. That call is the operator's to make.
+    [HttpPost]
+    public async Task<IActionResult> AddBot([FromBody] DeleteBotRequest req)
+    {
+        string? name, error;
+        using (var conn = _db.Characters())
+        {
+            await conn.OpenAsync();
+            (name, error) = await ResolveBotNameAsync(conn, req.Guid);
+        }
+        if (error != null)
+            return Json(new { success = false, error });
+
+        if (_bridge.Connections.ContainsKey((int)req.Guid))
+            return Json(new { success = false, error = $"{name} is already online" });
+
+        string response;
+        try
+        {
+            response = await _ra.SendCommandAsync($".bot add {name}");
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, error = $"RA command failed: {ex.Message}" });
+        }
+
+        // HandleBotAddCommand answers "[PlayerBotMgr] Bot added : ..." on success and
+        // "[PlayerBotMgr] Unable to load bot." on every rejection (already online,
+        // unknown name, faction cap).
+        if (response != null && response.Contains("Unable to load bot", StringComparison.OrdinalIgnoreCase))
+            return Json(new { success = false, error = $"Core refused to load {name} — it may already be online", response });
+
+        if (!await WaitForBridgeAsync(req.Guid))
+            return Json(new
+            {
+                success = false,
+                warned = true,
+                error = $"{name} was added but never dialed the brain within {BridgeWaitMs / 1000}s. " +
+                        "Its PlayerBotEntry was probably deregistered by an earlier .kick, so it came back " +
+                        "as a plain PlayerBotAI. Run '.bot reload' to rebuild the roster — note that kicks every bot offline first."
+            });
+
+        return Json(new { success = true, name });
+    }
+
+    /// <summary>Waits for a re-added bot's brain socket to appear — see AddBot.</summary>
+    private async Task<bool> WaitForBridgeAsync(uint guid)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(BridgeWaitMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (_bridge.Connections.ContainsKey((int)guid))
+                return true;
+            await Task.Delay(OfflinePollMs);
+        }
+        return _bridge.Connections.ContainsKey((int)guid);
     }
 
     // ==================== Delete (kick, then purge) ====================
@@ -349,4 +442,19 @@ public partial class BotsController
 public class DeleteBotRequest
 {
     public uint Guid { get; set; }
+}
+
+/// <summary>One row of the persisted `playerbot` roster, for the re-add picker.</summary>
+public class OfflineBotRow
+{
+    public uint Guid { get; set; }
+    public string Name { get; set; } = "";
+    // RaceId/ClassId rather than Race/Class: matches the `classId` the bot-state
+    // payload already uses client-side, and keeps `class` — a JS reserved word —
+    // out of the serialized JSON.
+    public byte RaceId { get; set; }
+    public byte ClassId { get; set; }
+    public byte Level { get; set; }
+    /// <summary>The `ai` column. Only "AiBotAI" rows come back with a SuperUI brain.</summary>
+    public string? Ai { get; set; }
 }

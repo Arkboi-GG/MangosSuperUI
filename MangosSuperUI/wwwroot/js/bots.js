@@ -4415,6 +4415,136 @@ $(function () {
         '</div></div></div>'
     );
 
+    // ===================== RE-ADD ONE PERSISTED BOT =====================
+    // "Load SuperUI Bots" (.bot add_all) is all-or-nothing. This is the single-bot
+    // form: pick an offline bot out of the persisted roster and bring just it back.
+    // Reuses the ab-* modal shell; rb-* is the inner style set.
+    $('<style>').text(
+        '.rb-modal{max-width:640px;}' +
+        '.rb-tools{display:flex;align-items:center;gap:10px;margin-bottom:12px;}' +
+        '.rb-search{flex:1;position:relative;}' +
+        '.rb-search i{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text-muted,#787c99);font-size:12px;pointer-events:none;}' +
+        '.rb-search input{width:100%;box-sizing:border-box;padding:7px 10px 7px 30px;border-radius:8px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);color:var(--text-secondary,#c0caf5);font-size:12.5px;outline:none;transition:border-color .12s;}' +
+        '.rb-search input:focus{border-color:var(--accent,#7aa2f7);}' +
+        '.rb-sum{font-size:11px;color:var(--text-muted,#787c99);white-space:nowrap;font-variant-numeric:tabular-nums;}' +
+        '.rb-list{max-height:52vh;overflow-y:auto;}' +
+        '.rb-row{display:flex;align-items:center;gap:10px;padding:8px 11px 8px 14px;border-radius:10px;border:1px solid var(--border-light,#414868);background:var(--bg-card-alt,#24283b);margin-bottom:7px;}' +
+        '.rb-name{font-size:12.5px;color:var(--text-primary,#c0caf5);font-weight:600;min-width:110px;}' +
+        '.rb-name mark{background:rgba(122,162,247,0.35);color:inherit;border-radius:2px;padding:0 1px;}' +
+        '.rb-meta{flex:1;min-width:0;font-size:11px;color:var(--text-muted,#787c99);}' +
+        '.rb-warn{font-size:10.5px;color:#e0af68;margin-left:6px;}' +
+        '.rb-add{font-size:11px;padding:4px 12px;border-radius:7px;border:1px solid rgba(158,206,106,0.5);background:rgba(158,206,106,0.12);color:#9ece6a;cursor:pointer;flex:none;transition:all .12s;}' +
+        '.rb-add:hover{background:#9ece6a;color:#1a1b26;}' +
+        '.rb-add:disabled{opacity:.5;cursor:default;}' +
+        '.rb-add:disabled:hover{background:rgba(158,206,106,0.12);color:#9ece6a;}' +
+        '.rb-empty{color:var(--text-muted,#787c99);font-size:12px;padding:18px 4px;text-align:center;}' +
+        '.rb-hint{font-size:11px;color:var(--text-muted,#787c99);}'
+    ).appendTo('head');
+
+    $('body').append(
+        '<div class="ab-overlay" id="readdBotModal">' +
+        '<div class="ab-modal rb-modal">' +
+        '<div class="ab-header">' +
+        '<div class="ab-hleft"><div class="ab-hicon"><i class="fa-solid fa-user-check"></i></div>' +
+        '<div class="ab-htxt"><b>Re-add Bot</b><span>Bring a single persisted bot back online</span></div></div>' +
+        '<button class="ab-close" id="rbClose"><i class="fa-solid fa-xmark"></i></button></div>' +
+        '<div class="ab-body">' +
+        '<div class="rb-tools">' +
+        '<div class="rb-search"><i class="fa-solid fa-magnifying-glass"></i><input type="text" id="rbSearch" placeholder="Search by name..." autocomplete="off"></div>' +
+        '<span class="rb-sum" id="rbSummary"></span>' +
+        '</div>' +
+        '<div class="rb-list" id="rbList"><div class="rb-empty">Loading...</div></div>' +
+        '</div>' +
+        '<div class="ab-foot">' +
+        '<span class="rb-hint" id="rbHint">Only bots that are currently offline are listed.</span>' +
+        '</div></div></div>'
+    );
+
+    var rbRows = [];
+
+    function rbHighlight(name, q) {
+        var safe = esc(name);
+        if (!q) return safe;
+        var i = name.toLowerCase().indexOf(q);
+        if (i < 0) return safe;
+        return esc(name.slice(0, i)) + '<mark>' + esc(name.slice(i, i + q.length)) + '</mark>' + esc(name.slice(i + q.length));
+    }
+
+    function rbRender() {
+        var q = ($('#rbSearch').val() || '').trim().toLowerCase();
+        var shown = q ? rbRows.filter(function (r) { return String(r.name || '').toLowerCase().indexOf(q) >= 0; }) : rbRows;
+
+        $('#rbSummary').text(shown.length + ' of ' + rbRows.length + ' offline');
+
+        if (!rbRows.length) {
+            $('#rbList').html('<div class="rb-empty">Every persisted bot is already online.</div>');
+            return;
+        }
+        if (!shown.length) {
+            $('#rbList').html('<div class="rb-empty">No offline bot matches "' + esc(q) + '".</div>');
+            return;
+        }
+
+        $('#rbList').html(shown.map(function (r) {
+            // A row whose `ai` column isn't AiBotAI has no SuperUI brain by design —
+            // say so up front rather than letting the post-add bridge check "fail".
+            var noBrain = String(r.ai || '') !== 'AiBotAI';
+            return '<div class="rb-row" data-guid="' + r.guid + '">' +
+                '<span class="rb-name">' + rbHighlight(String(r.name || ''), q) + '</span>' +
+                '<span class="rb-meta">L' + (r.level || 0) + ' · ' +
+                esc(RACE_NAMES[r.raceId] || '?') + ' ' + esc(CLASS_NAMES[r.classId] || '?') +
+                (noBrain ? '<span class="rb-warn" title="The playerbot.ai column is not AiBotAI, so this one has no SuperUI brain">no brain</span>' : '') +
+                '</span>' +
+                '<button type="button" class="rb-add"><i class="fa-solid fa-plus" style="margin-right:5px;"></i>Add</button>' +
+                '</div>';
+        }).join(''));
+    }
+
+    function rbLoad() {
+        $('#rbList').html('<div class="rb-empty">Loading...</div>');
+        $('#rbSummary').text('');
+        $.getJSON('/Bots/OfflineRoster', function (data) {
+            rbRows = (data && data.offline) || [];
+            rbRender();
+        }).fail(function () {
+            $('#rbList').html('<div class="rb-empty" style="color:#f7768e;">Failed to load the roster.</div>');
+        });
+    }
+
+    $('#btnReaddBot').on('click', function () { $('#readdBotModal').addClass('active'); rbLoad(); $('#rbSearch').val('').focus(); });
+    $('#rbClose').on('click', function () { $('#readdBotModal').removeClass('active'); });
+    $('#readdBotModal').on('click', function (e) { if (e.target === this) $(this).removeClass('active'); });
+    $(document).on('keydown', function (e) { if (e.key === 'Escape') $('#readdBotModal').removeClass('active'); });
+    $(document).on('input', '#rbSearch', rbRender);
+
+    $(document).on('click', '.rb-add', function () {
+        var $btn = $(this);
+        if ($btn.prop('disabled')) return;
+        var $row = $btn.closest('.rb-row');
+        var guid = parseInt($row.data('guid'), 10) || 0;
+        if (guid <= 0) return;
+
+        // The server waits for the bot to log in AND dial the brain, so this is a
+        // tens-of-seconds request. Lock just this row, not the whole modal.
+        $btn.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin" style="margin-right:5px;"></i>Adding');
+        $.ajax({ url: '/Bots/AddBot', type: 'POST', contentType: 'application/json', timeout: 60000, data: JSON.stringify({ guid: guid }) })
+            .done(function (r) {
+                if (r && r.success) {
+                    $row.remove();
+                    rbRows = rbRows.filter(function (x) { return x.guid !== guid; });
+                    rbRender();
+                    showToast('Re-added ' + (r.name || 'bot'));
+                } else {
+                    $btn.prop('disabled', false).html('<i class="fa-solid fa-plus" style="margin-right:5px;"></i>Add');
+                    showToast((r && r.error) || 'Re-add failed', true);
+                }
+            })
+            .fail(function (x, textStatus) {
+                $btn.prop('disabled', false).html('<i class="fa-solid fa-plus" style="margin-right:5px;"></i>Add');
+                showToast(bdcFailMsg('Re-add', x, textStatus), true);
+            });
+    });
+
     var mgGroups = [], mgNames = {}, mgModeName = '';
 
     function mgEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
