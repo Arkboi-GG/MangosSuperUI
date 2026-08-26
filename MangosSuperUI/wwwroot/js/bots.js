@@ -3462,6 +3462,13 @@ $(function () {
         '.bm-tab-danger.active { color:#f7768e;border-bottom-color:#f7768e; }' +
         '.bm-delete-btn { margin-left:auto;align-self:center;padding:5px 14px;font-size:12px;font-weight:600;color:#f7768e;background:rgba(247,118,142,0.1);border:1px solid rgba(247,118,142,0.4);border-radius:4px;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px; }' +
         '.bm-delete-btn:hover { color:#fff;background:#f7768e;border-color:#f7768e; }' +
+        // Kick sits left of Delete and owns the auto margin, so Delete keeps its
+        // flush-right position whether or not Kick is showing.
+        '.bm-kick-btn { margin-left:auto;align-self:center;margin-right:8px;padding:5px 14px;font-size:12px;font-weight:600;color:#e0af68;background:rgba(224,175,104,0.1);border:1px solid rgba(224,175,104,0.4);border-radius:4px;cursor:pointer;text-transform:uppercase;letter-spacing:0.5px; }' +
+        '.bm-kick-btn:hover { color:#1a1b26;background:#e0af68;border-color:#e0af68; }' +
+        '.bm-kick-btn:disabled { opacity:0.4;cursor:default; }' +
+        '.bm-kick-btn:disabled:hover { color:#e0af68;background:rgba(224,175,104,0.1);border-color:rgba(224,175,104,0.4); }' +
+        '.bm-kick-btn + .bm-delete-btn { margin-left:0; }' +
         '.bm-body { flex:1;overflow-y:auto;padding:16px 20px; }' +
         '.bdc-overlay { display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:10001;align-items:center;justify-content:center; }' +
         '.bdc-overlay.active { display:flex; }' +
@@ -3509,6 +3516,7 @@ $(function () {
         '<div class="bm-tab" data-tab="quests"><i class="fa-solid fa-scroll" style="margin-right:5px;"></i>Quests</div>' +
         '<div class="bm-tab" data-tab="gear"><i class="fa-solid fa-shield-halved" style="margin-right:5px;"></i>Gear</div>' +
         '<div class="bm-tab" data-tab="brain"><i class="fa-solid fa-brain" style="margin-right:5px;"></i>Brain</div>' +
+        '<button type="button" class="bm-kick-btn" id="bmKickBtn"><i class="fa-solid fa-right-from-bracket" style="margin-right:5px;"></i>Kick</button>' +
         '<button type="button" class="bm-delete-btn" id="bmDeleteBtn"><i class="fa-solid fa-trash" style="margin-right:5px;"></i>Delete</button>' +
         '</div>' +
         '<div class="bm-body" id="bmBody"></div>' +
@@ -3572,54 +3580,168 @@ $(function () {
         if (guid <= 0) return;
         var s = botStates[guid];
         var name = s ? s.name : ('bot ' + guid);
-        $('#bdcMsg').text('Are you sure you want to delete ' + name + '?');
+        var online = s && s.taskState !== 'DISCONNECTED';
+        $('#bdcMsg').html('Are you sure you want to delete ' + esc(name) + '?' +
+            (online
+                ? '<div style="margin-top:8px;font-size:12px;color:var(--text-muted, #787c99);">' +
+                  'It will be kicked offline first, then purged from the database. This cannot be undone.</div>'
+                : '<div style="margin-top:8px;font-size:12px;color:var(--text-muted, #787c99);">' +
+                  'This cannot be undone.</div>'));
+        $('#bdcConfirm').text('Delete');
         $('#bdcOverlay').data({ mode: 'single', guid: guid }).addClass('active');
+    });
+
+    // Kick = disconnect only. The core parks the PlayerBotEntry at PB_STATE_OFFLINE
+    // and keeps the `playerbot` row, so "Load SuperUI Bots" (.bot add_all) brings
+    // it back with its AiBotAI intact.
+    $(document).on('click', '#bmKickBtn', function () {
+        if ($(this).prop('disabled')) return;
+        var guid = parseInt($('#botModal').data('guid'), 10) || 0;
+        if (guid <= 0) return;
+        var s = botStates[guid];
+        var name = s ? s.name : ('bot ' + guid);
+        $('#bdcMsg').html('Kick ' + esc(name) + ' offline?' +
+            '<div style="margin-top:8px;font-size:12px;color:var(--text-muted, #787c99);">' +
+            'The bot stays in the roster and can be brought back with Load SuperUI Bots.</div>');
+        $('#bdcConfirm').text('Kick');
+        $('#bdcOverlay').data({ mode: 'kick', guid: guid }).addClass('active');
+    });
+
+    $(document).on('click', '#bmMassKickBtn', function () {
+        if ($(this).prop('disabled')) return;
+        var online = $('#bmBody').data('rosterOnline') || 0;
+        if (online <= 0) return;
+        $('#bdcMsg').html('Kick ' + online + ' bot' + (online === 1 ? '' : 's') + ' offline?' +
+            '<div style="margin-top:8px;font-size:12px;color:var(--text-muted, #787c99);">' +
+            'Nothing is deleted — they stay in the roster and come back with Load SuperUI Bots.</div>');
+        $('#bdcConfirm').text('Kick all');
+        $('#bdcOverlay').data({ mode: 'kickmass' }).addClass('active');
     });
 
     $(document).on('click', '#bmMassDeleteBtn', function () {
         var total = $('#bmBody').data('rosterTotal') || 0;
         if (total <= 0) return;
-        $('#bdcMsg').text('Are you sure you want to delete ' + total + ' bot' + (total === 1 ? '' : 's') + '?');
+        $('#bdcMsg').html('Are you sure you want to delete ' + total + ' bot' + (total === 1 ? '' : 's') + '?' +
+            '<div style="margin-top:8px;font-size:12px;color:var(--text-muted, #787c99);">' +
+            'Any that are still online will be kicked first. This cannot be undone.</div>');
+        $('#bdcConfirm').text('Delete');
         $('#bdcOverlay').data({ mode: 'mass' }).addClass('active');
     });
 
     $(document).on('click', '#bdcCancel', function () {
+        if ($('#bdcOverlay').data('busy')) return;
         $('#bdcOverlay').removeClass('active');
     });
 
     $('#bdcOverlay').on('click', function (e) {
+        if ($(this).data('busy')) return;
         if (e.target === this) $(this).removeClass('active');
     });
 
+    // Kick and delete both wait on the core: the request fires an RA command and
+    // then polls until the bot's bridge socket drops, which takes seconds rather
+    // than milliseconds. Lock the dialog for the round trip so the operator can't
+    // double-fire a kick or close the box thinking nothing happened.
+    function bdcBusy(label) {
+        $('#bdcConfirm').prop('disabled', true)
+            .html('<i class="fa-solid fa-spinner fa-spin" style="margin-right:6px;"></i>' + label);
+        $('#bdcCancel').prop('disabled', true);
+        $('#bdcOverlay').data('busy', true);
+    }
+
+    function bdcDone() {
+        $('#bdcConfirm').prop('disabled', false);
+        $('#bdcCancel').prop('disabled', false);
+        $('#bdcOverlay').data('busy', false).removeClass('active');
+    }
+
+    // On a client-side timeout jqXHR.status is 0, so "HTTP 0" would be the least
+    // useful thing we could tell the operator — the core may well still be working
+    // through the logouts.
+    function bdcFailMsg(what, xhr, textStatus) {
+        if (textStatus === 'timeout')
+            return what + ' timed out waiting for the server — check the bot roster before retrying';
+        return what + ' failed (HTTP ' + (xhr && xhr.status ? xhr.status : '?') + ')';
+    }
+
     $(document).on('click', '#bdcConfirm', function () {
+        if ($('#bdcOverlay').data('busy')) return;
         var mode = $('#bdcOverlay').data('mode');
+
+        if (mode === 'kick') {
+            var kguid = parseInt($('#bdcOverlay').data('guid'), 10) || 0;
+            if (kguid <= 0) return;
+            bdcBusy('Kicking...');
+            // Server caps its own offline wait at 20s; give it headroom, but not
+            // forever — a hung request should surface as an error, not a spinner.
+            $.ajax({ url: '/Bots/KickBot', type: 'POST', contentType: 'application/json', timeout: 40000, data: JSON.stringify({ guid: kguid }) })
+                .done(function (r) {
+                    bdcDone();
+                    if (r && r.success) {
+                        $('#botModal').removeClass('active');
+                        // Deliberately NOT removeDeletedBot: the bot still exists and
+                        // is re-addable. The BotDisconnected handler manages the row.
+                        showToast('Kicked ' + (r.name || 'bot') + ' offline');
+                    } else {
+                        showToast((r && r.error) || 'Kick failed', true);
+                    }
+                })
+                .fail(function (x, textStatus) {
+                    bdcDone();
+                    showToast(bdcFailMsg('Kick', x, textStatus), true);
+                });
+            return;
+        }
 
         if (mode === 'single') {
             var guid = parseInt($('#bdcOverlay').data('guid'), 10) || 0;
             if (guid <= 0) return;
-            $.ajax({ url: '/Bots/DeleteBot', type: 'POST', contentType: 'application/json', data: JSON.stringify({ guid: guid }) })
+            bdcBusy('Deleting...');
+            $.ajax({ url: '/Bots/DeleteBot', type: 'POST', contentType: 'application/json', timeout: 40000, data: JSON.stringify({ guid: guid }) })
                 .done(function (r) {
+                    bdcDone();
                     if (r && r.success) {
-                        $('#bdcOverlay').removeClass('active');
                         $('#botModal').removeClass('active');
                         removeDeletedBot(guid);
                         showToast('Bot deleted');
                     } else {
-                        $('#bdcOverlay').removeClass('active');
                         showToast((r && r.error) || 'Delete failed', true);
                     }
                 })
-                .fail(function (x) {
-                    $('#bdcOverlay').removeClass('active');
-                    showToast('Delete failed (HTTP ' + x.status + ')', true);
+                .fail(function (x, textStatus) {
+                    bdcDone();
+                    showToast(bdcFailMsg('Delete', x, textStatus), true);
+                });
+            return;
+        }
+
+        if (mode === 'kickmass') {
+            bdcBusy('Kicking...');
+            $.ajax({ url: '/Bots/KickAllBots', type: 'POST', timeout: 200000 })
+                .done(function (r) {
+                    bdcDone();
+                    if (r && r.success) {
+                        $('#botModal').removeClass('active');
+                        // Nothing removed from the roster — the bots still exist.
+                        showToast('Kicked ' + r.kicked + ' bot' + (r.kicked === 1 ? '' : 's') + ' offline');
+                    } else {
+                        showToast((r && r.error) || 'Mass kick failed', true);
+                    }
+                })
+                .fail(function (x, textStatus) {
+                    bdcDone();
+                    showToast(bdcFailMsg('Mass kick', x, textStatus), true);
                 });
             return;
         }
 
         if (mode === 'mass') {
-            $.ajax({ url: '/Bots/DeleteAllBots', type: 'POST' })
+            bdcBusy('Deleting...');
+            // Whole-roster delete waits on every logout; the server caps that at
+            // 180s, so allow a little more than that here before giving up.
+            $.ajax({ url: '/Bots/DeleteAllBots', type: 'POST', timeout: 200000 })
                 .done(function (r) {
-                    $('#bdcOverlay').removeClass('active');
+                    bdcDone();
                     if (r && r.success) {
                         $('#botModal').removeClass('active');
                         Object.keys(botStates).forEach(function (g) { removeDeletedBot(parseInt(g, 10)); });
@@ -3628,9 +3750,9 @@ $(function () {
                         showToast((r && r.error) || 'Mass delete failed', true);
                     }
                 })
-                .fail(function (x) {
-                    $('#bdcOverlay').removeClass('active');
-                    showToast('Mass delete failed (HTTP ' + x.status + ')', true);
+                .fail(function (x, textStatus) {
+                    bdcDone();
+                    showToast(bdcFailMsg('Mass delete', x, textStatus), true);
                 });
         }
     });
@@ -4506,6 +4628,7 @@ $(function () {
             $('.bm-tab[data-tab!="control"]').hide();
             $('.bm-tab[data-tab="danger"]').show();
             $('#bmDeleteBtn').hide();
+            $('#bmKickBtn').hide();
             tab = 'control';
         } else {
             var className = CLASS_NAMES[s.classId] || '?';
@@ -4518,6 +4641,12 @@ $(function () {
             $('.bm-tab').show();
             $('.bm-tab[data-tab="danger"]').hide();
             $('#bmDeleteBtn').show();
+            // Kick only means anything while the bot's bridge socket is up. Offline
+            // bots stay listed (BotStates is a last-seen cache that survives the
+            // disconnect), so gate on the same DISCONNECTED marker the roster uses.
+            var isOffline = s.taskState === 'DISCONNECTED';
+            $('#bmKickBtn').show().prop('disabled', isOffline)
+                .attr('title', isOffline ? 'Bot is already offline' : '');
         }
 
         $('#botModal').data('guid', guid).addClass('active');
@@ -4557,20 +4686,36 @@ $(function () {
         $.getJSON('/Bots/RosterSummary', function (data) {
             var total = data.total || 0;
             var online = data.online || 0;
-            var html = '<div class="bc-card"><div class="bc-card-h"><i class="fa-solid fa-skull-crossbones"></i>Mass Delete' +
+
+            // Mass kick is NOT destructive — it belongs above the delete card and
+            // must not read like a milder shade of it.
+            var html = '<div class="bc-card"><div class="bc-card-h"><i class="fa-solid fa-right-from-bracket"></i>Mass Kick' +
+                '<span class="bc-note">takes every bot offline, keeps them in the database</span></div>' +
+                '<div class="bc-card-b">' +
+                '<div style="margin-bottom:12px;color:var(--text-secondary, #a9b1d6);font-size:13px;">' +
+                (online > 0
+                    ? '<b>' + online + '</b> of ' + total + ' bot' + (total === 1 ? '' : 's') + ' currently online. ' +
+                      'They stay in the roster — bring them back with <b>Load SuperUI Bots</b>.'
+                    : 'No bots are online.') +
+                '</div>' +
+                '<button type="button" class="bm-kick-btn" id="bmMassKickBtn" style="margin-left:0;margin-right:0;"' +
+                (online === 0 ? ' disabled' : '') + '><i class="fa-solid fa-right-from-bracket" style="margin-right:5px;"></i>Kick All Bots</button>' +
+                '</div></div>' +
+
+                '<div class="bc-card"><div class="bc-card-h"><i class="fa-solid fa-skull-crossbones"></i>Mass Delete' +
                 '<span class="bc-note">permanently deletes bots from the database</span></div>' +
                 '<div class="bc-card-b">' +
                 '<div style="margin-bottom:12px;color:var(--text-secondary, #a9b1d6);font-size:13px;">' +
                 'Targets the entire bot roster: <b>' + total + '</b> bot' + (total === 1 ? '' : 's') + '.' +
                 (online > 0
-                    ? ' <span style="color:#f7768e;">' + online + ' still online — disconnect them first, the whole batch is blocked otherwise.</span>'
+                    ? ' <span style="color:#e0af68;">' + online + ' still online — they will be kicked first, then purged.</span>'
                     : '') +
                 '</div>' +
                 '<button type="button" class="bm-delete-btn" id="bmMassDeleteBtn" style="margin-left:0;"' +
                 (total === 0 ? ' disabled' : '') + '><i class="fa-solid fa-trash" style="margin-right:5px;"></i>Delete All Bots</button>' +
                 '</div></div>';
             $body.html(html);
-            $body.data('rosterTotal', total);
+            $body.data({ rosterTotal: total, rosterOnline: online });
         }).fail(function () {
             $body.html('<div style="color:#f7768e;padding:16px;">Failed to load roster summary</div>');
         });
