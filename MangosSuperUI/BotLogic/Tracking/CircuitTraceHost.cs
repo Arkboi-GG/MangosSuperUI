@@ -294,16 +294,44 @@ public sealed class CircuitTraceHost
             _writer!.WriteLine(JsonSerializer.Serialize(new { k = "site", id = site.Id, file = site.File, line = site.Line, desc = site.Description }));
     }
 
+    // A trace file is scoped to ONE PROCESS SESSION — never to a day.
+    //
+    // Site ids are session-local nicknames (R5: the durable identity is file:line;
+    // the number is a coat-check ticket, valid for one visit). A daily file that
+    // several processes append to therefore carries several CONFLICTING id spaces
+    // in one stream, and any reader that builds a single id→site map silently
+    // mislabels every record from the older sessions. It does not fail — it lies.
+    //
+    // This is not hypothetical. 2026-08-26: one day's file held FIVE sessions;
+    // BotBrain.cs:255 was id 24, then 71, then 96, then 51, then 87. An analysis
+    // decoded the whole file against the newest manifest and produced a confident,
+    // completely wrong diagnosis of a stalled bot — retracted only because two
+    // measurements happened to disagree and got chased down.
+    //
+    // One file per session makes the naive read the CORRECT read. The header
+    // record below lets any reader assert it rather than infer it. See R11.
+    private readonly string _sessionId =
+        DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + "-" + Environment.ProcessId;
+
     private void EnsureWriter()
     {
         var today = DateTime.UtcNow.ToString("yyyyMMdd");
         if (_writer != null && _writerDate == today) return;
         _writer?.Dispose();
-        _writer = new StreamWriter(Path.Combine(TRACE_DIR, $"circuit_{today}.jsonl"), append: true);
+        _writer = new StreamWriter(Path.Combine(TRACE_DIR, $"circuit_{today}_{_sessionId}.jsonl"), append: true);
         _writerDate = today;
-        // New file (or rollover): replay the FULL site manifest so every daily file
-        // decodes standalone.
+        // Fresh file (new session, or midnight rollover within one session):
+        // replay the FULL site manifest so this file decodes standalone — which is
+        // now a true statement, because nothing else will ever append to it.
         _siteWatermark = 0;
+        _writer.WriteLine(JsonSerializer.Serialize(new
+        {
+            k = "session",
+            id = _sessionId,
+            startedUtc = DateTime.UtcNow.ToString("O"),
+            pid = Environment.ProcessId,
+            note = "site ids in this file are scoped to THIS session only — never decode a trace against another session's manifest"
+        }));
         EmitNewSites();
     }
 
