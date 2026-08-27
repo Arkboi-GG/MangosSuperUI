@@ -1701,7 +1701,7 @@ public class PatchBuilderService
     private uint PatchSpellIconDbc(DbcWriterService spellIconDbc, string sanitizedSpellName)
     {
         string textureBase = $@"Interface\Icons\CustomSpell_{sanitizedSpellName}";
-        uint newIconId = Math.Max(spellIconDbc.GetMaxId() + 1, CUSTOM_SPELL_FLOOR);
+        uint newIconId = Math.Max(spellIconDbc.GetMaxId() + 1, CUSTOM_ICON_FLOOR);
 
         int fieldCount = spellIconDbc.RecordSize / 4;
         var row = new uint[fieldCount];
