@@ -180,12 +180,31 @@ public class DbcWriterService
         return removed;
     }
 
-    /// <summary>Add a new row with the given field values. Must have the correct field count.</summary>
+    /// <summary>
+    /// Add a new row with the given field values, replacing any existing row with the
+    /// same ID (field[0]). Must have the correct field count.
+    ///
+    /// Replace, not append: this is the single choke point every insertion path
+    /// (CloneRow included) funnels through. Rebuilds always re-add every custom
+    /// entry from custom_spell_meta, but only ID ranges above each DBC's scrub
+    /// floor (ReadCleanDbc) get pre-scrubbed from the "clean" base before that —
+    /// entries below the floor (all stock/Blizzard IDs) reach here still present
+    /// in the base file. Without this replace, re-adding one of those IDs left
+    /// the old row physically in _records (orphaned from _idIndex, which just
+    /// pointed at the new one) while still being serialized to the output file —
+    /// silent duplicate rows accumulating on every rebuild.
+    /// </summary>
     public void AddRow(uint[] fields)
     {
         int expectedFields = RecordSize / 4;
         if (fields.Length != expectedFields)
             throw new ArgumentException($"Row has {fields.Length} fields, expected {expectedFields}");
+
+        if (_idIndex.TryGetValue(fields[0], out int existingIdx))
+        {
+            _records[existingIdx] = fields;
+            return;
+        }
 
         _records.Add(fields);
         _idIndex[fields[0]] = _records.Count - 1;
