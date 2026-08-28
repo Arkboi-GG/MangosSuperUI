@@ -24,6 +24,25 @@ $(function () {
     var paused = false;
     var lastMode = '?';
     var feedMode = false;
+    var histMode = false;       // Activity tab: macro episodes with decision/source drill-down
+    var histEpisodes = [];      // frozen or live snapshot from /CircuitTrace/Timeline
+    var histChanges = [];       // flattened decisions (old name retained for small helper reuse)
+    var histEpisodeIx = -1;
+    var histIx = -1;            // selected decision in the flattened list
+    var histPathIx = -1;        // selected literal probe inside that decision
+    var histNavIndexes = [];    // meaningful transitions/events; confirmations stay drill-down only
+    var histFrozenNewestId = 0;
+    var histFrozenMomentIds = {};
+    var histFrozenEpisodeState = {};
+    var histNewCount = 0;
+    var histConfirmationOpen = {};
+    var histWindowTruncated = false;
+    var histRequestSerial = 0;
+    var histLoading = false;
+    var sourceRequestSerial = 0;
+    var sourceCache = {};
+    var sourceVersion = String($('#cbSource').attr('data-source-version') || '');
+    var botList = [];           // last /Bots/States list — names for the "Traced…" modal
     var laneFilter = null;
     var showAllLanes = false;
     var selectedSite = null;
@@ -124,6 +143,7 @@ $(function () {
     function loadBots() {
         $.getJSON('/Bots/States', function (d) {
             var bots = (d && d.bots) || [];
+            botList = bots;
             var sel = $('#cbBot');
             var cur = sel.val();
             sel.find('option:not(:first)').remove();
@@ -559,7 +579,7 @@ $(function () {
 
     // ---------- polling ----------
     function poll() {
-        if (paused || guid <= 0) return;
+        if (paused || histMode || guid <= 0) return;   // Changes tab is frozen — never poll under it
         $.getJSON('/CircuitTrace/Peek?guid=' + guid + '&maxSegments=256', function (d) {
             var segs = (d && d.segments) || [];
             lastSegs = segs;
@@ -606,8 +626,19 @@ $(function () {
         guid = parseInt($(this).val(), 10) || 0;
         botName = ($(this).find('option:selected').text() || '').replace(/\s*\(\d+\)\s*$/, '');
         builtKey = ''; selectedSite = null; userAdjusted = false;
+        histRequestSerial++;
+        sourceRequestSerial++;
+        histEpisodes = []; histChanges = [];
+        histNavIndexes = [];
+        histEpisodeIx = histIx = histPathIx = -1;
+        histFrozenNewestId = histNewCount = 0;
+        histFrozenMomentIds = {};
+        histFrozenEpisodeState = {};
+        histConfirmationOpen = {};
+        histWindowTruncated = false;
         $('#cbDetail').hide();
-        poll(); refreshStatus();
+        if (histMode) captureHistory({ force: true, follow: !paused }); else poll();
+        refreshStatus();
     });
     $('#cbArm').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Arm?guid=' + guid).done(refreshStatus); });
     $('#cbDisarm').on('click', function () { if (guid > 0) $.post('/CircuitTrace/Disarm?guid=' + guid).done(refreshStatus); });
@@ -616,17 +647,860 @@ $(function () {
         var next = lastMode === 'shadow' ? 'off' : 'shadow';
         $.post('/CircuitTrace/Mode?mode=' + next).done(refreshStatus);
     });
-    $('#cbPause').on('click', function () { paused = !paused; $(this).text(paused ? 'Resume' : 'Pause').toggleClass('cb-active', paused); });
+    function setPaused(next) {
+        paused = !!next;
+        if (paused && histMode && histChanges.length) {
+            histFrozenNewestId = histChanges[histChanges.length - 1].id || histFrozenNewestId;
+            freezeHistorySnapshot();
+        }
+        $('#cbPause').text(paused ? 'Resume' : 'Pause').toggleClass('cb-active', paused);
+        renderHistoryLiveState();
+        if (!paused) {
+            histNewCount = 0;
+            if (histMode) captureHistory({ force: true, follow: true });
+            else poll();
+        }
+    }
+    $('#cbPause').on('click', function () { setPaused(!paused); });
     $('#cbAllLanes').on('click', function () { showAllLanes = !showAllLanes; $(this).toggleClass('cb-active', showAllLanes); builtKey = ''; poll(); });
     $('#cbFit').on('click', function () { userAdjusted = false; fitWidth(); });
-    $('#cbTabBoard, #cbTabFeed').on('click', function () {
-        feedMode = this.id === 'cbTabFeed';
-        $('#cbTabBoard').toggleClass('cb-active', !feedMode);
-        $('#cbTabFeed').toggleClass('cb-active', feedMode);
-        $('#cbBoardWrap').toggle(!feedMode);
-        $('#cbFeed').toggle(feedMode);
-        poll();
+    function setView(mode) {
+        feedMode = mode === 'feed';
+        histMode = mode === 'history';
+        $('#cbTabBoard').toggleClass('cb-active', mode === 'board');
+        $('#cbTabFeed').toggleClass('cb-active', mode === 'feed');
+        $('#cbTabHistory').toggleClass('cb-active', mode === 'history');
+        $('#cbBoardWrap').toggle(mode === 'board');
+        $('#cbFeed').toggle(mode === 'feed');
+        $('#cbHistory').css('display', mode === 'history' ? 'grid' : 'none');
+        $('.cb-footer').toggle(mode !== 'history');
+        $('#cbAllLanes,#cbFit').toggle(mode === 'board');
+        if (mode !== 'board') $('#cbWedge').hide();
+        if (mode === 'history') captureHistory({ force: histEpisodes.length === 0, follow: !paused });
+        else poll();
+    }
+    $('#cbTabBoard').on('click', function () { setView('board'); });
+    $('#cbTabFeed').on('click', function () { setView('feed'); });
+    $('#cbTabHistory').on('click', function () { setView('history'); });
+
+    // ---------- Activity reader: incident/routine → meaningful change → source ----------
+    // The server retains exact decision runs for twenty minutes, groups routine work
+    // by durable objective, and holds sustained alarms open as conditions. Confirming
+    // frames remain available here without masquerading as new incidents.
+    function resetHistory(message) {
+        histEpisodes = [];
+        histChanges = [];
+        histNavIndexes = [];
+        histEpisodeIx = histIx = histPathIx = -1;
+        histFrozenNewestId = histNewCount = 0;
+        histFrozenMomentIds = {};
+        histFrozenEpisodeState = {};
+        histConfirmationOpen = {};
+        $('#cbHistList').html('<div class="cb-reader-empty"><strong>' + esc(message) + '</strong>' +
+            (guid <= 0 ? 'Find → fight → loot → heal loops will appear as one routine episode.' : '') + '</div>');
+        $('#cbHistDetail').html('<div class="cb-reader-empty"><strong>No decision selected.</strong></div>');
+        $('#cbDecisionList,#cbPathList').empty();
+        renderSourceEmpty('Choose a decision step to read its code.');
+        updateHistNav();
+        renderHistoryLiveState();
+    }
+
+    function flattenEpisodes(episodes) {
+        var out = [];
+        (episodes || []).forEach(function (episode, episodeIx) {
+            (episode.decisions || []).forEach(function (decision, localIx) {
+                decision._episodeIx = episodeIx;
+                decision._localIx = localIx;
+                out.push(decision);
+            });
+        });
+        return out;
+    }
+
+    function episodeKind(episode) {
+        var kind = String((episode && episode.kind) || '').toLowerCase();
+        if (kind === 'condition' || kind === 'eventburst' || kind === 'routine') return kind;
+        return episode && episode.severity === 'alarm' ? 'eventburst' : 'routine';
+    }
+
+    function decisionPresentation(decision, episode, localIx) {
+        var value = String((decision && decision.presentation) || '').toLowerCase();
+        if (value === 'transition' || value === 'confirmation' || value === 'event' || value === 'decision')
+            return value;
+
+        var kind = episodeKind(episode);
+        if (kind === 'eventburst') return 'event';
+        if (kind !== 'condition') return 'decision';
+        if (localIx === 0 || (decision && decision.transition)) return 'transition';
+        if (episode && episode.status === 'resolved' && localIx === (episode.decisions || []).length - 1)
+            return 'transition';
+        return 'confirmation';
+    }
+
+    function isNavigableDecision(decision) {
+        var episode = histEpisodes[decision && decision._episodeIx];
+        if (!decision || !episode) return false;
+        if (episode.startedBeforeWindow && decision._localIx === 0) return true;
+        return decisionPresentation(decision, episode, decision._localIx) !== 'confirmation';
+    }
+
+    function rebuildHistNav() {
+        histNavIndexes = [];
+        var representedEpisodes = {};
+        histChanges.forEach(function (decision, flatIx) {
+            if (!isNavigableDecision(decision)) return;
+            histNavIndexes.push(flatIx);
+            representedEpisodes[decision._episodeIx] = true;
+        });
+
+        // A retained window can begin in the middle of an already-active condition.
+        // Keep one representative selectable even when every retained frame is a confirmation.
+        histEpisodes.forEach(function (episode, episodeIx) {
+            if (representedEpisodes[episodeIx] || !(episode.decisions || []).length) return;
+            var firstIx = histChanges.findIndex(function (decision) {
+                return decision._episodeIx === episodeIx;
+            });
+            if (firstIx >= 0) histNavIndexes.push(firstIx);
+        });
+        histNavIndexes.sort(function (a, b) { return a - b; });
+    }
+
+    function momentKey(decision) {
+        return 'decision:' + String(decision && decision.id);
+    }
+
+    function episodeKey(episode) {
+        if (episodeKind(episode) === 'condition')
+            return 'episode:condition:' + String(episode && episode.id);
+        return 'episode:' + String(episode && episode.id) + ':' + String((episode && episode.start) || '');
+    }
+
+    function freezeHistorySnapshot() {
+        histFrozenMomentIds = {};
+        histNavIndexes.forEach(function (flatIx) {
+            histFrozenMomentIds[momentKey(histChanges[flatIx])] = true;
+        });
+        histFrozenEpisodeState = {};
+        histEpisodes.forEach(function (episode) {
+            histFrozenEpisodeState[episodeKey(episode)] = {
+                kind: episodeKind(episode),
+                status: String(episode.status || ''),
+                transitionCount: +episode.transitionCount || 0,
+                occurrenceCount: +episode.occurrenceCount || 0
+            };
+        });
+    }
+
+    function countHumanHistoryUpdates(incomingEpisodes, incomingDecisions) {
+        var unseenByEpisode = {};
+        var count = 0;
+        incomingDecisions.forEach(function (decision) {
+            var episode = incomingEpisodes[decision._episodeIx];
+            var presentation = decisionPresentation(decision, episode, decision._localIx);
+            var navigable = presentation !== 'confirmation' || (episode && episode.startedBeforeWindow && decision._localIx === 0);
+            if (!navigable || histFrozenMomentIds[momentKey(decision)]) return;
+            count++;
+            unseenByEpisode[episodeKey(episode)] = true;
+        });
+
+        incomingEpisodes.forEach(function (episode) {
+            var key = episodeKey(episode);
+            var before = histFrozenEpisodeState[key];
+            if (!before) {
+                if (!unseenByEpisode[key]) count++;
+                return;
+            }
+
+            var meaningfulStateChanged = before.status !== String(episode.status || '')
+                || before.transitionCount !== (+episode.transitionCount || 0)
+                || (episodeKind(episode) === 'eventburst'
+                    && before.occurrenceCount !== (+episode.occurrenceCount || 0));
+            if (meaningfulStateChanged && !unseenByEpisode[key]) count++;
+        });
+        return count;
+    }
+
+    function captureHistory(options) {
+        options = options || {};
+        if (guid <= 0) {
+            resetHistory('Pick a bot to read its activity.');
+            return;
+        }
+        if (histLoading && options.quiet) return;
+
+        var requestedGuid = guid;
+        var serial = ++histRequestSerial;
+        var priorDecisionId = histChanges[histIx] && histChanges[histIx].id;
+        var priorPathIx = histPathIx;
+        histLoading = true;
+        $.getJSON('/CircuitTrace/Timeline/' + requestedGuid + '?maxRuns=2048')
+            .done(function (d) {
+                if (serial !== histRequestSerial || requestedGuid !== guid || !d) return;
+                lastMode = d.mode || lastMode;
+                var incomingEpisodes = d.episodes || [];
+                var incomingDecisions = flattenEpisodes(incomingEpisodes);
+                var incomingNewest = d.newestDecisionId ||
+                    (incomingDecisions.length ? incomingDecisions[incomingDecisions.length - 1].id : 0);
+
+                // A paused reader is a real snapshot. Poll only to light the "new"
+                // badge; never move or replace the material somebody is teaching from.
+                if (paused && !options.force && histChanges.length) {
+                    histNewCount = countHumanHistoryUpdates(incomingEpisodes, incomingDecisions);
+                    renderHistoryLiveState();
+                    return;
+                }
+
+                histEpisodes = incomingEpisodes;
+                histChanges = incomingDecisions;
+                rebuildHistNav();
+                histWindowTruncated = !!d.windowTruncated;
+                histNewCount = 0;
+                if (!histChanges.length) {
+                    resetHistory(lastMode === 'shadow'
+                        ? 'No activity has been recorded for this bot yet.'
+                        : 'Shadow mode is off — turn it on to record activity.');
+                    return;
+                }
+
+                var preserved = -1;
+                if (options.preserve && priorDecisionId != null) {
+                    preserved = histChanges.findIndex(function (decision) { return decision.id === priorDecisionId; });
+                }
+                histIx = preserved >= 0 ? preserved
+                    : (histNavIndexes.length ? histNavIndexes[histNavIndexes.length - 1] : histChanges.length - 1);
+                histEpisodeIx = histChanges[histIx]._episodeIx;
+                histPathIx = preserved >= 0 ? priorPathIx : -1;
+                histFrozenNewestId = incomingNewest;
+                freezeHistorySnapshot();
+                renderHistList();
+                renderHistDetail();
+                renderHistoryLiveState();
+            })
+            .fail(function () {
+                if (serial !== histRequestSerial || options.quiet || histChanges.length) return;
+                resetHistory('The activity timeline could not be loaded.');
+            })
+            .always(function () {
+                if (serial === histRequestSerial) histLoading = false;
+            });
+    }
+
+    function timeOf(value) {
+        if (!value) return '—';
+        var date = new Date(value);
+        if (isNaN(date.getTime())) return ('' + value).replace('T', ' ').substring(11, 19);
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    }
+
+    function durationText(ms, start, end) {
+        if (ms == null && start && end) ms = new Date(end) - new Date(start);
+        ms = Math.max(0, +ms || 0);
+        if (ms < 1000) return Math.round(ms) + ' ms';
+        var seconds = Math.round(ms / 1000);
+        if (seconds < 60) return seconds + ' s';
+        var minutes = Math.floor(seconds / 60);
+        var rest = seconds % 60;
+        return minutes + 'm' + (rest ? ' ' + rest + 's' : '');
+    }
+
+    function friendlyActivity(name) {
+        return ({
+            Searching: 'find target', Engaged: 'fight', Recovering: 'heal / recover',
+            Traveling: 'travel', Idle: 'idle', Blocked: 'blocked', Unknown: 'unknown'
+        })[name] || name || 'unknown';
+    }
+
+    function pluralCount(value, singular, plural) {
+        var count = Math.max(0, +value || 0);
+        return count + ' ' + (count === 1 ? singular : (plural || singular + 's'));
+    }
+
+    function cleanAlarmLabel(value) {
+        return String(value || '').replace(/^alarm\s*[·:\-]\s*/i, '').trim();
+    }
+
+    function friendlyCondition(episode) {
+        var condition = String((episode && episode.condition) || '').toLowerCase();
+        if (condition === 'dead') return 'Dead';
+        if (condition === 'blocked') return 'Activity blocked';
+        return cleanAlarmLabel(episode && episode.label) || 'Attention needed';
+    }
+
+    function secondaryAlarmReasons(episode, reasons) {
+        var primary = String((episode && episode.condition) || '').toLowerCase() === 'blocked'
+            ? 'activity blocked' : String((episode && episode.condition) || '').toLowerCase();
+        return (reasons || []).filter(function (reason) {
+            return episodeKind(episode) !== 'condition'
+                || cleanAlarmLabel(reason).toLowerCase() !== primary;
+        });
+    }
+
+    function episodeTitle(episode) {
+        var kind = episodeKind(episode);
+        if (kind === 'condition') return friendlyCondition(episode);
+        if (kind === 'eventburst') return cleanAlarmLabel(episode.label) || 'Attention event';
+        return episode.label || 'Activity';
+    }
+
+    function episodeStatus(episode) {
+        if (episodeKind(episode) !== 'condition') return '';
+        if (episode.continuationUnknown) return 'end unknown';
+        if (String(episode.status).toLowerCase() === 'ongoing') return 'ongoing';
+        if (String(episode.status).toLowerCase() === 'resolved') return 'resolved';
+        return 'observed';
+    }
+
+    function episodeTimeRange(episode) {
+        var start = (episode.startedBeforeWindow ? '≤' : '') + timeOf(episode.start);
+        if (episodeKind(episode) === 'condition' && episodeStatus(episode) === 'ongoing')
+            return start + '–…';
+        return start + '–' + timeOf(episode.end);
+    }
+
+    function episodeMetaParts(episode) {
+        var kind = episodeKind(episode);
+        var parts = [];
+        if (kind === 'condition') {
+            if (episode.startedBeforeWindow) parts.push('already active at window start');
+            if (!episode.startedBeforeWindow || (+episode.transitionCount || 0) > 0)
+                parts.push(pluralCount(episode.transitionCount, 'meaningful transition'));
+            parts.push(pluralCount(episode.confirmationCount, 'confirmation'));
+            if ((episode.events || []).length)
+                parts.push(pluralCount((episode.events || []).reduce(function (sum, event) {
+                    return sum + Math.max(1, +event.occurrenceCount || 1);
+                }, 0), 'related event'));
+        } else if (kind === 'eventburst') {
+            parts.push(pluralCount(episode.occurrenceCount || episode.decisionCount, 'occurrence'));
+        } else {
+            parts.push(pluralCount(episode.decisionCount, 'activity change'));
+            parts.push(pluralCount(episode.rawSegmentCount, 'observed frame'));
+        }
+        parts.push(durationText(episode.durationMs, episode.start, episode.end));
+        if (episode.killDelta > 0) parts.push('+' + episode.killDelta + ' kills');
+        return parts;
+    }
+
+    function activityClass(name, attention) {
+        if (attention || name === 'Blocked') return 'cb-attention';
+        return ({ Searching: 'cb-search', Engaged: 'cb-combat', Recovering: 'cb-heal',
+            Traveling: 'cb-search', Idle: 'cb-wait' })[name] || 'cb-wait';
+    }
+
+    function activityStrip(episode) {
+        var spans = episode.activitySpans || [];
+        if (!spans.length) return '';
+        return '<div class="cb-activity-strip">' + spans.map(function (span) {
+            var amount = Math.max(1, Math.min(24, span.rawSegmentCount || span.decisionCount || 1));
+            var title = friendlyActivity(span.activity) + ' · ' + durationText(span.durationMs, span.start, span.end) +
+                ' · ' + pluralCount(span.rawSegmentCount || 1, 'observed frame');
+            return '<span class="cb-activity-chip ' + activityClass(span.activity, episode.severity === 'alarm') + '"' +
+                ' style="flex-grow:' + amount + '" title="' + esc(title) + '"></span>';
+        }).join('') + '</div>';
+    }
+
+    function episodeFlowLabel(episode) {
+        if (episode.cycle && episode.cycle.pattern && episode.cycle.pattern.length) {
+            return episode.cycle.pattern.map(friendlyActivity).join(' → ') + ' ×' + episode.cycle.completeCycles;
+        }
+        var names = (episode.activitySpans || []).map(function (span) { return friendlyActivity(span.activity); });
+        if (names.length > 6) names = names.slice(0, 5).concat(['…']);
+        return names.join(' → ') || 'no activity readback';
+    }
+
+    function renderHistList() {
+        if (!histEpisodes.length) return;
+        var html = '';
+        histEpisodes.forEach(function (episode, ix) {
+            var kind = episodeKind(episode);
+            var attention = kind !== 'routine' || episode.severity === 'alarm';
+            var selected = ix === histEpisodeIx;
+            var status = episodeStatus(episode);
+            var stateLabel = kind === 'condition' ? 'CONDITION'
+                : (kind === 'eventburst' ? 'EVENT ×' + Math.max(1, +episode.occurrenceCount || +episode.decisionCount || 1) : 'ROUTINE');
+            var meta = episodeMetaParts(episode).map(function (part) {
+                return '<span>' + esc(part) + '</span>';
+            }).join('');
+            var extraReasons = secondaryAlarmReasons(episode, episode.alarmReasons);
+            var reason = attention && extraReasons.length
+                ? '<div class="cb-episode-reason">' + esc(extraReasons.join(' · ')) + '</div>'
+                : '';
+            var relatedEvents = kind === 'condition' && (episode.events || []).length
+                ? '<div class="cb-episode-events">Also observed: ' + (episode.events || []).map(function (event) {
+                    var count = Math.max(1, +event.occurrenceCount || 1);
+                    return esc(cleanAlarmLabel(event.reason || event.label || 'attention event')) + (count > 1 ? ' ×' + count : '');
+                }).join(' · ') + '</div>'
+                : '';
+            var bodyLead = kind === 'condition'
+                ? 'One continuous condition. Repeated observations are confirmations, not new incidents.'
+                : (kind === 'eventburst'
+                    ? pluralCount(episode.occurrenceCount || episode.decisionCount, 'point event') + ' grouped into one burst.'
+                    : episodeFlowLabel(episode));
+            html += '<article class="cb-episode ' + (attention ? 'cb-episode-attention' : 'cb-episode-normal') +
+                ' cb-episode-' + kind +
+                (selected ? ' cb-selected cb-expanded' : '') + '" data-episode-ix="' + ix + '"' +
+                ' aria-selected="' + selected + '" aria-expanded="' + selected + '">' +
+                '<div class="cb-episode-summary"><div class="cb-episode-top">' +
+                '<span class="cb-episode-state">' + esc(stateLabel) + '</span>' +
+                '<span class="cb-episode-title">' + esc(episodeTitle(episode)) + '</span>' +
+                (status ? '<span class="cb-episode-status cb-status-' + esc(status.replace(/\s+/g, '-')) + '">' + esc(status) + '</span>' : '') +
+                '<span class="cb-episode-time">' + esc(episodeTimeRange(episode)) + '</span></div>' +
+                '<div class="cb-episode-meta">' + meta + '</div>' +
+                (kind === 'routine' ? activityStrip(episode) : '') + '</div>' +
+                '<div class="cb-episode-body"><strong>' + esc(bodyLead) + '</strong>' + reason + relatedEvents +
+                '<div class="cb-episode-meta">Select to inspect meaningful changes and their source.</div></div></article>';
+        });
+        $('#cbHistList').html(html);
+        var selected = $('#cbHistList .cb-selected');
+        if (selected.length) selected[0].scrollIntoView({ block: 'nearest' });
+        updateHistNav();
+    }
+
+    function siteForHit(hit) {
+        return (hit && hit.site) || (hit && sites[hit.siteId]) || null;
+    }
+
+    function siteShort(site, siteId) {
+        if (!site) return 'site #' + siteId;
+        var desc = site.desc || site.description || '';
+        var colon = desc.indexOf(':');
+        return colon >= 0 ? desc.substring(colon + 1).trim() : (desc || ('site #' + siteId));
+    }
+
+    function findDecisionIndex(id) {
+        return histChanges.findIndex(function (decision) { return decision.id === id; });
+    }
+
+    function preferredPathIndex(decision) {
+        var hits = (decision && decision.hits) || [];
+        if (!hits.length) return -1;
+        var focus = decision.focusSiteId;
+        for (var i = hits.length - 1; i >= 0; i--) if (hits[i].siteId === focus) return i;
+        return hits.length - 1;
+    }
+
+    function displayPresentation(decision, episode, localIx) {
+        var presentation = decisionPresentation(decision, episode, localIx);
+        if (presentation === 'confirmation' && episode.startedBeforeWindow && localIx === 0)
+            return 'windowstart';
+        return presentation;
+    }
+
+    function decisionPointEvents(decision) {
+        return (decision && decision.events) || [];
+    }
+
+    function decisionEventCount(decision) {
+        var events = decisionPointEvents(decision);
+        if (!events.length) return Math.max(1, +decision.rawSegmentCount || 1);
+        return events.reduce(function (sum, event) {
+            return sum + Math.max(1, +event.occurrenceCount || 1);
+        }, 0);
+    }
+
+    function decisionMomentTitle(decision, episode, localIx) {
+        var presentation = displayPresentation(decision, episode, localIx);
+        var condition = String(episode.condition || '').toLowerCase();
+        var transition = String(decision.transition || '').toLowerCase();
+        if (presentation === 'windowstart') return 'Condition already active';
+        if (presentation === 'confirmation') return 'Condition unchanged';
+        if (presentation === 'event') {
+            var point = decisionPointEvents(decision)[0];
+            return cleanAlarmLabel((point && (point.reason || point.label)) || (decision.alarmReasons || [])[0] || decision.label) || 'Attention event';
+        }
+        if (presentation === 'transition') {
+            if (transition === 'onset') {
+                if (condition === 'dead') return 'Death observed';
+                if (condition === 'blocked') return 'Activity became blocked';
+                return 'Condition began';
+            }
+            if (transition === 'clear') {
+                if (condition === 'dead') return 'Alive again';
+                if (condition === 'blocked') return 'Activity moving again';
+                return 'Condition cleared';
+            }
+            if (transition === 'phase') {
+                if (condition === 'dead') return 'Recovery phase changed';
+                if (condition === 'blocked') return 'Blocked-state handling changed';
+                return 'Condition phase changed';
+            }
+            return cleanAlarmLabel(decision.label) || 'Condition changed';
+        }
+        var state = decision.state || {};
+        return friendlyActivity(state.activity) || decision.label || decision.kind || 'Activity changed';
+    }
+
+    function decisionMomentSubtitle(decision, episode, localIx) {
+        var presentation = displayPresentation(decision, episode, localIx);
+        var state = decision.state || {};
+        if (presentation === 'confirmation')
+            return 'No new incident; the same condition was observed again.';
+        if (presentation === 'windowstart')
+            return 'The condition began before the retained reader window.';
+        if (presentation === 'event') {
+            var events = decisionPointEvents(decision);
+            if (events.length > 1) return pluralCount(decisionEventCount(decision), 'related point event');
+            return cleanAlarmLabel((events[0] && (events[0].reason || events[0].label)) || (decision.alarmReasons || [])[0] || state.step || decision.label);
+        }
+        return state.step || cleanAlarmLabel(decision.label) || '';
+    }
+
+    function renderDecisionRow(item, episode, localIx, rawConfirmation) {
+        var flatIx = findDecisionIndex(item.id);
+        var selected = flatIx === histIx;
+        var presentation = displayPresentation(item, episode, localIx);
+        var marker = presentation === 'transition'
+            ? (String(item.transition).toLowerCase() === 'clear' ? 'OUT' : 'IN')
+            : (presentation === 'windowstart' ? '…' : (presentation === 'event' ? '!' : (presentation === 'confirmation' ? '·' : (localIx + 1))));
+        var meta = '';
+        if (presentation === 'confirmation')
+            meta = pluralCount(item.rawSegmentCount || 1, 'confirmation');
+        else if (presentation === 'event')
+            meta = pluralCount(decisionEventCount(item), 'occurrence');
+        else if (presentation === 'transition' || presentation === 'windowstart')
+            meta = presentation === 'windowstart' ? 'window start' : (item.transition || 'transition');
+        else
+            meta = pluralCount(item.rawSegmentCount || 1, 'observed frame');
+
+        return '<div class="cb-decision-row cb-decision-' + presentation +
+            (rawConfirmation ? ' cb-raw-confirmation' : '') +
+            (selected ? ' cb-selected' : '') +
+            (presentation === 'event' || item.severity === 'alarm' ? ' cb-attention' : '') +
+            '" data-decision-id="' + item.id + '" aria-selected="' + selected + '">' +
+            '<span class="cb-decision-index">' + esc(marker) + '</span>' +
+            '<span class="cb-decision-copy"><strong>' + esc(decisionMomentTitle(item, episode, localIx)) + '</strong>' +
+            '<span>' + esc(decisionMomentSubtitle(item, episode, localIx)) + '</span></span>' +
+            '<span class="cb-decision-meta">' + esc(meta) + '<br>' + esc(timeOf(item.start)) + '</span></div>';
+    }
+
+    function renderConfirmationGroup(items, episode, groupIx) {
+        if (!items.length) return '';
+        var count = items.reduce(function (sum, entry) {
+            return sum + Math.max(1, +entry.item.rawSegmentCount || 1);
+        }, 0);
+        var open = !!histConfirmationOpen[episodeKey(episode)];
+        var selectedInside = items.some(function (entry) { return findDecisionIndex(entry.item.id) === histIx; });
+        var html = '<button type="button" class="cb-confirmation-group' + (selectedInside ? ' cb-selected' : '') +
+            '" data-confirm-toggle="' + esc(episodeKey(episode)) + '" data-confirm-group="' + groupIx + '" aria-expanded="' + open + '">' +
+            '<span class="cb-decision-index">' + (open ? '−' : '+') + '</span>' +
+            '<span class="cb-decision-copy"><strong>' + esc(pluralCount(count, 'unchanged confirmation')) + '</strong>' +
+            '<span>' + pluralCount(items.length, 'recorded frame') + '; no new incident.</span></span>' +
+            '<span class="cb-decision-meta">' + (open ? 'Hide raw' : 'Show raw') + '</span></button>';
+        if (open) {
+            items.forEach(function (entry) {
+                html += renderDecisionRow(entry.item, episode, entry.localIx, true);
+            });
+        }
+        return html;
+    }
+
+    function renderDecisionMoments(episode) {
+        var html = '';
+        var confirmations = [];
+        var groupIx = 0;
+        function flushConfirmations() {
+            if (!confirmations.length) return;
+            html += renderConfirmationGroup(confirmations, episode, groupIx++);
+            confirmations = [];
+        }
+        (episode.decisions || []).forEach(function (item, localIx) {
+            if (displayPresentation(item, episode, localIx) === 'confirmation') {
+                confirmations.push({ item: item, localIx: localIx });
+                return;
+            }
+            flushConfirmations();
+            html += renderDecisionRow(item, episode, localIx, false);
+        });
+        flushConfirmations();
+        return html || '<div class="cb-reader-empty"><strong>No trace moments were retained for this episode.</strong></div>';
+    }
+
+    function renderHistDetail() {
+        var decision = histChanges[histIx];
+        var episode = histEpisodes[histEpisodeIx];
+        if (!decision || !episode) {
+            $('#cbHistDetail').html('<div class="cb-reader-empty"><strong>No decision to show.</strong></div>');
+            $('#cbDecisionList,#cbPathList').empty();
+            renderSourceEmpty('Choose a decision step to read its code.');
+            return;
+        }
+
+        var state = decision.state || {};
+        var kind = episodeKind(episode);
+        var presentation = displayPresentation(decision, episode, decision._localIx);
+        var enter = decision.enter || [], exit = decision.exit || [];
+        var chips = '';
+        enter.forEach(function (id) {
+            var site = sites[id];
+            chips += '<span class="cb-chip cb-chip-in">+ ' + esc(siteShort(site, id)) + '</span>';
+        });
+        exit.forEach(function (id) {
+            var site = sites[id];
+            chips += '<span class="cb-chip cb-chip-out">− ' + esc(siteShort(site, id)) + '</span>';
+        });
+        if (decision.orderChanged) chips += '<span class="cb-chip cb-chip-in">execution order changed</span>';
+        if (!chips) chips = '<span class="cb-chip cb-chip-none">' +
+            (presentation === 'confirmation' ? 'same condition; no meaningful transition' : 'same probes; activity/state changed') + '</span>';
+
+        var decisionAlarmReasons = secondaryAlarmReasons(episode, decision.alarmReasons);
+        var alarm = decisionAlarmReasons.length
+            ? '<div style="color:var(--danger,#f7768e);margin-top:6px">' + esc(decisionAlarmReasons.join(' · ')) + '</div>' : '';
+        var status = episodeStatus(episode);
+        var episodeMeta = episodeMetaParts(episode).join(' · ');
+        var selectedFrames = Math.max(1, +decision.rawSegmentCount || 1);
+        var childEvents = kind === 'condition' && (episode.events || []).length
+            ? '<div class="cb-hd-events"><strong>Related point events</strong>' + (episode.events || []).map(function (event) {
+                var count = Math.max(1, +event.occurrenceCount || 1);
+                return '<span>' + esc(cleanAlarmLabel(event.reason || event.label || 'attention event')) + (count > 1 ? ' ×' + count : '') + '</span>';
+            }).join('') + '</div>' : '';
+        $('#cbHistDetail').html(
+            '<div class="cb-hd-head"><b>' + esc(episodeTitle(episode)) + '</b>' +
+            (status ? ' · ' + esc(status) : ' · ' + esc(episodeFlowLabel(episode))) + '</div>' +
+            '<div><strong>' + esc(decisionMomentTitle(decision, episode, decision._localIx)) + '</strong>' +
+            (decisionMomentSubtitle(decision, episode, decision._localIx) ? ' · ' + esc(decisionMomentSubtitle(decision, episode, decision._localIx)) : '') + '</div>' +
+            '<div class="cb-hd-head" style="margin-top:4px">Episode: ' + esc(episodeMeta) + '</div>' +
+            '<div class="cb-hd-head">Selected moment: ' + esc(timeOf(decision.start)) + ' → ' + esc(timeOf(decision.end)) +
+            ' · ' + esc(pluralCount(selectedFrames, presentation === 'confirmation' ? 'confirmation' : 'observed frame')) +
+            ' · ' + esc(durationText(decision.durationMs, decision.start, decision.end)) +
+            (state.taskKills != null ? ' · kill count ' + state.taskKills : '') + '</div>' +
+            '<div class="cb-hd-diff">' + chips + '</div>' + alarm + childEvents +
+            (histWindowTruncated ? '<div class="cb-hd-head">Older activity has rolled out of the 20-minute reader window.</div>' : ''));
+
+        $('#cbDecisionList').html(renderDecisionMoments(episode));
+
+        var hits = decision.hits || [];
+        if (histPathIx < 0 || histPathIx >= hits.length) histPathIx = preferredPathIndex(decision);
+        var pathHtml = '';
+        hits.forEach(function (hit, ix) {
+            var site = siteForHit(hit);
+            var file = site && site.file ? site.file.split(/[\\/]/).pop() + ':' + site.line : 'source unavailable';
+            var payload = hit.value !== null && hit.value !== undefined ? ' = ' + hit.value :
+                (hit.note ? ' · ' + hit.note : '');
+            pathHtml += '<li class="cb-path-step' + (ix === histPathIx ? ' cb-selected' : '') + '" data-path-ix="' + ix +
+                '" aria-current="' + (ix === histPathIx ? 'step' : 'false') + '"><div class="cb-path-copy">' +
+                esc(siteShort(site, hit.siteId) + payload) + '<small>' + esc(file) + '</small></div></li>';
+        });
+        $('#cbPathList').html(pathHtml || '<li class="cb-reader-empty"><strong>No own-context probes were recorded in this decision.</strong></li>');
+        showSelectedSource();
+
+        var selectedDecision = $('#cbDecisionList .cb-selected');
+        if (selectedDecision.length) selectedDecision[0].scrollIntoView({ block: 'nearest' });
+        updateHistNav();
+    }
+
+    function renderSourceEmpty(message) {
+        $('#cbSourceHeader').html('<div class="cb-pane-title">Source at this step</div>' +
+            '<div class="cb-pane-kicker">A few lines before the fired probe show the literal branch that led here.</div>');
+        $('#cbSourceBody').html('<div class="cb-reader-empty"><strong>' + esc(message) + '</strong></div>');
+    }
+
+    function showSelectedSource() {
+        var decision = histChanges[histIx];
+        var hits = (decision && decision.hits) || [];
+        var hit = hits[histPathIx];
+        if (!hit) {
+            renderSourceEmpty('This decision has no source-bearing probe.');
+            return;
+        }
+        var previous = histPathIx > 0 ? hits[histPathIx - 1] : null;
+        var site = siteForHit(hit);
+        var priorSite = siteForHit(previous);
+        var sourceName = site && site.file ? site.file.split(/[\\/]/).pop() + ':' + site.line : 'registered site #' + hit.siteId;
+        var flow = priorSite ? siteShort(priorSite, previous.siteId) + ' → ' + siteShort(site, hit.siteId)
+            : 'decision entry → ' + siteShort(site, hit.siteId);
+        $('#cbSourceHeader').html('<div class="cb-pane-title">Step ' + (histPathIx + 1) + ' · ' + esc(sourceName) + '</div>' +
+            '<div class="cb-pane-kicker">' + esc(flow) + '</div>');
+        $('#cbSourceBody').html('<div class="cb-reader-empty"><strong>Reading source…</strong></div>');
+
+        var token = ++sourceRequestSerial;
+        var cacheKey = sourceVersion + ':' + hit.siteId;
+        if (sourceCache[cacheKey]) {
+            renderSourceSnippet(sourceCache[cacheKey], token, flow, histPathIx + 1);
+            return;
+        }
+        $.getJSON('/CircuitTrace/Source?siteId=' + encodeURIComponent(hit.siteId) +
+            '&before=6&after=1&sourceVersion=' + encodeURIComponent(sourceVersion))
+            .done(function (data) {
+                var responseVersion = String((data && data.sourceVersion) || '');
+                if (responseVersion && responseVersion !== sourceVersion) {
+                    sourceVersion = responseVersion;
+                    sourceCache = {};
+                    $('#cbSource').attr('data-source-version', sourceVersion);
+                }
+                sourceCache[sourceVersion + ':' + hit.siteId] = data;
+                renderSourceSnippet(data, token, flow, histPathIx + 1);
+            })
+            .fail(function (xhr) {
+                if (token !== sourceRequestSerial) return;
+                var message = xhr.responseJSON && xhr.responseJSON.error
+                    ? xhr.responseJSON.error : 'Source could not be read for this registered probe.';
+                $('#cbSourceBody').html('<div class="cb-reader-empty"><strong>' + esc(message) + '</strong></div>');
+            });
+    }
+
+    function renderSourceSnippet(data, token, flow, stepNumber) {
+        if (token !== sourceRequestSerial) return;
+        if (!data || !data.available) {
+            $('#cbSourceBody').html('<div class="cb-reader-empty"><strong>' +
+                esc((data && (data.error || data.sourceNote)) || 'Source is unavailable for this probe.') + '</strong></div>');
+            return;
+        }
+        $('#cbSourceHeader').html('<div class="cb-pane-title">Step ' + stepNumber + ' · ' +
+            esc(data.file + ':' + data.line) + '</div><div class="cb-pane-kicker">' + esc(flow) + '</div>');
+        var lines = data.lines || [];
+        var html = '<div style="padding:2px 14px 8px;color:var(--text-muted);font-size:10.5px">' +
+            esc(data.sourceNote || 'Configured source checkout; build revision is not verified.') + '</div>';
+        lines.forEach(function (line) {
+            html += '<div class="cb-source-line' + (line.isTarget ? ' cb-target' : '') + '" data-target="' + !!line.isTarget + '">' +
+                '<span class="cb-source-number">' + line.number + '</span><span class="cb-source-text">' + esc(line.text) + '</span></div>';
+        });
+        $('#cbSourceBody').html(html);
+        var target = $('#cbSourceBody .cb-target');
+        if (target.length) target[0].scrollIntoView({ block: 'center' });
+    }
+
+    function renderHistoryLiveState() {
+        $('#cbHistLive').toggleClass('cb-frozen', paused)
+            .attr('data-state', paused ? 'frozen' : 'live')
+            .text(paused ? 'paused · this change and source are frozen' : 'live · newest meaningful change follows automatically');
+        $('#cbHistNew').toggleClass('cb-show', paused && histNewCount > 0)
+            .text(histNewCount + ' new ' + (histNewCount === 1 ? 'change' : 'changes'));
+    }
+
+    function updateHistNav() {
+        var position = histNavIndexes.indexOf(histIx);
+        var previous = histNavIndexes.some(function (flatIx) { return flatIx < histIx; });
+        var next = histNavIndexes.some(function (flatIx) { return flatIx > histIx; });
+        $('#cbHistPrev').prop('disabled', !previous);
+        $('#cbHistNext').prop('disabled', !next);
+        $('#cbHistCount').text(!histNavIndexes.length ? '0 changes'
+            : (position >= 0 ? 'change ' + (position + 1) + ' / ' + histNavIndexes.length
+                : 'confirmation · ' + histNavIndexes.length + ' changes'));
+    }
+
+    function selectDecision(flatIx, freeze) {
+        if (flatIx < 0 || flatIx >= histChanges.length) return;
+        var changed = !histChanges[histIx] || histChanges[histIx].id !== histChanges[flatIx].id;
+        if (freeze) setPaused(true);
+        histIx = flatIx;
+        histEpisodeIx = histChanges[flatIx]._episodeIx;
+        if (changed) histPathIx = -1;
+        renderHistList();
+        renderHistDetail();
+    }
+
+    function stepHistory(delta) {
+        if (!histNavIndexes.length) return;
+        var candidates = histNavIndexes.filter(function (flatIx) {
+            return delta < 0 ? flatIx < histIx : flatIx > histIx;
+        });
+        var next = delta < 0 ? candidates[candidates.length - 1] : candidates[0];
+        if (next != null && next !== histIx) selectDecision(next, true);
+    }
+
+    function stepPath(delta) {
+        var decision = histChanges[histIx];
+        var hits = (decision && decision.hits) || [];
+        if (!hits.length) return;
+        setPaused(true);
+        histPathIx = Math.max(0, Math.min(hits.length - 1, histPathIx + delta));
+        $('#cbPathList .cb-path-step').removeClass('cb-selected').attr('aria-current', 'false')
+            .filter('[data-path-ix="' + histPathIx + '"]').addClass('cb-selected').attr('aria-current', 'step');
+        showSelectedSource();
+    }
+
+    function refreshActiveView() {
+        if (histMode) captureHistory({ quiet: true, preserve: paused });
+        else poll();
+    }
+
+    $('#cbHistPrev').on('click', function () { stepHistory(-1); });
+    $('#cbHistNext').on('click', function () { stepHistory(1); });
+    $('#cbHistRefresh,#cbHistNew').on('click', function () { setPaused(false); });
+    $(document).on('click', '.cb-episode', function () {
+        var episodeIx = +$(this).data('episode-ix');
+        var episode = histEpisodes[episodeIx];
+        if (!episode || !(episode.decisions || []).length) return;
+        var firstMeaningful = histNavIndexes.find(function (flatIx) {
+            return histChanges[flatIx] && histChanges[flatIx]._episodeIx === episodeIx;
+        });
+        selectDecision(firstMeaningful != null ? firstMeaningful : findDecisionIndex(episode.decisions[0].id), true);
     });
+    $(document).on('click', '.cb-decision-row', function () {
+        selectDecision(findDecisionIndex(+$(this).data('decision-id')), true);
+    });
+    $(document).on('click', '.cb-confirmation-group', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        var key = String($(this).data('confirm-toggle') || '');
+        histConfirmationOpen[key] = !histConfirmationOpen[key];
+        renderHistDetail();
+    });
+    $(document).on('click', '.cb-path-step', function () {
+        setPaused(true);
+        histPathIx = +$(this).data('path-ix');
+        $('#cbPathList .cb-path-step').removeClass('cb-selected').attr('aria-current', 'false');
+        $(this).addClass('cb-selected').attr('aria-current', 'step');
+        showSelectedSource();
+    });
+    $(document).on('keydown', function (e) {
+        var tag = (e.target && e.target.tagName || '').toLowerCase();
+        if (histMode && tag !== 'input' && tag !== 'select' && tag !== 'textarea' && !$('#cbWhoModal').hasClass('cb-open')) {
+            if (e.key === 'ArrowLeft') { e.preventDefault(); stepHistory(-1); }
+            else if (e.key === 'ArrowRight') { e.preventDefault(); stepHistory(1); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); stepPath(-1); }
+            else if (e.key === 'ArrowDown') { e.preventDefault(); stepPath(1); }
+        }
+        if (e.key === 'Escape') closeWho();
+    });
+
+    // ---------- "Traced…" modal: who is armed / recording right now ----------
+    function openWho() { $('#cbWhoModal').addClass('cb-open'); renderWho(); }
+    function closeWho() { $('#cbWhoModal').removeClass('cb-open'); }
+
+    function renderWho() {
+        $.getJSON('/CircuitTrace/Status', function (d) {
+            if (!d) return;
+            var armed = d.armed || [];
+            var nameOf = {};
+            botList.forEach(function (b) { nameOf[b.guid] = b.name; });
+            $('#cbWhoSub').text('mode: ' + d.mode + ' · ' + armed.length + ' armed (writing to disk) · ' +
+                d.ringBots + ' bots ringing in memory · ' + d.sites + ' sites');
+            if (!armed.length) {
+                $('#cbWhoBody').html('<div class="cb-who-empty">No bots are armed.' +
+                    (d.mode === 'shadow'
+                        ? ' Shadow is on, so every bot is recording in memory — arm one to write it to disk and follow it here.'
+                        : ' Shadow mode is off — turn it on to record.') + '</div>');
+                return;
+            }
+            var html = '';
+            armed.slice().sort(function (a, b) { return (nameOf[a] || ('' + a)).localeCompare(nameOf[b] || ('' + b)); })
+                .forEach(function (g) {
+                    html += '<div class="cb-who-row" data-guid="' + g + '">' +
+                        '<span class="cb-who-rec">● REC</span>' +
+                        '<span class="cb-who-name">' + esc(nameOf[g] || ('bot ' + g)) + '</span>' +
+                        '<span class="cb-who-guid">#' + g + '</span>' +
+                        '<span class="cb-who-go">select →</span></div>';
+                });
+            $('#cbWhoBody').html(html);
+        });
+    }
+
+    $('#cbWho').on('click', openWho);
+    $('#cbWhoClose').on('click', closeWho);
+    $('#cbWhoModal').on('click', function (e) { if (e.target === this) closeWho(); });
+    $(document).on('click', '.cb-who-row', function () {
+        var g = +$(this).data('guid');
+        if ($('#cbBot').find('option[value="' + g + '"]').length) $('#cbBot').val(g).trigger('change');
+        else showToastLite('bot ' + g + ' is armed but not in the live list');
+        closeWho();
+    });
+
+    // The viewer is standalone (no bots.js) — a tiny toast for the rare miss above.
+    function showToastLite(msg) {
+        var el = $('#cbToastLite');
+        if (!el.length) el = $('<div id="cbToastLite" style="position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:60;padding:8px 14px;border-radius:6px;background:var(--bg-card-alt);border:1px solid var(--border-light);color:var(--text-primary);font-size:12.5px;box-shadow:0 6px 20px rgba(0,0,0,.4)"></div>').appendTo('body');
+        el.text(msg).stop(true, true).fadeIn(120).delay(2200).fadeOut(300);
+    }
     $(document).on('click', '.cb-node', function (e) { e.stopPropagation(); showDetails(+$(this).data('id')); });
     $(document).on('click', '.cb-lane-head', function (e) {
         e.stopPropagation();
@@ -656,11 +1530,11 @@ $(function () {
     function trim(t, n) { return t.length > n ? t.substring(0, n - 1) + '…' : t; }
 
     // ---------- boot ----------
-    loadSites();
+    loadSites().always(function () { setView('history'); });
     loadBots();
     refreshStatus();
     applyView();
-    setInterval(poll, 1500);
+    setInterval(refreshActiveView, 1500);
     setInterval(refreshStatus, 5000);
     setInterval(loadBots, 30000);
     $(window).on('resize', function () { if (!userAdjusted) fitWidth(); else applyView(); });

@@ -281,6 +281,32 @@ else
     warn "Log directory not found"
 fi
 
+# The runtime is commonly <checkout>/run/bin. Walk upward from the discovered
+# binary/config locations and select only a SuperUI-Core checkout containing the
+# fork-specific SuiBots source. Stock VMaNGOS must not satisfy this check.
+discover_superui_core_source() {
+    local current="$1"
+    while [ -n "$current" ] && [ "$current" != "/" ]; do
+        if [ -d "$current/src/game/SuperUiContent/SuiBots" ]; then
+            echo "$current/src"
+            return 0
+        fi
+        current=$(dirname "$current")
+    done
+    echo ""
+}
+
+VMANGOS_SOURCE_PATH=$(discover_superui_core_source "$BIN_DIR")
+if [ -z "$VMANGOS_SOURCE_PATH" ]; then
+    VMANGOS_SOURCE_PATH=$(discover_superui_core_source "$CONFIG_DIR")
+fi
+
+if [ -n "$VMANGOS_SOURCE_PATH" ]; then
+    ok "SuperUI-Core source: $VMANGOS_SOURCE_PATH"
+else
+    warn "SuperUI-Core source checkout not found (Circuit Board will show upload instructions)"
+fi
+
 # ── Step 4: RA settings ──
 header "Step 4: Remote Access (RA) configuration"
 
@@ -385,7 +411,8 @@ cat > /tmp/mangossuperui-config-generated.json << JSONEOF
     "MangosdConfPath": "$MANGOSD_CONF",
     "LogsDir": "$LOG_DIR",
     "DbcPath": "$DBC_PATH",
-    "MapsDataPath": "$MAPS_PATH"
+    "MapsDataPath": "$MAPS_PATH",
+    "VmangosSourcePath": "$VMANGOS_SOURCE_PATH"
   },
   "RemoteAccess": {
     "Host": "$RA_HOST",
@@ -415,6 +442,7 @@ echo "    Config Dir:  $CONFIG_DIR" >&2
 echo "    Conf Path:   $MANGOSD_CONF" >&2
 echo "    DBC Path:    $DBC_PATH" >&2
 echo "    Maps Path:   $MAPS_PATH" >&2
+echo "    Source Path: $VMANGOS_SOURCE_PATH" >&2
 echo "" >&2
 echo -e "  ${BOLD}Process Names:${NC}" >&2
 echo "    mangosd:     $MANGOSD_PROCESS" >&2

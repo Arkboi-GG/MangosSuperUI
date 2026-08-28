@@ -16,7 +16,7 @@ namespace MangosSuperUI.BotLogic.Planners;
 //   * accept-all: visit each unaccepted giver nearest-first, accept its quests.
 //   * objective-sweep: work the nearest unmet kill objective across the batch as a
 //     section-4 ENRICHED MOVE_TO (creature_entry+grind_radius+kill_count -> C++
-//     grinds at the mouth). After each, re-QUERY_QUEST_STATUS and recompute -- the
+//     grinds at the mouth). After each, wait for the next authoritative STATE and recompute -- the
 //     server credits a kill to EVERY accepted quest that needs it, so overlapping
 //     objectives fall for free. Distance orders PHASES only (near sweep <= BatchRadius,
 //     then turn-ins, then the phase-4b lone-far trek) -- it never drops a quest. The one
@@ -35,7 +35,7 @@ namespace MangosSuperUI.BotLogic.Planners;
 // (path_unsafe blacklists the route and shelves the sweep). The ONLY drop is a
 // quest going GREY (out-leveled), via ABANDON_QUEST + BotIdentity.AbandonGrey.
 //
-// The carried set's durable truth is the C++ log + QUEST_STATUS_ALL; the batch
+// The carried set's durable truth is the C++ log pushed on STATE; the batch
 // scratch is rebuilt from it on (re)entry, so shelving survives goal bounces.
 //
 // Scope: kill, no-objective, and creature-sourced item quests (incl. kill+item). An item
@@ -64,9 +64,7 @@ public sealed class QuestPlanner : IBotPlanner
     private const int DeferMinutes = 15;
     private const int AbandonAfterDefers = 3;
     private const int QuestStatusComplete = 1;  // VMaNGOS QUEST_STATUS_COMPLETE
-    private const double LogSyncCapSec = 3;      // (solo path retired) — kept only for the group-path GroupSyncSec sibling below
     private const double StateFreshCapSec = 6;   // obj_sync: wait up to this long for a post-kill STATE before re-deriving (one 5s heartbeat + margin). Must exceed the STATE interval so we never re-derive off pre-kill counts.
-    private const double GroupSyncSec = 5;      // group consult: re-QUERY the log at most this often so the god bot's all-eligible-done gate sees server truth (shared kill-credit advances counts with no local ack)
     private const int GroupGrindSentinel = 9999;// group consult: kill_count for the shared-objective grind -- a ceiling never reached (no-WAIT), so C++ grinds the mob indefinitely until the god bot moves the objective. NOT 0 (0 can insta-complete the enriched leg)
 
     // -- Group-vendor errand (GAP G, 2026-07-02) -- mirror MaintenancePlanner's solo vendor values so a
@@ -638,18 +636,26 @@ public sealed class QuestPlanner : IBotPlanner
                     ctx.SetStep("to_objective");
                     _logger.LogInformation("[QUEST] {Name} overflow grind [{Id}] slot {Slot} (server still INCOMPLETE past our count, try {N}/{Max})",
                         ctx.Name, bq.QuestId, o.Slot, tries + 1, MaxOverflowGrinds);
-                    // Real-spawn coord, same fix as the normal sweep (UnmetLegs/NearestCreatureSlot):
-                    // the giver-scoped cluster nearest the bot, not a single canonical centroid and not
-                    // an unscoped global Scatter() pick (see NearestSpawnPoint for why). Routed through
+                    // Real-spawn coord selected by NearestCreatureSlot: the nearest spawn in the
+                    // giver-scoped cluster that is not in fleet-wide no-path memory. Carrying that exact
+                    // point out of selection keeps scoring and dispatch on one verdict. Routed through
                     // MoveToObjectiveLeg (a GrindLeg with Count=OverflowChunk → kill_count=OverflowChunk,
                     // identical to the retired MoveToObjective).
-                    var op = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
-                    var oleg = new GrindLeg(o.CreatureEntry, op.X, op.Y, op.Z, o.GrindMap, OverflowChunk);
+                    var oleg = new GrindLeg(
+                        o.CreatureEntry, oPick.Value.X, oPick.Value.Y, oPick.Value.Z,
+                        o.GrindMap, OverflowChunk);
                     ctx.SetObjective(Objective.Grind(ObjectiveSource.SelfSolo,
                         oleg.CreatureEntry, oleg.X, oleg.Y, oleg.Z, oleg.Map,
                         OverflowChunk, bq.QuestId, o.Slot));   // SelfSolo overflow grind — same self-heal anchor
                     return MoveToObjectiveLeg(oleg);
                 }
+
+                // A fleet-known no-path destination is not an overflow attempt. If every eligible
+                // creature cluster is currently blacklisted, issue nothing and do not consume an
+                // attempt; the normal exhaust/reselect path below can choose other work, and these
+                // candidates become eligible again when their no-path memory expires.
+                CircuitTrace.Hit(ctx.Guid,
+                    "quest: overflow blocked, all candidate spawns fleet-known no_path", stuck.Count);
             }
 
             // -- 3. TURN-IN -- every quest the server says is done, nearest-first (after
@@ -764,10 +770,8 @@ public sealed class QuestPlanner : IBotPlanner
             // arbitration, so it still folds in a quest as it wanders into a fresh hub.
             // GRIND-LOCK INVARIANT (the owed guard). Before stamping a 20-min lock, two gates so the bot
             // can NEVER lock while it still has real work -- the failure seen live (locked at L4 with #33
-            // mid-grind 5/8 and #15 unstarted, decided one tick BEFORE the QUEST_STATUS_ALL landed):
-            //   (a) FRESHNESS -- never decide an exhaust off a stale/in-flight log. After a Training/
-            //       Maintenance round-trip the re-sync may not have landed (grind credit + a just-done
-            //       turn-in invisible). Stale -> re-QUERY and wait; the verdict is made on server truth only.
+            // mid-grind 5/8 and #15 unstarted, decided one tick BEFORE the old pull reply landed):
+            //   (a) FRESHNESS -- historical pull-era rule, now retired because the complete log rides STATE.
             //   (b) WORKABILITY -- never grind-lock while ANY in-log quest is workable on this map, read
             //       straight off ctx.QuestLog (WorkableInLog), INDEPENDENT of the batch. A quest the batch
             //       dropped (resume filter) or a stale-snapshot race cannot strand the bot. Workable-in-log
@@ -1203,8 +1207,8 @@ public sealed class QuestPlanner : IBotPlanner
     }
 
     // In-log accept reconcile (re-accept march fix). The C++ log (ctx.QuestLog, refreshed by
-    // QUEST_STATUS_ALL) is the durable truth for what is accepted. A batch quest can read Accepted=false
-    // yet ALREADY be in the log -- BuildBatch step-1 resume ran off a pre-QUERY snapshot (a Questing
+    // STATE) is the durable truth for what is accepted. A batch quest can read Accepted=false
+    // yet ALREADY be in the log -- BuildBatch step-1 resume ran off an older snapshot (a Questing
     // re-entry right after a level-up / Training bounce), so it missed the quest, and GatherLocals then
     // re-seeded it as a fresh pick (Pickable uses the no-active GetAvailableQuests overload, which does
     // NOT exclude in-log quests). The accept phase would then march the bot ALL THE WAY to the giver to
@@ -1633,7 +1637,7 @@ public sealed class QuestPlanner : IBotPlanner
     }
 
     // "Started" = the quest has accrued any server-side kill or item credit on a leg, i.e. the bot is
-    // mid-quest on it. Read from ctx.QuestLog (the QUEST_STATUS_ALL-refreshed counts), so it survives a
+    // mid-quest on it. Read from ctx.QuestLog (the STATE-refreshed counts), so it survives a
     // train/level round-trip — exactly the case where the old pure-nearest pick abandoned in-progress work.
     private static bool HasProgress(BotContext ctx, BatchQuest b)
     {
@@ -1673,12 +1677,15 @@ public sealed class QuestPlanner : IBotPlanner
     // Overflow target: the nearest same-map creature slot among quests the server still calls
     // INCOMPLETE despite our local counts being met. Unlike the §2 leg picker it does NOT gate on
     // RawRemaining > 0 (by definition all slots are already model-met here) — we re-grind to push
-    // the server's credit past our stale count. Scored against the nearest real spawn in the
-    // giver-scoped cluster (NearestSpawnPoint), same fix as UnmetLegs — not the single canonical
-    // GrindX/GrindY, which can read far closer or farther than where the bot actually is.
-    private (BatchQuest Quest, int Slot, QuestObjective Obj)? NearestCreatureSlot(BotContext ctx, List<BatchQuest> set)
+    // the server's credit past our stale count. Scored against the nearest non-blacklisted real
+    // spawn in the giver-scoped cluster (NearestPathableSpawnPoint), same invariant as UnmetLegs —
+    // not the single canonical GrindX/GrindY, which can read far closer or farther than where the
+    // bot actually is. The selected point is returned with the slot so dispatch cannot recompute a
+    // different destination.
+    private (BatchQuest Quest, int Slot, QuestObjective Obj, float X, float Y, float Z)?
+        NearestCreatureSlot(BotContext ctx, List<BatchQuest> set)
     {
-        (BatchQuest, int, QuestObjective)? best = null;
+        (BatchQuest, int, QuestObjective, float, float, float)? best = null;
         float bestD = float.MaxValue;
         foreach (var b in set)
         {
@@ -1688,9 +1695,17 @@ public sealed class QuestPlanner : IBotPlanner
                 if (!o.IsCreature || o.Count <= 0) continue;   // cb:fold per-objective scan, overflow pick probed in derive 2b
                 if (IsCastDrivable(o, b.QuestId)) continue;   // never overflow-GRIND a cast objective's creature (e.g. a heal-target NPC)   // cb:fold per-objective scan, overflow pick probed in derive 2b
                 if (o.GrindMap != ctx.MapId) continue;   // cb:fold per-objective scan, overflow pick probed in derive 2b
-                var p = NearestSpawnPoint(o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y, o.GrindX, o.GrindY, o.GrindZ);
-                float d = Dist2(ctx.Pos.X, ctx.Pos.Y, p.X, p.Y);
-                if (d < bestD) { bestD = d; best = (b, i, o); }   // cb:fold min-tracking detail, overflow pick probed in derive 2b
+                var p = NearestPathableSpawnPoint(
+                    o.GrindMap, o.SpawnPositions, ctx.Pos.X, ctx.Pos.Y,
+                    o.GrindX, o.GrindY, o.GrindZ);
+                if (p is not { } point)
+                {
+                    CircuitTrace.Hit(ctx.Guid,
+                        "quest: overflow candidate has no pathable spawn", b.QuestId);
+                    continue;
+                }
+                float d = Dist2(ctx.Pos.X, ctx.Pos.Y, point.X, point.Y);
+                if (d < bestD) { bestD = d; best = (b, i, o, point.X, point.Y, point.Z); }   // cb:fold min-tracking detail, overflow pick probed in derive 2b
             }
         }
         return best;
@@ -2140,18 +2155,9 @@ public sealed class QuestPlanner : IBotPlanner
             return StepResult.Wait();
         }
 
-        // Keep the quest-log cache FRESH before ANY group phase reads it. The accept / turn-in gates
-        // (NextAcceptableAtGiver here; NextGiver / NextEnder in the coordinator) key on ctx.QuestLog --
-        // an in-memory cache refreshed only by QUEST_STATUS_ALL. Without a sync, a just-landed accept
-        // never updates the cache, so the gates keep re-selecting an already-held quest -> the C++
-        // CanTakeQuest-failed re-accept loop (and the same class would wedge TurnIn). GroupObjective
-        // self-synced and the default (Forming) case synced; hoisting the SAME cadence here covers
-        // every phase, so no group decision is ever made off a pre-accept snapshot.
-        if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
-        {
-            CircuitTrace.Hit(ctx.Guid, "quest: group - log stale, re-query");
-            return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
-        }
+        // The host admits a group tick only from a fresh STATE snapshot, and Sense
+        // copies that envelope's full quest log before reaching this planner. The
+        // retired QUERY pull must not compete with that single source of truth.
 
         switch (o.Phase)
         {
@@ -2184,15 +2190,10 @@ public sealed class QuestPlanner : IBotPlanner
                 CircuitTrace.Hit(ctx.Guid, "quest: group - vendor errand phase");
                 return GroupVendorErrand(ctx, o);
             default:
-                // Forming (transient) or a phase this v1 executor doesn't drive: keep the log fresh on a
-                // cadence so the coordinator's gates see server truth, then idle until it stamps a
-                // concrete phase. Never a hard wait that could strand the bot.
-                CircuitTrace.Hit(ctx.Guid, "quest: group - forming/unhandled phase, idle refresh");
-                if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
-                {
-                    CircuitTrace.Hit(ctx.Guid, "quest: group - forming, log stale, re-query");
-                    return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
-                }
+                // Forming (transient) or a phase this v1 executor doesn't drive:
+                // idle until the coordinator stamps a concrete phase. STATE keeps
+                // the quest-log snapshot authoritative while waiting.
+                CircuitTrace.Hit(ctx.Guid, "quest: group - forming/unhandled phase, idle");
                 return StepResult.Wait();
         }
     }
@@ -2235,15 +2236,10 @@ public sealed class QuestPlanner : IBotPlanner
     // Grind the ONE shared objective the coordinator stamped (its embedded kill directive). Indefinite
     // enriched grind (sentinel count, no WAIT), (re)issued when the objective changes OR when we just
     // arrived from another phase (Step guard) -- a member already grinding the same mob stays quiet,
-    // otherwise we (re)engage. The log is refreshed on a cadence so the coordinator's "all holders done"
-    // gate sees server-credited kills (shared group credit advances counts with no local ack).
+    // otherwise we (re)engage. The next STATE supplies server-credited shared-kill counts to the
+    // coordinator's "all holders done" gate.
     private StepResult GroupObjective(BotContext ctx, GroupOrder o)
     {
-        if ((DateTime.UtcNow - ctx.QuestLogStampUtc).TotalSeconds > GroupSyncSec)
-        {
-            CircuitTrace.Hit(ctx.Guid, "quest: group objective - log stale, re-query");
-            return StepResult.Fire(new BridgeCommand("QUERY_QUEST_STATUS"));
-        }
         if (o != ctx.LastGroupOrder || ctx.Step != "grp_obj")
         {
             CircuitTrace.Hit(ctx.Guid, "quest: group objective - (re)engaging shared grind");

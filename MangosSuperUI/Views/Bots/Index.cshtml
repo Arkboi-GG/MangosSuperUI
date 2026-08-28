@@ -845,6 +845,37 @@
                     background: rgba(247,118,142,0.10);
                 }
 
+            /* A toggle that is currently ON (circuit armed, shadow recording). */
+            .bc-btn.bc-on {
+                border-color: var(--accent);
+                background: var(--accent-light);
+                color: var(--accent);
+            }
+
+        /* When the selected bot is circuit-armed, the whole card reads as "recording"
+           so it's obvious at a glance which bot is being written to disk. */
+        .bc-card.bc-armed {
+            border-color: rgba(247,118,142,0.55);
+            box-shadow: 0 0 0 1px rgba(247,118,142,0.30), 0 0 14px rgba(247,118,142,0.20);
+        }
+
+            .bc-card.bc-armed .bc-card-h,
+            .bc-card.bc-armed .bc-card-h i {
+                color: #f7768e;
+            }
+
+        #bcCircuitState.bc-rec {
+            color: #f7768e;
+            font-weight: 600;
+        }
+
+        .bc-rec-dot { animation: bcRecPulse 1.6s ease-in-out infinite; }
+
+        @@keyframes bcRecPulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
         /* --- Inventory Panel --- */
         .bt-inv-section-title {
             font-size: 11px;

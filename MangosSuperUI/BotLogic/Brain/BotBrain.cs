@@ -5,6 +5,38 @@ using MangosSuperUI.BotLogic.Tracking;
 
 namespace MangosSuperUI.BotLogic.Brain;
 
+internal enum StillObservationKind
+{
+    MissingState,
+    StateNotAdvanced,
+    Seeded,
+    BridgeSessionChanged,
+    ContinuityReset,
+    MapChanged,
+    Moved,
+    Still
+}
+
+internal readonly record struct StillObservation(StillObservationKind Kind, double ElapsedSeconds);
+
+internal enum CombatStillResetGate
+{
+    Eligible,
+    ProtocolTooOld,
+    WedgeStreakBelowCap,
+    CooldownActive
+}
+
+internal enum CombatStillPostResetGate
+{
+    AwaitNewerState,
+    SessionSuperseded,
+    Dead,
+    ExternalOwner,
+    StillInCombat,
+    SafeToEscape
+}
+
 // ============================================================================
 // BotBrain — the live thread / driver (§4).
 //
@@ -56,6 +88,17 @@ public sealed class BotBrain
     // stranding, and a refused/failed port re-accrues the same window before retrying.
     private const int StrandedWedgeCap = 6;
     private const double TrainWedgeCooldownSec = 300;   // a trainer-route wedge defers Training this long (mirrors TrainingPlanner give-up) so the bot quests instead of re-bee-lining
+
+    // ── Combat-still recovery ──
+    // A STATE older than this is already rejected by the bridge's sensory-feed
+    // wall. The independent continuity check here ensures a disconnected gap can
+    // never be counted as proof that the bot remained fixed in place.
+    private const double StillStateContinuitySec = 15;
+    private const int CombatStillResetProtocol = 6;
+    private const double CombatStillResetDeadlineSec = 15;
+    private const double CombatStillResetCooldownSec = 600;
+    internal const string CombatStillResetCommandType = "RESET_COMBAT_STUCK";
+    internal const string CombatStillResetAckEvent = "COMBAT_RESET_ACK";
 
     // ── No-path group-leg quarantine ──
     private const int NoPathQuarantineStreakCount = 5;
@@ -110,6 +153,35 @@ public sealed class BotBrain
         // 1. Read snapshot → refresh sensory.
         ctx.Sense(snap);
 
+        // 1a--1. A correlated command was rejected because a player/RTS
+        // controller owns the bot. Preserve the goal, scratch, and held
+        // objective, but issue no planner traffic during the bounded handoff.
+        // This is control ownership, not work failure: do not defer a quest,
+        // trip a trainer cooldown, or grow the wedge streak.
+        if (ctx.ControlFenceObservedUtc != default
+            && snap.StateUtc <= ctx.ControlFenceObservedUtc)
+        {
+            CircuitTrace.HitNote(ctx.Guid, "tick: control fence - planner stands down", ctx.ControlFenceReason);
+            ctx.Pending = null;
+            ctx.Failure = null;
+            ctx.GoalReason = ctx.ControlFenceReason;
+            ctx.MarkProgress();
+            if (ctx.Identity is { } controlled)   // cb:fold control-hold timer hygiene; hold decision probed above
+            {   // cb:fold control-hold timer hygiene; hold decision probed above
+                ResetStillWindow(ctx, controlled, snap.StateUtc);
+            }
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
+            return;
+        }
+        if (ctx.ControlFenceObservedUtc != default)
+        {
+            CircuitTrace.Hit(ctx.Guid, "tick: fresh STATE releases transient control fence");
+            // Only a newer STATE can release the transient fence. Sense has
+            // already copied its durable Possessed/Conscripted truth below.
+            ctx.ControlFenceObservedUtc = default;
+            ctx.ControlFenceReason = "";
+        }
+
         // 1a-0. [CONSCRIPTED] Enlisted in a player's RTS army: the planner stands
         //       down entirely. Park once (EnterGoalAsync(Idle) clears Pending,
         //       Failure and the goal scratch; ctx.Held is deliberately PRESERVED
@@ -120,37 +192,37 @@ public sealed class BotBrain
         //       formations and RTS orders run server-side, and the core's bridge
         //       fence independently drops planner commands — so this gate is
         //       politeness plus timer hygiene, not the only wall.
-        if (ctx.Conscripted)
+        if (ctx.Conscripted || ctx.Possessed)
         {
-            CircuitTrace.Hit(ctx.Guid, "tick: conscripted - planner stands down");
+            string controlReason = ctx.Possessed ? "possessed" : "conscripted";
+            CircuitTrace.HitNote(ctx.Guid, "tick: externally controlled - planner stands down", controlReason);
             if (ctx.Goal != Goal.Idle)
             {
-                CircuitTrace.Hit(ctx.Guid, "tick: conscripted park to idle");
+                CircuitTrace.Hit(ctx.Guid, "tick: externally controlled park to idle");
                 await EnterGoalAsync(ctx, Goal.Idle);
             }
-            ctx.GoalReason = "conscripted";
+            ctx.GoalReason = controlReason;
             ctx.MarkProgress();
             if (ctx.Identity is { } enlisted)
             {
                 CircuitTrace.Hit(ctx.Guid, "tick: conscripted still-anchor refresh");
-                enlisted.StillAnchorX = ctx.Pos.X;
-                enlisted.StillAnchorY = ctx.Pos.Y;
-                enlisted.StillSinceUtc = DateTime.UtcNow;
+                ResetStillWindow(ctx, enlisted, snap.StateUtc);
             }
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
             return;
         }
 
         // 1a. Combat-directive overlay (grouping §3.6). The GroupCoordinator pre-pass already
         //     stamped ctx.CombatDirective this tick (Assist(anchor) / None). Emit COMBAT_DIRECTIVE
-        //     to C++ ONLY when the stamp changed since we last told it -- the coordinator re-stamps
-        //     every tick (idempotent) but the wire stays brain-cadence, not per-tick traffic
+        //     to C++ when the stamp changed or a new bridge session has not received it -- the
+        //     coordinator re-stamps every tick (idempotent) but the wire stays brain-cadence
         //     (§3.8.4 / §1). Fire-and-forget, no WAIT (like SET_TASK), and orthogonal to Pending --
         //     so it runs ahead of the wedge/goal machinery and regardless of any in-flight leg.
-        if (ctx.CombatDirective != ctx.LastEmittedCombat)
+        if (ctx.NeedsCombatDirectiveEmission)
         {
-            CircuitTrace.Hit(ctx.Guid, "tick: combat directive changed, emit to C++");
+            CircuitTrace.Hit(ctx.Guid, "tick: combat directive changed or session renewed, emit to C++");
             await _executor.IssueNoWaitAsync(ctx, BridgeCommand.Combat(ctx.CombatDirective));
-            ctx.LastEmittedCombat = ctx.CombatDirective;
+            ctx.MarkCombatDirectiveEmitted();
         }
 
         // 1b. A repeated group no-path is quarantined until the coordinator
@@ -294,7 +366,7 @@ public sealed class BotBrain
         // [CONSCRIPTED] An enlisted bot idles by ORDER — never a wedge, never a
         // streak, never a stranded port. (Unreachable today via the TickAsync
         // gate; kept as a wall against call-order drift.)
-        if (ctx.Conscripted) { CircuitTrace.Hit(ctx.Guid, "wedge: conscripted exempt"); return false; }
+        if (ctx.Conscripted || ctx.Possessed) { CircuitTrace.Hit(ctx.Guid, "wedge: external control exempt"); return false; }
         var id = ctx.Identity;
         if (id?.WedgeBackoffUntil is DateTime parked && DateTime.UtcNow < parked)
         {
@@ -347,38 +419,57 @@ public sealed class BotBrain
             // C++-refused anyway). Clears the grind-lock state so the bot quests fresh at home, and
             // blacklists the stranded cell until it has outleveled it (~7 levels of headroom).
             id.WedgeStreak++;
-            if (id.WedgeStreak >= StrandedWedgeCap && !ctx.Dead && !ctx.InCombat && !ctx.InPlayerParty)
+            if (id.WedgeStreak >= StrandedWedgeCap)
             {
-                CircuitTrace.Hit(ctx.Guid, "wedge: stranded escalation (streak at cap)", id.WedgeStreak);
-                // [ESCAPE-BANDS] Level-appropriate escape: the LOWEST band whose range holds the bot's
-                // level, rolling a same-faction spot that is NOT the pocket it's stuck in (so a bot
-                // stuck in its own starter rolls a different same-faction starter — valid at 1-5). This
-                // replaces the level-blind HomeFor + PickEscapeTown that could fling a L2 into Loch
-                // Modan. HomeFor is the defensive fallback only if the level lands outside every band.
-                (float X, float Y, float Z, int Map)? dest =
-                    PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
-                if (dest is null)
+                CircuitTrace.Hit(ctx.Guid, "wedge: stranded escalation cap reached", id.WedgeStreak);
+                if (ctx.Dead)
                 {
-                    CircuitTrace.Hit(ctx.Guid, "wedge: no banded escape, trying HomeFor fallback");
-                    var home = BotIdentity.HomeFor(id.Race, id.Level);
-                    if (home.Map >= 0) { CircuitTrace.Hit(ctx.Guid, "wedge: HomeFor fallback valid"); dest = home; }
+                    CircuitTrace.Hit(ctx.Guid, "wedge: stranded escape suppressed, death recovery owns bot");
                 }
-
-                if (dest is { } d)
+                else if (ctx.InPlayerParty)
                 {
-                    CircuitTrace.Hit(ctx.Guid, "wedge: stranded escape port issued");
-                    await IssueEscapePortAsync(ctx, id, d,
-                        $"STRANDED (wedge streak {StrandedWedgeCap}, goal {ctx.Goal}, L{id.Level})");
+                    CircuitTrace.Hit(ctx.Guid, "wedge: stranded escape suppressed, player party owns movement");
+                }
+                else if (ctx.InCombat)
+                {
+                    // Active combat is never ported blindly. The independent
+                    // physical-still timer decides whether this is a proven
+                    // combat-still case and owns the correlated reset handshake.
+                    CircuitTrace.Hit(ctx.Guid, "wedge: stranded escape suppressed, combat-reset gate owns recovery");
                 }
                 else
                 {
-                    CircuitTrace.Hit(ctx.Guid, "wedge: no escape town at all, streak reset + local park");
-                    // No alternate town on this map at all (shouldn't happen for a live bot) — reset
-                    // and let the wedge ladder keep shuffling it locally.
-                    id.WedgeStreak = 0;
-                    _logger.LogInformation(
-                        "[ESCAPE] {Name} stranded @ {Pos} but no alt escape town on map{Map} — parking",
-                        ctx.Name, ctx.Pos, ctx.MapId);
+                    CircuitTrace.Hit(ctx.Guid, "wedge: stranded escalation (streak at cap)", id.WedgeStreak);
+                    // [ESCAPE-BANDS] Level-appropriate escape: the LOWEST band whose range holds the bot's
+                    // level, rolling a same-faction spot that is NOT the pocket it's stuck in (so a bot
+                    // stuck in its own starter rolls a different same-faction starter — valid at 1-5). This
+                    // replaces the level-blind HomeFor + PickEscapeTown that could fling a L2 into Loch
+                    // Modan. HomeFor is the defensive fallback only if the level lands outside every band.
+                    (float X, float Y, float Z, int Map)? dest =
+                        PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
+                    if (dest is null)
+                    {
+                        CircuitTrace.Hit(ctx.Guid, "wedge: no banded escape, trying HomeFor fallback");
+                        var home = BotIdentity.HomeFor(id.Race, id.Level);
+                        if (home.Map >= 0) { CircuitTrace.Hit(ctx.Guid, "wedge: HomeFor fallback valid"); dest = home; }
+                    }
+
+                    if (dest is { } d)
+                    {
+                        CircuitTrace.Hit(ctx.Guid, "wedge: stranded escape port issued");
+                        await IssueEscapePortAsync(ctx, id, d,
+                            $"STRANDED (wedge streak {StrandedWedgeCap}, goal {ctx.Goal}, L{id.Level})");
+                    }
+                    else
+                    {
+                        CircuitTrace.Hit(ctx.Guid, "wedge: no escape town at all, streak reset + local park");
+                        // No alternate town on this map at all (shouldn't happen for a live bot) — reset
+                        // and let the wedge ladder keep shuffling it locally.
+                        id.WedgeStreak = 0;
+                        _logger.LogInformation(
+                            "[ESCAPE] {Name} stranded @ {Pos} but no alt escape town on map{Map} — parking",
+                            ctx.Name, ctx.Pos, ctx.MapId);
+                    }
                 }
             }
         }
@@ -407,59 +498,174 @@ public sealed class BotBrain
     // guid+rotation spread so a mass of stuck bots diffuses across towns instead of re-piling on one.
 
     // [STUCK-STILL] Physical-stuck detector knobs. A bot within StuckStillRadius of its anchor for
-    // StuckStillSeconds (alive/solo/OOC, and not currently landing kills) is physically frozen.
+    // StuckStillSeconds (alive/solo and not currently landing kills) is physically frozen. Combat is
+    // deliberately observed, not excluded: it suppresses a direct port and enters the bounded reset
+    // handshake only after the independent wedge streak also proves repeated non-recovery.
     private const float StuckStillRadius = 3f;
     private const double StuckStillSeconds = 120;
 
     /// <summary>[STUCK-STILL] Ground-truth physical-stuck eject. If the bot hasn't physically moved
-    /// more than StuckStillRadius in StuckStillSeconds (alive + solo + out of combat), teleport it to a
-    /// friendly hub — on the FIRST window, no wedge streak. A bot mid-trek moves, so this never fires on
-    /// it; a bot still landing REAL kills (in-place grind) is productive, so a recent kill defers it.</summary>
+    /// more than StuckStillRadius in StuckStillSeconds (alive + solo), recover it through a friendly
+    /// hub. Out of combat this preserves the first-window escape. In combat it first sends the protocol-6
+    /// correlated RESET_COMBAT_STUCK command at the bounded wedge cap; only its exact ACK plus a newer
+    /// out-of-combat STATE permits the existing escape port. A bot mid-trek moves, so this never fires on
+    /// it; a bot still landing REAL kills (in-place grind) is productive, so a recent kill restarts it.</summary>
     private async Task<bool> TryEjectIfPhysicallyStuckAsync(BotContext ctx)
     {
         var id = ctx.Identity;
 
-        // Not eligible (dead / in combat / player-driven): hold the anchor here so the window starts
-        // fresh the moment the bot becomes eligible again.
-        if (id == null || ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted)
+        if (id == null)
         {
-            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible state, window reset");
-            if (id != null) { CircuitTrace.Hit(ctx.Guid, "stuck-still: anchor refreshed while ineligible"); id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow; }
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible, identity unavailable");
             return false;
         }
 
-        // First sight this session: seed the anchor.
-        if (id.StillSinceUtc == default)
+        // Once issued, this recovery owns the bot until a terminal outcome and
+        // post-ACK STATE resolve it. In particular, the normal wedge breaker may
+        // not clear its correlated WAIT out from underneath it.
+        if (ctx.CombatStillRecoveryStage != CombatStillRecoveryStage.None)
         {
-            CircuitTrace.Hit(ctx.Guid, "stuck-still: first sight, anchor seeded");
-            id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow;
-            return false;
+            CircuitTrace.Hit(ctx.Guid, "combat-still: in-flight recovery owns tick");
+            return await ContinueCombatStillRecoveryAsync(ctx, id);
         }
 
-        // Moved beyond the radius → not stuck; restart the window from the new spot.
-        float dx = ctx.Pos.X - id.StillAnchorX, dy = ctx.Pos.Y - id.StillAnchorY;
-        if (dx * dx + dy * dy > StuckStillRadius * StuckStillRadius)
+        StillObservation observation = ObserveFreshStillPosition(ctx, id);
+        switch (observation.Kind)
         {
-            CircuitTrace.Hit(ctx.Guid, "stuck-still: moved, window restarted");
-            id.StillAnchorX = ctx.Pos.X; id.StillAnchorY = ctx.Pos.Y; id.StillSinceUtc = DateTime.UtcNow;
+            case StillObservationKind.MissingState:
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: suppressed, STATE timestamp missing");
+                return false;
+            case StillObservationKind.StateNotAdvanced:
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: suppressed, STATE not advanced");
+                return false;
+            case StillObservationKind.Seeded:
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: first fresh STATE, anchor seeded");
+                ResetCombatStillRecovery(ctx, clearCooldown: true);
+                return false;
+            case StillObservationKind.BridgeSessionChanged:
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: bridge session changed, window reset");
+                ResetCombatStillRecovery(ctx, clearCooldown: true);
+                return false;
+            case StillObservationKind.ContinuityReset:
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: telemetry continuity gap, window reset");
+                ResetCombatStillRecovery(ctx, clearCooldown: true);
+                return false;
+            case StillObservationKind.MapChanged:
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: map changed, window reset");
+                ResetCombatStillRecovery(ctx, clearCooldown: true);
+                return false;
+            case StillObservationKind.Moved:
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: moved, window restarted");
+                ResetCombatStillRecovery(ctx, clearCooldown: true);
+                return false;
+        }
+
+        // Death and real-player ownership each have their own recovery/intent.
+        // Name the exact suppression and restart the physical proof window.
+        if (ctx.Dead)
+        {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible dead, window reset");
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
+            return false;
+        }
+        if (ctx.InPlayerParty)
+        {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible player-party, window reset");
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
+            return false;
+        }
+        if (IsBotGroupOwned(ctx))
+        {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible bot-group, window reset");
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
+            return false;
+        }
+        if (ctx.Possessed)
+        {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible possessed, window reset");
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
+            return false;
+        }
+        if (ctx.Conscripted)
+        {
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: ineligible conscripted, window reset");
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
             return false;
         }
 
         // Still landing real kills → productive in-place grind, not stuck. (LastKillUtc advances only
-        // on REAL kills — trash/grey kills don't count — so a chicken farmer still reads as stuck.)
+        // on REAL kills — trash/grey kills don't count — so a chicken farmer still reads as stuck.) A
+        // kill restarts the proof window; merely returning here would let an old anchor mature behind
+        // productive combat and produce an instant false verdict when kill recency elapsed.
         if ((DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds < StuckStillSeconds)
         {
-            CircuitTrace.Hit(ctx.Guid, "stuck-still: productive in-place grind (recent kill)");
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: productive in-place grind, window reset by real kill");
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
             return false;
         }
 
         // Not yet frozen for the whole window.
-        if ((DateTime.UtcNow - id.StillSinceUtc).TotalSeconds < StuckStillSeconds)
+        if (observation.ElapsedSeconds < StuckStillSeconds)
         {
-            CircuitTrace.Hit(ctx.Guid, "stuck-still: window not yet elapsed");
+            CircuitTrace.Hit(ctx.Guid, "stuck-still: fresh window remains below threshold", observation.ElapsedSeconds);
+            if (ctx.InCombat)
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: combat observed, fixed-position timer continues", observation.ElapsedSeconds);
+            else
+                CircuitTrace.Hit(ctx.Guid, "stuck-still: window not yet elapsed", observation.ElapsedSeconds);
             return false;
         }
-        CircuitTrace.Hit(ctx.Guid, "stuck-still: FROZEN whole window", (DateTime.UtcNow - id.StillSinceUtc).TotalSeconds);
+
+        if (ctx.InCombat)
+        {
+            CircuitTrace.Hit(ctx.Guid, "combat-still: fixed whole window while in combat", observation.ElapsedSeconds);
+            CombatStillResetGate gate = ClassifyCombatStillResetGate(ctx, id, DateTime.UtcNow);
+            switch (gate)
+            {
+                case CombatStillResetGate.ProtocolTooOld:
+                    CircuitTrace.Hit(ctx.Guid, "combat-still: reset suppressed, bridge protocol below 6", ctx.BridgeProtocol);
+                    return false;
+                case CombatStillResetGate.WedgeStreakBelowCap:
+                    CircuitTrace.Hit(ctx.Guid, "combat-still: reset suppressed, wedge streak below cap", id.WedgeStreak);
+                    return false;
+                case CombatStillResetGate.CooldownActive:
+                    CircuitTrace.Hit(ctx.Guid, "combat-still: reset suppressed, retry cooldown active",
+                        (ctx.CombatStillResetCooldownUntilUtc!.Value - DateTime.UtcNow).TotalSeconds);
+                    return false;
+            }
+
+            CircuitTrace.Hit(ctx.Guid, "combat-still: bounded reset issued", id.WedgeStreak);
+            CircuitTrace.RequestDump(ctx.Guid, "combat-still-reset");
+            _executor.ClearPending(ctx);
+            ctx.Failure = null;
+            ctx.CombatStillRecoveryStage = CombatStillRecoveryStage.AwaitingResetOutcome;
+            ctx.CombatStillResetIssuedStateUtc = ctx.LastStateReceivedUtc;
+            ctx.CombatStillResetAckReceivedUtc = default;
+            ctx.CombatStillResetBridgeSessionId = ctx.BridgeSessionId;
+
+            await _executor.IssueAsync(
+                ctx,
+                CreateCombatStillResetCommand(ctx, id, observation.ElapsedSeconds),
+                CombatStillResetAckEvent,
+                TimeSpan.FromSeconds(CombatStillResetDeadlineSec));
+
+            // EVENT handling is serialized behind this tick, so a missing WAIT
+            // here is a definite send/session failure, never an ultra-fast ACK.
+            if (ctx.Pending == null)
+            {
+                CircuitTrace.Hit(ctx.Guid, "combat-still: reset issue produced no WAIT");
+                string reason = ctx.Failure?.Reason ?? "session_superseded";
+                FailCombatStillReset(ctx, reason);
+            }
+            return true;
+        }
+
+        CircuitTrace.Hit(ctx.Guid, "stuck-still: FROZEN whole window out of combat", observation.ElapsedSeconds);
 
         // Physically frozen for the whole window → eject to a level-appropriate friendly hub.
         // [ESCAPE-BANDS] lowest band containing the level, same-faction, never the pocket we're in.
@@ -477,7 +683,7 @@ public sealed class BotBrain
             CircuitTrace.Hit(ctx.Guid, "stuck-still: nowhere to send, window restarted");
             // Nowhere friendly to send (shouldn't happen for a live bot) — restart the window so we
             // don't re-evaluate every tick, and let the wedge ladder remain the fallback.
-            id.StillSinceUtc = DateTime.UtcNow;
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
             return false;
         }
 
@@ -485,8 +691,280 @@ public sealed class BotBrain
             "[STUCK] {Name} physically frozen {Sec:F0}s (<{R:F0}yd) @ {Pos} — ejecting to friendly hub ({X:F0},{Y:F0})@map{Map}",
             ctx.Name, StuckStillSeconds, StuckStillRadius, ctx.Pos, d.X, d.Y, d.Map);
         await IssueEscapePortAsync(ctx, id, d, $"STUCK — no movement {StuckStillSeconds:F0}s");
-        id.StillAnchorX = d.X; id.StillAnchorY = d.Y; id.StillSinceUtc = DateTime.UtcNow;
+        id.StillAnchorX = d.X;
+        id.StillAnchorY = d.Y;
+        id.StillSinceUtc = ctx.LastStateReceivedUtc;
+        ctx.StillAnchorMapId = d.Map;
         return true;
+    }
+
+    /// <summary>
+    /// Advance the fixed-position proof using each STATE at most once. A stale
+    /// duplicate tick cannot advance time, and a telemetry gap longer than the
+    /// bridge freshness budget restarts the proof instead of counting an
+    /// unobserved disconnect as stationary time.
+    /// </summary>
+    internal static StillObservation ObserveFreshStillPosition(BotContext ctx, BotIdentity id)
+    {
+        DateTime stateUtc = ctx.LastStateReceivedUtc;
+        if (stateUtc == default)   // cb:fold observation classifier; caller probes MissingState
+            return new(StillObservationKind.MissingState, 0);   // cb:fold observation classifier; caller probes MissingState
+
+        DateTime priorStateUtc = ctx.LastStillObservationStateUtc;
+        if (priorStateUtc != default
+            && ctx.LastStillObservationBridgeSessionId != ctx.BridgeSessionId)
+        {   // cb:fold observation classifier; caller probes BridgeSessionChanged
+            ResetStillWindow(ctx, id, stateUtc);
+            return new(StillObservationKind.BridgeSessionChanged, 0);
+        }
+        if (priorStateUtc != default && stateUtc <= priorStateUtc)   // cb:fold observation classifier; caller probes StateNotAdvanced
+            return new(StillObservationKind.StateNotAdvanced, 0);   // cb:fold observation classifier; caller probes StateNotAdvanced
+
+        if (priorStateUtc == default || id.StillSinceUtc == default)   // cb:fold observation classifier; caller probes Seeded
+        {   // cb:fold observation classifier; caller probes Seeded
+            ResetStillWindow(ctx, id, stateUtc);
+            return new(StillObservationKind.Seeded, 0);
+        }
+
+        if ((stateUtc - priorStateUtc).TotalSeconds > StillStateContinuitySec)   // cb:fold observation classifier; caller probes ContinuityReset
+        {   // cb:fold observation classifier; caller probes ContinuityReset
+            ResetStillWindow(ctx, id, stateUtc);
+            return new(StillObservationKind.ContinuityReset, 0);
+        }
+
+        ctx.LastStillObservationStateUtc = stateUtc;
+        if (ctx.StillAnchorMapId != ctx.MapId)   // cb:fold observation classifier; caller probes MapChanged
+        {   // cb:fold observation classifier; caller probes MapChanged
+            ResetStillWindow(ctx, id, stateUtc);
+            return new(StillObservationKind.MapChanged, 0);
+        }
+
+        float dx = ctx.Pos.X - id.StillAnchorX;
+        float dy = ctx.Pos.Y - id.StillAnchorY;
+        if (dx * dx + dy * dy > StuckStillRadius * StuckStillRadius)   // cb:fold observation classifier; caller probes Moved
+        {   // cb:fold observation classifier; caller probes Moved
+            ResetStillWindow(ctx, id, stateUtc);
+            return new(StillObservationKind.Moved, 0);
+        }
+
+        return new(
+            StillObservationKind.Still,
+            Math.Max(0, (stateUtc - id.StillSinceUtc).TotalSeconds));
+    }
+
+    internal static CombatStillResetGate ClassifyCombatStillResetGate(
+        BotContext ctx,
+        BotIdentity id,
+        DateTime utcNow)
+    {
+        if (id.WedgeStreak < StrandedWedgeCap)   // cb:fold pure gate classifier; caller switch probes result
+            return CombatStillResetGate.WedgeStreakBelowCap;   // cb:fold pure gate classifier; caller switch probes result
+        if (ctx.BridgeProtocol < CombatStillResetProtocol)   // cb:fold pure gate classifier; caller switch probes result
+            return CombatStillResetGate.ProtocolTooOld;   // cb:fold pure gate classifier; caller switch probes result
+        if (ctx.CombatStillResetCooldownUntilUtc is DateTime cooldown && utcNow < cooldown)   // cb:fold pure gate classifier; caller switch probes result
+            return CombatStillResetGate.CooldownActive;   // cb:fold pure gate classifier; caller switch probes result
+        return CombatStillResetGate.Eligible;
+    }
+
+    internal static CombatStillPostResetGate ClassifyCombatStillPostResetGate(BotContext ctx)
+    {
+        if (ctx.BridgeSessionId != ctx.CombatStillResetBridgeSessionId)   // cb:fold pure post-reset classifier; caller switch probes result
+            return CombatStillPostResetGate.SessionSuperseded;   // cb:fold pure post-reset classifier; caller switch probes result
+        if (ctx.CombatStillResetAckReceivedUtc == default
+            || ctx.LastStateReceivedUtc <= ctx.CombatStillResetAckReceivedUtc)   // cb:fold pure post-reset classifier; caller switch probes result
+            return CombatStillPostResetGate.AwaitNewerState;   // cb:fold pure post-reset classifier; caller switch probes result
+        if (ctx.Dead)   // cb:fold pure post-reset classifier; caller switch probes result
+            return CombatStillPostResetGate.Dead;   // cb:fold pure post-reset classifier; caller switch probes result
+        if (ctx.InPlayerParty
+            || IsBotGroupOwned(ctx)
+            || ctx.Possessed
+            || ctx.Conscripted)   // cb:fold pure post-reset classifier; caller switch probes result
+            return CombatStillPostResetGate.ExternalOwner;   // cb:fold pure post-reset classifier; caller switch probes result
+        if (ctx.InCombat)   // cb:fold pure post-reset classifier; caller switch probes result
+            return CombatStillPostResetGate.StillInCombat;   // cb:fold pure post-reset classifier; caller switch probes result
+        return CombatStillPostResetGate.SafeToEscape;
+    }
+
+    internal static bool IsBotGroupOwned(BotContext ctx)
+        => ctx.GroupId.HasValue || ctx.GroupOrder.IsActive;
+
+    internal static BridgeCommand CreateCombatStillResetCommand(
+        BotContext ctx,
+        BotIdentity id,
+        double stillSeconds)
+        => new(CombatStillResetCommandType, new
+        {
+            anchor_x = id.StillAnchorX,
+            anchor_y = id.StillAnchorY,
+            anchor_z = ctx.Pos.Z,
+            anchor_map = ctx.MapId,
+            radius = StuckStillRadius,
+            still_seconds = Math.Max(0, (int)Math.Floor(stillSeconds)),
+            wedge_streak = id.WedgeStreak
+        });
+
+    private async Task<bool> ContinueCombatStillRecoveryAsync(BotContext ctx, BotIdentity id)
+    {
+        if (ctx.CombatStillRecoveryStage == CombatStillRecoveryStage.AwaitingResetOutcome
+            && ctx.Dead)
+        {
+            CircuitTrace.Hit(ctx.Guid, "combat-still: in-flight reset cancelled, bot died");
+            _executor.ClearPending(ctx);
+            ctx.Failure = null;
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            return false;
+        }
+
+        // A real kill after issuance disproves the premise that this combat is
+        // inert. Retire the waiter and do not turn a recovered fight into a port.
+        if (ctx.LastKillUtc > ctx.CombatStillResetIssuedStateUtc)
+        {
+            CircuitTrace.Hit(ctx.Guid, "combat-still: real kill cancelled reset recovery");
+            _executor.ClearPending(ctx);
+            ctx.Failure = null;
+            ResetCombatStillRecovery(ctx, clearCooldown: true);
+            ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+            return false;
+        }
+
+        if (ctx.BridgeSessionId != ctx.CombatStillResetBridgeSessionId)
+        {
+            CircuitTrace.Hit(ctx.Guid, "combat-still: reset session superseded before proof");
+            FailCombatStillReset(ctx, "session_superseded");
+            return true;
+        }
+
+        if (ctx.CombatStillRecoveryStage == CombatStillRecoveryStage.AwaitingResetOutcome)
+        {
+            if (ctx.Pending is { } pending)
+            {
+                if (!pending.CommandType.Equals(CombatStillResetCommandType, StringComparison.OrdinalIgnoreCase))
+                {
+                    CircuitTrace.HitNote(ctx.Guid, "combat-still: reset ownership lost to another WAIT", pending.CommandType);
+                    FailCombatStillReset(ctx, "wait_owner_replaced");
+                    return true;
+                }
+                if (pending.Expired)
+                {
+                    CircuitTrace.Hit(ctx.Guid, "combat-still: reset ACK deadline expired");
+                    _executor.ClearPending(ctx);
+                    FailCombatStillReset(ctx, "deadline");
+                    return true;
+                }
+
+                CircuitTrace.Hit(ctx.Guid, "combat-still: waiting for correlated reset outcome");
+                return true;
+            }
+
+            if (ctx.Failure is { } failure
+                && failure.CommandType.Equals(CombatStillResetCommandType, StringComparison.OrdinalIgnoreCase))
+            {
+                CircuitTrace.HitNote(ctx.Guid, "combat-still: correlated reset failed", failure.Reason);
+                FailCombatStillReset(ctx, failure.Reason);
+                return true;
+            }
+            // Only exact positive admission clears the WAIT without Failure.
+            CircuitTrace.Hit(ctx.Guid, "combat-still: correlated reset ACK admitted");
+            ctx.CombatStillRecoveryStage = CombatStillRecoveryStage.AwaitingPostResetState;
+        }
+
+        switch (ClassifyCombatStillPostResetGate(ctx))
+        {
+            case CombatStillPostResetGate.SessionSuperseded:
+                CircuitTrace.Hit(ctx.Guid, "combat-still: post-reset STATE came from replacement session");
+                FailCombatStillReset(ctx, "session_superseded");
+                return true;
+            case CombatStillPostResetGate.AwaitNewerState:
+                CircuitTrace.Hit(ctx.Guid, "combat-still: reset ACK admitted, awaiting newer STATE");
+                return true;
+            case CombatStillPostResetGate.Dead:
+                CircuitTrace.Hit(ctx.Guid, "combat-still: post-reset port suppressed, bot died");
+                ResetCombatStillRecovery(ctx, clearCooldown: true);
+                ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+                return false;
+            case CombatStillPostResetGate.ExternalOwner:
+                string owner = ctx.Possessed
+                    ? "possessed"
+                    : ctx.Conscripted
+                        ? "conscripted"
+                        : IsBotGroupOwned(ctx)
+                            ? "bot_group"
+                            : "player_party";
+                CircuitTrace.HitNote(ctx.Guid, "combat-still: post-reset port suppressed, external owner", owner);
+                ResetCombatStillRecovery(ctx, clearCooldown: true);
+                ResetStillWindow(ctx, id, ctx.LastStateReceivedUtc);
+                return false;
+            case CombatStillPostResetGate.StillInCombat:
+                CircuitTrace.Hit(ctx.Guid, "combat-still: newer STATE remained in combat, port refused");
+                FailCombatStillReset(ctx, "state_still_in_combat");
+                return true;
+        }
+
+        (float X, float Y, float Z, int Map)? dest =
+            PickBandedEscape(ctx, id.Level, id.EscapeRotation, ZoneSafetyMap.TeamFromFaction(id.Faction));
+        if (dest is null)
+        {
+            CircuitTrace.Hit(ctx.Guid, "combat-still: no banded post-reset escape, trying HomeFor fallback");
+            var home = BotIdentity.HomeFor(id.Race, id.Level);
+            if (home.Map >= 0)
+            {
+                CircuitTrace.Hit(ctx.Guid, "combat-still: HomeFor fallback valid");
+                dest = home;
+            }
+        }
+        if (dest is not { } d)
+        {
+            CircuitTrace.Hit(ctx.Guid, "combat-still: reset succeeded but no safe escape exists");
+            FailCombatStillReset(ctx, "no_safe_escape");
+            return true;
+        }
+
+        CircuitTrace.Hit(ctx.Guid, "combat-still: newer STATE proved OOC, escape port issued");
+        ResetCombatStillRecovery(ctx, clearCooldown: true);
+        await IssueEscapePortAsync(ctx, id, d,
+            $"COMBAT-STILL reset ACK + fresh OOC STATE (wedge streak {id.WedgeStreak})");
+        id.StillAnchorX = d.X;
+        id.StillAnchorY = d.Y;
+        id.StillSinceUtc = ctx.LastStateReceivedUtc;
+        ctx.StillAnchorMapId = d.Map;
+        return true;
+    }
+
+    private static void ResetStillWindow(BotContext ctx, BotIdentity id, DateTime stateUtc)
+    {
+        id.StillAnchorX = ctx.Pos.X;
+        id.StillAnchorY = ctx.Pos.Y;
+        id.StillSinceUtc = stateUtc;
+        ctx.StillAnchorMapId = ctx.MapId;
+        ctx.LastStillObservationStateUtc = stateUtc;
+        ctx.LastStillObservationBridgeSessionId = ctx.BridgeSessionId;
+    }
+
+    private static void ResetCombatStillRecovery(BotContext ctx, bool clearCooldown)
+    {
+        ctx.CombatStillRecoveryStage = CombatStillRecoveryStage.None;
+        ctx.CombatStillResetIssuedStateUtc = default;
+        ctx.CombatStillResetAckReceivedUtc = default;
+        ctx.CombatStillResetBridgeSessionId = 0;
+        if (clearCooldown)   // cb:fold reset-state hygiene; caller probes the reset reason
+            ctx.CombatStillResetCooldownUntilUtc = null;   // cb:fold reset-state hygiene; caller probes the reset reason
+    }
+
+    private void FailCombatStillReset(BotContext ctx, string reason)
+    {
+        _executor.ClearPending(ctx);
+        ctx.Failure = null;
+        ctx.ConsecutiveFailures = 0;
+        ctx.CombatStillRecoveryStage = CombatStillRecoveryStage.None;
+        ctx.CombatStillResetIssuedStateUtc = default;
+        ctx.CombatStillResetAckReceivedUtc = default;
+        ctx.CombatStillResetBridgeSessionId = 0;
+        ctx.CombatStillResetCooldownUntilUtc = DateTime.UtcNow.AddSeconds(CombatStillResetCooldownSec);
+        CircuitTrace.HitNote(ctx.Guid, "combat-still: recovery cooled without port", reason);
+        _logger.LogWarning(
+            "[COMBAT-STILL] {Name} reset did not produce correlated ACK + fresh OOC STATE ({Reason}); no port, retry cooled {Sec:F0}s",
+            ctx.Name, reason, CombatStillResetCooldownSec);
     }
 
     private const float EscapeSpreadYards = 500f;   // a candidate spot this close to the bot = the pocket it's in → skip it
@@ -613,7 +1091,7 @@ public sealed class BotBrain
     {
         var id = ctx.Identity;
         if (id == null || id.IslandStreak < IslandEscapeCap) { CircuitTrace.Hit(ctx.Guid, "island: no isolation streak"); return false; }
-        if (ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted) { CircuitTrace.Hit(ctx.Guid, "island: ineligible state"); return false; }
+        if (ctx.Dead || ctx.InCombat || ctx.InPlayerParty || ctx.Conscripted || ctx.Possessed) { CircuitTrace.Hit(ctx.Guid, "island: ineligible state"); return false; }
         if (id.IslandEscapeCooldownUntil is DateTime cd && DateTime.UtcNow < cd) { CircuitTrace.Hit(ctx.Guid, "island: escape cooling down"); return false; }
 
         // [ESCAPE-BANDS] Level-appropriate destination: lowest band containing the level, same-faction,
@@ -762,9 +1240,9 @@ public sealed class BotBrain
     }
 
     /// <summary>Route an inbound bridge event for this bot through the executor's ack matching.</summary>
-    public void OnEvent(BotContext ctx, BotEvent evt)
+    public bool OnEvent(BotContext ctx, BotEvent evt)
     {
-        _executor.OnEvent(ctx, evt);
+        return _executor.OnEvent(ctx, evt);
     }
 
     // ----------------------------------------------------------------------

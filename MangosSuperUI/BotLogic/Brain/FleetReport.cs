@@ -1,5 +1,7 @@
 using System.Text;
 using MangosSuperUI.BotLogic.Core;
+using MangosSuperUI.BotLogic.Tracking;
+using MangosSuperUI.Services;
 
 namespace MangosSuperUI.BotLogic.Brain;
 
@@ -27,31 +29,49 @@ public static class FleetReport
         // ---- rollups ----
         var byGoal = new SortedDictionary<Goal, int>();
         var levels = new List<int>();
-        int stalled = 0;
+        int stalled = 0, feedStale = 0;
         foreach (var b in bots)
         {
             byGoal[b.Goal] = byGoal.TryGetValue(b.Goal, out var n) ? n + 1 : 1;
-            if (b.Level > 0) levels.Add(b.Level);
-            if (b.Stalled) stalled++;
+            if (b.Level > 0)
+            {
+                CircuitTrace.Hit(b.Guid, "fleet-report: level included in rollup", b.Level);
+                levels.Add(b.Level);
+            }
+            if (b.Stalled)
+            {
+                CircuitTrace.Hit(b.Guid, "fleet-report: stalled bot included in rollup");
+                stalled++;
+            }
+            if (b.SensoryFeedStale)
+            {
+                CircuitTrace.Hit(b.Guid, "fleet-report: stale feed included in rollup");
+                feedStale++;
+            }
         }
 
         sb.Append("  goals:   ").Append(string.Join("  ", byGoal.Select(kv => $"{kv.Key}={kv.Value}"))).Append('\n');
         if (levels.Count > 0)
         {
+            CircuitTrace.Hit(0, "fleet-report: level rollup rendered", levels.Count);
             levels.Sort();
             sb.Append("  levels:  min=").Append(levels[0])
               .Append(" avg=").Append(levels.Average().ToString("F1"))
               .Append(" max=").Append(levels[^1]).Append('\n');
         }
         sb.Append("  stalled: ").Append(stalled).Append('/').Append(bots.Count).Append('\n');
+        sb.Append("  feed-stale: ").Append(feedStale).Append('/').Append(bots.Count).Append('\n');
         sb.Append("  ----\n");
 
         // ---- per-bot lines (stalled first, then by name) ----
         int shown = 0;
-        foreach (var b in bots.OrderByDescending(b => b.Stalled).ThenBy(b => b.Name, StringComparer.OrdinalIgnoreCase))
+        foreach (var b in bots.OrderByDescending(b => b.SensoryFeedStale)
+                              .ThenByDescending(b => b.Stalled)
+                              .ThenBy(b => b.Name, StringComparer.OrdinalIgnoreCase))
         {
             if (shown++ >= MaxRows)
             {
+                CircuitTrace.Hit(b.Guid, "fleet-report: row cap reached", MaxRows);
                 sb.Append("  … ").Append(bots.Count - MaxRows).Append(" more bots (raise MaxRows to see all)\n");
                 break;
             }
@@ -71,28 +91,77 @@ public static class FleetReport
         sb.Append("z=").Append(b.ZoneId).Append(' ').Append(b.Pos).Append('@').Append(b.MapId).Append("  ");
 
         sb.Append("hp=").Append((b.HpPct * 100).ToString("F0")).Append('%');
-        if (b.ManaPct > 0f && b.ManaPct < 1f) sb.Append(" mp=").Append((b.ManaPct * 100).ToString("F0")).Append('%');
+        if (b.ManaPct > 0f && b.ManaPct < 1f)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: mana rendered", b.ManaPct);
+            sb.Append(" mp=").Append((b.ManaPct * 100).ToString("F0")).Append('%');
+        }
         sb.Append(" bag=").Append(b.FreeSlots).Append("f cu=").Append(b.Copper).Append("c  ");
 
-        if (b.Target.HasValue) sb.Append("tgt=").Append(b.DistToTarget.ToString("F0")).Append("y  ");
+        if (b.Target.HasValue)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: target distance rendered", b.DistToTarget);
+            sb.Append("tgt=").Append(b.DistToTarget.ToString("F0")).Append("y  ");
+        }
 
         sb.Append("inStep=").Append(b.TimeInStepSec.ToString("F0")).Append("s ");
         sb.Append("noProg=").Append(b.TimeSinceProgressSec.ToString("F0")).Append("s  ");
 
         var p = b.Pending;
         sb.Append("pend=");
-        if (p != null) sb.Append(p.ExpectedEvent).Append('(').Append(p.AgeSec.ToString("F0")).Append("s)");
-        else sb.Append('-');
+        if (p != null)
+        {
+            CircuitTrace.HitNote(b.Guid, "fleet-report: pending action rendered", p.ExpectedEvent);
+            sb.Append(p.ExpectedEvent).Append('(').Append(p.AgeSec.ToString("F0")).Append("s)");
+        }
+        else
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: no pending action rendered");
+            sb.Append('-');
+        }
 
-        if (b.InCombat) sb.Append("  [combat]");
-        if (b.Dead) sb.Append("  [dead]");
+        if (b.InCombat)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: combat marker rendered");
+            sb.Append("  [combat]");
+        }
+        if (b.Dead)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: dead marker rendered");
+            sb.Append("  [dead]");
+        }
+        if (b.SensoryFeedStale)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: stale feed marker rendered", b.SensoryStateAgeSec);
+            sb.Append("  [FEED_STALE ").Append(b.SensoryStateAgeSec.ToString("F0")).Append("s]");
+        }
+        if (b.BridgeProtocolIncompatible)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: incompatible bridge marker rendered", b.BridgeProtocol);
+            sb.Append("  [BRIDGE_PROTOCOL ").Append(b.BridgeProtocol).Append("<")
+              .Append(BotBridgeService.RequiredCorrelatedOutcomeProtocol).Append(']');
+        }
+        if (b.Possessed)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: possessed marker rendered");
+            sb.Append("  [possessed]");
+        }
+        else if (b.Conscripted)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: conscripted marker rendered");
+            sb.Append("  [conscripted]");
+        }
 
         var q = b.Quest;
         if (q != null && q.ActiveQuestIds.Count > 0)
+        {
+            CircuitTrace.Hit(b.Guid, "fleet-report: active quests rendered", q.ActiveQuestIds.Count);
             sb.Append("  q=[").Append(string.Join(",", q.ActiveQuestIds)).Append(']');
+        }
 
         if (b.Stalled)
         {
+            CircuitTrace.HitNote(b.Guid, "fleet-report: stall detail rendered", b.StallReason);
             int secs = (int)(DateTime.UtcNow - b.StalledSinceUtc).TotalSeconds;
             sb.Append("  *STALL ").Append(b.StallReason).Append('(').Append(secs).Append("s)");
         }
@@ -100,7 +169,10 @@ public static class FleetReport
         // Why the bot is in this goal (the arbitration's reasoning) — explains a grinding
         // bot at a glance: "q av=12 pick=0" = quests available but none pass the pick filter.
         if (!string.IsNullOrEmpty(b.GoalReason))
+        {
+            CircuitTrace.HitNote(b.Guid, "fleet-report: goal reason rendered", b.GoalReason);
             sb.Append("  why=").Append(b.GoalReason);
+        }
 
         return sb.ToString();
     }

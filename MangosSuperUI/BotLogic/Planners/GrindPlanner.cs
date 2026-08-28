@@ -33,6 +33,8 @@ public sealed class GrindPlanner : IBotPlanner
     private const int GuardTownParkSec = 120;    // guard-town bail: hold Idle this long instead of re-bailing at tick speed
     private const double ArmGraceSec = 45;       // grace after entry before KILL-recency applies
     private const double KillRecencySec = 120;   // a bot landing REAL kills is progressing
+    private const int GrindPatrolPointId = 102;   // C++ AIBOT_POINT_GRIND_PATROL
+    private const int GrindPatrolRefusalBarrenCount = 3; // three 10s-rate-limited refusals beat the 45s silent grace
 
     // [GRIND-RELOCATE] (FINDING_003 residual) — see the relocate block in PlanNext.
     private const float RelocateSearchRadius = 350f; // a modest walk, never a cross-zone trek
@@ -70,18 +72,41 @@ public sealed class GrindPlanner : IBotPlanner
         // (unreachable/contested/bad combat pocket), so C++ never says no_target. The old 45s planner
         // stall then re-issued SET_TASK GRIND, resetting the core scan and preserving the bad pocket.
         // Treat the planner's own bounded no-real-kill verdict as the same relocation request.
+        DateTime now = DateTime.UtcNow;
+        bool patrolCannotLeave = ctx.Failure == null
+            && ctx.Grind is { KillGoal: 0 }
+            && !ctx.InCombat
+            && ctx.HasRecentAutonomousMoveRefusals(
+                GrindPatrolPointId,
+                GrindPatrolRefusalBarrenCount,
+                now);
+        if (patrolCannotLeave)
+        {
+            CircuitTrace.Hit(ctx.Guid,
+                "grind: repeated autonomous patrol refusals prove barren spot",
+                ctx.AutonomousMoveRefusalStreak);
+        }
+
         WaitFailure? empty = ctx.Failure is { CommandType: "GRIND", Reason: "no_target" } reported
             ? reported
+            : patrolCannotLeave
+              ? new WaitFailure
+                {
+                    CommandType = "GRIND",
+                    Reason = "patrol_no_path",
+                    Dest = ctx.Grind!.AreaCenter,
+                    Utc = now
+                }
             : ctx.Failure == null
               && ctx.Grind != null
               && ctx.TimeInGoalSec >= ArmGraceSec
-              && (DateTime.UtcNow - ctx.LastKillUtc).TotalSeconds >= KillRecencySec
+              && (now - ctx.LastKillUtc).TotalSeconds >= KillRecencySec
                 ? new WaitFailure
                 {
                     CommandType = "GRIND",
                     Reason = "no_kills",
                     Dest = ctx.Grind.AreaCenter,
-                    Utc = DateTime.UtcNow
+                    Utc = now
                 }
                 : null;
 

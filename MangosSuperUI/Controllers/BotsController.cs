@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Hosting;
 using MangosSuperUI.Services;
 using MangosSuperUI.Models;
 using MangosSuperUI.BotLogic.Data;
+using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Tracking;
 using Dapper;
 using System.Text.RegularExpressions;
@@ -492,15 +493,67 @@ public partial class BotsController : Controller
     [HttpPost]
     public async Task<IActionResult> AttackTarget([FromBody] TargetRequest req)
     {
-        await _bridge.SendAttackTargetAsync(req.Guid, req.TargetGuid);
-        return Json(new { success = true, command = "ATTACK_TARGET", req.Guid, req.TargetGuid });
+        if (req.TargetEntry <= 0 || req.TargetGuid <= 0)
+            return Json(new { success = false, error = "Creature entry and target GUID are required." });
+        ExactCreatureCommandDispatch dispatch = await _bridge.SendAttackTargetAsync(
+            req.Guid, req.TargetEntry, req.TargetGuid);
+        if (!dispatch.Sent)
+        {
+            CircuitTrace.Hit(req.Guid, "controller: ATTACK_TARGET not confirmed written", dispatch.CorrelationId);
+            return Json(new
+            {
+                success = false,
+                accepted = false,
+                status = dispatch.StatusCode,
+                cbt = dispatch.CorrelationId,
+                error = dispatch.Detail
+            });
+        }
+        return Json(new
+        {
+            accepted = true,
+            sent = true,
+            executionPending = true,
+            status = "sent",
+            cbt = dispatch.CorrelationId,
+            command = "ATTACK_TARGET",
+            req.Guid,
+            req.TargetEntry,
+            req.TargetGuid
+        });
     }
 
     [HttpPost]
     public async Task<IActionResult> InteractNpc([FromBody] TargetRequest req)
     {
-        await _bridge.SendInteractNpcAsync(req.Guid, req.TargetGuid);
-        return Json(new { success = true, command = "INTERACT_NPC", req.Guid, req.TargetGuid });
+        if (req.TargetEntry <= 0 || req.TargetGuid <= 0)
+            return Json(new { success = false, error = "Creature entry and target GUID are required." });
+        ExactCreatureCommandDispatch dispatch = await _bridge.SendInteractNpcAsync(
+            req.Guid, req.TargetEntry, req.TargetGuid);
+        if (!dispatch.Sent)
+        {
+            CircuitTrace.Hit(req.Guid, "controller: INTERACT_NPC not confirmed written", dispatch.CorrelationId);
+            return Json(new
+            {
+                success = false,
+                accepted = false,
+                status = dispatch.StatusCode,
+                cbt = dispatch.CorrelationId,
+                error = dispatch.Detail
+            });
+        }
+        return Json(new
+        {
+            accepted = true,
+            sent = true,
+            executionPending = true,
+            status = "sent",
+            cbt = dispatch.CorrelationId,
+            command = "INTERACT_NPC",
+            req.Guid,
+            req.TargetEntry,
+            req.TargetGuid
+        });
     }
 
     [HttpPost]
@@ -838,24 +891,34 @@ public partial class BotsController : Controller
             return Json(new { success = false, error = "Invalid mode. Use 0=Off, 1=Sticky, 2=Opportunistic." });
 
         var mode = (MangosSuperUI.BotLogic.Core.GroupingMode)req.Mode;
-        await _brain.SetGroupingModeAsync(mode);
-        return Json(new { success = true, mode = req.Mode, modeName = mode.ToString() });
+        GroupMutationBatchResult result = await _brain.SetGroupingModeAsync(mode);
+        GroupMutationResult? unresolved = result.Results.FirstOrDefault(item => !item.Succeeded);
+        return Json(new
+        {
+            success = result.Succeeded,
+            requestedMode = req.Mode,
+            mode = (int)_brain.GroupManager.Mode,
+            modeName = _brain.GroupManager.Mode.ToString(),
+            error = unresolved?.Detail,
+            outcomes = GroupMutationOutcomes(result)
+        });
     }
 
     [HttpPost]
     public async Task<IActionResult> AutoFormGroups()
     {
-        var formed = await _brain.AutoFormGroupsAsync();
+        GroupMutationBatchResult result = await _brain.AutoFormGroupsAsync();
         return Json(new
         {
-            success = true,
-            groupsFormed = formed.Count,
-            groups = formed.Select(g => new
+            success = result.Succeeded,
+            groupsFormed = result.SuccessCount,
+            groups = result.Results.Where(item => item.Succeeded && item.Group != null).Select(item => new
             {
-                groupId = g.GroupId,
-                leaderGuid = g.LeaderGuid,
-                memberGuids = g.MemberGuids
-            })
+                groupId = item.Group!.GroupId,
+                leaderGuid = item.Group.LeaderGuid,
+                memberGuids = item.Group.MemberGuids
+            }),
+            outcomes = GroupMutationOutcomes(result)
         });
     }
 
@@ -865,33 +928,73 @@ public partial class BotsController : Controller
         if (req.LeaderGuid <= 0 || req.FollowerGuids == null || req.FollowerGuids.Length == 0)
             return Json(new { success = false, error = "Need leaderGuid + at least 1 followerGuid" });
 
-        var group = await _brain.FormGroupAsync(req.LeaderGuid, req.FollowerGuids);
-        if (group == null)
-            return Json(new { success = false, error = "Formation failed — check mode is not Off and bots are not already grouped" });
+        GroupMutationResult result = await _brain.FormGroupAsync(req.LeaderGuid, req.FollowerGuids);
+        if (!result.Succeeded || result.Group == null)
+            return Json(new
+            {
+                success = false,
+                status = result.StatusCode,
+                error = result.Detail,
+                cbt = result.CorrelationId == 0 ? (long?)null : result.CorrelationId,
+                operation = result.OperationCode,
+                leaderGuid = result.LeaderGuid,
+                memberGuids = result.MemberGuids
+            });
 
         return Json(new
         {
             success = true,
-            groupId = group.GroupId,
-            leaderGuid = group.LeaderGuid,
-            memberGuids = group.MemberGuids
+            status = result.StatusCode,
+            cbt = result.CorrelationId,
+            operation = result.OperationCode,
+            groupId = result.Group.GroupId,
+            leaderGuid = result.LeaderGuid,
+            memberGuids = result.MemberGuids
         });
     }
 
     [HttpPost]
     public async Task<IActionResult> DisbandGroup([FromBody] DisbandGroupRequest req)
     {
-        await _brain.DisbandGroupAsync(req.GroupId);
-        return Json(new { success = true, groupId = req.GroupId });
+        GroupMutationResult result = await _brain.DisbandGroupAsync(req.GroupId);
+        return Json(new
+        {
+            success = result.Succeeded,
+            status = result.StatusCode,
+            error = result.Succeeded ? null : result.Detail,
+            cbt = result.CorrelationId == 0 ? (long?)null : result.CorrelationId,
+            operation = result.OperationCode,
+            groupId = req.GroupId,
+            leaderGuid = result.LeaderGuid,
+            memberGuids = result.MemberGuids
+        });
     }
 
     /// <summary>Dissolve every active bot group (Manage Bot Groups → Dissolve All).</summary>
     [HttpPost]
     public async Task<IActionResult> DisbandAllGroups()
     {
-        var disbanded = await _brain.DisbandAllGroupsAsync();
-        return Json(new { success = true, disbanded });
+        GroupMutationBatchResult result = await _brain.DisbandAllGroupsAsync();
+        return Json(new
+        {
+            success = result.Succeeded,
+            disbanded = result.SuccessCount,
+            outcomes = GroupMutationOutcomes(result)
+        });
     }
+
+    private static object GroupMutationOutcomes(GroupMutationBatchResult batch)
+        => batch.Results.Select(result => new
+        {
+            success = result.Succeeded,
+            status = result.StatusCode,
+            detail = result.Detail,
+            cbt = result.CorrelationId == 0 ? (long?)null : result.CorrelationId,
+            groupId = result.Group?.GroupId,
+            operation = result.OperationCode,
+            leaderGuid = result.LeaderGuid,
+            memberGuids = result.MemberGuids
+        }).ToList();
 
     // ==================== Bot Quest Progress ====================
 
@@ -1201,6 +1304,7 @@ public class LearnSpellRequest
 public class TargetRequest
 {
     public int Guid { get; set; }
+    public int TargetEntry { get; set; }
     public int TargetGuid { get; set; }
 }
 

@@ -46,6 +46,12 @@ public readonly struct Vec4
 // is DeadlineUtc exceeded — independent of any domain.
 public sealed class Outstanding
 {
+    /// <summary>
+    /// Protocol correlation id sent as top-level <c>cbt</c>. Real bridge WAITs
+    /// always use a positive value; the coordinator's synthetic/virtual waits
+    /// use zero because no wire outcome resolves them.
+    /// </summary>
+    public long CorrelationId { get; init; }
     public string CommandType { get; init; } = "";
     public string ExpectedEvent { get; init; } = "";
     public DateTime SentUtc { get; init; }
@@ -82,6 +88,20 @@ public sealed class Outstanding
     public bool Expired => DateTime.UtcNow > DeadlineUtc;
 }
 
+/// <summary>
+/// Ownership token for a behavioral command that deliberately has no deadline
+/// WAIT. Protocol v4 can still return negative/terminal events for these
+/// commands; retaining the exact cbt prevents a delayed outcome from an older
+/// fire-and-forget task from mutating the current one.
+/// </summary>
+public sealed class NoWaitCommandOwner
+{
+    public long CorrelationId { get; init; }
+    public string CommandType { get; init; } = "";
+    public bool OwnsTaskMotion { get; init; }
+    public bool CanGrindBlock { get; init; }
+}
+
 // ---------------------- Negative-ack outcome (§3.5b) -----------------------
 // A pending WAIT can be resolved two ways: by its positive ack (ExpectedEvent),
 // or NEGATED by a failure event that means "this won't complete" — MOVE_FAILED /
@@ -112,7 +132,7 @@ public sealed class WaitFailure
 // One quest inside the batch. CARRIED — accepted in the C++ quest log with its
 // partial kill progress — until it is rewarded, goes grey (out-leveled), or, for
 // the span of a single sweep, gets shelved (far outlier or a failed leg). The
-// durable truth is the C++ log + QUEST_STATUS_ALL; this list is rebuilt from it
+// durable truth is the C++ quest-log snapshot carried on STATE; this list is rebuilt from it
 // on every (re)entry to Questing, so shelving survives goal bounces for free.
 public sealed class BatchQuest
 {
@@ -169,6 +189,19 @@ public sealed class GrindScratch
 // Stage of a vendor/repair errand (driven by MaintenancePlanner under Goal.Maintenance,
 // on ctx.Service). None = no errand in flight (the GoalSelector hold keys off this).
 public enum VendorPhase { None, Route, Sell, Repair }
+
+/// <summary>
+/// C# half of the bounded combat-still recovery handshake. The reset command is
+/// never treated as permission to teleport by itself: a correlated ACK first
+/// advances this state machine, then a newer STATE must prove the bot is out of
+/// combat before the existing safe-hub escape can run.
+/// </summary>
+internal enum CombatStillRecoveryStage
+{
+    None,
+    AwaitingResetOutcome,
+    AwaitingPostResetState
+}
 
 public sealed class ServiceScratch
 {
@@ -251,8 +284,8 @@ public sealed class TeleportTrip
     public bool Failed { get; set; }      // the business failed at the NPC — return anyway, THEN give up (never strand the bot in the pocket)
 }
 
-// One quest's authoritative server-side state, parsed from QUEST_STATUS_ALL (the
-// C++ reply to QUERY_QUEST_STATUS). Lets the QuestPlanner RESUME an in-log quest
+// One quest's authoritative server-side state, parsed from the full quest-log snapshot on
+// STATE. Lets the QuestPlanner RESUME an in-log quest
 // after a death/restart instead of re-accepting it (which C++ rejects → zombie).
 public sealed class QuestLogEntry
 {
@@ -358,6 +391,8 @@ public sealed class BotContext
     public int Guid { get; init; }
     public string Name { get; set; } = "";
     public int Level { get; set; }
+    /// <summary>Exact active TCP session that produced the sensed snapshot.</summary>
+    public long BridgeSessionId { get; private set; }
 
     // ---- durable roster back-ref (set once by the host at seed) ----
     // Quest completed-set / deferrals / path blacklist live on BotIdentity (durable,
@@ -376,7 +411,54 @@ public sealed class BotContext
     public string GoalReason { get; set; } = "";
 
     // ---- THE WAIT — the observability spine ----
-    public Outstanding? Pending { get; set; }
+    private Outstanding? _pending;
+    private NoWaitCommandOwner? _latestNoWaitCommand;
+    private NoWaitCommandOwner? _noWaitTaskOwner;
+
+    /// <summary>
+    /// Serializes the brain tick, group pre-pass, and inbound EVENT mutation for
+    /// this bot. Socket callbacks and the 250 ms planner loop run on different
+    /// tasks, but BotContext is deliberately a single-writer state machine.
+    /// </summary>
+    internal SemaphoreSlim MutationGate { get; } = new(1, 1);
+
+    public Outstanding? Pending
+    {
+        get => Volatile.Read(ref _pending);
+        set => Volatile.Write(ref _pending, value);
+    }
+
+    /// <summary>
+    /// Clear only the exact waiter previously classified by an event. This is a
+    /// defensive atomic wall in addition to MutationGate: an old outcome can
+    /// never erase a replacement waiter if a future caller bypasses serialization.
+    /// </summary>
+    internal bool TryClearPending(Outstanding expected)
+        => ReferenceEquals(Interlocked.CompareExchange(ref _pending, null, expected), expected);
+
+    /// <summary>Latest no-WAIT command of any kind, used to authenticate control-fence drops.</summary>
+    internal NoWaitCommandOwner? LatestNoWaitCommand
+    {
+        get => Volatile.Read(ref _latestNoWaitCommand);
+        set => Volatile.Write(ref _latestNoWaitCommand, value);
+    }
+
+    /// <summary>Latest no-WAIT SET_TASK/MOVE_TO owner, used for delayed motion/task failures.</summary>
+    internal NoWaitCommandOwner? NoWaitTaskOwner
+    {
+        get => Volatile.Read(ref _noWaitTaskOwner);
+        set => Volatile.Write(ref _noWaitTaskOwner, value);
+    }
+
+    internal bool TryReplaceLatestNoWaitOwner(NoWaitCommandOwner expected, NoWaitCommandOwner? replacement)
+        => ReferenceEquals(
+            Interlocked.CompareExchange(ref _latestNoWaitCommand, replacement, expected),
+            expected);
+
+    internal bool TryReplaceNoWaitTaskOwner(NoWaitCommandOwner expected, NoWaitCommandOwner? replacement)
+        => ReferenceEquals(
+            Interlocked.CompareExchange(ref _noWaitTaskOwner, replacement, expected),
+            expected);
 
     // ---- last negative outcome (set by the executor when a WAIT is negated; consumed by the brain) ----
     public WaitFailure? Failure { get; set; }
@@ -396,6 +478,87 @@ public sealed class BotContext
     public float LastPosDelta { get; set; }
     public Vec3 LastPosRef { get; set; }                  // ping-pong / no-progress detection
 
+    // ---- autonomous MovePoint refusal evidence ----
+    // MOVE_POINT_REFUSED is deliberately NOT a command outcome. It is an unsolicited, cbt=0
+    // observation that a short C++-owned wander/patrol/combat candidate could not path. Keep it
+    // live-context-local so it can inform bounded liveness decisions without ever entering
+    // WaitFailure, ConsecutiveFailures, or BotIdentity's durable destination/island memory.
+    private const int MaxAutonomousMoveRefusalStreak = 8;
+    private const float AutonomousMoveRefusalAnchorRadius = 8f;
+    // The producer has a global 10s traffic limiter and a patrol can retry on a slower cadence;
+    // 75s admits three 10-20s-spaced samples while still expiring transient evidence quickly.
+    private static readonly TimeSpan AutonomousMoveRefusalChainWindow = TimeSpan.FromSeconds(75);
+
+    internal int AutonomousMoveRefusalStreak { get; private set; }
+    internal int AutonomousMoveRefusalPointId { get; private set; }
+    internal int AutonomousMoveRefusalMapId { get; private set; } = -1;
+    internal Vec3 AutonomousMoveRefusalAnchor { get; private set; }
+    internal Vec3 AutonomousMoveRefusalDest { get; private set; }
+    internal DateTime AutonomousMoveRefusalSinceUtc { get; private set; }
+    internal DateTime AutonomousMoveRefusalUtc { get; private set; }
+    internal long AutonomousMoveRefusalBridgeSessionId { get; private set; }
+
+    internal void RecordAutonomousMoveRefusal(int pointId, Vec3 dest, DateTime observedUtc)
+    {
+        float dx = Pos.X - AutonomousMoveRefusalAnchor.X;
+        float dy = Pos.Y - AutonomousMoveRefusalAnchor.Y;
+        float dz = Pos.Z - AutonomousMoveRefusalAnchor.Z;
+        bool sameChain = AutonomousMoveRefusalStreak > 0
+            && AutonomousMoveRefusalPointId == pointId
+            && AutonomousMoveRefusalMapId == MapId
+            && AutonomousMoveRefusalBridgeSessionId == BridgeSessionId
+            && observedUtc >= AutonomousMoveRefusalUtc
+            && observedUtc - AutonomousMoveRefusalUtc <= AutonomousMoveRefusalChainWindow
+            && observedUtc - AutonomousMoveRefusalSinceUtc <= AutonomousMoveRefusalChainWindow
+            && dx * dx + dy * dy + dz * dz
+                <= AutonomousMoveRefusalAnchorRadius * AutonomousMoveRefusalAnchorRadius;
+
+        if (!sameChain)
+        {
+            CircuitTrace.Hit(Guid, "ctx: autonomous move refusal chain restarted", pointId);
+            AutonomousMoveRefusalStreak = 1;
+            AutonomousMoveRefusalPointId = pointId;
+            AutonomousMoveRefusalMapId = MapId;
+            AutonomousMoveRefusalAnchor = Pos;
+            AutonomousMoveRefusalSinceUtc = observedUtc;
+            AutonomousMoveRefusalBridgeSessionId = BridgeSessionId;
+        }
+        else
+        {
+            CircuitTrace.Hit(Guid, "ctx: autonomous move refusal chain advanced", pointId);
+            AutonomousMoveRefusalStreak = Math.Min(
+                MaxAutonomousMoveRefusalStreak,
+                AutonomousMoveRefusalStreak + 1);
+        }
+
+        AutonomousMoveRefusalDest = dest;
+        AutonomousMoveRefusalUtc = observedUtc;
+    }
+
+    internal bool HasRecentAutonomousMoveRefusals(int pointId, int minimumCount, DateTime nowUtc)
+        => minimumCount > 0
+            && AutonomousMoveRefusalStreak >= minimumCount
+            && AutonomousMoveRefusalPointId == pointId
+            && AutonomousMoveRefusalMapId == MapId
+            && AutonomousMoveRefusalBridgeSessionId == BridgeSessionId
+            && nowUtc >= AutonomousMoveRefusalUtc
+            && nowUtc - AutonomousMoveRefusalUtc <= AutonomousMoveRefusalChainWindow
+            && nowUtc - AutonomousMoveRefusalSinceUtc <= AutonomousMoveRefusalChainWindow;
+
+    internal void ClearAutonomousMoveRefusals()
+    {
+        if (AutonomousMoveRefusalStreak > 0)   // cb:fold evidence-presence guard; clearing decision is probed below
+            CircuitTrace.Hit(Guid, "ctx: autonomous move refusal evidence cleared");
+        AutonomousMoveRefusalStreak = 0;
+        AutonomousMoveRefusalPointId = 0;
+        AutonomousMoveRefusalMapId = -1;
+        AutonomousMoveRefusalAnchor = default;
+        AutonomousMoveRefusalDest = default;
+        AutonomousMoveRefusalSinceUtc = default;
+        AutonomousMoveRefusalUtc = default;
+        AutonomousMoveRefusalBridgeSessionId = 0;
+    }
+
     // ---- no-progress circuit breaker (brain-owned; the universal silent/fast-stall net) ----
     // ConsecutiveFailures: negated WAITs since the last success — a fast fail-loop (e.g. relocate
     // MOVE_FAILED no_path at 1Hz) that the slow no-progress clock would take too long to catch.
@@ -411,6 +574,20 @@ public sealed class BotContext
     // provably in a dead pocket, so it need not wait the full still window. Reset on any real progress.
     public int ConsecutiveReselects { get; set; }
     public DateTime LastReselectUtc { get; set; } = DateTime.MinValue;
+
+    // ---- fresh-telemetry physical-still recovery ----
+    // The position anchor itself remains on BotIdentity so it survives a C++
+    // reconnect while this C# process stays alive. These stamps belong to the
+    // live BotContext: they prove which STATE samples formed the timer and own
+    // the correlated combat-reset handshake for the current bridge session.
+    internal DateTime LastStillObservationStateUtc { get; set; }
+    internal long LastStillObservationBridgeSessionId { get; set; }
+    internal int StillAnchorMapId { get; set; } = -1;
+    internal CombatStillRecoveryStage CombatStillRecoveryStage { get; set; }
+    internal DateTime CombatStillResetIssuedStateUtc { get; set; }
+    internal DateTime CombatStillResetAckReceivedUtc { get; set; }
+    internal long CombatStillResetBridgeSessionId { get; set; }
+    internal DateTime? CombatStillResetCooldownUntilUtc { get; set; }
 
     // Recently-tried grind cell centers (cell granularity) that produced no kills. The breaker records
     // the current spot here on a wedge so the next forced relocation goes somewhere NEW, not back onto
@@ -445,6 +622,14 @@ public sealed class BotContext
     public string StallReason { get; set; } = "";
     public DateTime StalledSinceUtc { get; set; }
 
+    // A correlated core ownership fence (human possession / RTS conscription)
+    // rejected a planner command. Hold until a STATE newer than this event says
+    // who owns the bot; ACK/control traffic may not clear the handoff.
+    public DateTime ControlFenceObservedUtc { get; set; }
+    public string ControlFenceReason { get; set; } = "";
+    public bool HasUnreleasedControlFence => ControlFenceObservedUtc != default
+        && LastStateReceivedUtc <= ControlFenceObservedUtc;
+
     // ---- sensory (refreshed each tick from BotStateSnapshot) ----
     public Vec3 Pos { get; set; }
     public int MapId { get; set; }
@@ -457,7 +642,20 @@ public sealed class BotContext
     public bool InCombat { get; set; }
     public bool Dead { get; set; }
     public bool InPlayerParty { get; set; }                // [PLAYERPARTY] a REAL player leads this bot's group (C++ pparty; GoalSelector holds Idle on it)
+    public bool Possessed { get; set; }                    // direct human/free-view control owns intent; planner stands down until STATE clears it
     public bool Conscripted { get; set; }                  // [CONSCRIPTED] enlisted in a player's RTS army (C++ conscripted; the brain stands down, objective preserved)
+    /// <summary>Dedicated receive time of the last STATE copied by Sense.</summary>
+    public DateTime LastStateReceivedUtc { get; set; }
+    /// <summary>
+    /// Host-owned fail-closed latch. While true the context remains observable,
+    /// but neither group coordination nor the per-bot driver may consume it.
+    /// </summary>
+    public bool SensoryFeedStale { get; set; }
+    public int BridgeProtocol { get; set; }
+    public bool BridgeProtocolIncompatible { get; set; }
+    public double SensoryStateAgeSec => LastStateReceivedUtc == DateTime.MinValue
+        ? 0
+        : Math.Max(0, (DateTime.UtcNow - LastStateReceivedUtc).TotalSeconds);
 
     // ---- C++ held-task echo (Held-Objective build §4; refreshed each tick from STATE) ----
     // What C++ reports it is ACTUALLY running right now (mirror of m_currentTask). Unknown until the
@@ -490,7 +688,7 @@ public sealed class BotContext
     // surviving the goal change is the whole mechanism.
     public DateTime? HubErrandDone { get; set; }
 
-    // ---- quest-log cache (refreshed by QUEST_STATUS_ALL; read by QuestPlanner to resume) ----
+    // ---- quest-log snapshot (refreshed by STATE; read by QuestPlanner to resume) ----
     // Reference-swapped by the executor (not mutated in place) so the planner can read a
     // stable snapshot without locking. Stamp = when it was last refreshed.
     public Dictionary<int, QuestLogEntry> QuestLog { get; set; } = new();
@@ -511,9 +709,21 @@ public sealed class BotContext
 
     // The combat seam the spine last EMITTED to C++ (BotBrain step 1a). The coordinator re-stamps
     // CombatDirective every tick (idempotent), but the wire only fires when it differs from this --
-    // keeping COMBAT_DIRECTIVE at brain-cadence, not per-tick traffic (§3.8.4 / §1). Value-equality
-    // on the record struct drives that change check.
+    // keeping COMBAT_DIRECTIVE at brain-cadence, not per-tick traffic (§3.8.4 / §1). The session
+    // marker invalidates that cache when a replacement bridge connection is sensed: C++ may have
+    // lost its overlay even though the desired value is unchanged.
     public CombatDirective LastEmittedCombat { get; set; } = CombatDirective.None;
+    private long _lastEmittedCombatSessionId;
+
+    internal bool NeedsCombatDirectiveEmission
+        => CombatDirective != LastEmittedCombat
+            || BridgeSessionId != _lastEmittedCombatSessionId;
+
+    internal void MarkCombatDirectiveEmitted()
+    {
+        LastEmittedCombat = CombatDirective;
+        _lastEmittedCombatSessionId = BridgeSessionId;
+    }
 
     // The group ORDER (grouping §7.1) -- the god bot's (GroupCoordinator pre-pass) per-tick per-member
     // stamp. It GENERALIZES the old kill-only ExecDirective stamp (which carried only the shared mob) to
@@ -603,11 +813,30 @@ public sealed class BotContext
     {
         LastProgressUtc = DateTime.UtcNow;
         ConsecutiveReselects = 0;   // real progress ⇒ not churning a dead batch
+        ClearAutonomousMoveRefusals();
     }
 
     /// <summary>Refresh the sensory fields from the latest bridge snapshot. No control logic here.</summary>
     public void Sense(BotStateSnapshot snap)
     {
+        if (AutonomousMoveRefusalStreak > 0)   // cb:fold evidence-presence guard; clearing decision is probed below
+        {   // cb:fold evidence-presence guard; clearing decision is probed below
+            float refusalDx = snap.X - AutonomousMoveRefusalAnchor.X;
+            float refusalDy = snap.Y - AutonomousMoveRefusalAnchor.Y;
+            float refusalDz = snap.Z - AutonomousMoveRefusalAnchor.Z;
+            bool sessionReplaced = BridgeSessionId != snap.BridgeSessionId;
+            bool meaningfullyMoved = snap.MapId != AutonomousMoveRefusalMapId
+                || refusalDx * refusalDx + refusalDy * refusalDy + refusalDz * refusalDz
+                    > AutonomousMoveRefusalAnchorRadius * AutonomousMoveRefusalAnchorRadius;
+            if (sessionReplaced || meaningfullyMoved)
+            {
+                CircuitTrace.HitNote(Guid, "ctx: clearing autonomous refusal evidence from STATE",
+                    sessionReplaced ? "bridge-session-replaced" : "meaningful-movement");
+                ClearAutonomousMoveRefusals();
+            }
+        }
+
+        BridgeSessionId = snap.BridgeSessionId;
         Level = snap.Level;
         Pos = new Vec3(snap.X, snap.Y, snap.Z);
         MapId = snap.MapId;
@@ -620,8 +849,12 @@ public sealed class BotContext
         InCombat = snap.InCombat;
         Dead = snap.IsDead;
         InPlayerParty = snap.InPlayerParty;
+        Possessed = snap.Possessed;
         Conscripted = snap.Conscripted;
         HeldTask = snap.HeldTask;   // C++ task readback (Unknown until the Session-3 STATE echo lands)
+        LastStateReceivedUtc = snap.StateUtc;
+        SensoryFeedStale = false;
+        BridgeProtocol = snap.BridgeProtocol;
 
         // Quest log now rides on STATE (the QUERY_QUEST_STATUS pull is retired). Set it here — on the TICK
         // thread, the SINGLE writer — so there is no cross-thread mutation race and no request/reply cache to

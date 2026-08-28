@@ -603,7 +603,7 @@ The script will:
 
 2. **Read your database connections** — parses the `WorldDatabase.Info`, `CharacterDatabase.Info`, `LoginDatabase.Info`, and `LogsDatabase.Info` lines from `mangosd.conf`. These are in the format `host;port;user;password;database` and the script converts them to the connection string format MangosSuperUI expects. The `vmangos_admin` connection is derived automatically from the World DB credentials.
 
-3. **Discover SuperUI-Core paths** — finds your binary directory (preferring `run/` paths over `build/` paths), config directory, DBC files, heightmap files, and log files. All derived from the binary location and the `DataDir` setting in `mangosd.conf`.
+3. **Discover SuperUI-Core paths** — finds your binary directory (preferring `run/` paths over `build/` paths), config directory, DBC files, heightmap files, logs, and the fork's `src` directory when the checkout is present. All are derived from the binary location and the `DataDir` setting in `mangosd.conf`.
 
 4. **Detect process names** — if mangosd and realmd are running, reads their process names from `/proc`. Otherwise falls back to the binary filenames.
 
@@ -641,6 +641,7 @@ Step 3: Discovering SuperUI-Core paths
   ✓ DBC path: /home/YOU/vmangos/run/data/5875/dbc (158 .dbc files)
   ✓ Maps path: /home/YOU/vmangos/run/data/maps (2429 .map files)
   ✓ Log directory: /home/YOU/vmangos/run/bin
+  ✓ SuperUI-Core source: /home/YOU/vmangos/src
 
 Step 4: Remote Access (RA) configuration
   ✓ RA port: 3443
@@ -679,6 +680,7 @@ Configuration Summary
     Conf Path:   /home/YOU/vmangos/run/etc/mangosd.conf
     DBC Path:    /home/YOU/vmangos/run/data/5875/dbc
     Maps Path:   /home/YOU/vmangos/run/data/maps
+    Source Path: /home/YOU/vmangos/src
 
   Process Names:
     mangosd:     mangosd
@@ -782,6 +784,7 @@ Where your SuperUI-Core installation lives on the filesystem. The setup script d
 | Auth Server Process Name  | `realmd` or `realmd-main`                | Same as above, for the auth server                             |
 | mangosd.conf Path         | `/home/YOU/vmangos/run/etc/mangosd.conf` | Full path — used by the Config Editor page                     |
 | Server Logs Directory     | `/home/YOU/vmangos/run/bin`              | Used by the Live Logs page for real-time log tailing           |
+| SuperUI-Core Source       | `/home/YOU/vmangos/src`                  | Source Map, source backups, and Circuit Board C++ line display |
 
 > **Finding your process names:** If you need to check what your binaries register as, run this while the server is running:
 > 
@@ -790,6 +793,19 @@ Where your SuperUI-Core installation lives on the filesystem. The setup script d
 > ```
 > 
 > As of v1.1, MangosSuperUI auto-scans `/proc` as a 3-strategy fallback if the configured name doesn't match. But setting the correct name avoids the 30-second scan cache delay.
+
+#### Circuit Board Source Code
+
+Circuit Board shows the literal source lines behind a bot decision. It reads **two separate codebases**; neither one is contained in the pre-built `MangosSuperUI-linux-x64.zip` application package.
+
+Open **Settings → Circuit Board Source Code** and configure both rows:
+
+1. **MangosSuperUI (C#)** — use the project folder from the checkout that built the web app, or open the [matching MangosSuperUI release](https://github.com/Yafrovon/MangosSuperUI/releases), download its **Source code (zip)** asset, and upload that ZIP. It must contain `MangosSuperUI/MangosSuperUI.csproj` and `MangosSuperUI/BotLogic/`.
+2. **SuperUI-Core (C++)** — use the `src` folder from the exact checkout that built the running `mangosd`. The setup script fills this path automatically when it can find that checkout. Otherwise, download the matching revision from the [SuperUI-Core repository](https://github.com/Yafrovon/SuperUI-Core) and upload the repository ZIP. It must contain `src/game/SuperUiContent/SuiBots/`.
+
+Do **not** upload stock VMaNGOS for the second row; it does not contain the SuperUI-Core bot code. A path entered in Settings is a folder on the machine running MangosSuperUI. A ZIP upload comes from the computer running your browser and installs immediately. Path changes require **Save Settings**.
+
+Use the same tags or commits that built the running programs. Circuit trace probes store file names and line numbers, so a different revision may be readable but highlight the wrong code.
 
 #### DBC Data Files
 

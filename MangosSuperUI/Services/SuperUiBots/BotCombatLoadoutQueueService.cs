@@ -819,7 +819,7 @@ public sealed class BotCombatLoadoutQueueService : BackgroundService
         }
         if (!runtime.HasReceivedState
             || DateTime.UtcNow - runtime.ConnectedAt < ConnectionHydrationDelay
-            || DateTime.UtcNow - runtime.LastUpdate > MaximumStateAge)
+            || DateTime.UtcNow - runtime.LastStateReceivedUtc >= MaximumStateAge)
         {
             CircuitTrace.Hit(row.Guid, "loadout: dispatch deferred, runtime hydrating or stale");
             await DeferAsync(row, "runtime_hydrating",

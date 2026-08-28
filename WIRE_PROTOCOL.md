@@ -1,8 +1,43 @@
-# BotBridge Wire Protocol — v3
+# BotBridge Wire Protocol — v6
 
-> **v3 (2026-08-26, circuit board):** every C#→C++ envelope now carries a third
-> top-level field `"cbt"` (monotonic chain id, CIRCUIT_BOARD.md R2); C++ records
-> it as a probe value so traces stitch cause→effect across the boundary. New
+> **v6 (2026-08-27, restart identity + bounded combat recovery):** HELLO now
+> advertises one opaque, process-wide `circuitEpoch`; every CIRCUIT_SITE and
+> CIRCUIT_BATCH echoes it. C# keys numeric C++ probe ids by `(circuitEpoch,id)`
+> and rejects missing/mismatched epoch payloads, so a mangosd restart can never
+> reuse an old label inside a surviving SuperUI trace session. Protocol v6 also
+> adds the correlated `RESET_COMBAT_STUCK` / `COMBAT_RESET_ACK` /
+> `COMBAT_RESET_FAIL` handshake. C# issues it only after continuous fresh STATE
+> proves a solo bot has been fixed in combat for 120 seconds with no real kill
+> and the stranded wedge streak has reached six. The core revalidates the small
+> position anchor, clears the combat latch, and holds autonomous reacquisition
+> for five seconds. ACK alone never authorizes relocation: C# requires a STATE
+> received strictly after that exact ACK, from the same bridge session, saying
+> the bot is out of combat.
+
+> **v5 (2026-08-27, authority closure):** FORM_GROUP and DISBAND_GROUP are
+> session/`cbt` transactions. Formation preflights the complete bot-only member set,
+> mutates all-or-nothing, and ACKs the exact leader plus full membership. Disband
+> carries and verifies that same expected topology before acting. C# commits its
+> in-memory and persisted topology only after the exact ACK; a rejection, missing
+> outcome, reconnect, or topology mismatch leaves it unchanged and is never blindly
+> retried. ATTACK_TARGET and INTERACT_NPC now require complete creature identity
+> (`entry` + low `guid`) and emit correlated validation/resolution failures. The core
+> advertises `bridgeProtocol: 5` for these capabilities. The obsolete
+> QUERY_QUEST_STATUS / QUEST_STATUS_ALL pull is removed; STATE remains authoritative.
+
+> **v4 (2026-08-26, integrity tranche):** `cbt` is now behavioral correlation,
+> not trace-only metadata. A v4 core advertises `bridgeProtocol: 4` in HELLO,
+> adopts each command's top-level `cbt`, and echoes that exact id on every
+> terminal ACK/failure/drop EVENT. SuperUI arms a WAIT before writing and releases
+> it only when event type, command attribution, and `cbt` match. Missing or stale
+> ids fail closed. No-WAIT commands retain their latest command/task owner too,
+> so delayed MOVE/GRIND failures cannot mutate a replacement task. STATE also
+> exposes `possessed`; snapshots and sends are bound to the exact TCP session;
+> and the STATE-only feed watchdog holds planning after 15 seconds without STATE
+> and recycles the socket (including a pre-HELLO socket) after 30.
+>
+> **v3 (2026-08-26, circuit board):** every C#→C++ envelope gained a third
+> top-level field `"cbt"`; C++ originally recorded it only as a probe value. New
 > messages: **CIRCUIT_TRACE** (C#→C++, `{"mode":0|1,"ship":0|1}` — global probe
 > mode + per-bot ship-to-disk flag; pushed on HELLO and on every toggle) and
 > **CIRCUIT_SITE** / **CIRCUIT_BATCH** (C++→C#, the probe-site manifest and the
@@ -13,7 +48,8 @@
 **Transport:** TCP on `127.0.0.1:3444`  
 **Encoding:** UTF-8, newline-delimited JSON (one JSON object per `\n`)  
 **Direction:** C++ (AiBotAI) is the TCP CLIENT → C# (BotBridgeService) is the TCP SERVER  
-**Last audited:** AiBotAI.cpp, BotBridgeService.cs, BotBridgeHub.cs
+**Last audited:** AiBotAIBridge.cpp, AiBotAIMain.cpp/.h, AiBotAIMovement.cpp, AiBotCircuit.cpp/.h,
+BotBridgeService.cs, BotBrainService.cs, BotExecutor.cs, BotBridgeHub.cs
 
 ---
 
@@ -32,11 +68,17 @@
 
 ## Message Envelope
 
-Every line is a JSON object with exactly two fields:
+Every line has `type` and `payload`. Every C# command additionally carries a
+positive top-level `cbt`:
 
 ```json
-{"type":"MESSAGE_TYPE","payload":{...}}
+{"type":"MESSAGE_TYPE","payload":{...},"cbt":7298098123456789}
 ```
+
+For a command-terminal EVENT, C++ must echo the exact same top-level `cbt`.
+Unsolicited telemetry such as KILL or LEVEL_UP uses `cbt: 0` (or omits it during
+legacy compatibility); it cannot resolve a WAIT. IDs remain below `2^53` so the
+circuit viewer's numeric representation preserves exact identity.
 
 C++ uses `snprintf` for outbound, `JsonExtractString/Int/Float` helpers for inbound (no JSON library). All payload fields are flat within the `payload` object.
 
@@ -51,6 +93,8 @@ Sent once after initialization. Registers the bot with the bridge.
 {
   "type": "HELLO",
   "payload": {
+    "bridgeProtocol": 6,
+    "circuitEpoch": "18da5e88c4f2-7f1a42c0",
     "guid": 12345,
     "name": "Edageq",
     "race": 1,
@@ -64,6 +108,14 @@ Sent once after initialization. Registers the bot with the bridge.
   }
 }
 ```
+
+`bridgeProtocol >= 4` is required for autonomous planner driving. Transactional
+group mutations and exact-identity ATTACK_TARGET / INTERACT_NPC additionally require
+`bridgeProtocol >= 5`. Combat-latch reset additionally requires `bridgeProtocol >= 6`.
+`circuitEpoch` is optional only for legacy compatibility: an omitted value receives a
+unique per-socket host namespace. Once HELLO advertises an epoch, every SITE/BATCH on
+that connection must echo the exact same nonempty string. An older core may still connect for visibility/operator work,
+but SuperUI holds or refuses capabilities whose advertised ownership contract is absent.
 
 ### STATE
 Periodic heartbeat with full state snapshot.
@@ -85,6 +137,7 @@ Periodic heartbeat with full state snapshot.
     "z": 83.5312,
     "inCombat": false,
     "isDead": false,
+    "possessed": 0,
     "targetGuid": 0,
     "taskState": "IDLE"
   }
@@ -109,6 +162,7 @@ Discrete events. The `event` field determines which additional payload fields ar
 ```json
 {
   "type": "EVENT",
+  "cbt": 7298098123456789,
   "payload": {
     "guid": 12345,
     "event": "EVENT_NAME",
@@ -125,12 +179,51 @@ Discrete events. The `event` field determines which additional payload fields ar
 | `QUEST_UPDATE` | Quest accepted, rewarded, or abandoned | `quest_id`, `status` | `SendQuestUpdateEvent()` |
 | `LEVEL_UP` | Bot level increased | `new_level` | `SendLevelUpEvent()` |
 | `CHAT_RECV` | Incoming whisper/say intercepted via EVENT path | `sender`, `message`, `chat_type` | `SendChatRecvEvent()` |
-| `TASK_COMPLETE` | `MovementInform(AIBOT_POINT_TASK_DEST)` fires | `data` = `"MOVE_TO arrived"` | `BridgeSendEvent()` |
+| `TASK_COMPLETE` | The owned movement/task reaches its terminal success | MOVE_TO arrivals use `data` beginning `MOVE_TO arrived` and append accepted `x`, `y`, `z` when available; task/grind variants carry diagnostic text | `BridgeSendEvent()` / task handlers |
+| `MOVE_FAILED` | An owned MOVE_TO or SET_TASK approach cannot path/progress | `data` includes `reason`, destination, and `source=set_task_approach` when applicable; terminal owner `cbt` echoed | movement/task handlers |
+| `GRIND_BLOCKED` | An owned grind finds no valid target for its dwell budget | `data` = `x=...|y=...|z=...|reason=no_target`; terminal owner `cbt` echoed | grind task loop |
 | `DEATH` | `me->IsDead()` transition detected | (none) | `BridgeSendEvent()` |
 | `RESPAWN` | Self-revive completes | (none) | `BridgeSendEvent()` |
 | `NPC_INTERACT` | INTERACT_NPC reaches the NPC (≤10yd) | `data` = creature name | `BridgeSendEvent()` |
 | `QUEST_FAILED` | Quest command validation fails | `data` = reason string | `BridgeSendEvent()` |
 | `COMBAT_LOADOUT_ACK` | A correlated combat-loadout request succeeds or is rejected | `data` = pipe-delimited final runtime state and result | `BridgeHandleApplyCombatLoadout()` |
+| `QUEST_CAST_FAIL` | A QUEST_CAST cannot execute | `data` = pipe-delimited `reason` and cast attribution | `BridgeHandleQuestCast()` |
+| `POSSESSED_DROP` | Human possession fence rejects a command | `data` = exact dropped command type; terminal `cbt` echoed | bridge dispatch fence |
+| `CONSCRIPTED_DROP` | RTS conscription fence rejects a command | `data` = exact dropped command type; terminal `cbt` echoed | bridge dispatch fence |
+| `MOVE_POINT_REFUSED` | An autonomous candidate hop has no path | `data` = `reason=no_path|source=move_point|point_id=...|dest_*`; transient evidence, always `cbt:0` | `MovePointRun()` |
+| `COMBAT_RESET_ACK` | A validated RESET_COMBAT_STUCK cleared (or found already clear) the combat latch and passed immediate idle/OOC postconditions | `data` includes result, position, still duration, and wedge streak; exact command `cbt` echoed | `BridgeHandleResetCombatStuck()` |
+| `COMBAT_RESET_FAIL` | RESET_COMBAT_STUCK proof/actor/postcondition validation failed | `data` = pipe-delimited `reason=...`; exact command `cbt` echoed | `BridgeHandleResetCombatStuck()` |
+| `ATTACK_TARGET_FAIL` | ATTACK_TARGET validation or exact creature resolution fails | `data` includes `reason=bad_payload`, `not_found`, or `not_hostile` plus `entry` and `guid`; dispatch `cbt` echoed | `BridgeHandleAttackTarget()` |
+| `NPC_INTERACT_FAIL` | INTERACT_NPC validation/resolution fails, its approach fails, or a newer motion owner preempts it | `data` includes `reason=bad_payload`, `not_found`, `no_path`, or `preempted`; terminal interaction `cbt` echoed | interaction/motion ownership |
+
+`GRIND_BLOCKED` is a terminal negative outcome for its exact current MOVE_TO or
+SET_TASK owner. A waited owner is released immediately into the planner's
+`GRIND/no_target` recovery contract; a no-WAIT owner is accepted only when it is
+still the latest retained task owner. Autonomous `MOVE_POINT_REFUSED` always uses
+`cbt:0`: it never resolves or negates a WAIT and never feeds durable MOVE_FAILED,
+island, or destination-quarantine state. C# retains only a bounded same-session,
+same-map, same-position, same-point-type streak. Three recent point-102 grind-patrol
+refusals may classify an armed, indefinite, out-of-combat grind as barren and enter
+the existing safe camp recovery; combat point ids remain diagnostic evidence only.
+
+### CIRCUIT_SITE / CIRCUIT_BATCH process identity
+
+Numeric C++ site ids are compact process-local values. Protocol v6 makes their
+namespace explicit:
+
+```json
+{"type":"CIRCUIT_SITE","payload":{"circuitEpoch":"18da5e88c4f2-7f1a42c0","guid":14,"id":37,"file":"AiBotAIMain.cpp","line":1700,"desc":"cpp-combat-reset: newly-adopted recovery hold owns tick"}}
+{"type":"CIRCUIT_BATCH","payload":{"circuitEpoch":"18da5e88c4f2-7f1a42c0","guid":14,"map":0,"zone":12,"x":1.0,"y":2.0,"z":3.0,"drops":0,"h":[[37,5000]]}}
+```
+
+The epoch is generated once per mangosd process and survives socket reconnects to
+that process. Each TCP socket may claim exactly one HELLO identity; a duplicate
+HELLO is rejected before it can change GUID or epoch. C# accepts circuit payloads
+only from the active HELLO connection, with matching bot GUID and epoch, and
+revalidates that exact active connection atomically when each SITE/BATCH is committed.
+A same-epoch id re-registered with different
+metadata is quarantined as an explicit conflict site; a hit received before its
+manifest is stored as an explicit unregistered site, never under a stale label.
 
 **KILL example:**
 ```json
@@ -447,6 +540,8 @@ Walk to coordinates using pathfinding.
 - Calls `StopMoving()` then `MovePoint(AIBOT_POINT_TASK_DEST, x, y, z, MOVE_PATHFINDING)`
 - Sets `m_currentTask.type = TASK_MOVE_TO`
 - Fires `TASK_COMPLETE` event on arrival via `MovementInform()`
+- Stores the command `cbt` on the owned task/motion generation; cancellation of
+  a previous MOVE_TO cannot borrow a newer command's id.
 
 #### SAY_TEXT
 Make the bot speak or yell.
@@ -470,6 +565,55 @@ Keepalive — no-op on C++ side.
 ```json
 {"type":"PING","payload":{}}
 ```
+
+#### RESET_COMBAT_STUCK (protocol v6)
+
+This is a narrow recovery handshake for a proven combat latch, not a general
+operator "leave combat" primitive.
+
+```json
+{
+  "type": "RESET_COMBAT_STUCK",
+  "cbt": 7298098123456792,
+  "payload": {
+    "anchor_x": -1042.5,
+    "anchor_y": -321.0,
+    "anchor_z": 52.3,
+    "anchor_map": 0,
+    "radius": 3.0,
+    "still_seconds": 120,
+    "wedge_streak": 6
+  }
+}
+```
+
+C# may issue it only for a live, unpossessed, unconscripted bot that belongs to no
+player party or bot group, after continuous same-bridge-session fresh STATE samples
+prove it stayed within the 3-yard anchor for
+at least 120 seconds in combat, no real kill refreshed progress, the wedge streak
+is at least six, no reset is already in flight, and its ten-minute failure cooldown
+has expired.
+
+The core independently requires a nonzero `cbt`, a live in-world actor outside
+taxi/transport/hearth transitions, sane complete proof fields, an exact current-map
+match, and a current position still inside the supplied radius. Any grouped actor
+is refused; the existing possession/conscription dispatch fences remain
+authoritative. A validated reset:
+
+- performs combat teardown for the owner and controlled pets/guardians/charms,
+  clears hostile references, and clears target/motion;
+- clears only transient pull, stalemate, overpull, and victim-inference state;
+- preserves the strategic task and combat directive;
+- holds autonomous reacquisition for five seconds while bridge STATE remains live;
+- emits exact-cbt `COMBAT_RESET_ACK` only after immediate OOC/empty-target/idle
+  postconditions pass, otherwise exact-cbt `COMBAT_RESET_FAIL`.
+
+After admitting the exact ACK, SuperUI stamps its host receive time and still waits
+for a STATE received strictly after that ACK, from the same socket session, with
+`inCombat:false`. Only that second proof allows
+the existing level/faction-banded `PORT_HOME` escape. Failure, timeout, session
+replacement, or a newer STATE still showing combat causes a ten-minute cooldown
+and no blind port.
 
 ### Phase 2.5 — Implemented, Testing In Progress
 
@@ -532,31 +676,109 @@ the quest graph (giver for accept, turn-in for complete) before sending.
 ```json
 {
   "type": "ATTACK_TARGET",
-  "payload": { "guid": 54321 }
+  "payload": { "entry": 257, "guid": 54321 }
 }
 ```
 
 **C++ behavior:**
-- `guid` is the creature's `GetGUIDLow()` counter value
-- Looks up creature on current map via `ObjectGuid(HIGHGUID_UNIT, uint32(guidLow))`
+- `entry` is the creature template entry and `guid` is its `GetGUIDLow()` counter value
+- Requires both fields and resolves the exact current-map identity via
+  `ObjectGuid(HIGHGUID_UNIT, entry, guid)`
 - Validates `IsValidHostileTarget()`
+- Fires correlated `ATTACK_TARGET_FAIL` with `bad_payload`, `not_found`, or `not_hostile`
+  instead of silently dropping an unresolved command
 - Calls `AttackStart(pCreature)` — handles role-aware chase distance
 - Once engaged, autonomous combat rotation (`UpdateInCombatAI_*`) takes over entirely
+
+SuperUI admits and writes this command on one captured protocol-v5 bridge session. Its
+HTTP/Hub receipt returns the generated `cbt`, `sent: true`, and `executionPending: true`
+only after the complete line is written and flushed; that receipt is not execution success.
+Any correlated failure is forwarded to the operator with the same `cbt`.
 
 #### INTERACT_NPC
 
 ```json
 {
   "type": "INTERACT_NPC",
-  "payload": { "guid": 54321 }
+  "payload": { "entry": 1234, "guid": 54321 }
 }
 ```
 
 **C++ behavior:**
-- `guid` is the NPC's `GetGUIDLow()` counter value
-- If distance > 10yd: moves to contact point via `MovePoint()`, defers interaction
+- `entry` is the NPC template entry and `guid` is its `GetGUIDLow()` counter value; both
+  are required and form the exact creature `ObjectGuid`
+- A malformed or unresolved identity fires correlated `NPC_INTERACT_FAIL` with
+  `reason=bad_payload` or `reason=not_found`
+- If distance > 10yd: moves on a distinct interaction point id, retains the
+  interaction's `cbt`, and defers interaction
 - If distance ≤ 10yd: `SetFacingToObject(pCreature)`, fires `NPC_INTERACT` event
+- A no-path approach fires correlated `NPC_INTERACT_FAIL|reason=no_path`; a newer
+  motion/task owner preempts it once with the old interaction `cbt`
 - Does NOT open vendor/trainer/quest UI — those require separate commands
+
+The same session-bound send/receipt rule as ATTACK_TARGET applies: a successful receipt
+means fully written with execution pending, and exposes the `cbt` used by later events.
+
+#### FORM_GROUP
+
+```json
+{
+  "type": "FORM_GROUP",
+  "cbt": 7298098123456790,
+  "payload": {
+    "leader_guid": 14,
+    "member_guids": [15, 16]
+  }
+}
+```
+
+The receiving bot is the requested leader; `member_guids` contains followers only, and
+the command must carry a nonzero `cbt`.
+The core rejects malformed/duplicate identities, a leader or follower in a different
+group, a real-player member, an offline member, or a party outside the 2–5 player
+limit before creating anything. Every follower must be added or the newly-created
+group is unregistered, disbanded, and deleted immediately. An exact replay against an
+already-existing group with the same leader and full persistent member-slot set is
+idempotently ACKed; a different existing topology is rejected. This is the explicit
+reconciliation path for an ACK lost after the core committed.
+
+Success emits `FORM_GROUP_ACK` under the exact command `cbt`:
+
+```text
+leader_guid=14|member_guids=14,15,16
+```
+
+The ACK contains the full set including the leader. Failure emits
+`FORM_GROUP_FAIL` with a pipe-delimited `reason=...` and performs no partial commit.
+
+#### DISBAND_GROUP
+
+```json
+{
+  "type": "DISBAND_GROUP",
+  "cbt": 7298098123456791,
+  "payload": {
+    "leader_guid": 14,
+    "member_guids": [14, 15, 16]
+  }
+}
+```
+
+The full expected topology is an optimistic-authority token, and the command must carry
+a nonzero `cbt`. The core compares the persistent group member-slot set, including
+offline members, requires every slot to resolve as an online bot, and refuses a
+real-player party or any membership mismatch with
+`GROUP_DISBAND_FAIL`; it does
+not disband whichever party happens to exist. If the group is already absent, the
+desired state is idempotently acknowledged. A successful `GROUP_DISBANDED` echoes
+the exact `leader_guid` and full `member_guids` under the command `cbt`.
+
+C# admits either group success only when the active bridge session, `cbt`, leader,
+operation, and complete member set all match the pending owner. It then—and only
+then—commits GroupManager and database state. Timeout or send ambiguity is reported
+as `outcome_unknown`, with no automatic retry.
+Formation results retain the requested operation, leader, full member set, and old `cbt` so the
+operator can explicitly confirm an exact replay with a fresh `cbt`; the UI never performs it blindly.
 
 ### Phase 3 — Planned, Need C++ Handlers
 
@@ -679,3 +901,10 @@ The AiBotAI TCP client:
 - Buffer overflow: buffer cleared, logged
 - MOVE_TO while in combat: deferred with log message
 - Quest validation failures: `QUEST_FAILED` event returned to C# with reason string
+
+## v4 rollout order
+
+Deploy the v4 C++ core first, then SuperUI. New C++ outcomes are harmless to an
+older C# receiver, while strict v4 C# intentionally refuses to drive an old core
+that cannot echo outcomes. Roll back in the reverse order. No component should
+temporarily re-enable event-type-only WAIT matching.
