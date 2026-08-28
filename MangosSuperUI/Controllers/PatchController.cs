@@ -2069,13 +2069,25 @@ public partial class PatchController : Controller
             }
 
             // Spell Completer: IconSource "source" keeps the inherited spell's
-            // vanilla icon instead of the school fallback.
+            // vanilla icon instead of the school fallback. IconSource can also be
+            // a raw spell entry (numeric string) to pull the icon from a DIFFERENT
+            // spell than SourceEntry -- e.g. picking a specific vanilla icon by eye
+            // without changing which spell the effect/target/mechanics data clones
+            // from. Added 2026-08-28 for Holy Strike/Divine Strike's final icon pass.
             uint? sourceIconId = null;
-            if (string.Equals(config.IconSource, "source", StringComparison.OrdinalIgnoreCase) &&
-                _dbc.SpellEntries.TryGetValue((uint)config.SourceEntry, out var sourceDbcEntry) &&
-                sourceDbcEntry.SpellIconId > 0)
+            if (string.Equals(config.IconSource, "source", StringComparison.OrdinalIgnoreCase))
             {
-                sourceIconId = sourceDbcEntry.SpellIconId;
+                if (_dbc.SpellEntries.TryGetValue((uint)config.SourceEntry, out var sourceDbcEntry) &&
+                    sourceDbcEntry.SpellIconId > 0)
+                {
+                    sourceIconId = sourceDbcEntry.SpellIconId;
+                }
+            }
+            else if (uint.TryParse(config.IconSource, out uint iconSourceEntry) &&
+                _dbc.AllSpellEntries.TryGetValue(iconSourceEntry, out var iconRefDbcEntry) &&
+                iconRefDbcEntry.SpellIconId > 0)
+            {
+                sourceIconId = iconRefDbcEntry.SpellIconId;
             }
 
             requests.Add(new SpellPatchRequest
