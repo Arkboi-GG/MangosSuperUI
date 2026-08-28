@@ -12,6 +12,7 @@ namespace MangosSuperUI.Hubs;
 ///   BotConnected(BotState)          — new bot joined
 ///   BotDisconnected(int guid)       — bot TCP dropped
 ///   BotStateUpdate(BotState)        — periodic state refresh
+///   BotSensoryFeedStale(object)      — STATE heartbeat age crossed the fail-closed threshold
 ///   BotEvent(object)                — discrete event (combat, death, quest, etc.)
 ///   BotChatReceived(object)         — player whispered a bot
 ///
@@ -122,18 +123,42 @@ public class BotBridgeHub : Hub
         await Clients.Caller.SendAsync("CommandAck", new { guid, command = "LEARN_SPELL", spellId, success = true });
     }
 
-    public async Task SendAttackTarget(int guid, int targetGuid)
+    public async Task SendAttackTarget(int guid, int targetEntry, int targetGuid)
     {
-        _logger.LogInformation("BotBridgeHub: ATTACK_TARGET bot {Guid} target={Target}", guid, targetGuid);
-        await _bridge.SendAttackTargetAsync(guid, targetGuid);
-        await Clients.Caller.SendAsync("CommandAck", new { guid, command = "ATTACK_TARGET", targetGuid, success = true });
+        _logger.LogInformation("BotBridgeHub: ATTACK_TARGET bot {Guid} target={Entry}:{Target}", guid, targetEntry, targetGuid);
+        ExactCreatureCommandDispatch dispatch = await _bridge.SendAttackTargetAsync(guid, targetEntry, targetGuid);
+        await Clients.Caller.SendAsync("CommandAck", new
+        {
+            guid,
+            command = "ATTACK_TARGET",
+            targetEntry,
+            targetGuid,
+            accepted = dispatch.Sent,
+            sent = dispatch.Sent,
+            executionPending = dispatch.Sent,
+            status = dispatch.StatusCode,
+            cbt = dispatch.CorrelationId,
+            error = dispatch.Sent ? null : dispatch.Detail
+        });
     }
 
-    public async Task SendInteractNpc(int guid, int npcGuid)
+    public async Task SendInteractNpc(int guid, int npcEntry, int npcGuid)
     {
-        _logger.LogInformation("BotBridgeHub: INTERACT_NPC bot {Guid} npc={Npc}", guid, npcGuid);
-        await _bridge.SendInteractNpcAsync(guid, npcGuid);
-        await Clients.Caller.SendAsync("CommandAck", new { guid, command = "INTERACT_NPC", npcGuid, success = true });
+        _logger.LogInformation("BotBridgeHub: INTERACT_NPC bot {Guid} npc={Entry}:{Npc}", guid, npcEntry, npcGuid);
+        ExactCreatureCommandDispatch dispatch = await _bridge.SendInteractNpcAsync(guid, npcEntry, npcGuid);
+        await Clients.Caller.SendAsync("CommandAck", new
+        {
+            guid,
+            command = "INTERACT_NPC",
+            npcEntry,
+            npcGuid,
+            accepted = dispatch.Sent,
+            sent = dispatch.Sent,
+            executionPending = dispatch.Sent,
+            status = dispatch.StatusCode,
+            cbt = dispatch.CorrelationId,
+            error = dispatch.Sent ? null : dispatch.Detail
+        });
     }
 
     public async Task SendTakeFlight(int guid, int sourceNode, int destNode)

@@ -120,8 +120,11 @@ public sealed class WeaponPatchBuilder
     }
 
     /// <summary>Canonicalize an MPQ member path: forward slashes → backslashes, trim leading
-    /// separators, collapse doubles. Casing is preserved but compared case-insensitively.</summary>
-    private static string CanonicalMpqPath(string path)
+    /// separators, collapse doubles. Casing is preserved but compared case-insensitively.
+    /// Public to the assembly so callers can collapse members on the SAME rule the builder
+    /// rejects duplicates by — a caller that dedupes on the raw string still hands us two
+    /// paths the builder considers one.</summary>
+    internal static string CanonicalMpqPath(string path)
     {
         var p = path.Replace('/', '\\').Trim().TrimStart('\\');
         while (p.Contains("\\\\")) p = p.Replace("\\\\", "\\");

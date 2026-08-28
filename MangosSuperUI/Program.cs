@@ -59,6 +59,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<BotBridgeService>(
 builder.Services.AddSingleton<BotSpawnService>();   // Add Bots batches: background RA loop + SpawnProgress over the bridge hub
 builder.Services.AddSingleton<OllamaChatService>();
 builder.Services.AddSingleton<SourceIndexerService>();
+builder.Services.AddSingleton<CircuitTraceSourceService>();
 builder.Services.AddSingleton<ZoneSafetyMap>();
 builder.Services.AddSingleton<BotFallRecorder>();   // always-on void/fall black box (flush-only-on-fall)
 builder.Services.AddSingleton<SpellCreatorService>();

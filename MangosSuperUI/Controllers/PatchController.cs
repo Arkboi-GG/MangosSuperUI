@@ -189,7 +189,7 @@ public partial class PatchController : Controller
         // ── Step 3: Merge, sort by entry, cap at limit ──
         var merged = sqlResults.Cast<object>()
             .Concat(dbcMatches)
-            .OrderBy(r => ((dynamic)r).entry)
+            .OrderBy(r => Convert.ToUInt32(((dynamic)r).entry))
             .Take(limit)
             .ToList();
 

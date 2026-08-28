@@ -1412,10 +1412,43 @@ public sealed class CustomWeaponBuildService
         int replaced = baseReader.RemoveRowsWhere(id => customIds.Contains(id));
         byte[] cleanedBase = replaced > 0 ? baseReader.Write() : baseDbc;
 
-        // Effect textures (multi-pass glow) ride along as additional members, keyed by the
-        // hardcoded paths the packaged M2s reference.
+        // Effect textures (multi-pass glow) and packaged icons ride along as additional members,
+        // keyed by the hardcoded paths the packaged M2s and display rows reference.
         var effectMembers = await LoadEffectTextureMembersAsync(
             packaged.Select(w => (long)w.ModelId).ToHashSet());
+
+        // One member per canonical path across BOTH texture sets. Per-weapon art (SUI_W_nnnn) is
+        // unique by construction, but a SHARED member is not: every weapon imported from the same
+        // source ships that source's bag icon as Interface\Icons\<stem>.blp, so a second import off
+        // the same art — the off-hand Warglaive after the main hand — lands on a path the first one
+        // already occupies. The builder treats a duplicate path as a determinism failure and throws,
+        // which turned that into a hard "Duplicate MPQ member path" build error with nothing wrong.
+        // Collapse here instead: identical bytes ARE the same file, and differing bytes get a
+        // diagnostic naming the collision rather than a silent overwrite. Keyed through the
+        // builder's own canonicaliser so the two agree on what "same path" means. The armor
+        // assembler funnels every member through one such set and so cannot hit this; weapons
+        // deduped models and per-weapon textures separately and concatenated shared members raw,
+        // which left the icon — the only member two weapons can share — completely unguarded.
+        var textureMembers = new List<MpqMember>();
+        var seenTexturePaths = new Dictionary<string, MpqMember>(StringComparer.OrdinalIgnoreCase);
+        foreach (var member in packaged
+                     .Select(w => new MpqMember { MpqPath = w.TextureMpqPath, Data = w.Blp! })
+                     .Concat(effectMembers))
+        {
+            string key = WeaponPatchBuilder.CanonicalMpqPath(member.MpqPath);
+            if (seenTexturePaths.TryGetValue(key, out var kept))
+            {
+                if (!kept.Data.AsSpan().SequenceEqual(member.Data))
+                    diag.Warn("package.member.conflict",
+                        $"Two forged weapons ship DIFFERENT bytes for the same member '{key}' " +
+                        $"({kept.Data.Length:N0} vs {member.Data.Length:N0} bytes); packing the first and " +
+                        "dropping the second — one of the two will wear the other's art in-game. Re-forge the " +
+                        "later weapon with its own texture or icon name if both are meant to differ.");
+                continue;
+            }
+            seenTexturePaths[key] = member;
+            textureMembers.Add(member);
+        }
 
         var input = new WeaponPatchInput
         {
@@ -1433,10 +1466,7 @@ public sealed class CustomWeaponBuildService
             }).ToArray(),
             Models = packaged.GroupBy(w => w.ModelMpqPath!, StringComparer.OrdinalIgnoreCase)
                 .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().M2! }).ToArray(),
-            Textures = packaged.GroupBy(w => w.TextureMpqPath, StringComparer.OrdinalIgnoreCase)
-                .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().Blp! })
-                .Concat(effectMembers)
-                .ToArray(),
+            Textures = textureMembers.ToArray(),
         };
         string tempDir = Path.Combine(Path.GetTempPath(), "weaponforge", tempKey);
         var patch = _patch.Build(input, tempDir);

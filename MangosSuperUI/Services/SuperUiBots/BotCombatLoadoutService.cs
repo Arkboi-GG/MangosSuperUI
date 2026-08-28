@@ -59,7 +59,7 @@ public sealed class BotCombatLoadoutService
 
         string blocker = !online ? "Bot is offline."
             : runtime?.HasReceivedState != true ? "Bot runtime is still hydrating."
-            : DateTime.UtcNow - runtime.LastUpdate > MaximumRuntimeStateAge ? "Bot runtime state is stale."
+            : DateTime.UtcNow - runtime.LastStateReceivedUtc >= MaximumRuntimeStateAge ? "Bot runtime state is stale."
             : runtime?.IsDead == true ? "Bot is dead."
             : runtime?.InCombat == true ? "Bot is in combat."
             : "";
@@ -452,7 +452,7 @@ public sealed class BotCombatLoadoutService
             throw Error(409, "runtime_hydrating",
                 "The bot's first live state has not arrived yet. Refresh shortly before applying the build.");
         }
-        if (requireReadyRuntime && DateTime.UtcNow - runtime!.LastUpdate > MaximumRuntimeStateAge)
+        if (requireReadyRuntime && DateTime.UtcNow - runtime!.LastStateReceivedUtc >= MaximumRuntimeStateAge)
         {
             CircuitTrace.Hit(guid, "loadout: prepare rejected, runtime stale");
             throw Error(409, "runtime_stale",

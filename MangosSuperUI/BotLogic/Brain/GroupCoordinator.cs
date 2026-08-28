@@ -173,7 +173,10 @@ public static class GroupCoordinator
             // the coordinator's: no assist stamp, no GroupOrder, no Held churn.
             var members = new List<BotContext>(group.MemberGuids.Count);
             foreach (var guid in group.MemberGuids)
-                if (contexts.TryGetValue(guid, out var ctx) && !ctx.Conscripted)
+                if (contexts.TryGetValue(guid, out var ctx)
+                    && !ctx.Conscripted
+                    && !ctx.Possessed
+                    && !ctx.HasUnreleasedControlFence)
                 {
                     CircuitTrace.Hit(ctx.Guid, "group: member present this tick");
                     members.Add(ctx);
@@ -788,7 +791,8 @@ public static class GroupCoordinator
         // behind exactly this for 10+ hours on 2026-07-04. Now: resolve wins if it can; an
         // unresolved-but-expired WAIT becomes a deadline Failure the real Recover shelves
         // (DeferAcceptedQuest — durable, carried); only an unresolved, unexpired WAIT re-stamps.
-        if (vctx.Pending != null && !TryResolveVirtualWait(plan, vctx, members, quests))
+        if (vctx.Pending != null && !TryResolveVirtualWait(
+                plan, vctx, members, quests, anchorGuid, prevPhase))
         {
             CircuitTrace.Hit(vctx.Guid, "group: virtual WAIT unresolved");
             if (vctx.Pending is { Expired: true })
@@ -1034,9 +1038,12 @@ public static class GroupCoordinator
     }
 
     // Given the virtual bot's CURRENT in-flight WAIT (vctx.Pending), decide whether REAL group state
-    // now satisfies it. True = resolved (Pending cleared, MarkProgress'd, safe to ask Derive for the
-    // next step this same tick). False = still outstanding (caller re-stamps the same order).
-    private static bool TryResolveVirtualWait(GroupPlan plan, BotContext vctx, List<BotContext> members, QuestGraphLoader quests)
+    // has produced a terminal outcome. True = resolved progress OR an explicit Failure (Pending
+    // cleared, safe to ask PlanNext to advance/recover this tick). False = still outstanding (caller
+    // re-stamps the same order).
+    private static bool TryResolveVirtualWait(
+        GroupPlan plan, BotContext vctx, List<BotContext> members, QuestGraphLoader quests,
+        int anchorGuid, GroupPhase prevPhase)
     {
         var p = vctx.Pending;
         if (p == null) { CircuitTrace.Hit(vctx.Guid, "group: no pending WAIT, trivially resolved"); return true; }
@@ -1174,7 +1181,21 @@ public static class GroupCoordinator
             return true;
         }
 
-        vctx.Pending = null;   // an unhandled command type (shouldn't happen) -- don't wedge forever
+        // A virtual WAIT is a closed set: every command the virtual planner can arm must have an
+        // explicit real-state resolver above. Clearing an unknown type as if it succeeded false-advanced
+        // the shared plan and erased the only evidence that the command was never observed complete.
+        // Convert it to a normal failure instead. Returning true is intentional: the caller proceeds to
+        // QuestPlanner.PlanNext this tick, whose ordinary Recover path shelves/re-derives the active leg.
+        CircuitTrace.HitNote(vctx.Guid, "group: unsupported virtual WAIT -> recover", p.CommandType);
+        vctx.Pending = null;
+        vctx.Failure = new WaitFailure
+        {
+            CommandType = p.CommandType,
+            Reason = "unsupported_virtual_wait",
+            Utc = DateTime.UtcNow
+        };
+        EmitForce(anchorGuid, prevPhase, prevPhase,
+            $"virtual: WAIT {p.CommandType} has no resolver -> Recover (fail-closed)", members);
         return true;
     }
 

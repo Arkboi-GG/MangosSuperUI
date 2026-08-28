@@ -65,6 +65,8 @@ Desktop.ini
 /WEAPON_GEN.md
 /WORLD_STATE.md
 /CIRCUIT_BOARD.md
+/CIRCUIT_BOARD_CL_DISC1.md
+/ADDENDUM_FINDINGS_WRAP_UP.md
 
 # ----- Weapon Forge: docs + sample art only (code IS committed) -----
 /WEAPON_FORGE.md
@@ -74,3 +76,4 @@ Desktop.ini
 /CMANGOS_PORT.md
 /WEAPON_GEN.md
 /ARMOR_FORGE.md
+/MangosSuperUI.Tests/Properties/PublishProfiles/FolderProfile.pubxml

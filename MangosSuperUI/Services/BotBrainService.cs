@@ -57,6 +57,8 @@ public class BotBrainService : BackgroundService
     // live-state the spine drives. One entry per connected bot in both.
     private readonly ConcurrentDictionary<int, BotIdentity> _bots = new();
     private readonly ConcurrentDictionary<int, BotContext> _contexts = new();
+    private readonly ConcurrentDictionary<long, PendingGroupMutation> _pendingGroupMutations = new();
+    private readonly SemaphoreSlim _groupMutationGate = new(1, 1);
 
     private readonly HashSet<int> _initializedGuids = new();
     private readonly object _initializedGuidsLock = new();
@@ -67,6 +69,7 @@ public class BotBrainService : BackgroundService
 
     private const double EVICT_DISCONNECT_SEC = 60.0;
     private const double FLEET_LOG_INTERVAL_SEC = 30.0;
+    internal static readonly TimeSpan GroupMutationAckDeadline = TimeSpan.FromSeconds(15);
 
     public BotBrainService(
         BotBridgeService bridge,
@@ -256,6 +259,24 @@ public class BotBrainService : BackgroundService
             copper = c.Copper,
             inCombat = c.InCombat,
             dead = c.Dead,
+            sensoryFeed = new
+            {
+                status = c.SensoryFeedStale
+                    ? "stale"
+                    : c.LastStateReceivedUtc == DateTime.MinValue ? "hydrating" : "fresh",
+                stale = c.SensoryFeedStale,
+                lastStateReceivedUtc = c.LastStateReceivedUtc == DateTime.MinValue
+                    ? (DateTime?)null
+                    : c.LastStateReceivedUtc,
+                stateAgeSec = AgoOrNull(c.LastStateReceivedUtc, now)
+            },
+            bridgeProtocol = new
+            {
+                actual = c.BridgeProtocol,
+                required = BotBridgeService.RequiredCorrelatedOutcomeProtocol,
+                compatible = !c.BridgeProtocolIncompatible
+            },
+            externalControl = c.Possessed ? "possessed" : c.Conscripted ? "conscripted" : null,
 
             // combat directive (grouping §3.6) -- the coordinator's per-tick stamp. Assist = this bot
             // is focus-firing the anchor member's victim (anchorGuid == self => this bot IS the anchor;
@@ -387,7 +408,7 @@ public class BotBrainService : BackgroundService
     // The active quest's human-readable detail: title, where to accept / hand in, and
     // each objective with its resolved name, required/current counts, and world coords.
     // Names come straight from the quest graph (TargetName/ItemName/CreatureName/GoName) —
-    // no DB hit. Kill "have" counts come from the QUEST_STATUS_ALL cache (slot-1 indexed).
+    // no DB hit. Kill "have" counts come from the STATE quest-log snapshot (slot-1 indexed).
     private static object? ProjectActiveQuest(BotContext c)
     {
         var aq = c.Quest?.Active;
@@ -419,7 +440,8 @@ public class BotBrainService : BackgroundService
             });
         }
 
-        // item-gather objectives (no live "have" — QUEST_STATUS_ALL cache holds only mob counts)
+        // Item counts exist in the STATE quest-log snapshot but this dashboard projection does not
+        // currently expose them; keep the omission explicit instead of blaming the retired pull.
         foreach (var it in node.ItemObjectives)
         {
             var src = it.BestDropSource;
@@ -458,10 +480,361 @@ public class BotBrainService : BackgroundService
 
     // -------------------- Grouping (delegates to GroupManager) --------------------
 
-    /// <summary>Set grouping mode from the dashboard and persist to DB.</summary>
-    public async Task SetGroupingModeAsync(GroupingMode mode)
+    /// <summary>
+    /// Set grouping mode from the dashboard. Switching Off first disbands every
+    /// group through the same correlated transaction as the explicit endpoint;
+    /// a rejection or unknown outcome leaves the mode enabled for reconciliation.
+    /// </summary>
+    public async Task<GroupMutationBatchResult> SetGroupingModeAsync(GroupingMode mode)
     {
-        _groupManager.Mode = mode;
+        await _groupMutationGate.WaitAsync();
+        try
+        {
+            GroupMutationBatchResult disbands = mode == GroupingMode.Off
+                ? await DisbandAllGroupsCoreAsync()
+                : new GroupMutationBatchResult { Results = Array.Empty<GroupMutationResult>() };
+            if (!disbands.Succeeded)
+            {
+                CircuitTrace.Hit(0, "host: grouping mode change withheld after unresolved disband");
+                return disbands;
+            }
+
+            _groupManager.Mode = mode;
+            await PersistGroupingModeAsync(mode);
+            _groupManager.EnrichAllBots(_bots.Values);
+            return disbands;
+        }
+        finally
+        {
+            _groupMutationGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Form a group only after the core acknowledges the exact requested member
+    /// set on the same session and cbt. Rejection/no-send/timeout leaves C# and
+    /// the DB untouched.
+    /// </summary>
+    public async Task<GroupMutationResult> FormGroupAsync(int leaderGuid, params int[] followerGuids)
+    {
+        await _groupMutationGate.WaitAsync();
+        try
+        {
+            return await FormGroupCoreAsync(leaderGuid, followerGuids);
+        }
+        finally
+        {
+            _groupMutationGate.Release();
+        }
+    }
+
+    private async Task<GroupMutationResult> FormGroupCoreAsync(int leaderGuid, int[] followerGuids)
+    {
+        int[] followers = followerGuids.ToArray();
+        int[] expectedMembers = followers.Append(leaderGuid).OrderBy(guid => guid).ToArray();
+        if (!_groupManager.CanFormGroup(leaderGuid, followers))
+        {
+            CircuitTrace.Hit(leaderGuid, "host: form group rejected by local preflight");
+            return GroupResult(
+                GroupMutationStatus.Rejected,
+                "local_preflight_rejected",
+                GroupMutationKind.Form,
+                leaderGuid,
+                expectedMembers);
+        }
+
+        var pending = CreatePendingGroupMutation(
+            GroupMutationKind.Form,
+            leaderGuid,
+            expectedMembers,
+            out string refusal);
+        if (pending == null)
+            return GroupResult(   // cb:fold refusal is probed by pending factory
+                GroupMutationStatus.NotSent,
+                refusal,
+                GroupMutationKind.Form,
+                leaderGuid,
+                expectedMembers);
+
+        GroupMutationResult outcome = await SendGroupMutationAsync(
+            pending,
+            new BridgeCommand("FORM_GROUP", new
+            {
+                leader_guid = leaderGuid,
+                member_guids = followers
+            }));
+        if (!outcome.Succeeded)
+            return outcome;   // cb:fold terminal outcome probed by send helper
+
+        // The dashboard mutation gate keeps other form/disband requests out while
+        // the ACK is in flight. Revalidate anyway: roster eviction/mode recovery
+        // is allowed to run independently and must not turn an ACK into a blind
+        // overwrite of newer local topology.
+        BotGroup? group = _groupManager.FormGroup(leaderGuid, followers);
+        if (group == null)
+        {
+            CircuitTrace.Hit(leaderGuid, "host: FORM_GROUP ACK could not commit local topology", pending.CorrelationId);
+            _logger.LogError(
+                "BotBrain: core ACKed FORM_GROUP cbt={Cbt}, but local topology changed before commit; reconciliation required",
+                pending.CorrelationId);
+            return GroupResult(
+                GroupMutationStatus.OutcomeUnknown,
+                "local_topology_changed_after_ack",
+                pending.Kind,
+                pending.LeaderGuid,
+                pending.MemberGuids,
+                pending.CorrelationId);
+        }
+
+        EnrichGroupMembers(group.MemberGuids);
+        await _groupManager.SaveGroupsToDbAsync();
+        CircuitTrace.Hit(leaderGuid, "host: FORM_GROUP exact ACK committed", pending.CorrelationId);
+        return outcome with { Group = group };
+    }
+
+    /// <summary>Disband a group only after an exact correlated core acknowledgement.</summary>
+    public async Task<GroupMutationResult> DisbandGroupAsync(int groupId)
+    {
+        await _groupMutationGate.WaitAsync();
+        try
+        {
+            return await DisbandGroupCoreAsync(groupId);
+        }
+        finally
+        {
+            _groupMutationGate.Release();
+        }
+    }
+
+    private async Task<GroupMutationResult> DisbandGroupCoreAsync(int groupId)
+    {
+        BotGroup? group = _groupManager.GetAllGroups().FirstOrDefault(candidate => candidate.GroupId == groupId);
+        if (group == null)
+        {
+            CircuitTrace.Hit(0, "host: disband rejected, group not found");
+            return GroupResult(
+                GroupMutationStatus.Rejected,
+                "group_not_found",
+                GroupMutationKind.Disband,
+                0,
+                Array.Empty<int>());
+        }
+
+        int leaderGuid = group.LeaderGuid;
+        int[] expectedMembers = group.MemberGuids.OrderBy(guid => guid).ToArray();
+        var pending = CreatePendingGroupMutation(
+            GroupMutationKind.Disband,
+            leaderGuid,
+            expectedMembers,
+            out string refusal);
+        if (pending == null)
+            return GroupResult(   // cb:fold refusal is probed by pending factory
+                GroupMutationStatus.NotSent,
+                refusal,
+                GroupMutationKind.Disband,
+                leaderGuid,
+                expectedMembers);
+
+        GroupMutationResult outcome = await SendGroupMutationAsync(
+            pending,
+            new BridgeCommand("DISBAND_GROUP", new
+            {
+                leader_guid = leaderGuid,
+                member_guids = expectedMembers
+            }));
+        if (!outcome.Succeeded)
+            return outcome with { Group = group };   // cb:fold terminal outcome probed by send helper
+
+        BotGroup? current = _groupManager.GetAllGroups().FirstOrDefault(candidate => candidate.GroupId == groupId);
+        bool topologyStillOwned = current != null
+            && current.LeaderGuid == leaderGuid
+            && current.MemberGuids.OrderBy(guid => guid).SequenceEqual(expectedMembers);
+        if (!topologyStillOwned || !_groupManager.DisbandGroup(groupId))
+        {
+            CircuitTrace.Hit(leaderGuid, "host: GROUP_DISBANDED ACK could not commit local topology", pending.CorrelationId);
+            _logger.LogError(
+                "BotBrain: core ACKed DISBAND_GROUP cbt={Cbt}, but local topology changed before commit; reconciliation required",
+                pending.CorrelationId);
+            return GroupResult(
+                GroupMutationStatus.OutcomeUnknown,
+                "local_topology_changed_after_ack",
+                pending.Kind,
+                pending.LeaderGuid,
+                pending.MemberGuids,
+                pending.CorrelationId,
+                group);
+        }
+
+        EnrichGroupMembers(expectedMembers);
+        await _groupManager.SaveGroupsToDbAsync();
+        CircuitTrace.Hit(leaderGuid, "host: GROUP_DISBANDED exact ACK committed", pending.CorrelationId);
+        return outcome with { Group = group };
+    }
+
+    /// <summary>Dissolve every group, reporting each exact transactional result.</summary>
+    public async Task<GroupMutationBatchResult> DisbandAllGroupsAsync()
+    {
+        await _groupMutationGate.WaitAsync();
+        try
+        {
+            return await DisbandAllGroupsCoreAsync();
+        }
+        finally
+        {
+            _groupMutationGate.Release();
+        }
+    }
+
+    private async Task<GroupMutationBatchResult> DisbandAllGroupsCoreAsync()
+    {
+        var results = new List<GroupMutationResult>();
+        foreach (BotGroup group in _groupManager.GetAllGroups().OrderBy(group => group.GroupId).ToList())
+            results.Add(await DisbandGroupCoreAsync(group.GroupId));
+        return new GroupMutationBatchResult { Results = results };
+    }
+
+    /// <summary>
+    /// Plan auto-groups without mutating the manager, then transactionally form
+    /// each candidate. Failed/unknown candidates remain uncommitted and visible
+    /// in the per-candidate result list.
+    /// </summary>
+    public async Task<GroupMutationBatchResult> AutoFormGroupsAsync()
+    {
+        await _groupMutationGate.WaitAsync();
+        try
+        {
+            var candidates = _groupManager.PlanAutoGroups(AllBots,
+                guid => _tracker.GetAllPositions().FirstOrDefault(position => position.Guid == guid));
+            var results = new List<GroupMutationResult>(candidates.Count);
+            foreach (BotGroup candidate in candidates)
+            {
+                int[] followers = candidate.MemberGuids
+                    .Where(guid => guid != candidate.LeaderGuid)
+                    .ToArray();
+                results.Add(await FormGroupCoreAsync(candidate.LeaderGuid, followers));
+            }
+            return new GroupMutationBatchResult { Results = results };
+        }
+        finally
+        {
+            _groupMutationGate.Release();
+        }
+    }
+
+    private PendingGroupMutation? CreatePendingGroupMutation(
+        GroupMutationKind kind,
+        int leaderGuid,
+        int[] expectedMembers,
+        out string refusal)
+    {
+        refusal = "leader_not_connected";
+        if (!_bridge.Connections.TryGetValue(leaderGuid, out BotConnection? connection)
+            || connection.SessionId <= 0)
+        {
+            CircuitTrace.Hit(leaderGuid, "host: group mutation not sent, leader disconnected");
+            return null;
+        }
+        if (connection.BridgeProtocol < BotBridgeService.RequiredTransactionalGroupProtocol)
+        {
+            refusal = "transactional_group_protocol_required";
+            CircuitTrace.Hit(
+                leaderGuid,
+                "host: group mutation not sent, protocol lacks exact topology ACK",
+                connection.BridgeProtocol);
+            _logger.LogWarning(
+                "BotBrain: refusing group mutation for leader {Guid}; core bridgeProtocol={Actual}, required={Required}",
+                leaderGuid,
+                connection.BridgeProtocol,
+                BotBridgeService.RequiredTransactionalGroupProtocol);
+            return null;
+        }
+
+        return new PendingGroupMutation
+        {
+            Kind = kind,
+            LeaderGuid = leaderGuid,
+            SessionId = connection.SessionId,
+            CorrelationId = BridgeCorrelation.NextId(),
+            MemberGuids = expectedMembers.OrderBy(guid => guid).ToArray()
+        };
+    }
+
+    private async Task<GroupMutationResult> SendGroupMutationAsync(
+        PendingGroupMutation pending,
+        BridgeCommand command)
+    {
+        if (!_pendingGroupMutations.TryAdd(pending.CorrelationId, pending))
+        {
+            CircuitTrace.Hit(pending.LeaderGuid, "host: duplicate group correlation id", pending.CorrelationId);
+            throw new InvalidOperationException($"Duplicate bridge correlation id {pending.CorrelationId}.");
+        }
+
+        CorrelatedSendStatus sendStatus = CorrelatedSendStatus.DefinitelyNotSent;
+        try
+        {
+            sendStatus = await _bridge.TrySendCorrelatedAsync(
+                pending.LeaderGuid,
+                command.Type,
+                command.Payload,
+                pending.CorrelationId,
+                pending.SessionId);
+            if (sendStatus is CorrelatedSendStatus.DefinitelyNotSent or CorrelatedSendStatus.SessionSuperseded)
+            {
+                CircuitTrace.Hit(pending.LeaderGuid, "host: group mutation definitely not sent", pending.CorrelationId);
+                return GroupResult(
+                    GroupMutationStatus.NotSent,
+                    sendStatus == CorrelatedSendStatus.SessionSuperseded
+                        ? "session_superseded_before_send"
+                        : "definitely_not_sent",
+                    pending.Kind,
+                    pending.LeaderGuid,
+                    pending.MemberGuids,
+                    pending.CorrelationId);
+            }
+
+            GroupBridgeOutcome bridgeOutcome;
+            try
+            {
+                bridgeOutcome = await pending.Completion.Task.WaitAsync(GroupMutationAckDeadline);
+            }
+            catch (TimeoutException)
+            {
+                CircuitTrace.Hit(pending.LeaderGuid, "host: group mutation outcome unknown at deadline", pending.CorrelationId);
+                _logger.LogWarning(
+                    "BotBrain: {Command} cbt={Cbt} has no exact terminal outcome; not retrying and not changing C# topology",
+                    command.Type, pending.CorrelationId);
+                return GroupResult(
+                    GroupMutationStatus.OutcomeUnknown,
+                    sendStatus == CorrelatedSendStatus.OutcomeUnknown
+                        ? "send_and_outcome_unknown"
+                        : "ack_timeout",
+                    pending.Kind,
+                    pending.LeaderGuid,
+                    pending.MemberGuids,
+                    pending.CorrelationId);
+            }
+
+            return bridgeOutcome.Disposition switch
+            {
+                GroupBridgeOutcomeDisposition.Accepted => GroupResult(   // cb:fold pure result projection; accepted terminal was probed by resolver
+                    GroupMutationStatus.Success, bridgeOutcome.Detail,
+                    pending.Kind, pending.LeaderGuid, pending.MemberGuids, pending.CorrelationId),
+                GroupBridgeOutcomeDisposition.Rejected => GroupResult(   // cb:fold pure result projection; rejected terminal was probed by resolver
+                    GroupMutationStatus.Rejected, bridgeOutcome.Detail,
+                    pending.Kind, pending.LeaderGuid, pending.MemberGuids, pending.CorrelationId),
+                _ => GroupResult(   // cb:fold pure result projection; protocol mismatch was probed by resolver
+                    GroupMutationStatus.OutcomeUnknown, bridgeOutcome.Detail,
+                    pending.Kind, pending.LeaderGuid, pending.MemberGuids, pending.CorrelationId)
+            };
+        }
+        finally
+        {
+            _pendingGroupMutations.TryRemove(pending.CorrelationId, out _);
+        }
+    }
+
+    private async Task PersistGroupingModeAsync(GroupingMode mode)
+    {
         try
         {
             using var conn = _db.Admin();
@@ -471,7 +844,6 @@ public class BotBrainService : BackgroundService
                 ON DUPLICATE KEY UPDATE setting_value = @Value",
                 new { Value = ((int)mode).ToString() });
             await _groupManager.SaveGroupsToDbAsync();
-            _groupManager.EnrichAllBots(_bots.Values);
         }
         catch (Exception ex)
         {
@@ -480,98 +852,31 @@ public class BotBrainService : BackgroundService
         }
     }
 
-    /// <summary>Form a group from the dashboard. Sends FORM_GROUP to the C++ leader.</summary>
-    public async Task<BotGroup?> FormGroupAsync(int leaderGuid, params int[] followerGuids)
+    private void EnrichGroupMembers(IEnumerable<int> memberGuids)
     {
-        var group = _groupManager.FormGroup(leaderGuid, followerGuids);
-        if (group == null) { CircuitTrace.Hit(leaderGuid, "host: form group refused by manager"); return null; }
-
-        foreach (var guid in group.MemberGuids)
-            if (_bots.TryGetValue(guid, out var bot))
-                _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
-
-        CircuitTrace.Hit(leaderGuid, "host: FORM_GROUP sent to leader");
-        await _bridge.SendToBotAsync(leaderGuid, "FORM_GROUP", new
-        {
-            member_guids = group.GetFollowers()
-        });
-
-        await _groupManager.SaveGroupsToDbAsync();
-        return group;
+        foreach (int guid in memberGuids)
+            if (_bots.TryGetValue(guid, out BotIdentity? bot))
+                _groupManager.EnrichBotIdentity(bot);   // cb:fold identity projection after authoritative commit
     }
 
-    /// <summary>Disband a group from the dashboard.</summary>
-    public async Task DisbandGroupAsync(int groupId)
-    {
-        var group = _groupManager.GetAllGroups().FirstOrDefault(g => g.GroupId == groupId);
-        if (group == null) { CircuitTrace.Hit(0, "host: disband refused, group not found"); return; }
-
-        int leaderGuid = group.LeaderGuid;
-        var members = group.MemberGuids.ToList();
-
-        _groupManager.DisbandGroup(groupId);
-        foreach (var guid in members)
-            if (_bots.TryGetValue(guid, out var bot))
-                _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
-
-        CircuitTrace.Hit(leaderGuid, "host: DISBAND_GROUP sent to leader");
-        await _bridge.SendToBotAsync(leaderGuid, "DISBAND_GROUP", new { });
-        await _groupManager.SaveGroupsToDbAsync();
-    }
-
-    /// <summary>
-    /// Disband every active group from the dashboard ("Manage Bot Groups" → Dissolve All).
-    /// Snapshots the group list first so a concurrent Form can't interleave with the walk,
-    /// sends DISBAND_GROUP to each leader, then persists once. Returns the number disbanded.
-    /// </summary>
-    public async Task<int> DisbandAllGroupsAsync()
-    {
-        var snapshot = _groupManager.GetAllGroups().ToList();
-        int disbanded = 0;
-        foreach (var group in snapshot)
+    private static GroupMutationResult GroupResult(
+        GroupMutationStatus status,
+        string detail,
+        GroupMutationKind operation,
+        int leaderGuid,
+        IEnumerable<int> memberGuids,
+        long correlationId = 0,
+        BotGroup? group = null)
+        => new()
         {
-            int leaderGuid = group.LeaderGuid;
-            var members = group.MemberGuids.ToList();
-            if (!_groupManager.DisbandGroup(group.GroupId)) continue;   // cb:fold iteration filter
-            disbanded++;
-            foreach (var guid in members)
-                if (_bots.TryGetValue(guid, out var bot))
-                    _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
-            try { await _bridge.SendToBotAsync(leaderGuid, "DISBAND_GROUP", new { }); }
-            catch (Exception ex) { CircuitTrace.Hit(leaderGuid, "host: DISBAND_GROUP send failed"); _logger.LogWarning(ex, "BotBrain: DISBAND_GROUP send failed for leader {Guid}", leaderGuid); }
-        }
-        if (disbanded > 0)
-        {
-            CircuitTrace.Hit(0, "host: all groups disbanded", disbanded);
-            await _groupManager.SaveGroupsToDbAsync();
-        }
-        return disbanded;
-    }
-
-    /// <summary>Auto-form groups from the dashboard. Returns the formed groups.</summary>
-    public async Task<List<BotGroup>> AutoFormGroupsAsync()
-    {
-        var formed = _groupManager.AutoFormGroups(AllBots,
-            guid => _tracker.GetAllPositions().FirstOrDefault(p => p.Guid == guid));
-        foreach (var group in formed)
-        {
-            foreach (var guid in group.MemberGuids)
-                if (_bots.TryGetValue(guid, out var bot))
-                    _groupManager.EnrichBotIdentity(bot);   // cb:fold enrich detail
-
-            CircuitTrace.Hit(group.LeaderGuid, "host: auto-form FORM_GROUP sent to leader");
-            await _bridge.SendToBotAsync(group.LeaderGuid, "FORM_GROUP", new
-            {
-                member_guids = group.GetFollowers()
-            });
-        }
-        if (formed.Count > 0)
-        {
-            CircuitTrace.Hit(0, "host: auto-formed groups", formed.Count);
-            await _groupManager.SaveGroupsToDbAsync();
-        }
-        return formed;
-    }
+            Status = status,
+            Detail = detail,
+            Operation = operation,
+            LeaderGuid = leaderGuid,
+            MemberGuids = memberGuids.OrderBy(guid => guid).ToArray(),
+            CorrelationId = correlationId,
+            Group = group
+        };
 
     // -------------------- Bridge event entry (unchanged contract) --------------------
 
@@ -581,27 +886,97 @@ public class BotBrainService : BackgroundService
     /// for WAIT/ack matching. The old grouping fan-out + economy loot routing are shed
     /// (grouping → Phase 5, economy → Phase 4).
     /// </summary>
-    public Task HandleBridgeEventAsync(int guid, BotEvent evt)
+    public async Task<bool> HandleBridgeEventAsync(int guid, BotEvent evt)
     {
-        if (evt.EventType == "LEVEL_UP" && evt.NewLevel > 0 && _bots.TryGetValue(guid, out var bot))
+        // Group topology has its own dashboard transaction owner rather than a
+        // planner Outstanding. Resolve it before requiring a BotContext: an ACK
+        // must still settle its waiter while driving is disabled or the roster is
+        // between HELLO hydration passes.
+        if (GroupBridgeOutcomeMatcher.IsGroupTerminal(evt.EventType))
+            return TryResolveGroupMutationOutcome(guid, evt);   // cb:fold resolver probes admitted/rejected ownership outcome
+
+        if (!_contexts.TryGetValue(guid, out var ctx))
         {
-            CircuitTrace.Hit(guid, "host: level-up reflags training", evt.NewLevel);
-            bot.Level = evt.NewLevel;
-            // A level-up unlocks new class spells → flag the bot to visit a trainer (gold-gated in
-            // GoalSelector). Clear any training cooldown so a fresh level justifies a retry even if a
-            // recent trainer trip gave up. TrainingPlanner buys what the bot can afford and re-clears
-            // the flag; what it can't afford waits for the next level-up's gold.
-            bot.HasUnlearnedSpells = true;
-            bot.TrainCooldownUntil = null;
+            CircuitTrace.Hit(guid, "host: event has no spine context");
+            return false;
         }
 
-        if (_contexts.TryGetValue(guid, out var ctx))
+        await ctx.MutationGate.WaitAsync();
+        try
         {
+            // Session admission belongs inside the single-writer gate. An event
+            // can pass BotBridgeService's entry check, await a SignalR broadcast,
+            // and then queue here while a replacement HELLO takes ownership.
+            // Reject it before it can clear/negate Pending or mutate progress.
+            if (!_bridge.IsActiveSession(guid, evt.BridgeSessionId))
+            {
+                CircuitTrace.Hit(guid, "host: event from superseded bridge session rejected");
+                return false;
+            }
+
+            if (evt.EventType == "LEVEL_UP" && evt.NewLevel > 0 && _bots.TryGetValue(guid, out var bot))
+            {
+                CircuitTrace.Hit(guid, "host: level-up reflags training", evt.NewLevel);
+                bot.Level = evt.NewLevel;
+                // A level-up unlocks new class spells → flag the bot to visit a trainer (gold-gated in
+                // GoalSelector). Clear any training cooldown so a fresh level justifies a retry even if a
+                // recent trainer trip gave up. TrainingPlanner buys what the bot can afford and re-clears
+                // the flag; what it can't afford waits for the next level-up's gold.
+                bot.HasUnlearnedSpells = true;
+                bot.TrainCooldownUntil = null;
+            }
+
             CircuitTrace.Hit(guid, "host: event handed to spine driver");
-            _driver.OnEvent(ctx, evt);
+            bool handled = _driver.OnEvent(ctx, evt);
+            if (handled)   // cb:fold accepted-position helper internally whitelists positive arrival events
+                _bridge.ApplyAcceptedOutcomePosition(guid, evt);   // cb:fold exact outcome handling is probed in executor/bridge
+            return handled;
+        }
+        finally
+        {
+            ctx.MutationGate.Release();
+        }
+    }
+
+    private bool TryResolveGroupMutationOutcome(int guid, BotEvent evt)
+    {
+        // Close the replacement race after BotBridgeService's pre-route check:
+        // a HELLO can publish a new socket in the few instructions before this
+        // resolver runs. Matching the pending session is necessary but the old
+        // session must still actively own the guid at admission time as well.
+        if (!_bridge.IsActiveSession(guid, evt.BridgeSessionId))
+        {
+            CircuitTrace.Hit(guid, "host: group terminal from superseded session ignored", evt.CorrelationId ?? 0);
+            return false;
         }
 
-        return Task.CompletedTask;
+        if (evt.CorrelationId is not long cbt
+            || !_pendingGroupMutations.TryGetValue(cbt, out PendingGroupMutation? pending))
+        {
+            CircuitTrace.Hit(guid, "host: late or unowned group terminal ignored", evt.CorrelationId ?? 0);
+            return false;
+        }
+
+        GroupBridgeOutcome outcome = GroupBridgeOutcomeMatcher.Classify(pending, guid, evt);
+        if (outcome.Disposition == GroupBridgeOutcomeDisposition.Ignore)
+        {
+            CircuitTrace.Hit(guid, "host: group terminal owner mismatch ignored", cbt);
+            return false;
+        }
+
+        if (outcome.Disposition == GroupBridgeOutcomeDisposition.ProtocolMismatch)
+        {
+            CircuitTrace.Hit(guid, "host: correlated group ACK topology mismatch", cbt);
+            _logger.LogError(
+                "BotBrain: rejecting correlated group ACK cbt={Cbt}: {Detail}; C# topology remains unchanged",
+                cbt, outcome.Detail);
+        }
+        else
+        {
+            CircuitTrace.HitNote(guid, "host: correlated group terminal admitted", outcome.Disposition.ToString());
+        }
+
+        return pending.Completion.TrySetResult(outcome);
     }
 
     // ==================== Lifecycle ====================
@@ -696,8 +1071,19 @@ public class BotBrainService : BackgroundService
             }
             else if (_bots.TryGetValue(guid, out var bot))
             {   // cb:fold mirror refresh, no decision
-                bot.Level = bs.Level;
-                _tracker.UpdatePosition(guid, bs.ZoneId, bs.MapId, bs.X, bs.Y, bs.Z);
+                // Position/level are STATE fields copied under SensoryFeedGate.
+                // Read one coherent snapshot instead of racing the mutable UI
+                // projection while HandleStateAsync is copying the next beat.
+                BotStateSnapshot? snapshot = _bridge.GetBotStateSnapshot(guid);
+                DateTime trackerNow = DateTime.UtcNow;
+                if (snapshot != null
+                    && snapshot.StateUtc != DateTime.MinValue
+                    && trackerNow - snapshot.StateUtc < BotBridgeService.SensoryFeedStaleAfter)
+                {
+                    CircuitTrace.Hit(guid, "host: tracker refreshed from coherent STATE snapshot");
+                    bot.Level = snapshot.Level;
+                    _tracker.UpdatePosition(guid, snapshot.ZoneId, snapshot.MapId, snapshot.X, snapshot.Y, snapshot.Z);   // cb:fold tracker mirror only; planning gate is separate
+                }
             }
         }
 
@@ -747,6 +1133,79 @@ public class BotBrainService : BackgroundService
     /// </summary>
     private async Task RunBrainTicksAsync()
     {
+        DateTime now = DateTime.UtcNow;
+
+        // Build the exact sensory-safe roster once for both decision layers. A
+        // stale member is absent from the god-bot pre-pass as well as its own
+        // BotBrain tick, so group decisions cannot consume the same frozen
+        // health/combat/position that the per-bot guard rejects.
+        var freshContexts = new Dictionary<int, BotContext>(_contexts.Count);
+        var freshSnapshots = new Dictionary<int, BotStateSnapshot>(_contexts.Count);
+        foreach (var kvp in _contexts)
+        {
+            await kvp.Value.MutationGate.WaitAsync();
+            try
+            {
+                BotState? bs = _bridge.GetBotState(kvp.Key);
+                if (bs == null || bs.TaskState == "DISCONNECTED")
+                    continue;   // cb:fold iteration filter
+
+                if (!BotBridgeService.HasFreshSensoryState(bs, now))   // cb:fold stale/hydrating outcomes probed in the called hold or explicit trace below
+                {   // cb:fold stale/hydrating outcomes probed in called hold or explicit trace
+                    if (BotBridgeService.IsSensoryFeedStale(bs, now))   // cb:fold stale outcome probed inside HoldForStaleSensoryFeed
+                        HoldForStaleSensoryFeed(kvp.Value, bs, now);   // cb:fold stale outcome probed inside helper
+                    else
+                        CircuitTrace.Hit(kvp.Key, "host: awaiting first STATE, not ticked");
+                    continue;
+                }
+
+                BotStateSnapshot? snapshot = _bridge.GetBotStateSnapshot(kvp.Key);
+                if (snapshot == null)
+                    continue;   // cb:fold connection replacement boundary; bridge probes the session change
+                if (snapshot.StateUtc == DateTime.MinValue
+                    || (now > snapshot.StateUtc
+                        && now - snapshot.StateUtc >= BotBridgeService.SensoryFeedStaleAfter))
+                {
+                    CircuitTrace.Hit(kvp.Key, "host: captured snapshot is not fresh, excluded from group roster");
+                    continue;
+                }
+
+                bool feedRecovered = kvp.Value.SensoryFeedStale;
+
+                // GroupCoordinator runs before BotBrain.TickAsync, so refresh the
+                // context here as well. Otherwise the first pre-pass after recovery
+                // would consume the very frozen snapshot this hold is meant to fence.
+                kvp.Value.Sense(snapshot);
+                if (feedRecovered)
+                {   // cb:fold incompatible outcome probed inside hold helper
+                    CircuitTrace.Hit(kvp.Key, "host: fresh STATE releases sensory hold");
+                    _logger.LogInformation(
+                        "BotBrain: sensory feed fresh for {Name} (guid={Guid}); planning may resume",
+                        kvp.Value.Name, kvp.Key);
+                }
+
+                if (snapshot.BridgeProtocol < BotBridgeService.RequiredCorrelatedOutcomeProtocol)   // cb:fold incompatible outcome probed inside hold helper
+                {   // cb:fold boundary recheck outcome probed inside hold helper
+                    HoldForIncompatibleBridgeProtocol(kvp.Value, snapshot.BridgeProtocol);
+                    continue;
+                }
+                if (kvp.Value.BridgeProtocolIncompatible)
+                {
+                    kvp.Value.BridgeProtocolIncompatible = false;
+                    CircuitTrace.Hit(kvp.Key, "host: correlated bridge protocol restored", snapshot.BridgeProtocol);
+                    _logger.LogInformation(
+                        "BotBrain: correlated bridge protocol restored for {Name} (guid={Guid}, protocol={Protocol})",
+                        kvp.Value.Name, kvp.Key, snapshot.BridgeProtocol);
+                }
+                freshContexts[kvp.Key] = kvp.Value;
+                freshSnapshots[kvp.Key] = snapshot;
+            }
+            finally
+            {
+                kvp.Value.MutationGate.Release();
+            }
+        }
+
         // Grouping pre-pass (§3.2): the "god bot" stamps each grouped member's BotContext BEFORE the
         // per-bot ticks, so each tick consults a fresh stamp. Two seams: the combat directive
         // (Assist(anchor)) and the EXECUTION directive -- the union-chosen shared objective the team
@@ -754,39 +1213,196 @@ public class BotBrainService : BackgroundService
         // decision+stamp -- it issues NO commands; the spine emits COMBAT_DIRECTIVE on change (BotBrain
         // step 1a) and the QuestPlanner consults the exec stamp. Only when driving; sensing-only skips it.
         if (_brainEnabled)
-            GroupCoordinator.Update(_contexts, _groupManager, _quests, _safety, _spawns, _driver.QuestPlanner, _zoneData);   // cb:fold god-bot pre-pass, probed inside GroupCoordinator
-
-        foreach (var kvp in _contexts)
-        {
-            var bs = _bridge.GetBotState(kvp.Key);
-            if (bs == null || bs.TaskState == "DISCONNECTED") continue;   // cb:fold iteration filter
-
-            // Gate on the first real STATE; HELLO carries placeholder health/position.
-            if (!bs.HasReceivedState) { CircuitTrace.Hit(kvp.Key, "host: awaiting first STATE, not ticked"); continue; }
-
-            var snap = BotStateSnapshot.FromBridgeState(bs);
-
-            // Circuit-board tick bracket (R10): every probe between Begin and End lands in
-            // one per-tick segment; EndTick stamps the bot's world position for the map view.
-            CircuitTrace.BeginTick(kvp.Key);
+        {   // cb:fold mutation-serialization shell; coordinator probes all behavioral outcomes
+            var lockedContexts = new List<BotContext>(freshContexts.Count);
+            var revalidatedContexts = new Dictionary<int, BotContext>(freshContexts.Count);
+            var revalidatedSnapshots = new Dictionary<int, BotStateSnapshot>(freshContexts.Count);
             try
             {
-                if (_brainEnabled)
-                    await _driver.TickAsync(kvp.Value, snap);   // cb:fold spine tick, probed throughout BotBrain
-                else
-                {
-                    CircuitTrace.Hit(kvp.Key, "host: sense only (driving disabled)");
-                    kvp.Value.Sense(snap);                        // disabled: still sense so FleetReport stays live
+                // Stable lock order makes the multi-bot pre-pass one serialized
+                // mutation relative to each bot's socket EVENT stream.
+                foreach (BotContext ctx in freshContexts.Values.OrderBy(c => c.Guid))
+                {   // cb:fold mutation serialization; coordinator probes behavior
+                    await ctx.MutationGate.WaitAsync();
+                    lockedContexts.Add(ctx);
                 }
 
-                // Always-on void/fall black box: ctx.Pos is fresh (post-Sense) either way. Cheap; flushes only on a fall.
-                _fallRecorder.Observe(kvp.Value);
+                // Lock acquisition can wait behind socket EVENT work. Recapture
+                // every member only after all context gates are held; a cached
+                // pre-lock snapshot must never drive group orders after HELLO
+                // replaced that member or its STATE crossed the stale boundary.
+                DateTime groupNow = DateTime.UtcNow;
+                foreach (var kvp in freshContexts)
+                {
+                    BotStateSnapshot? current = _bridge.GetBotStateSnapshot(kvp.Key);
+                    if (current == null)
+                    {
+                        CircuitTrace.Hit(kvp.Key, "host: group member session changed while locks acquired, excluded");
+                        continue;
+                    }
+                    if (current.StateUtc == DateTime.MinValue
+                        || groupNow - current.StateUtc >= BotBridgeService.SensoryFeedStaleAfter)
+                    {
+                        CircuitTrace.Hit(kvp.Key, "host: group member stale at decision boundary, excluded");
+                        if (_bridge.GetBotState(kvp.Key) is { } staleState)
+                            HoldForStaleSensoryFeed(kvp.Value, staleState, groupNow);   // cb:fold state projection availability; exclusion probe carries decision
+                        continue;
+                    }
+                    if (current.BridgeProtocol < BotBridgeService.RequiredCorrelatedOutcomeProtocol)
+                    {   // cb:fold incompatible outcome probed inside hold helper
+                        HoldForIncompatibleBridgeProtocol(kvp.Value, current.BridgeProtocol);
+                        continue;
+                    }
+
+                    kvp.Value.Sense(current);
+                    revalidatedContexts[kvp.Key] = kvp.Value;
+                    revalidatedSnapshots[kvp.Key] = current;
+                }
+
+                // Final generation/age check gives the coordinator a roster that
+                // was simultaneously admissible at its decision boundary. A
+                // later replacement still cannot receive an old decision because
+                // executor sends are bound to the sensed session id.
+                DateTime decisionNow = DateTime.UtcNow;
+                foreach (int guid in revalidatedSnapshots
+                    .Where(kvp => !_bridge.IsActiveSession(kvp.Key, kvp.Value.BridgeSessionId)
+                        || decisionNow - kvp.Value.StateUtc >= BotBridgeService.SensoryFeedStaleAfter)
+                    .Select(kvp => kvp.Key)
+                    .ToList())
+                {
+                    CircuitTrace.Hit(guid, "host: group member invalidated before coordinator, excluded");
+                    revalidatedSnapshots.Remove(guid);
+                    revalidatedContexts.Remove(guid);
+                }
+
+                var groupContexts = revalidatedContexts
+                    .Where(kvp => !kvp.Value.HasUnreleasedControlFence)
+                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                GroupCoordinator.Update(groupContexts, _groupManager, _quests, _safety, _spawns, _driver.QuestPlanner, _zoneData);   // cb:fold god-bot pre-pass, probed inside GroupCoordinator
             }
             finally
             {
-                CircuitTrace.EndTick(kvp.Key, snap.MapId, snap.ZoneId, snap.X, snap.Y, snap.Z);
+                for (int i = lockedContexts.Count - 1; i >= 0; --i)
+                    lockedContexts[i].MutationGate.Release();   // cb:fold mutation serialization only
+            }
+
+            freshContexts = revalidatedContexts;
+            freshSnapshots = revalidatedSnapshots;
+        }
+
+        foreach (var kvp in freshContexts)
+        {
+            await kvp.Value.MutationGate.WaitAsync();
+            try
+            {
+                var bs = _bridge.GetBotState(kvp.Key);
+                if (bs == null || bs.TaskState == "DISCONNECTED") continue;   // cb:fold iteration filter
+
+                BotStateSnapshot? currentSnapshot = _bridge.GetBotStateSnapshot(kvp.Key);
+                if (currentSnapshot == null)
+                {
+                    CircuitTrace.Hit(kvp.Key, "host: tick snapshot unavailable after session replacement, skipped");
+                    continue;
+                }
+                BotStateSnapshot snap = currentSnapshot;
+
+                // A group decision is tied to the exact session generation it
+                // sensed. If HELLO replaced this member after the pre-pass, skip
+                // its tick and recompute the fleet next pass from hydrated STATE.
+                if (_brainEnabled
+                    && freshSnapshots.TryGetValue(kvp.Key, out BotStateSnapshot? admitted)
+                    && snap.BridgeSessionId != admitted.BridgeSessionId)
+                {
+                    CircuitTrace.Hit(kvp.Key, "host: tick session differs from group decision, skipped");
+                    continue;
+                }
+
+                // Close the small boundary between the fleet classification and this
+                // bot's turn. If the snapshot crossed the age limit during the group
+                // pre-pass, fail closed here instead of granting one stale tick.
+                DateTime tickNow = DateTime.UtcNow;
+                if (snap.StateUtc == DateTime.MinValue || tickNow - snap.StateUtc >= BotBridgeService.SensoryFeedStaleAfter)   // cb:fold boundary recheck outcome probed inside hold helper
+                {   // cb:fold stale boundary body is covered by HoldForStaleSensoryFeed probes
+                    HoldForStaleSensoryFeed(kvp.Value, bs, tickNow);
+                    continue;
+                }
+                if (snap.BridgeProtocol < BotBridgeService.RequiredCorrelatedOutcomeProtocol)
+                {   // cb:fold incompatible outcome probed inside hold helper
+                    HoldForIncompatibleBridgeProtocol(kvp.Value, snap.BridgeProtocol);
+                    continue;
+                }
+
+                // Circuit-board tick bracket (R10): every probe between Begin and End lands in
+                // one per-tick segment; EndTick stamps the bot's world position for the map view.
+                CircuitTrace.BeginTick(kvp.Key);
+                try
+                {
+                    if (_brainEnabled)
+                        await _driver.TickAsync(kvp.Value, snap);   // cb:fold spine tick, probed throughout BotBrain
+                    else
+                    {
+                        CircuitTrace.Hit(kvp.Key, "host: sense only (driving disabled)");
+                        kvp.Value.Sense(snap);                        // disabled: still sense so FleetReport stays live
+                    }
+
+                    // Always-on void/fall black box: ctx.Pos is fresh (post-Sense) either way. Cheap; flushes only on a fall.
+                    _fallRecorder.Observe(kvp.Value);
+                }
+                finally
+                {
+                    CircuitTrace.EndTick(
+                        kvp.Key,
+                        snap.MapId,
+                        snap.ZoneId,
+                        snap.X,
+                        snap.Y,
+                        snap.Z,
+                        kvp.Value);
+                }
+            }
+            finally
+            {
+                kvp.Value.MutationGate.Release();
             }
         }
+    }
+
+    private void HoldForStaleSensoryFeed(BotContext ctx, BotState bs, DateTime now)
+    {
+        TimeSpan age = BotBridgeService.GetSensoryFeedAge(bs, now);
+
+        // These are transient intent stamps. Clear them while blind so neither a
+        // stale group order nor a stale combat directive can leak through if a
+        // caller inspects the held context outside the normal driver loop.
+        ctx.CombatDirective = CombatDirective.None;
+        ctx.GroupOrder = GroupOrder.None;
+
+        if (ctx.SensoryFeedStale)   // cb:fold duplicate-log suppression; initial hold is probed below
+            return;   // cb:fold duplicate stale-log suppression; initial hold is probed below
+
+        ctx.SensoryFeedStale = true;
+        _tracker.Remove(ctx.Guid);
+        CircuitTrace.Hit(ctx.Guid, "host: stale sensory feed, planning held", age.TotalSeconds);
+        _logger.LogWarning(
+            "BotBrain: holding state-dependent planning for {Name} (guid={Guid}); last STATE is {Age:F1}s old",
+            ctx.Name, ctx.Guid, age.TotalSeconds);
+    }
+
+    private void HoldForIncompatibleBridgeProtocol(BotContext ctx, int bridgeProtocol)
+    {
+        ctx.CombatDirective = CombatDirective.None;
+        ctx.GroupOrder = GroupOrder.None;
+        ctx.Pending = null;
+        ctx.Failure = null;
+
+        if (ctx.BridgeProtocolIncompatible)   // cb:fold duplicate-log suppression; initial hold is probed below
+            return;   // cb:fold duplicate protocol-log suppression; initial hold is probed below
+
+        ctx.BridgeProtocolIncompatible = true;
+        CircuitTrace.Hit(ctx.Guid, "host: bridge protocol lacks correlated outcomes", bridgeProtocol);
+        _logger.LogError(
+            "BotBrain: holding planner for {Name} (guid={Guid}); core bridgeProtocol={Actual}, required={Required}",
+            ctx.Name, ctx.Guid, bridgeProtocol, BotBridgeService.RequiredCorrelatedOutcomeProtocol);
     }
 
     // ==================== Bot init ====================
@@ -900,7 +1516,11 @@ public class BotBrainService : BackgroundService
             Identity = bot          // P3: durable roster back-ref for the quest planner
         };
 
-        _tracker.UpdatePosition(guid, bs.ZoneId, bs.MapId, bs.X, bs.Y, bs.Z);
+        // HELLO position is only a hydration placeholder. Do not publish it into
+        // the live position tracker unless a real, still-fresh STATE already won
+        // the race with roster initialization.
+        if (BotBridgeService.HasFreshSensoryState(bs, DateTime.UtcNow))   // cb:fold initialization mirror only; tick gate owns planning decision
+            _tracker.UpdatePosition(guid, bs.ZoneId, bs.MapId, bs.X, bs.Y, bs.Z);   // cb:fold initialization mirror only; tick gate owns planning
 
         // Stamp group membership (from DB-loaded groups).
         _groupManager.EnrichBotIdentity(bot);

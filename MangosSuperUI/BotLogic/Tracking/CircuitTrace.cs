@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using MangosSuperUI.BotLogic.Core;
 
 namespace MangosSuperUI.BotLogic.Tracking;
 
@@ -41,6 +42,15 @@ public static class CircuitTrace
 {
     public enum TraceMode { Off = 0, Shadow = 1 }
 
+    /// <summary>
+    /// Sustained conditions are stamped at ingestion time so the activity reader can
+    /// distinguish a lifecycle from a repeated point alarm. Only a structured C# tick
+    /// may change this state; inter-tick and C++ segments may only attach to the latest
+    /// still-fresh incident.
+    /// </summary>
+    public enum ConditionKind { None = 0, Dead = 1, Blocked = 2 }
+    public enum ConditionTransition { None = 0, Onset = 1, Confirmation = 2, Clear = 3 }
+
     /// <summary>One recorded probe firing. Seq is global and monotonic — the merge/order key.
     /// Ctx is the recording thread: the brain tick, the bridge socket and the chat loop all
     /// write into the SAME open segment, so two adjacent hits are only genuinely
@@ -53,22 +63,73 @@ public static class CircuitTrace
     /// core-side update, so the whole segment shares a context by construction.</summary>
     public const int RemoteCtx = -1;
 
-    /// <summary>One registered call site. Session-scoped; the generated Map joins on File:Line.</summary>
-    public sealed record ProbeSite(int Id, string File, int Line, string Description);
+    /// <summary>One registered call site. Session-scoped; the generated Map joins on File:Line.
+    /// RemoteEpoch/RemoteId are populated only for C++ sites so a trace file carries the
+    /// complete identity needed to decode sites reused after a core restart.</summary>
+    public sealed record ProbeSite(
+        int Id,
+        string File,
+        int Line,
+        string Description,
+        string? RemoteEpoch = null,
+        int? RemoteId = null);
 
     /// <summary>A sealed slice of one bot's trace: the ordered hits of one tick (or the
     /// gap between ticks), stamped with when and — for real ticks — where in the world.</summary>
     public sealed class TickSegment
     {
+        /// <summary>Stable arrival cursor for a frozen, steppable trace view.</summary>
+        public long Seq;
         public int Guid;
         public string Kind = "tick";          // tick | inter | overflow
         public DateTime StartUtc;
         public DateTime EndUtc;
+        /// <summary>The context that owns this path. Brain ticks stamp it before a
+        /// bridge/chat thread can race in with the segment's first hit.</summary>
+        public int PrimaryCtx;
         public bool HasPos;
         public int MapId = -1;
         public int ZoneId;
         public float X, Y, Z;
+        public string? RemoteEpoch;
+        // Structured state sampled at EndTick. Primitive fields keep the long-lived
+        // activity reader independent from descriptions and from mutable BotContext.
+        public int Goal = -1;
+        public string? Step;
+        public int TaskKind = -1;
+        public int Activity = -1;
+        public int TaskKills;
+        public int ObjectiveKind = -1;
+        public int ObjectiveSource = -1;
+        public int ObjectiveQuestId;
+        public int ObjectiveSlot;
+        public int ObjectiveCreatureEntry;
+        public int ObjectiveNpcEntry;
+        public bool InCombat;
+        public bool Dead;
+        public bool HasStructuredState;
+        public long ConditionIncidentId;
+        public ConditionKind Condition;
+        public ConditionTransition ConditionTransition;
+        public bool HasPointAlarm;
         public List<ProbeHit> Hits = new(16);
+    }
+
+    /// <summary>A compact, stable decision run retained longer than raw tick history.
+    /// Identical consecutive decision/state frames keep one newest representative while
+    /// preserving their first/last cursor and raw segment count for drill-down context.</summary>
+    public sealed record DecisionRunSnapshot(
+        long Id,
+        long ThroughSeq,
+        DateTime StartUtc,
+        DateTime EndUtc,
+        int SegmentCount,
+        TickSegment Representative)
+    {
+        public long ConditionIncidentId { get; init; }
+        public ConditionKind Condition { get; init; }
+        public ConditionTransition ConditionTransition { get; init; }
+        public bool HasStructuredState { get; init; }
     }
 
     // ── mode + armed set ────────────────────────────────────────────────────
@@ -154,11 +215,42 @@ public static class CircuitTrace
         // Same objects, references only — the memory is the segments themselves.
         public readonly Queue<TickSegment> Recent = new();
         public long Dropped;   // segments evicted unflushed (shadow ring overwrite)
+        public readonly LinkedList<DecisionRun> Decisions = new();
+        public long DecisionsDropped;
+        public ConditionKind OpenCondition;
+        public long OpenConditionId;
+        public DateTime LastStructuredConditionUtc;
     }
-    private const int RecentViewCap = 512;
+    // Keep the complete bounded shadow horizon readable. Recent contains references
+    // to the same segment objects as Sealed, so matching the cap does not duplicate hits.
+    private const int RecentViewCap = SegmentRingCap;
+    private const int DecisionHistoryCap = 2048;
+    private static readonly TimeSpan DecisionHistoryHorizon = TimeSpan.FromMinutes(20);
+    private static readonly TimeSpan ConditionCarryHorizon = TimeSpan.FromSeconds(30);
+
+    private sealed class DecisionRun
+    {
+        public required long Id;
+        public required long ThroughSeq;
+        public required DateTime StartUtc;
+        public required DateTime EndUtc;
+        public required int SegmentCount;
+        public required TickSegment Representative;
+        public required int[] Path;
+        // The first structured frame after a recovery-phase change is retained as
+        // its own teaching moment. Later identical samples may compact together,
+        // but never into the transition frame itself.
+        public bool StartsConditionPhase;
+    }
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, BotRing> _rings = new();
     private static long _seq;
+    private static long _segmentSeq;
+    // A managed thread id is not a control-flow id: TickAsync awaits and may resume
+    // elsewhere. AsyncLocal follows that logical tick across awaits while unrelated
+    // bridge/chat callbacks keep their own (negative) physical fallback context.
+    private static readonly AsyncLocal<int> _logicalContext = new();
+    private static int _nextLogicalContext;
 
     /// <summary>The host brackets each brain tick. An unsealed previous segment
     /// (missed EndTick — exception path) is sealed as-is so nothing is lost.</summary>
@@ -169,23 +261,72 @@ public static class CircuitTrace
         lock (ring.Lock)
         {
             SealOpen_NoLock(ring);
-            ring.Open = new TickSegment { Guid = guid, Kind = "tick", StartUtc = DateTime.UtcNow };
+            int flow = Interlocked.Increment(ref _nextLogicalContext);
+            if (flow <= 0)
+            {
+                Interlocked.Exchange(ref _nextLogicalContext, 1);
+                flow = 1;
+            }
+            _logicalContext.Value = flow;
+            ring.Open = new TickSegment
+            {
+                Guid = guid,
+                Kind = "tick",
+                StartUtc = DateTime.UtcNow,
+                PrimaryCtx = flow
+            };
         }
     }
 
     /// <summary>Seal the current tick segment, stamping the bot's world position (R10).</summary>
-    public static void EndTick(int guid, int mapId, int zoneId, float x, float y, float z)
+    public static void EndTick(
+        int guid,
+        int mapId,
+        int zoneId,
+        float x,
+        float y,
+        float z,
+        BotContext? context = null)
     {
-        if (_mode == (int)TraceMode.Off) return;
-        if (!_rings.TryGetValue(guid, out var ring)) return;
-        lock (ring.Lock)
+        int closingContext = _logicalContext.Value;
+        try
         {
-            if (ring.Open == null) return;
-            ring.Open.HasPos = true;
-            ring.Open.MapId = mapId;
-            ring.Open.ZoneId = zoneId;
-            ring.Open.X = x; ring.Open.Y = y; ring.Open.Z = z;
-            SealOpen_NoLock(ring);
+            if (_mode == (int)TraceMode.Off) return;
+            if (!_rings.TryGetValue(guid, out var ring)) return;
+            lock (ring.Lock)
+            {
+                if (ring.Open == null) return;
+                ring.Open.HasPos = true;
+                ring.Open.MapId = mapId;
+                ring.Open.ZoneId = zoneId;
+                ring.Open.X = x; ring.Open.Y = y; ring.Open.Z = z;
+                if (context != null)
+                {
+                    ring.Open.HasStructuredState = true;
+                    ring.Open.Goal = (int)context.Goal;
+                    ring.Open.Step = context.Step;
+                    ring.Open.TaskKind = (int)context.HeldTask.Kind;
+                    ring.Open.Activity = (int)context.HeldTask.Activity;
+                    ring.Open.TaskKills = context.HeldTask.Kills;
+                    ring.Open.InCombat = context.InCombat;
+                    ring.Open.Dead = context.Dead;
+                    if (context.Held is { } held)
+                    {
+                        ring.Open.ObjectiveKind = (int)held.Kind;
+                        ring.Open.ObjectiveSource = (int)held.Source;
+                        ring.Open.ObjectiveQuestId = held.QuestId;
+                        ring.Open.ObjectiveSlot = held.Slot;
+                        ring.Open.ObjectiveCreatureEntry = held.CreatureEntry;
+                        ring.Open.ObjectiveNpcEntry = held.NpcEntry;
+                    }
+                }
+                SealOpen_NoLock(ring);
+            }
+        }
+        finally
+        {
+            if (_logicalContext.Value == closingContext)
+                _logicalContext.Value = 0;
         }
     }
 
@@ -195,12 +336,183 @@ public static class CircuitTrace
         if (open == null) return;
         ring.Open = null;
         if (open.Hits.Count == 0 && open.Kind != "tick") return;   // empty inter-gap: drop silently
+        open.Seq = Interlocked.Increment(ref _segmentSeq);
         open.EndUtc = DateTime.UtcNow;
+        StampCondition_NoLock(ring, open);
         ring.Sealed.Enqueue(open);
         while (ring.Sealed.Count > SegmentRingCap) { ring.Sealed.Dequeue(); ring.Dropped++; }
         ring.Recent.Enqueue(open);
         while (ring.Recent.Count > RecentViewCap) ring.Recent.Dequeue();
+        AddDecisionHistory_NoLock(ring, open);
     }
+
+    private static void StampCondition_NoLock(BotRing ring, TickSegment segment)
+    {
+        if (segment.HasStructuredState)
+        {
+            ConditionKind observed = segment.Dead
+                ? ConditionKind.Dead
+                : segment.Activity == (int)TaskActivity.Blocked
+                    ? ConditionKind.Blocked
+                    : ConditionKind.None;
+            ConditionKind prior = ring.OpenCondition;
+            long priorId = ring.OpenConditionId;
+
+            if (observed == prior)
+            {
+                if (observed != ConditionKind.None)
+                {
+                    segment.Condition = observed;
+                    segment.ConditionIncidentId = priorId;
+                    segment.ConditionTransition = ConditionTransition.Confirmation;
+                }
+            }
+            else if (observed == ConditionKind.None)
+            {
+                // The first authoritative clear belongs to the incident it closes so
+                // drill-down shows the literal transition back to routine behavior.
+                if (prior != ConditionKind.None)
+                {
+                    segment.Condition = prior;
+                    segment.ConditionIncidentId = priorId;
+                    segment.ConditionTransition = ConditionTransition.Clear;
+                }
+                ring.OpenCondition = ConditionKind.None;
+                ring.OpenConditionId = 0;
+            }
+            else
+            {
+                // A direct condition change (for example blocked -> dead) closes the
+                // old incident at its previous observation and starts the new one here.
+                ring.OpenCondition = observed;
+                ring.OpenConditionId = segment.Seq;
+                segment.Condition = observed;
+                segment.ConditionIncidentId = segment.Seq;
+                segment.ConditionTransition = ConditionTransition.Onset;
+            }
+
+            ring.LastStructuredConditionUtc = segment.EndUtc;
+            return;
+        }
+
+        if (ring.OpenCondition == ConditionKind.None
+            || ring.OpenConditionId == 0
+            || ring.LastStructuredConditionUtc == default
+            || segment.StartUtc - ring.LastStructuredConditionUtc > ConditionCarryHorizon)
+            return;
+
+        segment.Condition = ring.OpenCondition;
+        segment.ConditionIncidentId = ring.OpenConditionId;
+        segment.ConditionTransition = ConditionTransition.None;
+    }
+
+    private static void AddDecisionHistory_NoLock(BotRing ring, TickSegment segment)
+    {
+        int primary = segment.PrimaryCtx != 0
+            ? segment.PrimaryCtx
+            : segment.Hits.Count > 0 ? segment.Hits[0].Ctx : 0;
+        int[] path = segment.Hits.Where(h => h.Ctx == primary).Select(h => h.SiteId).ToArray();
+        DecisionRun? current = ring.Decisions.Last?.Value;
+
+        if (current != null && !current.StartsConditionPhase && SameDecision(current, segment, path))
+        {
+            current.ThroughSeq = segment.Seq;
+            current.EndUtc = segment.EndUtc;
+            current.SegmentCount++;
+            // Inter/C++ confirmations contribute duration/count evidence, but must
+            // not replace the structured C# frame that explains the recovery phase.
+            // A later structured confirmation is the freshest representative.
+            if (segment.HasStructuredState || !current.Representative.HasStructuredState)
+                current.Representative = segment;
+        }
+        else
+        {
+            bool startsConditionPhase = current != null
+                && current.Representative.ConditionIncidentId != 0
+                && current.Representative.ConditionIncidentId == segment.ConditionIncidentId
+                && current.Representative.Condition == segment.Condition
+                && current.Representative.HasStructuredState
+                && segment.HasStructuredState
+                && segment.ConditionTransition is ConditionTransition.None or ConditionTransition.Confirmation
+                && !segment.HasPointAlarm
+                && !SameConditionPhase(current.Representative, segment);
+            ring.Decisions.AddLast(new DecisionRun
+            {
+                Id = segment.Seq,
+                ThroughSeq = segment.Seq,
+                StartUtc = segment.StartUtc,
+                EndUtc = segment.EndUtc,
+                SegmentCount = 1,
+                Representative = segment,
+                Path = path,
+                StartsConditionPhase = startsConditionPhase
+            });
+        }
+
+        DateTime cutoff = segment.EndUtc - DecisionHistoryHorizon;
+        while (ring.Decisions.Count > DecisionHistoryCap
+               || (ring.Decisions.First is { Value.EndUtc: var oldest } && oldest < cutoff))
+        {
+            ring.Decisions.RemoveFirst();
+            ring.DecisionsDropped++;
+        }
+    }
+
+    private static bool SameDecision(DecisionRun run, TickSegment segment, int[] path)
+    {
+        TickSegment prior = run.Representative;
+        // A sustained condition is one human incident, even though its literal
+        // control-flow path alternates between C#, inter-tick callbacks, and C++.
+        // Compact only quiet confirmations. A point alarm deliberately breaks the
+        // run so its exact source-bearing decision remains available as a child.
+        if (prior.ConditionIncidentId != 0
+            && prior.ConditionIncidentId == segment.ConditionIncidentId
+            && prior.Condition == segment.Condition
+            && prior.Condition != ConditionKind.None
+            && prior.ConditionTransition is ConditionTransition.None or ConditionTransition.Confirmation
+            && segment.ConditionTransition is ConditionTransition.None or ConditionTransition.Confirmation
+            && !prior.HasPointAlarm
+            && !segment.HasPointAlarm)
+        {
+            // Repeated samples inside one phase are cheap confirmations. A structured
+            // phase change (rez_wait -> rez_sent, goal handoff, guard wait, and so on)
+            // remains its own long-history run so the teaching/source view can show it.
+            return !prior.HasStructuredState
+                || !segment.HasStructuredState
+                || SameConditionPhase(prior, segment);
+        }
+
+        return prior.Kind == segment.Kind
+            && run.Path.AsSpan().SequenceEqual(path)
+            && prior.ConditionIncidentId == segment.ConditionIncidentId
+            && prior.Condition == segment.Condition
+            && prior.ConditionTransition == segment.ConditionTransition
+            && prior.Goal == segment.Goal
+            && prior.Step == segment.Step
+            && prior.TaskKind == segment.TaskKind
+            && prior.Activity == segment.Activity
+            && prior.TaskKills == segment.TaskKills
+            && prior.ObjectiveKind == segment.ObjectiveKind
+            && prior.ObjectiveSource == segment.ObjectiveSource
+            && prior.ObjectiveQuestId == segment.ObjectiveQuestId
+            && prior.ObjectiveSlot == segment.ObjectiveSlot
+            && prior.ObjectiveCreatureEntry == segment.ObjectiveCreatureEntry
+            && prior.ObjectiveNpcEntry == segment.ObjectiveNpcEntry
+            && prior.InCombat == segment.InCombat
+            && prior.Dead == segment.Dead;
+    }
+
+    private static bool SameConditionPhase(TickSegment prior, TickSegment current)
+        => prior.Goal == current.Goal
+            && prior.Step == current.Step
+            && prior.TaskKind == current.TaskKind
+            && prior.Activity == current.Activity
+            && prior.ObjectiveKind == current.ObjectiveKind
+            && prior.ObjectiveSource == current.ObjectiveSource
+            && prior.ObjectiveQuestId == current.ObjectiveQuestId
+            && prior.ObjectiveSlot == current.ObjectiveSlot
+            && prior.ObjectiveCreatureEntry == current.ObjectiveCreatureEntry
+            && prior.ObjectiveNpcEntry == current.ObjectiveNpcEntry;
 
     /// <summary>Move a bot's sealed segments out (host flush). Oldest first.</summary>
     public static List<TickSegment> DrainSealed(int guid)
@@ -233,57 +545,226 @@ public static class CircuitTrace
     public static int RingCount => _rings.Count;
 
     // ── chains (R2) + the C++ side's remote sites / segments (R1, R3) ──────
-    // Chain ids stamp every outbound bridge envelope ("cbt"); both sides record
-    // the id as a probe VALUE ("chain: command sent" here, "cpp-chain: command
-    // adopted" over there), so the viewer stitches cause to effect by value.
-    private static long _chain;
-    public static long NextChain() => Interlocked.Increment(ref _chain);
+    // BridgeCorrelation owns behavioral cbt allocation. CircuitTrace records
+    // those ids as probe VALUES but must never maintain a second/colliding id
+    // generator of its own.
 
     // Remote (C++) probe sites live in their own id space (rule R3): shifted by
-    // RemoteSiteBase so they can never collide with local session ids.
+    // RemoteSiteBase so they can never collide with local session ids. The wire's
+    // compact remote id is process-epoch-local, however, so it is NEVER itself a
+    // valid host site id. Each (epoch, remote id) receives a unique host id.
     public const int RemoteSiteBase = 100000;
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, ProbeSite> _remoteSites = new();
+    private static readonly object _remoteSiteLock = new();
+    private static readonly Dictionary<(string Epoch, int RemoteId), RemoteSiteBinding> _remoteSites = new();
+    private static readonly Dictionary<(string Epoch, int RemoteId), ProbeSite> _unknownRemoteSites = new();
+    private static int _nextRemoteSiteId;
 
-    public static void RegisterRemoteSite(int remoteId, string file, int line, string desc)
+    private sealed class RemoteSiteBinding
     {
-        var site = new ProbeSite(RemoteSiteBase + remoteId, "cpp/" + file, line, desc);
-        if (!_remoteSites.TryAdd(remoteId, site)) return;   // idempotent across re-ships
+        public required ProbeSite Site { get; init; }
+        public ProbeSite? ConflictSite { get; set; }
+        public bool Conflicted => ConflictSite != null;
+    }
+
+    /// <summary>Copy the longer compressed decision horizon, oldest first.</summary>
+    public static (List<DecisionRunSnapshot> Runs, bool Truncated) PeekDecisionRuns(
+        int guid,
+        int maxRuns = DecisionHistoryCap)
+    {
+        if (!_rings.TryGetValue(guid, out var ring))
+            return (new List<DecisionRunSnapshot>(), false);
+
+        lock (ring.Lock)
+        {
+            int take = Math.Clamp(maxRuns, 1, DecisionHistoryCap);
+            int skip = Math.Max(0, ring.Decisions.Count - take);
+            var runs = ring.Decisions.Skip(skip).Select(d => new DecisionRunSnapshot(
+                d.Id,
+                d.ThroughSeq,
+                d.StartUtc,
+                d.EndUtc,
+                d.SegmentCount,
+                d.Representative)
+            {
+                ConditionIncidentId = d.Representative.ConditionIncidentId,
+                Condition = d.Representative.Condition,
+                ConditionTransition = d.Representative.ConditionTransition,
+                HasStructuredState = d.Representative.HasStructuredState
+            }).ToList();
+            return (runs, ring.DecisionsDropped > 0 || skip > 0);
+        }
+    }
+
+    public enum RemoteSiteRegistration
+    {
+        Added,
+        AlreadyRegistered,
+        Conflict
+    }
+
+    public readonly record struct RemoteIngestResult(int UnknownSites, int ConflictedSites);
+
+    /// <summary>
+    /// Register one process-epoch-local C++ site. Re-shipping the same manifest is
+    /// idempotent. Reusing an id for different metadata inside one claimed epoch is
+    /// quarantined onto an explicit conflict site; it can never inherit the old label.
+    /// </summary>
+    public static RemoteSiteRegistration RegisterRemoteSite(
+        string remoteEpoch,
+        int remoteId,
+        string file,
+        int line,
+        string desc)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(remoteEpoch);
+        var key = (remoteEpoch, remoteId);
+        lock (_remoteSiteLock)
+        {
+            if (!_remoteSites.TryGetValue(key, out var binding))
+            {
+                var site = CreateRemoteSite_NoLock(remoteEpoch, remoteId, "cpp/" + file, line, desc);
+                _remoteSites.Add(key, new RemoteSiteBinding { Site = site });
+                return RemoteSiteRegistration.Added;
+            }
+
+            if (!binding.Conflicted
+                && binding.Site.File == "cpp/" + file
+                && binding.Site.Line == line
+                && binding.Site.Description == desc)
+                return RemoteSiteRegistration.AlreadyRegistered;
+
+            if (!binding.Conflicted)
+            {
+                string conflict =
+                    $"C++ site id {remoteId} reused inside epoch {remoteEpoch}: " +
+                    $"{binding.Site.File}:{binding.Site.Line} '{binding.Site.Description}' != " +
+                    $"cpp/{file}:{line} '{desc}'";
+                binding.ConflictSite = CreateRemoteSite_NoLock(
+                    remoteEpoch,
+                    remoteId,
+                    "cpp/<circuit-site-conflict>",
+                    remoteId,
+                    conflict);
+            }
+            return RemoteSiteRegistration.Conflict;
+        }
+    }
+
+    private static ProbeSite CreateRemoteSite_NoLock(
+        string remoteEpoch,
+        int remoteId,
+        string file,
+        int line,
+        string desc)
+    {
+        var site = new ProbeSite(
+            RemoteSiteBase + Interlocked.Increment(ref _nextRemoteSiteId),
+            file,
+            line,
+            desc,
+            remoteEpoch,
+            remoteId);
         lock (_siteList)
         {
-            if (!_siteListIds.Contains(site.Id)) { _siteList.Add(site); _siteListIds.Add(site.Id); }
+            _siteList.Add(site);
+            _siteListIds.Add(site.Id);
         }
+        return site;
+    }
+
+    private static ProbeSite ResolveRemoteSite_NoLock(
+        string remoteEpoch,
+        int remoteId,
+        out bool unknown,
+        out bool conflicted)
+    {
+        var key = (remoteEpoch, remoteId);
+        if (_remoteSites.TryGetValue(key, out var binding))
+        {
+            unknown = false;
+            conflicted = binding.Conflicted;
+            return binding.ConflictSite ?? binding.Site;
+        }
+
+        unknown = true;
+        conflicted = false;
+        if (_unknownRemoteSites.TryGetValue(key, out var placeholder)) return placeholder;
+
+        placeholder = CreateRemoteSite_NoLock(
+            remoteEpoch,
+            remoteId,
+            "cpp/<unregistered-circuit-site>",
+            remoteId,
+            $"C++ site id {remoteId} used before its manifest in epoch {remoteEpoch}");
+        _unknownRemoteSites.Add(key, placeholder);
+        return placeholder;
     }
 
     /// <summary>Merge one C++ CIRCUIT_BATCH into the bot's timeline as a sealed
     /// "cpp" segment (position-stamped per R10). Hits get fresh global seqs at
     /// arrival — ordering across the two sides is by arrival, which the 1s ship
     /// cadence makes honest enough until chains take over.</summary>
-    public static void IngestRemoteSegment(int guid, int mapId, int zoneId, float x, float y, float z,
+    public static RemoteIngestResult IngestRemoteSegment(
+        string remoteEpoch,
+        int guid,
+        int mapId,
+        int zoneId,
+        float x,
+        float y,
+        float z,
         List<(int RemoteId, double? Value, string? Note)> hits, int drops)
     {
-        if (_mode == (int)TraceMode.Off) return;
+        ArgumentException.ThrowIfNullOrWhiteSpace(remoteEpoch);
+        if (_mode == (int)TraceMode.Off) return default;
         var seg = new TickSegment
         {
+            Seq = Interlocked.Increment(ref _segmentSeq),
             Guid = guid,
             Kind = drops > 0 ? "cpp-drops" : "cpp",
             StartUtc = DateTime.UtcNow,
             EndUtc = DateTime.UtcNow,
+            PrimaryCtx = RemoteCtx,
             HasPos = true,
             MapId = mapId,
             ZoneId = zoneId,
             X = x, Y = y, Z = z,
+            RemoteEpoch = remoteEpoch,
+            HasPointAlarm = drops > 0,
         };
-        foreach (var h in hits)
-            seg.Hits.Add(new ProbeHit(RemoteSiteBase + h.RemoteId, Interlocked.Increment(ref _seq), h.Note, h.Value, RemoteCtx));
+        int unknownSites = 0;
+        int conflictedSites = 0;
+        lock (_remoteSiteLock)
+        {
+            foreach (var h in hits)
+            {
+                ProbeSite site = ResolveRemoteSite_NoLock(
+                    remoteEpoch,
+                    h.RemoteId,
+                    out bool unknown,
+                    out bool conflicted);
+                if (unknown) unknownSites++;
+                if (conflicted) conflictedSites++;
+                if (IsPointAlarmText(site.Description, site.File, h.Note))
+                    seg.HasPointAlarm = true;
+                seg.Hits.Add(new ProbeHit(site.Id, Interlocked.Increment(ref _seq), h.Note, h.Value, RemoteCtx));
+            }
+        }
 
         var ring = _rings.GetOrAdd(guid, static _ => new BotRing());
         lock (ring.Lock)
         {
+            StampCondition_NoLock(ring, seg);
             ring.Sealed.Enqueue(seg);
             while (ring.Sealed.Count > SegmentRingCap) { ring.Sealed.Dequeue(); ring.Dropped++; }
             ring.Recent.Enqueue(seg);
             while (ring.Recent.Count > RecentViewCap) ring.Recent.Dequeue();
+            // The activity reader has a longer, run-compressed horizon than the
+            // raw ring. C++ activity is part of the same human decision flow, so
+            // it must enter that history too (the timeline builder carries the
+            // latest structured C# objective across these remote segments).
+            AddDecisionHistory_NoLock(ring, seg);
         }
+        return new RemoteIngestResult(unknownSites, conflictedSites);
     }
 
     // ── wedge auto-dump requests (R8) ───────────────────────────────────────
@@ -405,19 +886,50 @@ public static class CircuitTrace
 
     private static void Record(int guid, string file, int line, string desc, string? note, double? value)
     {
+        int context = _logicalContext.Value;
+        if (context == 0)
+            context = -1 - Environment.CurrentManagedThreadId; // -1 is reserved for C++
         var hit = new ProbeHit(SiteId(file, line, desc), Interlocked.Increment(ref _seq), note, value,
-                               Environment.CurrentManagedThreadId);
+                               context);
         var ring = _rings.GetOrAdd(guid, static _ => new BotRing());
         lock (ring.Lock)
         {
             // Hits outside a tick bracket (bridge/chat threads) open an inter-tick segment.
-            ring.Open ??= new TickSegment { Guid = guid, Kind = "inter", StartUtc = DateTime.UtcNow };
+            ring.Open ??= new TickSegment
+            {
+                Guid = guid,
+                Kind = "inter",
+                StartUtc = DateTime.UtcNow,
+                PrimaryCtx = context
+            };
             ring.Open.Hits.Add(hit);
+            if (IsPointAlarmText(desc, file, note)) ring.Open.HasPointAlarm = true;
             if (ring.Open.Hits.Count >= OpenSegmentHitCap)
             {
                 ring.Open.Kind = "overflow";
                 SealOpen_NoLock(ring);
             }
         }
+    }
+
+    internal static bool IsPointAlarmText(string description, string file, string? note)
+    {
+        string text = string.Join(' ', description, file, note ?? "").ToUpperInvariant();
+        return text.Contains("TRIPPED", StringComparison.Ordinal)
+            || text.Contains("GIVEUP", StringComparison.Ordinal)
+            || text.Contains("GIVE UP", StringComparison.Ordinal)
+            || (text.Contains("ENGAGED", StringComparison.Ordinal)
+                && text.Contains("QUARANTINE", StringComparison.Ordinal))
+            || (text.Contains("FROZEN", StringComparison.Ordinal)
+                && text.Contains("WHOLE WINDOW", StringComparison.Ordinal))
+            || text.Contains("MOVE_FAILED", StringComparison.Ordinal)
+            || text.Contains("MOVE FAILED", StringComparison.Ordinal)
+            || text.Contains("PATH_UNSAFE", StringComparison.Ordinal)
+            || text.Contains("PATH UNSAFE", StringComparison.Ordinal)
+            || text.Contains("GRIND_BLOCKED", StringComparison.Ordinal)
+            || text.Contains("GRIND BLOCKED", StringComparison.Ordinal)
+            || (text.Contains("SITE", StringComparison.Ordinal)
+                && text.Contains("CONFLICT", StringComparison.Ordinal))
+            || text.Contains("UNREGISTERED", StringComparison.Ordinal);
     }
 }

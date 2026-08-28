@@ -14,6 +14,7 @@ public class SettingsController : Controller
     private readonly AuditService _audit;
     private readonly ILogger<SettingsController> _logger;
     private readonly ComfyUIDispatcher? _comfyDispatcher;
+    private readonly CircuitTraceSourceService _circuitSources;
 
     private string ConfigFilePath => Path.Combine(_env.ContentRootPath, "server-config.json");
 
@@ -22,12 +23,14 @@ public class SettingsController : Controller
         IConfiguration config,
         AuditService audit,
         ILogger<SettingsController> logger,
+        CircuitTraceSourceService circuitSources,
         ComfyUIDispatcher? comfyDispatcher = null)
     {
         _env = env;
         _config = config;
         _audit = audit;
         _logger = logger;
+        _circuitSources = circuitSources;
         _comfyDispatcher = comfyDispatcher;
     }
 
@@ -90,6 +93,11 @@ public class SettingsController : Controller
             Wiki = new WikiConfig
             {
                 Root = _config["Wiki:Root"] ?? ""
+            },
+            CircuitTrace = new CircuitTraceConfig
+            {
+                CSharpSourcePath = _config["CircuitTrace:CSharpSourcePath"] ?? "",
+                SourcePackageDirectory = _config["CircuitTrace:SourcePackageDirectory"] ?? ""
             },
             Kestrel = new KestrelConfig
             {
@@ -271,6 +279,7 @@ public class SettingsController : Controller
             Set("spellCreator", settings.SpellCreator);
             Set("weaponForge", settings.WeaponForge);
             Set("wiki", settings.Wiki);
+            Set("circuitTrace", settings.CircuitTrace);
             Set("kestrel", settings.Kestrel);
 
             var json = root.ToJsonString(JsonOpts);
@@ -345,6 +354,107 @@ public class SettingsController : Controller
 
         var statuses = await _comfyDispatcher.GetPoolStatusAsync();
         return Json(statuses);
+    }
+
+    /// <summary>
+    /// Non-secret source readiness used by Settings and the Circuit Board gate.
+    /// Do not make either page call Current(): that payload intentionally includes
+    /// credentials needed by the Settings form.
+    /// </summary>
+    [HttpGet]
+    public IActionResult CircuitSourceStatus() => Json(CircuitSourceStatusPayload());
+
+    /// <summary>
+    /// Installs a C# or C++ source ZIP into managed, non-web storage. Extraction,
+    /// validation, and atomic replacement live in CircuitTraceSourceService; this
+    /// controller remains the thin Settings HTTP seam.
+    /// </summary>
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    [RequestSizeLimit(CircuitTraceSourceService.MaxArchiveBytes + 1_048_576)]
+    [RequestFormLimits(MultipartBodyLengthLimit = CircuitTraceSourceService.MaxArchiveBytes + 1_048_576)]
+    public async Task<IActionResult> UploadCircuitSource(
+        IFormFile? file,
+        string? kind,
+        CancellationToken cancellationToken)
+    {
+        if (!CircuitTraceSourceService.TryParseKind(kind, out CircuitTraceSourceKind parsed))
+            return BadRequest(new { success = false, error = "Source kind must be csharp or cpp." });
+        if (file == null || file.Length == 0)
+            return BadRequest(new { success = false, error = "Choose a source ZIP to upload." });
+        if (file.Length > CircuitTraceSourceService.MaxArchiveBytes)
+            return StatusCode(StatusCodes.Status413PayloadTooLarge, new
+            {
+                success = false,
+                error = $"The source package is larger than {CircuitTraceSourceService.MaxArchiveMegabytes} MB."
+            });
+
+        try
+        {
+            await using Stream stream = file.OpenReadStream();
+            CircuitTraceSourceUploadResult result = await _circuitSources.UploadArchiveAsync(
+                parsed,
+                stream,
+                file.FileName,
+                file.Length,
+                cancellationToken);
+            _logger.LogInformation(
+                "Installed {Kind} Circuit source package with {FileCount} source files",
+                result.Kind,
+                result.SourceFileCount);
+            return Json(new
+            {
+                success = true,
+                message = $"Installed {result.Source.Label} ({result.SourceFileCount:N0} files).",
+                status = CircuitSourceStatusPayload(result.Status)
+            });
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return StatusCode(499, new { success = false, error = "The upload was cancelled." });
+        }
+        catch (Exception ex) when (ex is InvalidDataException or IOException
+            or UnauthorizedAccessException or NotSupportedException or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "Rejected {Kind} Circuit source package", kind);
+            return BadRequest(new
+            {
+                success = false,
+                error = ex.Message,
+                status = CircuitSourceStatusPayload()
+            });
+        }
+    }
+
+    private object CircuitSourceStatusPayload(CircuitTraceSourceSetupStatus? supplied = null)
+    {
+        CircuitTraceSourceSetupStatus status = supplied ?? _circuitSources.GetStatus();
+        object Requirement(CircuitTraceSourceLocationStatus source) => new
+        {
+            id = source.Kind,
+            source.Label,
+            source.Ready,
+            origin = source.Ready ? source.Origin : "none",
+            code = source.Ready ? "ready" : "missing",
+            source.Message
+        };
+
+        return new
+        {
+            ready = status.Ready,
+            setupRequired = !status.Ready,
+            status.SourceVersion,
+            requirements = new[] { Requirement(status.CSharp), Requirement(status.Cpp) },
+            upload = new { accept = ".zip", maxBytes = CircuitTraceSourceService.MaxArchiveBytes },
+            applicationSource = new
+            {
+                repositoryUrl = CircuitTraceSourceService.MangosSuperUiRepositoryUrl,
+                revision = CircuitTraceSourceService.InstalledApplicationRevision,
+                archiveUrl = CircuitTraceSourceService.InstalledApplicationSourceArchiveUrl
+            },
+            coreSource = new { repositoryUrl = CircuitTraceSourceService.SuperUiCoreRepositoryUrl },
+            settingsUrl = "/Settings#circuit-source"
+        };
     }
 
     // ==================== File helpers ====================
@@ -486,7 +596,19 @@ public class ServerConfig
     public SpellCreatorConfig? SpellCreator { get; set; }
     public WeaponForgeConfig? WeaponForge { get; set; }
     public WikiConfig? Wiki { get; set; }
+    public CircuitTraceConfig? CircuitTrace { get; set; }
     public KestrelConfig? Kestrel { get; set; }
+}
+
+public class CircuitTraceConfig
+{
+    /// <summary>Server folder containing MangosSuperUI.csproj and BotLogic.</summary>
+    public string CSharpSourcePath { get; set; } = "";
+    /// <summary>
+    /// Durable storage for uploaded source packages. Blank uses the service
+    /// account's local application-data folder, outside the publish directory.
+    /// </summary>
+    public string SourcePackageDirectory { get; set; } = "";
 }
 
 public class WeaponForgeConfig
