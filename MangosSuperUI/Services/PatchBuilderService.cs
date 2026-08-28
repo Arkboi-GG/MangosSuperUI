@@ -120,6 +120,9 @@ public class PatchBuilderService
     private const int FIELD_EFFECT_APPLY_AURA_0 = 91;   // EffectApplyAuraName[3]
     private const int FIELD_EFFECT_AMPLITUDE_0 = 94;    // EffectAmplitude[3] (tick ms)
     private const int FIELD_EFFECT_MISC_VALUE_0 = 106;  // EffectMiscValue[3]
+    private const int FIELD_EFFECT_IMPLICIT_TARGET_A_0 = 82; // EffectImplicitTargetA[3]
+    private const int FIELD_EFFECT_IMPLICIT_TARGET_B_0 = 85; // EffectImplicitTargetB[3]
+    private const int FIELD_EFFECT_RADIUS_INDEX_0 = 88;      // EffectRadiusIndex[3]
 
     // ── Trainer wrapper DBC field indices (Session 34) ──
     // Trainer wrappers use SPELL_EFFECT_LEARN_SPELL (36) to teach the real spell.
@@ -473,6 +476,12 @@ public class PatchBuilderService
                             spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_AMPLITUDE_0 + ef.Slot, (uint)ef.Amplitude.Value);
                         if (ef.MiscValue.HasValue)
                             spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_MISC_VALUE_0 + ef.Slot, unchecked((uint)ef.MiscValue.Value));
+                        if (ef.TargetA.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_IMPLICIT_TARGET_A_0 + ef.Slot, (uint)ef.TargetA.Value);
+                        if (ef.TargetB.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_IMPLICIT_TARGET_B_0 + ef.Slot, (uint)ef.TargetB.Value);
+                        if (ef.RadiusIndex.HasValue)
+                            spellDbc.PatchRow(request.SpellEntry, FIELD_EFFECT_RADIUS_INDEX_0 + ef.Slot, (uint)ef.RadiusIndex.Value);
                     }
 
                     // ── SkillLineAbility ──
@@ -834,6 +843,12 @@ public class PatchBuilderService
                                 spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_AMPLITUDE_0 + ef.Slot, (uint)ef.Amplitude.Value);
                             if (ef.MiscValue.HasValue)
                                 spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_MISC_VALUE_0 + ef.Slot, unchecked((uint)ef.MiscValue.Value));
+                            if (ef.TargetA.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_IMPLICIT_TARGET_A_0 + ef.Slot, (uint)ef.TargetA.Value);
+                            if (ef.TargetB.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_IMPLICIT_TARGET_B_0 + ef.Slot, (uint)ef.TargetB.Value);
+                            if (ef.RadiusIndex.HasValue)
+                                spellDbc.PatchRow(rank.Entry, FIELD_EFFECT_RADIUS_INDEX_0 + ef.Slot, (uint)ef.RadiusIndex.Value);
                         }
 
                         // ── SkillLineAbility.dbc — tab placement for this rank ──
@@ -2159,6 +2174,9 @@ public class EffectStructurePatch
     public int? DieSides { get; set; }
     public int? Amplitude { get; set; }
     public int? MiscValue { get; set; }
+    public int? TargetA { get; set; }
+    public int? TargetB { get; set; }
+    public int? RadiusIndex { get; set; }
 }
 
 /// <summary>

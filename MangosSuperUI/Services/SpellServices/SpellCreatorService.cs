@@ -629,6 +629,9 @@ public class SpellCreatorService
                     DieSides = Col($"effectDieSides{n}"),
                     Amplitude = Col($"effectAmplitude{n}"),
                     MiscValue = Col($"effectMiscValue{n}"),
+                    TargetA = Col($"effectImplicitTargetA{n}"),
+                    TargetB = Col($"effectImplicitTargetB{n}"),
+                    RadiusIndex = Col($"effectRadiusIndex{n}"),
                 });
             }
 

@@ -2061,6 +2061,9 @@ public partial class PatchController : Controller
                         DieSides = Col($"effectDieSides{i}"),
                         Amplitude = Col($"effectAmplitude{i}"),
                         MiscValue = Col($"effectMiscValue{i}"),
+                        TargetA = Col($"effectImplicitTargetA{i}"),
+                        TargetB = Col($"effectImplicitTargetB{i}"),
+                        RadiusIndex = Col($"effectRadiusIndex{i}"),
                     });
                 }
             }
