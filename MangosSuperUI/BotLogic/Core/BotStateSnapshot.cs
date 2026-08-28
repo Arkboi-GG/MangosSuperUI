@@ -8,6 +8,9 @@ using MangosSuperUI.BotLogic.Data;   // QuestLogEntry (the quest-log snapshot no
 /// </summary>
 public class BotStateSnapshot
 {
+    /// <summary>C#-local identity of the socket that produced this snapshot.</summary>
+    public long BridgeSessionId { get; set; }
+    public int BridgeProtocol { get; set; }
     // From STATE message
     public int Health { get; set; }
     public int MaxHealth { get; set; }
@@ -53,6 +56,9 @@ public class BotStateSnapshot
     // groups the god-bot formed).
     public bool InPlayerParty { get; set; } = false;
 
+    /// <summary>Direct human/free-view control owns intent; autonomous planning stands down.</summary>
+    public bool Possessed { get; set; } = false;
+
     // [CONSCRIPTED] Enlisted in a player's RTS army (C++ conscripted on STATE, 2026-08-24).
     // The client assigned this bot to a control group; the C++ core fences brain commands
     // and stands the bot at attention. C# stands down like the player-party hold but
@@ -93,7 +99,7 @@ public class BotStateSnapshot
     // The authoritative mirror of the C++ player quest log (me->GetQuestStatusMap()), parsed from the
     // STATE "quests" blob. ctx.QuestLog is set from this in Sense every tick, so the planner always reads
     // ground truth and never a stale/partial/empty request-reply cache. StateUtc is when this STATE landed
-    // (bs.LastUpdate) — the freshness clock the objective re-derive (obj_sync) gates on.
+    // (bs.LastStateReceivedUtc) — acknowledgements cannot advance this sensory clock.
     public Dictionary<int, QuestLogEntry> QuestLog { get; set; } = new();
     public DateTime StateUtc { get; set; }
 
@@ -105,6 +111,7 @@ public class BotStateSnapshot
         return new BotStateSnapshot
         {
             Health = bs.Health,
+            BridgeProtocol = bs.BridgeProtocol,
             MaxHealth = bs.MaxHealth,
             Mana = bs.Mana,
             MaxMana = bs.MaxMana,
@@ -122,6 +129,7 @@ public class BotStateSnapshot
             Copper = bs.Copper,
             Durability = bs.Durability,
             InPlayerParty = bs.InPlayerParty,   // [PLAYERPARTY] pparty on STATE — needs the BotState parse in BotBridgeService
+            Possessed = bs.Possessed,
             Conscripted = bs.Conscripted,       // [CONSCRIPTED] conscripted on STATE — the RTS-army stand-down
             HubErrandUntil = bs.HubErrandUntil, // [HUB-ERRAND] run token — stamped by the CHAT_RECV recognizer, persists on conn.State
             PartyBossDist = bs.PartyBossDist,   // [HUB-ERRAND] ppdist on STATE — the boss-range abort guard
@@ -129,7 +137,7 @@ public class BotStateSnapshot
             ServerQuestStatus = bs.QuestStatus,
             HeldTask = ParseHeldTask(bs),
             QuestLog = ParseQuestLog(bs.Quests),   // full quest-log snapshot off STATE (retired pull)
-            StateUtc = bs.LastUpdate                // when this STATE landed → the obj-resync freshness clock
+            StateUtc = bs.LastStateReceivedUtc      // dedicated STATE-only sensory/obj-resync clock
         };
     }
 

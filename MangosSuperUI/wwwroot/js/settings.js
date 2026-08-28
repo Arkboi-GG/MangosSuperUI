@@ -150,6 +150,11 @@ $(function () {
         kept += setField('#cfgWotlkDataPath', wf.wotlkDataPath, force);
 
         kept += setField('#cfgWikiRoot', s.wiki ? s.wiki.root : '', force);
+
+        var circuit = s.circuitTrace || {};
+        kept += setField('#cfgCircuitCSharpSourcePath', circuit.cSharpSourcePath, force);
+        kept += setField('#cfgCircuitSourcePackageDirectory', circuit.sourcePackageDirectory, force);
+
         kept += setField('#cfgKestrelUrl', s.kestrel ? s.kestrel.url : '', force);
 
         // Node rows get rebuilt wholesale, so only touch them when they are clean.
@@ -195,11 +200,190 @@ $(function () {
 
     // Status panels only - never touches form fields.
     function loadStatuses() {
+        loadCircuitSourceStatus();
         loadDbcStatus();
         loadComfyStatus();
         loadBackupStatus();
         loadWikiStatus();
     }
+
+    // ===================== CIRCUIT SOURCE SETUP =====================
+
+    var circuitSourceUploadMaxBytes = 256 * 1024 * 1024;
+
+    function formatFileSize(bytes) {
+        if (!isFinite(bytes) || bytes < 0) return 'unknown size';
+        if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        return bytes + ' bytes';
+    }
+
+    function setCircuitUploadFeedback(kind, state, message) {
+        var prefix = kind === 'csharp' ? '#circuitCSharp' : '#circuitCpp';
+        var $state = $(prefix + 'State').removeClass('is-ready is-missing is-error is-working');
+        var $detail = $(prefix + 'Status').removeClass('is-ready is-error is-working');
+        if (state === 'error') {
+            $state.addClass('is-error').text('Rejected');
+            $detail.addClass('is-error').text(message);
+        } else {
+            $state.addClass('is-working').text(state === 'uploading' ? 'Uploading' : 'Installing');
+            $detail.addClass('is-working').text(message);
+        }
+    }
+
+    function showCircuitUploadError(kind, message) {
+        setCircuitUploadFeedback(kind, 'error', message);
+        $('#circuitSourceOverall')
+            .removeClass('is-ready is-missing')
+            .addClass('is-error')
+            .empty()
+            .append($('<i class="fa-solid fa-circle-exclamation"></i>'))
+            .append($('<span>').text('Source upload failed: ' + message));
+    }
+
+    function loadCircuitSourceStatus() {
+        $.getJSON('/Settings/CircuitSourceStatus', function (data) {
+            renderCircuitSourceStatus(data);
+        }).fail(function () {
+            $('#circuitSourceOverall')
+                .removeClass('is-ready is-missing')
+                .addClass('is-error')
+                .html('<i class="fa-solid fa-circle-exclamation"></i><span>Could not check Circuit Board source code.</span>');
+            setCircuitSourceRow('csharp', null);
+            setCircuitSourceRow('cpp', null);
+        });
+    }
+
+    function renderCircuitSourceStatus(data) {
+        if (!data) return;
+        if (data.upload && data.upload.maxBytes) {
+            circuitSourceUploadMaxBytes = data.upload.maxBytes;
+            $('#circuitUploadLimit').text('up to ' + formatFileSize(circuitSourceUploadMaxBytes) + ' each');
+        }
+
+        var requirements = data.requirements || [];
+        var byId = {};
+        requirements.forEach(function (item) { byId[String(item.id || '').toLowerCase()] = item; });
+        setCircuitSourceRow('csharp', byId.csharp || null);
+        setCircuitSourceRow('cpp', byId.cpp || null);
+
+        var $overall = $('#circuitSourceOverall').removeClass('is-ready is-missing is-error');
+        if (data.ready) {
+            $overall.addClass('is-ready').html(
+                '<i class="fa-solid fa-circle-check"></i>' +
+                '<span>Source code is ready. Circuit Board can show the literal decision flow.</span>');
+        } else {
+            var missing = requirements.filter(function (item) { return !item.ready; })
+                .map(function (item) { return item.label; });
+            $overall.addClass('is-missing').empty()
+                .append($('<i class="fa-solid fa-triangle-exclamation"></i>'))
+                .append($('<span>').text('Source required before Circuit Board can start' +
+                    (missing.length ? ': ' + missing.join(' and ') + '.' : '.')));
+        }
+    }
+
+    function setCircuitSourceRow(kind, item) {
+        var prefix = kind === 'csharp' ? '#circuitCSharp' : '#circuitCpp';
+        var $state = $(prefix + 'State').removeClass('is-ready is-missing is-error');
+        var $detail = $(prefix + 'Status').removeClass('is-ready is-error');
+
+        if (!item) {
+            $state.addClass('is-error').text('Unknown');
+            $detail.addClass('is-error').text('Source status is unavailable.');
+            return;
+        }
+
+        if (item.ready) {
+            $state.addClass('is-ready').text('Ready');
+            var origin = item.origin ? ' Active source: ' + item.origin + '.' : '';
+            $detail.addClass('is-ready').text((item.message || 'Source is readable.') + origin);
+        } else {
+            $state.addClass('is-missing').text('Required');
+            $detail.text(item.message || 'Choose a server folder or upload a source ZIP.');
+        }
+    }
+
+    $(document).on('click', '.btn-source-upload', function () {
+        var kind = $(this).data('sourceKind');
+        $('.source-file-input[data-source-kind="' + kind + '"]').trigger('click');
+    });
+
+    $(document).on('change', '.source-file-input', function () {
+        var input = this;
+        var file = input.files && input.files[0];
+        if (!file) return;
+
+        var kind = $(input).data('sourceKind');
+        var $button = $('.btn-source-upload[data-source-kind="' + kind + '"]');
+        var buttonHtml = $button.html();
+        if (!/\.zip$/i.test(file.name)) {
+            showCircuitUploadError(kind, 'Choose a .zip source package.');
+            input.value = '';
+            return;
+        }
+        if (file.size > circuitSourceUploadMaxBytes) {
+            showCircuitUploadError(kind,
+                file.name + ' is ' + formatFileSize(file.size) +
+                '; the upload limit is ' + formatFileSize(circuitSourceUploadMaxBytes) + '.');
+            input.value = '';
+            return;
+        }
+
+        var form = new FormData();
+        form.append('file', file);
+        form.append('kind', kind);
+        form.append('__RequestVerificationToken', $('input[name="__RequestVerificationToken"]').val() || '');
+
+        setCircuitUploadFeedback(kind, 'uploading',
+            'Uploading ' + file.name + ' (' + formatFileSize(file.size) + ')…');
+        $button.prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin"></i> Uploading...');
+        $.ajax({
+            url: '/Settings/UploadCircuitSource',
+            type: 'POST',
+            data: form,
+            processData: false,
+            contentType: false,
+            xhr: function () {
+                var request = $.ajaxSettings.xhr();
+                if (request.upload) {
+                    request.upload.addEventListener('progress', function (event) {
+                        if (!event.lengthComputable) return;
+                        var percent = Math.min(100, Math.round(event.loaded * 100 / event.total));
+                        if (percent < 100) {
+                            setCircuitUploadFeedback(kind, 'uploading',
+                                'Uploading ' + file.name + '… ' + percent + '%');
+                        } else {
+                            setCircuitUploadFeedback(kind, 'installing',
+                                'Upload complete. Validating and installing source files…');
+                            $button.html('<i class="fa-solid fa-spinner fa-spin"></i> Installing...');
+                        }
+                    });
+                }
+                return request;
+            },
+            success: function (data) {
+                if (data && data.status) renderCircuitSourceStatus(data.status);
+                else loadCircuitSourceStatus();
+            },
+            error: function (xhr) {
+                var body = xhr.responseJSON || {};
+                if (body.status) renderCircuitSourceStatus(body.status);
+                var message = body.error;
+                if (!message && xhr.status === 413) {
+                    message = 'The web server rejected this ZIP as too large before it reached the installer.';
+                }
+                if (!message && xhr.status === 400) {
+                    message = 'The server rejected the upload. Reload Settings and try again; if it persists, verify that this ZIP matches the selected source type.';
+                }
+                showCircuitUploadError(kind, message ||
+                    'The source package could not be installed (HTTP ' + (xhr.status || 'network error') + ').');
+            },
+            complete: function () {
+                input.value = '';
+                $button.prop('disabled', false).html(buttonHtml);
+            }
+        });
+    });
 
     // ===================== COMFYUI NODE MANAGEMENT =====================
 
@@ -590,6 +774,10 @@ $(function () {
             wiki: {
                 root: $('#cfgWikiRoot').val() || ''
             },
+            circuitTrace: {
+                cSharpSourcePath: $('#cfgCircuitCSharpSourcePath').val() || '',
+                sourcePackageDirectory: $('#cfgCircuitSourcePackageDirectory').val() || ''
+            },
             kestrel: {
                 url: $('#cfgKestrelUrl').val()
             }
@@ -618,6 +806,9 @@ $(function () {
                     bindConfig(data.settings, true);
                     showSaveResult(data);
                     loadStatuses();
+                    // IConfiguration reloads from the file watcher after the save
+                    // response. Recheck source readiness once that new root is live.
+                    setTimeout(loadCircuitSourceStatus, 1000);
                 } else if (data.conflict) {
                     fileStamp = data.fileStamp || fileStamp;
                     pendingConfig = config;

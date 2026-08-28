@@ -57,13 +57,6 @@ public class GroupManager
             var old = _mode;
             _mode = value;
             _logger.LogInformation("[BOT-GROUP] Grouping mode changed: {Old} → {New}", old, value);
-
-            // If switching to Off, disband everything
-            if (value == GroupingMode.Off && old != GroupingMode.Off)
-            {
-                CircuitTrace.Hit(0, "groupmgr: mode switched off, disbanding all groups");
-                DisbandAll();
-            }
         }
     }
 
@@ -121,18 +114,27 @@ public class GroupManager
     /// Does NOT send FORM_GROUP to C++ — caller must do that after
     /// (BotBrainService has the bridge reference).
     /// </summary>
-    public BotGroup? FormGroup(int leaderGuid, params int[] followerGuids)
+    public bool CanFormGroup(int leaderGuid, params int[] followerGuids)
     {
         if (_mode == GroupingMode.Off)
         {
             CircuitTrace.Hit(leaderGuid, "groupmgr: form rejected, grouping mode off");
             _logger.LogDebug("[BOT-GROUP] FormGroup rejected — mode is Off");
-            return null;
+            return false;
         }
 
         // Validate: no one is already grouped
         var allMembers = new List<int> { leaderGuid };
         allMembers.AddRange(followerGuids);
+
+        if (leaderGuid <= 0
+            || followerGuids.Any(guid => guid <= 0)
+            || allMembers.Distinct().Count() != allMembers.Count)
+        {
+            CircuitTrace.Hit(leaderGuid, "groupmgr: form rejected, invalid or duplicate guid");
+            _logger.LogWarning("[BOT-GROUP] FormGroup rejected — invalid or duplicate member GUID");
+            return false;
+        }
 
         foreach (var guid in allMembers)
         {
@@ -141,7 +143,7 @@ public class GroupManager
                 CircuitTrace.Hit(guid, "groupmgr: form rejected, bot already grouped");
                 _logger.LogWarning("[BOT-GROUP] FormGroup rejected — bot {Guid} is already in group {GroupId}",
                     guid, _botToGroup[guid]);
-                return null;
+                return false;
             }
         }
 
@@ -149,8 +151,19 @@ public class GroupManager
         {
             CircuitTrace.Hit(leaderGuid, "groupmgr: form rejected, invalid size", allMembers.Count);
             _logger.LogWarning("[BOT-GROUP] FormGroup rejected — invalid size {Size} (need 2-5)", allMembers.Count);
-            return null;
+            return false;
         }
+
+        return true;
+    }
+
+    public BotGroup? FormGroup(int leaderGuid, params int[] followerGuids)
+    {
+        if (!CanFormGroup(leaderGuid, followerGuids))
+            return null;   // cb:fold preflight rejection is probed inside CanFormGroup
+
+        var allMembers = new List<int> { leaderGuid };
+        allMembers.AddRange(followerGuids);
 
         var group = new BotGroup
         {
@@ -302,7 +315,7 @@ public class GroupManager
     /// Leader selection: Tank > Healer > Dps (tankiest leads). Within the same role, lowest level
     /// leads (so quests are available to all).
     /// </summary>
-    public List<BotGroup> AutoFormGroups(
+    public List<BotGroup> PlanAutoGroups(
         IReadOnlyDictionary<int, BotIdentity> allBots,
         Func<int, BotPosition?>? getPosition = null)
     {
@@ -359,14 +372,20 @@ public class GroupManager
                 .First().Guid;
         }
 
-        // Helper: try to form a group, returns true if successful
+        // Helper: reserve one non-mutating candidate. The authoritative GroupManager
+        // topology is changed only after the core returns an exact correlated ACK.
         bool TryForm(params BotIdentity[] members)
         {
             if (members.Any(m => claimed.Contains(m.Guid))) { CircuitTrace.Hit(members[0].Guid, "groupmgr: tryform rejected, member already claimed this round"); return false; }
             int leader = PickLeader(members);
-            var followers = members.Where(m => m.Guid != leader).Select(m => m.Guid).ToArray();
-            var group = FormGroup(leader, followers);
-            if (group == null) return false;   // cb:fold reject reason probed inside FormGroup
+            var group = new BotGroup
+            {
+                GroupId = 0,
+                LeaderGuid = leader,
+                MemberGuids = members.Select(member => member.Guid).ToList(),
+                LeaderType = GroupLeaderType.BotCoordinated,
+                FormedAt = DateTime.UtcNow
+            };
             formed.Add(group);
             foreach (var m in members) claimed.Add(m.Guid);
             return true;
@@ -513,7 +532,6 @@ public class GroupManager
                 {
                     CircuitTrace.Hit(stray.Guid, "groupmgr: stray absorbed into existing group");
                     bestGroup.MemberGuids.Add(stray.Guid);
-                    _botToGroup[stray.Guid] = bestGroup.GroupId;
                     claimed.Add(stray.Guid);
 
                     _logger.LogInformation(

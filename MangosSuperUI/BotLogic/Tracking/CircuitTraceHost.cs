@@ -16,8 +16,10 @@ namespace MangosSuperUI.BotLogic.Tracking;
 // LoadSettingsAsync runs once at startup, Tick() runs from the ~250ms main loop.
 //
 // File format (one JSON object per line, self-decoding):
-//   {"k":"site","id":1,"file":"BotLogic/...","line":105,"desc":"..."}      site manifest, emitted before first use
+//   {"k":"site","id":1,"file":"BotLogic/...","line":105,"desc":"..."}      C# site manifest, emitted before first use
+//   {"k":"site",...,"circuitEpoch":"...","remoteId":1}                         C++ site identity, unique across core restarts
 //   {"k":"tick","g":123,"t0":"...","t1":"...","map":0,"zone":12,"x":..,"y":..,"z":..,"h":[[id],[id,val],[id,null,"note"]]}
+//   {"k":"cpp",...,"circuitEpoch":"...","h":[...]}                            C++ batch bound to the same process epoch
 //   {"k":"inter", ...same shape, no pos...}                                 hits that arrived between ticks
 //   {"k":"dump","g":123,"reason":"wedge","segs":N}                          header preceding an auto-dump's segments
 // Every hit row is [siteId] | [siteId,value] | [siteId,null,"note"]; order within
@@ -257,7 +259,9 @@ public sealed class CircuitTraceHost
             // the segment's own context; two hits are control-flow adjacent only
             // when their contexts match. Absent that, the board draws edges that
             // never happened. Cost: nothing for the common case.
-            int primaryCtx = s.Hits.Count > 0 ? s.Hits[0].Ctx : 0;
+            int primaryCtx = s.PrimaryCtx != 0
+                ? s.PrimaryCtx
+                : s.Hits.Count > 0 ? s.Hits[0].Ctx : 0;
             var hits = new object?[s.Hits.Count][];
             for (int i = 0; i < s.Hits.Count; i++)
             {
@@ -267,20 +271,30 @@ public sealed class CircuitTraceHost
                         : h.Value != null ? new object?[] { h.SiteId, h.Value }
                         : new object?[] { h.SiteId };
             }
-            WriteLine(JsonSerializer.Serialize(s.HasPos
+            object record = s.RemoteEpoch != null
                 ? new
                 {
                     k = s.Kind, g = s.Guid,
                     t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
                     map = s.MapId, zone = s.ZoneId, x = s.X, y = s.Y, z = s.Z,
+                    circuitEpoch = s.RemoteEpoch,
                     h = hits
                 }
-                : (object)new
-                {
-                    k = s.Kind, g = s.Guid,
-                    t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
-                    h = hits
-                }));
+                : s.HasPos
+                    ? new
+                    {
+                        k = s.Kind, g = s.Guid,
+                        t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
+                        map = s.MapId, zone = s.ZoneId, x = s.X, y = s.Y, z = s.Z,
+                        h = hits
+                    }
+                    : (object)new
+                    {
+                        k = s.Kind, g = s.Guid,
+                        t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
+                        h = hits
+                    };
+            WriteLine(JsonSerializer.Serialize(record));
         }
     }
 
@@ -291,7 +305,23 @@ public sealed class CircuitTraceHost
         var news = new List<CircuitTrace.ProbeSite>();
         _siteWatermark = CircuitTrace.SitesSince(_siteWatermark, news);
         foreach (var site in news)
-            _writer!.WriteLine(JsonSerializer.Serialize(new { k = "site", id = site.Id, file = site.File, line = site.Line, desc = site.Description }));
+        {
+            // Preserve the compact legacy shape for C# sites. C++ sites also
+            // carry their process epoch and wire-local id, making a trace file
+            // independently auditable across any number of core restarts.
+            _writer!.WriteLine(JsonSerializer.Serialize(site.RemoteEpoch == null
+                ? new { k = "site", id = site.Id, file = site.File, line = site.Line, desc = site.Description }
+                : (object)new
+                {
+                    k = "site",
+                    id = site.Id,
+                    file = site.File,
+                    line = site.Line,
+                    desc = site.Description,
+                    circuitEpoch = site.RemoteEpoch,
+                    remoteId = site.RemoteId
+                }));
+        }
     }
 
     // A trace file is scoped to ONE PROCESS SESSION — never to a day.
@@ -310,15 +340,28 @@ public sealed class CircuitTraceHost
     //
     // One file per session makes the naive read the CORRECT read. The header
     // record below lets any reader assert it rather than infer it. See R11.
-    private readonly string _sessionId =
-        DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + "-" + Environment.ProcessId;
+    private readonly string _sessionId = CreateTraceSessionId(
+        DateTime.UtcNow,
+        Environment.ProcessId,
+        Guid.NewGuid());
+
+    internal static string CreateTraceSessionId(DateTime utcNow, int processId, Guid nonce)
+        => $"{utcNow:yyyyMMdd-HHmmss.fffffff}-{processId}-{nonce:N}";
+
+    internal static StreamWriter CreateNewTraceWriter(string path)
+        => new(new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.Read));
 
     private void EnsureWriter()
     {
         var today = DateTime.UtcNow.ToString("yyyyMMdd");
         if (_writer != null && _writerDate == today) return;
         _writer?.Dispose();
-        _writer = new StreamWriter(Path.Combine(TRACE_DIR, $"circuit_{today}_{_sessionId}.jsonl"), append: true);
+        _writer = CreateNewTraceWriter(
+            Path.Combine(TRACE_DIR, $"circuit_{today}_{_sessionId}.jsonl"));
         _writerDate = today;
         // Fresh file (new session, or midnight rollover within one session):
         // replay the FULL site manifest so this file decodes standalone — which is

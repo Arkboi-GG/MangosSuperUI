@@ -316,6 +316,7 @@ $(function () {
             else if (evt.eventType === 'SELL_ACK') { text += ' ' + (evt.data || ''); cls = 'bt-tl-switch'; }
             else if (evt.eventType === 'EQUIP') { text += ' ' + (evt.data || ''); }
             else text += ' ' + (evt.data || '');
+            if (evt.cbt != null) text += ' [cbt=' + evt.cbt + ']';
 
             // Invalidate inventory cache on loot/sell/equip events
             if (['LOOT', 'SELL_ACK', 'EQUIP', 'BAG_EQUIP'].indexOf(evt.eventType) >= 0) {
@@ -3204,10 +3205,13 @@ $(function () {
             success: function (data) {
                 if (data.success) {
                     showToast('Grouping: ' + data.modeName);
-                    refreshGroupingStatus();
                 } else {
-                    showToast('Error: ' + (data.error || 'unknown'), true);
+                    $('#groupingMode').val(data.mode);
+                    var details = ((data && data.outcomes) || []).filter(function (outcome) { return !outcome.success; })
+                        .map(groupMutationOutcomeText).join(' | ');
+                    showToast('Grouping mode unchanged: ' + (details || data.error || 'unknown'), true);
                 }
+                refreshGroupingStatus();
             }
         });
     });
@@ -3219,13 +3223,52 @@ $(function () {
             contentType: 'application/json',
             data: '{}',
             success: function (data) {
-                if (data.success) {
-                    showToast('Formed ' + data.groupsFormed + ' group(s)');
-                    refreshGroupingStatus();
-                }
+                var outcomes = (data && data.outcomes) || [];
+                var failures = outcomes.filter(function (outcome) { return !outcome.success; });
+                showToast('Auto-form: ' + ((data && data.groupsFormed) || 0) + ' formed, ' + failures.length + ' unresolved', failures.length > 0);
+                failures.forEach(function (outcome) {
+                    showToast(groupMutationOutcomeText(outcome), true);
+                    offerUnknownFormReconciliation(outcome);
+                });
+                // Partial success still changed authoritative topology; always refresh.
+                refreshGroupingStatus();
             }
         });
     });
+
+    function groupMutationOutcomeText(outcome) {
+        var members = (outcome.memberGuids || []).join(',');
+        return (outcome.operation || 'group') + ' leader=' + (outcome.leaderGuid || '?') +
+            ' members=[' + members + '] → ' + (outcome.status || 'unknown') +
+            ': ' + (outcome.detail || 'no detail') + (outcome.cbt ? ' [cbt=' + outcome.cbt + ']' : '');
+    }
+
+    function offerUnknownFormReconciliation(outcome) {
+        if (!outcome || outcome.operation !== 'form' || outcome.status !== 'outcome_unknown') return;
+        var members = outcome.memberGuids || [];
+        var followers = members.filter(function (guid) { return guid !== outcome.leaderGuid; });
+        if (!outcome.leaderGuid || !followers.length) return;
+        if (!confirm(groupMutationOutcomeText(outcome) + '\n\nRe-send this exact formation with a fresh cbt to reconcile?')) return;
+
+        $.ajax({
+            url: '/Bots/FormGroup',
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ leaderGuid: outcome.leaderGuid, followerGuids: followers }),
+            success: function (result) {
+                if (result && result.success) {
+                    showToast('Group formation reconciled [cbt=' + result.cbt + ']');
+                } else {
+                    showToast('Reconciliation failed: ' + ((result && (result.error || result.status)) || 'unknown') +
+                        (result && result.cbt ? ' [cbt=' + result.cbt + ']' : ''), true);
+                }
+                refreshGroupingStatus();
+            },
+            error: function (xhr) {
+                showToast('Reconciliation request failed (HTTP ' + xhr.status + ')', true);
+            }
+        });
+    }
 
     function refreshGroupingStatus() {
         $.getJSON('/Bots/BrainStatus', function (data) {
@@ -3289,6 +3332,9 @@ $(function () {
                 if (data.success) {
                     showToast('Group #' + groupId + ' disbanded');
                     refreshGroupingStatus();
+                } else {
+                    showToast('Disband failed: ' + ((data && (data.error || data.status)) || 'unknown') +
+                        (data && data.cbt ? ' [cbt=' + data.cbt + ']' : ''), true);
                 }
             }
         });
@@ -4681,7 +4727,8 @@ $(function () {
                     renderManageGroups();
                     refreshGroupingStatus();
                 } else {
-                    showToast('Disband failed: ' + ((data && data.error) || 'unknown'), true);
+                    showToast('Disband failed: ' + ((data && (data.error || data.status)) || 'unknown') +
+                        (data && data.cbt ? ' [cbt=' + data.cbt + ']' : ''), true);
                     $btn.prop('disabled', false);
                 }
             })
@@ -4699,7 +4746,10 @@ $(function () {
                     showToast('Dissolved ' + data.disbanded + ' group' + (data.disbanded === 1 ? '' : 's'));
                     loadManageGroups();
                 } else {
-                    showToast('Dissolve all failed: ' + ((data && data.error) || 'unknown'), true);
+                    var details = ((data && data.outcomes) || []).filter(function (outcome) { return !outcome.success; })
+                        .map(groupMutationOutcomeText).join(' | ');
+                    showToast('Dissolve all incomplete: ' + (details || 'unknown'), true);
+                    loadManageGroups();
                 }
             })
             .fail(function (xhr) { showToast('Dissolve all failed (' + xhr.status + ')', true); })
@@ -5296,18 +5346,25 @@ $(function () {
     function bcSend(url, build, verb) {
         var targets = bcTargets();
         if (!targets.length) { showToast('No target bots', true); return; }
-        var done = 0, failed = 0, firstErr = null;
+        var done = 0, sent = 0, failed = 0, firstErr = null, correlations = [];
         targets.forEach(function (g) {
             $.ajax({ url: url, type: 'POST', contentType: 'application/json', data: JSON.stringify(build(g)) })
                 .done(function (r) {
                     if (r && r.success === false) { failed++; if (!firstErr) firstErr = r.error; }
-                    else done++;
+                    else {
+                        done++;
+                        if (r && r.sent === true) sent++;
+                        if (r && r.cbt) correlations.push(r.cbt);
+                    }
                 })
                 .fail(function (x) { failed++; if (!firstErr) firstErr = 'HTTP ' + x.status; })
                 .always(function () {
                     if (done + failed !== targets.length) return;
-                    if (failed) showToast(verb + ' — ' + done + ' ok, ' + failed + ' failed' + (firstErr ? ' (' + firstErr + ')' : ''), true);
-                    else showToast(verb + ' \u2192 ' + (targets.length === 1 ? bcTargetLabel() : targets.length + ' bots'));
+                    if (failed) showToast(verb + ' — ' + done + ' accepted, ' + failed + ' not sent' + (firstErr ? ' (' + firstErr + ')' : ''), true);
+                    else if (sent) showToast(verb + ' sent; execution pending \u2192 ' +
+                        (targets.length === 1 ? bcTargetLabel() : targets.length + ' bots') +
+                        (correlations.length === 1 ? ' [cbt=' + correlations[0] + ']' : ''));
+                    else showToast(verb + ' accepted \u2192 ' + (targets.length === 1 ? bcTargetLabel() : targets.length + ' bots'));
                 });
         });
     }
@@ -5431,6 +5488,7 @@ $(function () {
         var sp = '<div class="bc-row">' +
             bcNum('bcSpellId', 'spell id', '', 110) + bcBtn('bcLearn', 'fa-book', 'Learn spell') +
             '</div><div class="bc-row">' +
+            bcNum('bcTargetEntry', 'creature entry', '', 130) +
             bcNum('bcTargetGuid', 'target guid', '', 120) +
             bcBtn('bcAttack', 'fa-crosshairs', 'Attack', 'danger') +
             bcBtn('bcInteract', 'fa-hand-point-up', 'Interact') +
@@ -5482,9 +5540,19 @@ $(function () {
             if (!d) return;
             var armed = d.armed || [];
             var mine = bcGuid > 0 && armed.indexOf(bcGuid) >= 0;
-            $('#bcCircuitState').text('circuit: ' + d.mode + ' · ' + armed.length + ' armed' +
-                (bcGuid > 0 ? (mine ? ' · this bot IS armed' : ' · this bot is not armed') : ''));
-        }).fail(function () { $('#bcCircuitState').text('circuit: status unavailable'); });
+            var shadow = d.mode === 'shadow';
+            // Make an armed bot unmistakable: the Arm button lights up, the whole
+            // Circuit Board card goes "recording", and the state line shows a REC dot.
+            $('#bcCircuitArm').toggleClass('bc-on', mine).closest('.bc-card').toggleClass('bc-armed', mine);
+            $('#bcCircuitShadow').toggleClass('bc-on', shadow);
+            $('#bcCircuitState').toggleClass('bc-rec', mine).html(
+                (mine ? '<span class="bc-rec-dot">●</span> ' : '') +
+                'circuit: ' + esc(d.mode) + ' · ' + armed.length + ' armed' +
+                (bcGuid > 0 ? (mine ? ' · this bot IS armed (writing to disk)' : ' · this bot is not armed') : ''));
+        }).fail(function () {
+            $('#bcCircuitState').removeClass('bc-rec').text('circuit: status unavailable');
+            $('#bcCircuitArm').removeClass('bc-on').closest('.bc-card').removeClass('bc-armed');
+        });
     }
 
     // ---- control handlers (delegated — the modal body is rebuilt on every open)
@@ -5558,14 +5626,14 @@ $(function () {
         bcSend('/Bots/LearnSpell', function (g) { return { guid: g, spellId: sid }; }, 'LEARN_SPELL');
     });
     $(document).on('click', '#bcAttack', function () {
-        var t = parseInt($('#bcTargetGuid').val(), 10) || 0;
-        if (!t) { showToast('Target guid required', true); return; }
-        bcSend('/Bots/AttackTarget', function (g) { return { guid: g, targetGuid: t }; }, 'ATTACK_TARGET');
+        var e = parseInt($('#bcTargetEntry').val(), 10) || 0, t = parseInt($('#bcTargetGuid').val(), 10) || 0;
+        if (!e || !t) { showToast('Creature entry + target guid required', true); return; }
+        bcSend('/Bots/AttackTarget', function (g) { return { guid: g, targetEntry: e, targetGuid: t }; }, 'ATTACK_TARGET');
     });
     $(document).on('click', '#bcInteract', function () {
-        var t = parseInt($('#bcTargetGuid').val(), 10) || 0;
-        if (!t) { showToast('Target guid required', true); return; }
-        bcSend('/Bots/InteractNpc', function (g) { return { guid: g, targetGuid: t }; }, 'INTERACT_NPC');
+        var e = parseInt($('#bcTargetEntry').val(), 10) || 0, t = parseInt($('#bcTargetGuid').val(), 10) || 0;
+        if (!e || !t) { showToast('Creature entry + target guid required', true); return; }
+        bcSend('/Bots/InteractNpc', function (g) { return { guid: g, targetEntry: e, targetGuid: t }; }, 'INTERACT_NPC');
     });
     $(document).on('click', '#bcTakeFlight', function () {
         var src = parseInt($('#bcFlySrc').val(), 10) || 0, dst = parseInt($('#bcFlyDst').val(), 10) || 0;

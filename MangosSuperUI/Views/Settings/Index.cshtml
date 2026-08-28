@@ -1,5 +1,10 @@
 ﻿@{
     ViewData["Title"] = "Settings";
+    string? circuitAppRevision = MangosSuperUI.Services.CircuitTraceSourceService.InstalledApplicationRevision;
+    string? circuitAppArchiveUrl = MangosSuperUI.Services.CircuitTraceSourceService.InstalledApplicationSourceArchiveUrl;
+    string circuitAppRevisionShort = circuitAppRevision is { Length: > 12 }
+        ? circuitAppRevision[..12]
+        : circuitAppRevision ?? "unknown";
 }
 
 <div class="app-shell">
@@ -28,6 +33,8 @@
         </div>
 
         <div class="content-body">
+            @Html.AntiForgeryToken()
+
             <!-- Status Banner -->
             <div class="card mb-4" id="configStatusCard">
                 <div class="card-body d-flex align-items-center gap-3">
@@ -36,6 +43,139 @@
                         <div style="font-weight: 600; font-size: 13.5px;" id="configStatusTitle">Loading configuration...</div>
                         <div style="font-size: 12.5px; color: var(--text-secondary);" id="configStatusDetail"></div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Circuit Board source code -->
+            <div class="card mb-4 source-setup-card" id="circuit-source">
+                <div class="card-header d-flex align-items-center justify-content-between gap-3">
+                    <div class="d-flex align-items-center gap-2">
+                        <i class="fa-solid fa-code-branch" style="color: var(--accent);"></i>
+                        Circuit Board Source Code
+                    </div>
+                    <a class="btn-outline-subtle btn-xs" id="btnOpenCircuit" href="/CircuitTrace">
+                        Open Circuit Board <i class="fa-solid fa-arrow-right"></i>
+                    </a>
+                </div>
+                <div class="card-body">
+                    <p class="source-setup-intro">
+                        Circuit Board explains each decision beside the exact code that made it. It needs
+                        <strong>two different source code packages</strong>&mdash;one from MangosSuperUI and one from
+                        SuperUI-Core. A published application ZIP contains compiled files, not source, and will not work here.
+                    </p>
+
+                    <div class="source-package-guide">
+                        <i class="fa-solid fa-circle-info" aria-hidden="true"></i>
+                        <div>
+                            <strong>Use the source versions that built this installation.</strong>
+                            If the source checkout is on the same machine as the MangosSuperUI service, enter its server path.
+                            Otherwise, download the matching repository source ZIP and upload it in the correct row below.
+                            A server path is not a folder on the computer running your browser.
+                        </div>
+                    </div>
+
+                    <div class="source-overall" id="circuitSourceOverall" aria-live="polite">
+                        <i class="fa-solid fa-spinner fa-spin"></i>
+                        <span>Checking source code...</span>
+                    </div>
+
+                    <div class="source-setup-grid">
+                        <section class="source-setup-item" data-source-row="csharp">
+                            <div class="source-setup-heading">
+                                <div>
+                                    <div class="source-setup-title">1. MangosSuperUI (C#)</div>
+                                    <div class="source-setup-note">
+                                        Get the matching source from the
+                                        <a href="https://github.com/Yafrovon/MangosSuperUI/releases" target="_blank" rel="noopener">MangosSuperUI release</a>
+                                        you installed (the <strong>Source code (zip)</strong> asset), or from your build checkout.
+                                        The ZIP must contain <code>MangosSuperUI/MangosSuperUI.csproj</code> and <code>MangosSuperUI/BotLogic</code>.
+                                        @if (circuitAppArchiveUrl != null)
+                                        {
+                                            <span class="source-revision-callout">
+                                                This installation records base commit <code title="@circuitAppRevision">@circuitAppRevisionShort</code>.
+                                                <a href="@circuitAppArchiveUrl" target="_blank" rel="noopener">Download that commit's source ZIP</a>.
+                                                If the application was built with uncommitted changes, use its original build checkout instead.
+                                            </span>
+                                        }
+                                    </div>
+                                </div>
+                                <span class="source-state" id="circuitCSharpState">Checking</span>
+                            </div>
+                            <div class="source-method">
+                                <label class="source-method-label" for="cfgCircuitCSharpSourcePath">Folder already on the server</label>
+                                <input type="text" class="form-input cfg-input" id="cfgCircuitCSharpSourcePath"
+                                       aria-label="MangosSuperUI source folder on the server"
+                                       placeholder="C:\source\MangosSuperUI\MangosSuperUI or /srv/MangosSuperUI/MangosSuperUI" />
+                                <span class="source-method-help">Paste the server path, then click <strong>Save Settings</strong>.</span>
+                            </div>
+                            <div class="source-method-divider"><span>or</span></div>
+                            <div class="source-method">
+                                <span class="source-method-label">ZIP from this computer</span>
+                                <button type="button" class="btn-outline-subtle btn-source-upload" data-source-kind="csharp"
+                                        aria-label="Upload MangosSuperUI C# source ZIP">
+                                    <i class="fa-solid fa-file-zipper"></i> Upload MangosSuperUI ZIP
+                                </button>
+                                <span class="source-method-help">Uploads and installs immediately; no Settings save is needed.</span>
+                                <input type="file" class="source-file-input" id="circuitCSharpZip" data-source-kind="csharp" accept=".zip,application/zip" />
+                            </div>
+                            <div class="source-result" id="circuitCSharpStatus">Waiting for source status.</div>
+                        </section>
+
+                        <section class="source-setup-item" data-source-row="cpp">
+                            <div class="source-setup-heading">
+                                <div>
+                                    <div class="source-setup-title">2. SuperUI-Core (VMaNGOS C++)</div>
+                                    <div class="source-setup-note">
+                                        Prefer the exact checkout that built the running <code>mangosd</code>. Enter its
+                                        <code>src</code> folder on this server, or download that revision from the
+                                        <a href="https://github.com/Yafrovon/SuperUI-Core" target="_blank" rel="noopener">SuperUI-Core repository</a>
+                                        and upload the repository ZIP. It must contain <code>src/game/SuperUiContent/SuiBots</code>.
+                                        <span class="source-revision-callout">
+                                            The Dashboard's <strong>Core Revision</strong> identifies the commit used by the running server.
+                                        </span>
+                                    </div>
+                                </div>
+                                <span class="source-state" id="circuitCppState">Checking</span>
+                            </div>
+                            <div class="source-method">
+                                <label class="source-method-label" for="cfgSourcePath">Folder already on the server</label>
+                                <input type="text" class="form-input cfg-input" id="cfgSourcePath"
+                                       aria-label="SuperUI-Core src folder on the server"
+                                       placeholder="/home/wowvmangos/vmangos/src" />
+                                <span class="source-method-help">Paste the server's <code>src</code> path, then click <strong>Save Settings</strong>.</span>
+                            </div>
+                            <div class="source-method-divider"><span>or</span></div>
+                            <div class="source-method">
+                                <span class="source-method-label">ZIP from this computer</span>
+                                <button type="button" class="btn-outline-subtle btn-source-upload" data-source-kind="cpp"
+                                        aria-label="Upload SuperUI-Core C++ source ZIP">
+                                    <i class="fa-solid fa-file-zipper"></i> Upload SuperUI-Core ZIP
+                                </button>
+                                <span class="source-method-help">Uploads and installs immediately; do not use stock VMaNGOS.</span>
+                                <input type="file" class="source-file-input" id="circuitCppZip" data-source-kind="cpp" accept=".zip,application/zip" />
+                            </div>
+                            <div class="source-result" id="circuitCppStatus">Waiting for source status.</div>
+                        </section>
+                    </div>
+
+                    <p class="source-upload-help">
+                        <i class="fa-solid fa-lightbulb" aria-hidden="true"></i>
+                        Upload each ZIP in its own row (<span id="circuitUploadLimit">up to 256 MB each</span>).
+                        GitHub's downloaded ZIP can be uploaded as-is; the installer finds the project inside its wrapper folder.
+                        After a successful upload, that row changes to <strong>Ready</strong>.
+                    </p>
+
+                    <details class="source-advanced">
+                        <summary>Advanced upload storage</summary>
+                        <div class="source-advanced-body">
+                            <label class="cmd-label">Uploaded source package directory</label>
+                            <input type="text" class="form-input cfg-input" id="cfgCircuitSourcePackageDirectory"
+                                   placeholder="(uses the service account's application-data folder)" />
+                            <div class="source-setup-note">
+                                Leave blank for durable storage outside the published site. A relative path is resolved under the service account's application-data folder.
+                            </div>
+                        </div>
+                    </details>
                 </div>
             </div>
 
@@ -454,13 +594,6 @@
                         </div>
                         <div class="col-md-6">
                             <label class="cmd-label">
-                                VMaNGOS Source Path
-                                <i class="fa-solid fa-circle-question cfg-hint" title="Path to the C++ source tree (src/). Included in Core Source backups. Leave empty to skip source in core backups."></i>
-                            </label>
-                            <input type="text" class="form-input cfg-input" id="cfgSourcePath" placeholder="/home/wowvmangos/vmangos/src" />
-                        </div>
-                        <div class="col-md-6">
-                            <label class="cmd-label">
                                 VMaNGOS SQL Path
                                 <i class="fa-solid fa-circle-question cfg-hint" title="Path to the SQL migrations directory. Included in Core Source backups alongside the source tree."></i>
                             </label>
@@ -550,6 +683,240 @@
             border: 1px solid var(--border);
             border-radius: var(--radius-sm);
             padding: 10px 14px;
+        }
+
+        .source-setup-card {
+            scroll-margin-top: 18px;
+        }
+
+        .source-setup-intro {
+            max-width: 920px;
+            margin: 0 0 14px;
+            color: var(--text-secondary);
+            font-size: 12.75px;
+            line-height: 1.55;
+        }
+
+        .source-package-guide {
+            display: grid;
+            grid-template-columns: 18px minmax(0, 1fr);
+            gap: 9px;
+            margin-bottom: 14px;
+            padding: 11px 12px;
+            border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
+            border-radius: var(--radius-sm);
+            background: color-mix(in srgb, var(--accent) 6%, var(--bg-input));
+            color: var(--text-secondary);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .source-package-guide > i {
+            margin-top: 2px;
+            color: var(--accent);
+        }
+
+        .source-package-guide strong {
+            color: var(--text-primary);
+        }
+
+        .source-overall {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 14px;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--accent);
+            border-radius: var(--radius-sm);
+            background: var(--bg-input);
+            color: var(--text-secondary);
+            font-size: 12.5px;
+        }
+
+        .source-overall.is-ready {
+            border-left-color: var(--status-online);
+        }
+
+        .source-overall.is-missing {
+            border-left-color: var(--status-warning);
+        }
+
+        .source-overall.is-error {
+            border-left-color: var(--status-error);
+            color: var(--status-error);
+        }
+
+        .source-setup-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .source-setup-item {
+            min-width: 0;
+            padding: 14px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: color-mix(in srgb, var(--bg-input) 72%, transparent);
+        }
+
+        .source-setup-heading {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 11px;
+        }
+
+        .source-setup-title {
+            color: var(--text-primary);
+            font-size: 13px;
+            font-weight: 650;
+        }
+
+        .source-setup-note,
+        .source-result {
+            color: var(--text-muted);
+            font-size: 11.75px;
+            line-height: 1.45;
+        }
+
+        .source-setup-note a,
+        .source-upload-help a {
+            color: var(--accent);
+        }
+
+        .source-revision-callout {
+            display: block;
+            margin-top: 6px;
+            color: var(--text-secondary);
+        }
+
+        .source-state {
+            flex: 0 0 auto;
+            padding: 2px 8px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            color: var(--text-muted);
+            font-size: 10.5px;
+            font-weight: 650;
+            text-transform: uppercase;
+            letter-spacing: .035em;
+        }
+
+        .source-state.is-ready {
+            border-color: color-mix(in srgb, var(--status-online) 55%, var(--border));
+            color: var(--status-online);
+        }
+
+        .source-state.is-missing {
+            border-color: color-mix(in srgb, var(--status-warning) 55%, var(--border));
+            color: var(--status-warning);
+        }
+
+        .source-state.is-error {
+            border-color: color-mix(in srgb, var(--status-error) 55%, var(--border));
+            color: var(--status-error);
+        }
+
+        .source-state.is-working {
+            border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+            color: var(--accent);
+        }
+
+        .source-method {
+            display: grid;
+            gap: 6px;
+            margin-top: 12px;
+        }
+
+        .source-method-label {
+            color: var(--text-secondary);
+            font-size: 11.5px;
+            font-weight: 650;
+        }
+
+        .source-method-help {
+            color: var(--text-muted);
+            font-size: 10.75px;
+            line-height: 1.4;
+        }
+
+        .source-method-divider {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            gap: 8px;
+            margin: 11px 0 -1px;
+            color: var(--text-muted);
+            font-size: 10px;
+            text-transform: uppercase;
+        }
+
+        .source-method-divider::before,
+        .source-method-divider::after {
+            height: 1px;
+            background: var(--border);
+            content: "";
+        }
+
+        .btn-source-upload {
+            width: 100%;
+            white-space: nowrap;
+        }
+
+        .source-file-input {
+            display: none;
+        }
+
+        .source-result.is-ready {
+            color: var(--text-secondary);
+        }
+
+        .source-result.is-error {
+            color: var(--status-error);
+        }
+
+        .source-result.is-working {
+            color: var(--accent);
+        }
+
+        .source-upload-help {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            margin: 11px 2px 0;
+            color: var(--text-muted);
+            font-size: 11.75px;
+            line-height: 1.45;
+        }
+
+        .source-upload-help > i {
+            margin-top: 2px;
+            color: var(--status-warning);
+        }
+
+        .source-advanced {
+            margin-top: 12px;
+            color: var(--text-muted);
+            font-size: 11.75px;
+        }
+
+        .source-advanced summary {
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .source-advanced-body {
+            max-width: 760px;
+            margin-top: 9px;
+        }
+
+        @@media (max-width: 980px) {
+            .source-setup-grid {
+                grid-template-columns: 1fr;
+            }
         }
 
         .dbc-count-chip {

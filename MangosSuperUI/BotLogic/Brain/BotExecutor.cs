@@ -15,11 +15,11 @@ namespace MangosSuperUI.BotLogic.Brain;
 // Nothing here is goal-specific; this is the single piece of plumbing every goal
 // shares.
 //
-// corr (§5.2): corr is written ONLY to the C++ story file for offline merge — it
-// never rides a bridge event. So WAIT-matching is by EVENT TYPE, not corr. This
-// is sufficient because the spine holds exactly one outstanding command per bot
-// (ctx.Pending is singular) → an inbound event has at most one WAIT to satisfy.
-// The old corr-stamp / corr-echo machinery was dead code and is gone.
+// cbt (§5.2): every real WAIT owns a protocol correlation id. It is allocated
+// BEFORE the socket write, stamped on ctx.Pending, sent as top-level cbt, and
+// echoed on the terminal EVENT. Event type says what kind of outcome this is;
+// exact cbt equality says which command it belongs to. A stale or missing cbt
+// can therefore never release a newer same-type WAIT.
 // ============================================================================
 public sealed class BotExecutor
 {
@@ -35,11 +35,10 @@ public sealed class BotExecutor
     // Ridge workers = 180s, but pass-2 'kill anything' keeps the gap far under this).
     private static readonly TimeSpan ObjectiveKillGrace = TimeSpan.FromSeconds(120);
 
-    // Premature-arrival guard (npc_not_found fix). Acks match by event TYPE (no corr), so a duplicate /
-    // previous-leg TASK_COMPLETE in the pipe can ack a just-issued travel leg early — the bot "arrives"
-    // hundreds of yards out and QuestPlanner fires QUEST_INTERACT from the wrong spot. We reject a
-    // TASK_COMPLETE only when it is BOTH implausibly young (a leg too new to have walked this far) AND
-    // far from dest — that pair is the stale-duplicate signature. We do NOT reject on distance alone:
+    // Premature-arrival guard (npc_not_found fix). Exact cbt matching is the structural stale-ack
+    // defense; this remains as a secondary semantic check against a core falsely reporting success for
+    // the CURRENT leg. We reject a TASK_COMPLETE only when it is BOTH implausibly young and far from
+    // dest. We do NOT reject on distance alone:
     // ctx.Pos is refreshed only on the 5s STATE heartbeat, so a legitimately-walked long leg can read up
     // to ~one STATE-cycle stale (≈ 35yd at 7yd/s) at the instant C++'s real arrival lands. C++ only ever
     // emits "arrived" within its own 3yd 2D gate (AiBotAIMain), so once a leg is older than
@@ -72,14 +71,26 @@ public sealed class BotExecutor
         // [CONSCRIPTED] The commander owns this bot; no planner traffic. The C++
         // bridge fence would drop the command anyway — refusing here keeps
         // Pending unarmed so nothing waits on an event that can never come.
-        if (ctx.Conscripted)
+        if (ctx.Conscripted || ctx.Possessed)
         {
-            CircuitTrace.HitNote(ctx.Guid, "issue: refused (conscripted)", cmd.Type);
-            _logger.LogDebug("[EXEC] {Name} refuse {Type} (conscripted)", ctx.Name, cmd.Type);
+            CircuitTrace.HitNote(ctx.Guid, "issue: refused (externally controlled)", cmd.Type);
+            _logger.LogDebug("[EXEC] {Name} refuse {Type} (externally controlled)", ctx.Name, cmd.Type);
             return;
         }
 
         var now = DateTime.UtcNow;
+        NoWaitCommandOwner? priorNoWaitCommand = ctx.LatestNoWaitCommand;
+        NoWaitCommandOwner? priorNoWaitTask = ctx.NoWaitTaskOwner;
+        bool supersedesTaskMotion = cmd.Type.Equals("MOVE_TO", StringComparison.OrdinalIgnoreCase)
+            || cmd.Type.Equals("SET_TASK", StringComparison.OrdinalIgnoreCase);
+
+        // A newer waited command supersedes control-drop ownership. A waited
+        // task/motion command also supersedes the prior no-WAIT task owner. If
+        // the socket write is definitely not attempted, both are restored below
+        // because the core is still running the old command.
+        ctx.LatestNoWaitCommand = null;
+        if (supersedesTaskMotion)
+            ctx.NoWaitTaskOwner = null;   // cb:fold task-domain owner detail; send outcome probes the transition
 
         // An ENRICHED objective MOVE_TO (§4) carries creature_entry/kill_count: C++ travels
         // then grinds in place under this one WAIT. Flag it so the KILL-push in OnEvent rolls
@@ -91,8 +102,13 @@ public sealed class BotExecutor
         // moveTgt below for MOVE_TO.
         int? questId = ExtractQuestId(cmd);
 
-        ctx.Pending = new Outstanding
+        // Allocate BEFORE arming/sending. If the core replies immediately, the
+        // EVENT can already find this exact WAIT while the socket write is still
+        // unwinding; allocating after await would create a lost-ack race.
+        long correlationId = BridgeCorrelation.NextId();
+        var outstanding = new Outstanding
         {
+            CorrelationId = correlationId,
             CommandType = cmd.Type,
             ExpectedEvent = expectedEvent,
             SentUtc = now,
@@ -107,6 +123,7 @@ public sealed class BotExecutor
             RescanAtUtc = objectiveGrind ? now + RescanLeadIn : (DateTime?)null,
             QuestId = questId
         };
+        ctx.Pending = outstanding;
 
         // Capture the destination so FleetReport can show distance-to-target.
         Vec4? moveTgt = null;
@@ -116,6 +133,7 @@ public sealed class BotExecutor
             moveTgt = ExtractTarget(cmd);
             if (moveTgt != null) ctx.Target = moveTgt;   // cb:fold outcome carried by the capture probe
         }
+        CircuitTrace.Hit(ctx.Guid, "issue: WAIT armed with correlation", correlationId);
         CircuitTrace.HitNote(ctx.Guid, "issue: WAIT armed + command sent", cmd.Type);
 
         // Instrumentation: a travel MOVE_TO logs dest + bot pos + distance; a QUEST_INTERACT logs the
@@ -132,7 +150,55 @@ public sealed class BotExecutor
             _logger.LogDebug("[EXEC] {Name} issue {Type} expect={Expect} deadline={Sec}s",   // cb:fold logging only
                 ctx.Name, cmd.Type, expectedEvent, deadline.TotalSeconds);
 
-        await _bridge.SendToBotAsync(ctx.Guid, cmd.Type, cmd.Payload);
+        CorrelatedSendStatus sendStatus = await _bridge.TrySendCorrelatedAsync(
+            ctx.Guid, cmd.Type, cmd.Payload, correlationId, ctx.BridgeSessionId);
+
+        // The bridge's legacy send API is intentionally best-effort, but a WAIT
+        // must not remain armed when no bytes were written. Only clear the exact
+        // object we installed: an immediate ACK may already have resolved it.
+        if (sendStatus == CorrelatedSendStatus.SessionSuperseded
+            && ReferenceEquals(ctx.Pending, outstanding))
+        {
+            // A socket handoff is infrastructure churn, not a failed route or
+            // action. Retire all old-session ownership without poisoning planner
+            // failure state; a fresh STATE will drive the next decision.
+            ctx.Pending = null;
+            ctx.LatestNoWaitCommand = null;
+            if (supersedesTaskMotion)
+                ctx.NoWaitTaskOwner = null;   // cb:fold task-domain owner detail; session-retired probe carries outcome
+            ctx.Failure = null;
+            CircuitTrace.Hit(ctx.Guid, "issue: session replaced before send, WAIT retired", correlationId);
+        }
+        else if (sendStatus == CorrelatedSendStatus.DefinitelyNotSent
+            && ReferenceEquals(ctx.Pending, outstanding))
+        {
+            ctx.LatestNoWaitCommand = priorNoWaitCommand;
+            if (supersedesTaskMotion)
+                ctx.NoWaitTaskOwner = priorNoWaitTask;   // cb:fold task-domain owner detail; send-failed probe carries outcome
+            CircuitTrace.Hit(ctx.Guid, "issue: correlated send failed, WAIT released", correlationId);
+            ctx.Pending = null;
+            ctx.Failure = new WaitFailure
+            {
+                CommandType = cmd.Type,
+                Reason = "send_failed",
+                Dest = moveTgt,
+                QuestId = questId,
+                Utc = DateTime.UtcNow
+            };
+            ctx.ConsecutiveFailures++;
+            _logger.LogWarning("[EXEC] {Name} failed to send {Type} cbt={Cbt}; WAIT released",
+                ctx.Name, cmd.Type, correlationId);
+        }
+        else if (sendStatus == CorrelatedSendStatus.OutcomeUnknown
+                 && ReferenceEquals(ctx.Pending, outstanding))
+        {
+            // A partial socket write may already have committed in the core.
+            // Keep the bounded correlated waiter; retrying here could duplicate
+            // a destructive/non-idempotent action.
+            CircuitTrace.Hit(ctx.Guid, "issue: send outcome unknown, WAIT retained", correlationId);
+            _logger.LogWarning("[EXEC] {Name} send outcome unknown for {Type} cbt={Cbt}; retaining WAIT to deadline",
+                ctx.Name, cmd.Type, correlationId);
+        }
     }
 
     /// <summary>
@@ -145,12 +211,36 @@ public sealed class BotExecutor
     {
         // [CONSCRIPTED] Same refusal as IssueAsync — the army answers to its
         // commander, not the planner.
-        if (ctx.Conscripted)
+        if (ctx.Conscripted || ctx.Possessed)
         {
-            CircuitTrace.HitNote(ctx.Guid, "fire: refused (conscripted)", cmd.Type);
-            _logger.LogDebug("[EXEC] {Name} refuse {Type} (conscripted)", ctx.Name, cmd.Type);
+            CircuitTrace.HitNote(ctx.Guid, "fire: refused (externally controlled)", cmd.Type);
+            _logger.LogDebug("[EXEC] {Name} refuse {Type} (externally controlled)", ctx.Name, cmd.Type);
             return;
         }
+
+        // Allocate and retain an owner even without a deadline WAIT. Protocol-v4
+        // negative outcomes and control drops are still terminal feedback; exact
+        // ownership stops a delayed A outcome from mutating a newer B task.
+        long correlationId = BridgeCorrelation.NextId();
+        bool ownsTaskMotion = cmd.Type.Equals("MOVE_TO", StringComparison.OrdinalIgnoreCase)
+            || cmd.Type.Equals("SET_TASK", StringComparison.OrdinalIgnoreCase);
+        bool canGrindBlock = cmd.Type.Equals("MOVE_TO", StringComparison.OrdinalIgnoreCase)
+                && cmd.Payload.ContainsKey("creature_entry")
+            || cmd.Type.Equals("SET_TASK", StringComparison.OrdinalIgnoreCase)
+                && cmd.Payload.TryGetValue("task", out object? task)
+                && string.Equals(task?.ToString(), "GRIND", StringComparison.OrdinalIgnoreCase);
+        var owner = new NoWaitCommandOwner
+        {
+            CorrelationId = correlationId,
+            CommandType = cmd.Type,
+            OwnsTaskMotion = ownsTaskMotion,
+            CanGrindBlock = canGrindBlock
+        };
+        NoWaitCommandOwner? priorNoWaitCommand = ctx.LatestNoWaitCommand;
+        NoWaitCommandOwner? priorNoWaitTask = ctx.NoWaitTaskOwner;
+        ctx.LatestNoWaitCommand = owner;
+        if (ownsTaskMotion)
+            ctx.NoWaitTaskOwner = owner;   // cb:fold task-domain owner detail; correlated send probe carries issue
 
         // Parity with IssueAsync: keep distance-to-target live for MOVE_TO fires.
         if (cmd.Type == "MOVE_TO")
@@ -163,7 +253,26 @@ public sealed class BotExecutor
 
         _logger.LogDebug("[EXEC] {Name} fire {Type} (no-wait)", ctx.Name, cmd.Type);
 
-        await _bridge.SendToBotAsync(ctx.Guid, cmd.Type, cmd.Payload);
+        CorrelatedSendStatus sendStatus = await _bridge.TrySendCorrelatedAsync(
+            ctx.Guid, cmd.Type, cmd.Payload, correlationId, ctx.BridgeSessionId);
+        if (sendStatus == CorrelatedSendStatus.SessionSuperseded)
+        {
+            ctx.TryReplaceLatestNoWaitOwner(owner, null);
+            if (ownsTaskMotion)
+                ctx.TryReplaceNoWaitTaskOwner(owner, null);   // cb:fold task-domain owner detail; session-retired probe carries outcome
+            CircuitTrace.Hit(ctx.Guid, "fire: session replaced before send, owner retired", correlationId);
+        }
+        else if (sendStatus == CorrelatedSendStatus.DefinitelyNotSent)
+        {
+            ctx.TryReplaceLatestNoWaitOwner(owner, priorNoWaitCommand);
+            if (ownsTaskMotion)
+                ctx.TryReplaceNoWaitTaskOwner(owner, priorNoWaitTask);   // cb:fold task-domain owner detail; send-failed probe carries outcome
+            CircuitTrace.Hit(ctx.Guid, "fire: correlated send failed, owner restored", correlationId);
+        }
+        else if (sendStatus == CorrelatedSendStatus.OutcomeUnknown)
+        {
+            CircuitTrace.Hit(ctx.Guid, "fire: send outcome unknown, owner retained", correlationId);
+        }
     }
 
     /// <summary>
@@ -220,21 +329,19 @@ public sealed class BotExecutor
                 }
                 break;
             case "QUEST_UPDATE":
-            case "QUEST_COMPLETE_ACK":
                 CircuitTrace.Hit(ctx.Guid, "event: quest advance stamped");
                 ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
                 ctx.MarkProgress();
                 break;
             case "QUEST_ACCEPT_ACK":
-                CircuitTrace.Hit(ctx.Guid, "event: quest accept stamped");
-                ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
-                ctx.MarkProgress();
+                CircuitTrace.Hit(ctx.Guid, "event: quest accept terminal candidate");
                 // No cache seed anymore. ctx.QuestLog is fed exclusively by STATE (the retired pull), so the
                 // just-accepted quest appears on the next 5s heartbeat as C++ ground truth. The batch entry is
                 // already flipped Accepted=true by QuestPlanner's "accept" step this same tick, so the in-flight
                 // accept never depended on the cache. (Trade-off: a quest accepted <5s before a goal bounce can
                 // be re-gathered+re-accepted on return until STATE catches up — bounded, and the C++ accept is
                 // idempotent, so it's one wasted interact at worst. Strictly better than the old stale-cache class.)
+                // Progress is stamped only AFTER type+cbt validation below.
                 break;
             case "LEVEL_UP":
                 CircuitTrace.Hit(ctx.Guid, "event: level-up stamped");
@@ -248,23 +355,73 @@ public sealed class BotExecutor
             // empty-payload guard and dropped-held instrumentation) is gone with it. C++ no longer emits this
             // event because nothing sends QUERY_QUEST_STATUS.
             case "TELEPORT_ACK":
-                CircuitTrace.Hit(ctx.Guid, "event: teleport ack, position snapped");
-                // Teleport-assist: the bot was relocated (NearTeleportTo). Update Pos from the ack
-                // payload (x|y|z|map) IMMEDIATELY so the planner sees DistToTarget≈0 and fires the
-                // interaction THIS cycle — the 5 s STATE cadence would otherwise lag the new pos and
-                // the planner would re-issue a MOVE_TO from the stale position. Not progress-stamped
-                // here; the generic positive-ack path below clears the TELEPORT_TO WAIT + MarkProgress.
-                {
-                    var tk = ParsePipe(evt.Data);
-                    if (tk.TryGetValue("x", out var txs) && tk.TryGetValue("y", out var tys))
-                    {   // cb:fold parse detail, outcome carried by the ack probe
-                        float tz = tk.TryGetValue("z", out var tzs) ? ParseF(tzs) : ctx.Pos.Z;
-                        ctx.Pos = new Vec3(ParseF(txs), ParseF(tys), tz);
-                        if (tk.TryGetValue("map", out var tms) && int.TryParse(tms, out var tmap))
-                            ctx.MapId = tmap;   // cb:fold parse detail
-                    }
-                }
+                CircuitTrace.Hit(ctx.Guid, "event: teleport terminal candidate");
+                // Position is snapped only AFTER type+cbt validation below. A
+                // delayed ACK from an older hop must not mutate the current leg.
                 break;
+            case "MOVE_POINT_REFUSED":
+                {
+                    // This is unsolicited evidence from a C++-owned candidate hop, never a
+                    // terminal command outcome. Accept only the protocol's cbt=0 shape and
+                    // return before WAIT matching so even an in-flight command is untouched.
+                    if (evt.CorrelationId.GetValueOrDefault() != 0)
+                    {
+                        CircuitTrace.Hit(ctx.Guid,
+                            "event: autonomous move refusal rejected (nonzero cbt)",
+                            evt.CorrelationId ?? 0);
+                        return false;
+                    }
+
+                    if (!TryParseUniquePipe(evt.Data, out var refusal))
+                    {
+                        CircuitTrace.Hit(ctx.Guid,
+                            "event: autonomous move refusal rejected (malformed/duplicate fields)");
+                        return false;
+                    }
+                    if (!refusal.TryGetValue("reason", out string? refusalReason)
+                        || !refusalReason.Equals("no_path", StringComparison.OrdinalIgnoreCase)
+                        || !refusal.TryGetValue("source", out string? refusalSource)
+                        || !refusalSource.Equals("move_point", StringComparison.OrdinalIgnoreCase))
+                    {
+                        CircuitTrace.Hit(ctx.Guid,
+                            "event: autonomous move refusal rejected (reason/source contract)");
+                        return false;
+                    }
+
+                    if (!refusal.TryGetValue("point_id", out string? pointText)
+                        || !int.TryParse(pointText,
+                            System.Globalization.NumberStyles.None,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            out int pointId)
+                        || !IsAutonomousMovePoint(pointId))
+                    {
+                        CircuitTrace.HitNote(ctx.Guid,
+                            "event: autonomous move refusal rejected (invalid point id)",
+                            pointText ?? "missing");
+                        return false;
+                    }
+
+                    if (!refusal.TryGetValue("dest_x", out string? destXText)
+                        || !refusal.TryGetValue("dest_y", out string? destYText)
+                        || !refusal.TryGetValue("dest_z", out string? destZText)
+                        || !TryParseFiniteFloat(destXText, out float destX)
+                        || !TryParseFiniteFloat(destYText, out float destY)
+                        || !TryParseFiniteFloat(destZText, out float destZ))
+                    {
+                        CircuitTrace.Hit(ctx.Guid,
+                            "event: autonomous move refusal rejected (invalid destination)");
+                        return false;
+                    }
+
+                    CircuitTrace.Hit(ctx.Guid,
+                        "event: autonomous move refusal accepted as transient evidence",
+                        pointId);
+                    ctx.RecordAutonomousMoveRefusal(
+                        pointId,
+                        new Vec3(destX, destY, destZ),
+                        DateTime.UtcNow);
+                    return true;
+                }
             case "GRIND_BLOCKED":
                 // C++ froze on a grind (over-cap field OR no valid target) for AIBOT_GRIND_FREEZE_DWELL
                 // ticks and handed back. There is NO pending MOVE_TO WAIT at grind time (the enriched
@@ -274,9 +431,30 @@ public sealed class BotExecutor
                 // reason=no_target (the objective-grind overpull_dwell handback was retired 2026-06-30 when
                 // C++ began self-unsticking dense fields in place); the parse below stays reason-generic so a
                 // future reason flows through untouched — it's the planner that decides what to act on.
-                // Not a WAIT ack and not progress; bump the fail streak so the wedge breaker stays a backstop
-                // (a successful detour's TASK_COMPLETE resets it).
+                // Not a WAIT ack and not progress. It deliberately does not bump
+                // the hard-failure streak; the recovery detour's own WAIT is the
+                // bounded backstop (details beside the assignment below).
                 {
+                    if (ctx.Pending != null)
+                    {
+                        // Protocol v4 gives this task-owned cbt. Defer to the
+                        // exact matcher below: a current MOVE_TO/SET_TASK is
+                        // negated promptly; a delayed/wrong-cbt handback cannot
+                        // touch the replacement WAIT.
+                        CircuitTrace.Hit(ctx.Guid, "event: GRIND_BLOCKED deferred to correlated WAIT matcher");
+                        break;
+                    }
+                    NoWaitCommandOwner? owner = ctx.NoWaitTaskOwner;
+                    var ownerDisposition = owner == null
+                        ? WaitOutcomeMatcher.Disposition.NotForPending
+                        : WaitOutcomeMatcher.Classify(owner, evt);
+                    if (ownerDisposition != WaitOutcomeMatcher.Disposition.Negative)
+                    {
+                        CircuitTrace.Hit(ctx.Guid, "event: no-WAIT GRIND_BLOCKED rejected (owner/cbt mismatch)", evt.CorrelationId ?? 0);
+                        return false;
+                    }
+                    ctx.TryReplaceNoWaitTaskOwner(owner!, null);
+                    ctx.TryReplaceLatestNoWaitOwner(owner!, null);
                     CircuitTrace.Hit(ctx.Guid, "event: GRIND_BLOCKED handback -> failure for detour");
                     var gb = ParsePipe(evt.Data);
                     Vec4? dead = null;
@@ -295,7 +473,9 @@ public sealed class BotExecutor
                         QuestId = null,
                         Utc = DateTime.UtcNow
                     };
-                    ctx.Pending = null;            // drop any stale grind WAIT so the planner re-derives cleanly
+                    // This handback belongs to an unacked/no-WAIT grind. Never
+                    // clear a later, unrelated correlated WAIT if the event was
+                    // delayed in the socket.
                     // NB: do NOT bump ConsecutiveFailures. GRIND_BLOCKED is a self-healing handback (C# answers
                     // with the unstick detour), not a hard failure — counting it tripped the wedge-breaker
                     // (cap 8) within ~24s of metronoming, which parked the bot into a Goal.Grinding filler
@@ -307,6 +487,92 @@ public sealed class BotExecutor
                 }
         }
 
+        var pending = ctx.Pending;
+
+        if (pending == null
+            && (evt.EventType.Equals("POSSESSED_DROP", StringComparison.OrdinalIgnoreCase)
+                || evt.EventType.Equals("CONSCRIPTED_DROP", StringComparison.OrdinalIgnoreCase)))
+        {
+            NoWaitCommandOwner? owner = ctx.LatestNoWaitCommand;
+            var ownerDisposition = owner == null
+                ? WaitOutcomeMatcher.Disposition.NotForPending
+                : WaitOutcomeMatcher.Classify(owner, evt);
+            if (ownerDisposition != WaitOutcomeMatcher.Disposition.Negative)
+            {
+                CircuitTrace.Hit(ctx.Guid, "event: no-WAIT control drop rejected (owner/cbt mismatch)", evt.CorrelationId ?? 0);
+                return false;
+            }
+
+            ctx.TryReplaceLatestNoWaitOwner(owner!, null);
+            if (ReferenceEquals(ctx.NoWaitTaskOwner, owner))
+                ctx.TryReplaceNoWaitTaskOwner(owner!, null);   // cb:fold domain-owner cleanup; fence probe carries accepted outcome
+            ctx.Failure = null;
+            bool possessedDrop = evt.EventType.Equals("POSSESSED_DROP", StringComparison.OrdinalIgnoreCase);
+            ctx.ControlFenceReason = possessedDrop ? "possessed" : "conscripted";
+            ctx.ControlFenceObservedUtc = DateTime.UtcNow;
+            if (possessedDrop) ctx.Possessed = true;   // cb:fold fence kind carried by ControlFenceReason probe
+            else ctx.Conscripted = true;   // cb:fold fence kind carried by ControlFenceReason probe
+            CircuitTrace.HitNote(ctx.Guid, "event: correlated no-WAIT control fence latched", ctx.ControlFenceReason);
+            return true;
+        }
+
+        NoWaitCommandOwner? noWaitTaskOwner = ctx.NoWaitTaskOwner;
+        WaitOutcomeMatcher.Disposition noWaitDisposition = noWaitTaskOwner == null
+            ? WaitOutcomeMatcher.Disposition.NotForPending
+            : WaitOutcomeMatcher.Classify(noWaitTaskOwner, evt);
+
+        if (pending == null && noWaitDisposition == WaitOutcomeMatcher.Disposition.Positive)
+        {
+            ctx.TryReplaceNoWaitTaskOwner(noWaitTaskOwner!, null);
+            ctx.TryReplaceLatestNoWaitOwner(noWaitTaskOwner!, null);
+            if (ctx.Target is { } noWaitReached && ctx.Identity is { } noWaitMoveId)
+            {
+                CircuitTrace.Hit(ctx.Guid, "event: no-WAIT arrival clears the no-path streak");
+                noWaitMoveId.ClearNoPathStreak(noWaitReached.Map, noWaitReached.X, noWaitReached.Y);
+            }
+            ctx.Failure = null;
+            ctx.MarkProgress();
+            ctx.ConsecutiveFailures = 0;
+            CircuitTrace.Hit(ctx.Guid, "event: correlated no-WAIT task completed, owner retired");
+            return true;
+        }
+
+        if (pending == null
+            && evt.EventType.Equals("PATH_UNSAFE", StringComparison.OrdinalIgnoreCase))
+        {
+            if (noWaitDisposition != WaitOutcomeMatcher.Disposition.Negative)
+            {
+                CircuitTrace.Hit(ctx.Guid, "event: no-WAIT PATH_UNSAFE rejected (owner/cbt mismatch)", evt.CorrelationId ?? 0);
+                return false;
+            }
+
+            ctx.TryReplaceNoWaitTaskOwner(noWaitTaskOwner!, null);
+            ctx.TryReplaceLatestNoWaitOwner(noWaitTaskOwner!, null);
+            var unsafeData = ParsePipe(evt.Data);
+            Vec4? unsafeDest = null;
+            if (unsafeData.TryGetValue("dest_x", out var udx)
+                && unsafeData.TryGetValue("dest_y", out var udy))
+            {   // cb:fold parse detail, outcome carried in the failure record
+                float udz = unsafeData.TryGetValue("dest_z", out var udzs) ? ParseF(udzs) : ctx.Pos.Z;
+                unsafeDest = new Vec4(ParseF(udx), ParseF(udy), udz, ctx.MapId);
+            }
+            int danger = unsafeData.TryGetValue("danger_level", out var dangerText)
+                && int.TryParse(dangerText, out int parsedDanger)
+                    ? parsedDanger
+                    : 0;
+            ctx.Failure = new WaitFailure
+            {
+                CommandType = "MOVE_TO",
+                Reason = "path_unsafe",
+                Dest = unsafeDest,
+                DangerLevel = danger,
+                Utc = DateTime.UtcNow
+            };
+            ctx.ConsecutiveFailures++;
+            CircuitTrace.Hit(ctx.Guid, "event: correlated no-WAIT PATH_UNSAFE stamped for recovery", danger);
+            return true;
+        }
+
         // Fix 3 (2026-07-04): the durable no_path streak must count EVERY MOVE_FAILED reason=no_path,
         // WAIT or no WAIT. Group objective legs and every reconcile re-issue are fire-and-forget
         // (Dispatch) — no Pending, so TryNegate below never sees their failures, no Failure is
@@ -315,7 +581,16 @@ public sealed class BotExecutor
         // 10,033 uncounted no_paths against one coordinate at ~1/s for 10 hours while the waited
         // path's identical rescue saved Xoz in 5 fails). Recorded HERE, unconditionally; the old
         // duplicate recorder inside TryNegate is removed so a waited fail doesn't double-count.
-        if (evt.EventType == "MOVE_FAILED" && ctx.Identity is { } idNoPath)
+        // When another WAIT is already active, however, a delayed MOVE_FAILED
+        // may not poison its destination history unless cbt proves it belongs to
+        // that exact MOVE_TO. With no WAIT this remains the fire-and-forget path.
+        bool moveFailureBelongsHere = pending == null
+            ? noWaitTaskOwner != null
+                && WaitOutcomeMatcher.Classify(noWaitTaskOwner, evt) == WaitOutcomeMatcher.Disposition.Negative
+            : (pending.CorrelationId > 0
+                && evt.CorrelationId == pending.CorrelationId
+                && WaitOutcomeMatcher.Classify(pending, evt) == WaitOutcomeMatcher.Disposition.Negative);
+        if (evt.EventType == "MOVE_FAILED" && moveFailureBelongsHere && ctx.Identity is { } idNoPath)
         {
             CircuitTrace.Hit(ctx.Guid, "event: MOVE_FAILED durable bookkeeping");
             var mfk = ParsePipe(evt.Data);
@@ -352,27 +627,75 @@ public sealed class BotExecutor
             }
         }
 
-        var pending = ctx.Pending;
+        if (pending == null
+            && evt.EventType.Equals("MOVE_FAILED", StringComparison.OrdinalIgnoreCase)
+            && moveFailureBelongsHere)
+        {
+            // MOVE_FAILED is a one-shot terminal outcome in the core. Retire the
+            // exact fire owner even when this bot has no durable identity record,
+            // so a replay cannot count the same destination/island failure twice.
+            ctx.TryReplaceNoWaitTaskOwner(noWaitTaskOwner!, null);
+            ctx.TryReplaceLatestNoWaitOwner(noWaitTaskOwner!, null);
+            CircuitTrace.Hit(ctx.Guid, "event: correlated no-WAIT MOVE_FAILED owner retired");
+            return true;
+        }
+
         if (pending == null) { CircuitTrace.Hit(ctx.Guid, "event: no WAIT outstanding"); return false; }
 
-        // Negative outcome FIRST: a failure event that NEGATES the matching WAIT
-        // (the no_path-plateau fix). MOVE_FAILED/PATH_UNSAFE negate a MOVE_TO WAIT;
-        // QUEST_INTERACT_FAIL negates a QUEST_INTERACT WAIT. Clears the WAIT + stamps
-        // ctx.Failure so the planner escapes now, not after the (generous) deadline.
-        // No MarkProgress — a failure is not progress.
-        if (TryNegate(ctx, pending, evt)) { CircuitTrace.Hit(ctx.Guid, "event: WAIT negated by failure event"); return true; }
+        var disposition = WaitOutcomeMatcher.Classify(pending, evt);
+        if (disposition == WaitOutcomeMatcher.Disposition.NotForPending)
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: does not match the outstanding WAIT");
+            return false;
+        }
+        if (disposition == WaitOutcomeMatcher.Disposition.CorrelationMismatch)
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: terminal outcome rejected (cbt mismatch)", evt.CorrelationId ?? 0);
+            _logger.LogWarning(
+                "[EXEC] {Name} ignored {Event} for {Command}: outcome cbt={EventCbt}, pending cbt={PendingCbt}",
+                ctx.Name, evt.EventType, pending.CommandType, evt.CorrelationId, pending.CorrelationId);
+            return false;
+        }
 
-        // Positive ack: match purely by event type (corr is story-file-only — §5.2).
-        // One outstanding command per bot, so at most one WAIT to satisfy.
-        bool typeMatch = !string.IsNullOrEmpty(pending.ExpectedEvent)
-                         && string.Equals(evt.EventType, pending.ExpectedEvent, StringComparison.OrdinalIgnoreCase);
-        if (!typeMatch) { CircuitTrace.Hit(ctx.Guid, "event: does not match the outstanding WAIT"); return false; }
+        // Negative outcome: type identifies a failure for this command and cbt
+        // proves it belongs to this exact WAIT. Clear it promptly rather than
+        // burning the generous deadline. A failure is not progress.
+        if (disposition == WaitOutcomeMatcher.Disposition.Negative)
+        {
+            bool possessedDrop = evt.EventType.Equals("POSSESSED_DROP", StringComparison.OrdinalIgnoreCase);
+            bool conscriptedDrop = evt.EventType.Equals("CONSCRIPTED_DROP", StringComparison.OrdinalIgnoreCase);
+            if (possessedDrop || conscriptedDrop)
+            {
+                // Human/RTS ownership is not a failed route or quest. Release
+                // only the exactly-correlated WAIT and briefly stand the planner
+                // down; STATE's durable conscripted flag takes over when present.
+                if (!ctx.TryClearPending(pending))
+                {
+                    CircuitTrace.Hit(ctx.Guid, "event: control fence lost exact-WAIT race, replacement preserved");
+                    return false;
+                }
+                ctx.Failure = null;
+                ctx.ControlFenceReason = possessedDrop
+                    ? "possessed"
+                    : "conscripted";
+                ctx.ControlFenceObservedUtc = DateTime.UtcNow;
+                CircuitTrace.HitNote(ctx.Guid, "event: correlated control fence, WAIT released", ctx.ControlFenceReason);
+                if (possessedDrop) ctx.Possessed = true;   // cb:fold fence kind carried by ControlFenceReason probe
+                if (conscriptedDrop) ctx.Conscripted = true;   // cb:fold fence kind carried by ControlFenceReason probe
+                _logger.LogInformation("[EXEC] {Name} {Fence} rejected {Command}; planner held until fresh STATE",
+                    ctx.Name, ctx.ControlFenceReason, pending.CommandType);
+                return true;
+            }
 
-        // Stale/duplicate TASK_COMPLETE guard (premature-arrival fix). A PLAIN travel MOVE_TO only
-        // truly completes when the bot is AT the dest. Because acks match by type only (no corr), a
-        // duplicate or previous-leg TASK_COMPLETE in the pipe would otherwise ack a just-issued travel
-        // leg early — the bot "arrives" hundreds of yards out and the QuestPlanner fires QUEST_INTERACT
-        // from the wrong spot (npc_not_found). Objective grinds are EXEMPT: their "GRIND finished"
+            if (!Negate(ctx, pending, evt))
+                return false;   // cb:fold defensive CAS loss; replacement-preservation probe lives in Negate
+            CircuitTrace.Hit(ctx.Guid, "event: WAIT negated by correlated failure event");
+            return true;
+        }
+
+        // Semantic TASK_COMPLETE guard (premature-arrival fix). A PLAIN travel MOVE_TO only
+        // truly completes when the bot is AT the dest. cbt already excludes previous legs; this catches
+        // a false success attributed to the current leg. Objective grinds are EXEMPT: their "GRIND finished"
         // TASK_COMPLETE legitimately fires away from the dest (C++ grinds at the mouth/scan hit).
         if (pending.CommandType == "MOVE_TO" && !pending.IsObjectiveGrind
             && string.Equals(evt.EventType, "TASK_COMPLETE", StringComparison.OrdinalIgnoreCase)
@@ -385,8 +708,50 @@ public sealed class BotExecutor
             return false;   // a too-young far arrival is a previous-leg duplicate; wait for the real one
         }
 
+        if (!ctx.TryClearPending(pending))
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: positive outcome lost exact-WAIT race, replacement preserved");
+            return false;
+        }
+
         _logger.LogDebug("[EXEC] {Name} ack {Type} via {Evt}",
             ctx.Name, pending.CommandType, evt.EventType);
+
+        bool combatStillResetAck = pending.CommandType.Equals(
+                BotBrain.CombatStillResetCommandType,
+                StringComparison.OrdinalIgnoreCase)
+            && evt.EventType.Equals(
+                BotBrain.CombatStillResetAckEvent,
+                StringComparison.OrdinalIgnoreCase);
+        if (combatStillResetAck)
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: correlated combat-reset ACK boundary stamped");
+            // This ACK proves only that the core admitted the reset. It is not
+            // world progress, and it cannot make a STATE that arrived before
+            // the ACK eligible for the post-reset escape gate.
+            ctx.CombatStillResetAckReceivedUtc = DateTime.UtcNow;
+        }
+
+        if (evt.EventType is "QUEST_ACCEPT_ACK" or "QUEST_COMPLETE_ACK")
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: correlated quest outcome stamped");
+            ctx.LastQuestAdvanceUtc = DateTime.UtcNow;
+        }
+
+        if (evt.EventType == "TELEPORT_ACK")
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: correlated teleport ack, position snapped");
+            // Teleport-assist: update Pos immediately so the planner does not
+            // wait for the next STATE heartbeat before interacting.
+            var tk = ParsePipe(evt.Data);
+            if (tk.TryGetValue("x", out var txs) && tk.TryGetValue("y", out var tys))
+            {   // cb:fold parse detail, outcome carried by the ack probe
+                float tz = tk.TryGetValue("z", out var tzs) ? ParseF(tzs) : ctx.Pos.Z;
+                ctx.Pos = new Vec3(ParseF(txs), ParseF(tys), tz);
+                if (tk.TryGetValue("map", out var tms) && int.TryParse(tms, out var tmap))
+                    ctx.MapId = tmap;   // cb:fold parse detail
+            }
+        }
 
         // 2026-06-30: ack-driven, goal-bounce-proof durable completion. A QUEST_COMPLETE_ACK for a
         // QUEST_INTERACT WAIT means the server just rewarded this quest — stamp CompletedQuestIds
@@ -418,8 +783,13 @@ public sealed class BotExecutor
             moveId.ClearNoPathStreak(reached.Map, reached.X, reached.Y);
         }
 
+        if (combatStillResetAck)
+        {
+            CircuitTrace.Hit(ctx.Guid, "event: combat reset ACK admitted, generic progress deferred");
+            return true;
+        }
+
         CircuitTrace.HitNote(ctx.Guid, "event: WAIT acked, progress stamped", pending.CommandType);
-        ctx.Pending = null;
         ctx.MarkProgress();
         ctx.ConsecutiveFailures = 0;   // a real ack breaks any fail streak
         return true;
@@ -431,37 +801,16 @@ public sealed class BotExecutor
     // ------------------------------------------------------------------------
     // Negative-ack: a failure event that negates the matching WAIT (§3.5b).
     // ------------------------------------------------------------------------
-    private bool TryNegate(BotContext ctx, Outstanding pending, BotEvent evt)
+    private bool Negate(BotContext ctx, Outstanding pending, BotEvent evt)
     {
-        bool moveFail = (evt.EventType == "MOVE_FAILED" || evt.EventType == "PATH_UNSAFE")
-                        && pending.CommandType == "MOVE_TO";
-        bool interactFail = evt.EventType == "QUEST_INTERACT_FAIL"
-                            && pending.CommandType == "QUEST_INTERACT";
-        bool trainFail = evt.EventType == "TRAIN_FAIL"
-                            && pending.CommandType == "TRAIN_AT_NPC";
-        // Vendor errand fails: SELL_FAIL/REPAIR_FAIL negate the SELL_ITEMS/REPAIR_AT_NPC WAIT
-        // instead of burning the full 30s SELL_ACK/REPAIR_ACK deadline. The cases are
-        // vendor_not_found / npc_not_found (the chosen NPC isn't in the world — a runtime
-        // despawn / pool rotation that slipped past ZoneDataLoader's load-time event-gate
-        // filter) and not_enough_gold (the bot is broke). Both carry reason=<code>, so the
-        // reason flows through the kv.TryGetValue("reason") branch below unchanged; the
-        // MaintenancePlanner decides phantom-giveup vs finish from failure.Reason.
-        bool sellFail = evt.EventType == "SELL_FAIL"
-                            && pending.CommandType == "SELL_ITEMS";
-        bool repairFail = evt.EventType == "REPAIR_FAIL"
-                            && pending.CommandType == "REPAIR_AT_NPC";
-        // Teleport-assist: TELEPORT_FAIL (bad_payload / dead / cross_map / too_far) negates the
-        // TELEPORT_TO WAIT so the planner abandons the hop (Outbound) / completes anyway (Inbound)
-        // immediately instead of burning the 10 s TELEPORT_ACK deadline. Carries reason=<code>.
-        bool teleportFail = evt.EventType == "TELEPORT_FAIL"
-                            && pending.CommandType == "TELEPORT_TO";
-        if (!moveFail && !interactFail && !trainFail && !sellFail && !repairFail && !teleportFail)
+        if (!ctx.TryClearPending(pending))
         {
-            CircuitTrace.Hit(ctx.Guid, "negate: event is not a failure for this WAIT");
+            CircuitTrace.Hit(ctx.Guid, "negate: exact-WAIT race lost, replacement preserved");
             return false;
         }
 
         var kv = ParsePipe(evt.Data);
+        bool grindBlocked = evt.EventType.Equals("GRIND_BLOCKED", StringComparison.OrdinalIgnoreCase);
 
         // PATH_UNSAFE carries no reason= field; QUEST_INTERACT_FAIL leads with a bare
         // reason segment (no key); TRAIN_FAIL is a flat fail; MOVE_FAILED uses reason=<code>.
@@ -477,13 +826,21 @@ public sealed class BotExecutor
             float dz = kv.TryGetValue("dest_z", out var dzs) ? ParseF(dzs) : ctx.Pos.Z;
             dest = new Vec4(ParseF(dxs), ParseF(dys), dz, ctx.MapId);
         }
+        else if (grindBlocked && kv.TryGetValue("x", out dxs) && kv.TryGetValue("y", out dys))
+        {   // cb:fold GRIND_BLOCKED coordinate normalization is asserted by the integrity test
+            float dz = kv.TryGetValue("z", out var dzs) ? ParseF(dzs) : ctx.Pos.Z;
+            dest = new Vec4(ParseF(dxs), ParseF(dys), dz, ctx.MapId);
+        }
 
         int danger = kv.TryGetValue("danger_level", out var dls) && int.TryParse(dls, out var dl) ? dl : 0;
         int? qid = kv.TryGetValue("quest_id", out var qs) && int.TryParse(qs, out var q) ? q : null;
 
         ctx.Failure = new WaitFailure
         {
-            CommandType = pending.CommandType,
+            // Preserve the established self-healing handback contract: planners
+            // recognize GRIND/no_target regardless of whether the owned task was
+            // originally adopted through MOVE_TO or SET_TASK.
+            CommandType = grindBlocked ? "GRIND" : pending.CommandType,
             Reason = reason,
             Dest = dest,
             DangerLevel = danger,
@@ -500,9 +857,9 @@ public sealed class BotExecutor
         // (Fix 3, 2026-07-04 — WAIT or fire-and-forget alike), so nothing to record here; recording
         // in both places would double-count a waited fail.
 
-        ctx.Pending = null;   // NB: no MarkProgress — a failure is not progress.
-        ctx.ConsecutiveFailures++;   // feeds the brain's fast fail-loop breaker
-        return true;
+        if (!grindBlocked)
+            ctx.ConsecutiveFailures++;   // cb:fold ordinary hard-failure streak; GRIND_BLOCKED exemption is asserted by integrity test
+        return true;   // NB: no MarkProgress — a failure is not progress.
     }
 
     // Pipe-delimited key=value parse (the bridge event-data format). Segments with
@@ -516,6 +873,27 @@ public sealed class BotExecutor
                   .Where(p => p.Length == 2)
                   .ToDictionary(p => p[0].Trim(), p => p[1].Trim(), StringComparer.OrdinalIgnoreCase);
 
+    // Strict parser for unsolicited telemetry. Duplicate keys are ambiguous and
+    // Dictionary.ToDictionary would throw, escaping the per-line JSON catch and
+    // recycling the bot socket. Reject them (including casing variants) in-band.
+    private static bool TryParseUniquePipe(
+        string? data,
+        out Dictionary<string, string> values)
+    {
+        values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(data)) return true;   // cb:fold pure telemetry parser; caller probes admission/rejection
+
+        foreach (string segment in data.Split('|'))
+        {
+            string[] pair = segment.Split('=', 2);
+            if (pair.Length != 2) return false;   // cb:fold pure telemetry parser; caller probes malformed rejection
+            string key = pair[0].Trim();
+            if (key.Length == 0 || !values.TryAdd(key, pair[1].Trim())) return false;   // cb:fold pure telemetry parser; caller probes duplicate/empty-key rejection
+        }
+
+        return true;
+    }
+
     private static string FirstBareSegment(string? data)
     {
         if (string.IsNullOrEmpty(data)) return "";   // cb:fold pure helper
@@ -526,6 +904,25 @@ public sealed class BotExecutor
     private static float ParseF(string s)
         => float.TryParse(s, System.Globalization.NumberStyles.Float,
                           System.Globalization.CultureInfo.InvariantCulture, out var f) ? f : 0f;
+
+    private static bool TryParseFiniteFloat(string text, out float value)
+    {
+        bool parsed = float.TryParse(
+            text,
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out value);
+        return parsed && float.IsFinite(value);
+    }
+
+    // Only short C++-owned hops may use MOVE_POINT_REFUSED. Task destination, taxi,
+    // and NPC-interaction points own correlated terminal contracts instead.
+    private static bool IsAutonomousMovePoint(int pointId)
+        => pointId is 100    // wander
+            or 102           // grind patrol
+            or 104           // stalemate nudge
+            or 105           // overpull flee
+            or 106;          // pull retreat
 
     private static Vec4? ExtractTarget(BridgeCommand cmd)
     {

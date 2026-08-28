@@ -484,7 +484,15 @@
         body.querySelectorAll('.gmember').forEach(function (m) { m.addEventListener('click', function () { selectBot(Number(m.dataset.guid)); }); });
         var db = $('btnDisband');
         if (db) db.addEventListener('click', function () {
-            postJSON('/Bots/DisbandGroup', { groupId: grp.groupId }).then(function () { toast('Group ' + grp.groupId + ' disbanded', 'ok'); pollBrain(); pollStates(); });
+            postJSON('/Bots/DisbandGroup', { groupId: grp.groupId }).then(function (result) {
+                if (result && result.success) {
+                    toast('Group ' + grp.groupId + ' disbanded', 'ok');
+                } else {
+                    toast('Disband failed: ' + ((result && (result.error || result.status)) || 'unknown') +
+                        (result && result.cbt ? ' [cbt=' + result.cbt + ']' : ''), 'err');
+                }
+                pollBrain(); pollStates();
+            });
         });
     }
 
@@ -576,6 +584,33 @@
     // ========================================================================
     //  CONTROLS WIRING
     // ========================================================================
+    function groupMutationOutcomeText(outcome) {
+        var members = (outcome.memberGuids || []).join(',');
+        return (outcome.operation || 'group') + ' leader=' + (outcome.leaderGuid || '?') +
+            ' members=[' + members + '] → ' + (outcome.status || 'unknown') +
+            ': ' + (outcome.detail || 'no detail') + (outcome.cbt ? ' [cbt=' + outcome.cbt + ']' : '');
+    }
+
+    function offerUnknownFormReconciliation(outcome) {
+        if (!outcome || outcome.operation !== 'form' || outcome.status !== 'outcome_unknown') return;
+        var members = outcome.memberGuids || [];
+        var followers = members.filter(function (guid) { return guid !== outcome.leaderGuid; });
+        if (!outcome.leaderGuid || !followers.length) return;
+        if (!confirm(groupMutationOutcomeText(outcome) + '\n\nRe-send this exact formation with a fresh cbt to reconcile?')) return;
+
+        postJSON('/Bots/FormGroup', { leaderGuid: outcome.leaderGuid, followerGuids: followers })
+            .then(function (result) {
+                if (result && result.success) {
+                    toast('Group formation reconciled [cbt=' + result.cbt + ']', 'ok');
+                } else {
+                    toast('Reconciliation failed: ' + ((result && (result.error || result.status)) || 'unknown') +
+                        (result && result.cbt ? ' [cbt=' + result.cbt + ']' : ''), 'err');
+                }
+                pollBrain(); pollStates();
+            })
+            .catch(function () { toast('Reconciliation request failed', 'err'); });
+    }
+
     function wire() {
         $('rosterFilter').addEventListener('input', function (e) { rosterFilterText = e.target.value; renderRoster(); });
 
@@ -600,11 +635,31 @@
 
         $('btnGroupMode').addEventListener('click', function () {
             var next = (brain.groupingMode + 1) % 3;
-            postJSON('/Bots/SetGroupingMode', { mode: next }).then(function () { toast('Grouping: ' + GROUPING_MODES[next], 'ok'); pollBrain(); });
+            postJSON('/Bots/SetGroupingMode', { mode: next }).then(function (result) {
+                if (result && result.success) {
+                    toast('Grouping: ' + (result.modeName || GROUPING_MODES[next]), 'ok');
+                } else {
+                    var detail = ((result && result.outcomes) || []).filter(function (outcome) { return !outcome.success; })
+                        .map(groupMutationOutcomeText).join(' | ');
+                    toast('Grouping mode unchanged: ' + (detail || (result && result.error) || 'unknown'), 'err');
+                }
+                pollBrain(); pollStates();
+            });
         });
 
         $('btnAutoForm').addEventListener('click', function () {
-            postJSON('/Bots/AutoFormGroups').then(function (d) { toast((d && d.groupsFormed || 0) + ' group(s) formed', 'ok'); pollBrain(); pollStates(); });
+            postJSON('/Bots/AutoFormGroups').then(function (d) {
+                var outcomes = (d && d.outcomes) || [];
+                var failures = outcomes.filter(function (outcome) { return !outcome.success; });
+                var detail = failures.map(groupMutationOutcomeText).join(' | ');
+                toast(((d && d.groupsFormed) || 0) + ' formed, ' + failures.length + ' unresolved' +
+                    (detail ? ': ' + detail : ''), failures.length ? 'err' : 'ok');
+                failures.forEach(function (outcome) {
+                    offerUnknownFormReconciliation(outcome);
+                });
+                // Partial success still changes topology; refresh on every response.
+                pollBrain(); pollStates();
+            });
         });
 
         $('btnMap').addEventListener('click', function () { openModal('mapModal'); });
