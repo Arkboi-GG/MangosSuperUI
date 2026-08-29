@@ -11,9 +11,11 @@
 //   • the `suiFx` extras manifest carries material animation (colour / opacity / UV-scroll) and
 //     particle emitters. Undecoded, every animated track is frozen at whichever key got baked into
 //     baseColorFactor, and no particle ever spawns.
-//   • ItemVisual enchant effects (Thunderfury's lightning, Ashbringer's glow) are mounted by
+//   • ItemVisual enchant effects are mounted by
 //     GlbWriter.EmbedVisualEffects as manifest EMITTERS ONLY — no geometry is merged. So without a
 //     suiFx decoder they render as literally nothing.
+//     Thunderfury is different: display 30606 has ItemVisual 0 and its native M2 rig carries the
+//     lightning, so preserving that rig and its global sequences is mandatory.
 //
 // This module runs the same four passes, in the same order, that the Weapon Forge viewer runs, and
 // drives the fx handle every frame. It is deliberately generic — it takes a container and a URL and

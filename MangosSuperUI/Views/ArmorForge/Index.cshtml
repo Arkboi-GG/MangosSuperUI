@@ -132,7 +132,7 @@
             Import armor from a <strong>TBC (2.4.3)</strong> or <strong>WotLK (3.3.5a) client</strong> into the live vanilla server — whole <strong>sets</strong> at once
             (they're grouped from the client's own set data so the pieces that belong together come across together), or a single piece.
             Painted pieces carry their body textures; helms &amp; shoulders are re-emitted as native vanilla models (all 16 race/gender
-            variants, L/R shoulders); cloaks carry their cape texture. Ships in <code>patch-6.MPQ</code> — restart the client, then <code>.additem</code>.
+            variants, L/R shoulders); cloaks carry their cape texture. Ships in <code>patch-4.MPQ</code> — restart the client, then <code>.additem</code>.
             Set bonuses are yours to define. The TBC and WotLK lanes cannot carry theirs across (their spell
             ids belong to a later client), but a VANILLA set clone pre-fills the source set's own bonuses,
             because those spells already exist in your core — edit or clear them like any other row.
@@ -143,7 +143,7 @@
             <span class="af-pill" id="pillWotlk">WotLK …</span>
             <span class="af-pill" id="pillVanilla" title="Checked when you open the Clone Vanilla card — it is a live world-database query">Vanilla: clone</span>
             <span class="af-pill" id="pillPatch">patch …</span>
-            <span class="af-pill" id="pillDeploy" title="Is the patch-6.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
+            <span class="af-pill" id="pillDeploy" title="Is the patch-4.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
             <span class="af-pill" id="pillItemSet" title="Set membership and n-piece bonuses need ItemSet.dbc in the SERVER's dbc directory, not just in the client patch. The core reads it once at startup and zeroes item_template.set_id for any set it cannot find — so a freshly deployed file does nothing until mangosd restarts.">sets …</span>
         </div>
     </div>
@@ -195,12 +195,12 @@
 
             <div class="af-card collapsed">
                 <h3><span class="phase">Registry</span> Forged Armor</h3>
-                <p>The exact contents of <code>patch-6.MPQ</code>, grouped by set. <strong>View</strong> shows a piece on the character.
+                <p>The forged armor inside <code>patch-4.MPQ</code>, grouped by set. <strong>View</strong> shows a piece on the character.
                    Delete removes it from the world DB and the patch; ids return to the pool.</p>
                 <div id="afList" class="af-list"><span class="muted" style="font-size:12px;">Loading…</span></div>
                 <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
                     <button class="af-btn secondary" data-action="rebuildPatch">Rebuild patch</button>
-                    <a class="af-btn secondary" href="/ArmorForge/DownloadPatch" style="text-decoration:none;"><i class="fa-solid fa-download"></i> Download patch-6.MPQ</a>
+                    <a class="af-btn secondary" href="/ArmorForge/DownloadPatch" style="text-decoration:none;"><i class="fa-solid fa-download"></i> Download patch-4.MPQ</a>
                     <button class="af-btn secondary" id="btnRestartMangosd" data-action="restartMangosd" style="display:none;"
                             title="ItemSet.dbc has been written to the server's dbc directory but mangosd has not restarted since. The core only reads DBCs at startup, so forged sets stay inert until it does.">
                         <i class="fa-solid fa-rotate"></i> Restart mangosd (sets pending)</button>

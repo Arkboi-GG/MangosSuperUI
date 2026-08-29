@@ -100,7 +100,7 @@
     // and mirrored by data-section="" on each .sidebar-section in _Sidebar.cshtml.
     var SECTIONS = [
         { key: 'admin', label: 'Server Administration', icon: 'fa-server', groups: ['operations', 'server', 'state'] },
-        { key: 'tuning', label: 'Gameplay Tuning', icon: 'fa-sliders', groups: ['content', 'spells', 'world'] },
+        { key: 'tuning', label: 'Gameplay Tuning', icon: 'fa-sliders', groups: ['content', 'loot', 'spells', 'world', 'archive'] },
         { key: 'aibots', label: 'AI Bot Control', icon: 'fa-robot', groups: ['bots'] },
         { key: 'devdata', label: 'Data & Development', icon: 'fa-database', groups: ['data', 'devtools', 'gamedev'] },
         { key: 'wiki', label: 'Wiki', icon: 'fa-book', groups: ['wiki'] },
@@ -112,9 +112,11 @@
         operations: { name: 'Operations', icon: 'fa-gauge' },
         server: { name: 'Server', icon: 'fa-server' },
         state: { name: 'Worlds & History', icon: 'fa-layer-group' },
-        content: { name: 'Items & Loot', icon: 'fa-box-open' },
+        content: { name: 'Items', icon: 'fa-box-open' },
+        loot: { name: 'Loot', icon: 'fa-dice-d20' },
         spells: { name: 'Spells', icon: 'fa-wand-sparkles' },
         world: { name: 'World & Maps', icon: 'fa-map-location-dot' },
+        archive: { name: 'Archive', icon: 'fa-box-archive' },
         bots: { name: 'Bots', icon: 'fa-robot' },
         data: { name: 'Data', icon: 'fa-database' },
         devtools: { name: 'Bot Development', icon: 'fa-code' },
@@ -132,14 +134,16 @@
 
     // Default group order + item order within each group
     var DEFAULT_ORDER = {
-        groups: ['operations', 'server', 'state', 'content', 'spells', 'world', 'bots', 'data', 'devtools', 'gamedev', 'wiki', 'superui'],
+        groups: ['operations', 'server', 'state', 'content', 'loot', 'spells', 'world', 'archive', 'bots', 'data', 'devtools', 'gamedev', 'wiki', 'superui'],
         items: {
             operations: ['home', 'console', 'players', 'accounts', 'realm'],
             server: ['serverlogs', 'livelogs', 'config'],
             state: ['worlds', 'changes', 'activity'],
-            content: ['items', 'retextureengine', 'gameobjects', 'loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier', 'professiontuning'],
-            spells: ['spells', 'patch', 'visuallab', 'spellcompleter'],
+            content: ['items', 'retextureengine'],
+            loot: ['loottuner', 'instances', 'lootifier', 'questlootifier', 'craftinglootifier', 'professiontuning'],
+            spells: ['spells', 'patch', 'spellcompleter'],
             world: ['worldmap', 'worldeditor'],
+            archive: ['visuallab', 'gameobjects'],
             bots: ['bots-dashboard', 'bots-fleet', 'bots-map', 'bots-chatfeel', 'bots-chatcapacity'],
             data: ['database', 'sourcemap'],
             devtools: ['circuittrace'],
@@ -148,6 +152,24 @@
             superui: ['downloads-page', 'settings']
         }
     };
+
+    // Insert entries present in defaultList but missing from storedList at the
+    // position they hold in defaultList — right after their nearest preceding
+    // sibling that already exists in storedList — instead of appending at the
+    // end. Keeps a newly-added group/item next to its neighbours for users who
+    // already have a saved order. Mutates storedList in place.
+    function spliceMissingInOrder(storedList, defaultList) {
+        var prev = -1; // stored index to insert the next missing entry after
+        defaultList.forEach(function (key) {
+            var idx = storedList.indexOf(key);
+            if (idx === -1) {
+                storedList.splice(prev + 1, 0, key);
+                prev = prev + 1;
+            } else {
+                prev = idx;
+            }
+        });
+    }
 
     function getSidebarOrder() {
         var defaults = JSON.parse(JSON.stringify(DEFAULT_ORDER));
@@ -159,10 +181,9 @@
 
         // --- Merge: splice new groups/items into stored order ---
 
-        // 1. Add any default groups missing from stored list (append at end)
-        defaults.groups.forEach(function (g) {
-            if (stored.groups.indexOf(g) === -1) stored.groups.push(g);
-        });
+        // 1. Splice any default groups missing from stored into their default
+        //    position (next to their sibling), not at the end.
+        spliceMissingInOrder(stored.groups, defaults.groups);
 
         // 2. Remove stored groups that no longer exist in defaults
         stored.groups = stored.groups.filter(function (g) {
@@ -174,10 +195,8 @@
             var defItems = defaults.items[g] || [];
             var storedItems = stored.items[g] || [];
 
-            // Append any new default items not yet in stored list
-            defItems.forEach(function (item) {
-                if (storedItems.indexOf(item) === -1) storedItems.push(item);
-            });
+            // Splice any new default items into their default position
+            spliceMissingInOrder(storedItems, defItems);
 
             // Remove items that no longer exist in defaults
             stored.items[g] = storedItems.filter(function (item) {
@@ -344,8 +363,12 @@
         var collapsed = getCollapsedGroups();
 
         // Every group in the active section opens by default (the sidebar only
-        // shows one section now, so there is room), unless it was shut by hand.
+        // shows one section now, so there is room), unless it was shut by hand
+        // or the group is flagged data-default-collapsed (e.g. Archive), which
+        // stays shut until the user opens it themselves.
         sectionGroups.forEach(function (g) {
+            var secEl = container.querySelector('.sidebar-section[data-group="' + g + '"]');
+            if (secEl && secEl.getAttribute('data-default-collapsed') === 'true') return;
             if (collapsed.indexOf(g) === -1 && expanded.indexOf(g) === -1) expanded.push(g);
         });
 

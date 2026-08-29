@@ -9,16 +9,21 @@ namespace MangosSuperUI.Services.WeaponForge;
 
 /// <summary>
 /// The content-hash direct preview (WEAPON_GEN.md §4.1, §7.4). Given raw generated (or
-/// MPQ-extracted) M2 + BLP bytes, it renders a GLB by parsing the M2 and binding the BLP to every
-/// texture slot the geometry samples — WITHOUT any display-id/retexture resolution. This is the
+/// MPQ-extracted) M2 + BLP bytes, it renders a GLB by parsing the M2 and binding the display BLP to
+/// the M2's Type-2 object-skin slot — WITHOUT any display-id/retexture resolution. This is the
 /// piece the existing display-id-driven <c>EnsureGlb</c> cannot do: it resolves a custom display
 /// back to a vanilla M2 and ignores custom-M2 bytes, so it can never preview a truly custom model.
 ///
-/// Output GLBs are cached by the SHA-256 of (m2 ++ blp) so an identical byte pair is rendered once.
-/// This is an output cache under wwwroot; it never reads pre-extracted game assets.
+/// Output GLBs are cached by the SHA-256 of every rendered input (M2, display/supplemental BLPs,
+/// mounted effects, and source-graph mode). This is an output cache under wwwroot.
 /// </summary>
 public sealed class WeaponPreviewService
 {
+    /// <summary>Vanilla's runtime replacement for TEX_COMPONENT_WEAPON_BLADE (Type 3). This is
+    /// loaded only into WebGL previews; it must never be packaged over the stock client member.</summary>
+    internal const string WeaponBladePreviewTexturePath =
+        @"ITEM\ObjectComponents\WEAPON\ArmorReflect4.BLP";
+
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<WeaponPreviewService> _logger;
 
@@ -33,12 +38,13 @@ public sealed class WeaponPreviewService
     /// these, not in its own bytes.</param>
     public WeaponPreviewResult RenderFromBytes(byte[] m2Bytes, byte[]? blpBytes,
         IReadOnlyDictionary<string, byte[]>? effectBlpsByPath = null,
-        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null)
+        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null,
+        bool preserveSourceGraph = false)
     {
         if (m2Bytes is null || m2Bytes.Length == 0)
             return WeaponPreviewResult.Fail("No M2 bytes supplied.");
 
-        string key = ContentKey(m2Bytes, blpBytes, effectBlpsByPath, visualEffects);
+        string key = ContentKey(m2Bytes, blpBytes, effectBlpsByPath, visualEffects, preserveSourceGraph);
         var cacheDir = Path.Combine(_env.WebRootPath, "weapon_forge_cache");
         Directory.CreateDirectory(cacheDir);
         var fileName = $"wf_{key[..24]}.glb";
@@ -57,7 +63,7 @@ public sealed class WeaponPreviewService
         // The pass-aware path builds its own scene and cannot host mounted effects, so an item that
         // actually has an ItemVisual goes down the general path instead — a correct glow beats a
         // slightly better-modelled set of passes.
-        if (visualEffects is null || visualEffects.Count == 0)
+        if (!preserveSourceGraph && (visualEffects is null || visualEffects.Count == 0) && CanUsePassAwarePreview(m2))
         {
             var passAware = TryRenderPassAware(m2, blpBytes, effectBlpsByPath);
             if (passAware is { Ok: true }) return passAware;
@@ -67,24 +73,31 @@ public sealed class WeaponPreviewService
             return new WeaponPreviewResult(true, webPath, m2.Vertices.Count, triangleCount, key, Cached: true, Error: null);
 
         // Bind textures by slot: Type-2 (DBC-driven) slots get the base BLP; Type-0 hardcoded
-        // slots get their bytes when the caller supplied them by path (multi-pass glow).
+        // slots and Type-3's stock runtime weapon-blade replacement get their exact bytes when the
+        // caller supplied them. Replaceable slot types are semantics, not interchangeable images.
         var textures = new Dictionary<int, byte[]>();
         for (int ti = 0; ti < m2.Textures.Count; ti++)
         {
             var t = m2.Textures[ti];
-            if (t.Type != 0 && blpBytes is { Length: > 0 })
+            if (UsesDisplayTexture(t) && blpBytes is { Length: > 0 })
                 textures[ti] = blpBytes;
-            else if (t.Type == 0 && t.Filename.Length > 0 && effectBlpsByPath is not null &&
-                     effectBlpsByPath.TryGetValue(t.Filename, out var bytes))
+            else if (StockPreviewTexturePath(t) is { } stockPath && effectBlpsByPath is not null &&
+                     effectBlpsByPath.TryGetValue(stockPath, out var bytes))
                 textures[ti] = bytes;
         }
-        if (textures.Count == 0 && blpBytes is { Length: > 0 })
+        // Legacy/generated blobs with no parsed texture table still get the old slot-0 rescue.
+        // When the M2 DOES declare slots, an absence of Type 2 is meaningful: binding the display
+        // skin to Type 3 would overwrite the client-supplied weapon-blade/reflect texture.
+        if (textures.Count == 0 && m2.Textures.Count == 0 && blpBytes is { Length: > 0 })
         {
             foreach (var idx in GlbWriter.SampledTextureIndices(m2)) textures[idx] = blpBytes;
             if (textures.Count == 0) textures[0] = blpBytes; // fall back to slot 0 if nothing resolved
         }
 
-        bool ok = GlbWriter.SaveGlb(m2, textures, fullPath, doubleSided: false, visualEffects);
+        bool ok = GlbWriter.SaveGlb(m2, textures, fullPath,
+            doubleSided: false,
+            visualEffects: visualEffects,
+            strictTextureSlots: preserveSourceGraph);
         if (!ok)
             return WeaponPreviewResult.Fail("GlbWriter failed to emit a GLB for the parsed M2.");
 
@@ -92,6 +105,53 @@ public sealed class WeaponPreviewService
             m2.Vertices.Count, triangleCount, webPath);
         return new WeaponPreviewResult(true, webPath, m2.Vertices.Count, triangleCount, key, Cached: false, Error: null);
     }
+
+    /// <summary>
+    /// The pass-aware renderer rebuilds an M2 as a <see cref="RigidWeaponMesh"/>. That is useful for
+    /// generated render graphs, but destructive for stock items whose visible geometry rides animated
+    /// or camera-facing bones. Thunderfury is the canonical case: choosing this path strips its
+    /// ItemArmature and every GlobalSequence clip before JavaScript ever sees the GLB.
+    /// </summary>
+    internal static bool CanUsePassAwarePreview(M2Model m2)
+        => !SkinnedGlbWriter.RequiresItemSkin(m2);
+
+    /// <summary>
+    /// ItemDisplayInfo.TextureName1 fills only TEX_COMPONENT_OBJECT_SKIN (Type 2). Other empty
+    /// replaceable slots have their own client semantics; notably Thunderfury's Type 3 weapon-blade
+    /// sheen is not a second copy of its diffuse BLP and must never be bound to that display BLP.
+    /// </summary>
+    internal static bool UsesDisplayTexture(M2TextureRef texture) => texture.Type == 2;
+
+    /// <summary>Every texture slot reached by every unit in the M2 batch graph. This deliberately
+    /// differs from <see cref="GlbWriter.SampledTextureIndices"/>, whose first-batch-only result is
+    /// used to identify a base recolor target in older authoring paths.</summary>
+    internal static HashSet<int> SampledTextureSlots(M2Model m2)
+    {
+        var result = new HashSet<int>();
+        foreach (var batch in m2.Batches)
+        {
+            for (int unit = 0; unit < batch.TextureCount; unit++)
+            {
+                long combo = (long)batch.TextureIndex + unit;
+                if (combo < 0 || combo >= m2.TextureLookup.Count) continue;
+                int slot = m2.TextureLookup[(int)combo];
+                if (slot >= 0 && slot < m2.Textures.Count) result.Add(slot);
+            }
+        }
+        return result;
+    }
+
+    internal static bool SamplesDisplayTexture(M2Model m2)
+        => SampledTextureSlots(m2).Any(slot => UsesDisplayTexture(m2.Textures[slot]));
+
+    /// <summary>Stock bytes a WebGL preview may resolve for a non-display texture slot. Type 0
+    /// carries its own filename; Type 3 is supplied by the 1.12 client at runtime.</summary>
+    internal static string? StockPreviewTexturePath(M2TextureRef texture) => texture.Type switch
+    {
+        0 => WeaponTexturePath.Canonicalize(texture.Filename),
+        3 => WeaponBladePreviewTexturePath,
+        _ => null,
+    };
 
     private WeaponPreviewResult? TryRenderPassAware(M2Model m2, byte[]? baseBlp,
         IReadOnlyDictionary<string, byte[]>? effectBlpsByPath)
@@ -438,6 +498,13 @@ public sealed class WeaponPreviewService
             {
                 writer.Write(v.ModelPath);
                 writer.Write(v.MountMesh.X); writer.Write(v.MountMesh.Y); writer.Write(v.MountMesh.Z);
+                WriteBytes(writer, v.M2);
+                writer.Write(v.Textures.Count);
+                foreach (var texture in v.Textures.OrderBy(kv => kv.Key))
+                {
+                    writer.Write(texture.Key);
+                    WriteBytes(writer, texture.Value);
+                }
             }
             writer.Write(emitters?.Count ?? -1);
             foreach (var e in emitters ?? Array.Empty<PreviewEmitter>())
@@ -759,16 +826,24 @@ public sealed class WeaponPreviewService
     }
 
     private static string ContentKey(byte[] m2, byte[]? blp, IReadOnlyDictionary<string, byte[]>? extras = null,
-        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null)
+        IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null, bool preserveSourceGraph = false)
     {
         using var stream = new MemoryStream();
         using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
         {
+            writer.Write(preserveSourceGraph);
             writer.Write(visualEffects?.Count ?? -1);
             foreach (var v in visualEffects ?? Array.Empty<M2Fx.ItemVisualEffects.Effect>())
             {
                 writer.Write(v.ModelPath);
                 writer.Write(v.MountMesh.X); writer.Write(v.MountMesh.Y); writer.Write(v.MountMesh.Z);
+                WriteSegment(v.M2);
+                writer.Write(v.Textures.Count);
+                foreach (var texture in v.Textures.OrderBy(kv => kv.Key))
+                {
+                    writer.Write(texture.Key);
+                    WriteSegment(texture.Value);
+                }
             }
             // v3: GlbWriter now bakes the M2Color rest tint into baseColorFactor and attaches the
             // suiFx material-animation manifest. This cache is keyed on the INPUT bytes only, so a
@@ -780,7 +855,12 @@ public sealed class WeaponPreviewService
             // so without the salt bump the Forge keeps serving pre-change GLBs while the Items page
             // (which IS MVID-swept) regenerates — the same weapon rendering two different ways on
             // two pages, which is exactly the divergence this work exists to remove.
-            writer.Write("WeaponPreviewBytes/v4");
+            // v5: source items that need an item skin bypass the rigid pass-aware reconstruction,
+            // and the display BLP binds only to Type 2 rather than every non-Type-0 slot. Both are
+            // load-bearing for Thunderfury; stale v4 GLBs have already lost its rig and Type-3 sheen.
+            // v6: source-preserved previews require exact texture slots, bind the client's stock
+            // Type-3 weapon-blade replacement explicitly, and hash resolved ItemVisual bytes.
+            writer.Write("WeaponPreviewBytes/v6");
             WriteSegment(m2);
             WriteSegment(blp);
             writer.Write(extras?.Count ?? -1);

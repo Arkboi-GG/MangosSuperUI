@@ -6,15 +6,15 @@ namespace MangosSuperUI.Services.M2Fx;
 /// The THIRD way vanilla animates an item, and the one that carries most of the ones people actually
 /// name: <c>ItemDisplayInfo.itemVisual</c>.
 ///
-/// Material tracks live on the item's own materials and particle emitters live in the item's own M2,
-/// but an enchant glow, Thunderfury's lightning, Sulfuras's flame and the Warglaives' fire are none of
-/// those. They are SEPARATE effect models the client mounts onto the item at render time:
+/// Material tracks and native particle emitters live in the item's own M2. Enchant glows and many
+/// permanent weapon effects instead use SEPARATE models the client mounts at render time:
 ///
 ///   ItemDisplayInfo.itemVisual → ItemVisuals.dbc row → up to 5 ItemVisualEffects.dbc ids
 ///                              → each names a model, e.g. Spells\Enchantments\RedFlame_Low.mdx
 ///
 /// Nothing in the item's own bytes hints that any of this exists, which is why an item can be fully
-/// decoded, correctly rendered, and still look dead next to the game.
+/// decoded, correctly rendered, and still look dead next to the game. Thunderfury is the important
+/// opposite case: stock display 30606 has ItemVisual 0; its lightning is native M2 geometry/tracks.
 ///
 /// === The mounting rule (measured on the 1.12 client — do NOT re-derive) ===
 ///

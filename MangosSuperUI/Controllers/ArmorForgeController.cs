@@ -1019,9 +1019,9 @@ public class ArmorForgeController : Controller
     [HttpGet]
     public IActionResult DownloadPatch()
     {
-        var p = _armor.CanonicalPatchPath;
-        if (p is null) return NotFound("No patch-6.MPQ has been built yet.");
-        return PhysicalFile(p, "application/octet-stream", CustomArmorBuildService.PatchFileName);
+        // Forged armor ships in the unified patch now, not an archive of its own. Redirect rather
+        // than serve the stale lane-local artifact — there is exactly one file to install.
+        return RedirectToAction("DownloadPatch", "UnifiedPatch");
     }
 
     // ── Vanilla set bonuses (optional) ──────────────────────────────────

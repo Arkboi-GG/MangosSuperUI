@@ -3284,8 +3284,8 @@ public class ItemsController : Controller
             // Session N diagnostic: m_itemVisual — indexes ItemVisuals.dbc.
             // Non-zero means this item is supposed to render lightning,
             // glow, ribbons, or other visual effects on top of its base
-            // mesh. Zero for most items. Thunderfury (30606) should come
-            // back non-zero — that's Task 1's success criterion.
+            // mesh. Zero for most items. Thunderfury display 30606 is also
+            // zero; its lightning is native geometry/tracks in the weapon M2.
             itemVisualId = info.Value.ItemVisualId,
         });
     }
@@ -3616,25 +3616,12 @@ public class ItemsController : Controller
     /// </summary>
     [HttpGet]
     [HttpHead]
-    public async Task<IActionResult> DownloadPatch(string file)
+    public IActionResult DownloadPatch(string file)
     {
-        if (string.IsNullOrWhiteSpace(file)) return BadRequest("File name required");
-        file = Path.GetFileName(file); // sanitize
-        var fullPath = Path.Combine(_env.WebRootPath, "patches", "retexture", file);
-
-        // wwwroot is ephemeral — a publish/restart wipes wwwroot/patches while the
-        // retextures survive in the DB. If the current unified patch is missing on a
-        // real download (GET), regenerate it from the DB first so the download works
-        // in every environment without depending on wwwroot persisting.
-        if (!System.IO.File.Exists(fullPath)
-            && string.Equals(Request.Method, "GET", StringComparison.OrdinalIgnoreCase)
-            && string.Equals(file, "patch-4.MPQ", StringComparison.OrdinalIgnoreCase))
-        {
-            await _retexture.EnsurePatchBuiltAsync();
-        }
-
-        if (!System.IO.File.Exists(fullPath)) return NotFound($"Patch '{file}' not found");
-        return PhysicalFile(fullPath, "application/octet-stream", file);
+        // Retextures no longer have an archive of their own: they ship in the unified patch with
+        // forged weapons and armor, and wwwroot/patches/retexture is no longer written. Redirect to
+        // the one deployable file rather than 404 on a path nothing produces any more.
+        return RedirectToAction("DownloadPatch", "UnifiedPatch");
     }
 
     /// <summary>

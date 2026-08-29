@@ -470,12 +470,11 @@ public class RetextureEngineController : Controller
     /// </summary>
     [HttpGet]
     [HttpHead]
-    public async Task<IActionResult> DownloadPatch(string? file = null)
+    public IActionResult DownloadPatch(string? file = null)
     {
-        bool build = string.Equals(Request.Method, "GET", StringComparison.OrdinalIgnoreCase);
-        var (path, name, err) = await _support.EnsurePatchFileAsync(file, build);
-        if (path == null) return NotFound(err);
-        return PhysicalFile(path, "application/octet-stream", name);
+        // Retextures ship in the unified patch now, alongside forged weapons and armor, so this
+        // lane no longer has an archive of its own to serve. One file to install, one download.
+        return RedirectToAction("DownloadPatch", "UnifiedPatch");
     }
 
     /// <summary>GET /RetextureEngine/PatchStatus — can a patch be produced, and

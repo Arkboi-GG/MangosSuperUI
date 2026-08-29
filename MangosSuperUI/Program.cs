@@ -110,6 +110,14 @@ builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WotlkMpqSource>
 // never live in MPQs. LegacyImportSources pairs each mount with its catalog, keyed "tbc"/"wotlk".
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.TbcItemCatalog>();
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.WotlkItemCatalog>();
+// Third lane: stock 1.12 art through the SAME import pipeline. It exists because a vanilla clone
+// reuses the source display and therefore can never be recolored — colours live in the BLP, glow
+// and particle colours in the M2, and a clone ships neither. This lane packages its own, which is
+// what makes "recolor skin" and "tint glow / flame effects" available on a stock weapon.
+// It mounts the LIVE client and excludes the patches this app writes, so our own output can never
+// be re-imported as source art; its item list is the live item_template, not a shipped json.
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.VanillaMpqSource>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.VanillaItemCatalog>();
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.LegacyImportSources>();
 builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.VanillaItemSpellCatalog>();
 // Shared typed-gameplay intake (itemConfig JSON → validated item_template overrides) for both forges.
@@ -131,6 +139,16 @@ builder.Services.AddSingleton<MangosSuperUI.Services.WeaponForge.GlbWeaponImport
 // cloaks) + tier sets (ItemSet.dbc). Reuses the weapon id allocator + reservation tables.
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.ArmorPatchBuilder>();
 builder.Services.AddSingleton<MangosSuperUI.Services.ArmorForge.CustomArmorBuildService>();
+
+// Unified patch — the ONE archive carrying ItemDisplayInfo.dbc for every lane that writes it
+// (retextures, weapons, armor), replacing the patch-4 -> patch-5 -> patch-6 chain so a change in any
+// lane means one rebuild and one download instead of a cascade.
+// SCOPED, not singleton, for the same reason as CustomDisplayRegistrar below: it resolves
+// ItemRetextureService, which is scoped, and a singleton capturing a scoped dependency fails DI
+// validation at startup. Singletons that want to trigger a rebuild must open a scope
+// (IServiceScopeFactory.CreateScope) rather than injecting this directly.
+builder.Services.AddSingleton<MangosSuperUI.Services.UnifiedPatch.UnifiedPatchBuilder>();
+builder.Services.AddScoped<MangosSuperUI.Services.UnifiedPatch.UnifiedPatchService>();
 // SCOPED, not singleton: it depends on ItemRetextureService, which is scoped. A singleton
 // capturing a scoped dependency fails DI validation at startup.
 builder.Services.AddScoped<CustomDisplayRegistrar>();

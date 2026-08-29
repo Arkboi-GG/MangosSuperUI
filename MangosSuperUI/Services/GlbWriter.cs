@@ -114,7 +114,7 @@ public static class GlbWriter
     /// weapons NO.
     /// </summary>
     /// <param name="visualEffects">Separate effect models this item's <c>ItemVisual</c> mounts on it —
-    /// enchant glows, Thunderfury's lightning, a Warglaive's fire. None of that is in the item's own
+    /// enchant glows and some permanent weapon effects. None of those models is in the item's own
     /// bytes, so without this an item can be decoded perfectly and still render dead. Resolve them
     /// with <see cref="M2Fx.ItemVisualEffects.Resolve"/>; their emitters are folded into this GLB's
     /// manifest at their mount points and their sheets embedded alongside.</param>
@@ -122,10 +122,15 @@ public static class GlbWriter
     /// the import WILL bake, rendered via <see cref="M2Fx.M2FxReader.FromGraft"/> instead of the raw
     /// later-client emitter summary (which has no scale/alpha curves or flipbook ranges and draws
     /// giant flat white columns). When present, the degraded WotLK raw-summary fallback never runs.</param>
+    /// <param name="strictTextureSlots">Require every material to use the exact M2 texture slot it
+    /// samples. Source-preserved items use this because replaceable slots have distinct client
+    /// semantics: substituting the Type-2 object skin for a missing Type-3 weapon-blade texture
+    /// paints the blade sheen with the diffuse skin and no longer resembles the stock client.</param>
     public static bool SaveGlb(M2Model m2, Dictionary<int, byte[]> textures, string outputPath,
         bool doubleSided = false,
         IReadOnlyList<M2Fx.ItemVisualEffects.Effect>? visualEffects = null,
-        IReadOnlyList<WeaponForge.WeaponPreviewService.PreviewEmitter>? plannedEmitters = null)
+        IReadOnlyList<WeaponForge.WeaponPreviewService.PreviewEmitter>? plannedEmitters = null,
+        bool strictTextureSlots = false)
     {
         if (!m2.IsValid) return false;
 
@@ -209,7 +214,7 @@ public static class GlbWriter
                 //      slot over a type=0 (M2-embedded environment/reflect
                 //      map) when both are present — picking the reflect
                 //      map as the base color is the Might-helm/shoulder bug.
-                //   3. Grey fallback (only if zero textures decoded at all)
+                //   3. Grey fallback (when no substitution is available, or strict slots forbid it)
                 // Losing tier 2 is what made the v4-regenerated Thunderfury
                 // come out fully grey: 11 submeshes all referenced texIdx
                 // values that weren't present in pngByTexIdx (the only
@@ -221,7 +226,7 @@ public static class GlbWriter
                 {
                     pngBytes = exact;
                 }
-                else if (!exactOnly && pngByTexIdx.Count > 0)
+                else if (MaySubstituteMissingTexture(exactOnly, strictTextureSlots, pngByTexIdx.Count))
                 {
                     // Prefer the lowest-index type=2 slot (the DBC-supplied
                     // diffuse) over any type=0 slot (embedded reflection
@@ -1068,6 +1073,12 @@ public static class GlbWriter
     /// </summary>
     public static IReadOnlyList<int> SampledTextureIndices(M2Model m2)
         => BuildSubmeshTextureMap(m2).Values.Distinct().ToList();
+
+    /// <summary>Pure guard for the legacy first-available texture rescue. Preserved source graphs
+    /// opt out because their replaceable texture types are not interchangeable.</summary>
+    internal static bool MaySubstituteMissingTexture(
+        bool exactOnly, bool strictTextureSlots, int decodedTextureCount)
+        => !exactOnly && !strictTextureSlots && decodedTextureCount > 0;
 
     /// <summary>
     /// Build a mapping of submeshIndex → static-alpha-in-idle-pose using

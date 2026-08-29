@@ -377,6 +377,16 @@ public static class LegacyWeaponMeshExtractor
                     // Type-2 is the one replaceable texture supplied by ItemDisplayInfo for an
                     // object/weapon. It is the only texture kind for which a null source path is
                     // meaningful to the controller.
+                    //
+                    // Types 3 (weapon blade) and 4 (weapon handle) are ALSO externally supplied, and
+                    // accepting them here the same way looks right but corrupts the model. A null
+                    // source path makes the controller resolve that slot to the display row's BLP and
+                    // pack it as another member, so a blade that is already the base texture gets
+                    // packed a SECOND time as an effect slot. Every later effect slot then shifts by
+                    // one and the batches sample the wrong textures — measured on Thunderfury, whose
+                    // 32x32 glow orb ended up drawn over the blade. Handling 3/4 properly means
+                    // binding them to the emitted M2's own replaceable slot rather than baking a
+                    // copy, which is a change to the writer, not to this switch.
                     texture = new SourceTexture(null, source.Flags, source.Type);
                     return true;
                 default:

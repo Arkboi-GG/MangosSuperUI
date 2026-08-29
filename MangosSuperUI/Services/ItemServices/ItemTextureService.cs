@@ -353,8 +353,8 @@ public class ItemTextureService
     /// <summary>
     /// The item's <c>ItemVisual</c>, resolved to loaded effect models mounted on its attachments.
     ///
-    /// This is the channel that carries most of the effects anyone can name — enchant glows,
-    /// Thunderfury's lightning, a Warglaive's fire — and none of it is in the item's own bytes, so
+    /// This channel carries enchant glows and many permanent weapon effects, and none of those
+    /// separate effect models is in the item's own bytes, so
     /// without this an item decodes perfectly and still renders dead. Best-effort by design: an item
     /// with no visual, or a visual whose models are missing, simply gets no extra emitters.
     /// </summary>
@@ -2064,7 +2064,7 @@ public struct ItemModelDbc
     // from visuals here. ~1.2% of ItemDisplayInfo rows have a non-zero
     // value; for most items this stays 0 and the client renders no effect.
     //
-    // Confirmed via Session M discovery: Thunderfury (displayId 30606)
-    // expects a non-zero ItemVisualId resolving to the lightning effects.
+    // Thunderfury display 30606 is a useful counterexample: this stays zero;
+    // its lightning comes from native geometry/tracks in the weapon M2.
     public uint ItemVisualId;
 }

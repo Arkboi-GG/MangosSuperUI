@@ -40,6 +40,9 @@ public sealed class CustomArmorBuildService
     private readonly BlpWriterService _blp;
     private readonly IWebHostEnvironment _env;
     private readonly IConfiguration _config;
+    /// <summary>For reaching UnifiedPatchService, which is SCOPED while this service is a singleton
+    /// — it has to be resolved through a scope rather than injected.</summary>
+    private readonly IServiceProvider _services;
     private readonly ILogger<CustomArmorBuildService> _logger;
 
     private const string KindSet = WeaponIdReservationService.KindArmorSet;
@@ -48,10 +51,11 @@ public sealed class CustomArmorBuildService
         ArmorPatchBuilder patch, ArmorImportSources lanes, DbcService dbc,
         AuditService audit, RaService ra, ConnectionFactory db, PaletteSwapService palette,
         BlpWriterService blp, IWebHostEnvironment env,
-        IConfiguration config, ILogger<CustomArmorBuildService> logger)
+        IConfiguration config, IServiceProvider services, ILogger<CustomArmorBuildService> logger)
     {
         _mpq = mpq; _ids = ids; _patch = patch; _lanes = lanes; _dbc = dbc;
-        _audit = audit; _ra = ra; _db = db; _palette = palette; _blp = blp; _env = env; _config = config; _logger = logger;
+        _audit = audit; _ra = ra; _db = db; _palette = palette; _blp = blp; _env = env; _config = config;
+        _services = services; _logger = logger;
     }
 
     private string? ClientDataPath
@@ -316,7 +320,7 @@ public sealed class CustomArmorBuildService
         {
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, sql.Text);
-            var dep = DeployPatch(patch); apply.PatchDeployed = dep.Ok; apply.PatchDeployMessage = dep.Message;
+            var dep = await DeployUnifiedAsync($"armor imported: {name}"); apply.PatchDeployed = dep.Ok; apply.PatchDeployMessage = dep.Message;
             var setDep = DeployItemSetToServer(patch);
             apply.ServerItemSetState = setDep.State.ToString();
             apply.ServerItemSetMessage = setDep.Message;
@@ -422,7 +426,7 @@ public sealed class CustomArmorBuildService
             // One rebuild + deploy for the whole set.
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, null);
-            var dep = DeployPatch(patch);
+            var dep = await DeployUnifiedAsync("armor set import");
             var serverDeploy = DeployItemSetToServer(patch);
             result.PatchDeployed = dep.Ok;
             result.ServerItemSetDeployed = serverDeploy.State == ItemSetDeployState.Deployed;
@@ -516,7 +520,7 @@ public sealed class CustomArmorBuildService
             var stamp = await StampItemSetAsync(setId, stampEntries);
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, null);
-            var deploy = DeployPatch(patch);
+            var deploy = await DeployUnifiedAsync("armor set clone");
             var serverDeploy = DeployItemSetToServer(patch);
             var reload = await ReloadItemTemplateAsync();
 
@@ -1236,7 +1240,7 @@ public sealed class CustomArmorBuildService
             var reload = await ReloadItemTemplateAsync();
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, null);
-            var dep = DeployPatch(patch);
+            var dep = await DeployUnifiedAsync("armor vanilla clone");
             var serverDeploy = DeployItemSetToServer(patch);
             result.PatchDeployed = dep.Ok;
             result.ServerItemSetDeployed = serverDeploy.State == ItemSetDeployState.Deployed;
@@ -1484,26 +1488,29 @@ public sealed class CustomArmorBuildService
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // UNIFIED PATCH-6 ASSEMBLY
+    // PATCH ASSEMBLY — lane contribution + standalone patch-6
     // ═══════════════════════════════════════════════════════════════════
 
-    public async Task<ArmorPatchResult?> AssembleUnifiedPatchAsync()
+    /// <summary>This lane's rows and members for the single unified patch. Null when there is
+    /// genuinely nothing to ship. Every source is a DB table, never a mounted archive, which is what
+    /// lets the old per-lane patches stop existing without losing anything already forged.
+    ///
+    /// <paramref name="patchCeilingName"/> names the archive this contribution will be packed into,
+    /// so the base ItemSet.dbc resolves from strictly BENEATH it and a builder never reads its own
+    /// previous output back as input. Defaults to this lane's own patch for the standalone path.</summary>
+    internal async Task<UnifiedPatch.ArmorLaneContribution?> GetPatchContributionAsync(
+        ForgeDiagnostics diag, string? patchCeilingName = null)
     {
         var rows = await LoadArmorRowsAsync();
         // Sets are resolved up front, not just at packaging time, because they can be the ONLY reason to
         // build a patch. A cloned set writes no custom_armor_display rows at all, so `rows.Count == 0`
         // used to mean "nothing to ship" and returned null — which on a clone-only install removed
-        // patch-6 from the client and restored the server's stock ItemSet.dbc, quietly unmaking the set
+        // the patch from the client and restored the server's stock ItemSet.dbc, quietly unmaking the set
         // that had just been created. Bail only when there is genuinely nothing.
         var sets = await LoadSetsAsync(rows);
         if (rows.Count == 0 && sets.Count == 0) return null;
 
-        byte[] baseDbc = ResolveBaseDbc();
-        var baseReader = DbcWriterService.ReadDbc(baseDbc, ArmorNaming.ItemDisplayInfoMember);
-        var customIds = rows.Select(r => (uint)r.DisplayId).ToHashSet();
-        int replaced = baseReader.RemoveRowsWhere(id => customIds.Contains(id));
-        byte[] cleanedBase = replaced > 0 ? baseReader.Write() : baseDbc;
-
+        int skippedCount = 0;
         var displays = new List<ArmorDisplayEntry>();
         var models = new List<MpqMember>();
         var textures = new List<MpqMember>();
@@ -1541,7 +1548,11 @@ public sealed class CustomArmorBuildService
                 _logger.LogWarning(
                     "ArmorForge: display {DisplayId} is a {Kind} piece with no stored model bytes — omitted from " +
                     "{Patch} entirely (no member, no display row). Delete it from the Forged Armor list and re-import it.",
-                    r.DisplayId, kind, PatchFileName);
+                    r.DisplayId, kind, patchCeilingName ?? PatchFileName);
+                diag.Warn("armor.skipped",
+                    $"armor display {r.DisplayId} is a {kind} piece with no stored model bytes — omitted entirely " +
+                    "(no member, no display row). Delete it from the Forged Armor list and re-import it.");
+                skippedCount++;
                 continue;
             }
 
@@ -1609,19 +1620,84 @@ public sealed class CustomArmorBuildService
         bool setsOmitted = false;
         if (sets.Count > 0)
         {
-            baseItemSet = _mpq.ExtractFile(ArmorNaming.ItemSetMember, skipArchive: n => n.StartsWith("patch-6", StringComparison.OrdinalIgnoreCase));
+            // Beneath the archive we are packing INTO, by rank. Matching on the name "patch-6" was
+            // only ever correct while this lane owned that one file; ranking keeps it correct when
+            // the contribution is packed into the unified patch instead.
+            int ceiling = Mpq.MpqPatchOrder.Rank(patchCeilingName ?? PatchFileName);
+            baseItemSet = _mpq.ExtractFile(ArmorNaming.ItemSetMember,
+                skipArchive: n => Mpq.MpqPatchOrder.Rank(n) >= ceiling);
             if (baseItemSet is null || baseItemSet.Length == 0)
             {
-                _logger.LogWarning("ArmorForge: base ItemSet.dbc unreadable — {Count} set(s) omitted from patch-6 this build", sets.Count);
+                _logger.LogWarning("ArmorForge: base ItemSet.dbc unreadable — {Count} set(s) omitted from this build", sets.Count);
+                diag.Warn("armor.sets.omitted",
+                    $"Base ItemSet.dbc could not be read, so {sets.Count} forged set(s) ship no bonuses this build.");
                 sets = new List<ArmorSetDefinition>();
                 setsOmitted = true;
             }
         }
 
+        return new UnifiedPatch.ArmorLaneContribution
+        {
+            Displays = displays,
+            // One list out; the standalone builder splits it back by extension exactly the way the
+            // gather loop decided which bucket each member belonged in.
+            Members = models.Concat(textures).ToArray(),
+            Sets = sets,
+            CleanItemSetDbc = baseItemSet,
+            SetsOmitted = setsOmitted,
+            SkippedCount = skippedCount,
+        };
+    }
+
+    /// <summary>Deploy through the UNIFIED patch. Every lane that writes ItemDisplayInfo.dbc now
+    /// ships in one archive, so this lane no longer places a file of its own: it asks the unified
+    /// service to repackage all lanes, deploy that, and retire the superseded per-lane archives.
+    ///
+    /// Scoped resolve, not injection: UnifiedPatchService depends on the scoped ItemRetextureService
+    /// and this service is a singleton, so it must open a scope. Best-effort like the deploy it
+    /// replaces — a packaging failure is reported, never thrown into an import flow.</summary>
+    private async Task<(bool Ok, string Message)> DeployUnifiedAsync(string reason)
+    {
+        try
+        {
+            using var scope = _services.CreateScope();
+            if (scope.ServiceProvider.GetService(typeof(UnifiedPatch.UnifiedPatchService))
+                is not UnifiedPatch.UnifiedPatchService unified)
+                return (false, "unified patch service unavailable — nothing deployed");
+            var summary = await unified.RebuildAsync(reason);
+            return (summary.Ok, summary.DeployMessage ?? summary.Message);
+        }
+        catch (Exception ex)
+        {
+            return (false, $"unified patch rebuild failed ({ex.Message}) — nothing deployed");
+        }
+    }
+
+    /// <summary>Standalone patch-6 assembly — this lane packing its own archive, as it did before the
+    /// unified patch existed. Kept so the Armor Forge can still build in isolation; the unified
+    /// service calls <see cref="GetPatchContributionAsync"/> and packs one archive for all lanes.</summary>
+    public async Task<ArmorPatchResult?> AssembleUnifiedPatchAsync()
+    {
+        var diag = new ForgeDiagnostics("armor-assemble");
+        var contribution = await GetPatchContributionAsync(diag);
+        if (contribution is null) return null;
+
+        byte[] baseDbc = ResolveBaseDbc();
+        var baseReader = DbcWriterService.ReadDbc(baseDbc, ArmorNaming.ItemDisplayInfoMember);
+        var customIds = contribution.Displays.Select(d => d.Params.DisplayId).ToHashSet();
+        int replaced = baseReader.RemoveRowsWhere(id => customIds.Contains(id));
+        byte[] cleanedBase = replaced > 0 ? baseReader.Write() : baseDbc;
+
+        static bool IsModel(MpqMember m) => m.MpqPath.EndsWith(".m2", StringComparison.OrdinalIgnoreCase);
         var input = new ArmorPatchInput
         {
-            CleanItemDisplayInfoDbc = cleanedBase, Displays = displays, Models = models, Textures = textures,
-            Sets = sets, CleanItemSetDbc = baseItemSet, SetsOmitted = setsOmitted,
+            CleanItemDisplayInfoDbc = cleanedBase,
+            Displays = contribution.Displays,
+            Models = contribution.Members.Where(IsModel).ToArray(),
+            Textures = contribution.Members.Where(m => !IsModel(m)).ToArray(),
+            Sets = contribution.Sets,
+            CleanItemSetDbc = contribution.CleanItemSetDbc,
+            SetsOmitted = contribution.SetsOmitted,
         };
         string tempDir = Path.Combine(Path.GetTempPath(), "armorforge", Guid.NewGuid().ToString("N")[..8]);
         return _patch.Build(input, tempDir);
@@ -1657,7 +1733,7 @@ public sealed class CustomArmorBuildService
                 return "no armor in registry — patch-6 removed";
             }
             WriteCanonicalPatch(patch);
-            var deploy = DeployPatch(patch);
+            var deploy = await DeployUnifiedAsync("armor patch rebuild: " + reason);
             var setDeploy = DeployItemSetToServer(patch);
             if (setDeploy.State == ItemSetDeployState.Failed)
                 _logger.LogWarning("ArmorForge: server ItemSet.dbc NOT deployed — {Msg}", setDeploy.Message);
@@ -2168,10 +2244,21 @@ public sealed class CustomArmorBuildService
     private (ItemSetDeployState State, string Message, string? Path) DeployItemSetToServer(ArmorPatchResult? patch)
     {
         if (patch is null) return (ItemSetDeployState.NotNeeded, "no patch built", null);
-        if (patch.ItemSetOmitted)
+        return DeployItemSetToServer(patch.ItemSetDbcBytes, patch.ItemSetOmitted);
+    }
+
+    /// <summary>Deploy the built ItemSet.dbc to the RUNNING SERVER's dbc folder, by bytes rather than
+    /// by patch object, so the unified patch can reuse it — the sets it ships are the same sets, and
+    /// the core still zeroes every forged set_id without this file whatever archive shipped it.
+    /// Overload, not a rewrite: the client-side member and the server-side file have always been two
+    /// separate deliveries, and only the second one is what mangosd reads.</summary>
+    internal (ItemSetDeployState State, string Message, string? Path) DeployItemSetToServer(
+        byte[]? itemSetDbcBytes, bool itemSetOmitted)
+    {
+        if (itemSetOmitted)
             return (ItemSetDeployState.Failed,
                 "sets exist but no ItemSet.dbc was built (the base ItemSet.dbc could not be read from the mounted archives) — the server will zero every forged set_id", null);
-        if (patch.ItemSetDbcBytes is not { Length: > 0 } bytes)
+        if (itemSetDbcBytes is not { Length: > 0 } bytes)
             return (ItemSetDeployState.NotNeeded, "no forged sets — nothing to deploy", null);
 
         var (dir, detail) = ResolveServerDbcDir();
