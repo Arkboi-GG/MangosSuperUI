@@ -15,8 +15,11 @@
         "home" or "console" or "players" or "accounts" or "realm" => "operations",
         "serverlogs" or "livelogs" or "config" => "server",
         "worlds" or "changes" or "activity" => "state",
-        "spells" or "patch" or "spellcompleter" => "spells",
-        "items" or "retextureengine" or "gameobjects" or "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" or "professiontuning" => "content",
+        "spells" or "spellcompleter" => "spells",
+        "patch" => currentAction.Equals("VisualLab", StringComparison.OrdinalIgnoreCase) ? "archive" : "spells",
+        "gameobjects" => "archive",
+        "items" or "retextureengine" => "content",
+        "loottuner" or "instances" or "lootifier" or "questlootifier" or "craftinglootifier" or "professiontuning" => "loot",
         "worldeditor" or "worldmap" => "world",
         "database" or "functiongraph" or "sourcemap" => "data",
         "circuittrace" => "devtools",
@@ -31,7 +34,7 @@
     string activeSection = activeGroup switch
     {
         "operations" or "server" or "state" => "admin",
-        "content" or "spells" or "world" => "tuning",
+        "content" or "loot" or "spells" or "world" or "archive" => "tuning",
         "bots" => "aibots",
         "data" or "devtools" or "gamedev" => "devdata",
         "wiki" => "wiki",
@@ -196,10 +199,10 @@
         </div>
 
         <!-- ========== Gameplay Tuning ========== -->
-        <!-- Items & Loot -->
+        <!-- Items -->
         <div class="sidebar-section" data-group="content" data-section="tuning">
             <div class="sidebar-section-title" data-toggle-group="content">
-                <span>Items &amp; Loot</span>
+                <span>Items</span>
                 <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
             </div>
             <ul class="sidebar-nav sidebar-nav-collapsible">
@@ -215,12 +218,16 @@
                         Retexture Engine
                     </a>
                 </li>
-                <li class="sidebar-nav-item" data-nav-key="gameobjects">
-                    <a asp-controller="GameObjects" asp-action="Index" class="@NavClass("GameObjects")">
-                        <i class="fa-solid fa-cubes"></i>
-                        Game Objects
-                    </a>
-                </li>
+            </ul>
+        </div>
+
+        <!-- Loot -->
+        <div class="sidebar-section" data-group="loot" data-section="tuning">
+            <div class="sidebar-section-title" data-toggle-group="loot">
+                <span>Loot</span>
+                <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
+            </div>
+            <ul class="sidebar-nav sidebar-nav-collapsible">
                 <li class="sidebar-nav-item" data-nav-key="loottuner">
                     <a asp-controller="LootTuner" asp-action="Index" class="@NavClass("LootTuner")">
                         <i class="fa-solid fa-dice-d20"></i>
@@ -279,12 +286,6 @@
                         Spell Creator
                     </a>
                 </li>
-                <li class="sidebar-nav-item" data-nav-key="visuallab">
-                    <a asp-controller="Patch" asp-action="VisualLab" class="@(currentController.Equals("Patch", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("VisualLab", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
-                        <i class="fa-solid fa-cube"></i>
-                        Spell Visualizer
-                    </a>
-                </li>
                 <li class="sidebar-nav-item" data-nav-key="spellcompleter">
                     <a asp-controller="SpellCompleter" asp-action="Index" class="@NavClass("SpellCompleter")">
                         <i class="fa-solid fa-flag-checkered"></i>
@@ -311,6 +312,28 @@
                     <a asp-controller="WorldEditor" asp-action="Index" class="@NavClass("WorldEditor")">
                         <i class="fa-solid fa-mountain-sun"></i>
                         3D World Editor
+                    </a>
+                </li>
+            </ul>
+        </div>
+
+        <!-- Archive (collapsed by default) -->
+        <div class="sidebar-section" data-group="archive" data-section="tuning" data-default-collapsed="true">
+            <div class="sidebar-section-title" data-toggle-group="archive">
+                <span>Archive</span>
+                <i class="fa-solid fa-chevron-right sidebar-chevron"></i>
+            </div>
+            <ul class="sidebar-nav sidebar-nav-collapsible">
+                <li class="sidebar-nav-item" data-nav-key="visuallab">
+                    <a asp-controller="Patch" asp-action="VisualLab" class="@(currentController.Equals("Patch", StringComparison.OrdinalIgnoreCase) && currentAction.Equals("VisualLab", StringComparison.OrdinalIgnoreCase) ? "active" : "")">
+                        <i class="fa-solid fa-cube"></i>
+                        Spell Visualizer
+                    </a>
+                </li>
+                <li class="sidebar-nav-item" data-nav-key="gameobjects">
+                    <a asp-controller="GameObjects" asp-action="Index" class="@NavClass("GameObjects")">
+                        <i class="fa-solid fa-cubes"></i>
+                        Game Objects
                     </a>
                 </li>
             </ul>
