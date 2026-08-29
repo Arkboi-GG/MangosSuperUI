@@ -321,7 +321,7 @@
         <div class="wf-header-sub">
             The import station: bring a <strong>finished GLB</strong> (UVs + texture authored elsewhere), decimate it
             to a game budget, and forge it into the game. Forging inserts the item into the world database, reloads
-            <code>item_template</code>, and deploys <code>patch-5.MPQ</code> to the client Data folder. Restart the
+            <code>item_template</code>, and deploys <code>patch-4.MPQ</code> to the client Data folder. Restart the
             client, then <code>.additem</code> the new entry. If an existing custom entry shows an old name or equip
             slot, fully close WoW and remove <code>WDB\itemcache.wdb</code> (or the whole <code>WDB</code> cache
             directory) before relaunching; the client recreates it. All build files are also kept in the artifact folder.
@@ -330,7 +330,7 @@
             <span class="wf-pill" id="pillFixture">fixture …</span>
             <span class="wf-pill" id="pillDonor">donor …</span>
             <span class="wf-pill" id="pillContract">contract …</span>
-            <span class="wf-pill" id="pillDeploy" title="Is the patch-5.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
+            <span class="wf-pill" id="pillDeploy" title="Is the patch-4.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
         </div>
     </div>
 
@@ -577,7 +577,7 @@
                         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-light);">
                             <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="tbcRcGlowOn"> tint glow / flame effects</label>
                             <input type="color" id="tbcRcGlowColor" value="#33aaff" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
-                            <span id="tbcRcGlowNote" style="font-size:11px;color:var(--text-muted);">Live in the preview; baked into the emitter colour on forge.</span>
+                            <span id="tbcRcGlowNote" style="font-size:11px;color:var(--text-muted);">Recolors compositing effect sheets and rebuilt emitters in preview and forge; movement stays intact.</span>
                         </div>
                         <div id="tbcRcStatus" style="font-size:11px;color:var(--text-muted);margin-top:6px;"></div>
                     </div>
@@ -655,7 +655,7 @@
                         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-light);">
                             <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="wotlkRcGlowOn"> tint glow / flame effects</label>
                             <input type="color" id="wotlkRcGlowColor" value="#33aaff" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
-                            <span id="wotlkRcGlowNote" style="font-size:11px;color:var(--text-muted);">Live in the preview; baked into the emitter colour on forge.</span>
+                            <span id="wotlkRcGlowNote" style="font-size:11px;color:var(--text-muted);">Recolors compositing effect sheets and rebuilt emitters in preview and forge; movement stays intact.</span>
                         </div>
                         <div id="wotlkRcStatus" style="font-size:11px;color:var(--text-muted);margin-top:6px;"></div>
                     </div>
@@ -670,13 +670,17 @@
                 </div>
             </div>
 
+
             <div class="wf-card">
                 <h3><span class="phase">Clone</span> Vanilla weapon</h3>
                 <p id="vanillaState">Clone an existing <strong>vanilla weapon or shield</strong> into a new custom item and
                    re-itemize it (name, quality, damage, speed, stats, effects, price). It reuses the source's own
                    display — model, texture, icon, sheath, grip and sound are already in your client — so
                    <strong>nothing is packaged</strong>: no patch, no download, no client restart. Usable via
-                   <code>.additem</code> as soon as the core reloads. Reads the live world database, so unlike the
+                   <code>.additem</code> as soon as the core reloads. <strong>Unless you recolor its skin</strong> — that
+                   creates a new display and texture in the patch while copying the stock M2 byte-for-byte. Authored
+                   bones, global loops, billboards, material animation and hardcoded glow sheets therefore stay intact.
+                   Leave the recolor box unticked and it stays a pure clone. Reads the live world database, so unlike the
                    TBC and WotLK lanes it needs no client path in Settings.</p>
                 <div class="wf-row">
                     <div class="wf-field" style="flex:1;min-width:220px;">
@@ -699,6 +703,30 @@
                     <button class="wf-btn" data-action="vanillaClone" id="vanillaCloneBtn" disabled>
                         <i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
+                <div class="wf-group" title="Recolor the stock Type-2 display skin without rebuilding its M2. Leave both off and this stays a pure clone: nothing is packaged.">
+                    <div class="wf-group-title"><span>Recolor (optional)</span></div>
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="vanillaRcOn"> recolor skin</label>
+                        <input type="color" id="vanillaRcColor" value="#3b6fd4" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
+                        <label style="display:flex;align-items:center;gap:5px;font-size:12px;">Tier
+                            <select id="vanillaRcTier">
+                                <option value="subtle">Subtle</option>
+                                <option value="improved" selected>Improved</option>
+                                <option value="bold">Bold</option>
+                                <option value="extreme">Extreme</option>
+                            </select>
+                        </label>
+                    </div>
+                    <div id="vanillaRcTheories" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-light);">
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;"><input type="checkbox" id="vanillaRcGlowOn"> recolor native glow / material effects</label>
+                        <input type="color" id="vanillaRcGlowColor" value="#33aaff" style="width:40px;height:26px;padding:0;border:1px solid var(--border-color);border-radius:6px;background:none;">
+                        <span style="font-size:11px;color:var(--text-muted);">Safely isolated Type-0 geometry, particle, and ribbon sheets become private copies; shared ItemVisual and Type-3 effects stay stock.</span>
+                    </div>
+                    <div id="vanillaRcStatus" style="font-size:11px;color:var(--text-muted);margin-top:8px;">
+                        Both off — pure clone, nothing packaged.
+                    </div>
+                </div>
                 <div class="wf-note">
                     The clone keeps the source's <strong>equip slot and weapon subclass</strong> — a stock display cannot be
                     re-scaffolded for a different family, so slot changes belong to the import lanes, which build a model for
@@ -712,7 +740,7 @@
 
             <div class="wf-card">
                 <h3><span class="phase">Registry</span> Forged Weapons</h3>
-                <p>The weapons currently in the registry — the exact contents of <code>patch-5.MPQ</code>.
+                <p>The weapons currently in the registry — the weapons inside <code>patch-4.MPQ</code>.
                    <strong>View</strong> renders a weapon's stored M2+BLP in the viewer. <strong>Delete</strong>
                    removes it from the game: world-database row, packaged patch, and registry entry; its IDs return
                    to the pool. All forge and delete actions are recorded in the Activity Log.</p>
@@ -720,7 +748,7 @@
                 <div class="wf-row" style="margin-top:10px;">
                     <button class="wf-btn secondary" data-action="rebuildPatch">Rebuild patch</button>
                     <a class="wf-btn secondary" href="/WeaponForge/DownloadPatch" style="text-decoration:none;">
-                        <i class="fa-solid fa-download"></i> Download current patch-5.MPQ</a>
+                        <i class="fa-solid fa-download"></i> Download current patch-4.MPQ</a>
                 </div>
             </div>
 
@@ -1337,7 +1365,7 @@
                     'Verified': d.allMembersVerified ? 'yes' : 'NO', 'Triangles': d.triangleCount,
                 },
                 downloads: [
-                    { label: 'patch-5.MPQ', url: d.mpqDownloadUrl },
+                    { label: 'patch-4.MPQ', url: '/UnifiedPatch/DownloadPatch' },
                     { label: 'item_template.sql', url: d.sqlDownloadUrl },
                 ],
                 diagnostics: [
@@ -1776,8 +1804,31 @@
                 const exactMatches = rows.filter(r => +r.id === id);
                 if (!exactMatches.length) { setSpellResolution(card, false, `Spell #${id} is not a native stock-item effect for this trigger.`); return false; }
                 if (exactMatches.length > 1) {
+                    // Several stock items install this same spell and differ only in the slot numbers
+                    // (Thunderfury 19019 procs at 8 PPM; the deprecated 17802 carries the identical
+                    // spell at 0). The card is ALREADY pre-filled from the source item, so those
+                    // numbers are the answer — narrow on them before demanding a choice.
+                    const cur = {
+                        charges: +card.querySelector('.ib-spell-charges').value || 0,
+                        ppm: +card.querySelector('.ib-spell-ppm').value || 0,
+                        category: +card.querySelector('.ib-spell-category').value || 0,
+                    };
+                    const narrowed = exactMatches.filter(r =>
+                        (r.charges ?? 0) === cur.charges &&
+                        (r.ppmRate ?? 0) === cur.ppm &&
+                        (r.category ?? 0) === cur.category);
+                    if (narrowed.length === 1) { selectItemSpell(card, { ...narrowed[0], trigger }); return true; }
+
+                    // Still ambiguous. Offer the list, and ALSO spell the variants out in the message:
+                    // the results dropdown is absolutely positioned and can be clipped inside the
+                    // modal, and an unreachable picker is the same as no picker.
                     renderItemSpellResults(card, exactMatches);
-                    setSpellResolution(card, false, `Spell #${id} has multiple stock item variants. Choose the charges / PPM / cooldown row you want.`);
+                    const summary = exactMatches
+                        .map(r => `charges ${r.charges ?? 0} / PPM ${r.ppmRate ?? 0} / category ${r.category ?? 0}`)
+                        .join('  —  ');
+                    setSpellResolution(card, false,
+                        `Spell #${id} has ${exactMatches.length} stock item variants: ${summary}. ` +
+                        `Pick one from the list, or type those numbers into the fields below to choose it.`);
                     return false;
                 }
                 selectItemSpell(card, { ...exactMatches[0], trigger });
@@ -2046,7 +2097,8 @@
         function itemBuildSourceKindLabel() {
             const mode = itemBuildState.mode;
             if (mode === 'glb') return 'GLB import';
-            if (mode === 'vanilla') return 'Vanilla clone';
+            if (mode === 'vanilla')
+                return vanillaRecolorOn() ? 'Vanilla recolor (forged)' : 'Vanilla clone';
             return `${LEGACY[mode].label} import`;
         }
         async function submitItemBuild() {
@@ -2088,6 +2140,19 @@
                     // actually landed reported a TypeError into an already-closed modal.
                     vanillaSource = VANILLA.sel;
                     fd.append('entry', vanillaSource.entry);
+                    // A recolor cannot be a clone: it needs its own display and art. Same selection,
+                    // same config modal — it just goes down the packaging route instead. The server
+                    // resolves model and display row from the entry alone.
+                    if (vanillaRecolorOn()) {
+                        fd.append('weaponType', vanillaSource.family || '');
+                        if (document.getElementById('vanillaRcOn').checked) {
+                            fd.append('recolorHue', Math.round(hexToHue(document.getElementById('vanillaRcColor').value)));
+                            fd.append('recolorTheory', (VANILLA.rcTheory && VANILLA.rcTheory()) || 'primary');
+                            fd.append('recolorTier', document.getElementById('vanillaRcTier').value || 'improved');
+                        }
+                        if (document.getElementById('vanillaRcGlowOn').checked)
+                            fd.append('glowColor', document.getElementById('vanillaRcGlowColor').value);
+                    }
                 } else if (mode === 'glb') {
                     const file = document.getElementById('glbFile').files[0];
                     if (!file) throw new Error('The selected GLB is no longer available.');
@@ -2116,12 +2181,15 @@
                 const resolvedErrors = validateItemConfig(config);
                 if (resolvedErrors.length) { showItemBuildErrors(resolvedErrors); return; }
 
-                const cloning = mode === 'vanilla';
+                // A recolored vanilla item is NOT a clone — it mints its own display and art — so it
+                // goes down the packaging route. Same card, same selection, same config modal.
+                const cloning = mode === 'vanilla' && !vanillaRecolorOn();
                 btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${cloning ? 'Cloning…' : 'Forging…'}`;
                 status.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${cloning ? 'Cloning the item…' : 'Forging the final item…'}`;
                 fd.append('name', config.name);
                 fd.append('itemConfig', JSON.stringify(config));
                 const url = cloning ? '/WeaponForge/CloneVanilla'
+                    : mode === 'vanilla' ? '/WeaponForge/ForgeVanilla'
                     : mode === 'glb' ? '/WeaponForge/ForgeGlb'
                     : LEGACY[mode].urls.forge;
                 const response = await fetch(url, { method: 'POST', body: fd });
@@ -2130,7 +2198,9 @@
                     showItemBuildErrors([d?.error || d?.message || (cloning ? 'Clone failed.' : 'Forge failed.'), ...(d?.errors || []), ...(d?.diagnostics || [])]);
                     return;
                 }
-                if (cloning) { /* no lane name field to write back — the source list is unchanged */ }
+                // A recolored vanilla item forges from the clone card, which has no lane Name field
+                // to write back into — same as a plain clone.
+                if (cloning || mode === 'vanilla') { /* no lane name field — the source list is unchanged */ }
                 else if (mode === 'glb') document.getElementById('glbName').value = config.name;
                 else LEGACY[mode].el('Name').value = config.name;
                 closeItemBuild(true);
@@ -2149,7 +2219,9 @@
                         note: d.note,
                     });
                 } else {
-                    forgeResult(d, mode === 'glb' ? 'GLB forged' : `${LEGACY[mode].label} weapon forged`);
+                    forgeResult(d, mode === 'glb' ? 'GLB forged'
+                        : mode === 'vanilla' ? 'Vanilla weapon forged (recolored)'
+                        : `${LEGACY[mode].label} weapon forged`);
                 }
             } catch (e) {
                 showItemBuildErrors([String(e)]);
@@ -2391,7 +2463,7 @@
                 setResult({
                     title: 'Patch repackaged',
                     kv: { 'Weapons': d.weaponCount, 'Patch': d.patchRemoved ? 'removed (no weapons in registry)' : 'rebuilt' },
-                    downloads: d.patchDownloadUrl ? [{ label: 'patch-5.MPQ', url: d.patchDownloadUrl }] : [],
+                    downloads: d.patchDownloadUrl ? [{ label: 'patch-4.MPQ', url: d.patchDownloadUrl }] : [],
                     diagnostics: [applyLine(d.patchDeployed || d.patchRemoved, 'Deploy', d.patchDeployMessage || ''), ...(d.diagnostics || [])]
                 });
                 loadWeapons();
@@ -2409,10 +2481,14 @@
         // ---------- Later-client import lanes: TBC + WotLK ----------
         // Both lanes are the same UI and the same server contract; only element ids (`${key}Xxx`),
         // endpoint urls and labels differ. The item-build modal receives the lane key as its mode.
-        function makeLane(key, label, urls) {
+        // idPrefix defaults to the key and exists so a lane's element ids can differ from the key it
+        // sends to the server. Note mode 'vanilla' is NOT in here: the vanilla card is its own block
+        // (clone, or a recolored forge) and is handled before LEGACY[mode] is ever consulted.
+        function makeLane(key, label, urls, idPrefix) {
+            const ids = idPrefix || key;
             const lane = {
-                key, label, urls, sel: null, page: 1, searchTimer: null, previewSerial: 0, previewTimer: null,
-                el(suffix) { return document.getElementById(key + suffix); },
+                key, label, urls, idPrefix: ids, sel: null, page: 1, searchTimer: null, previewSerial: 0, previewTimer: null,
+                el(suffix) { return document.getElementById(ids + suffix); },
                 targetTris() { return +(lane.el('Target')?.value || 0); },
                 invalidatePreview() { ++lane.previewSerial; lane.el('ForgeBtn').disabled = true; },
             };
@@ -2437,17 +2513,10 @@
             target.append('recolorTheory', lane.rcTheory || 'primary');
             target.append('recolorTier', lane.el('RcTier').value || 'improved');
         }
-        // Glow tint is client-side in the preview (wfTintGlow) and a forge-only field (glowColor).
+        // Imported material effects need a real hue-shifted texture, not material.color
+        // multiplication (which cannot turn a green Warglaive reflection into arbitrary hues).
+        // The same glowColor now drives the server preview and the forge bake.
         function laneGlowTint(lane) { return lane.el('RcGlowOn').checked ? lane.el('RcGlowColor').value : null; }
-        function laneApplyGlowTint(lane) {
-            wfGlowWanted = lane.el('RcGlowOn').checked ? hexToRgb01(lane.el('RcGlowColor').value) : null;
-            let n = 0;
-            if (wfGlowWanted) n = wfTintGlow(wfGlowWanted); else wfClearGlow();
-            lane.el('RcGlowNote').textContent = !lane.el('RcGlowOn').checked
-                ? 'Live in the preview; baked into the emitter colour on forge.'
-                : (n ? `${n} glow material(s) tinted — bakes into the M2 emitter colour on forge.`
-                     : 'No glow/particle material in the current preview to tint (rebuilt emitters are still tinted on forge).');
-        }
         function wireLaneRecolor(lane) {
             lane.rcTheory = 'primary';
             const schedule = () => {
@@ -2456,6 +2525,20 @@
                 lane.invalidatePreview();
                 clearTimeout(lane.previewTimer);
                 lane.previewTimer = setTimeout(() => lanePreview(lane), 350);
+            };
+            const scheduleEffectTint = () => {
+                // The returned GLB already contains hue-shifted effect pixels. Never multiply its
+                // material color again: the environment-mapped pass must remain free to animate.
+                wfGlowWanted = null;
+                wfClearGlow();
+                const enabled = lane.el('RcGlowOn').checked;
+                lane.el('RcGlowNote').textContent = enabled
+                    ? 'Recoloring effect preview…'
+                    : 'Recolors compositing effect sheets and rebuilt emitters in preview and forge; movement stays intact.';
+                if (!lane.sel) return;
+                lane.invalidatePreview();
+                clearTimeout(lane.previewTimer);
+                lane.previewTimer = setTimeout(() => lanePreview(lane), 220);
             };
             const host = lane.el('RcTheories');
             for (const [key, label] of RC_THEORIES) {
@@ -2493,10 +2576,10 @@
                     } else lane.el('RcStatus').textContent = d.error || 'Could not detect a primary colour.';
                 } catch (e) { lane.el('RcStatus').textContent = 'Detect failed: ' + e; }
             });
-            lane.el('RcGlowOn').addEventListener('change', () => laneApplyGlowTint(lane));
+            lane.el('RcGlowOn').addEventListener('change', scheduleEffectTint);
             lane.el('RcGlowColor').addEventListener('input', () => {
                 if (!lane.el('RcGlowOn').checked) lane.el('RcGlowOn').checked = true;
-                laneApplyGlowTint(lane);
+                scheduleEffectTint();
             });
         }
         async function loadItemVisuals() {
@@ -2528,9 +2611,61 @@
         // ---------- vanilla clone lane ----------
         // Deliberately NOT a makeLane(): that abstraction is built around a mounted client archive
         // (status probe, paged MPQ browse, mesh preview, triangle budget, glow and recolor bakes).
-        // The vanilla lane has none of those — it reads the live world DB and packages nothing — so
-        // it gets its own small block rather than a lane object with most fields unused.
+        // The vanilla lane reads the live world DB; a pure clone packages nothing, while an art edit
+        // packages a source-preserved M2 plus private BLPs. It still gets its own small block rather
+        // than a lane object with most import-only fields unused.
         const VANILLA = { sel: null, searchTimer: null, rows: [], previewSerial: 0, searchSerial: 0, seeded: false, seedInFlight: false };
+
+        // Recolor on the clone card. Ticking either box promotes the clone into a real forge: a
+        // recolored weapon needs its OWN display, texture and model, which is exactly what a clone
+        // does not have. The submit path routes on this, and the readout says which one you will get.
+        function vanillaRecolorOn() {
+            return document.getElementById('vanillaRcOn').checked
+                || document.getElementById('vanillaRcGlowOn').checked;
+        }
+        function vanillaRecolorNote() {
+            const skin = document.getElementById('vanillaRcOn').checked;
+            const glow = document.getElementById('vanillaRcGlowOn').checked;
+            document.getElementById('vanillaRcStatus').textContent = glow && skin
+                ? 'Skin + native effects on — private effect sheets and in-place hue shifts; the original animated graph is preserved (client restart needed).'
+                : glow
+                    ? 'Native effect recolor on — private effect sheets and hue-shifted color values; timing and animation tracks stay live.'
+                    : skin
+                    ? 'Skin recolor on — new display/BLP, original animated M2 preserved byte-for-byte (client restart needed).'
+                    : 'Both off — pure clone, nothing packaged.';
+        }
+        function wireVanillaRecolor() {
+            const host = document.getElementById('vanillaRcTheories');
+            let theory = 'primary';
+            for (const [key, label] of RC_THEORIES) {
+                const b = document.createElement('button');
+                b.type = 'button'; b.className = 'wf-btn secondary'; b.dataset.theory = key;
+                b.style.cssText = 'padding:3px 10px;font-size:12px;';
+                b.textContent = label;
+                if (key === theory) b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
+                b.addEventListener('click', () => {
+                    theory = key;
+                    host.querySelectorAll('button').forEach(x => x.style.outline = '');
+                    b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
+                    const on = document.getElementById('vanillaRcOn');
+                    if (!on.checked) on.checked = true;
+                    if (VANILLA.repreview) VANILLA.repreview();
+                });
+                host.appendChild(b);
+            }
+            VANILLA.rcTheory = () => theory;
+            let rcTimer = null;
+            const repreview = () => {
+                vanillaRecolorNote();
+                if (!VANILLA.sel) return;
+                clearTimeout(rcTimer);
+                rcTimer = setTimeout(() => vanillaPreview(VANILLA.sel), 300);
+            };
+            VANILLA.repreview = repreview;
+            for (const id of ['vanillaRcOn', 'vanillaRcColor', 'vanillaRcTier', 'vanillaRcGlowOn', 'vanillaRcGlowColor'])
+                document.getElementById(id).addEventListener(id.endsWith('Color') ? 'input' : 'change', repreview);
+            vanillaRecolorNote();
+        }
 
         function vanillaSetSelection(w) {
             VANILLA.sel = w;
@@ -2558,9 +2693,32 @@
             // state this preview was added to remove.
             if (!w || !w.displayId) { clearViewerOwnedBy('vanilla'); return; }
             lastGrip = null;        // a stock display carries no forge grip payload
-            wfGlowWanted = null;    // and renders its own baked colours, not a lane's live tint
+            // Vanilla native effects are recolored in their actual texture/track data. Do not also
+            // multiply material.color every frame: that was freezing the M2's animated colour track
+            // and could turn a coloured effect sheet black.
+            wfGlowWanted = null;
+            wfClearGlow();
             try {
-                const d = await (await fetch('/WeaponForge/VanillaPreview?displayId=' + encodeURIComponent(w.displayId))).json();
+                // Any Vanilla art edit keeps the source M2 graph. Skin swaps the Type-2 display
+                // texture; native-effect tinting uses private Type-0 sheets and in-place hue shifts.
+                let url;
+                if (vanillaRecolorOn() && w.entry) {
+                    const q = new URLSearchParams({
+                        entry: w.entry,
+                        weaponType: w.family || '',
+                    });
+                    if (document.getElementById('vanillaRcOn').checked) {
+                        q.append('recolorHue', Math.round(hexToHue(document.getElementById('vanillaRcColor').value)));
+                        q.append('recolorTheory', (VANILLA.rcTheory && VANILLA.rcTheory()) || 'primary');
+                        q.append('recolorTier', document.getElementById('vanillaRcTier').value || 'improved');
+                    }
+                    if (document.getElementById('vanillaRcGlowOn').checked)
+                        q.append('glowColor', document.getElementById('vanillaRcGlowColor').value);
+                    url = '/WeaponForge/VanillaPreviewWeapon?' + q.toString();
+                } else {
+                    url = '/WeaponForge/VanillaPreview?displayId=' + encodeURIComponent(w.displayId);
+                }
+                const d = await (await fetch(url)).json();
                 if (serial !== VANILLA.previewSerial) return;   // a newer selection already won
                 // ok:false is an EXPECTED outcome (quivers, ammo pouches, a few off-hand tomes have no
                 // ObjectComponents M2), not just an error path — so it has to empty the viewer too.
@@ -2570,12 +2728,21 @@
                     title: `Previewing ${w.name}`,
                     kv: {
                         'Source item': w.entry,
-                        'Display': `${w.displayId} (the clone keeps it)`,
+                        'Display': vanillaRecolorOn()
+                            ? `${w.displayId} source (forge creates a new display)`
+                            : `${w.displayId} (the clone keeps it)`,
                         'Type': w.familyLabel || '—',
                         'Equip slot': w.inventoryTypeLabel || '—',
                         'Enchant glow': d.itemVisual ? `ItemVisual ${d.itemVisual}` : 'none',
+                        'Native effects': document.getElementById('vanillaRcGlowOn').checked
+                            ? `${d.nativeEffectTexturesRecolored || 0} private texture(s), ${d.nativeColorTracksRecolored || 0} material track(s), ${d.nativeEmittersRecolored || 0} emitter(s)`
+                            : 'stock',
                     },
-                    note: 'This is the finished look — a clone packages no art, so nothing about the model changes. "Configure item…" sets the name, quality, damage, stats and effects of the new item.',
+                    note: vanillaRecolorOn()
+                        ? (document.getElementById('vanillaRcGlowOn').checked
+                            ? (d.note || 'The stock animation/render graph stays alive, changed Type-0 sheets become private to this weapon, and shared ItemVisual / Type-3 effects remain stock.')
+                            : 'The recolored preview uses the original stock M2, not a rigid rebuild. Forge packages that exact M2 plus the new Type-2 skin.')
+                        : 'This is the finished look — a clone packages no art, so nothing about the model changes. "Configure item…" sets the name, quality, damage, stats and effects of the new item.',
                 });
             } catch (e) {
                 if (serial !== VANILLA.previewSerial) return;
@@ -2855,8 +3022,12 @@
             });
             laneGlowParams(lane, q);
             laneRecolorParams(lane, q);
-            // The glow tint follows THIS lane's controls; loadGlb re-applies it to the new model.
-            wfGlowWanted = lane.el('RcGlowOn').checked ? hexToRgb01(lane.el('RcGlowColor').value) : null;
+            const effectTint = laneGlowTint(lane);
+            if (effectTint) q.append('glowColor', effectTint);
+            // The server hue-shifts the actual effect sheet and emitter color. A second client-side
+            // material multiplier would distort the requested hue and can blacken a colored matcap.
+            wfGlowWanted = null;
+            wfClearGlow();
             let d;
             try {
                 const response = await fetch(lane.urls.preview + '?' + q);
@@ -2875,6 +3046,13 @@
                 lane.el('RcStatus').textContent = d.recolorApplied
                     ? `Recolored at ${Math.round(hexToHue(lane.el('RcColor').value))}° (${lane.rcTheory}, ${lane.el('RcTier').value}) — will bake on forge.`
                     : 'No recolorable colour families on this skin — previewing the original.';
+            if (lane.el('RcGlowOn').checked) {
+                const sheets = Number(d.effectTexturesRecolored || 0);
+                const emitters = Number(d.effectEmittersRecolored || 0);
+                lane.el('RcGlowNote').textContent = sheets || emitters
+                    ? `${sheets} compositing effect sheet(s) and ${emitters} rebuilt emitter(s) recolored — the forge uses the same bake.`
+                    : 'This model has no safely isolated compositing effect sheet or rebuildable emitter; its separate ItemVisual stays stock.';
+            }
             const p = d.particles || {};
             const sug = d.suggestedItemVisual;
             const autoOpt = lane.el('Visual').querySelector('option[value="-1"]');
@@ -2915,15 +3093,16 @@
                 } : undefined,
                 diagnostics: d.diagnostics, note: d.grip && d.grip.note, error: d.error,
             });
-            loadGlb(previewUrl(d), lane.key);
+            loadGlb(previewUrl(d), lane.idPrefix);
         }
 
         function laneForge(lane) {
             if (!lane.sel) return setResult({ title: `No ${lane.label} weapon selected`, error: 'Browse and pick one first.' });
-            itemBuildOpen(lane.key);
+            itemBuildOpen(lane.idPrefix);
         }
 
         LEGACY_LANES.forEach(wireLane);
+        wireVanillaRecolor();
 
         // ---------- forged weapons registry ----------
         async function loadWeapons() {
@@ -2976,7 +3155,7 @@
                         applyLine(d.reloaded, 'Reload', d.reloadMessage || ''),
                         applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
                     ],
-                    downloads: d.patchDownloadUrl ? [{ label: 'patch-5.MPQ', url: d.patchDownloadUrl }] : [],
+                    downloads: d.patchDownloadUrl ? [{ label: 'patch-4.MPQ', url: d.patchDownloadUrl }] : [],
                     note: 'IDs returned to the pool. Fully restart the client. If a reused entry shows cached item metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory); WoW recreates it.'
                 });
             } finally { btn.disabled = false; loadWeapons(); }
@@ -3059,7 +3238,7 @@
         // the server, so it is instant; failures leave the line blank rather than shouting.
         async function loadGlowCoverage() {
             for (const lane of LEGACY_LANES) {
-                const el = document.getElementById(lane.key + 'GlowCoverage');
+                const el = lane.el('GlowCoverage');
                 if (!el) continue;
                 try {
                     const d = await (await fetch(`/WeaponForge/GlowCoverage?expansion=${lane.key}`)).json();

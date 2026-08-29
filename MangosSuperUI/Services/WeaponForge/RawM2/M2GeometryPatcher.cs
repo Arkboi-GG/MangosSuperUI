@@ -104,6 +104,119 @@ public static class M2GeometryPatcher
     }
 
     /// <summary>
+    /// Repoint selected hardcoded (Type-0) texture slots to new MPQ paths without rebuilding the
+    /// source model. Vanilla's 16-byte texture record is
+    /// <c>{ uint type; uint flags; uint nFilename; uint ofsFilename; }</c>. Longer filenames are
+    /// appended at EOF (each 4-aligned), then only <c>nFilename</c>/<c>ofsFilename</c> at +8/+12 in
+    /// the selected records are changed. Every pre-existing byte outside those eight-byte fields,
+    /// including all animation data and every other absolute offset, remains untouched.
+    /// </summary>
+    /// <remarks>
+    /// Replacements are keyed by the M2 texture-table index, not by filename: two stock slots may
+    /// legally name the same BLP while only one is selected by the render graph. The operation
+    /// validates the complete request before producing output and never mutates
+    /// <paramref name="input"/>. An empty replacement set is an exact no-op.
+    /// </remarks>
+    public static byte[] RewriteHardcodedTexturePaths(byte[] input,
+        IReadOnlyDictionary<int, string> replacements)
+        => RewriteHardcodedTexturePaths(input, replacements, expectedSourcePaths: null);
+
+    /// <summary>Repoint selected Type-0 slots, additionally proving that every selected record still
+    /// names the source member its prepared BLP came from. This prevents a stale slot map from
+    /// pairing one effect's pixels with another effect's texture record.</summary>
+    public static byte[] RewriteHardcodedTexturePaths(byte[] input,
+        IReadOnlyDictionary<int, string> replacements,
+        IReadOnlyDictionary<int, string>? expectedSourcePaths)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentNullException.ThrowIfNull(replacements);
+        if (replacements.Count == 0) return input;
+        if (expectedSourcePaths is not null &&
+            (expectedSourcePaths.Count != replacements.Count ||
+             replacements.Keys.Any(key => !expectedSourcePaths.ContainsKey(key))))
+            throw new ArgumentException(
+                "Expected source paths must name exactly the texture slots being replaced.",
+                nameof(expectedSourcePaths));
+
+        var doc = RawM2Document.Parse(input, out var error)
+            ?? throw new InvalidOperationException($"M2 parse failed: {error}");
+        var textures = doc.FindArray("textures")
+            ?? throw new InvalidOperationException("M2 has no texture array.");
+        if (!textures.InBounds)
+            throw new InvalidOperationException("M2 texture array runs past EOF.");
+
+        var pending = new List<(int RecordOffset, byte[] PathBytes)>(replacements.Count);
+        foreach (var (textureIndex, newPath) in replacements.OrderBy(pair => pair.Key))
+        {
+            if (textureIndex < 0 || (uint)textureIndex >= textures.Count)
+                throw new ArgumentOutOfRangeException(nameof(replacements),
+                    $"Texture slot {textureIndex} is outside the table of {textures.Count} slot(s).");
+            if (string.IsNullOrWhiteSpace(newPath))
+                throw new ArgumentException($"Texture slot {textureIndex} has an empty replacement path.",
+                    nameof(replacements));
+            if (newPath.Any(ch => ch == '\0' || ch > 0x7F))
+                throw new ArgumentException(
+                    $"Texture slot {textureIndex} replacement path must contain only non-NUL ASCII characters.",
+                    nameof(replacements));
+
+            int recordOffset = checked((int)textures.Offset + textureIndex * 16);
+            uint type = BinaryPrimitives.ReadUInt32LittleEndian(input.AsSpan(recordOffset, 4));
+            if (type != 0)
+                throw new InvalidOperationException(
+                    $"Texture slot {textureIndex} is Type {type}; only hardcoded Type-0 slots may be repointed.");
+
+            uint oldLength = BinaryPrimitives.ReadUInt32LittleEndian(input.AsSpan(recordOffset + 8, 4));
+            uint oldOffset = BinaryPrimitives.ReadUInt32LittleEndian(input.AsSpan(recordOffset + 12, 4));
+            if (oldLength < 2 || oldOffset == 0 || oldOffset + (long)oldLength > input.Length ||
+                input[checked((int)(oldOffset + oldLength - 1))] != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Texture slot {textureIndex} has an invalid hardcoded filename range.");
+            }
+
+            if (expectedSourcePaths is not null)
+            {
+                string? expected = WeaponTexturePath.Canonicalize(expectedSourcePaths[textureIndex]);
+                string actualRaw = Encoding.ASCII.GetString(input,
+                    checked((int)oldOffset), checked((int)oldLength - 1));
+                string? actual = WeaponTexturePath.Canonicalize(actualRaw);
+                if (expected is null)
+                    throw new ArgumentException(
+                        $"Texture slot {textureIndex} has an empty expected source path.",
+                        nameof(expectedSourcePaths));
+                if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException(
+                        $"Texture slot {textureIndex} names '{actualRaw}', not the prepared source " +
+                        $"'{expectedSourcePaths[textureIndex]}'; refusing to pair the wrong BLP with it.");
+            }
+
+            byte[] pathBytes = Encoding.ASCII.GetBytes(newPath + "\0");
+            pending.Add((recordOffset, pathBytes));
+        }
+
+        var list = new List<byte>(input);
+        var appendedOffsets = new int[pending.Count];
+        for (int i = 0; i < pending.Count; i++)
+        {
+            while (list.Count % 4 != 0) list.Add(0);
+            appendedOffsets[i] = list.Count;
+            list.AddRange(pending[i].PathBytes);
+        }
+        while (list.Count % 4 != 0) list.Add(0);
+
+        var output = list.ToArray();
+        for (int i = 0; i < pending.Count; i++)
+        {
+            var (recordOffset, pathBytes) = pending[i];
+            BinaryPrimitives.WriteUInt32LittleEndian(output.AsSpan(recordOffset + 8, 4),
+                checked((uint)pathBytes.Length));
+            BinaryPrimitives.WriteUInt32LittleEndian(output.AsSpan(recordOffset + 12, 4),
+                checked((uint)appendedOffsets[i]));
+        }
+        return output;
+    }
+
+    /// <summary>
     /// Move the donor's attachment points (vanilla v256: header 0x104/0x108, 48-byte records, id at
     /// +0, position at +8) to new WoW-space positions, keyed by attachment id. Offset-preserving —
     /// only the 12 position bytes of matching records change. Weapon attachments 0..4 are where the

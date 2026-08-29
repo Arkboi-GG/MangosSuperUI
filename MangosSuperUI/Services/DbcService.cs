@@ -315,7 +315,7 @@ public partial class DbcService
                     HelmetGeosetVis1 = sourceModel.HelmetGeosetVis1,
                     HelmetGeosetVis2 = sourceModel.HelmetGeosetVis2,
                     // Session N: inherit the source's item visual so a
-                    // retextured Thunderfury still produces lightning.
+                    // retextured enchanted weapon keeps its mounted effect.
                     ItemVisualId = itemVisual ?? sourceModel.ItemVisualId,
                 };
                 modelDict[newDisplayId] = custom;
@@ -956,8 +956,9 @@ public partial class DbcService
             }
 
             // Session N: field 22 — m_itemVisual. Indexes ItemVisuals.dbc.
-            // Non-zero on ~1.2% of rows (Thunderfury, Sulfuras, enchanted
-            // weapons, glowing staves, etc). Empirically verified by the
+            // Non-zero on ~1.2% of rows (Sulfuras, enchanted weapons, glowing
+            // staves, etc). Thunderfury 30606 is zero; its effects are native M2.
+            // Empirically verified by the
             // field-21 histogram pass — the original parser already checked
             // this offset for the schema doc above, so no re-probing needed.
             uint itemVisualId = BitConverter.ToUInt32(records, offset + 22 * 4);

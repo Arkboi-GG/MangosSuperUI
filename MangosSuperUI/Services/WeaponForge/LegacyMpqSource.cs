@@ -54,7 +54,9 @@ public abstract class LegacyMpqSource : IDisposable
     public string Label { get; }
     protected string LogPrefix { get; }
 
-    public string? ConfiguredPath
+    /// <summary>Virtual so a lane can fall back to a path the app already knows: the vanilla lane
+    /// mounts the live client and needs no separate install to be configured.</summary>
+    public virtual string? ConfiguredPath
     {
         get
         {
@@ -62,6 +64,12 @@ public abstract class LegacyMpqSource : IDisposable
             return string.IsNullOrWhiteSpace(p) ? null : p.Trim();
         }
     }
+
+    /// <summary>Whether one archive in the mounted folder belongs to this lane. Every archive by
+    /// default — the TBC and WotLK lanes mount a foreign client that cannot contain our output. The
+    /// vanilla lane mounts the LIVE client and must exclude the patches this app writes, or a forged
+    /// item could be re-imported as though it were stock art.</summary>
+    protected virtual bool ShouldMountArchive(string archiveFileName) => true;
 
     /// <summary>Current mount state for the status endpoint. Mount errors are reported, not thrown.</summary>
     public (bool Configured, string? Path, int ArchiveCount, string? Error) Status()
@@ -263,6 +271,12 @@ public abstract class LegacyMpqSource : IDisposable
                 TextureStem = texStem,
                 BlpPath = texStem.Length > 0 ? $@"{dir}\{texStem}.blp" : null,
                 IconStem = dbc.ReadString(row[WeaponDisplayInfoRow.F_InventoryIcon]),
+                SpellVisualId = row.Length > WeaponDisplayInfoRow.F_SpellVisualId
+                    ? row[WeaponDisplayInfoRow.F_SpellVisualId] : 0,
+                GroupSoundIndex = row.Length > WeaponDisplayInfoRow.F_GroupSoundIndex
+                    ? row[WeaponDisplayInfoRow.F_GroupSoundIndex] : 0,
+                MirrorModelName2 = model2.Length > 0 &&
+                    string.Equals(model2, model, StringComparison.OrdinalIgnoreCase),
             });
         }
 
@@ -329,6 +343,11 @@ public abstract class LegacyMpqSource : IDisposable
         foreach (var mpqPath in mpqFiles)
         {
             var name = Path.GetFileName(mpqPath);
+            if (!ShouldMountArchive(name))
+            {
+                _logger.LogInformation("{Prefix}: {Name} excluded from this lane (not source art)", LogPrefix, name);
+                continue;
+            }
             try
             {
                 var archive = MpqArchive.Open(mpqPath);
@@ -386,4 +405,7 @@ public sealed record LegacyWeaponEntry
     public required string TextureStem { get; init; }
     public string? BlpPath { get; init; }
     public required string IconStem { get; init; }
+    public uint SpellVisualId { get; init; }
+    public uint GroupSoundIndex { get; init; }
+    public bool MirrorModelName2 { get; init; }
 }

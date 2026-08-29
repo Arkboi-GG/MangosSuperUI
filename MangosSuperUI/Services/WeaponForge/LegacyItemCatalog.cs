@@ -82,7 +82,10 @@ public abstract class LegacyItemCatalog
 
     public LegacyItemInfo? FindByEntry(uint entry) => Items.FirstOrDefault(i => i.Entry == entry);
 
-    private IReadOnlyList<LegacyItemInfo> Load()
+    /// <summary>Virtual so a lane can source items from somewhere other than a shipped json — the
+    /// vanilla lane reads the live world DB it is forging against, which needs no shipped file and
+    /// cannot drift from the server.</summary>
+    protected virtual IReadOnlyList<LegacyItemInfo> Load()
     {
         var path = Path.Combine(_env.WebRootPath, CatalogWebPath.Replace('/', Path.DirectorySeparatorChar));
         if (!File.Exists(path))
@@ -182,24 +185,34 @@ public sealed class LegacyImportSource
 /// the weapon/armor controllers, status endpoints and UI cards pick it up by key.</summary>
 public sealed class LegacyImportSources
 {
-    public LegacyImportSources(TbcMpqSource tbcMpq, TbcItemCatalog tbcItems, WotlkMpqSource wotlkMpq, WotlkItemCatalog wotlkItems)
+    public LegacyImportSources(TbcMpqSource tbcMpq, TbcItemCatalog tbcItems, WotlkMpqSource wotlkMpq,
+        WotlkItemCatalog wotlkItems, VanillaMpqSource vanillaMpq, VanillaItemCatalog vanillaItems)
     {
         Tbc = new LegacyImportSource(tbcMpq, tbcItems);
         Wotlk = new LegacyImportSource(wotlkMpq, wotlkItems);
-        All = new[] { Tbc, Wotlk };
+        Vanilla = new LegacyImportSource(vanillaMpq, vanillaItems);
+        All = new[] { Tbc, Wotlk, Vanilla };
     }
 
     public LegacyImportSource Tbc { get; }
     public LegacyImportSource Wotlk { get; }
+
+    /// <summary>Stock 1.12 art through the import pipeline. The Vanilla CLONE lane reuses a stock
+    /// display and so can never be recolored; this one packages its own, which is what makes recolor
+    /// and glow tint possible on a stock weapon at all.</summary>
+    public LegacyImportSource Vanilla { get; }
+
     public IReadOnlyList<LegacyImportSource> All { get; }
 
     /// <summary>Lane by key; unknown/blank keys fall back to TBC (the original lane).</summary>
     public LegacyImportSource Get(string? key) =>
-        string.Equals(key, WotlkMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase) ? Wotlk : Tbc;
+        string.Equals(key, WotlkMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase) ? Wotlk :
+        string.Equals(key, VanillaMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase) ? Vanilla : Tbc;
 
     public bool IsKnown(string? key) =>
         string.Equals(key, TbcMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(key, WotlkMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase);
+        string.Equals(key, WotlkMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(key, VanillaMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>One shipped later-expansion item (from the open-source world DB). Class 2 = weapon,

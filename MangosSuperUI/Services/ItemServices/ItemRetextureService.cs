@@ -37,6 +37,10 @@ public class ItemRetextureService
     private readonly ILogger<ItemRetextureService> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService _weaponForge;
+    /// <summary>For reaching UnifiedPatchService. Both are scoped, so this could have been injected
+    /// directly — going through the provider keeps the shape identical to the two forge lanes and
+    /// avoids a constructor edge back into a service that resolves this one.</summary>
+    private readonly IServiceProvider _services;
     private readonly HttpClient _http;
 
     private readonly string _dbcPath;
@@ -59,6 +63,7 @@ public class ItemRetextureService
         IConfiguration config,
         ILogger<ItemRetextureService> logger,
         ILoggerFactory loggerFactory,
+        IServiceProvider services,
         MangosSuperUI.Services.WeaponForge.CustomWeaponBuildService weaponForge)
     {
         _comfy = comfy;
@@ -71,6 +76,7 @@ public class ItemRetextureService
         _config = config;
         _logger = logger;
         _loggerFactory = loggerFactory;
+        _services = services;
         _weaponForge = weaponForge;
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(180) };
 
@@ -954,6 +960,128 @@ public class ItemRetextureService
             mpqBuilder.AddFile($@"{dir}{bare}{sfx}.blp", blp);
     }
 
+    /// <summary>The gender-suffixed component members for one body-atlas BLP, as a list rather than
+    /// pushed into an <see cref="MpqBuilderService"/>. Same names as
+    /// <see cref="AddComponentBlpAllGenders"/> — the unified builder takes members, not a builder.</summary>
+    private static IEnumerable<WeaponForge.MpqMember> ComponentBlpAllGenders(string blpMpqPath, byte[] blp)
+    {
+        int cut = blpMpqPath.LastIndexOf('\\');
+        string dir = cut >= 0 ? blpMpqPath.Substring(0, cut + 1) : "";
+        string file = blpMpqPath.Substring(cut + 1);
+        string bare = file.EndsWith(".blp", StringComparison.OrdinalIgnoreCase)
+            ? file.Substring(0, file.Length - 4)
+            : file;
+
+        foreach (var sfx in COMPONENT_SUFFIXES)
+            yield return new WeaponForge.MpqMember { MpqPath = $@"{dir}{bare}{sfx}.blp", Data = blp };
+    }
+
+    /// <summary>The bare texture name a cloned ItemDisplayInfo row points at: no directory, no
+    /// extension, no gender suffix — the client composes all three itself. Linux Path.GetFileName
+    /// does not split on backslash, so the path is normalized first.</summary>
+    private static string BareTextureName(string blpMpqPath)
+    {
+        string normalized = blpMpqPath.Replace('\\', '/');
+        return Path.GetFileNameWithoutExtension(Path.GetFileName(normalized));
+    }
+
+    /// <summary>This lane's rows and members for the single unified patch. Mirrors the two loops in
+    /// <see cref="RebuildPatchMAsync"/> — model retextures patch DBC field 3, body-atlas retextures
+    /// patch m_texture[0..7] at fields 14..21 — but emits row INSTRUCTIONS instead of mutating a DBC,
+    /// because the unified builder owns the one writer and clones the source rows itself.
+    ///
+    /// Both tables are keyed into one entry per new display id: a display that somehow appears in
+    /// both gets its field patches merged rather than one table silently losing to the other.</summary>
+    internal async Task<UnifiedPatch.RetextureLaneContribution> GetPatchContributionAsync(
+        WeaponForge.ForgeDiagnostics diag)
+    {
+        await EnsureTableAsync();
+
+        var members = new List<WeaponForge.MpqMember>();
+        var sources = new Dictionary<uint, uint>();
+        var patches = new Dictionary<uint, Dictionary<int, string>>();
+
+        void Patch(uint newDisplayId, uint sourceDisplayId, int field, string textureName)
+        {
+            sources[newDisplayId] = sourceDisplayId;
+            if (!patches.TryGetValue(newDisplayId, out var fields))
+                patches[newDisplayId] = fields = new Dictionary<int, string>();
+            fields[field] = textureName;
+        }
+
+        List<dynamic> retextures;
+        using (var conn = _db.Admin())
+        {
+            retextures = (await conn.QueryAsync(
+                @"SELECT display_id, new_display_id, custom_blp_mpq_path, custom_blp
+                  FROM custom_item_retexture
+                  ORDER BY id")).ToList();
+        }
+
+        foreach (var row in retextures)
+        {
+            uint origDisplayId = (uint)row.display_id;
+            uint newDisplayId = (uint)row.new_display_id;
+            string blpMpqPath = (string)row.custom_blp_mpq_path;
+            byte[]? blpBytes = row.custom_blp as byte[];
+
+            if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
+                members.Add(new WeaponForge.MpqMember { MpqPath = blpMpqPath, Data = blpBytes });
+
+            // Field 3 is TextureName1: ModelName1 stays vanilla, only the texture changes.
+            if (!string.IsNullOrEmpty(blpMpqPath))
+                Patch(newDisplayId, origDisplayId, 3, BareTextureName(blpMpqPath));
+            else
+                sources[newDisplayId] = origDisplayId;
+        }
+
+        List<dynamic> atlasRows;
+        using (var conn = _db.Admin())
+        {
+            atlasRows = (await conn.QueryAsync(
+                @"SELECT display_id, new_display_id, slot, custom_blp_mpq_path, custom_blp
+                  FROM custom_item_retexture_atlas
+                  ORDER BY new_display_id, slot")).ToList();
+        }
+
+        foreach (var row in atlasRows)
+        {
+            uint origDisplayId = (uint)row.display_id;
+            uint newDisplayId = (uint)row.new_display_id;
+            int slot = (int)(byte)row.slot;
+            string blpMpqPath = (string)row.custom_blp_mpq_path;
+            byte[]? blpBytes = row.custom_blp as byte[];
+
+            // Component BLPs are gender-suffixed in the client: packing only "{name}.blp" makes the
+            // cloned row blank the component instead of recoloring it.
+            if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
+                members.AddRange(ComponentBlpAllGenders(blpMpqPath, blpBytes));
+
+            if (slot >= 0 && slot <= 7 && !string.IsNullOrEmpty(blpMpqPath))
+                Patch(newDisplayId, origDisplayId, 14 + slot, BareTextureName(blpMpqPath));
+            else
+                sources[newDisplayId] = origDisplayId;
+        }
+
+        var displays = sources
+            .OrderBy(kv => kv.Key)
+            .Select(kv => new UnifiedPatch.RetextureDisplayEntry
+            {
+                NewDisplayId = kv.Key,
+                SourceDisplayId = kv.Value,
+                TexturePatches = patches.TryGetValue(kv.Key, out var f)
+                    ? f
+                    : new Dictionary<int, string>(),
+            })
+            .ToArray();
+
+        if (displays.Length > 0)
+            diag.Info("retexture.contributed",
+                $"{displays.Length} retexture display(s), {members.Count} texture member(s).");
+
+        return new UnifiedPatch.RetextureLaneContribution { Displays = displays, Members = members };
+    }
+
     /// <summary>
     /// Commit a body-atlas (painted armor) retexture. The painted-armor analog
     /// of RetextureFromBitmapAsync: instead of one model texture → one BLP →
@@ -1140,214 +1268,44 @@ public class ItemRetextureService
     // REBUILD PATCH-M.MPQ — ALL RETEXTURES (legacy section marker)
     // ═══════════════════════════════════════════════════════════════════
 
+    /// <summary>Rebuild the client patch. This lane no longer packs an archive of its own.
+    ///
+    /// It used to build and deploy patch-4.MPQ directly — which is now the UNIFIED patch's filename,
+    /// so leaving it would have overwritten the one archive with a retexture-only one and silently
+    /// dropped every forged weapon and armor piece. The row/member logic that used to live here is
+    /// now <see cref="GetPatchContributionAsync"/>, which the unified builder calls alongside the two
+    /// forge lanes; all three end up in one ItemDisplayInfo.dbc, one archive, one download.
+    ///
+    /// The old cascade hop into the Weapon Forge is gone with it: there is no patch above us left to
+    /// re-union, which was the entire point of collapsing the three archives into one.</summary>
     public async Task<PatchMRebuildResult> RebuildPatchMAsync()
     {
         var result = new PatchMRebuildResult();
-
         try
         {
-            await EnsureTableAsync();
-
-            List<dynamic> retextures;
-            using (var conn = _db.Admin())
+            using var scope = _services.CreateScope();
+            if (scope.ServiceProvider.GetService(typeof(UnifiedPatch.UnifiedPatchService))
+                is not UnifiedPatch.UnifiedPatchService unified)
             {
-                retextures = (await conn.QueryAsync(
-                    @"SELECT id, display_id, new_display_id, item_name,
-                             texture_filename, custom_blp_mpq_path, custom_m2_mpq_path,
-                             custom_blp, custom_m2
-                      FROM custom_item_retexture
-                      ORDER BY id")).ToList();
-            }
-
-            if (retextures.Count == 0)
-            {
-                _logger.LogInformation("Retexture: No retextures in DB, skipping patch-4 rebuild");
-                result.Success = true;
+                result.Error = "unified patch service unavailable — nothing rebuilt";
                 return result;
             }
 
-            _logger.LogInformation("Retexture: Rebuilding patch-4.MPQ with {Count} retexture(s)",
-                retextures.Count);
-
-            // Load clean ItemDisplayInfo.dbc
-            string dbcFile = Path.Combine(_dbcPath, "ItemDisplayInfo.dbc");
-            if (!File.Exists(dbcFile))
-            {
-                result.Error = "ItemDisplayInfo.dbc not found";
-                return result;
-            }
-
-            var displayDbc = DbcWriterService.ReadDbc(dbcFile);
-            // A REAL logger, not null. It was `new MpqBuilderService(null)`, which
-            // silenced every diagnostic inside the builder — including the hash-table
-            // size line and the "REFUSING to build" error. The archive could wrap its
-            // hash table to zero and emit a completely unreadable patch without a
-            // single log line saying so. That is precisely how the ushort overflow
-            // went unnoticed.
-            var mpqBuilder = new MpqBuilderService(_loggerFactory.CreateLogger<MpqBuilderService>());
-
-            foreach (var row in retextures)
-            {
-                uint origDisplayId = (uint)row.display_id;
-                uint newDisplayId = (uint)row.new_display_id;
-                string blpMpqPath = (string)row.custom_blp_mpq_path;
-                byte[]? blpBytes = row.custom_blp as byte[];
-
-                if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
-                    mpqBuilder.AddFile(blpMpqPath, blpBytes);
-
-                // Clone ItemDisplayInfo.dbc entry — DBC-only approach:
-                // ModelName1 stays vanilla, only TextureName1 changes.
-                var sourceRow = displayDbc.GetRow(origDisplayId);
-                if (sourceRow != null && displayDbc.GetRow(newDisplayId) == null)
-                {
-                    displayDbc.CloneRow(origDisplayId, newDisplayId);
-
-                    // Field 3 (TextureName1): custom BLP filename, no ext, no dir.
-                    // Linux Path.GetFileName doesn't split on backslash — normalize first.
-                    if (!string.IsNullOrEmpty(blpMpqPath))
-                    {
-                        string normalizedBlp = blpMpqPath.Replace('\\', '/');
-                        string customTexName = Path.GetFileNameWithoutExtension(
-                            Path.GetFileName(normalizedBlp));
-                        uint texOfs = displayDbc.AddString(customTexName);
-                        displayDbc.PatchRow(newDisplayId, 3, texOfs);
-                    }
-                }
-
-                result.TotalEntries++;
-            }
-
-            // ── Body-atlas (painted armor) entries ──
-            // One row PER SLOT, grouped by new_display_id. For each group: add
-            // every slot BLP to the MPQ, clone the source ItemDisplayInfo row
-            // once, then patch each slot's m_texture[] field (14 + slot) with
-            // that slot's bare BLP name. Mirrors the weapon loop's clone/AddString
-            // /PatchRow, just multi-field. Separate table, so weapons are untouched.
-            List<dynamic> atlasRows;
-            using (var conn = _db.Admin())
-            {
-                atlasRows = (await conn.QueryAsync(
-                    @"SELECT display_id, new_display_id, slot,
-                             custom_blp_mpq_path, custom_blp
-                      FROM custom_item_retexture_atlas
-                      ORDER BY new_display_id, slot")).ToList();
-            }
-
-            foreach (var grp in atlasRows.GroupBy(r => (uint)r.new_display_id))
-            {
-                uint newDisplayId = grp.Key;
-                uint origDisplayId = (uint)grp.First().display_id;
-
-                // Clone the source row ONCE per displayId (guard against an
-                // already-present row, same as the weapon loop).
-                bool cloned = displayDbc.GetRow(newDisplayId) != null;
-                if (!cloned && displayDbc.GetRow(origDisplayId) != null)
-                {
-                    displayDbc.CloneRow(origDisplayId, newDisplayId);
-                    cloned = true;
-                }
-
-                foreach (var row in grp)
-                {
-                    int slot = (int)(byte)row.slot;
-                    string blpMpqPath = (string)row.custom_blp_mpq_path;
-                    byte[]? blpBytes = row.custom_blp as byte[];
-
-                    // Component BLPs are GENDER-SUFFIXED in the client. See
-                    // AddComponentBlpAllGenders — packing only "{name}.blp" makes
-                    // the cloned DBC row blank the component instead of recoloring
-                    // it, because the client only ever asks for "{name}_M|F|U.blp".
-                    if (blpBytes != null && !string.IsNullOrEmpty(blpMpqPath))
-                        AddComponentBlpAllGenders(mpqBuilder, blpMpqPath, blpBytes);
-
-                    // m_texture[slot] is DBC field (14 + slot). Bare name, no ext,
-                    // no dir, NO gender suffix — the client prepends
-                    // Item\TextureComponents\{subdir}\ and appends _{M|F|U}.blp.
-                    if (cloned && slot >= 0 && slot <= 7 && !string.IsNullOrEmpty(blpMpqPath))
-                    {
-                        string normalizedBlp = blpMpqPath.Replace('\\', '/');
-                        string customTexName = Path.GetFileNameWithoutExtension(
-                            Path.GetFileName(normalizedBlp));
-                        uint texOfs = displayDbc.AddString(customTexName);
-                        displayDbc.PatchRow(newDisplayId, 14 + slot, texOfs);
-                    }
-                }
-
-                result.TotalEntries++;
-            }
-
-            byte[] patchedDbc = displayDbc.Write();
-            mpqBuilder.AddFile(@"DBFilesClient\ItemDisplayInfo.dbc", patchedDbc);
-
-            var patchDir = Path.Combine(_env.WebRootPath, "patches", "retexture");
-            Directory.CreateDirectory(patchDir);
-            string patchPath = Path.Combine(patchDir, "patch-4.MPQ");
-
-            // Drop the patched DBC next to the archive as a plain file. It is the
-            // single artifact the CLIENT reads and that nothing else in the pipeline
-            // can inspect — once it is sealed inside the MPQ it is a black box. Every
-            // silent failure today (zeroed hash table, DXT3 components, bare BLP
-            // names) shared that shape: the thing we could not look at was the thing
-            // that was wrong. So write it out and make it inspectable.
-            try
-            {
-                File.WriteAllBytes(Path.Combine(patchDir, "ItemDisplayInfo.dbc"), patchedDbc);
-                _logger.LogInformation(
-                    "Retexture: wrote patched ItemDisplayInfo.dbc ({Bytes} bytes, {Rows} rows) for inspection",
-                    patchedDbc.Length, displayDbc.RecordCount);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Retexture: could not dump patched DBC for inspection");
-            }
-
-            bool built = mpqBuilder.Build(patchPath);
-            if (!built)
-            {
-                result.Error = "Failed to build patch-4.MPQ";
-                return result;
-            }
-
-            // Deploy to WoW client Data folder
-            string? clientDataPath = _config["Vmangos:ClientDataPath"]
-                ?? _config["SpellCreator:ClientDataPath"];
-            if (!string.IsNullOrEmpty(clientDataPath) && Directory.Exists(clientDataPath))
-            {
-                string deployedPath = Path.Combine(clientDataPath, "patch-4.MPQ");
-                File.Copy(patchPath, deployedPath, overwrite: true);
-                _logger.LogInformation("Retexture: Deployed patch-4.MPQ to {Path} ({Count} retextures)",
-                    deployedPath, result.TotalEntries);
-            }
-
-            result.PatchWebPath = "/patches/retexture/patch-4.MPQ";
-            result.MpqFileCount = mpqBuilder.FileCount;
-            result.Success = true;
+            var summary = await unified.RebuildAsync("retexture rebuild");
+            result.Success = summary.Ok;
+            result.TotalEntries = summary.RetextureRows;
+            result.MpqFileCount = summary.MemberCount;
+            result.PatchWebPath = "/patches/unified/" + UnifiedPatch.UnifiedPatchService.PatchFileName;
+            if (!summary.Ok) result.Error = summary.Message;
 
             _logger.LogInformation(
-                "Retexture: patch-4.MPQ rebuilt — {Count} retextures, {Files} files, {Size}KB",
-                result.TotalEntries, mpqBuilder.FileCount,
-                new FileInfo(patchPath).Length / 1024);
-
-            // Weapon Forge patch-5 sits ABOVE patch-4 and carries its own copy of ItemDisplayInfo.dbc,
-            // so a fresh patch-4 row would be shadowed by a stale patch-5 until the Forge repackages.
-            // Trigger that repackage now (best-effort; a Forge hiccup must never fail a retexture).
-            try
-            {
-                var forge = await _weaponForge.RebuildPatchAsync("retexture patch-4 rebuilt");
-                if (forge.WeaponCount > 0)
-                    _logger.LogInformation("Retexture: Weapon Forge patch-5 re-unioned ({Count} weapon(s))", forge.WeaponCount);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Retexture: Weapon Forge patch-5 re-union failed — rebuild it from the Item Assets page");
-            }
-
+                "Retexture: unified patch rebuilt — {Retexture} retexture row(s) of {Total} total, {Members} members. {Msg}",
+                summary.RetextureRows, summary.TotalRows, summary.MemberCount, summary.Message);
             return result;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Retexture: patch-4 rebuild failed");
+            _logger.LogError(ex, "Retexture: unified patch rebuild failed");
             result.Error = ex.Message;
             return result;
         }

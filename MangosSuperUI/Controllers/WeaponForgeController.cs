@@ -44,6 +44,7 @@ public class WeaponForgeController : Controller
     private readonly VanillaItemSpellCatalog _itemSpells;
     private readonly ItemBudgetGenerator _itemize;
     private readonly PaletteSwapService _palette;
+    private readonly BlpWriterService _blp;
     private readonly ILogger<WeaponForgeController> _logger;
 
     // High-poly sources are welcome — they are decimated to budget before forging.
@@ -69,7 +70,7 @@ public class WeaponForgeController : Controller
         CustomWeaponBuildService builder, GlbWeaponImporter glbImporter, WeaponDonorResolver donors,
         LegacyImportSources sources, ConnectionFactory db, DbcService dbc,
         ItemTextureService itemTextures, VanillaItemSpellCatalog itemSpells,
-        ItemBudgetGenerator itemize, PaletteSwapService palette,
+        ItemBudgetGenerator itemize, PaletteSwapService palette, BlpWriterService blp,
         ILogger<WeaponForgeController> logger)
     {
         _mpq = mpq;
@@ -84,6 +85,7 @@ public class WeaponForgeController : Controller
         _itemSpells = itemSpells;
         _itemize = itemize;
         _palette = palette;
+        _blp = blp;
         _logger = logger;
     }
 
@@ -467,15 +469,13 @@ public class WeaponForgeController : Controller
         return PhysicalFile(fullPath, contentType, safeFile);
     }
 
-    /// <summary>GET /WeaponForge/DownloadPatch — the canonical latest unified patch-5.MPQ (every
-    /// custom weapon recorded in the database), refreshed on every build/delete/rebuild.</summary>
+    /// <summary>GET /WeaponForge/DownloadPatch — the one deployable archive. Forged weapons ship in
+    /// the unified patch alongside retextures and armor, so this redirects rather than serving the
+    /// stale weapon-only artifact: there is exactly one file to install.</summary>
     [HttpGet]
     public IActionResult DownloadPatch()
     {
-        var fullPath = Path.Combine(_builder.ArtifactRoot, CustomWeaponBuildService.PatchFileName);
-        if (!System.IO.File.Exists(fullPath))
-            return NotFound(new { error = "No patch built yet — forge a weapon first." });
-        return PhysicalFile(fullPath, "application/octet-stream", CustomWeaponBuildService.PatchFileName);
+        return RedirectToAction("DownloadPatch", "UnifiedPatch");
     }
 
     /// <summary>GET /WeaponForge/ListWeapons — the Forge's inventory: every weapon currently
@@ -821,29 +821,56 @@ public class WeaponForgeController : Controller
     [HttpGet]
     public async Task<IActionResult> PreviewForged(long displayId)
     {
-        var (m2, blp, effects) = await LoadForgedBytesAsync(displayId);
+        var (m2, blp, effects, sourceKind) = await LoadForgedBytesAsync(displayId);
         if (m2 is null) return NotFound(new { ok = false, error = $"No stored M2 for display id {displayId}." });
 
         // The forged weapon's enchant glow is an ItemVisual on its display row, not anything in the
         // stored M2 — resolve it so the preview shows what the client will.
         var host = M2Reader.Parse(m2);
         uint visualId = _dbc.GetItemModelInfo((uint)displayId)?.ItemVisualId ?? 0;
-        var preview = _preview.RenderFromBytes(m2, blp, effects, ResolveVisualEffects(visualId, host));
+        var preview = _preview.RenderFromBytes(m2, blp, MergeStockPreviewTextures(host, effects),
+            ResolveVisualEffects(visualId, host),
+            preserveSourceGraph: IsSourcePreservingBuild(sourceKind));
         return Json(new { ok = preview.Ok, preview, hasTexture = blp is { Length: > 0 }, displayId, itemVisual = visualId });
+    }
+
+    internal static bool IsSourcePreservingBuild(string? sourceKind)
+        => string.Equals(sourceKind, "vanilla_recolor", StringComparison.OrdinalIgnoreCase);
+
+    private IReadOnlyDictionary<string, byte[]>? MergeStockPreviewTextures(
+        M2Model? model, IReadOnlyDictionary<string, byte[]>? custom)
+    {
+        var result = custom is null
+            ? new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, byte[]>(custom, StringComparer.OrdinalIgnoreCase);
+        if (model is not null)
+        {
+            foreach (var texture in model.Textures)
+            {
+                string? stockPath = WeaponPreviewService.StockPreviewTexturePath(texture);
+                if (stockPath is null || result.ContainsKey(stockPath))
+                    continue;
+                byte[]? bytes = _mpq.ExtractFile(stockPath)
+                    ?? _mpq.ExtractFile(stockPath.ToLowerInvariant());
+                if (bytes is { Length: > 0 }) result[stockPath] = bytes;
+            }
+        }
+        return result.Count > 0 ? result : null;
     }
 
     /// <summary>Load a forged weapon's compiled M2 (+ BLP + effect textures) from the registry
     /// tables (model_id == display_id).</summary>
-    private async Task<(byte[]? M2, byte[]? Blp, Dictionary<string, byte[]>? Effects)> LoadForgedBytesAsync(long displayId)
+    private async Task<(byte[]? M2, byte[]? Blp, Dictionary<string, byte[]>? Effects, string? SourceKind)>
+        LoadForgedBytesAsync(long displayId)
     {
         await using var conn = _db.Admin();
         await conn.OpenAsync();
         var row = await conn.QueryFirstOrDefaultAsync(
-            @"SELECT m.compiled_m2 AS M2, d.compiled_blp AS Blp
+            @"SELECT m.compiled_m2 AS M2, d.compiled_blp AS Blp, m.source_kind AS SourceKind
               FROM custom_weapon_model m
               LEFT JOIN custom_weapon_display d ON d.model_id = m.model_id
               WHERE m.model_id = @displayId", new { displayId });
-        if (row is null) return (null, null, null);
+        if (row is null) return (null, null, null, null);
 
         Dictionary<string, byte[]>? effects = null;
         var texRows = await conn.QueryAsync(
@@ -856,7 +883,7 @@ public class WeaponForgeController : Controller
             effects ??= new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
             effects[(string)t.MpqPath] = (byte[])t.Blp;
         }
-        return ((byte[]?)row.M2, (byte[]?)row.Blp, effects);
+        return ((byte[]?)row.M2, (byte[]?)row.Blp, effects, (string?)row.SourceKind);
     }
 
     /// <summary>GET /WeaponForge/InspectWeapon?displayId= — structural side-by-side dump of a forged
@@ -915,7 +942,13 @@ public class WeaponForgeController : Controller
     [HttpGet]
     public IActionResult WotlkStatus() => LegacyStatus(_sources.Wotlk);
 
-    /// <summary>GET /WeaponForge/ImportStatus?expansion=tbc|wotlk — lane-keyed form.</summary>
+    /// <summary>GET /WeaponForge/VanillaImportStatus — mount state of the vanilla lane. Unlike the
+    /// other two this needs no client path configured: it falls back to the client the app already
+    /// deploys into, with our own patches excluded so forged art is never offered as source.</summary>
+    [HttpGet]
+    public IActionResult VanillaImportStatus() => LegacyStatus(_sources.Vanilla);
+
+    /// <summary>GET /WeaponForge/ImportStatus?expansion=tbc|wotlk|vanilla — lane-keyed form.</summary>
     [HttpGet]
     public IActionResult ImportStatus(string? expansion = null) => LegacyStatus(_sources.Get(expansion));
 
@@ -962,7 +995,14 @@ public class WeaponForgeController : Controller
     public IActionResult WotlkWeapons(string? search = null, int page = 1, int pageSize = 60) =>
         LegacyWeapons(_sources.Wotlk, search, page, pageSize);
 
-    /// <summary>GET /WeaponForge/ImportWeapons?expansion=tbc|wotlk&amp;search=… — lane-keyed form.</summary>
+    /// <summary>GET /WeaponForge/VanillaImportWeapons — browse stock weapons and shields. The item
+    /// list is the live item_template rather than a shipped catalog, so it cannot drift from the
+    /// server; custom entries are excluded so our own output is never re-imported.</summary>
+    [HttpGet]
+    public IActionResult VanillaImportWeapons(string? search = null, int page = 1, int pageSize = 60) =>
+        LegacyWeapons(_sources.Vanilla, search, page, pageSize);
+
+    /// <summary>GET /WeaponForge/ImportWeapons?expansion=tbc|wotlk|vanilla&amp;search=… — lane-keyed form.</summary>
     [HttpGet]
     public IActionResult ImportWeapons(string? expansion = null, string? search = null, int page = 1, int pageSize = 60) =>
         LegacyWeapons(_sources.Get(expansion), search, page, pageSize);
@@ -1114,7 +1154,8 @@ public class WeaponForgeController : Controller
     /// An item visual resolved to loaded effect models, mounted on the host's attachment points.
     ///
     /// The ItemVisual is a whole third channel: the item's own bytes say nothing about it, and it is
-    /// where enchant glows, Thunderfury's lightning and a Warglaive's fire actually live. The ids the
+    /// where enchant glows and many permanent weapon effects live. Thunderfury is not one of them:
+    /// its stock ItemVisual is zero and its lightning lives in its preserved M2. The ids the
     /// forge deals in are always VANILLA ids (the suggester only offers ones the 1.12 client has), so
     /// the effect models come out of the vanilla mount regardless of which lane the item came from.
     /// </summary>
@@ -1167,6 +1208,349 @@ public class WeaponForgeController : Controller
             return new EffectMotionPlanner.Plan(Array.Empty<M2EmitterTransplanter.Graft>(), Array.Empty<string>(), 0);
         return EffectMotionPlanner.Build(emitters, positionsWoW, path => _mpq.ExtractFile(path), null, label);
     }
+
+    private sealed record PreservedVanillaWeapon(
+        M2Model Model,
+        byte[] M2Bytes,
+        byte[] DisplayBlp,
+        byte[] DisplayPng,
+        IReadOnlyDictionary<string, byte[]>? SupplementalPreviewBlps,
+        ForgeDiagnostics Diagnostics);
+
+    /// <summary>
+    /// Load a stock 1.12 weapon without passing it through <see cref="LegacyWeaponMeshExtractor"/>.
+    /// Keeping the original M2 graph is what preserves source bones, global sequences, material
+    /// tracks, particle/ribbon emitters, and the Type-3 weapon-blade sheen. Skin-only recolors leave
+    /// every M2 byte intact; native-effect recolors later make only verified color-value and Type-0
+    /// filename-pointer edits.
+    /// </summary>
+    private (PreservedVanillaWeapon? Weapon, string? Error) LoadPreservedVanillaWeapon(
+        LegacyImportSource src, LegacyWeaponEntry entry)
+    {
+        var diag = new ForgeDiagnostics("vanilla-source");
+        var (model, m2Bytes, loadError) = src.Mpq.LoadM2Detailed(entry.M2Path);
+        if (model is null || m2Bytes is not { Length: > 0 })
+            return (null, loadError ?? "The stock 1.12 M2 could not be parsed.");
+        if (model.Version != 256)
+            return (null, $"The vanilla source-preserving lane requires an M2 v256 source (got v{model.Version}).");
+
+        var sampledTextureSlots = WeaponPreviewService.SampledTextureSlots(model);
+        if (!WeaponPreviewService.SamplesDisplayTexture(model))
+            return (null,
+                $"{entry.ModelStem} has no sampled Type-2 object-skin slot. Changing ItemDisplayInfo.TextureName1 would not recolor any rendered batch safely.");
+        if (string.IsNullOrWhiteSpace(entry.BlpPath))
+            return (null, $"Display {entry.DisplayRow} has no TextureName1 BLP to recolor.");
+
+        byte[]? displayBlp = src.Mpq.ExtractFile(entry.BlpPath)
+            ?? src.Mpq.ExtractFile(entry.BlpPath.ToLowerInvariant());
+        if (displayBlp is not { Length: > 0 })
+            return (null, $"The stock display texture '{entry.BlpPath}' could not be read.");
+        byte[]? displayPng = BlpToPng(displayBlp);
+        if (displayPng is not { Length: > 0 })
+            return (null, $"The stock display texture '{entry.BlpPath}' could not be decoded.");
+
+        var hardcoded = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        var emitterTextureSlots = MangosSuperUI.Services.M2Fx.M2FxReader
+            .EmitterTextureSlots(m2Bytes).ToHashSet();
+        for (int textureSlot = 0; textureSlot < model.Textures.Count; textureSlot++)
+        {
+            var texture = model.Textures[textureSlot];
+            string? stockPath = WeaponPreviewService.StockPreviewTexturePath(texture);
+            if (stockPath is null)
+            {
+                if (sampledTextureSlots.Contains(textureSlot) && !WeaponPreviewService.UsesDisplayTexture(texture))
+                    diag.Warn("vanilla.texture.runtime-unsupported",
+                        $"Sampled replaceable Type-{texture.Type} slot {textureSlot} has no WebGL runtime binding; it will use a neutral preview material while the original M2 remains intact for the client.");
+                continue;
+            }
+            if (hardcoded.ContainsKey(stockPath))
+                continue;
+            byte[]? bytes = src.Mpq.ExtractFile(stockPath)
+                ?? src.Mpq.ExtractFile(stockPath.ToLowerInvariant());
+            if (bytes is { Length: > 0 })
+            {
+                hardcoded[stockPath] = bytes;
+                continue;
+            }
+
+            if (texture.Type == 0 && sampledTextureSlots.Contains(textureSlot))
+                return (null,
+                    $"Sampled hardcoded source texture '{stockPath}' is unavailable in the vanilla mount; refusing to show an incomplete recolor preview.");
+
+            if (texture.Type == 0 && emitterTextureSlots.Contains(textureSlot))
+                diag.Warn("vanilla.texture.emitter-missing",
+                    $"Emitter sheet '{stockPath}' is unavailable in the vanilla mount; that native emitter cannot be shown in WebGL.");
+            else
+                diag.Warn("vanilla.texture.runtime-missing",
+                    $"The stock runtime Type-{texture.Type} preview texture '{stockPath}' is unavailable; that slot will use a neutral WebGL material. The packaged M2 still asks the 1.12 client for its own runtime replacement.");
+        }
+
+        diag.Info("vanilla.source.preserved",
+            $"Preserving the stock M2 byte-for-byte ({model.Vertices.Count:N0} vertices, {model.Indices.Count / 3:N0} triangles, " +
+            $"{model.Bones.Count:N0} bones, {model.GlobalSequenceDurations.Count:N0} global sequence(s)); downstream edits are restricted to its Type-2 skin and explicitly verified native-effect color channels.");
+        return (new PreservedVanillaWeapon(model, m2Bytes, displayBlp, displayPng,
+            hardcoded.Count > 0 ? hardcoded : null, diag), null);
+    }
+
+    /// <summary>Encode the already-recolored native-size PNG. DXT3 keeps authored alpha; the
+    /// palettized fallback is lossless for stock-style palettes and, unlike a resize path, never
+    /// changes the texture envelope.</summary>
+    private byte[]? EncodePreservedDisplayBlp(byte[] png)
+    {
+        try
+        {
+            using var bitmap = SKBitmap.Decode(png);
+            if (bitmap is null) return null;
+            return _blp.EncodeBitmapToBlp(bitmap, useDxt1: false)
+                ?? _blp.EncodeBitmapToBlpUncompressed(bitmap);
+        }
+        catch { return null; }
+    }
+
+    private sealed record PreparedNativeEffectTint(
+        byte[] M2Bytes,
+        IReadOnlyList<PrecompiledWeaponEffectTexture> Textures,
+        int ColorTracksRecolored,
+        int EmittersRecolored);
+
+    /// <summary>
+    /// Recolor only native effect channels that can remain structurally identical: private copies
+    /// of hardcoded Type-0 compositing/particle/ribbon sheets plus in-place hue shifts of authored
+    /// material and particle color values. Shared runtime Type-3 textures and ItemVisual effect
+    /// models are intentionally outside this boundary.
+    /// </summary>
+    private (PreparedNativeEffectTint? Tint, string? Error) PrepareNativeEffectTint(
+        PreservedVanillaWeapon source, string glowColor)
+    {
+        Vector3? target = HexToRgb255(glowColor);
+        if (target is not Vector3 rgb)
+            return (null, "Glow color must be a six-digit hex color such as #33aaff.");
+
+        var (targetHue, targetSaturation) = HueAndSaturation(rgb);
+        IReadOnlyList<NativeWeaponEffectTexture> selected;
+        try
+        {
+            selected = NativeWeaponEffectRecolor.SelectEligibleTextures(source.Model);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        {
+            return (null,
+                $"The source native-effect texture graph could not be inspected safely: {ex.Message}");
+        }
+
+        int[] eligibleTextureIndices = selected
+            .SelectMany(effect => effect.TextureIndices)
+            .Distinct()
+            .OrderBy(index => index)
+            .ToArray();
+        M2MaterialColorHueWriter.Result materialTint;
+        try
+        {
+            materialTint = M2MaterialColorHueWriter.Apply(
+                source.M2Bytes, targetHue, targetSaturation, eligibleTextureIndices);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        {
+            return (null,
+                $"The source material-color animation could not be inspected safely: {ex.Message}");
+        }
+        if (!materialTint.IsComplete)
+        {
+            string reason = materialTint.Notes.Count > 0
+                ? " " + string.Join("; ", materialTint.Notes)
+                : string.Empty;
+            return (null,
+                "The source material-color animation cannot be completely recolored without " +
+                "risking a static or corrupt effect; no effect changes were made." + reason);
+        }
+        foreach (string note in materialTint.Notes)
+            source.Diagnostics.Info("vanilla.effect.material", note);
+
+        var textures = new List<PrecompiledWeaponEffectTexture>(selected.Count);
+        foreach (NativeWeaponEffectTexture effect in selected)
+        {
+            if (source.SupplementalPreviewBlps is null ||
+                !source.SupplementalPreviewBlps.TryGetValue(effect.SourcePath, out byte[]? sourceBlp) ||
+                sourceBlp is not { Length: > 0 })
+            {
+                return (null,
+                    $"Native effect texture '{effect.SourcePath}' is unavailable; refusing to forge an incomplete recolor.");
+            }
+
+            byte[]? tintedBlp;
+            try
+            {
+                byte[]? sourcePng = BlpToPng(sourceBlp);
+                byte[]? tintedPng = sourcePng is { Length: > 0 }
+                    ? NativeWeaponEffectRecolor.TintPng(
+                        sourcePng, targetHue, targetSaturation)
+                    : null;
+                tintedBlp = tintedPng is { Length: > 0 }
+                    ? EncodePreservedDisplayBlp(tintedPng)
+                    : null;
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+            {
+                return (null,
+                    $"Native effect texture '{effect.SourcePath}' could not be inspected safely: {ex.Message}");
+            }
+            if (tintedBlp is not { Length: > 0 })
+                return (null, $"Native effect texture '{effect.SourcePath}' could not be recolored and encoded.");
+
+            textures.Add(new PrecompiledWeaponEffectTexture(
+                effect.TextureIndices, effect.SourcePath, tintedBlp));
+        }
+
+        byte[] tintedM2 = materialTint.M2;
+        int colorTracksRecolored = materialTint.ColorsChanged;
+        M2ParticleColorHueWriter.Result particleTint;
+        try
+        {
+            particleTint = M2ParticleColorHueWriter.Apply(
+                tintedM2, targetHue, targetSaturation, eligibleTextureIndices);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+        {
+            return (null,
+                $"The source particle color ramps could not be inspected safely: {ex.Message}");
+        }
+        if (!particleTint.IsComplete)
+        {
+            string reason = particleTint.Notes.Count > 0
+                ? " " + string.Join("; ", particleTint.Notes)
+                : string.Empty;
+            return (null,
+                "The source particle color ramps cannot be completely recolored without risking " +
+                "a partial or corrupt effect; no effect changes were made." + reason);
+        }
+        foreach (string note in particleTint.Notes)
+            source.Diagnostics.Info("vanilla.effect.particle", note);
+        tintedM2 = particleTint.M2;
+        int emittersRecolored = particleTint.EmittersChanged;
+
+        if (textures.Count == 0 && colorTracksRecolored == 0 && emittersRecolored == 0)
+        {
+            return (null,
+                "This model has no safely isolated native Type-0 effect/ribbon sheet, material color track, " +
+                "or particle color ramp to recolor. " +
+                "Shared ItemVisual and Type-3 runtime effects stay stock.");
+        }
+
+        source.Diagnostics.Info("vanilla.effect.tint",
+            $"Native effect recolor prepared {textures.Count} private Type-0 sheet(s) and " +
+            $"changed {colorTracksRecolored} material color track(s) plus " +
+            $"{emittersRecolored} particle ramp(s); shared ItemVisual and Type-3 effects remain stock.");
+        return (new PreparedNativeEffectTint(
+            tintedM2, textures, colorTracksRecolored, emittersRecolored), null);
+    }
+
+    private static (ItemVisualSuggester.Suggestion? Suggestion, uint Chosen, object ParticleInfo)
+        ChooseSourceVisual(M2Model model, LegacyItemVisualIndex? sourceVisuals, uint sourceDisplayRow,
+            int requestedVisual, ForgeDiagnostics diag)
+    {
+        var emitters = model.ParticleEmitters;
+        var (srcVisualId, srcVisualStems) = sourceVisuals?.ForDisplayRow(sourceDisplayRow)
+            ?? (0u, (IReadOnlyList<string>)Array.Empty<string>());
+        var sourceCatalogVisual = ItemVisualSuggester.Find(srcVisualId);
+        ItemVisualSuggester.Suggestion? suggestion = srcVisualId == 0 ? null : new(
+            srcVisualId,
+            sourceCatalogVisual?.Label ?? $"ItemVisual {srcVisualId}",
+            "Exact ItemVisual from the stock Vanilla ItemDisplayInfo row.",
+            string.Join(", ", srcVisualStems));
+        uint chosen = ChoosePreservedItemVisual(srcVisualId, requestedVisual);
+
+        if (srcVisualId != 0)
+            diag.Info("visual.source", $"The source display carries ItemVisual {srcVisualId}; auto preserves that exact Vanilla id.");
+        if (requestedVisual >= 0 && chosen != srcVisualId)
+            diag.Info("visual.override", $"Explicit ItemVisual override: source {srcVisualId}, chosen {chosen}.");
+        if (chosen != 0)
+            diag.Info("visual.chosen", $"Enchant-style glow: ItemVisual {chosen} ({ItemVisualSuggester.Find(chosen)?.Label ?? "custom"}).");
+
+        object particles = new
+        {
+            count = emitters.Count,
+            textures = emitters.Select(e => e.TextureName is null ? null : Path.GetFileNameWithoutExtension(e.TextureName))
+                .Where(t => t is not null).Distinct().Take(6),
+            colours = emitters.Where(e => e.ColorRgb is not null)
+                .Select(e => $"#{(int)Math.Clamp(e.ColorRgb!.Value.X, 0, 255):X2}{(int)Math.Clamp(e.ColorRgb!.Value.Y, 0, 255):X2}{(int)Math.Clamp(e.ColorRgb!.Value.Z, 0, 255):X2}")
+                .Distinct().Take(6),
+            sourceVisual = srcVisualId == 0 ? null : new
+            {
+                id = srcVisualId,
+                effects = srcVisualStems.Take(5),
+                preserved = srcVisualId,
+                label = sourceCatalogVisual?.Label,
+                reason = "Exact stock Vanilla ItemVisual; native M2 emitters are already preserved separately.",
+            },
+        };
+        return (suggestion, chosen, particles);
+    }
+
+    internal static uint ChoosePreservedItemVisual(uint sourceItemVisual, int requestedVisual)
+        => requestedVisual < 0 ? sourceItemVisual : checked((uint)requestedVisual);
+
+    /// <summary>Fail-closed placement predicate for a byte-preserved M2. LegacyPlacement ignores
+    /// width/depth/head/haft because later-client imports do not expose those reshapes, but a crafted
+    /// vanilla request must not slip one through and report that it was applied.</summary>
+    internal static bool IsSourceGraphPlacementIdentity(GlbShapeControls? shape, bool flipGripEnd)
+    {
+        static bool DefaultPercent(int value) => value <= 0 || value == 100;
+        return LegacyPlacement.IsIdentity(shape, flipGripEnd) &&
+               (shape is null ||
+                (DefaultPercent(shape.WidthPercent) && DefaultPercent(shape.DepthPercent) &&
+                 DefaultPercent(shape.HeadPercent) && DefaultPercent(shape.HaftPercent)));
+    }
+
+    /// <summary>Pure request boundary used by the vanilla source-preserving lane and its regression
+    /// tests. Exactly one payload is selected: raw precompiled M2, never a rigid mesh.</summary>
+    internal static CustomWeaponBuildRequest CreatePreservedVanillaBuildRequest(
+        string? name, string weaponTypeKey, Dictionary<string, string>? itemOverrides,
+        byte[] sourceM2, byte[] displayBlp, string? iconStem, uint itemVisual,
+        uint groupSoundIndex, uint spellVisualId, bool mirrorModelName2, string generatorParamsJson)
+        => new()
+        {
+            Name = name,
+            SourceKind = "vanilla_recolor",
+            IconStem = iconStem,
+            WeaponTypeKey = weaponTypeKey,
+            ItemOverrides = itemOverrides,
+            PrecompiledM2 = sourceM2,
+            PrecompiledBlp = displayBlp,
+            SourceBlob = sourceM2,
+            ItemVisual = itemVisual,
+            DisplayGroupSoundIndex = groupSoundIndex,
+            DisplaySpellVisualId = spellVisualId,
+            DisplayMirrorModelName2 = mirrorModelName2,
+            GeneratorParamsJson = generatorParamsJson,
+            WriterVersion = "vanilla-source-v1",
+        };
+
+    /// <summary>Effect-aware source-preserving request. <paramref name="sourceM2"/> remains the
+    /// provenance blob; <paramref name="tintedM2"/> differs only in verified color values and is
+    /// later repointed to build-private Type-0 members by the builder.</summary>
+    internal static CustomWeaponBuildRequest CreatePreservedVanillaEffectBuildRequest(
+        string? name, string weaponTypeKey, Dictionary<string, string>? itemOverrides,
+        byte[] sourceM2, byte[] tintedM2, byte[] displayBlp, string? iconStem, uint itemVisual,
+        uint groupSoundIndex, uint spellVisualId, bool mirrorModelName2, string generatorParamsJson,
+        IReadOnlyList<PrecompiledWeaponEffectTexture> effectTextures)
+        => new()
+        {
+            Name = name,
+            SourceKind = "vanilla_recolor",
+            IconStem = iconStem,
+            WeaponTypeKey = weaponTypeKey,
+            ItemOverrides = itemOverrides,
+            PrecompiledM2 = tintedM2,
+            PrecompiledBlp = displayBlp,
+            PrecompiledEffectTextures = effectTextures,
+            SourceBlob = sourceM2,
+            ItemVisual = itemVisual,
+            DisplayGroupSoundIndex = groupSoundIndex,
+            DisplaySpellVisualId = spellVisualId,
+            DisplayMirrorModelName2 = mirrorModelName2,
+            GeneratorParamsJson = generatorParamsJson,
+            WriterVersion = "vanilla-source-effects-v2",
+        };
 
     /// <summary>Shared extract + parse + mesh-build front half for both lanes. PNGs feed the web
     /// preview; original BLP2 bytes feed the forge so the source texture/mips/compression are not
@@ -1523,29 +1907,174 @@ public class WeaponForgeController : Controller
     public Task<IActionResult> TbcPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
         string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
         GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
-        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved") =>
-        LegacyPreviewWeapon(_sources.Tbc, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier);
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved",
+        string? glowColor = null) =>
+        LegacyPreviewWeapon(_sources.Tbc, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
 
     /// <summary>GET /WeaponForge/WotlkPreviewWeapon — the WotLK preview.</summary>
     [HttpGet]
     public Task<IActionResult> WotlkPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
         string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
         GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
-        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved") =>
-        LegacyPreviewWeapon(_sources.Wotlk, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier);
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved",
+        string? glowColor = null) =>
+        LegacyPreviewWeapon(_sources.Wotlk, entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
 
-    /// <summary>GET /WeaponForge/ImportPreviewWeapon?expansion=tbc|wotlk&amp;… — lane-keyed form.</summary>
+    /// <summary>GET /WeaponForge/VanillaPreviewWeapon — recolor the stock display skin while
+    /// preserving the original 1.12 M2 and its complete animation/render graph.</summary>
+    [HttpGet]
+    public Task<IActionResult> VanillaPreviewWeapon(uint entry = 0, string? model = null, uint displayRow = 0,
+        string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved",
+        string? glowColor = null) =>
+        PreviewPreservedVanillaWeapon(entry, model, displayRow, weaponType, brightness, saturation,
+            shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
+
+    /// <summary>GET /WeaponForge/ImportPreviewWeapon?expansion=tbc|wotlk|vanilla&amp;… — lane-keyed form.</summary>
     [HttpGet]
     public Task<IActionResult> ImportPreviewWeapon(string? expansion = null, uint entry = 0, string? model = null, uint displayRow = 0,
         string? weaponType = null, int targetTriangles = 0, int brightness = 0, int saturation = 0,
         GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
-        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved") =>
-        LegacyPreviewWeapon(_sources.Get(expansion), entry, model, displayRow, weaponType, targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier);
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved",
+        string? glowColor = null) =>
+        string.Equals(expansion, VanillaMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase)
+            ? PreviewPreservedVanillaWeapon(entry, model, displayRow, weaponType, brightness, saturation,
+                shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor)
+            : LegacyPreviewWeapon(_sources.Get(expansion), entry, model, displayRow, weaponType,
+                targetTriangles, brightness, saturation, shape, flipGripEnd, itemVisual, glowSpread,
+                recolorHue, recolorTheory, recolorTier, glowColor);
+
+    private async Task<IActionResult> PreviewPreservedVanillaWeapon(uint entry, string? model, uint displayRow,
+        string? weaponType, int brightness, int saturation, GlbShapeControls? shape, bool flipGripEnd,
+        int itemVisual, bool glowSpread, float? recolorHue, string recolorTheory, string recolorTier,
+        string? glowColor)
+    {
+        var src = _sources.Vanilla;
+        var (sel, item) = ResolveLegacySelection(src, entry, model, displayRow);
+        if (sel is null)
+            return NotFound(new { ok = false, error = $"Unknown Vanilla weapon (entry {entry}, model '{model}')." });
+
+        // Repositioning vertices without transforming every bone pivot/key and attachment would break
+        // the very source graph this route exists to preserve. The vanilla card exposes no placement
+        // controls, but fail closed for hand-authored requests instead of silently flattening the M2.
+        if (!IsSourceGraphPlacementIdentity(shape, flipGripEnd) || glowSpread)
+            return BadRequest(new
+            {
+                ok = false,
+                error = "Vanilla source-preserving recolor cannot reshape, flip, or redistribute glow anchors. " +
+                        "Those edits require a full animated-rig transform; use the stock placement to keep the weapon alive.",
+            });
+
+        string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
+            ? LegacyItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
+            : weaponType;
+        var profile = WeaponTypeCatalog.Find(typeKey);
+        if (profile is null)
+            return Json(new { ok = false, expansion = src.Key, error = $"Unknown or unsupported weapon family '{typeKey}'." });
+
+        var (source, loadError) = LoadPreservedVanillaWeapon(src, sel);
+        if (source is null)
+            return Json(new { ok = false, expansion = src.Key, error = loadError });
+
+        byte[] texturePng = source.DisplayPng;
+        bool recolorApplied = false;
+        if (recolorHue.HasValue)
+        {
+            int seed = RetextureSupport.SeedFor((int)sel.DisplayRow, recolorTier);
+            byte[]? recolored = await RecolorTexturePngAsync(texturePng, seed, recolorHue.Value,
+                recolorTheory, recolorTier, HttpContext.RequestAborted);
+            if (recolored is not null) { texturePng = recolored; recolorApplied = true; }
+            else source.Diagnostics.Warn("recolor.preview",
+                "The Type-2 skin has no recolorable colour families; showing the original texture.");
+        }
+
+        byte[]? adjustedPng = AdjustTexture(texturePng, brightness, saturation);
+        bool textureChanged = recolorApplied || brightness != 0 || saturation != 0;
+        byte[]? previewBlp = textureChanged && adjustedPng is { Length: > 0 }
+            ? EncodePreservedDisplayBlp(adjustedPng)
+            : source.DisplayBlp;
+        if (previewBlp is not { Length: > 0 })
+            return Json(new { ok = false, expansion = src.Key, error = "The recolored display skin could not be encoded as a vanilla BLP." });
+
+        PreparedNativeEffectTint? nativeTint = null;
+        byte[] previewM2 = source.M2Bytes;
+        IReadOnlyDictionary<string, byte[]>? previewTextures = source.SupplementalPreviewBlps;
+        if (!string.IsNullOrWhiteSpace(glowColor))
+        {
+            var (prepared, effectError) = PrepareNativeEffectTint(source, glowColor);
+            if (prepared is null)
+                return BadRequest(new { ok = false, expansion = src.Key, error = effectError });
+            nativeTint = prepared;
+            previewM2 = prepared.M2Bytes;
+
+            var exactTextures = source.SupplementalPreviewBlps is null
+                ? new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)
+                : source.SupplementalPreviewBlps.ToDictionary(
+                    pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+            foreach (PrecompiledWeaponEffectTexture effect in prepared.Textures)
+                exactTextures[effect.SourcePath] = effect.Blp;
+            previewTextures = exactTextures;
+        }
+
+        var visual = ChooseSourceVisual(source.Model, src.Mpq.ItemVisuals(), sel.DisplayRow,
+            itemVisual, source.Diagnostics);
+        var preview = _preview.RenderFromBytes(previewM2, previewBlp, previewTextures,
+            ResolveVisualEffects(visual.Chosen, source.Model), preserveSourceGraph: true);
+
+        return Json(new
+        {
+            ok = preview.Ok,
+            expansion = src.Key,
+            expansionLabel = src.Label,
+            itemEntry = item?.Entry ?? 0,
+            itemName = item?.Name,
+            model = sel.ModelStem,
+            texture = sel.TextureStem,
+            sel.DisplayRow,
+            weaponType = profile.Key,
+            weaponTypeLabel = profile.Label,
+            inventoryType = EffectiveTbcInventoryType(item, profile),
+            inventoryTypeLabel = CustomWeaponBuildService.InventoryTypeLabel(EffectiveTbcInventoryType(item, profile)),
+            vertexCount = source.Model.Vertices.Count,
+            triangleCount = source.Model.Indices.Count / 3,
+            hasTexture = true,
+            withinForgeBudget = true,
+            grip = (object?)null,
+            sourceGripPercent = (float?)null,
+            placementApplied = false,
+            recolorApplied,
+            nativeEffectsRecolored = nativeTint is not null,
+            nativeEffectTexturesRecolored = nativeTint?.Textures.Count ?? 0,
+            nativeColorTracksRecolored = nativeTint?.ColorTracksRecolored ?? 0,
+            nativeEmittersRecolored = nativeTint?.EmittersRecolored ?? 0,
+            ribbonsPreserved = source.Model.RibbonEmitterCount,
+            sourcePreserved = true,
+            bonesPreserved = source.Model.Bones.Count,
+            globalSequencesPreserved = source.Model.GlobalSequenceDurations.Count,
+            particles = visual.ParticleInfo,
+            itemVisual = visual.Chosen,
+            suggestedItemVisual = visual.Suggestion is null ? null : new
+            {
+                id = visual.Suggestion.ItemVisual,
+                label = visual.Suggestion.Label,
+                reason = visual.Suggestion.Reason,
+            },
+            preview,
+            diagnostics = source.Diagnostics.Items.Select(i => i.ToString()),
+            note = nativeTint is null
+                ? "Preview only — the original vanilla M2 is intact. Only its Type-2 ItemDisplayInfo skin was replaced; bones, global sequences, billboards, material tracks, Type-3 blade sheen, and hardcoded effect textures are preserved."
+                : source.Model.RibbonEmitterCount > 0
+                    ? $"Source-preserved effect preview — selected native Type-0 sheets and existing color values were hue-shifted without rebuilding the M2. The {source.Model.RibbonEmitterCount} preserved ribbon emitter(s) are packaged for the game client but are not simulated by this WebGL preview; their animation records and timing remain intact."
+                    : "Exact effect preview — selected native Type-0 sheets and existing color values were hue-shifted without rebuilding the M2. Bones, global sequences, billboards, animation timing, Type-3 runtime sheen, and the separate ItemVisual remain intact.",
+        });
+    }
 
     private async Task<IActionResult> LegacyPreviewWeapon(LegacyImportSource src, uint entry, string? model, uint displayRow,
         string? weaponType, int targetTriangles, int brightness, int saturation,
         GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread,
-        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved")
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved",
+        string? glowColor = null)
     {
         var (sel, item) = ResolveLegacySelection(src, entry, model, displayRow);
         if (sel is null) return NotFound(new { ok = false, error = $"Unknown {src.Label} weapon (entry {entry}, model '{model}')." });
@@ -1564,11 +2093,48 @@ public class WeaponForgeController : Controller
             if (rp is not null) { texturePng = rp; recolorApplied = true; }
             else diag.Warn("recolor.preview", "The skin has no recolorable colour families; showing the original texture.");
         }
+        Vector3? glowRgb = HexToRgb255(glowColor);
+        if (!string.IsNullOrWhiteSpace(glowColor) && glowRgb is null)
+            return BadRequest(new { ok = false, expansion = src.Key, error = "Glow color must be a six-digit hex color such as #33aaff." });
+
         var (mesh, _, sourceGripPercent, suggestion, chosenVisual, particleInfo, emitterPositions) =
             PlaceLegacyWeapon(loadedMesh, sourceModel, shape, flipGripEnd, itemVisual, diag,
                 src.Mpq.ItemVisuals(), sel.DisplayRow, glowSpread);
         var motionPlan = PlanMotion(sourceModel, emitterPositions, sel.ModelStem);
         foreach (var note in motionPlan.Notes) diag.Info("motion.emitter", note);
+
+        IReadOnlyList<int> effectTextureSlotsRecolored = Array.Empty<int>();
+        if (glowRgb is Vector3 previewGlow)
+        {
+            try
+            {
+                var (effectHue, effectSaturation) = HueAndSaturation(previewGlow);
+                LegacyWeaponEffectTint effectTint = LegacyWeaponEffectRecolor.Apply(
+                    mesh, effectPngs, effectBlps: null, effectHue, effectSaturation);
+                effectPngs = effectTint.Pngs;
+                effectTextureSlotsRecolored = effectTint.TextureSlots;
+                if (effectTextureSlotsRecolored.Count > 0)
+                    diag.Info("effect.tint.preview",
+                        $"Hue-shifted compositing effect texture slot(s) {string.Join(", ", effectTextureSlotsRecolored)} for the preview; render-pass animation and environment mapping are unchanged.");
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+            {
+                return BadRequest(new
+                {
+                    ok = false,
+                    expansion = src.Key,
+                    error = $"The imported effect textures could not be recolored safely: {ex.Message}",
+                });
+            }
+
+            if (motionPlan.Grafts.Count > 0)
+                motionPlan = motionPlan with
+                {
+                    Grafts = motionPlan.Grafts
+                        .Select(graft => graft with { ColorRgb = previewGlow, ColorRamp = null })
+                        .ToList(),
+                };
+        }
 
         string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
             ? LegacyItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
@@ -1619,6 +2185,9 @@ public class WeaponForgeController : Controller
             sourceGripPercent = MathF.Round(sourceGripPercent, 1),
             placementApplied = !LegacyPlacement.IsIdentity(shape, flipGripEnd),
             recolorApplied,
+            effectTexturesRecolored = effectTextureSlotsRecolored.Count,
+            effectTextureSlotsRecolored,
+            effectEmittersRecolored = glowRgb is null ? 0 : motionPlan.Grafts.Count,
             particles = particleInfo,
             itemVisual = chosenVisual,
             suggestedItemVisual = suggestion is null ? null : new { id = suggestion.ItemVisual, label = suggestion.Label, reason = suggestion.Reason },
@@ -1647,14 +2216,183 @@ public class WeaponForgeController : Controller
         float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved", string? glowColor = null) =>
         LegacyForge(_sources.Wotlk, entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
 
-    /// <summary>POST /WeaponForge/ForgeImport?expansion=tbc|wotlk — lane-keyed form.</summary>
+    /// <summary>POST /WeaponForge/ForgeVanilla — package one STOCK weapon as a new custom item with
+    /// its own display: recolored skin, tinted glow, chosen enchant visual. This is the whole reason
+    /// the lane exists — a vanilla CLONE reuses the source display and so can never be recolored,
+    /// because the colours live in the BLP and the glow colours in the M2 and a clone ships neither.
+    /// The trade is that this packages: a patch, and a client restart.</summary>
+    [HttpPost]
+    public Task<IActionResult> ForgeVanilla(uint entry = 0, string? model = null, uint displayRow = 0,
+        string? name = null, string? weaponType = null, int targetTriangles = 0,
+        int brightness = 0, int saturation = 0, string? itemConfig = null,
+        GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
+        float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved", string? glowColor = null) =>
+        ForgePreservedVanilla(entry, model, displayRow, name, weaponType, targetTriangles, brightness,
+            saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread, recolorHue,
+            recolorTheory, recolorTier, glowColor);
+
+    /// <summary>POST /WeaponForge/ForgeImport?expansion=tbc|wotlk|vanilla — lane-keyed form.</summary>
     [HttpPost]
     public Task<IActionResult> ForgeImport(string? expansion = null, uint entry = 0, string? model = null, uint displayRow = 0,
         string? name = null, string? weaponType = null, int targetTriangles = 0,
         int brightness = 0, int saturation = 0, string? itemConfig = null,
         GlbShapeControls? shape = null, bool flipGripEnd = false, int itemVisual = -1, bool glowSpread = false,
         float? recolorHue = null, string recolorTheory = "primary", string recolorTier = "improved", string? glowColor = null) =>
-        LegacyForge(_sources.Get(expansion), entry, model, displayRow, name, weaponType, targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
+        string.Equals(expansion, VanillaMpqSource.SourceKey, StringComparison.OrdinalIgnoreCase)
+            ? ForgePreservedVanilla(entry, model, displayRow, name, weaponType, targetTriangles,
+                brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual, glowSpread,
+                recolorHue, recolorTheory, recolorTier, glowColor)
+            : LegacyForge(_sources.Get(expansion), entry, model, displayRow, name, weaponType,
+                targetTriangles, brightness, saturation, itemConfig, shape, flipGripEnd, itemVisual,
+                glowSpread, recolorHue, recolorTheory, recolorTier, glowColor);
+
+    private async Task<IActionResult> ForgePreservedVanilla(uint entry, string? model, uint displayRow,
+        string? name, string? weaponType, int targetTriangles, int brightness, int saturation,
+        string? itemConfig, GlbShapeControls? shape, bool flipGripEnd, int itemVisual, bool glowSpread,
+        float? recolorHue, string recolorTheory, string recolorTier, string? glowColor)
+    {
+        var (configuredItem, configurationErrors) = await ParseItemConfigurationAsync(
+            itemConfig, HttpContext.RequestAborted);
+        if (configurationErrors.Count > 0)
+            return BadRequest(new
+            {
+                ok = false,
+                error = "The Vanilla item configuration is invalid.",
+                errors = configurationErrors,
+            });
+
+        var src = _sources.Vanilla;
+        var (sel, item) = ResolveLegacySelection(src, entry, model, displayRow);
+        if (sel is null)
+            return NotFound(new { ok = false, error = $"Unknown Vanilla weapon (entry {entry}, model '{model}')." });
+
+        string? typeKey = string.IsNullOrWhiteSpace(weaponType) && item is not null
+            ? LegacyItemCatalog.TypeKeyFor(item.ItemClass, item.Subclass)
+            : weaponType;
+        var profile = WeaponTypeCatalog.Find(typeKey);
+        if (profile is null)
+            return BadRequest(new { ok = false, error = $"Unknown or unsupported weapon family '{typeKey}'." });
+        var familyErrors = ValidateConfigurationForWeaponFamily(profile, configuredItem);
+        if (familyErrors.Count > 0)
+            return BadRequest(new { ok = false, error = "The item configuration does not match the weapon family.", errors = familyErrors });
+
+        if (!IsSourceGraphPlacementIdentity(shape, flipGripEnd) || glowSpread)
+            return BadRequest(new
+            {
+                ok = false,
+                error = "Vanilla source-preserving recolor cannot reshape, flip, or redistribute glow anchors. " +
+                        "Those edits would require rewriting the complete animated rig.",
+            });
+
+        var (source, loadError) = LoadPreservedVanillaWeapon(src, sel);
+        if (source is null)
+            return Json(new { ok = false, expansion = src.Key, error = loadError });
+
+        PreparedNativeEffectTint? nativeTint = null;
+        if (!string.IsNullOrWhiteSpace(glowColor))
+        {
+            var (prepared, effectError) = PrepareNativeEffectTint(source, glowColor);
+            if (prepared is null)
+                return BadRequest(new { ok = false, expansion = src.Key, error = effectError });
+            nativeTint = prepared;
+        }
+
+        if (targetTriangles > 0)
+            source.Diagnostics.Info("vanilla.source.target-ignored",
+                $"Triangle target {targetTriangles:N0} ignored: decimation would detach vertices from the source bone rig.");
+
+        byte[] texturePng = source.DisplayPng;
+        bool recolorBaked = false;
+        if (recolorHue.HasValue)
+        {
+            int seed = RetextureSupport.SeedFor((int)sel.DisplayRow, recolorTier);
+            byte[]? recolored = await RecolorTexturePngAsync(texturePng, seed, recolorHue.Value,
+                recolorTheory, recolorTier, HttpContext.RequestAborted);
+            if (recolored is not null) { texturePng = recolored; recolorBaked = true; }
+            else source.Diagnostics.Warn("recolor.bake",
+                "The Type-2 skin has no recolorable colour families; forging its original texture.");
+        }
+
+        byte[]? adjustedPng = AdjustTexture(texturePng, brightness, saturation);
+        bool textureChanged = recolorBaked || brightness != 0 || saturation != 0;
+        byte[]? packagedBlp = textureChanged && adjustedPng is { Length: > 0 }
+            ? EncodePreservedDisplayBlp(adjustedPng)
+            : source.DisplayBlp;
+        if (packagedBlp is not { Length: > 0 })
+            return Json(new { ok = false, error = "The recolored Type-2 display skin could not be encoded as a vanilla BLP." });
+
+        var visual = ChooseSourceVisual(source.Model, src.Mpq.ItemVisuals(), sel.DisplayRow,
+            itemVisual, source.Diagnostics);
+
+        Dictionary<string, string>? itemOverrides = null;
+        if (item is not null)
+        {
+            itemOverrides = new Dictionary<string, string>
+            {
+                ["sheath"] = item.Sheath.ToString(),
+                ["delay"] = item.DelayMs.ToString(),
+            };
+            if (!profile.IsRanged && item.InventoryType is 13 or 17 or 21 or 22)
+                itemOverrides["inventory_type"] = item.InventoryType.ToString();
+        }
+        itemOverrides = MergeItemOverrides(itemOverrides, configuredItem);
+
+        string buildName = !string.IsNullOrWhiteSpace(configuredItem?.Name) ? configuredItem.Name!
+            : !string.IsNullOrWhiteSpace(name) ? name.Trim()
+            : item is not null ? item.Name
+            : PrettyTbcName(sel.ModelStem);
+        string generatorJson = JsonSerializer.Serialize(new
+        {
+            sourceExpansion = src.Key,
+            sourceExpansionLabel = src.Label,
+            sourceItemEntry = item?.Entry ?? 0,
+            sourceItemName = item?.Name,
+            sourceModel = sel.ModelStem,
+            sourceTexture = sel.TextureStem,
+            sourceDisplayRow = sel.DisplayRow,
+            sourceM2Preserved = true,
+            sourceM2Version = source.Model.Version,
+            sourceBones = source.Model.Bones.Count,
+            sourceGlobalSequences = source.Model.GlobalSequenceDurations.Count,
+            brightness,
+            saturation,
+            itemVisual = visual.Chosen,
+            recolor = recolorBaked ? (object?)new
+            {
+                hue = recolorHue,
+                theory = recolorTheory,
+                tier = recolorTier,
+            } : null,
+            nativeEffectRecolor = nativeTint is null ? null : new
+            {
+                color = glowColor,
+                textureSheets = nativeTint.Textures.Count,
+                materialColorTracks = nativeTint.ColorTracksRecolored,
+                emitterRamps = nativeTint.EmittersRecolored,
+                itemVisualPreserved = visual.Chosen,
+                type3Preserved = true,
+            },
+        });
+
+        try
+        {
+            CustomWeaponBuildRequest request = nativeTint is null
+                ? CreatePreservedVanillaBuildRequest(buildName, profile.Key, itemOverrides,
+                    source.M2Bytes, packagedBlp, sel.IconStem, visual.Chosen,
+                    sel.GroupSoundIndex, sel.SpellVisualId, sel.MirrorModelName2, generatorJson)
+                : CreatePreservedVanillaEffectBuildRequest(buildName, profile.Key, itemOverrides,
+                    source.M2Bytes, nativeTint.M2Bytes, packagedBlp, sel.IconStem, visual.Chosen,
+                    sel.GroupSoundIndex, sel.SpellVisualId, sel.MirrorModelName2, generatorJson,
+                    nativeTint.Textures);
+            var result = await _builder.BuildAsync(request);
+            return Json(BuildResultJson(result));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WeaponForge: source-preserved Vanilla forge {Model} failed", sel.ModelStem);
+            return Json(new { ok = false, error = ex.Message, diagnostics = source.Diagnostics.Items.Select(i => i.ToString()) });
+        }
+    }
 
     private async Task<IActionResult> LegacyForge(LegacyImportSource src, uint entry, string? model, uint displayRow,
         string? name, string? weaponType, int targetTriangles, int brightness, int saturation, string? itemConfig,
@@ -1719,11 +2457,44 @@ public class WeaponForgeController : Controller
         var motionPlan = PlanMotion(sourceModel, emitterPositions, sel.ModelStem);
         foreach (var note in motionPlan.Notes) diag.Info("motion.emitter", note);
 
-        // Operator glow tint: the in-game flame/glow colour lives in the M2 emitter colour track,
-        // so override every planned graft's colour (ColorRamp=null so the flat ColorRgb wins).
-        // Null keeps the source's own colours — exactly the Armor Forge contract.
-        IReadOnlyList<M2EmitterTransplanter.Graft> motionGrafts = motionPlan.Grafts;
         Vector3? glowRgb = HexToRgb255(glowColor);
+        if (!string.IsNullOrWhiteSpace(glowColor) && glowRgb is null)
+            return BadRequest(new { ok = false, expansion = src.Key, error = "Glow color must be a six-digit hex color such as #33aaff." });
+
+        // Later-client material effects are independent of particle emitters. In particular, the
+        // Warglaive's moving green shell is ArmorReflect3 in an environment-mapped Blend-4 pass.
+        // Recolor its pixels only; the render pass (including the 0xFFFF EnvMap coordinate) remains
+        // untouched. Emptying the changed source-BLP entry is intentional: the builder otherwise
+        // prefers that original BLP over the recolored PNG and silently ships the stock green sheet.
+        IReadOnlyList<int> effectTextureSlotsRecolored = Array.Empty<int>();
+        if (glowRgb is Vector3 effectGlow)
+        {
+            try
+            {
+                var (effectHue, effectSaturation) = HueAndSaturation(effectGlow);
+                LegacyWeaponEffectTint effectTint = LegacyWeaponEffectRecolor.Apply(
+                    mesh, effectPngs, effectBlps, effectHue, effectSaturation);
+                effectPngs = effectTint.Pngs;
+                effectBlps = effectTint.Blps;
+                effectTextureSlotsRecolored = effectTint.TextureSlots;
+                if (effectTextureSlotsRecolored.Count > 0)
+                    diag.Info("effect.tint.bake",
+                        $"Hue-shifted compositing effect texture slot(s) {string.Join(", ", effectTextureSlotsRecolored)}; environment mapping and pass animation remain intact.");
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or OverflowException)
+            {
+                return BadRequest(new
+                {
+                    ok = false,
+                    expansion = src.Key,
+                    error = $"The imported effect textures could not be recolored safely: {ex.Message}",
+                });
+            }
+        }
+
+        // Particle effects are a separate channel: override every planned graft's authored colour
+        // ramp (ColorRamp=null so the selected flat ColorRgb wins).
+        IReadOnlyList<M2EmitterTransplanter.Graft> motionGrafts = motionPlan.Grafts;
         if (glowRgb is Vector3 gc && motionGrafts.Count > 0)
         {
             motionGrafts = motionGrafts.Select(g => g with { ColorRgb = gc, ColorRamp = null }).ToList();
@@ -1856,8 +2627,9 @@ public class WeaponForgeController : Controller
                     // Provenance of the baked appearance edits (the registry blobs already carry them).
                     recolor = recolorBaked ? (object?)new { hue = recolorHue, theory = recolorTheory, tier = recolorTier } : null,
                     glowColor = glowRgb is null ? null : glowColor,
+                    effectTextureSlotsRecolored,
                 }),
-                WriterVersion = "tbc-rendergraph-v2",
+                WriterVersion = "tbc-rendergraph-v3-effect-tint",
             });
             return Json(BuildResultJson(result, BuildGripInfo(mesh, profile, donor)));
         }
@@ -2172,6 +2944,28 @@ public class WeaponForgeController : Controller
             && int.TryParse(hex.AsSpan(2, 2), H, null, out int g)
             && int.TryParse(hex.AsSpan(4, 2), H, null, out int b)
             ? new Vector3(r, g, b) : null;
+    }
+
+    private static (float HueDegrees, float Saturation) HueAndSaturation(Vector3 rgb255)
+    {
+        float r = Math.Clamp(rgb255.X / 255f, 0f, 1f);
+        float g = Math.Clamp(rgb255.Y / 255f, 0f, 1f);
+        float b = Math.Clamp(rgb255.Z / 255f, 0f, 1f);
+        float max = MathF.Max(r, MathF.Max(g, b));
+        float min = MathF.Min(r, MathF.Min(g, b));
+        float delta = max - min;
+        float lightness = (max + min) * 0.5f;
+        if (delta < 0.0001f) return (0f, 0f);
+
+        float saturation = lightness > 0.5f
+            ? delta / (2f - max - min)
+            : delta / (max + min);
+        float hue = max == r
+            ? ((g - b) / delta + (g < b ? 6f : 0f)) * 60f
+            : max == g
+                ? ((b - r) / delta + 2f) * 60f
+                : ((r - g) / delta + 4f) * 60f;
+        return (hue, saturation);
     }
 
     // ── Itemization (tier/spec starting-point stats — Armor Forge parity) ─

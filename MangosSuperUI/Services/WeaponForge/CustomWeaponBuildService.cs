@@ -68,6 +68,31 @@ public sealed class CustomWeaponBuildService
     /// and carries its own full ItemDisplayInfo.dbc, so a fresh weapon row would be shadowed by a
     /// stale patch-6 until it repackages. Resolved lazily to avoid a construction-order coupling; a
     /// no-op when no armor exists. Best-effort — never fails the weapon flow.</summary>
+    /// <summary>Deploy through the UNIFIED patch. Every lane that writes ItemDisplayInfo.dbc now
+    /// ships in one archive, so this lane no longer places a file of its own: it asks the unified
+    /// service to repackage all lanes, deploy that, and retire the superseded per-lane archives.
+    /// This is what removed the old cascade — there is no patch above us left to re-union.
+    ///
+    /// Scoped resolve, not injection: UnifiedPatchService depends on the scoped ItemRetextureService
+    /// and this service is a singleton, so it must open a scope. Best-effort like the deploy it
+    /// replaces — a packaging failure is reported, never thrown into the forge flow.</summary>
+    private async Task<(bool Ok, string Message)> DeployUnifiedAsync(string reason)
+    {
+        try
+        {
+            using var scope = _services.CreateScope();
+            if (scope.ServiceProvider.GetService(typeof(UnifiedPatch.UnifiedPatchService))
+                is not UnifiedPatch.UnifiedPatchService unified)
+                return (false, "unified patch service unavailable — nothing deployed");
+            var summary = await unified.RebuildAsync(reason);
+            return (summary.Ok, summary.DeployMessage ?? summary.Message);
+        }
+        catch (Exception ex)
+        {
+            return (false, $"unified patch rebuild failed ({ex.Message}) — nothing deployed");
+        }
+    }
+
     private async Task RebuildArmorPatchAsync(string reason)
     {
         try
@@ -170,6 +195,8 @@ public sealed class CustomWeaponBuildService
         bool hasPrecompiled = request.PrecompiledM2 is { Length: > 0 };
         if (hasMesh == hasPrecompiled)
             throw new ArgumentException("Provide exactly one of Mesh or PrecompiledM2.", nameof(request));
+        if (hasMesh && request.PrecompiledEffectTextures is { Count: > 0 })
+            throw new ArgumentException("PrecompiledEffectTextures can only accompany PrecompiledM2.", nameof(request));
 
         if (!DonorItemTemplateFixture.Verify())
             throw new InvalidOperationException("Donor item_template fixture failed hash verification.");
@@ -179,7 +206,11 @@ public sealed class CustomWeaponBuildService
         // no usable stock donor.
         var profile = WeaponTypeCatalog.Get(request.WeaponTypeKey);
         var donor = _donors.Resolve(profile);
-        uint donorGroupSound = donor.GroupSoundIndex;
+        var displayFields = ResolveDisplayFields(request, donor.GroupSoundIndex,
+            donor.SpellVisualId, donor.MirrorModelName2);
+        uint displayGroupSound = displayFields.GroupSoundIndex;
+        uint displaySpellVisual = displayFields.SpellVisualId;
+        bool displayMirrorModelName2 = displayFields.MirrorModelName2;
 
         // 1) Base DBC (beneath patch-5) — id floor.
         byte[] baseDbc = ResolveBaseDbc();
@@ -337,6 +368,50 @@ public sealed class CustomWeaponBuildService
         {
             m2 = request.PrecompiledM2!;
             blp = request.PrecompiledBlp ?? ExtractDonorBlp(donor);
+
+            // A source-preserved Vanilla clone may recolor one or more native material-effect
+            // sheets (Thunderfury lightning, the Warglaive environment shell, ...). Stock Type-0
+            // filenames are shared by many models, so never package a replacement at the stock
+            // path. Give every changed slot a build-private member and alter only that texture
+            // record's filename pointer; the original animation/render graph remains untouched.
+            if (request.PrecompiledEffectTextures is { Count: > 0 } nativeEffects)
+            {
+                var ordered = nativeEffects
+                    .OrderBy(e => e.TextureSlots is { Count: > 0 } ? e.TextureSlots.Min() : int.MaxValue)
+                    .ToList();
+                if (ordered.Any(e => e.TextureSlots is not { Count: > 0 }))
+                    throw new InvalidOperationException("A precompiled effect texture has no M2 texture slots.");
+                int[] allSlots = ordered.SelectMany(e => e.TextureSlots).ToArray();
+                if (allSlots.Any(slot => slot < 0))
+                    throw new InvalidOperationException("A precompiled effect texture has a negative M2 texture slot.");
+                if (allSlots.GroupBy(slot => slot).Any(g => g.Count() != 1))
+                    throw new InvalidOperationException("A precompiled effect texture slot was supplied more than once.");
+
+                var replacements = new Dictionary<int, string>();
+                var expectedSources = new Dictionary<int, string>();
+                for (int i = 0; i < ordered.Count; i++)
+                {
+                    var effect = ordered[i];
+                    if (effect.Blp is not { Length: > 0 })
+                        throw new InvalidOperationException(
+                            $"Precompiled effect texture slot(s) {string.Join(", ", effect.TextureSlots)} have no BLP bytes.");
+
+                    string privatePath = WeaponNaming.EffectTextureMpqPath(
+                        modelIndex, i + 1, profile.ComponentDir);
+                    foreach (int textureSlot in effect.TextureSlots)
+                    {
+                        replacements.Add(textureSlot, privatePath);
+                        expectedSources.Add(textureSlot, effect.SourcePath);
+                    }
+                    effectBlps.Add((privatePath, effect.Blp));
+                    diag.Info("vanilla.effect.private",
+                        $"Type-0 texture slot(s) {string.Join(", ", effect.TextureSlots)} ('{effect.SourcePath}') " +
+                        $"were copied to '{privatePath}' for this weapon only.");
+                }
+
+                m2 = RawM2.M2GeometryPatcher.RewriteHardcodedTexturePaths(
+                    m2, replacements, expectedSources);
+            }
         }
 
         // 4) Persist FIRST — the stored compiled bytes are what every future unified rebuild
@@ -371,7 +446,8 @@ public sealed class CustomWeaponBuildService
         }
         trace.Stage = "persist";
         await PersistRecordsAsync(request, profile, donor, buildId, modelIndex, entryRes.Id, dispRes.Id,
-            weaponName, effectiveInventoryType, m2, blp, effectBlps, sql, donorGroupSound, iconStem);
+            weaponName, effectiveInventoryType, m2, blp, effectBlps, sql,
+            displayGroupSound, displaySpellVisual, displayMirrorModelName2, iconStem);
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemEntry, entryRes.Id, "committed");
         await _ids.MarkStateAsync(WeaponIdReservationService.KindItemDisplay, dispRes.Id, "committed");
 
@@ -380,7 +456,7 @@ public sealed class CustomWeaponBuildService
         // the Retexture Engine does for its custom displays. Without this the forged weapon's display
         // id is absent from the statically-loaded server DBC and renders as the red "?" with no
         // texture. Cloned from the family's donor row, then overridden with the weapon's own SUI_W names.
-        RegisterDisplayWithDbc(dispRes.Id, modelIndex, donor.DisplayRow, donor.MirrorModelName2,
+        RegisterDisplayWithDbc(dispRes.Id, modelIndex, donor.DisplayRow, displayMirrorModelName2,
             itemVisual: request.ItemVisual);
         // The donor-clone above copies the DONOR's icon. Override with the one actually written into
         // the patch row, or the Items page and the client disagree about how the item looks.
@@ -396,14 +472,15 @@ public sealed class CustomWeaponBuildService
         // The chosen enchant glow (ItemVisual) is resolved against the built M2's own attachment
         // points so the post-forge preview shows it exactly like the registry View does.
         var preview = _preview.RenderFromBytes(m2, blp,
-            effectBlps.Count > 0
-                ? effectBlps.ToDictionary(e => e.MpqPath, e => e.Blp, StringComparer.OrdinalIgnoreCase)
-                : null,
-            ResolvePreviewVisualEffects(request.ItemVisual, m2));
+            ResolvePreviewTextureBlps(m2, effectBlps),
+            ResolvePreviewVisualEffects(request.ItemVisual, m2),
+            preserveSourceGraph: string.Equals(request.SourceKind, "vanilla_recolor",
+                StringComparison.OrdinalIgnoreCase));
 
         // 7) Write the build directory: straight patch-5.MPQ + item_template.sql (+ reports). No ZIP.
         var manifest = BuildManifest(request, profile, donor, buildId, entryRes.Id, dispRes.Id, modelIndex, weaponName,
-            effectiveInventoryType, donorGroupSound, sql, assembly.Patch, assembly.PackagedCount,
+            effectiveInventoryType, displayGroupSound, displaySpellVisual, displayMirrorModelName2,
+            sql, assembly.Patch, assembly.PackagedCount,
             assembly.SkippedCount, assembly.ReplacedInBase);
         string buildDir = WriteOutputs(buildId, entryRes.Id, dispRes.Id, modelIndex, assembly.Patch, sql, manifest, diag, profile.ComponentDir);
 
@@ -412,7 +489,7 @@ public sealed class CustomWeaponBuildService
         trace.Stage = "apply";
         var sqlApply = await ApplyItemSqlAsync(sql, entryRes.Id);
         var reload = sqlApply.Ok ? await ReloadItemTemplateAsync() : (Ok: false, Message: "skipped — SQL was not applied");
-        var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
+        var deploy = await DeployUnifiedAsync("weapon forged: " + buildId);
         var apply = new ServerApplyStatus
         {
             SqlApplied = sqlApply.Ok, SqlMessage = sqlApply.Message,
@@ -459,10 +536,6 @@ public sealed class CustomWeaponBuildService
                     $"SQL: {sqlApply.Message}. Reload: {reload.Message}. Deploy: {deploy.Message}. " +
                     "Undo via the Forged Weapons list on the Item Assets page.",
         });
-
-        // patch-6 (armor) sits above patch-5 and carries a full ItemDisplayInfo.dbc, so it must
-        // re-union this fresh weapon row or it would shadow it in-client. No-op when no armor exists.
-        await RebuildArmorPatchAsync("weapon forged: " + buildId);
 
         return new CustomWeaponBuildResult
         {
@@ -530,9 +603,9 @@ public sealed class CustomWeaponBuildService
                         ok: removal.Ok, message: removal.Message,
                         notes: $"No weapons left in the registry, so {PatchFileName} was removed from the artifact root and " +
                                $"from the client Data folder ({removal.Message}). Triggered by: {reason}. " +
-                               "The armor patch-6 re-union runs next and will restore the server's stock ItemSet.dbc if no armor remains either.");
+                               "The unified patch rebuild runs next and will restore the server's stock ItemSet.dbc if no armor remains either.");
 
-                await RebuildArmorPatchAsync("weapon patch-5 rebuilt: " + reason);
+                await DeployUnifiedAsync("weapon registry emptied: " + reason);
                 return new WeaponPatchRebuildSummary
                 {
                     WeaponCount = 0,
@@ -545,7 +618,7 @@ public sealed class CustomWeaponBuildService
             }
 
             WriteCanonicalPatch(assembly.Patch.MpqBytes);
-            var deploy = DeployPatchToClient(assembly.Patch.MpqBytes);
+            var deploy = await DeployUnifiedAsync("weapon patch rebuild: " + reason);
             _logger.LogInformation("WeaponForge: rebuild ({Reason}) — {Patch} repackaged with {Count} weapon(s); deploy={Deploy}",
                 reason, PatchFileName, assembly.PackagedCount, deploy.Ok);
 
@@ -554,8 +627,6 @@ public sealed class CustomWeaponBuildService
                 notes: $"{PatchFileName} repackaged with {assembly.PackagedCount} weapon(s)" +
                        (assembly.SkippedCount > 0 ? $" ({assembly.SkippedCount} skipped — no compiled bytes)" : "") +
                        $". Deploy: {deploy.Message}. Triggered by: {reason}.");
-
-            await RebuildArmorPatchAsync("weapon patch-5 rebuilt: " + reason);
 
             return new WeaponPatchRebuildSummary
             {
@@ -1480,6 +1551,65 @@ public sealed class CustomWeaponBuildService
         };
     }
 
+    /// <summary>This lane's rows and members for the single unified patch. Same DB sources as
+    /// <see cref="AssembleUnifiedPatchAsync"/>, but it stops short of building an archive: the
+    /// unified builder owns the one ItemDisplayInfo.dbc now, and because DBC rows carry string
+    /// OFFSETS into a per-file string block, contributing rows into ITS writer is the only way the
+    /// names stay valid. No base-row cleanup is needed here either — the unified base is resolved
+    /// from beneath patch-4, so no forge output can leak back in as its own input.
+    ///
+    /// Members are handed over UNCOLLAPSED: the unified builder dedupes across all three lanes at
+    /// once, which is where a weapon and an armor piece sharing one bag icon actually meet.</summary>
+    internal async Task<UnifiedPatch.WeaponLaneContribution> GetPatchContributionAsync(ForgeDiagnostics diag)
+    {
+        byte[] baseDbc = ResolveBaseDbc();
+        var baseReader = DbcWriterService.ReadDbc(baseDbc, WeaponNaming.ItemDisplayInfoMember);
+        uint donorGroupSound = ReadGroupSound(baseReader);
+        string donorIcon = ReadDonorIconStem(baseReader);
+
+        var installed = await LoadPackagedWeaponsAsync();
+        var skipped = installed.Where(w => w.M2 is null || w.Blp is null || w.ModelMpqPath is null).ToList();
+        var packaged = installed.Where(w => w.M2 is not null && w.Blp is not null && w.ModelMpqPath is not null).ToList();
+        foreach (var s in skipped)
+        {
+            string what = s.ModelMpqPath is null ? "has no custom_weapon_model row at all"
+                        : s.M2 is null && s.Blp is null ? "has neither compiled M2 nor BLP bytes"
+                        : s.M2 is null ? "has no compiled M2 bytes"
+                        : "has no compiled BLP bytes";
+            diag.Warn("weapon.skipped",
+                $"weapon display {s.DisplayId} {what} — it is NOT in this patch and will render as the error model in-game; " +
+                "delete it from the Forged Weapons list and re-forge it to restore its art");
+        }
+        if (packaged.Count == 0)
+            return new UnifiedPatch.WeaponLaneContribution { SkippedCount = skipped.Count };
+
+        var effectMembers = await LoadEffectTextureMembersAsync(
+            packaged.Select(w => (long)w.ModelId).ToHashSet());
+
+        var members = new List<MpqMember>();
+        members.AddRange(packaged.GroupBy(w => w.ModelMpqPath!, StringComparer.OrdinalIgnoreCase)
+            .Select(g => new MpqMember { MpqPath = g.Key, Data = g.First().M2! }));
+        members.AddRange(packaged.Select(w => new MpqMember { MpqPath = w.TextureMpqPath, Data = w.Blp! }));
+        members.AddRange(effectMembers);
+
+        return new UnifiedPatch.WeaponLaneContribution
+        {
+            Displays = packaged.Select(w => new WeaponDisplayInfoParams
+            {
+                DisplayId = (uint)w.DisplayId,
+                ModelIndex = (int)w.ModelId,
+                GroupSoundIndex = w.GroupSoundIndex ?? donorGroupSound,
+                // Package-time fallback heals rows persisted before the icon fix (empty stem = red "?").
+                IconStem = string.IsNullOrEmpty(w.IconStem) ? donorIcon : w.IconStem,
+                SpellVisualId = w.SpellVisualId ?? 0,
+                MirrorModelName2 = w.MirrorModelName2,
+                ItemVisual = (uint)w.ItemVisual,
+            }).ToArray(),
+            Members = members,
+            SkippedCount = skipped.Count,
+        };
+    }
+
     /// <summary>The chosen enchant glow (ItemVisual) resolved into effect models mounted on the
     /// built M2's own attachment points, for the post-forge preview. Degrades to null — a visual is
     /// an enhancement and must never fail a build's preview step.</summary>
@@ -1494,6 +1624,38 @@ public sealed class CustomWeaponBuildService
             return effects.Count > 0 ? effects : null;
         }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// Custom/private render-graph effect members come from the build request. Any remaining
+    /// hardcoded stock paths (for example an unchanged Thunderfury sheet), plus replaceable Type 3
+    /// which the client supplies as ArmorReflect4, are resolved from the stock mount only for WebGL
+    /// preview. A recolored sheet is always repointed to its private path first; a stock path is
+    /// never persisted or shadowed globally.
+    /// </summary>
+    private IReadOnlyDictionary<string, byte[]>? ResolvePreviewTextureBlps(
+        byte[] m2Bytes, IReadOnlyList<(string MpqPath, byte[] Blp)> builtTextures)
+    {
+        var result = builtTextures.ToDictionary(e => e.MpqPath, e => e.Blp,
+            StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var model = M2Reader.Parse(m2Bytes);
+            if (model is not null)
+            {
+                foreach (var texture in model.Textures)
+                {
+                    string? stockPath = WeaponPreviewService.StockPreviewTexturePath(texture);
+                    if (stockPath is null || result.ContainsKey(stockPath))
+                        continue;
+                    byte[]? bytes = _mpq.ExtractFile(stockPath)
+                        ?? _mpq.ExtractFile(stockPath.ToLowerInvariant());
+                    if (bytes is { Length: > 0 }) result[stockPath] = bytes;
+                }
+            }
+        }
+        catch { /* missing stock preview texture never invalidates the built artifact */ }
+        return result.Count > 0 ? result : null;
     }
 
     /// <summary>The base ItemDisplayInfo.dbc to union onto: the effective mounted copy from strictly
@@ -1590,6 +1752,14 @@ public sealed class CustomWeaponBuildService
         return inventoryType;
     }
 
+    internal static (uint GroupSoundIndex, uint SpellVisualId, bool MirrorModelName2)
+        ResolveDisplayFields(CustomWeaponBuildRequest request, uint donorGroupSoundIndex,
+            uint donorSpellVisualId, bool donorMirrorModelName2)
+        => (
+            request.DisplayGroupSoundIndex ?? donorGroupSoundIndex,
+            request.DisplaySpellVisualId ?? donorSpellVisualId,
+            request.DisplayMirrorModelName2 ?? donorMirrorModelName2);
+
     /// <summary>Human equip-slot label for the vanilla/TBC inventory enum. Kept separate from the
     /// weapon-family label because a 1H Sword may be unrestricted, Main Hand, or Off Hand.</summary>
     public static string InventoryTypeLabel(int inventoryType) => inventoryType switch
@@ -1634,7 +1804,7 @@ public sealed class CustomWeaponBuildService
         WeaponDonorInfo donor, string buildId, int modelIndex,
         long entry, long display, string weaponName, int effectiveInventoryType, byte[] m2, byte[] blp,
         IReadOnlyList<(string MpqPath, byte[] Blp)> effectBlps, GeneratedSql sql, uint groupSound,
-        string iconStem)
+        uint spellVisualId, bool mirrorModelName2, string iconStem)
     {
         string? sourceSha = request.SourceBlob is { Length: > 0 } src ? Sha256(src) : null;
         // Everything the unified rebuild needs to re-author this display row from DB state alone:
@@ -1643,8 +1813,8 @@ public sealed class CustomWeaponBuildService
         string dbcFieldsJson = JsonSerializer.Serialize(new
         {
             groupSoundIndex = groupSound,
-            spellVisualId = donor.SpellVisualId,
-            mirrorModelName2 = donor.MirrorModelName2,
+            spellVisualId,
+            mirrorModelName2,
         });
         string gameplayJson = JsonSerializer.Serialize(new
         {
@@ -1834,8 +2004,8 @@ public sealed class CustomWeaponBuildService
 
     private object BuildManifest(CustomWeaponBuildRequest request, WeaponTypeProfile profile,
         WeaponDonorInfo donorInfo, string buildId, long entry, long display,
-        int modelIndex, string weaponName, int effectiveInventoryType, uint donorGroupSound,
-        GeneratedSql sql, WeaponPatchResult patch,
+        int modelIndex, string weaponName, int effectiveInventoryType, uint displayGroupSound,
+        uint displaySpellVisual, bool displayMirrorModelName2, GeneratedSql sql, WeaponPatchResult patch,
         int packagedCount, int skippedCount, int replacedInBase) => new
     {
         buildId,
@@ -1879,7 +2049,7 @@ public sealed class CustomWeaponBuildService
             displayRow = donorInfo.DisplayRow,
             model = donorInfo.ModelName,
             m2Path = donorInfo.M2Path,
-            groupSoundIndex = donorGroupSound,
+            groupSoundIndex = donorInfo.GroupSoundIndex,
             spellVisualId = donorInfo.SpellVisualId,
             mirrorModelName2 = donorInfo.MirrorModelName2,
             measureDisplayRow = donorInfo.MeasureDisplayRow,
@@ -1887,6 +2057,15 @@ public sealed class CustomWeaponBuildService
             extentX = donorInfo.ExtentX,
             palmBackFraction = donorInfo.PalmBackFraction,
             orientation = donorInfo.Orientation.ToString(),
+        },
+        displayFields = new
+        {
+            groupSoundIndex = displayGroupSound,
+            spellVisualId = displaySpellVisual,
+            mirrorModelName2 = displayMirrorModelName2,
+            sourcePreserved = request.DisplayGroupSoundIndex.HasValue ||
+                              request.DisplaySpellVisualId.HasValue ||
+                              request.DisplayMirrorModelName2.HasValue,
         },
         packaging = new
         {
@@ -2037,6 +2216,11 @@ public sealed class CustomWeaponBuildService
 
 /// <summary>One custom weapon to build and package. Exactly one of <see cref="Mesh"/> (compiled
 /// through the Forge writer) or <see cref="PrecompiledM2"/> (donor-clone bytes) must be set.</summary>
+public sealed record PrecompiledWeaponEffectTexture(
+    IReadOnlyList<int> TextureSlots,
+    string SourcePath,
+    byte[] Blp);
+
 public sealed class CustomWeaponBuildRequest
 {
     public string? Name { get; init; }
@@ -2052,7 +2236,7 @@ public sealed class CustomWeaponBuildRequest
     /// <c>Interface\Icons\{IconStem}.blp</c> so the client can resolve the name.</summary>
     public byte[]? IconBlp { get; init; }
 
-    /// <summary>'donor_patch' | 'parametric' | 'glb_import' | 'sketch3d' — recorded as provenance.</summary>
+    /// <summary>'donor_patch' | 'parametric' | 'glb_import' | 'vanilla_recolor' | 'sketch3d' — recorded as provenance.</summary>
     public required string SourceKind { get; init; }
 
     /// <summary>Weapon family key from <see cref="WeaponTypeCatalog"/> — drives the gameplay row
@@ -2092,6 +2276,11 @@ public sealed class CustomWeaponBuildRequest
     public byte[]? PrecompiledM2 { get; init; }
     public byte[]? PrecompiledBlp { get; init; }
 
+    /// <summary>Per-item replacements for selected hardcoded Type-0 texture records in a
+    /// source-preserved M2. The builder assigns private MPQ paths after reserving the display id,
+    /// repoints only those records, and packages these BLPs at the private paths.</summary>
+    public IReadOnlyList<PrecompiledWeaponEffectTexture>? PrecompiledEffectTextures { get; init; }
+
     /// <summary>Source material for later edit/recompile (original GLB, sketch PNG, …).</summary>
     public byte[]? SourceBlob { get; init; }
     public string? GeneratorParamsJson { get; init; }
@@ -2100,6 +2289,13 @@ public sealed class CustomWeaponBuildRequest
     /// renders permanently on the weapon's attachment points), 0 = none. Used by the later-client
     /// imports to approximate source particle effects the 1.12 scaffold cannot host.</summary>
     public uint ItemVisual { get; init; }
+
+    /// <summary>Optional source ItemDisplayInfo scalars. Vanilla byte-preserving recolors carry
+    /// these exactly; generated and later-client routes leave them null and retain family-donor
+    /// behavior.</summary>
+    public uint? DisplayGroupSoundIndex { get; init; }
+    public uint? DisplaySpellVisualId { get; init; }
+    public bool? DisplayMirrorModelName2 { get; init; }
     /// <summary>Attachment id → WoW-space position to write over the donor's attachment records after
     /// compilation (weapon ids 0..4 = where enchant/ItemVisual effects hang). Null keeps the donor's.</summary>
     public IReadOnlyDictionary<uint, System.Numerics.Vector3>? AttachmentPointsWoW { get; init; }
