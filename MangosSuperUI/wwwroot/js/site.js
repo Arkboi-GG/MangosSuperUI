@@ -824,13 +824,47 @@
 
 
     // =========================================================
-    //  7. INIT — on DOMContentLoaded
+    //  7. TOP-BAR RESTART BOTH
+    // =========================================================
+
+    function initTopnavRestartBoth() {
+        var btn = document.getElementById('btnTopnavRestartBoth');
+        if (!btn) return;
+
+        var originalHtml = btn.innerHTML;
+
+        function restartService(service) {
+            return fetch('/Home/ProcessAction', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ service: service, action: 'restart' })
+            });
+        }
+
+        btn.addEventListener('click', function () {
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+
+            restartService('realmd')
+                .catch(function () {})
+                .then(function () { return restartService('mangosd'); })
+                .catch(function () {})
+                .then(function () {
+                    btn.disabled = false;
+                    btn.innerHTML = originalHtml;
+                });
+        });
+    }
+
+    // =========================================================
+    //  8. INIT — on DOMContentLoaded
     // =========================================================
 
     document.addEventListener('DOMContentLoaded', function () {
         applySidebarOrder();
         initSidebarCollapse();
         initCustomizeModal();
+        initTopnavRestartBoth();
     });
 
 })();

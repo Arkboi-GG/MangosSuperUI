@@ -63,9 +63,14 @@
 
 <!-- ========== Top Navigation (macro sections) ========== -->
 <nav class="topnav">
-    <a class="topnav-brand" asp-controller="Home" asp-action="Index">
-        <span class="topnav-brand-sub">SuperUI</span>
-    </a>
+    <div class="topnav-brand">
+        <a class="topnav-brand-link" asp-controller="Home" asp-action="Index">
+            <span class="topnav-brand-sub">SuperUI</span>
+        </a>
+        <button class="btn-outline-subtle btn-icon-only" id="btnTopnavRestartBoth" title="Restart Both">
+            <i class="fa-solid fa-rotate"></i>
+        </button>
+    </div>
     <div class="topnav-sections" id="topNavSections">
         @foreach (var s in macroSections)
         {

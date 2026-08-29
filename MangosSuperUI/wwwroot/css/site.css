@@ -139,9 +139,15 @@ html, body {
     display: flex;
     align-items: center;
     justify-content: center;
+    gap: 10px;
     padding: 0 12px;
-    text-decoration: none;
     border-right: 1px solid var(--sidebar-border);
+}
+
+.topnav-brand-link {
+    display: flex;
+    align-items: center;
+    text-decoration: none;
 }
 
 .topnav-brand-sub {
@@ -616,6 +622,15 @@ html, body {
         border-color: var(--border-medium);
         background: var(--bg-card-alt);
         color: var(--text-primary);
+    }
+
+.btn-icon-only {
+    padding: 6px 9px;
+    line-height: 1;
+}
+
+    .btn-icon-only i {
+        font-size: 13px;
     }
 
 /* ---- Tables ---- */
