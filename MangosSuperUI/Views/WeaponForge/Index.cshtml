@@ -1387,7 +1387,7 @@
         // Both source routes enter this shared step. The resulting object is sent as the optional
         // multipart `itemConfig` field; blank optional values are omitted so family/TBC defaults survive.
         const ITEM_BUILD_TABS = ['basics', 'power', 'effects', 'rules', 'review'];
-        const ITEM_QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Artifact'];
+        const ITEM_QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Reforged', 'Legendary', 'Artifact', 'Relic'];
         const ITEM_DAMAGE_NAMES = ['Physical', 'Holy', 'Fire', 'Nature', 'Frost', 'Shadow', 'Arcane'];
         const ITEM_STAT_NAMES = { 0: 'Mana', 1: 'Health', 3: 'Agility', 4: 'Strength', 5: 'Intellect', 6: 'Spirit', 7: 'Stamina' };
         const ITEM_TRIGGER_NAMES = { 0: 'Use', 1: 'On Equip', 2: 'Chance on Hit' };
@@ -2933,9 +2933,9 @@
             } catch (e) { el.textContent = `${lane.label} status unavailable: ` + e; }
         }
 
-        // WoW quality colors (0 poor … 6 artifact).
+        // WoW quality colors (0 poor … 8 relic).
         // Common is white in-game; on the site's themed card background that is invisible, so it follows the text color.
-        const QUALITY_COLORS = ['#9d9d9d', 'var(--text-primary)', '#1eff00', '#0070dd', '#a335ee', '#ff8000', '#e6cc80'];
+        const QUALITY_COLORS = ['#9d9d9d', 'var(--text-primary)', '#1eff00', '#0070dd', '#a335ee', '#40c4ff', '#ff8000', '#e6cc80', '#e62020'];
 
         async function loadLanePage(lane, page) {
             lane.page = page;

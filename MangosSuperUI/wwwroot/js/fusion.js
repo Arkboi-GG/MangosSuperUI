@@ -22,7 +22,7 @@
         Questing: '#7aa2f7', Grinding: '#ff9e64', Training: '#bb9af7', Following: '#9ece6a',
         Maintenance: '#e0af68', Idle: '#5c6773'
     };
-    var QUALITY_COLORS = { 0: '#9d9d9d', 1: '#ffffff', 2: '#1eff00', 3: '#0070dd', 4: '#a335ee', 5: '#ff8000', 6: '#e6cc80' };
+    var QUALITY_COLORS = { 0: '#9d9d9d', 1: '#ffffff', 2: '#1eff00', 3: '#0070dd', 4: '#a335ee', 5: '#40c4ff', 6: '#ff8000', 7: '#e6cc80', 8: '#e62020' };
     var GROUPING_MODES = ['Off', 'Sticky', 'Opportunistic'];
 
     // ----- state -----

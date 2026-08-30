@@ -1006,7 +1006,7 @@ $(function () {
         h += '<div class="lf-legendary-card-body">' +
             '<img src="' + esc(iconPath) + '" style="width:28px;height:28px;border-radius:4px;border:1px solid #ff8000;" />' +
             '<div style="flex:1;min-width:0;">' +
-            '<div class="quality-5" style="font-weight:700;font-size:13px;">' + esc(legendary.legendaryName) + '</div>' +
+            '<div class="quality-6" style="font-weight:700;font-size:13px;">' + esc(legendary.legendaryName) + '</div>' +
             '<div style="font-size:11px;color:var(--text-muted);">Base: <span class="quality-' + legendary.baseItemQuality + '">' + esc(legendary.baseItemName) + '</span>' +
             ' &middot; Boss: ' + esc(legendary.bossName) +
             ' &middot; Budget: <span style="color:#ff8000;font-weight:600;">150%</span></div>' +

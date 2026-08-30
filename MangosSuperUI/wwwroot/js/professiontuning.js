@@ -24,7 +24,7 @@
     function qClass(q) {
         var n = parseInt(q);
         if (isNaN(n)) n = 1;
-        if (n < 0) n = 0; if (n > 6) n = 6;
+        if (n < 0) n = 0; if (n > 8) n = 8;
         return 'q' + n;
     }
 
