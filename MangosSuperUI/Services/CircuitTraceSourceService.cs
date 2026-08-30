@@ -414,7 +414,7 @@ public sealed class CircuitTraceSourceService
 
     private static int PathDepth(string root, string path) =>
         Path.GetRelativePath(root, path)
-            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            .Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
                 StringSplitOptions.RemoveEmptyEntries)
             .Length;
 
