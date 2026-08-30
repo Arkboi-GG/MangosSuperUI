@@ -1113,10 +1113,10 @@ public class CraftingLootifierController : Controller
     {
         int b = baseQuality <= 1 ? 2 : baseQuality;      // white + stats floors at green
         int q;
-        if (tier == "gods") q = Math.Min(b + 2, 5);      // legendary
+        if (tier == "gods") q = Math.Min(b + 2, 6);      // legendary
         else if (tier == "glory") q = Math.Min(b + 1, 4);// +1, capped at purple
         else q = b;                                      // improved / power keep base colour
-        return Math.Clamp(q, 2, 5);
+        return Math.Clamp(q, 2, 6);
     }
 
     private static int BandIndexForBudget(float budgetPct)
@@ -1190,7 +1190,7 @@ public class CraftingLootifierController : Controller
         // min+max damage by (1+p) raises DPS by exactly p%.
         string tier = CanonicalTier(tierLabel, roll.budgetPct);
         int variantQuality = VariantQuality(tier, baseQuality);
-        bool isLegendary = variantQuality >= 5;
+        bool isLegendary = variantQuality >= 6;
         int itemClass = GetPropInt(baseItem, "class");
         float effDpsBump = isLegendary ? legendaryDpsBumpPct : (dpsBumpPct ?? 0f);
         double dmgMult = (itemClass == ITEM_CLASS_WEAPON && effDpsBump > 0f) ? 1.0 + effDpsBump / 100.0 : 1.0;

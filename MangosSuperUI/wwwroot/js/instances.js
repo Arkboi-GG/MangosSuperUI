@@ -13,7 +13,7 @@ $(function () {
     var pendingAddItem = null;   // { entry, name, quality, iconPath }
     var pendingRemoveData = null; // { entry, item, groupId, patchMin, patchMax, source, itemName }
 
-    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Artifact'];
+    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Reforged', 'Legendary', 'Artifact', 'Relic'];
 
     // ===================== BASELINE INTEGRATION =====================
 

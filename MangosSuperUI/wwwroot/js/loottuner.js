@@ -5,7 +5,7 @@ $(function () {
     var previewData = null;
     var currentMultiplier = 2.0;
 
-    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Artifact'];
+    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Reforged', 'Legendary', 'Artifact', 'Relic'];
 
     // ===================== BASELINE INTEGRATION =====================
 

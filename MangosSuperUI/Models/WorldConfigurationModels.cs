@@ -124,8 +124,10 @@ public static class WorldConfigurationCatalog
         Rate("rate.drop_item_uncommon", "Uncommon item drops", "Economy", 1, 0.01, 1000, 0.25, "Uncommon-quality item drop multiplier."),
         Rate("rate.drop_item_rare", "Rare item drops", "Economy", 1, 0.01, 1000, 0.25, "Rare-quality item drop multiplier."),
         Rate("rate.drop_item_epic", "Epic item drops", "Economy", 1, 0.01, 1000, 0.25, "Epic-quality item drop multiplier."),
+        Rate("rate.drop_item_reforged", "Reforged item drops", "Economy", 1, 0.01, 1000, 0.25, "Reforged-quality item drop multiplier."),
         Rate("rate.drop_item_legendary", "Legendary item drops", "Economy", 1, 0.01, 1000, 0.25, "Legendary-quality item drop multiplier."),
         Rate("rate.drop_item_artifact", "Artifact item drops", "Economy", 1, 0.01, 1000, 0.25, "Artifact-quality item drop multiplier."),
+        Rate("rate.drop_item_relic", "Relic item drops", "Economy", 1, 0.01, 1000, 0.25, "Relic-quality item drop multiplier."),
         Rate("rate.drop_item_referenced", "Referenced loot", "Economy", 1, 0.01, 1000, 0.25, "Referenced loot-table multiplier.")
     };
 

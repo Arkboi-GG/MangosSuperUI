@@ -103,8 +103,8 @@ $(function () {
     }
     checkPatchMAvailable();
 
-    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Artifact'];
-    var QUALITY_COLORS = ['#9d9d9d', 'inherit', '#1eff00', '#0070dd', '#a335ee', '#ff8000', '#e6cc80'];
+    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Reforged', 'Legendary', 'Artifact', 'Relic'];
+    var QUALITY_COLORS = ['#9d9d9d', 'inherit', '#1eff00', '#0070dd', '#a335ee', '#40c4ff', '#ff8000', '#e6cc80', '#e62020'];
 
     var CLASS_NAMES = {
         0: 'Consumable', 1: 'Container', 2: 'Weapon', 4: 'Armor',
@@ -1962,7 +1962,7 @@ $(function () {
 
     function buildQualityDropdown(selected) {
         var h = '<select id="editFieldQuality">';
-        for (var i = 0; i <= 6; i++) {
+        for (var i = 0; i <= 8; i++) {
             h += '<option value="' + i + '" class="quality-option-' + i + '"' + (i === selected ? ' selected' : '') + '>' + QUALITY_NAMES[i] + '</option>';
         }
         return h + '</select>';

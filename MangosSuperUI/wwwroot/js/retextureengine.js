@@ -193,7 +193,7 @@
         14: 'Shield', 15: 'Ranged', 16: 'Back', 17: 'Two-Hand', 19: 'Tabard', 20: 'Robe',
         21: 'Main Hand', 22: 'Off Hand', 23: 'Held In Off-Hand', 25: 'Thrown', 26: 'Ranged'
     };
-    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Artifact'];
+    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Reforged', 'Legendary', 'Artifact', 'Relic'];
     // Combined weapon-type / armor-material dropdown; value "class:subclass" so it
     // needs no cascade (the old cascade left it disabled until a class was picked).
     var TYPE_OPTIONS = [

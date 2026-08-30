@@ -1092,7 +1092,7 @@ public class QuestLootifierController : Controller
         string disSet = disCol != null ? $", `{disCol}` = 0" : "";
 
         await mangosConn.ExecuteAsync(
-            $"UPDATE item_template SET name = @Name, quality = 5{disSet} WHERE entry = @Entry",
+            $"UPDATE item_template SET name = @Name, quality = 6{disSet} WHERE entry = @Entry",
             new { Name = legendaryName, Entry = newEntry });
         float legGoldMult = ScaleGoldMult(1f + ruleset.legendaryGoldBumpPct / 100f, ruleset.goldValueScalePct);
         if (legGoldMult > 1.001f)
@@ -1753,7 +1753,7 @@ public class QuestLootifierController : Controller
     private (string label, string position) ResolveBandNaming(int baseQuality, string canonicalTier,
         string defaultLabel, string defaultPosition)
     {
-        if (baseQuality >= 5)
+        if (baseQuality >= 6)
             return ("Immortal", "prefix");
 
         if (baseQuality == 4)
@@ -1839,13 +1839,13 @@ public class QuestLootifierController : Controller
 
         int laddered = canon switch
         {
-            "gods" => 5,                // orange — the legendary step, the only rung that reaches it
+            "gods" => 6,                // orange — the legendary step, the only rung that reaches it
             "glory" => 4,               // purple floor  (unchanged)
             "power" => 3,               // blue floor    (unchanged)
             _ => baseQuality,           // improved: INHERIT the base — this is the fix
         };
 
-        return Math.Clamp(Math.Max(baseQuality, laddered), 0, 5);
+        return Math.Clamp(Math.Max(baseQuality, laddered), 0, 6);
     }
 
     // Default band ladder — mirrors the Crafting Lootifier's defaults so the two

@@ -36,12 +36,14 @@ $(function () {
         2: '#1eff00', // Uncommon (green)
         3: '#0070dd', // Rare (blue)
         4: '#a335ee', // Epic (purple)
-        5: '#ff8000', // Legendary (orange)
-        6: '#e6cc80'  // Artifact (light gold)
+        5: '#40c4ff', // Reforged (cyan)
+        6: '#ff8000', // Legendary (orange)
+        7: '#e6cc80', // Artifact (light gold)
+        8: '#e62020'  // Relic (red)
     };
     var QUALITY_NAMES = {
         0: 'Poor', 1: 'Common', 2: 'Uncommon', 3: 'Rare',
-        4: 'Epic', 5: 'Legendary', 6: 'Artifact'
+        4: 'Epic', 5: 'Reforged', 6: 'Legendary', 7: 'Artifact', 8: 'Relic'
     };
 
     // Legible-on-page variants of the WoW quality colours. QUALITY_COLORS above is tuned for a
@@ -54,8 +56,10 @@ $(function () {
         2: '#16a34a', // Uncommon
         3: '#0062c4', // Rare
         4: '#8b2fd6', // Epic
-        5: '#d97706', // Legendary
-        6: '#a67c2e'  // Artifact
+        5: '#0e9bd6', // Reforged
+        6: '#d97706', // Legendary
+        7: '#a67c2e', // Artifact
+        8: '#c41818'  // Relic
     };
 
     // Zone ids as they come off AreaTable.dbc (the spine reports ctx.ZoneId; quest_template

@@ -860,7 +860,8 @@
                                 <select id="ibQuality">
                                     <option value="0">Poor</option><option value="1" selected>Common</option>
                                     <option value="2">Uncommon</option><option value="3">Rare</option>
-                                    <option value="4">Epic</option><option value="5">Legendary</option><option value="6">Artifact</option>
+                                    <option value="4">Epic</option><option value="5">Reforged</option>
+                                    <option value="6">Legendary</option><option value="7">Artifact</option><option value="8">Relic</option>
                                 </select>
                             </div>
                             <div class="wf-build-field">
@@ -1994,7 +1995,7 @@
             if (!config.name) errors.push('Item name is required.');
             if (config.name.length > 255) errors.push('Item name must be 255 characters or fewer.');
             if ((config.description || '').length > 255) errors.push('Description must be 255 characters or fewer.');
-            if (!Number.isInteger(config.quality) || config.quality < 0 || config.quality > 6) errors.push('Choose a valid vanilla item quality.');
+            if (!Number.isInteger(config.quality) || config.quality < 0 || config.quality > 8) errors.push('Choose a valid vanilla item quality.');
             if (!ITEM_SLOT_VALUES.includes(config.inventoryType)) errors.push('Choose a valid weapon equip slot.');
             if (!Number.isInteger(config.itemLevel) || config.itemLevel < 1 || config.itemLevel > 255) errors.push('Item level must be between 1 and 255.');
             if (!Number.isInteger(config.requiredLevel) || config.requiredLevel < 0 || config.requiredLevel > 60) errors.push('Required level must be between 0 and 60.');

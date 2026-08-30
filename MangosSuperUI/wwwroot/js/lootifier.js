@@ -15,7 +15,7 @@ $(function () {
     var legendaryBand = null;   // { min, max } boost band for the boss legendary; seeded from meta
 
     var RANK_NAMES = { 0: 'Normal', 1: 'Elite', 2: 'Rare Elite', 3: 'Boss', 4: 'Rare' };
-    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary'];
+    var QUALITY_NAMES = ['Poor', 'Common', 'Uncommon', 'Rare', 'Epic', 'Reforged', 'Legendary', 'Artifact', 'Relic'];
 
     // ===================== INIT =====================
 

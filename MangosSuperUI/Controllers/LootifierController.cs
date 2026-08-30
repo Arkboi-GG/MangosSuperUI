@@ -2033,16 +2033,16 @@ public class LootifierController : Controller
     // the first two rungs onto the base colour (which gave 7 greens + 2 blues on a
     // 5/2/2 split when the operator expected 5 / 2 / 2).
     //   improved -> base      power -> +1      glory -> +2 (capped purple)
-    //   gods/legendary -> 5
+    //   gods/legendary -> 6
     private static int VariantQuality(string tier, int baseQuality)
     {
         int b = baseQuality <= 1 ? 2 : baseQuality;      // white + stats floors at green
         int q;
-        if (tier == "gods") q = 5;                       // legendary, always orange
+        if (tier == "gods") q = 6;                       // legendary, always orange
         else if (tier == "glory") q = Math.Min(b + 2, 4);// +2, capped at purple
         else if (tier == "power") q = Math.Min(b + 1, 4);// +1, capped at purple
         else q = b;                                      // improved keeps the base colour
-        return Math.Clamp(Math.Max(b, q), 2, 5);         // never below the base's own quality
+        return Math.Clamp(Math.Max(b, q), 2, 6);         // never below the base's own quality
     }
 
     // Per-base-quality band naming (shared with Quest/Crafting). A purple or
@@ -2054,7 +2054,7 @@ public class LootifierController : Controller
     private static (string label, string position) ResolveBandNaming(int baseQuality, string canonicalTier,
         string defaultLabel, string defaultPosition)
     {
-        if (baseQuality >= 5)
+        if (baseQuality >= 6)
             return ("Immortal", "prefix");
 
         if (baseQuality == 4)
@@ -2373,7 +2373,7 @@ public class LootifierController : Controller
         await conn.ExecuteAsync(
             "UPDATE item_template SET quality = @Q WHERE entry = @Entry",
             new { Q = variantQuality, Entry = newEntry });
-        if (variantQuality >= 5)
+        if (variantQuality >= 6)
             await ClearDisenchant(conn, newEntry);
     }
 
@@ -2509,7 +2509,7 @@ public class LootifierController : Controller
         await conn.ExecuteAsync(
             "UPDATE item_template SET quality = @Q WHERE entry = @Entry",
             new { Q = variantQuality, Entry = newEntry });
-        if (variantQuality >= 5)
+        if (variantQuality >= 6)
             await ClearDisenchant(conn, newEntry);
     }
 
@@ -2598,7 +2598,7 @@ public class LootifierController : Controller
             bossName,
             budgetPct = 150.0,
             dropPct = ruleset.legendaryDropPct,
-            quality = 5,
+            quality = 6,
             stats = stats.Select(s => (object)new { s.statType, s.statValue, s.name }).ToList()
         };
     }
@@ -2701,7 +2701,7 @@ public class LootifierController : Controller
             await InsertVariantItem(mangosConn, item, newEntry, roll, ruleset, isLegendary: true);
 
         await mangosConn.ExecuteAsync(
-            "UPDATE item_template SET name = @Name, quality = 5 WHERE entry = @Entry",
+            "UPDATE item_template SET name = @Name, quality = 6 WHERE entry = @Entry",
             new { Name = legendaryName, Entry = newEntry });
 
         // Legendaries aren't disenchantable. Column is `disenchant_id` in VMaNGOS

@@ -735,8 +735,10 @@ public partial class RetextureSupport
         2 => "Uncommon",
         3 => "Rare",
         4 => "Epic",
-        5 => "Legendary",
-        6 => "Artifact",
+        5 => "Reforged",
+        6 => "Legendary",
+        7 => "Artifact",
+        8 => "Relic",
         _ => "Tier " + q
     };
 

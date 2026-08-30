@@ -616,7 +616,10 @@ public class LootTunerController : Controller
                 2 => "Uncommon",
                 3 => "Rare",
                 4 => "Epic",
-                5 => "Legendary",
+                5 => "Reforged",
+                6 => "Legendary",
+                7 => "Artifact",
+                8 => "Relic",
                 _ => $"Q{q}"
             });
             parts.Add($"quality=[{string.Join(",", names)}]");
