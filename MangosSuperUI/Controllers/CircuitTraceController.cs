@@ -1,11 +1,11 @@
-using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Services;
 
 namespace MangosSuperUI.Controllers;
 
 // ════════════════════════════════════════════════════════════════════════════
-// CircuitTraceController — the ONE trace query surface (CIRCUIT_BOARD.md R10).
+// CircuitTraceController — the ONE trace query surface (docs/CIRCUIT_BOARD.md R10).
 //
 // Both consumers — the SuperUI visual layers (logic view + world-map layer) and
 // the LLM context-pack — read THESE endpoints and nothing else, so the two

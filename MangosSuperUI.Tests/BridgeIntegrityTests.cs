@@ -6,7 +6,10 @@ using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Data;
 using MangosSuperUI.BotLogic.Planners;
 using MangosSuperUI.Controllers;
+using MangosSuperUI.Hubs;
 using MangosSuperUI.Services;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -504,6 +507,219 @@ public sealed class BridgeIntegrityTests
     }
 
     [Fact]
+    public void UiStateBuffer_CoalescesToNewestStatePerGuid()
+    {
+        DateTime firstUtc = new(2026, 8, 29, 12, 0, 0, DateTimeKind.Utc);
+        var buffer = new BotStateUpdateBuffer();
+        buffer.Enqueue(new BotState { Guid = 14, Health = 50, LastUpdate = firstUtc });
+        buffer.Enqueue(new BotState { Guid = 14, Health = 75, LastUpdate = firstUtc.AddSeconds(5) });
+
+        BotState state = Assert.Single(buffer.Drain(10));
+        BotStateBatchMetrics metrics = buffer.GetMetrics();
+
+        Assert.Equal(75, state.Health);
+        Assert.Equal(2, metrics.StateUpdatesQueued);
+        Assert.Equal(1, metrics.StateUpdatesCoalesced);
+        Assert.Equal(0, metrics.PendingBotCount);
+    }
+
+    [Fact]
+    public void UiStateBuffer_HonorsChunkLimitWithoutDroppingRemainder()
+    {
+        var buffer = new BotStateUpdateBuffer();
+        for (int guid = 1; guid <= 5; guid++)
+            buffer.Enqueue(new BotState { Guid = guid, LastUpdate = DateTime.UtcNow });
+
+        Assert.Equal(2, buffer.Drain(2).Count);
+        Assert.Equal(3, buffer.GetMetrics().PendingBotCount);
+        Assert.Equal(3, buffer.Drain(10).Count);
+        Assert.Equal(0, buffer.GetMetrics().PendingBotCount);
+    }
+
+    [Fact]
+    public void UiStateBuffer_ServesTenThousandGuidBurstWithoutStarvation()
+    {
+        var buffer = new BotStateUpdateBuffer();
+        DateTime updateUtc = new(2026, 8, 29, 12, 0, 0, DateTimeKind.Utc);
+        for (int guid = 1; guid <= 10_000; guid++)
+            buffer.Enqueue(new BotState { Guid = guid, LastUpdate = updateUtc });
+
+        var delivered = new HashSet<int>();
+        while (buffer.PendingCount > 0)
+        {
+            foreach (BotState state in buffer.Drain(1_024))
+                Assert.True(delivered.Add(state.Guid));
+        }
+
+        Assert.Equal(10_000, delivered.Count);
+    }
+
+    [Fact]
+    public async Task UiStateBuffer_ConcurrentMutationRetainsNewestStateForEveryGuid()
+    {
+        const int guidCount = 128;
+        const int producerCount = 8;
+        const int rounds = 24;
+        DateTime epoch = new(2026, 8, 29, 12, 0, 0, DateTimeKind.Utc);
+        DateTime producerLatest = epoch.AddTicks(producerCount * rounds);
+        DateTime removalLatest = producerLatest.AddTicks(1);
+        var buffer = new BotStateUpdateBuffer();
+        var observed = new ConcurrentDictionary<int, DateTime>();
+
+        Task[] producers = Enumerable.Range(0, producerCount)
+            .Select(worker => Task.Run(() =>
+            {
+                for (int round = 0; round < rounds; round++)
+                {
+                    DateTime updateUtc = epoch.AddTicks((worker * rounds) + round + 1);
+                    for (int guid = 1; guid <= guidCount; guid++)
+                        buffer.Enqueue(new BotState { Guid = guid, LastUpdate = updateUtc });
+                }
+            }))
+            .ToArray();
+
+        Task remover = Task.Run(() =>
+        {
+            for (int guid = 7; guid <= guidCount; guid += 7)
+            {
+                buffer.Remove(guid);
+                buffer.Enqueue(new BotState { Guid = guid, LastUpdate = removalLatest });
+            }
+        });
+        Task mutations = Task.WhenAll(producers.Append(remover));
+
+        Task consumer = Task.Run(async () =>
+        {
+            int pass = 0;
+            do
+            {
+                IReadOnlyList<BotState> batch = buffer.Drain(31);
+                if (batch.Count == 0)
+                {
+                    await Task.Yield();
+                    continue;
+                }
+
+                // Exercise the failed-send path while producers and removals race.
+                if (++pass % 11 == 0)
+                {
+                    buffer.Requeue(batch);
+                    continue;
+                }
+
+                foreach (BotState state in batch)
+                {
+                    observed.AddOrUpdate(
+                        state.Guid,
+                        state.LastUpdate,
+                        (_, current) => state.LastUpdate > current ? state.LastUpdate : current);
+                }
+            }
+            while (!mutations.IsCompleted || buffer.PendingCount > 0);
+        });
+
+        await Task.WhenAll(mutations, consumer)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        for (int guid = 1; guid <= guidCount; guid++)
+        {
+            DateTime expected = guid % 7 == 0 ? removalLatest : producerLatest;
+            Assert.Equal(expected, observed[guid]);
+        }
+        Assert.Equal(0, buffer.PendingCount);
+    }
+
+    [Fact]
+    public void UiStateBuffer_RemoveAndPostFailurePurgePreventResurrection()
+    {
+        var buffer = new BotStateUpdateBuffer();
+        var state = new BotState { Guid = 14, LastUpdate = DateTime.UtcNow };
+        buffer.Enqueue(state);
+        IReadOnlyList<BotState> inFlight = buffer.Drain(10);
+
+        // Model lifecycle removal, followed by an in-flight send failure and
+        // the second purge after the UI publication barrier is acquired.
+        buffer.Remove(14);
+        buffer.Requeue(inFlight);
+        Assert.True(buffer.Remove(14));
+
+        Assert.Empty(buffer.Drain(10));
+        Assert.Equal(0, buffer.PendingCount);
+    }
+
+    [Fact]
+    public void UiStateSnapshot_IsDetachedAndOmitsPlannerQuestBlob()
+    {
+        var source = new BotState
+        {
+            Guid = 14,
+            Health = 50,
+            Name = "ScaleBot",
+            Quests = "101:3:1,0,0,0:0,0,0,0"
+        };
+
+        BotState snapshot = source.CreateUiSnapshot();
+        source.Health = 1;
+        source.Name = "Mutated";
+
+        Assert.Equal(50, snapshot.Health);
+        Assert.Equal("ScaleBot", snapshot.Name);
+        Assert.Equal("", snapshot.Quests);
+    }
+
+    [Fact]
+    public void UiStateBuffer_FailedBatchCannotOverwriteNewerQueuedState()
+    {
+        DateTime firstUtc = new(2026, 8, 29, 12, 0, 0, DateTimeKind.Utc);
+        var buffer = new BotStateUpdateBuffer();
+        var failed = new BotState { Guid = 14, Health = 50, LastUpdate = firstUtc };
+        buffer.Enqueue(failed);
+        IReadOnlyList<BotState> inFlight = buffer.Drain(10);
+
+        buffer.Enqueue(new BotState { Guid = 14, Health = 80, LastUpdate = firstUtc.AddSeconds(5) });
+        buffer.Requeue(inFlight);
+
+        BotState retried = Assert.Single(buffer.Drain(10));
+        Assert.Equal(80, retried.Health);
+        Assert.Equal(1, buffer.GetMetrics().StatesRequeued);
+    }
+
+    [Fact]
+    public void UiStateBuffer_TerminalDisconnectAndReconnectRemainLatestWins()
+    {
+        DateTime firstUtc = new(2026, 8, 29, 12, 0, 0, DateTimeKind.Utc);
+        var buffer = new BotStateUpdateBuffer();
+        var activeInFlight = new BotState
+        {
+            Guid = 14,
+            TaskState = "GRIND",
+            LastUpdate = firstUtc
+        };
+        buffer.Enqueue(activeInFlight);
+        IReadOnlyList<BotState> failedBatch = buffer.Drain(10);
+
+        buffer.Enqueue(new BotState
+        {
+            Guid = 14,
+            TaskState = "DISCONNECTED",
+            LastUpdate = firstUtc.AddSeconds(1)
+        });
+        buffer.Requeue(failedBatch);
+
+        BotState terminal = Assert.Single(buffer.Drain(10));
+        Assert.Equal("DISCONNECTED", terminal.TaskState);
+
+        buffer.Enqueue(new BotState
+        {
+            Guid = 14,
+            TaskState = "IDLE",
+            ConnectedAt = firstUtc.AddSeconds(2),
+            LastUpdate = firstUtc.AddSeconds(2)
+        });
+        Assert.Equal("IDLE", Assert.Single(buffer.Drain(10)).TaskState);
+    }
+
+    [Fact]
     public void Snapshot_CarriesExactActiveSessionGeneration()
     {
         const int guid = 14;
@@ -518,6 +734,177 @@ public sealed class BridgeIntegrityTests
         BotStateSnapshot snapshot = Assert.IsType<BotStateSnapshot>(bridge.GetBotStateSnapshot(guid));
 
         Assert.Equal(77, snapshot.BridgeSessionId);
+    }
+
+    [Fact]
+    public void InitialUiRoster_UsesDetachedQuestlessSnapshots()
+    {
+        const int guid = 14;
+        var bridge = new BotBridgeService(NullLogger<BotBridgeService>.Instance, hub: null!);
+        var connection = new BotConnection
+        {
+            Guid = guid,
+            State = new BotState
+            {
+                Guid = guid,
+                Name = "ScaleBot",
+                Health = 75,
+                Quests = "101:3:1,0,0,0:0,0,0,0"
+            }
+        };
+        bridge.Connections[guid] = connection;
+        bridge.BotStates[guid] = connection.State;
+
+        BotState uiState = Assert.Single(bridge.GetAllBotUiStates());
+        connection.State.Health = 1;
+
+        Assert.Equal(75, uiState.Health);
+        Assert.Equal("", uiState.Quests);
+    }
+
+    [Fact]
+    public async Task InitialUiRoster_IsOrderedBeforeANewerDeletionTombstone()
+    {
+        var hub = new RecordingHubContext();
+        var bridge = new BotBridgeService(NullLogger<BotBridgeService>.Instance, hub);
+        bridge.BotStates[14] = new BotState { Guid = 14, Name = "ScaleBot" };
+        var rosterStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRoster = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        hub.Proxy.SendHandler = (method, _, cancellationToken) =>
+        {
+            if (method != "AllBots")
+                return Task.CompletedTask;
+
+            rosterStarted.TrySetResult();
+            return releaseRoster.Task.WaitAsync(cancellationToken);
+        };
+
+        Task roster = bridge.PublishAllBotUiStatesAsync(
+            hub.Proxy,
+            CancellationToken.None);
+        await rosterStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Task removal = bridge.RemoveBotStateAsync(14);
+        await Task.Delay(25);
+        Assert.False(removal.IsCompleted);
+
+        releaseRoster.TrySetResult();
+        await Task.WhenAll(roster, removal)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(
+            new[] { "AllBots", "BotRemoved" },
+            hub.Proxy.Invocations.Select(invocation => invocation.Method));
+    }
+
+    [Fact]
+    public async Task RemoveBotState_PurgesStateAndPublishesFleetWideTombstone()
+    {
+        const int guid = 14;
+        var hub = new RecordingHubContext();
+        var bridge = new BotBridgeService(NullLogger<BotBridgeService>.Instance, hub);
+        bridge.BotStates[guid] = new BotState { Guid = guid, Name = "ScaleBot" };
+        bridge.Connections[guid] = new BotConnection
+        {
+            Guid = guid,
+            State = bridge.BotStates[guid]
+        };
+
+        await bridge.RemoveBotStateAsync(guid);
+
+        Assert.False(bridge.BotStates.ContainsKey(guid));
+        Assert.False(bridge.Connections.ContainsKey(guid));
+        var invocation = Assert.Single(hub.Proxy.Invocations);
+        Assert.Equal("BotRemoved", invocation.Method);
+        Assert.Equal(guid, Assert.IsType<int>(Assert.Single(invocation.Arguments)));
+    }
+
+    [Fact]
+    public async Task RemoveBotStates_PublishesOneFleetTombstone()
+    {
+        var hub = new RecordingHubContext();
+        var bridge = new BotBridgeService(NullLogger<BotBridgeService>.Instance, hub);
+        bridge.BotStates[14] = new BotState { Guid = 14 };
+        bridge.BotStates[15] = new BotState { Guid = 15 };
+
+        await bridge.RemoveBotStatesAsync(new[] { 14, 15, 15 });
+
+        var invocation = Assert.Single(hub.Proxy.Invocations);
+        Assert.Equal("BotsRemoved", invocation.Method);
+        Assert.Equal(
+            new[] { 14, 15 },
+            Assert.IsType<int[]>(Assert.Single(invocation.Arguments)));
+    }
+
+    [Fact]
+    public async Task RemoveBotState_BlockedTombstoneTimesOutAndReleasesPublishGate()
+    {
+        var hub = new RecordingHubContext();
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["BotBridge:UiPublishTimeoutMs"] = "100"
+            })
+            .Build();
+        var bridge = new BotBridgeService(
+            NullLogger<BotBridgeService>.Instance,
+            hub,
+            configuration);
+        bridge.BotStates[14] = new BotState { Guid = 14 };
+        hub.Proxy.SendHandler = (_, _, cancellationToken) =>
+            Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+
+        await bridge.RemoveBotStateAsync(14)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.False(bridge.BotStates.ContainsKey(14));
+
+        hub.Proxy.SendHandler = null;
+        var stateBufferField = typeof(BotBridgeService).GetField(
+            "_stateUpdates",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var buffer = Assert.IsType<BotStateUpdateBuffer>(stateBufferField?.GetValue(bridge));
+        buffer.Enqueue(new BotState { Guid = 15, LastUpdate = DateTime.UtcNow });
+        Assert.Equal(
+            1,
+            await bridge.FlushStateBatchAsync(CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task UiStatePublisher_CancellationRequeuesAndReleasesPublishGate()
+    {
+        var hub = new RecordingHubContext();
+        var bridge = new BotBridgeService(NullLogger<BotBridgeService>.Instance, hub);
+        var stateBufferField = typeof(BotBridgeService).GetField(
+            "_stateUpdates",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var buffer = Assert.IsType<BotStateUpdateBuffer>(stateBufferField?.GetValue(bridge));
+        buffer.Enqueue(new BotState { Guid = 14, LastUpdate = DateTime.UtcNow });
+
+        var sendStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        hub.Proxy.SendHandler = async (_, _, cancellationToken) =>
+        {
+            sendStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        };
+
+        using var cancellation = new CancellationTokenSource();
+        Task<int> blockedFlush = bridge.FlushStateBatchAsync(cancellation.Token);
+        await sendStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await blockedFlush);
+
+        Assert.Equal(1, buffer.PendingCount);
+        hub.Proxy.SendHandler = null;
+        Assert.Equal(
+            1,
+            await bridge.FlushStateBatchAsync(CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(0, buffer.PendingCount);
     }
 
     [Fact]
@@ -679,7 +1066,8 @@ public sealed class BridgeIntegrityTests
             safety: null!,
             spawns: null!,
             zoneData: null!,
-            fallRecorder: null!);
+            fallRecorder: null!,
+            loopMetrics: new BrainLoopMetrics());
         var context = new BotContext
         {
             Guid = guid,
@@ -1019,4 +1407,50 @@ public sealed class BridgeIntegrityTests
             CorrelationId = cbt,
             MemberGuids = memberGuids.OrderBy(guid => guid).ToArray()
         };
+
+    private sealed class RecordingHubContext : IHubContext<BotBridgeHub>
+    {
+        public RecordingHubContext()
+        {
+            Proxy = new RecordingClientProxy();
+            Clients = new RecordingHubClients(Proxy);
+        }
+
+        public RecordingClientProxy Proxy { get; }
+        public IHubClients Clients { get; }
+        public IGroupManager Groups => throw new NotSupportedException();
+    }
+
+    private sealed class RecordingHubClients : IHubClients
+    {
+        private readonly IClientProxy _proxy;
+
+        public RecordingHubClients(IClientProxy proxy) => _proxy = proxy;
+
+        public IClientProxy All => _proxy;
+        public IClientProxy AllExcept(IReadOnlyList<string> excludedConnectionIds) => _proxy;
+        public IClientProxy Client(string connectionId) => _proxy;
+        public IClientProxy Clients(IReadOnlyList<string> connectionIds) => _proxy;
+        public IClientProxy Group(string groupName) => _proxy;
+        public IClientProxy GroupExcept(string groupName, IReadOnlyList<string> excludedConnectionIds) => _proxy;
+        public IClientProxy Groups(IReadOnlyList<string> groupNames) => _proxy;
+        public IClientProxy User(string userId) => _proxy;
+        public IClientProxy Users(IReadOnlyList<string> userIds) => _proxy;
+    }
+
+    private sealed class RecordingClientProxy : IClientProxy
+    {
+        public ConcurrentQueue<(string Method, object?[] Arguments)> Invocations { get; } = new();
+        public Func<string, object?[], CancellationToken, Task>? SendHandler { get; set; }
+
+        public Task SendCoreAsync(
+            string method,
+            object?[] args,
+            CancellationToken cancellationToken = default)
+        {
+            Invocations.Enqueue((method, args));
+            return SendHandler?.Invoke(method, args, cancellationToken)
+                ?? Task.CompletedTask;
+        }
+    }
 }

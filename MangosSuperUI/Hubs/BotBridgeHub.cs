@@ -9,12 +9,15 @@ namespace MangosSuperUI.Hubs;
 /// SignalR hub at /hubs/botbridge.
 ///
 /// Server → Client events (pushed from BotBridgeService):
-///   BotConnected(BotState)          — new bot joined
-///   BotDisconnected(int guid)       — bot TCP dropped
-///   BotStateUpdate(BotState)        — periodic state refresh
+///   BotStateBatch(BotState[])       — coalesced state + connect/disconnect projections
+///   BotRemoved(int)                 — permanent deletion tombstone for every open monitor
+///   BotsRemoved(int[])              — one permanent tombstone for a fleet deletion
 ///   BotSensoryFeedStale(object)      — STATE heartbeat age crossed the fail-closed threshold
 ///   BotEvent(object)                — discrete event (combat, death, quest, etc.)
 ///   BotChatReceived(object)         — player whispered a bot
+///
+/// The bundled UI also accepts legacy BotConnected, BotDisconnected and
+/// BotStateUpdate events so it remains usable after an old-server rollback.
 ///
 /// Client → Server methods:
 ///   GetAllBots()                    — returns current snapshot of all bot states
@@ -40,8 +43,9 @@ public class BotBridgeHub : Hub
     /// </summary>
     public async Task GetAllBots()
     {
-        var bots = _bridge.GetAllBotStates();
-        await Clients.Caller.SendAsync("AllBots", bots);
+        await _bridge.PublishAllBotUiStatesAsync(
+            Clients.Caller,
+            Context.ConnectionAborted);
     }
 
     /// <summary>

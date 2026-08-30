@@ -536,6 +536,74 @@ if [ "$QUEUE_INDEX_COUNT" -ne 3 ]; then
 fi
 ok "Combat-loadout queue table and indexes verified"
 
+# ── Privileged helper + sudoers grant ──
+#
+# This replaces the manual `visudo` step the install guide used to require, and
+# is what lets SuperUI raise mangosd's descriptor limit from the web UI instead
+# of the operator running commands by hand.
+#
+# SECURITY: the helper must be root-owned and NOT writable by the service user.
+# A NOPASSWD grant on a file that user can rewrite is a grant of full root.
+header "Privileged helper"
+
+HELPER_SRC="${INSTALL_DIR}/Scripts/superui-privileged.sh"
+HELPER_DST="/usr/local/lib/mangossuperui/superui-privileged.sh"
+SUDOERS_FILE="/etc/sudoers.d/mangossuperui"
+
+# The unit file is authoritative about who SuperUI runs as; it exists by the
+# time setup runs. Fall back to the install directory owner, then to whoever
+# invoked sudo.
+SERVICE_USER="${SERVICE_USER:-$(systemctl show mangossuperui.service -p User --value 2>/dev/null || true)}"
+[ -n "$SERVICE_USER" ] || SERVICE_USER=$(stat -c %U "$INSTALL_DIR" 2>/dev/null || true)
+[ -n "$SERVICE_USER" ] || SERVICE_USER="${SUDO_USER:-}"
+
+if [ -z "$SERVICE_USER" ] || [ "$SERVICE_USER" = "root" ]; then
+    warn "Could not determine the SuperUI service user; skipping helper install."
+    warn "Set SERVICE_USER=<user> and re-run to enable in-app limit management."
+elif [ ! -f "$HELPER_SRC" ]; then
+    warn "Helper not found at $HELPER_SRC — publish output may predate this feature."
+else
+    # Install OUTSIDE the app directory. The service user can write its own
+    # install tree during a deploy; it must never be able to write a file that
+    # sudo will run as root.
+    install -d -m 0755 -o root -g root /usr/local/lib/mangossuperui
+    install -m 0755 -o root -g root "$HELPER_SRC" "$HELPER_DST"
+    ok "Installed privileged helper at $HELPER_DST (root:root, 0755)"
+
+    UNITS="mangosd realmd cmangos-mangosd cmangos-realmd"
+    SUDO_LINES=""
+    for u in $UNITS; do
+        for a in start stop restart status; do
+            SUDO_LINES="${SUDO_LINES}, /usr/bin/systemctl ${a} ${u}"
+        done
+    done
+    SUDO_LINES="${SUDO_LINES#, }"
+
+    TMP_SUDOERS=$(mktemp)
+    cat > "$TMP_SUDOERS" <<EOF
+# Managed by setup-mangossuperui.sh. Re-run setup to regenerate.
+#
+# Two grants, both deliberately narrow:
+#   1. Lifecycle control of the world/auth units only.
+#   2. One root-owned helper script, which validates its own arguments against
+#      a fixed allowlist. See $HELPER_DST.
+${SERVICE_USER} ALL=(ALL) NOPASSWD: ${SUDO_LINES}
+${SERVICE_USER} ALL=(ALL) NOPASSWD: ${HELPER_DST}
+EOF
+
+    # NEVER install an unvalidated sudoers file: a syntax error locks out sudo
+    # for everyone on the box.
+    if visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
+        install -m 0440 -o root -g root "$TMP_SUDOERS" "$SUDOERS_FILE"
+        ok "Installed sudoers grant for '$SERVICE_USER' at $SUDOERS_FILE"
+        info "SuperUI can now manage service lifecycle and descriptor limits from the web UI"
+    else
+        fail "Generated sudoers file failed validation — NOT installed."
+        echo "  Inspect it manually: $TMP_SUDOERS" >&2
+    fi
+    rm -f "$TMP_SUDOERS"
+fi
+
 # ── Done ──
 header "Setup Complete!"
 echo "" >&2

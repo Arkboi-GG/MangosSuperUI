@@ -60,6 +60,19 @@ public sealed class CircuitTraceHost
 
     // ── settings ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Startup always resolves to Off. Shadow is a diagnostic mode whose cost
+    /// scales with the fleet, so it must be turned on deliberately by someone
+    /// who is watching — never inherited from a setting written days ago.
+    /// </summary>
+    /// <returns>
+    /// The mode to start in, and whether a persisted "shadow" was suppressed
+    /// (so the caller can warn and heal the stored value).
+    /// </returns>
+    internal static (CircuitTrace.TraceMode Mode, bool ShadowSuppressed) ResolveStartupMode(string? persistedMode)
+        => (CircuitTrace.TraceMode.Off,
+            string.Equals(persistedMode, "shadow", StringComparison.OrdinalIgnoreCase));
+
     public async Task LoadSettingsAsync()
     {
         try
@@ -69,16 +82,37 @@ public sealed class CircuitTraceHost
                 "SELECT setting_key, setting_value FROM bot_settings WHERE setting_key IN (@M, @G)",
                 new { M = KEY_MODE, G = KEY_GUIDS })).ToList();
 
+            // Shadow is NEVER restored from settings. It is a diagnostic mode with a
+            // real, fleet-scaling cost — every bot gets a ring of up to SegmentRingCap
+            // segments plus DecisionHistoryCap decision runs, and the decision history
+            // pins segments the ring has already evicted. Measured on 2026-08-29 at
+            // 692 bots: ~1.4 GiB retained, ~20% higher allocation, ~26% slower brain
+            // ticks, and an RSS that ratcheted to 8.4 GiB instead of sitting at 2.8.
+            //
+            // A sticky setting is exactly how it stayed on unnoticed across restarts.
+            // Starting Off every time means the cost is only ever paid deliberately,
+            // by someone who just turned it on and is watching.
             var mode = rows.FirstOrDefault(r => r.setting_key == KEY_MODE).setting_value;
-            CircuitTrace.Mode = string.Equals(mode, "shadow", StringComparison.OrdinalIgnoreCase)
-                ? CircuitTrace.TraceMode.Shadow
-                : CircuitTrace.TraceMode.Off;
+            var startup = ResolveStartupMode(mode);
+            CircuitTrace.Mode = startup.Mode;
+            bool shadowWasPersisted = startup.ShadowSuppressed;
 
             var guids = rows.FirstOrDefault(r => r.setting_key == KEY_GUIDS).setting_value;
             if (!string.IsNullOrWhiteSpace(guids))
                 foreach (var part in guids.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                     if (int.TryParse(part, out var g))
                         CircuitTrace.Arm(g);
+
+            if (shadowWasPersisted)
+            {
+                // Rewrite the stored value so the UI and the runtime agree; leaving
+                // "shadow" on disk would keep reporting a mode that is not active.
+                await SaveSettingAsync(KEY_MODE, "off");
+                _log.LogWarning(
+                    "[CIRCUIT] shadow mode was persisted but is NOT being restored — starting Off. "
+                    + "Shadow costs roughly 2 MiB/bot retained and ~20% allocation; "
+                    + "re-enable deliberately via POST /CircuitTrace/Mode?mode=shadow when you need a trace.");
+            }
 
             _log.LogInformation("[CIRCUIT] settings loaded: mode={Mode} armed={Count}",
                 CircuitTrace.Mode, CircuitTrace.ArmedGuids().Length);

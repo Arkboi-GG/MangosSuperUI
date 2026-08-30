@@ -106,6 +106,94 @@
                 </div>
             </div>
 
+            <!-- Descriptor-limit warning. Hidden unless the world server's soft
+                 limit is genuinely low. This is the one thing an existing install
+                 cannot discover on its own: an upgrade ships new binaries but does
+                 not re-run setup, so the warning has to come from the app. -->
+            <div class="row g-3 mb-4 d-none" id="nofileWarnRow">
+                <div class="col-12">
+                    <div class="card" style="border-left: 3px solid var(--status-warning, #e0af68);">
+                        <div class="card-body d-flex align-items-start gap-3 flex-wrap">
+                            <i class="fa-solid fa-triangle-exclamation" style="font-size: 20px; color: var(--status-warning, #e0af68);"></i>
+                            <div style="flex: 1 1 320px;">
+                                <div class="dash-value" style="font-size: 15px;" id="nofileWarnTitle">—</div>
+                                <div class="dash-label mt-1" id="nofileWarnDetail">—</div>
+                            </div>
+                            <button class="btn btn-sm btn-warning d-none" id="nofileFixBtn">Raise limit</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Row 1b: Process resource usage.
+                 CPU is shown per-core (top/htop convention) so a saturated world
+                 loop reads as ~100%, not ~3% of 32 CPUs. -->
+            <div class="row g-3 mb-4">
+                <div class="col-md-3">
+                    <div class="card">
+                        <div class="card-body d-flex align-items-center gap-3">
+                            <i class="fa-solid fa-microchip" style="font-size: 20px; color: var(--accent);"></i>
+                            <div>
+                                <div class="dash-label">World Server CPU</div>
+                                <div class="dash-value" id="mangosdCpu">—</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card">
+                        <div class="card-body d-flex align-items-center gap-3">
+                            <i class="fa-solid fa-memory" style="font-size: 20px; color: var(--accent);"></i>
+                            <div>
+                                <div class="dash-label">World Server RAM</div>
+                                <div class="dash-value" id="mangosdMem">—</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card">
+                        <div class="card-body d-flex align-items-center gap-3">
+                            <i class="fa-solid fa-microchip" style="font-size: 20px; color: var(--text-secondary);"></i>
+                            <div>
+                                <div class="dash-label">SuperUI CPU</div>
+                                <div class="dash-value" id="superuiCpu">—</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card">
+                        <div class="card-body d-flex align-items-center gap-3">
+                            <i class="fa-solid fa-memory" style="font-size: 20px; color: var(--text-secondary);"></i>
+                            <div>
+                                <div class="dash-label">SuperUI RAM</div>
+                                <div class="dash-value" id="superuiMem">—</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Row 1c: per-core CPU breakdown.
+                 The summary cards above say how many cores each side is using;
+                 this says WHICH ones and how hard. That distinction is the whole
+                 point — a serial world loop pegging one core is invisible in any
+                 figure averaged across 32. -->
+            <div class="row g-3 mb-4">
+                <div class="col-12">
+                    <div class="card">
+                        <div class="card-body">
+                            <div class="d-flex align-items-center justify-content-between mb-3 flex-wrap gap-2">
+                                <div class="dash-label" id="coreHeading">CPU CORES</div>
+                                <div class="dash-label" id="hostCoreSummary">—</div>
+                            </div>
+                            <div id="coreBreakdown"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Row 2: Live Stats -->
             <div class="row g-3 mb-4">
                 <div class="col-md-3">

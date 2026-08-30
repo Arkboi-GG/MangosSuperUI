@@ -294,7 +294,7 @@ public partial class BotsController
             await DeleteBotRowsAsync(conn, req.Guid);
         }
         _brain.EvictBot((int)req.Guid);
-        _bridge.RemoveBotState((int)req.Guid);
+        await _bridge.RemoveBotStateAsync((int)req.Guid);
 
         return Json(new { success = true });
     }
@@ -347,15 +347,25 @@ public partial class BotsController
             }
         }
 
-        using (var conn = _db.Characters())
+        var deletedGuids = new List<int>(guids.Count);
+        try
         {
+            using var conn = _db.Characters();
             await conn.OpenAsync();
             foreach (var guid in guids)
             {
                 await DeleteBotRowsAsync(conn, guid);
-                _brain.EvictBot((int)guid);
-                _bridge.RemoveBotState((int)guid);
+                deletedGuids.Add((int)guid);
             }
+        }
+        finally
+        {
+            // The DB connection has unwound before notifications, including on
+            // a partial database failure. Keep in-memory state aligned with every
+            // row that was actually deleted, then emit one bounded tombstone.
+            foreach (int guid in deletedGuids)
+                _brain.EvictBot(guid);
+            await _bridge.RemoveBotStatesAsync(deletedGuids);
         }
 
         // Best-effort: the rows are already gone, so a failure here is cosmetic
