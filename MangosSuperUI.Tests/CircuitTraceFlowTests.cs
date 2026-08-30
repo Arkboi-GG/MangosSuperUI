@@ -309,6 +309,86 @@ public sealed class CircuitTraceFlowTests
         }
     }
 
+    [Fact]
+    public void RingDepth_ReportsViewCacheDepth_AfterDrainSealedEmptiesTheFlushQueue()
+    {
+        int guid = NextGuid();
+        CircuitTrace.TraceMode priorMode = CircuitTrace.Mode;
+        try
+        {
+            CircuitTrace.Mode = CircuitTrace.TraceMode.Shadow;
+            for (int i = 0; i < 5; i++)
+            {
+                CircuitTrace.BeginTick(guid);
+                CircuitTrace.Hit(guid, "flow-test: ring depth sample");
+                CircuitTrace.EndTick(guid, 0, 0, i, 0, 0);
+            }
+
+            Assert.Equal(5, CircuitTrace.DrainSealed(guid).Count);
+            Assert.Empty(CircuitTrace.DrainSealed(guid));
+            var ring = CircuitTrace.RingDepth(guid);
+            Assert.Equal(5, ring.Depth);
+            Assert.True(ring.ToUtc >= ring.FromUtc);
+            Assert.Equal(0, ring.Dropped);
+        }
+        finally
+        {
+            CircuitTrace.Forget(guid);
+            CircuitTrace.Mode = priorMode;
+        }
+    }
+
+    [Fact]
+    public void RingDepth_CountsEvictedSegments_SoTheHoleIsVisible()
+    {
+        int guid = NextGuid();
+        CircuitTrace.TraceMode priorMode = CircuitTrace.Mode;
+        try
+        {
+            CircuitTrace.Mode = CircuitTrace.TraceMode.Shadow;
+            for (int i = 0; i < 1030; i++)
+            {
+                CircuitTrace.BeginTick(guid);
+                CircuitTrace.Hit(guid, "flow-test: eviction sample");
+                CircuitTrace.EndTick(guid, 0, 0, 0, 0, 0);
+            }
+
+            var ring = CircuitTrace.RingDepth(guid);
+            Assert.Equal(1024, ring.Depth);
+            Assert.Equal(6, ring.Dropped);
+        }
+        finally
+        {
+            CircuitTrace.Forget(guid);
+            CircuitTrace.Mode = priorMode;
+        }
+    }
+
+    [Fact]
+    public void SealAndForget_ReturnsOpenInterSegment_ThatPlainForgetWouldDestroy()
+    {
+        int guid = NextGuid();
+        CircuitTrace.TraceMode priorMode = CircuitTrace.Mode;
+        try
+        {
+            CircuitTrace.Mode = CircuitTrace.TraceMode.Shadow;
+            CircuitTrace.Hit(guid, "flow-test: retirement tail sample");
+
+            List<CircuitTrace.TickSegment> segs = CircuitTrace.SealAndForget(guid);
+
+            CircuitTrace.TickSegment only = Assert.Single(segs);
+            Assert.Equal("inter", only.Kind);
+            Assert.Single(only.Hits);
+            Assert.Empty(CircuitTrace.PeekSegments(guid));
+            Assert.Empty(CircuitTrace.SealAndForget(guid));
+        }
+        finally
+        {
+            CircuitTrace.Forget(guid);
+            CircuitTrace.Mode = priorMode;
+        }
+    }
+
     private static int NextGuid() => Interlocked.Increment(ref _nextGuid);
 
     private static void RecordSteadyTick(int guid)

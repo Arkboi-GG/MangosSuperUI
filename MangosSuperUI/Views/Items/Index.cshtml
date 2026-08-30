@@ -951,8 +951,19 @@
                 }
 
             .checkbox-grid input[type="checkbox"] {
+                width: 16px;
+                height: 16px;
                 accent-color: var(--accent);
+                flex-shrink: 0;
             }
+
+        input.bitmask-all {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--accent);
+            flex-shrink: 0;
+            cursor: pointer;
+        }
 
         .price-inputs {
             display: flex;

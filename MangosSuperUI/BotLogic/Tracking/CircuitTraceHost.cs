@@ -40,6 +40,7 @@ public sealed class CircuitTraceHost
     private Func<string, object, Task>? _sendToAll;
 
     private StreamWriter? _writer;
+    private readonly object _writerLock = new();
     private string _writerDate = "";
     private int _siteWatermark;
     private DateTime _lastWriteError = DateTime.MinValue;
@@ -90,8 +91,8 @@ public sealed class CircuitTraceHost
             // ticks, and an RSS that ratcheted to 8.4 GiB instead of sitting at 2.8.
             //
             // A sticky setting is exactly how it stayed on unnoticed across restarts.
-            // Starting Off every time means the cost is only ever paid deliberately,
-            // by someone who just turned it on and is watching.
+            // Starting fleet Shadow Off every time prevents that fleet-wide cost.
+            // Explicitly armed guids remain active: Off means armed-only, not no tracing.
             var mode = rows.FirstOrDefault(r => r.setting_key == KEY_MODE).setting_value;
             var startup = ResolveStartupMode(mode);
             CircuitTrace.Mode = startup.Mode;
@@ -109,9 +110,9 @@ public sealed class CircuitTraceHost
                 // "shadow" on disk would keep reporting a mode that is not active.
                 await SaveSettingAsync(KEY_MODE, "off");
                 _log.LogWarning(
-                    "[CIRCUIT] shadow mode was persisted but is NOT being restored — starting Off. "
+                    "[CIRCUIT] shadow mode was persisted but is NOT being restored — starting armed-only. "
                     + "Shadow costs roughly 2 MiB/bot retained and ~20% allocation; "
-                    + "re-enable deliberately via POST /CircuitTrace/Mode?mode=shadow when you need a trace.");
+                    + "explicitly armed bots continue recording; re-enable Shadow only for fleet-wide capture.");
             }
 
             _log.LogInformation("[CIRCUIT] settings loaded: mode={Mode} armed={Count}",
@@ -152,6 +153,55 @@ public sealed class CircuitTraceHost
         _log.LogInformation("[CIRCUIT] disarmed bot {Guid}", guid);
     }
 
+    private const int RetireTailSegments = 32;
+
+    /// <summary>
+    /// Flush a retiring bot's final trace tail whether or not it was armed, then
+    /// remove its ring. Eviction is destructive state loss and must be visible.
+    /// </summary>
+    public void RetireBot(int guid, string reason)
+    {
+        if (!CircuitTrace.IsRecording(guid))
+        {
+            CircuitTrace.Forget(guid);
+            return;
+        }
+
+        lock (_writerLock)
+        {
+            try
+            {
+                var segs = CircuitTrace.SealAndForget(guid);
+                int held = segs.Count;
+                if (segs.Count > RetireTailSegments)
+                    segs.RemoveRange(0, segs.Count - RetireTailSegments);
+
+                EnsureWriter();
+                EmitNewSites();
+                WriteLine(JsonSerializer.Serialize(new
+                {
+                    k = "retire",
+                    g = guid,
+                    t = DateTime.UtcNow.ToString("O"),
+                    reason,
+                    held,
+                    segs = segs.Count,
+                    armed = CircuitTrace.IsArmed(guid)
+                }));
+                FlushSegments(segs);
+                _writer?.Flush();
+            }
+            catch (Exception ex)
+            {
+                if ((DateTime.UtcNow - _lastWriteError).TotalSeconds > 60)
+                {
+                    _lastWriteError = DateTime.UtcNow;
+                    _log.LogWarning(ex, "[CIRCUIT] retire record failed for bot {Guid} (throttled log)", guid);
+                }
+            }
+        }
+    }
+
     private async Task SaveSettingAsync(string key, string value)
     {
         try
@@ -168,15 +218,27 @@ public sealed class CircuitTraceHost
         }
     }
 
-    public object Status() => new
+    public object Status()
     {
-        mode = CircuitTrace.Mode.ToString().ToLowerInvariant(),
-        armed = CircuitTrace.ArmedGuids(),
-        sites = CircuitTrace.Sites.Count,
-        ringBots = CircuitTrace.RingCount,
-        traceDir = TRACE_DIR,
-        autoDumps = DumpStatsForStatus()
-    };
+        int[] armed = CircuitTrace.ArmedGuids();
+        return new
+        {
+            mode = CircuitTrace.Mode.ToString().ToLowerInvariant(),
+            effectiveMode = CircuitTrace.Mode == CircuitTrace.TraceMode.Shadow
+                ? "fleet-shadow"
+                : armed.Length > 0 ? "armed-only" : "off",
+            armed,
+            sites = CircuitTrace.Sites.Count,
+            ringBots = CircuitTrace.RingCount,
+            traceDir = TRACE_DIR,
+            autoDumps = DumpStatsForStatus(),
+            armedRings = armed.Select(g =>
+            {
+                var r = CircuitTrace.RingDepth(g);
+                return new { guid = g, depth = r.Depth, dropped = r.Dropped, decDropped = r.DecisionsDropped };
+            }).ToArray()
+        };
+    }
 
     /// <summary>Wedge auto-dump accounting. Surfaced so the rate limit is visible:
     /// a throttle that silently eats evidence would undermine the instrument.</summary>
@@ -192,27 +254,30 @@ public sealed class CircuitTraceHost
     /// requests and every armed bot's sealed segments to the daily JSONL file.</summary>
     public void Tick()
     {
-        if (CircuitTrace.Mode == CircuitTrace.TraceMode.Off) return;
-        try
+        if (!CircuitTrace.HasActiveRecording) return;
+        lock (_writerLock)
         {
-            while (CircuitTrace.TryDequeueDump(out var dump))
+            try
             {
-                var segs = CircuitTrace.DrainSealed(dump.Guid);
-                if (segs.Count == 0) continue;
-                WriteWedgeRecord(dump, segs);
+                while (CircuitTrace.TryDequeueDump(out var dump))
+                {
+                    var segs = CircuitTrace.DrainSealed(dump.Guid);
+                    if (segs.Count == 0) continue;
+                    WriteWedgeRecord(dump, segs);
+                }
+
+                foreach (var guid in CircuitTrace.ArmedGuids())
+                    FlushSegments(CircuitTrace.DrainSealed(guid));
+
+                _writer?.Flush();
             }
-
-            foreach (var guid in CircuitTrace.ArmedGuids())
-                FlushSegments(CircuitTrace.DrainSealed(guid));
-
-            _writer?.Flush();
-        }
-        catch (Exception ex)
-        {
-            if ((DateTime.UtcNow - _lastWriteError).TotalSeconds > 60)
+            catch (Exception ex)
             {
-                _lastWriteError = DateTime.UtcNow;
-                _log.LogWarning(ex, "[CIRCUIT] flush failed (throttled log)");
+                if ((DateTime.UtcNow - _lastWriteError).TotalSeconds > 60)
+                {
+                    _lastWriteError = DateTime.UtcNow;
+                    _log.LogWarning(ex, "[CIRCUIT] flush failed (throttled log)");
+                }
             }
         }
     }
@@ -252,7 +317,8 @@ public sealed class CircuitTraceHost
         if ((DateTime.UtcNow - _fullDumpHour).TotalHours >= 1) { _fullDumpHour = DateTime.UtcNow; _fullDumpsThisHour = 0; }
         bool armed = CircuitTrace.IsArmed(dump.Guid);
         bool novel = seen == 0 && _fullDumpsThisHour < FullDumpsPerHourCap;
-        bool full = armed || novel;
+        bool attach = armed || novel;
+        var ring = CircuitTrace.RingDepth(dump.Guid);
 
         EnsureWriter();
         EmitNewSites();
@@ -263,8 +329,13 @@ public sealed class CircuitTraceHost
             t = DateTime.UtcNow.ToString("O"),
             reason = dump.Reason,
             shapeSeen = seen + 1,          // how many times this shape today
-            segs = segs.Count,             // what was in the ring
-            full,                          // whether the ring follows this line
+            segs = segs.Count,             // segments actually attached below
+            attached = attach && segs.Count > 0,
+            depth = ring.Depth,             // retained pre-wedge view horizon
+            winFrom = ring.Depth > 0 ? ring.FromUtc.ToString("O") : null,
+            winTo = ring.Depth > 0 ? ring.ToUtc.ToString("O") : null,
+            dropped = ring.Dropped,
+            decDropped = ring.DecisionsDropped,
             map = last?.MapId ?? -1,
             zone = last?.ZoneId ?? 0,
             x = last?.X ?? 0f,
@@ -272,63 +343,66 @@ public sealed class CircuitTraceHost
             path                           // the decoded-elsewhere probe path
         }));
 
-        if (!full) return;
+        if (!attach) return;
         if (novel && !armed) _fullDumpsThisHour++;
         FlushSegments(segs);
-        _log.LogWarning("[CIRCUIT] wedge dump for bot {Guid} ({Reason}): {Count} segments, shape #{Shape}",
-            dump.Guid, dump.Reason, segs.Count, seen + 1);
+        _log.LogWarning("[CIRCUIT] wedge dump for bot {Guid} ({Reason}): {Count} segments attached, ring depth {Depth}, shape #{Shape}",
+            dump.Guid, dump.Reason, segs.Count, ring.Depth, seen + 1);
     }
 
     private void FlushSegments(List<CircuitTrace.TickSegment> segs)
     {
         if (segs.Count == 0) return;
-        EnsureWriter();
-        EmitNewSites();
-        foreach (var s in segs)
+        lock (_writerLock)
         {
-            // A segment can contain hits from more than one thread (brain tick,
-            // bridge socket, chat loop all write into whichever segment is open),
-            // so each hit that did NOT come from the segment's own context carries
-            // its context id as a 4th element. Readers treat "no 4th element" as
-            // the segment's own context; two hits are control-flow adjacent only
-            // when their contexts match. Absent that, the board draws edges that
-            // never happened. Cost: nothing for the common case.
-            int primaryCtx = s.PrimaryCtx != 0
-                ? s.PrimaryCtx
-                : s.Hits.Count > 0 ? s.Hits[0].Ctx : 0;
-            var hits = new object?[s.Hits.Count][];
-            for (int i = 0; i < s.Hits.Count; i++)
+            EnsureWriter();
+            EmitNewSites();
+            foreach (var s in segs)
             {
-                var h = s.Hits[i];
-                hits[i] = h.Ctx != primaryCtx ? new object?[] { h.SiteId, h.Value, h.Note, h.Ctx }
-                        : h.Note != null ? new object?[] { h.SiteId, h.Value, h.Note }
-                        : h.Value != null ? new object?[] { h.SiteId, h.Value }
-                        : new object?[] { h.SiteId };
-            }
-            object record = s.RemoteEpoch != null
-                ? new
+                // A segment can contain hits from more than one thread (brain tick,
+                // bridge socket, chat loop all write into whichever segment is open),
+                // so each hit that did NOT come from the segment's own context carries
+                // its context id as a 4th element. Readers treat "no 4th element" as
+                // the segment's own context; two hits are control-flow adjacent only
+                // when their contexts match. Absent that, the board draws edges that
+                // never happened. Cost: nothing for the common case.
+                int primaryCtx = s.PrimaryCtx != 0
+                    ? s.PrimaryCtx
+                    : s.Hits.Count > 0 ? s.Hits[0].Ctx : 0;
+                var hits = new object?[s.Hits.Count][];
+                for (int i = 0; i < s.Hits.Count; i++)
                 {
-                    k = s.Kind, g = s.Guid,
-                    t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
-                    map = s.MapId, zone = s.ZoneId, x = s.X, y = s.Y, z = s.Z,
-                    circuitEpoch = s.RemoteEpoch,
-                    h = hits
+                    var h = s.Hits[i];
+                    hits[i] = h.Ctx != primaryCtx ? new object?[] { h.SiteId, h.Value, h.Note, h.Ctx }
+                            : h.Note != null ? new object?[] { h.SiteId, h.Value, h.Note }
+                            : h.Value != null ? new object?[] { h.SiteId, h.Value }
+                            : new object?[] { h.SiteId };
                 }
-                : s.HasPos
+                object record = s.RemoteEpoch != null
                     ? new
                     {
                         k = s.Kind, g = s.Guid,
                         t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
                         map = s.MapId, zone = s.ZoneId, x = s.X, y = s.Y, z = s.Z,
+                        circuitEpoch = s.RemoteEpoch,
                         h = hits
                     }
-                    : (object)new
-                    {
-                        k = s.Kind, g = s.Guid,
-                        t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
-                        h = hits
-                    };
-            WriteLine(JsonSerializer.Serialize(record));
+                    : s.HasPos
+                        ? new
+                        {
+                            k = s.Kind, g = s.Guid,
+                            t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
+                            map = s.MapId, zone = s.ZoneId, x = s.X, y = s.Y, z = s.Z,
+                            h = hits
+                        }
+                        : (object)new
+                        {
+                            k = s.Kind, g = s.Guid,
+                            t0 = s.StartUtc.ToString("O"), t1 = s.EndUtc.ToString("O"),
+                            h = hits
+                        };
+                WriteLine(JsonSerializer.Serialize(record));
+            }
         }
     }
 
@@ -414,7 +488,10 @@ public sealed class CircuitTraceHost
 
     private void WriteLine(string line)
     {
-        EnsureWriter();
-        _writer!.WriteLine(line);
+        lock (_writerLock)
+        {
+            EnsureWriter();
+            _writer!.WriteLine(line);
+        }
     }
 }

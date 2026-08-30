@@ -5,6 +5,7 @@ using Xunit;
 
 namespace MangosSuperUI.Tests;
 
+[Collection(CircuitTraceFlowCollection.Name)]
 public sealed class CircuitEpochTests
 {
     private static int _nextGuid = 1_500_000_000;
@@ -187,6 +188,7 @@ public sealed class CircuitEpochTests
         string first = CircuitTraceHost.CreateTraceSessionId(now, 1, Guid.NewGuid());
         string second = CircuitTraceHost.CreateTraceSessionId(now, 1, Guid.NewGuid());
         Assert.NotEqual(first, second);
+        Assert.Contains("-1-", first);
 
         string path = Path.Combine(Path.GetTempPath(), $"circuit-create-new-{Guid.NewGuid():N}.jsonl");
         try
@@ -194,7 +196,7 @@ public sealed class CircuitEpochTests
             using (StreamWriter writer = CircuitTraceHost.CreateNewTraceWriter(path))
                 writer.WriteLine("sentinel");
 
-            Assert.Throws<IOException>(() => CircuitTraceHost.CreateNewTraceWriter(path));
+            Assert.ThrowsAny<IOException>(() => CircuitTraceHost.CreateNewTraceWriter(path));
             Assert.Equal("sentinel", File.ReadAllText(path).Trim());
         }
         finally

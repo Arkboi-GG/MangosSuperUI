@@ -20,7 +20,8 @@ namespace MangosSuperUI.BotLogic.Tracking;
 // same file:line key.
 //
 // Phase 2 runtime — modes (resolves the R7/R8 tension, recorded in the doc):
-//   Off    — probes are one volatile read; nothing is recorded anywhere.
+//   Off    — unarmed bots are one volatile read + armed-set lookup; explicitly
+//            armed bots still record and flush. Off means fleet shadow is off.
 //   Shadow — EVERY bot's ring records (bounded memory, zero disk); this is what
 //            lets the wedge auto-dump (R8) produce a trace for a bot nobody had
 //            armed. Flushing still requires arming.
@@ -162,6 +163,17 @@ public static class CircuitTrace
     public static bool IsArmed(int guid) => _armedGuids.Contains(guid);
     public static int[] ArmedGuids() => _armedGuids.ToArray();
 
+    /// <summary>
+    /// Whether this bot is recording. Fleet-wide Shadow and explicit arming are
+    /// independent controls: Off disables the fleet shadow, never an explicit arm.
+    /// </summary>
+    public static bool IsRecording(int guid)
+        => _mode != (int)TraceMode.Off || _armedGuids.Contains(guid);
+
+    /// <summary>Whether the host has any rings that must be serviced.</summary>
+    public static bool HasActiveRecording
+        => _mode != (int)TraceMode.Off || _armedGuids.Count != 0;
+
     // ── call-site registry (session-scoped compact ids) ─────────────────────
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string File, int Line), ProbeSite> _sites = new();
     private static readonly List<ProbeSite> _siteList = new(2048);   // append-only, watermark reads
@@ -256,7 +268,7 @@ public static class CircuitTrace
     /// (missed EndTick — exception path) is sealed as-is so nothing is lost.</summary>
     public static void BeginTick(int guid)
     {
-        if (_mode == (int)TraceMode.Off) return;
+        if (!IsRecording(guid)) return;
         var ring = _rings.GetOrAdd(guid, static _ => new BotRing());
         lock (ring.Lock)
         {
@@ -291,7 +303,6 @@ public static class CircuitTrace
         int closingContext = _logicalContext.Value;
         try
         {
-            if (_mode == (int)TraceMode.Off) return;
             if (!_rings.TryGetValue(guid, out var ring)) return;
             lock (ring.Lock)
             {
@@ -538,8 +549,43 @@ public static class CircuitTrace
         }
     }
 
+    /// <summary>
+    /// Report the retained view horizon and all eviction accounting for one bot.
+    /// The Recent queue survives DrainSealed, so this is the honest pre-wedge
+    /// depth even when the armed flush pump has emptied the disk queue.
+    /// </summary>
+    public static (int Depth, DateTime FromUtc, DateTime ToUtc, long Dropped, long DecisionsDropped)
+        RingDepth(int guid)
+    {
+        if (!_rings.TryGetValue(guid, out var ring))
+            return (0, default, default, 0, 0);
+        lock (ring.Lock)
+        {
+            int depth = ring.Recent.Count;
+            DateTime from = depth > 0 ? ring.Recent.Peek().StartUtc : default;
+            DateTime to = depth > 0 ? ring.Recent.Last().EndUtc : default;
+            return (depth, from, to, ring.Dropped, ring.DecisionsDropped);
+        }
+    }
+
     /// <summary>Drop a bot's ring entirely (bot evicted/deleted).</summary>
     public static void Forget(int guid) => _rings.TryRemove(guid, out _);
+
+    /// <summary>
+    /// Seal any open segment, return every still-unflushed segment, and remove
+    /// the ring. Unlike Forget, this preserves a retiring bot's final evidence.
+    /// </summary>
+    public static List<TickSegment> SealAndForget(int guid)
+    {
+        if (!_rings.TryRemove(guid, out var ring)) return new List<TickSegment>();
+        lock (ring.Lock)
+        {
+            SealOpen_NoLock(ring);
+            var outList = new List<TickSegment>(ring.Sealed.Count);
+            while (ring.Sealed.Count > 0) outList.Add(ring.Sealed.Dequeue());
+            return outList;
+        }
+    }
 
     /// <summary>Bots currently holding trace rings (for status display).</summary>
     public static int RingCount => _rings.Count;
@@ -850,7 +896,7 @@ public static class CircuitTrace
         List<(int RemoteId, double? Value, string? Note)> hits, int drops)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(remoteEpoch);
-        if (_mode == (int)TraceMode.Off) return default;
+        if (!IsRecording(guid)) return default;
         var seg = new TickSegment
         {
             Seq = Interlocked.Increment(ref _segmentSeq),
@@ -934,7 +980,7 @@ public static class CircuitTrace
 
     public static void RequestDump(int guid, string reason)
     {
-        if (_mode == (int)TraceMode.Off) return;
+        if (!IsRecording(guid)) return;
 
         var now = DateTime.UtcNow;
         if (_lastDumpAt.TryGetValue(guid, out var last) && (now - last).TotalSeconds < DumpCooldownSec)
@@ -971,7 +1017,7 @@ public static class CircuitTrace
     /// asking for a specific bot is never noise.</summary>
     public static void RequestDumpForced(int guid, string reason)
     {
-        if (_mode == (int)TraceMode.Off) return;
+        if (!IsRecording(guid)) return;
         _lastDumpAt[guid] = DateTime.UtcNow;
         Interlocked.Increment(ref _dumpsAccepted);
         _dumpRequests.Enqueue((guid, reason));
@@ -987,7 +1033,7 @@ public static class CircuitTrace
     public static void Hit(int guid, string description,
         [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
     {
-        if (_mode == (int)TraceMode.Off) return;
+        if (!IsRecording(guid)) return;
         Record(guid, file, line, description, null, null);
     }
 
@@ -995,7 +1041,7 @@ public static class CircuitTrace
     public static void Hit(int guid, string description, double value,
         [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
     {
-        if (_mode == (int)TraceMode.Off) return;
+        if (!IsRecording(guid)) return;
         Record(guid, file, line, description, null, value);
     }
 
@@ -1005,7 +1051,7 @@ public static class CircuitTrace
     public static void HitNote(int guid, string description, string note,
         [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
     {
-        if (_mode == (int)TraceMode.Off) return;
+        if (!IsRecording(guid)) return;
         Record(guid, file, line, description, note, null);
     }
 
@@ -1014,7 +1060,7 @@ public static class CircuitTrace
     public static T Pass<T>(T value, int guid, string description,
         [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
     {
-        if (_mode != (int)TraceMode.Off)
+        if (IsRecording(guid))
             Record(guid, file, line, description, null, null);
         return value;
     }

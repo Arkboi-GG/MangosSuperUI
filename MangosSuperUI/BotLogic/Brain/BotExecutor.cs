@@ -5,6 +5,13 @@ using MangosSuperUI.Services;
 
 namespace MangosSuperUI.BotLogic.Brain;
 
+/// <summary>
+/// F2 (2026-08-30): separates corpse proof from level relevance without
+/// changing Stage-1 kill behavior. The pure seam makes the later policy flip
+/// independently testable after the unconfirmed population is measured.
+/// </summary>
+internal enum KillCreditKind { Progress, Unconfirmed, TrashOrGrey }
+
 // ============================================================================
 // BotExecutor — the hand of the brain (§4).
 //
@@ -281,17 +288,27 @@ public sealed class BotExecutor
     /// satisfies the outstanding WAIT — clears the WAIT and stamps generic
     /// progress. Returns true if this event resolved the pending command.
     /// </summary>
+    internal static KillCreditKind ClassifyKillCredit(bool killConfirmed, bool isRealKill)
+        => !isRealKill ? KillCreditKind.TrashOrGrey
+         : killConfirmed ? KillCreditKind.Progress
+         : KillCreditKind.Unconfirmed;
+
     public bool OnEvent(BotContext ctx, BotEvent evt)
     {
         switch (evt.EventType)
         {
             case "KILL":
                 CircuitTrace.Hit(ctx.Guid, "event: KILL received", evt.CreatureEntry);
+                KillCreditKind credit = ClassifyKillCredit(
+                    evt.KillConfirmed, _safety.IsRealKill(evt.CreatureEntry, ctx.Level));
+                if (credit == KillCreditKind.Unconfirmed)
+                    CircuitTrace.Hit(ctx.Guid, "event: unconfirmed kill, corpse never found", evt.CreatureEntry);
                 // Only a REAL kill is progress. A critter/grey kill (e.g. a chicken in a farmyard) must
                 // NOT advance LastKillUtc or reset the stall nets — counting it masked the no-kills
                 // reselect AND the no-progress breaker (the farmyard-grind-forever bug). Server-side
                 // quest kill credit is unaffected (TASK_COMPLETE is authoritative in C++).
-                if (_safety.IsRealKill(evt.CreatureEntry, ctx.Level))
+                // Stage 1 admits Unconfirmed exactly as before; only the split is new.
+                if (credit != KillCreditKind.TrashOrGrey)
                 {
                     CircuitTrace.Hit(ctx.Guid, "event: real kill, progress stamped");
                     ctx.LastKillUtc = DateTime.UtcNow;

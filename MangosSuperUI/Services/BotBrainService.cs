@@ -163,6 +163,7 @@ public class BotBrainService : BackgroundService
     /// </summary>
     public void EvictBot(int guid)
     {
+        CircuitTrace.Hit(guid, "host: bot evicted by roster delete");
         _groupManager.RemoveFromGroup(guid);
         _bots.TryRemove(guid, out _);
         _contexts.TryRemove(guid, out _);
@@ -170,7 +171,7 @@ public class BotBrainService : BackgroundService
         _disconnectedAt.TryRemove(guid, out _);
         _tracker.Remove(guid);
         _fallRecorder.Forget(guid);
-        CircuitTrace.Forget(guid);
+        _circuit.RetireBot(guid, "roster-delete");
     }
 
     /// <summary>
@@ -1143,7 +1144,7 @@ public class BotBrainService : BackgroundService
                 _disconnectedAt.TryRemove(guid, out _);
                 _tracker.Remove(guid);
                 _fallRecorder.Forget(guid);   // drop the bot's fall-ring so evicted guids don't leak memory
-                CircuitTrace.Forget(guid);    // drop the bot's circuit ring likewise
+                _circuit.RetireBot(guid, "stale-disconnect");   // flush the final trace tail, then drop the ring
                 _logger.LogInformation("BotBrain: evicted stale bot {Guid} (disconnected {Sec}s+)", guid, (int)EVICT_DISCONNECT_SEC);
             }
         }
