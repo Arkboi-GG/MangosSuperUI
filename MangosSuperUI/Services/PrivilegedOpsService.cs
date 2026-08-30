@@ -22,11 +22,23 @@ public sealed record UnitLimitsReport(
     long? ConfiguredHard,
     int RunningPid,
     long? RunningSoft,
-    long? RunningHard)
+    long? RunningHard,
+    string Source)
 {
     /// <summary>True when the running process still has less headroom than the drop-in asks for.</summary>
     public bool RestartRequired =>
         DropInPresent && DropInValue is long want && RunningSoft is long have && have < want;
+
+    /// <summary>
+    /// The limit is too low to be worth leaving alone. Every bot holds one bridge
+    /// socket in this process, so the soft limit is a hard cap on fleet size.
+    /// </summary>
+    public bool LimitTooLow =>
+        RunningSoft is long soft && soft < PrivilegedOpsService.WarnBelowNoFile;
+
+    /// <summary>Roughly how many bots fit before accept/connect starts failing.</summary>
+    public long? ApproximateBotCeiling =>
+        RunningSoft is long soft ? Math.Max(0, soft - PrivilegedOpsService.NonBridgeDescriptorAllowance) : null;
 }
 
 public sealed record PrivilegedOpResult(bool Ok, string Output, string? Error);
@@ -58,6 +70,16 @@ public sealed class PrivilegedOpsService
     /// </summary>
     public const long RecommendedNoFile = 65_535;
 
+    /// <summary>Warn below this. systemd's default of 1024 sits under it.</summary>
+    public const long WarnBelowNoFile = 8_192;
+
+    /// <summary>
+    /// Descriptors the world process holds for things that are not bot bridge
+    /// sockets — logs, DB handles, listeners, tty. Measured at ~36 on a live
+    /// 692-bot server; rounded up so the estimated ceiling errs low.
+    /// </summary>
+    public const long NonBridgeDescriptorAllowance = 64;
+
     /// <summary>
     /// Where setup installs the root-owned helper. Deliberately OUTSIDE the app
     /// directory: the service user can write its own install tree during a
@@ -81,16 +103,24 @@ public sealed class PrivilegedOpsService
 
     public bool HelperInstalled => OperatingSystem.IsLinux() && File.Exists(_helperPath);
 
-    public async Task<UnitLimitsReport> GetLimitsAsync(string unit, CancellationToken ct = default)
+    /// <param name="knownPid">
+    /// The running process, from ProcessManagerService. Supplying it lets the
+    /// report work with NO privilege at all, which matters more than it sounds:
+    /// an install that has never run the setup script has no helper, and those
+    /// are exactly the installs still capped at 1024 descriptors. Detection must
+    /// never depend on the thing being detected as missing.
+    /// </param>
+    public async Task<UnitLimitsReport> GetLimitsAsync(string unit, int? knownPid = null, CancellationToken ct = default)
     {
         if (!IsAllowedUnit(unit))
             return Unavailable(unit, $"unit not allowed: {unit}");
+
         if (!HelperInstalled)
-            return Unavailable(unit, $"privileged helper not installed at {_helperPath}");
+            return ReadFromProc(unit, knownPid, $"privileged helper not installed at {_helperPath}");
 
         PrivilegedOpResult result = await RunAsync(new[] { "show-limits", unit }, ct);
         if (!result.Ok)
-            return Unavailable(unit, result.Error);
+            return ReadFromProc(unit, knownPid, result.Error);
 
         Dictionary<string, string> kv = ParseKeyValues(result.Output);
         return new UnitLimitsReport(
@@ -103,8 +133,62 @@ public sealed class PrivilegedOpsService
             ConfiguredHard: ParseLong(kv.GetValueOrDefault("configured_LimitNOFILE")),
             RunningPid: (int)(ParseLong(kv.GetValueOrDefault("running_pid")) ?? 0),
             RunningSoft: ParseLong(kv.GetValueOrDefault("running_soft")),
-            RunningHard: ParseLong(kv.GetValueOrDefault("running_hard")));
+            RunningHard: ParseLong(kv.GetValueOrDefault("running_hard")),
+            Source: "helper");
     }
+
+    /// <summary>
+    /// Unprivileged fallback: /proc/&lt;pid&gt;/limits is world-readable, so the
+    /// limit can always be reported even when nothing can change it. The drop-in
+    /// and systemd-configured values stay unknown here — only the running
+    /// process is observable — and the running value is the one that matters.
+    /// </summary>
+    internal static UnitLimitsReport ReadFromProc(string unit, int? pid, string? helperError)
+    {
+        if (!OperatingSystem.IsLinux() || pid is not int id || id <= 0)
+            return Unavailable(unit, helperError ?? "no running process");
+
+        try
+        {
+            string path = $"/proc/{id}/limits";
+            if (!File.Exists(path))
+                return Unavailable(unit, helperError ?? $"{path} not readable");
+
+            foreach (string line in File.ReadLines(path))
+            {
+                if (!line.StartsWith("Max open files", StringComparison.Ordinal))
+                    continue;
+
+                string[] f = line["Max open files".Length..]
+                    .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (f.Length < 2)
+                    break;
+
+                return new UnitLimitsReport(
+                    Available: true,
+                    Error: helperError,
+                    Unit: unit,
+                    DropInPresent: false,
+                    DropInValue: null,
+                    ConfiguredSoft: null,
+                    ConfiguredHard: null,
+                    RunningPid: id,
+                    RunningSoft: ParseLimit(f[0]),
+                    RunningHard: ParseLimit(f[1]),
+                    Source: "proc");
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+
+        return Unavailable(unit, helperError ?? "could not read process limits");
+    }
+
+    /// <summary>/proc renders an absent limit as the word "unlimited".</summary>
+    private static long? ParseLimit(string text)
+        => string.Equals(text, "unlimited", StringComparison.OrdinalIgnoreCase)
+            ? long.MaxValue
+            : ParseLong(text);
 
     /// <summary>
     /// Writes the drop-in. Does not restart: applying a limit and bouncing a
@@ -187,5 +271,5 @@ public sealed class PrivilegedOpsService
         => long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out long v) ? v : null;
 
     private static UnitLimitsReport Unavailable(string unit, string? error)
-        => new(false, error, unit, false, null, null, null, 0, null, null);
+        => new(false, error, unit, false, null, null, null, 0, null, null, "none");
 }

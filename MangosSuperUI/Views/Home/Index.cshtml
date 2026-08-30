@@ -106,6 +106,25 @@
                 </div>
             </div>
 
+            <!-- Descriptor-limit warning. Hidden unless the world server's soft
+                 limit is genuinely low. This is the one thing an existing install
+                 cannot discover on its own: an upgrade ships new binaries but does
+                 not re-run setup, so the warning has to come from the app. -->
+            <div class="row g-3 mb-4 d-none" id="nofileWarnRow">
+                <div class="col-12">
+                    <div class="card" style="border-left: 3px solid var(--status-warning, #e0af68);">
+                        <div class="card-body d-flex align-items-start gap-3 flex-wrap">
+                            <i class="fa-solid fa-triangle-exclamation" style="font-size: 20px; color: var(--status-warning, #e0af68);"></i>
+                            <div style="flex: 1 1 320px;">
+                                <div class="dash-value" style="font-size: 15px;" id="nofileWarnTitle">—</div>
+                                <div class="dash-label mt-1" id="nofileWarnDetail">—</div>
+                            </div>
+                            <button class="btn btn-sm btn-warning d-none" id="nofileFixBtn">Raise limit</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Row 1b: Process resource usage.
                  CPU is shown per-core (top/htop convention) so a saturated world
                  loop reads as ~100%, not ~3% of 32 CPUs. -->

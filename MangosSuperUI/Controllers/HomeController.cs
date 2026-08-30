@@ -165,13 +165,35 @@ public class HomeController : Controller
     public async Task<IActionResult> UnitLimits(string unit = "mangosd")
     {
         var privileged = HttpContext.RequestServices.GetRequiredService<PrivilegedOpsService>();
-        UnitLimitsReport report = await privileged.GetLimitsAsync(unit, HttpContext.RequestAborted);
+        int? pid = unit.Contains("realmd", StringComparison.Ordinal)
+            ? _processManager.GetRealmdStatus().Pid
+            : _processManager.GetMangosdStatus().Pid;
+
+        UnitLimitsReport report = await privileged.GetLimitsAsync(unit, pid, HttpContext.RequestAborted);
+
+        // Remediation depends on whether this install has ever run setup. An
+        // upgrade drops the new binaries but does not re-run the script, so the
+        // helper is absent on every pre-existing install — and those are the
+        // ones still capped at 1024.
+        string? remediation = null;
+        if (report.LimitTooLow)
+        {
+            remediation = privileged.HelperInstalled
+                ? "Click Raise limit. Takes effect the next time the world server restarts."
+                : "Re-run the setup script to enable in-app fixes: "
+                  + "sudo bash /opt/mangossuperui/Scripts/setup-mangossuperui.sh";
+        }
+
         return Json(new
         {
             ok = report.Available,
             helperInstalled = privileged.HelperInstalled,
+            canFixInApp = privileged.HelperInstalled,
             recommended = PrivilegedOpsService.RecommendedNoFile,
             restartRequired = report.RestartRequired,
+            limitTooLow = report.LimitTooLow,
+            approximateBotCeiling = report.ApproximateBotCeiling,
+            remediation,
             report
         });
     }

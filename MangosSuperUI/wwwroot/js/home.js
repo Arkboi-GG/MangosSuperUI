@@ -129,6 +129,46 @@ $(function () {
         });
     });
 
+    // ===================== DESCRIPTOR LIMIT =====================
+    // Checked once per page load, not on the 10 s poll: the limit only changes
+    // when a unit restarts, and this reads /proc.
+    function checkNoFileLimit() {
+        $.getJSON('/Home/UnitLimits?unit=mangosd', function (d) {
+            if (!d || !d.ok || !d.limitTooLow) { $('#nofileWarnRow').addClass('d-none'); return; }
+
+            var soft = d.report && d.report.runningSoft;
+            $('#nofileWarnTitle').text(
+                'World server file-descriptor limit is ' + soft +
+                ' — caps the bot fleet near ' + d.approximateBotCeiling + ' bots');
+            $('#nofileWarnDetail').text(
+                'Every bot holds one bridge socket in the world process, so this limit is a hard '
+                + 'ceiling regardless of CPU or RAM. Recommended: ' + d.recommended + '. '
+                + (d.remediation || ''));
+
+            // Only offer the button when the privileged helper is actually
+            // installed; otherwise the fix is re-running setup, and the text says so.
+            $('#nofileFixBtn').toggleClass('d-none', !d.canFixInApp);
+            $('#nofileWarnRow').removeClass('d-none');
+        });
+    }
+
+    $(document).on('click', '#nofileFixBtn', function () {
+        var $b = $(this).prop('disabled', true).text('Applying…');
+        $.post('/Home/SetUnitNoFile', { unit: 'mangosd' }, function (r) {
+            if (r && r.ok) {
+                $b.addClass('d-none');
+                $('#nofileWarnDetail').text(r.note + ' Restart the world server to apply it.');
+            } else {
+                $b.prop('disabled', false).text('Raise limit');
+                $('#nofileWarnDetail').text('Could not apply: ' + ((r && r.error) || 'unknown error'));
+            }
+        }).fail(function () {
+            $b.prop('disabled', false).text('Raise limit');
+        });
+    });
+
+    checkNoFileLimit();
+
     // ===================== STATUS POLLING =====================
     var firstPollDone = false;
 
