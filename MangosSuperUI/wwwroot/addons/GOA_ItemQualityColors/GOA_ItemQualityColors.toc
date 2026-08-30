@@ -1,0 +1,7 @@
+## Interface: 11200
+## Title: GOA Item Quality Colors
+## Notes: Fixes item-quality colors for GOA's Reforged/Relic tiers (qualities 5-8 remapped).
+## Author: GOA
+## Version: 2.0
+
+GOA_ItemQualityColors.lua

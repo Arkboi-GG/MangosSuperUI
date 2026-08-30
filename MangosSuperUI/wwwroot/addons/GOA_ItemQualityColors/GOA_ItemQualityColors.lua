@@ -6,6 +6,13 @@
 -- Anything that reads live quality colors (GameTooltip, chat item links, etc.)
 -- calls GetItemQualityColor(quality) directly, not the cache table -- so the
 -- cache alone can't be patched, the native function itself has to be wrapped.
+--
+-- v2: v1 only overwrote the cache table and did nothing in-game. A second
+-- attempt shipped this same fix via a modified FrameXML.toc (a real client
+-- patch, no manual install needed) -- the client CRC-checks FrameXML.toc
+-- byte-for-byte and rejected it outright ("interface files are corrupt").
+-- So this has to stay an AddOns-folder addon after all, manual install and
+-- all -- FrameXML itself cannot be touched, even by one appended line.
 local GOA_OrigGetItemQualityColor = GetItemQualityColor
 local GOA_COLORS = {
     [5] = { 0.251, 0.769, 1.000, "ff40c4ff" }, -- Reforged (cyan)
