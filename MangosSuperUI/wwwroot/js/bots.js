@@ -123,6 +123,7 @@ $(function () {
     var connected = false;
     var botStates = {};       // guid → BotState (from bridge)
     var botBrains = {};       // guid → brain data (personality, decisions)
+    var deletedBotGuids = {}; // blocks late AJAX callbacks after a permanent removal
     var selectedGuid = null;
     var decisionLog = {};     // guid → array of decision entries
     var decisionCount = 0;
@@ -199,24 +200,16 @@ $(function () {
         // Session 25: AllBots now purges stale entries from previous sessions
         connection.on('AllBots', function (bots) {
             var newStates = {};
-            for (var i = 0; i < bots.length; i++) newStates[bots[i].guid] = bots[i];
+            for (var i = 0; i < bots.length; i++) {
+                delete deletedBotGuids[bots[i].guid];
+                newStates[bots[i].guid] = bots[i];
+            }
 
             // Remove brain/decision/inventory/DOM for bots no longer present
             var oldGuids = Object.keys(botStates);
             for (var i = 0; i < oldGuids.length; i++) {
                 var g = oldGuids[i];
-                if (!newStates[g]) {
-                    delete botBrains[g];
-                    delete decisionLog[g];
-                    delete inventoryCache[g];
-                    delete combatLoadoutCache[g];
-                    delete combatLoadoutLoading[g];
-                    delete combatLoadoutApplying[g];
-                    delete combatLoadoutQueueBusy[g];
-                    delete combatLoadoutRefreshPending[g];
-                    delete combatLoadoutNotices[g];
-                    $('#roster-' + g).remove();
-                }
+                if (!newStates[g]) removeDeletedBot(parseInt(g, 10) || 0);
             }
 
             botStates = newStates;
@@ -234,7 +227,8 @@ $(function () {
             }
         });
 
-        connection.on('BotConnected', function (state) {
+        function applyBotConnected(state) {
+            delete deletedBotGuids[state.guid];
             botStates[state.guid] = state;
             invalidateCombatLoadout(state.guid, selectedGuid === state.guid && detailTab === 'talents');
             invalidateSpellbook(state.guid);
@@ -243,10 +237,14 @@ $(function () {
             // its next tick; updateStats has its own 5s timer.
             rosterDirty = true;
             tlAppend(state.guid, 'Connected: ' + state.name + ' L' + state.level + ' ' + (CLASS_NAMES[state.classId] || ''), 'bt-tl-event');
-        });
+        }
+
+        // Legacy lifecycle event from pre-batching servers.
+        connection.on('BotConnected', applyBotConnected);
 
         // Session 25: BotDisconnected auto-removes after 30s if bot doesn't reconnect
-        connection.on('BotDisconnected', function (guid) {
+        function applyBotDisconnected(guid) {
+            guid = parseInt(guid, 10) || 0;
             if (botStates[guid]) {
                 botStates[guid].taskState = 'DISCONNECTED';
                 dirtyCards[guid] = true;
@@ -254,39 +252,48 @@ $(function () {
 
                 // Auto-remove after 30s if still disconnected (nuke/shutdown)
                 setTimeout(function () {
-                    if (botStates[guid] && botStates[guid].taskState === 'DISCONNECTED') {
-                        delete botStates[guid];
-                        delete botBrains[guid];
-                        delete decisionLog[guid];
-                        delete inventoryCache[guid];
-                        delete combatLoadoutCache[guid];
-                        delete combatLoadoutLoading[guid];
-                        delete combatLoadoutApplying[guid];
-                        delete combatLoadoutQueueBusy[guid];
-                        delete combatLoadoutRefreshPending[guid];
-                        delete combatLoadoutNotices[guid];
-                        delete spellbookCache[guid];
-                        delete spellbookLoading[guid];
-                        delete spellbookView[guid];
-                        $('#roster-' + guid).remove();
-                        rosterDirty = true;
-
-                        if (selectedGuid === parseInt(guid)) {
-                            selectedGuid = null;
-                            $('#detailEmpty').show();
-                            $('#detailPanel').empty();
-                            stopBrainPoll();
-                            stopLivePoll();
-                        }
-                    }
+                    if (botStates[guid] && botStates[guid].taskState === 'DISCONNECTED')
+                        removeDeletedBot(guid);
                 }, 30000);
             }
             invalidateCombatLoadout(guid, selectedGuid === parseInt(guid) && detailTab === 'talents');
+        }
+
+        // Legacy lifecycle event from pre-batching servers. The current server
+        // sends the same transition as a terminal state inside BotStateBatch.
+        connection.on('BotDisconnected', function (guid) {
+            applyBotDisconnected(guid);
         });
 
-        connection.on('BotStateUpdate', function (state) {
+        // A database-level delete is permanent, so remove it immediately in
+        // every open monitor instead of waiting for the disconnected timeout.
+        connection.on('BotRemoved', function (guid) {
+            removeDeletedBot(parseInt(guid, 10) || 0);
+        });
+
+        connection.on('BotsRemoved', function (guids) {
+            if (!Array.isArray(guids)) return;
+            for (var i = 0; i < guids.length; i++)
+                removeDeletedBot(parseInt(guids[i], 10) || 0);
+        });
+
+        function applyBotState(state) {
+            if (!state || !state.guid) return;
+            if (deletedBotGuids[state.guid] && state.taskState === 'DISCONNECTED') return;
             var previous = botStates[state.guid];
-            botStates[state.guid] = state;
+
+            if (state.taskState === 'DISCONNECTED') {
+                botStates[state.guid] = state;
+                dirtyCards[state.guid] = true;
+                if (!previous || previous.taskState !== 'DISCONNECTED')
+                    applyBotDisconnected(state.guid);
+                return;
+            }
+
+            if (!previous || previous.taskState === 'DISCONNECTED')
+                applyBotConnected(state);
+            else
+                botStates[state.guid] = state;
             // Card repaint is coalesced (see flushDirtyCards): a bot reports every
             // BRIDGE_STATE_INTERVAL, so at fleet scale this fires hundreds of times a second and
             // must not touch the DOM inline. updateStats() is NOT called here on purpose — it
@@ -301,6 +308,17 @@ $(function () {
                 if (detailTab === 'talents' && (!previous || previous.inCombat !== state.inCombat || previous.isDead !== state.isDead))
                     invalidateCombatLoadout(state.guid, true);
             }
+        }
+
+        // Accept single updates so this UI can also run against an older server.
+        // New servers coalesce state and lifecycle projections per guid and send
+        // bounded batches, reducing thousands of hub sends to a handful.
+        connection.on('BotStateUpdate', applyBotState);
+
+        connection.on('BotStateBatch', function (states) {
+            if (!Array.isArray(states)) return;
+            for (var i = 0; i < states.length; i++)
+                applyBotState(states[i]);
         });
 
         connection.on('BotEvent', function (evt) {
@@ -331,6 +349,7 @@ $(function () {
 
         // --- Brain events ---
         connection.on('BotBrainInit', function (data) {
+            if (!data || deletedBotGuids[data.guid]) return;
             botBrains[data.guid] = data;
             renderRosterCard(data.guid);
             if (selectedGuid === data.guid) renderDetail();
@@ -341,6 +360,7 @@ $(function () {
         });
 
         connection.on('BotDecision', function (data) {
+            if (!data || deletedBotGuids[data.guid]) return;
             botBrains[data.guid] = botBrains[data.guid] || {};
             botBrains[data.guid].lastDecision = data;
             decisionCount++;
@@ -425,7 +445,7 @@ $(function () {
                         var list = (all && all.bots) || [];
                         for (var i = 0; i < list.length; i++) {
                             var bs = list[i];
-                            if (!bs || !bs.personality) continue;
+                            if (!bs || !bs.personality || deletedBotGuids[bs.guid]) continue;
                             botBrains[bs.guid] = bs;
                             dirtyCards[bs.guid] = true;
                             if (selectedGuid === bs.guid) renderDetail();
@@ -1031,7 +1051,7 @@ $(function () {
 
     function invalidateCombatLoadout(guid, refetch) {
         guid = parseInt(guid);
-        if (!guid) return;
+        if (!guid || deletedBotGuids[guid]) return;
         delete combatLoadoutCache[guid];
         if (combatLoadoutLoading[guid]) {
             if (refetch) combatLoadoutRefreshPending[guid] = true;
@@ -1043,18 +1063,20 @@ $(function () {
 
     function fetchCombatLoadout(guid, force) {
         guid = parseInt(guid);
-        if (!guid || combatLoadoutLoading[guid]) return;
+        if (!guid || deletedBotGuids[guid] || combatLoadoutLoading[guid]) return;
         var cached = combatLoadoutCache[guid];
         if (!force && cached && Date.now() - cached.fetchedAt <= 15000) return;
 
         combatLoadoutLoading[guid] = true;
         $.getJSON('/Bots/CombatLoadout/' + guid)
             .done(function (data) {
+                if (deletedBotGuids[guid]) return;
                 data = normalizeCombatLoadout(data);
                 combatLoadoutCache[guid] = { data: data, fetchedAt: Date.now() };
                 if (selectedGuid === guid && detailTab === 'talents') renderCombatLoadoutData(data, botStates[guid]);
             })
             .fail(function (xhr) {
+                if (deletedBotGuids[guid]) return;
                 var body = xhr.responseJSON || {};
                 var problem = parseCombatLoadoutProblem(xhr);
                 var data = {
@@ -1068,6 +1090,10 @@ $(function () {
             })
             .always(function () {
                 delete combatLoadoutLoading[guid];
+                if (deletedBotGuids[guid]) {
+                    delete combatLoadoutRefreshPending[guid];
+                    return;
+                }
                 if (combatLoadoutRefreshPending[guid]) {
                     delete combatLoadoutRefreshPending[guid];
                     delete combatLoadoutCache[guid];
@@ -1103,24 +1129,26 @@ $(function () {
 
     function invalidateSpellbook(guid) {
         guid = parseInt(guid);
-        if (!guid) return;
+        if (!guid || deletedBotGuids[guid]) return;
         delete spellbookCache[guid];
         if (selectedGuid === guid && detailTab === 'spellbook') fetchSpellbook(guid, true);
     }
 
     function fetchSpellbook(guid, force) {
         guid = parseInt(guid);
-        if (!guid || spellbookLoading[guid]) return;
+        if (!guid || deletedBotGuids[guid] || spellbookLoading[guid]) return;
         var cached = spellbookCache[guid];
         if (!force && cached && Date.now() - cached.fetchedAt <= 60000) return;
 
         spellbookLoading[guid] = true;
         $.getJSON('/Bots/Spellbook/' + guid)
             .done(function (data) {
+                if (deletedBotGuids[guid]) return;
                 spellbookCache[guid] = { data: data, fetchedAt: Date.now() };
                 if (selectedGuid === guid && detailTab === 'spellbook') renderSpellbookData(data);
             })
             .fail(function (xhr) {
+                if (deletedBotGuids[guid]) return;
                 var body = xhr.responseJSON || {};
                 var data = {
                     guid: guid,
@@ -1796,6 +1824,7 @@ $(function () {
     });
 
     function postCombatLoadout(guid, payload, successText) {
+        if (deletedBotGuids[guid]) return;
         var shouldRefresh = false;
         combatLoadoutApplying[guid] = true;
         delete combatLoadoutNotices[guid];
@@ -1807,6 +1836,7 @@ $(function () {
             contentType: 'application/json',
             data: JSON.stringify(payload)
         }).done(function (response) {
+            if (deletedBotGuids[guid]) return;
             if (response && response.success === false) {
                 combatLoadoutNotices[guid] = { kind: 'error', title: 'Build rejected', message: response.error || response.message || 'The build was not applied.' };
                 showToast(combatLoadoutNotices[guid].message, true);
@@ -1816,12 +1846,14 @@ $(function () {
             delete combatLoadoutNotices[guid];
             showToast((response && (response.message || response.status)) || successText);
         }).fail(function (xhr) {
+            if (deletedBotGuids[guid]) return;
             var problem = parseCombatLoadoutProblem(xhr);
             combatLoadoutNotices[guid] = { kind: problem.kind || 'error', title: problem.title, message: problem.message, code: problem.code };
             showToast(problem.message, true);
             shouldRefresh = problem.refresh;
         }).always(function () {
             delete combatLoadoutApplying[guid];
+            if (deletedBotGuids[guid]) return;
             if (shouldRefresh) invalidateSpellbook(guid);
             if (shouldRefresh) invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
             else if (selectedGuid === guid && detailTab === 'talents' && combatLoadoutCache[guid])
@@ -1830,6 +1862,7 @@ $(function () {
     }
 
     function postCombatLoadoutQueue(guid, payload, successText) {
+        if (deletedBotGuids[guid]) return;
         var shouldRefresh = false;
         combatLoadoutQueueBusy[guid] = 'saving';
         delete combatLoadoutNotices[guid];
@@ -1841,6 +1874,7 @@ $(function () {
             contentType: 'application/json',
             data: JSON.stringify(payload)
         }).done(function (response) {
+            if (deletedBotGuids[guid]) return;
             if (response && response.success === false) {
                 combatLoadoutNotices[guid] = { kind: 'error', title: 'Queue rejected', message: response.error || response.message || 'The build was not queued.' };
                 showToast(combatLoadoutNotices[guid].message, true);
@@ -1855,12 +1889,14 @@ $(function () {
             };
             showToast(combatLoadoutNotices[guid].message);
         }).fail(function (xhr) {
+            if (deletedBotGuids[guid]) return;
             var problem = parseCombatLoadoutProblem(xhr);
             combatLoadoutNotices[guid] = { kind: 'error', title: problem.title, message: problem.message, code: problem.code };
             showToast(problem.message, true);
             shouldRefresh = problem.refresh;
         }).always(function () {
             delete combatLoadoutQueueBusy[guid];
+            if (deletedBotGuids[guid]) return;
             if (shouldRefresh) invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
             else if (selectedGuid === guid && detailTab === 'talents' && combatLoadoutCache[guid])
                 refreshBuildWorkshopState(combatLoadoutCache[guid].data);
@@ -1868,6 +1904,7 @@ $(function () {
     }
 
     function deleteCombatLoadoutQueue(guid) {
+        if (deletedBotGuids[guid]) return;
         var shouldRefresh = false;
         combatLoadoutQueueBusy[guid] = 'cancelling';
         delete combatLoadoutNotices[guid];
@@ -1880,6 +1917,7 @@ $(function () {
                     cached && cached.data && cached.data.queuedChange ? cached.data.queuedChange.status || '' : ''),
             method: 'DELETE'
         }).done(function (response) {
+            if (deletedBotGuids[guid]) return;
             if (response && response.success === false) {
                 combatLoadoutNotices[guid] = { kind: 'error', title: 'Cancellation rejected', message: response.error || response.message || 'The queued build was not cancelled.' };
                 showToast(combatLoadoutNotices[guid].message, true);
@@ -1894,12 +1932,14 @@ $(function () {
             };
             showToast(combatLoadoutNotices[guid].message);
         }).fail(function (xhr) {
+            if (deletedBotGuids[guid]) return;
             var problem = parseCombatLoadoutProblem(xhr);
             combatLoadoutNotices[guid] = { kind: 'error', title: problem.title, message: problem.message, code: problem.code };
             showToast(problem.message, true);
             shouldRefresh = problem.refresh;
         }).always(function () {
             delete combatLoadoutQueueBusy[guid];
+            if (deletedBotGuids[guid]) return;
             if (shouldRefresh) invalidateCombatLoadout(guid, selectedGuid === guid && detailTab === 'talents');
             else if (selectedGuid === guid && detailTab === 'talents' && combatLoadoutCache[guid])
                 refreshBuildWorkshopState(combatLoadoutCache[guid].data);
@@ -2882,15 +2922,18 @@ $(function () {
 
         $panel.html('<div style="text-align:center;padding:12px;color:var(--text-muted);"><i class="fa-solid fa-spinner fa-spin"></i> Loading inventory...</div>').show();
 
-        $.getJSON('/Bots/Inventory', { guid: selectedGuid }, function (data) {
+        var inventoryGuid = selectedGuid;
+        $.getJSON('/Bots/Inventory', { guid: inventoryGuid }, function (data) {
+            if (deletedBotGuids[inventoryGuid]) return;
             if (data.error) {
                 $panel.html('<div style="color:#f7768e;font-size:12px;">Error: ' + esc(data.error) + '</div>');
                 return;
             }
-            inventoryCache[selectedGuid] = data;
-            renderInventoryPanel(data);
+            inventoryCache[inventoryGuid] = data;
+            if (selectedGuid === inventoryGuid) renderInventoryPanel(data);
         }).fail(function () {
-            $panel.html('<div style="color:#f7768e;font-size:12px;">Failed to load inventory</div>');
+            if (!deletedBotGuids[inventoryGuid])
+                $panel.html('<div style="color:#f7768e;font-size:12px;">Failed to load inventory</div>');
         });
     });
 
@@ -3094,7 +3137,7 @@ $(function () {
         brainPollTimer = setInterval(function () {
             if (!selectedGuid || !connected) return;
             $.getJSON('/Bots/BrainState/' + selectedGuid, function (data) {
-                if (data && data.guid) {
+                if (data && data.guid && !deletedBotGuids[data.guid]) {
                     var existing = botBrains[data.guid] || {};
                     var prevDecision = existing.lastDecision;
                     botBrains[data.guid] = data;
@@ -3173,7 +3216,7 @@ $(function () {
                 var list = (all && all.bots) || [];
                 for (var i = 0; i < list.length; i++) {
                     var data = list[i];
-                    if (!data || !data.guid) continue;
+                    if (!data || !data.guid || deletedBotGuids[data.guid]) continue;
                     var existing = botBrains[data.guid] || {};
                     var prevDecision = existing.lastDecision;
                     botBrains[data.guid] = data;
@@ -3366,12 +3409,12 @@ $(function () {
 
         if (!botBrains[guid]) {
             $.getJSON('/Bots/BrainState/' + guid, function (data) {
-                if (data && data.guid) {
+                if (data && data.guid && !deletedBotGuids[data.guid]) {
                     botBrains[guid] = data;
                 }
-                renderDetail();
+                if (!deletedBotGuids[guid]) renderDetail();
             }).fail(function () {
-                renderDetail();
+                if (!deletedBotGuids[guid]) renderDetail();
             });
         } else {
             renderDetail();
@@ -3610,10 +3653,22 @@ $(function () {
     // Drops a deleted bot from every client-side cache/DOM row, mirroring the
     // BotDisconnected 30s auto-remove cleanup above.
     function removeDeletedBot(guid) {
+        guid = parseInt(guid, 10) || 0;
+        if (!guid) return;
+        deletedBotGuids[guid] = true;
         delete botStates[guid];
         delete botBrains[guid];
         delete decisionLog[guid];
         delete inventoryCache[guid];
+        delete combatLoadoutCache[guid];
+        delete combatLoadoutLoading[guid];
+        delete combatLoadoutApplying[guid];
+        delete combatLoadoutQueueBusy[guid];
+        delete combatLoadoutRefreshPending[guid];
+        delete combatLoadoutNotices[guid];
+        delete spellbookCache[guid];
+        delete spellbookLoading[guid];
+        delete spellbookView[guid];
         $('#roster-' + guid).remove();
         rosterDirty = true;
 
@@ -5734,10 +5789,14 @@ $(function () {
         if (inventoryCache[guid]) { $b.html(inventoryHtml(inventoryCache[guid])); return; }
         $b.html('<div class="bq-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading inventory...</div>');
         $.getJSON('/Bots/Inventory', { guid: guid }, function (data) {
+            if (deletedBotGuids[guid]) return;
             if (!data || data.error) { $b.html('<div class="bq-loading">' + esc((data && data.error) || 'no data') + '</div>'); return; }
             inventoryCache[guid] = data;
             $b.html(inventoryHtml(data));
-        }).fail(function () { $b.html('<div class="bq-loading">Failed to load inventory</div>'); });
+        }).fail(function () {
+            if (!deletedBotGuids[guid])
+                $b.html('<div class="bq-loading">Failed to load inventory</div>');
+        });
     }
 
     function renderBrainTab(guid) {

@@ -19,6 +19,8 @@ public class HomeController : Controller
     private readonly IOptionsMonitor<VmangosSettings> _vmangosSettings;
     private readonly IOptionsMonitor<RemoteAccessSettings> _raSettings;
     private readonly MpqReaderService _mpq;
+    private readonly ProcessResourceSampler _resources;
+    private readonly ProcessCoreSampler _cores;
     private readonly ILogger<HomeController> _logger;
 
     public HomeController(
@@ -32,8 +34,12 @@ public class HomeController : Controller
         IOptionsMonitor<VmangosSettings> vmangosSettings,
         IOptionsMonitor<RemoteAccessSettings> raSettings,
         MpqReaderService mpq,
+        ProcessResourceSampler resources,
+        ProcessCoreSampler cores,
         ILogger<HomeController> logger)
     {
+        _resources = resources;
+        _cores = cores;
         _processManager = processManager;
         _raService = raService;
         _db = db;
@@ -57,6 +63,21 @@ public class HomeController : Controller
     {
         var mangosd = _processManager.GetMangosdStatus();
         var realmd = _processManager.GetRealmdStatus();
+
+        // CPU is a rate, so the first poll after a page load reports null and the
+        // second onward reports a real figure. Sampled here, on the same 10 s poll
+        // the rest of the dashboard uses, rather than on a background timer — the
+        // delta window then matches what the user is actually looking at.
+        var mangosdResources = _resources.Sample("mangosd", mangosd.Pid);
+        var realmdResources = _resources.Sample("realmd", realmd.Pid);
+        var superuiResources = _resources.SampleCurrentProcess("superui");
+
+        // Per-core attribution. An aggregate hides the shape that matters: the
+        // world loop lives on one or two cores, so "0.44 of 32" reads as idle
+        // even when a map thread is close to saturating its core.
+        var mangosdCores = _cores.Sample("mangosd", mangosd.Pid);
+        var superuiCores = _cores.Sample("superui", Environment.ProcessId);
+        var hostCores = _cores.SampleHost();
 
         // Parse .server info from RA for live data
         string serverInfoRaw = null;
@@ -110,6 +131,18 @@ public class HomeController : Controller
         {
             mangosd,
             realmd,
+            resources = new
+            {
+                mangosd = mangosdResources,
+                realmd = realmdResources,
+                superui = superuiResources
+            },
+            cores = new
+            {
+                mangosd = mangosdCores,
+                superui = superuiCores,
+                host = hostCores
+            },
             raConnected = _raService.IsConnected,
             playersOnline,
             maxOnline,
@@ -120,6 +153,65 @@ public class HomeController : Controller
             totalCharacters,
             gmAccounts,
             bannedAccounts
+        });
+    }
+
+    /// <summary>
+    /// Reports the descriptor limit for a world/auth unit: what the drop-in asks
+    /// for, what systemd is configured to give, and — the only one that counts —
+    /// what the running process actually has.
+    /// </summary>
+    [HttpGet]
+    public async Task<IActionResult> UnitLimits(string unit = "mangosd")
+    {
+        var privileged = HttpContext.RequestServices.GetRequiredService<PrivilegedOpsService>();
+        UnitLimitsReport report = await privileged.GetLimitsAsync(unit, HttpContext.RequestAborted);
+        return Json(new
+        {
+            ok = report.Available,
+            helperInstalled = privileged.HelperInstalled,
+            recommended = PrivilegedOpsService.RecommendedNoFile,
+            restartRequired = report.RestartRequired,
+            report
+        });
+    }
+
+    /// <summary>
+    /// Writes the systemd drop-in that raises a unit's descriptor limit.
+    ///
+    /// Deliberately does not restart the unit: one bridge socket per bot means
+    /// this governs how large the fleet can grow, and bouncing a live world
+    /// server is the operator's call, through the existing restart control.
+    /// </summary>
+    [HttpPost]
+    public async Task<IActionResult> SetUnitNoFile(string unit = "mangosd", long value = 0)
+    {
+        var privileged = HttpContext.RequestServices.GetRequiredService<PrivilegedOpsService>();
+        if (value <= 0)
+            value = PrivilegedOpsService.RecommendedNoFile;
+
+        PrivilegedOpResult result = await privileged.SetNoFileAsync(unit, value, HttpContext.RequestAborted);
+        if (result.Ok)
+        {
+            // A privileged write to /etc belongs in the audit trail, not just the log.
+            await _audit.LogAsync(new AuditEntry
+            {
+                Category = "system",
+                Action = "set-nofile",
+                TargetType = "systemd-unit",
+                TargetName = unit,
+                StateAfter = $"LimitNOFILE={value}",
+                OperatorIp = HttpContext.Connection.RemoteIpAddress?.ToString()
+            });
+            _logger.LogInformation("LimitNOFILE for {Unit} set to {Value}", unit, value);
+        }
+
+        return Json(new
+        {
+            ok = result.Ok,
+            error = result.Error,
+            output = result.Output,
+            note = result.Ok ? $"Applies the next time {unit} starts." : null
         });
     }
 

@@ -42,6 +42,15 @@ builder.Services.AddSingleton<ConnectionFactory>();
 builder.Services.AddSingleton<DbInitializationService>();
 builder.Services.AddSingleton<RaService>();
 builder.Services.AddSingleton<ProcessManagerService>();
+// Every privileged operation funnels through one root-owned helper script, so
+// the trust boundary is a single reviewable file rather than scattered sudo calls.
+builder.Services.AddSingleton<PrivilegedOpsService>();
+// Singleton, not scoped: CPU% is a delta between polls, so the previous
+// CPU-time reading has to outlive the request that took it.
+builder.Services.AddSingleton<ProcessResourceSampler>();
+// Also a singleton, and for the same reason: per-core attribution is a delta
+// over per-thread CPU counters, so the previous reading must survive the request.
+builder.Services.AddSingleton<ProcessCoreSampler>();
 builder.Services.AddSingleton<StateCaptureService>();
 builder.Services.AddHttpContextAccessor();            // lets AuditService stamp the caller's ip on rows written deep in a service
 builder.Services.AddSingleton<AuditService>();
@@ -56,6 +65,11 @@ builder.Services.AddSingleton<BotTalentVisibilityService>();
 builder.Services.AddSingleton<HeightMapService>();
 builder.Services.AddSingleton<BotBridgeService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BotBridgeService>());
+// Written by BotBrainService, read by RuntimeScaleDiagnosticsService — a shared
+// singleton so the diagnostics service never has to depend on the brain.
+builder.Services.AddSingleton<BrainLoopMetrics>();
+builder.Services.AddSingleton<RuntimeScaleDiagnosticsService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<RuntimeScaleDiagnosticsService>());
 builder.Services.AddSingleton<BotSpawnService>();   // Add Bots batches: background RA loop + SpawnProgress over the bridge hub
 builder.Services.AddSingleton<OllamaChatService>();
 builder.Services.AddSingleton<SourceIndexerService>();

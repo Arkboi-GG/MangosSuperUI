@@ -340,4 +340,63 @@ public partial class BotsController
             stderr = r.Stderr
         });
     }
+
+    /// <summary>
+    /// Bounded in-process memory/GC/bridge history for scale investigations.
+    /// This endpoint is observational: it never forces a GC or writes a dump.
+    /// </summary>
+    [HttpGet]
+    public IActionResult ScaleRuntime(int history = 60)
+    {
+        var diagnostics = HttpContext.RequestServices
+            .GetRequiredService<Services.RuntimeScaleDiagnosticsService>();
+        return Json(new
+        {
+            ok = true,
+            report = diagnostics.GetReport(history)
+        });
+    }
+
+    /// <summary>
+    /// Forces one full compacting collection and reports LIVE managed bytes and
+    /// live bytes per connected bot.
+    ///
+    /// Unlike <see cref="ScaleRuntime"/> this is NOT observational: it stalls
+    /// every managed thread for the duration of the collection, which on a
+    /// multi-GiB heap can be seconds. It is rate-limited to one probe per five
+    /// minutes; a throttled call returns the previous measurement instead of an
+    /// error. Run it at two different bot counts — the slope between them is
+    /// what projects a fleet target, which no single absolute reading can.
+    /// </summary>
+    [HttpPost]
+    public IActionResult ScaleLiveHeap()
+    {
+        var diagnostics = HttpContext.RequestServices
+            .GetRequiredService<Services.RuntimeScaleDiagnosticsService>();
+        var result = diagnostics.MeasureLiveHeap();
+        return Json(new
+        {
+            ok = true,
+            measured = result.Measured,
+            throttleReason = result.ThrottleReason,
+            retryAfterSeconds = result.RetryAfterSeconds,
+            measurement = result.Measurement
+        });
+    }
+
+    /// <summary>
+    /// The bounded per-bot fleet table, on demand. The periodic Info log now
+    /// carries rollups only, so this is where the detail rows live.
+    /// </summary>
+    [HttpGet]
+    public IActionResult FleetReportDetail(int maxRows = MangosSuperUI.BotLogic.Brain.FleetReport.MaxRows)
+    {
+        int rows = Math.Clamp(maxRows, 1, 2000);
+        return Json(new
+        {
+            ok = true,
+            maxRows = rows,
+            report = _brain.GetFleetReport(rows)
+        });
+    }
 }

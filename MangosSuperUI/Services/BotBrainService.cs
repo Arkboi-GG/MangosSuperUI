@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using Dapper;
 using MangosSuperUI.BotLogic.Core;
 using MangosSuperUI.BotLogic.Brain;
@@ -29,7 +29,7 @@ namespace MangosSuperUI.Services;
 ///   GroupManager + group endpoints, BotIdentity roster (AllBots), personality
 ///   load/roll/persist, GetBotBrainSummary, BrainEnabled. (The old flight
 ///   recorder + story rider were removed 2026-08-26 — the circuit board
-///   [CIRCUIT_BOARD.md, CircuitTrace/CircuitTraceHost] replaces both.)
+///   [docs/CIRCUIT_BOARD.md, CircuitTrace/CircuitTraceHost] replaces both.)
 /// Shed: DecisionEngine + all domains as the driver, the grouping batch/errand
 ///   fan-out, known-good destinations, in-flight MOVE_TO recovery, fleet
 ///   diagnostics, and the flight recorder.
@@ -84,8 +84,10 @@ public class BotBrainService : BackgroundService
         ZoneSafetyMap safety,
         CreatureSpawnLoader spawns,
         ZoneDataLoader zoneData,
-        BotFallRecorder fallRecorder)
+        BotFallRecorder fallRecorder,
+        BrainLoopMetrics loopMetrics)
     {
+        _loopMetrics = loopMetrics;
         _bridge = bridge;
         _db = db;
         _tracker = tracker;
@@ -102,7 +104,11 @@ public class BotBrainService : BackgroundService
         _circuit = new CircuitTraceHost(_db, loggerFactory.CreateLogger<CircuitTraceHost>());
     }
 
-    // Circuit-board trace host (CIRCUIT_BOARD.md Phase 2): settings + JSONL flush for
+    // Shared with RuntimeScaleDiagnosticsService. Unlike GroupManager/CircuitTraceHost
+    // this cannot be constructed inline: the point is that another service reads it.
+    private readonly BrainLoopMetrics _loopMetrics;
+
+    // Circuit-board trace host (docs/CIRCUIT_BOARD.md Phase 2): settings + JSONL flush for
     // the CircuitTrace probes. Created here like GroupManager (no DI churn); the
     // controller reaches it through this property.
     private readonly CircuitTraceHost _circuit;
@@ -206,7 +212,13 @@ public class BotBrainService : BackgroundService
     /// The one-shot fleet picture (§3.6): rollups + one bounded line per bot.
     /// Exposed for a future endpoint; also logged on an interval (see the loop).
     /// </summary>
-    public string GetFleetReport() => FleetReport.Render(_contexts.Values.ToList());
+    /// <summary>Rollups plus the bounded row table. On-demand only — the periodic
+    /// log emits <see cref="GetFleetSummary"/> instead.</summary>
+    public string GetFleetReport(int maxRows = FleetReport.MaxRows)
+        => FleetReport.RenderDetailed(_contexts.Values.ToList(), maxRows);
+
+    /// <summary>Rollups only — cheap enough to log on an interval at any fleet size.</summary>
+    public string GetFleetSummary() => FleetReport.RenderSummary(_contexts.Values.ToList());
 
     // ==================== Live spine state (UI: the "Live" tab) ====================
     // The structured, per-bot projection of BotContext — the same picture FleetReport
@@ -1012,13 +1024,14 @@ public class BotBrainService : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            long iterationStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 // 1. Mirror the bridge roster into BotIdentity + BotContext.
-                await SyncBotRosterAsync();
+                await BrainLoopMetrics.TimeAsync(_loopMetrics.RecordRosterSync, SyncBotRosterAsync);
 
                 // 2. Drive the spine (sense always; drive+supervise when enabled).
-                await RunBrainTicksAsync();
+                await BrainLoopMetrics.TimeAsync(_loopMetrics.RecordBrainTicks, RunBrainTicksAsync);
 
                 // 2b. Circuit-board pump: flush armed bots' sealed trace segments +
                 //     any wedge auto-dump requests to the daily JSONL.
@@ -1030,13 +1043,32 @@ public class BotBrainService : BackgroundService
                 {   // cb:fold fleet-report logging cadence
 
                     _lastFleetLog = DateTime.UtcNow;
-                    _logger.LogInformation("BotBrain fleet:\n{Report}", GetFleetReport());
+
+                    // IsEnabled first: the report argument is evaluated before the
+                    // call, so without this guard the whole string was built every
+                    // 30 s even when Info was filtered out. Summary only — the row
+                    // table is on demand via GetFleetReport().
+                    if (_logger.IsEnabled(LogLevel.Information))
+                    {
+                        long reportStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                        string summary = GetFleetSummary();
+                        _loopMetrics.RecordFleetReport(
+                            System.Diagnostics.Stopwatch.GetElapsedTime(reportStart));
+                        _logger.LogInformation("BotBrain fleet:\n{Report}", summary);
+                    }
                 }
+
+                _loopMetrics.RecordTrackedContexts(_contexts.Count);
             }
             catch (Exception ex)
             {
                 CircuitTrace.Hit(0, "host: main loop error");
                 _logger.LogError(ex, "BotBrain: main loop error");
+            }
+            finally
+            {
+                _loopMetrics.RecordLoopIteration(
+                    System.Diagnostics.Stopwatch.GetElapsedTime(iterationStart));
             }
 
             await Task.Delay(250, stoppingToken);

@@ -59,21 +59,34 @@ Desktop.ini
 # ----- Owner-local tooling + planning docs (NOT for the public repo) -----
 # The root tools/ tree (port research, worldstate-clinical-check, etc.) plus the internal planning
 # docs are owner-local — they contain homeserver IPs, SSH key names, DB details, and internal paths,
-# so they are transferred privately, never published. Root-anchored so they only match the repo root.
+# so they are transferred privately, never published.
+#
+# Each rule is anchored to the file's actual location. The study docs now live under /docs/, and
+# these paths must move with them: an anchored rule silently stops matching when the file moves,
+# which would republish an owner-local document as an ordinary untracked file.
 /tools/
 /CMANGOS_PORT.md
 /WEAPON_GEN.md
-/WORLD_STATE.md
-/CIRCUIT_BOARD.md
-/CIRCUIT_BOARD_CL_DISC1.md
-/ADDENDUM_FINDINGS_WRAP_UP.md
+/docs/WORLD_STATE.md
+/docs/CIRCUIT_BOARD.md
+/docs/CIRCUIT_BOARD_CL_DISC1.md
+/docs/ADDENDUM_FINDINGS_WRAP_UP.md
 
 # ----- Weapon Forge: docs + sample art only (code IS committed) -----
 /WEAPON_FORGE.md
 /MangosSuperUI/wwwroot/weapon-forge/
 /.claude
-/SUPERUI_CORE_CONTENT_REORGANIZATION.md
+/docs/SUPERUI_CORE_CONTENT_REORGANIZATION.md
 /CMANGOS_PORT.md
 /WEAPON_GEN.md
 /ARMOR_FORGE.md
 /MangosSuperUI.Tests/Properties/PublishProfiles/FolderProfile.pubxml
+
+# ----- Local rollback bundles -----
+# backups/<change>/{original,patched}/ are point-in-time copies made before a
+# risky edit. They are pure duplicates of files git already versions — "original"
+# is the committed state and "patched" is the working tree — so committing them
+# doubles the diff for no recoverable information. One bundle was 23,503 lines,
+# roughly 87% of everything untracked in the repo.
+# They stay on disk for local restore; git is the real history.
+/backups/

@@ -1,10 +1,10 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using MangosSuperUI.BotLogic.Core;
 
 namespace MangosSuperUI.BotLogic.Tracking;
 
 // ════════════════════════════════════════════════════════════════════════════
-// CircuitTrace — the C# probe facade of the circuit board (CIRCUIT_BOARD.md).
+// CircuitTrace — the C# probe facade of the circuit board (docs/CIRCUIT_BOARD.md).
 //
 // A probe is one line dropped into a branch arm of the bot's decision logic:
 //
@@ -543,6 +543,141 @@ public static class CircuitTrace
 
     /// <summary>Bots currently holding trace rings (for status display).</summary>
     public static int RingCount => _rings.Count;
+
+    /// <summary>
+    /// What the shadow rings are actually retaining right now — the scale
+    /// report needs this because Shadow mode is per-bot retention that grows
+    /// with the fleet and was previously invisible to every memory metric.
+    /// Each ring can hold SegmentRingCap sealed segments plus DecisionHistoryCap
+    /// decision runs, so at a few hundred bots this is a first-order term in the
+    /// managed heap, not a rounding error.
+    /// </summary>
+    /// <param name="DecisionRetainedSegments">
+    /// Segments held ONLY by <c>DecisionRun.Representative</c>, i.e. already
+    /// evicted from the segment ring but still reachable through the decision
+    /// history. Missing these is what made the first version of this metric
+    /// understate circuit-trace retention by roughly 8x: the ring cap bounds
+    /// SegmentRingCap segments per bot, but the decision history can pin up to
+    /// DecisionHistoryCap more on top of it.
+    /// </param>
+    /// <param name="EstimatedRetainedBytes">
+    /// Estimated, not measured. Per-object sizes are order-of-magnitude
+    /// constants for 64-bit; the two things that actually vary — hits per
+    /// segment and decision path length — are counted exactly on a bounded
+    /// sample of rings and extrapolated. Walking every ring in full would hold
+    /// each ring lock against the live probe path for no diagnostic gain.
+    /// Read it as "hundreds of MiB or tens", never as an exact figure.
+    /// </param>
+    public readonly record struct RetentionSnapshot(
+        string Mode,
+        int RingCount,
+        long SealedSegments,
+        long RecentSegments,
+        long DecisionRuns,
+        long DecisionRetainedSegments,
+        long DroppedSegments,
+        int SampledRings,
+        double AverageHitsPerSampledSegment,
+        double AveragePathLengthPerSampledDecision,
+        long EstimatedRetainedBytes);
+
+    // Order-of-magnitude 64-bit object sizes. See EstimatedRetainedBytes.
+    /// <summary>One ProbeHit in a List slot.</summary>
+    private const int ApproximateHitBytes = 48;
+    /// <summary>TickSegment object plus its List header and array header, excluding hits.</summary>
+    private const int ApproximateSegmentBytes = 224;
+    /// <summary>DecisionRun object plus its LinkedList node.</summary>
+    private const int ApproximateDecisionBytes = 112;
+    /// <summary>Header of the DecisionRun Path array, excluding its elements.</summary>
+    private const int ApproximateArrayHeaderBytes = 24;
+
+    /// <summary>Rings sampled for the per-segment and per-decision averages.</summary>
+    internal const int RetentionSampleRings = 8;
+
+    public static RetentionSnapshot GetRetentionSnapshot()
+    {
+        string mode = Mode.ToString();
+        long sealedSegments = 0, recentSegments = 0, decisionRuns = 0, dropped = 0;
+        int sampledRings = 0;
+        long sampledSegments = 0, sampledHits = 0;
+        long sampledDecisions = 0, sampledDecisionOnlySegments = 0, sampledPathLength = 0;
+
+        foreach (var entry in _rings)
+        {
+            var ring = entry.Value;
+            bool sampleThisRing = sampledRings < RetentionSampleRings;
+            lock (ring.Lock)
+            {
+                sealedSegments += ring.Sealed.Count;
+                recentSegments += ring.Recent.Count;
+                decisionRuns += ring.Decisions.Count;
+                dropped += ring.Dropped;
+
+                if (!sampleThisRing)
+                    continue;
+
+                sampledRings++;
+
+                // Reference identity: TickSegment is a class, so the default
+                // comparer is what we want — two distinct segments must never
+                // collapse together just because their fields match.
+                var live = new HashSet<TickSegment>(ring.Recent.Count);
+                foreach (var segment in ring.Recent)
+                {
+                    live.Add(segment);
+                    sampledSegments++;
+                    sampledHits += segment.Hits.Count;
+                }
+
+                foreach (var decision in ring.Decisions)
+                {
+                    sampledDecisions++;
+                    sampledPathLength += decision.Path.Length;
+
+                    // Only representatives the ring has already evicted add new
+                    // bytes; the rest are the same objects counted above.
+                    if (live.Add(decision.Representative))
+                    {
+                        sampledDecisionOnlySegments++;
+                        sampledSegments++;
+                        sampledHits += decision.Representative.Hits.Count;
+                    }
+                }
+            }
+        }
+
+        double averageHits = sampledSegments > 0 ? sampledHits / (double)sampledSegments : 0;
+        double averagePath = sampledDecisions > 0 ? sampledPathLength / (double)sampledDecisions : 0;
+
+        // Extrapolate the sampled "how many decisions pin an evicted segment"
+        // ratio across the fleet. Rings fill at the same cadence, so a bounded
+        // sample tracks the whole population closely.
+        double decisionOnlyRatio = sampledDecisions > 0
+            ? sampledDecisionOnlySegments / (double)sampledDecisions
+            : 0;
+        long decisionRetainedSegments = (long)(decisionRuns * decisionOnlyRatio);
+
+        // Recent holds the same objects as Sealed, so segments are counted once
+        // from Recent, plus the evicted ones the decision history still pins.
+        double segmentBytes = ApproximateSegmentBytes + (averageHits * ApproximateHitBytes);
+        double decisionBytes = ApproximateDecisionBytes + ApproximateArrayHeaderBytes + (averagePath * sizeof(int));
+        long estimatedRetainedBytes =
+            (long)(((recentSegments + decisionRetainedSegments) * segmentBytes)
+                   + (decisionRuns * decisionBytes));
+
+        return new RetentionSnapshot(
+            Mode: mode,
+            RingCount: _rings.Count,
+            SealedSegments: sealedSegments,
+            RecentSegments: recentSegments,
+            DecisionRuns: decisionRuns,
+            DecisionRetainedSegments: decisionRetainedSegments,
+            DroppedSegments: dropped,
+            SampledRings: sampledRings,
+            AverageHitsPerSampledSegment: averageHits,
+            AveragePathLengthPerSampledDecision: averagePath,
+            EstimatedRetainedBytes: estimatedRetainedBytes);
+    }
 
     // ── chains (R2) + the C++ side's remote sites / segments (R1, R3) ──────
     // BridgeCorrelation owns behavioral cbt allocation. CircuitTrace records

@@ -132,6 +132,135 @@ $(function () {
     // ===================== STATUS POLLING =====================
     var firstPollDone = false;
 
+    // The CPU cards answer "how many cores is this using, out of how many";
+    // the per-core strip below answers "which ones, and how hard". An aggregate
+    // alone is actively misleading here: 0.44 spread over 32 cores looks idle
+    // whether it is 32 cores at 1.4% or one core at 44%, and only the second
+    // shape tells you anything about a serial world loop.
+    //
+    // A rate needs two readings, so the first poll after a page load genuinely
+    // has no value. Show a placeholder, never 0 — 0 would read as "idle".
+    function fmtCpuCard(breakdown, sample) {
+        var total = (breakdown && breakdown.processorCount)
+            || (sample && sample.processorCount) || null;
+        if (!total) return '—';
+
+        if (breakdown && breakdown.supported) {
+            if (!breakdown.isRunning) return '— of ' + total + ' in use';
+            if (!breakdown.cores || !breakdown.cores.length) return '… of ' + total + ' in use';
+            return breakdown.coresInUse + ' of ' + total + ' in use';
+        }
+
+        // Non-Linux: /proc is unavailable, so only the aggregate exists.
+        if (!sample || !sample.isRunning) return '— / ' + total + ' cores';
+        if (sample.cpuPercent == null) return '… / ' + total + ' cores';
+        return (sample.cpuPercent / 100).toFixed(2) + ' / ' + total + ' cores';
+    }
+
+    function cpuTitle(breakdown, sample) {
+        var parts = [];
+        if (breakdown && breakdown.supported && breakdown.isRunning) {
+            parts.push(breakdown.totalCores.toFixed(2) + ' cores total across '
+                + breakdown.threadCount + ' threads');
+            if (breakdown.cores && breakdown.cores.length) {
+                var b = breakdown.cores[0];
+                parts.push('busiest core ' + b.core + ' at ' + b.percent.toFixed(1) + '%');
+            }
+        }
+        if (sample && sample.cpuPercentOfHost != null) {
+            parts.push(sample.cpuPercentOfHost.toFixed(2) + '% of total CPU capacity');
+        }
+        return parts.join(' · ');
+    }
+
+    // One cell per core, filled by how much of THAT core the process used.
+    // Every core is drawn, present or idle, so the machine's width is visible
+    // at a glance and a single hot core stands out against its idle neighbours.
+    function coreStrip(breakdown, colour) {
+        if (!breakdown || !breakdown.supported) {
+            return '<span class="dash-label">per-core breakdown requires Linux</span>';
+        }
+        if (!breakdown.isRunning) return '<span class="dash-label">offline</span>';
+
+        var byCore = {};
+        (breakdown.cores || []).forEach(function (c) { byCore[c.core] = c; });
+
+        var html = '<div style="display:flex; gap:2px; flex-wrap:wrap;">';
+        for (var i = 0; i < breakdown.processorCount; i++) {
+            var c = byCore[i];
+            var pct = c ? c.percent : 0;
+            var fill = Math.max(0, Math.min(100, pct));
+            var tip = 'Core ' + i + ': ' + pct.toFixed(1) + '%'
+                + (c && c.threads ? ' (' + c.threads + ' thread' + (c.threads > 1 ? 's' : '') + ')' : '');
+            html += '<div title="' + tip + '" style="position:relative; width:22px; height:36px;'
+                + ' border-radius:3px; background:rgba(255,255,255,0.06); overflow:hidden;">'
+                + '<div style="position:absolute; bottom:0; left:0; right:0; height:' + fill.toFixed(1)
+                + '%; background:' + colour + ';"></div>'
+                + '</div>';
+        }
+        return html + '</div>';
+    }
+
+    function coreDetailLine(breakdown) {
+        if (!breakdown || !breakdown.supported || !breakdown.isRunning) return '';
+        var hot = (breakdown.cores || []).filter(function (c) { return c.percent >= 1; });
+        if (!hot.length) return 'no core above 1%';
+        return hot.slice(0, 8).map(function (c) {
+            return 'C' + c.core + ' ' + c.percent.toFixed(1) + '%';
+        }).join(' · ') + (hot.length > 8 ? ' · +' + (hot.length - 8) + ' more' : '');
+    }
+
+    function renderCoreBreakdown(cores) {
+        var $out = $('#coreBreakdown');
+        if (!cores) { $out.empty(); return; }
+
+        var rows = [
+            { label: 'World Server', bd: cores.mangosd, colour: 'var(--accent, #4f8ef7)' },
+            { label: 'SuperUI', bd: cores.superui, colour: 'rgba(255,255,255,0.45)' }
+        ];
+
+        var html = '';
+        rows.forEach(function (r) {
+            var bd = r.bd;
+            var summary = (bd && bd.supported && bd.isRunning)
+                ? bd.coresInUse + ' of ' + bd.processorCount + ' cores in use · '
+                  + bd.totalCores.toFixed(2) + ' cores total'
+                : '';
+            html += '<div class="mb-3">'
+                + '<div class="d-flex justify-content-between flex-wrap gap-2 mb-1">'
+                + '<div class="dash-value" style="font-size:15px;">' + r.label + '</div>'
+                + '<div class="dash-label">' + summary + '</div>'
+                + '</div>'
+                + coreStrip(bd, r.colour)
+                + '<div class="dash-label mt-1">' + coreDetailLine(bd) + '</div>'
+                + '</div>';
+        });
+        $out.html(html);
+
+        var host = cores.host;
+        if (host && host.supported) {
+            $('#coreHeading').text('CPU CORES · ' + host.processorCount + ' TOTAL');
+            $('#hostCoreSummary').text('whole machine: ' + host.coresInUse + ' of '
+                + host.processorCount + ' cores active · '
+                + (host.totalPercent / 100).toFixed(2) + ' cores busy');
+        } else if (host) {
+            $('#coreHeading').text('CPU CORES · ' + host.processorCount + ' TOTAL');
+            $('#hostCoreSummary').text('');
+        }
+    }
+
+    function fmtMem(sample) {
+        if (!sample || !sample.isRunning || sample.memoryBytes == null) return '—';
+        var bytes = sample.memoryBytes;
+        var text = bytes >= 1073741824
+            ? (bytes / 1073741824).toFixed(2) + ' GiB'
+            : (bytes / 1048576).toFixed(0) + ' MiB';
+        if (sample.memoryPercentOfHost != null) {
+            text += ' (' + sample.memoryPercentOfHost.toFixed(0) + '%)';
+        }
+        return text;
+    }
+
     function pollStatus() {
         $.getJSON('/Home/Status', function (data) {
             // mangosd process
@@ -158,6 +287,17 @@ $(function () {
                 }
             }
             $('#realmdText').text(rText);
+
+            // Process CPU / RAM
+            var res = data.resources || {};
+            var cores = data.cores || {};
+            $('#mangosdCpu').text(fmtCpuCard(cores.mangosd, res.mangosd))
+                            .attr('title', cpuTitle(cores.mangosd, res.mangosd));
+            $('#mangosdMem').text(fmtMem(res.mangosd));
+            $('#superuiCpu').text(fmtCpuCard(cores.superui, res.superui))
+                            .attr('title', cpuTitle(cores.superui, res.superui));
+            $('#superuiMem').text(fmtMem(res.superui));
+            renderCoreBreakdown(cores);
 
             // RA
             $('#raStatus').removeClass('online offline error').addClass(data.raConnected ? 'online' : 'offline');

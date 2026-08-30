@@ -515,6 +515,18 @@ public class BotState
     // Full quest-log snapshot pushed on STATE (retired pull). Pipe-delimited, QUEST_STATUS_ALL format.
     public string Quests { get; set; } = "";
     public bool HasReceivedState { get; set; } = false;
+
+    /// <summary>
+    /// Capture a detached, internally consistent payload for browser delivery.
+    /// The full quest-log wire blob is intentionally planner-only; the bot UI
+    /// reads quest detail from its dedicated endpoint and never consumes it.
+    /// </summary>
+    internal BotState CreateUiSnapshot()
+    {
+        var snapshot = (BotState)MemberwiseClone();
+        snapshot.Quests = "";
+        return snapshot;
+    }
 }
 
 /// <summary>
@@ -656,6 +668,9 @@ public class BotBridgeService : BackgroundService
     public static readonly TimeSpan SensoryFeedStaleAfter = TimeSpan.FromSeconds(15);
     public static readonly TimeSpan SensoryFeedRecycleAfter = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan SensoryFeedWatchInterval = TimeSpan.FromSeconds(1);
+    internal const int DefaultStateBatchPublishIntervalMs = 200;
+    internal const int DefaultStateBatchMaxSize = 1024;
+    internal const int DefaultUiPublishTimeoutMs = 2_000;
 
     private sealed class PendingCombatLoadout
     {
@@ -677,6 +692,9 @@ public class BotBridgeService : BackgroundService
 
     private readonly ILogger<BotBridgeService> _logger;
     private readonly IHubContext<BotBridgeHub> _hub;
+    private readonly TimeSpan _stateBatchPublishInterval;
+    private readonly int _stateBatchMaxSize;
+    private readonly TimeSpan _uiPublishTimeout;
     private TcpListener? _listener;
 
     // BotBrain integration — set after startup to avoid circular DI
@@ -695,6 +713,14 @@ public class BotBridgeService : BackgroundService
     // Snapshot of all bot states (survives brief disconnects for UI display)
     public ConcurrentDictionary<int, BotState> BotStates { get; } = new();
 
+    // Latest-wins browser projection. This is bounded by bot count rather than
+    // heartbeat count, so a slow UI cannot back up every STATE message.
+    private readonly BotStateUpdateBuffer _stateUpdates = new();
+    // Serializes batch sends and provides the rare delete path with a publication
+    // barrier. Connect/disconnect are themselves latest-wins state projections,
+    // so TCP ingestion never waits behind browser delivery.
+    private readonly SemaphoreSlim _uiPublishGate = new(1, 1);
+
     // Admin build changes use a request-id registry independent of BotBrain's
     // singular cbt-correlated planner WAIT.
     private readonly ConcurrentDictionary<string, PendingCombatLoadout> _pendingCombatLoadouts
@@ -712,10 +738,29 @@ public class BotBridgeService : BackgroundService
         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
-    public BotBridgeService(ILogger<BotBridgeService> logger, IHubContext<BotBridgeHub> hub)
+    public BotBridgeService(
+        ILogger<BotBridgeService> logger,
+        IHubContext<BotBridgeHub> hub,
+        IConfiguration? configuration = null)
     {
         _logger = logger;
         _hub = hub;
+        int intervalMs = Math.Clamp(
+            configuration?.GetValue<int?>("BotBridge:StateBatchPublishIntervalMs")
+                ?? DefaultStateBatchPublishIntervalMs,
+            50,
+            2_000);
+        _stateBatchPublishInterval = TimeSpan.FromMilliseconds(intervalMs);
+        _stateBatchMaxSize = Math.Clamp(
+            configuration?.GetValue<int?>("BotBridge:StateBatchMaxSize")
+                ?? DefaultStateBatchMaxSize,
+            64,
+            4_096);
+        _uiPublishTimeout = TimeSpan.FromMilliseconds(Math.Clamp(
+            configuration?.GetValue<int?>("BotBridge:UiPublishTimeoutMs")
+                ?? DefaultUiPublishTimeoutMs,
+            100,
+            10_000));
     }
 
     /// <summary>
@@ -852,6 +897,9 @@ public class BotBridgeService : BackgroundService
         }
         _logger.LogInformation("BotBridge TCP listener started on 127.0.0.1:3444");
 
+        using var publisherCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        Task statePublisher = PublishStateBatchesAsync(publisherCts.Token);
+
         try
         {
             while (!stoppingToken.IsCancellationRequested)
@@ -868,8 +916,70 @@ public class BotBridgeService : BackgroundService
         }
         finally
         {
+            publisherCts.Cancel();
+            try { await statePublisher; }
+            catch (OperationCanceledException) when (publisherCts.IsCancellationRequested) { }
             _listener.Stop();
             _logger.LogInformation("BotBridge TCP listener stopped");
+        }
+    }
+
+    private async Task PublishStateBatchesAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(_stateBatchPublishInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+                await FlushStateBatchAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal bridge/host shutdown. The reconnecting browser obtains a
+            // complete AllBots snapshot, so no shutdown flush is required.
+        }
+    }
+
+    internal async Task<int> FlushStateBatchAsync(CancellationToken cancellationToken)
+    {
+        await _uiPublishGate.WaitAsync(cancellationToken);
+        try
+        {
+            IReadOnlyList<BotState> batch = _stateUpdates.Drain(_stateBatchMaxSize);
+            if (batch.Count == 0)
+                return 0;
+
+            try
+            {
+                using var publishTimeout = CancellationTokenSource
+                    .CreateLinkedTokenSource(cancellationToken);
+                publishTimeout.CancelAfter(_uiPublishTimeout);
+                await _hub.Clients.All.SendAsync(
+                    "BotStateBatch",
+                    batch,
+                    publishTimeout.Token);
+                _stateUpdates.RecordPublished(batch.Count);
+                return batch.Count;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _stateUpdates.Requeue(batch);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Preserve eventual delivery, but never overwrite a newer state
+                // that arrived while this failed batch was in flight.
+                _stateUpdates.Requeue(batch);
+                _stateUpdates.RecordPublishFailure();
+                _logger.LogWarning(ex,
+                    "BotBridge: BotStateBatch publish failed; {Count} latest states requeued",
+                    batch.Count);
+                return 0;
+            }
+        }
+        finally
+        {
+            _uiPublishGate.Release();
         }
     }
 
@@ -983,7 +1093,10 @@ public class BotBridgeService : BackgroundService
                         // HELLO publication is excluded by the same gate. A new
                         // session can then atomically overwrite both entries.
                         conn.State.TaskState = "DISCONNECTED";
+                        conn.State.LastUpdate = DateTime.UtcNow;
                         BotStates[conn.Guid] = conn.State;
+                        _stateUpdates.Remove(conn.Guid);
+                        _stateUpdates.Enqueue(conn.State.CreateUiSnapshot());
                     }
                 }
                 // Pending requests belong to a concrete socket session, not just
@@ -996,8 +1109,6 @@ public class BotBridgeService : BackgroundService
                     CircuitTrace.Hit(conn.Guid, "bridge: state marked DISCONNECTED");
 
                 _logger.LogInformation("BotBridge: bot {Guid} ({Name}) disconnected", conn.Guid, conn.State.Name);
-                if (removedActive)
-                    await _hub.Clients.All.SendAsync("BotDisconnected", conn.Guid);   // cb:fold notify only, teardown probe above fires
             }
 
             try { client.Dispose(); } catch { /* cb:fold disposal trivia */ }
@@ -1539,10 +1650,10 @@ public class BotBridgeService : BackgroundService
         }
     }
 
-    private async Task HandleHelloAsync(JsonElement payload, BotConnection conn)
+    private Task HandleHelloAsync(JsonElement payload, BotConnection conn)
     {
         var hello = payload.Deserialize<BotHelloPayload>(JsonOpts);
-        if (hello == null) { CircuitTrace.Hit(conn.Guid, "bridge: HELLO payload malformed"); return; }
+        if (hello == null) { CircuitTrace.Hit(conn.Guid, "bridge: HELLO payload malformed"); return Task.CompletedTask; }
         if (!TryClaimHelloIdentity(conn, hello.Guid, out string helloRejection))
         {
             CircuitTrace.HitNote(conn.Guid, "bridge: HELLO identity rejected", helloRejection);
@@ -1552,7 +1663,7 @@ public class BotBridgeService : BackgroundService
                 helloRejection,
                 conn.Guid,
                 hello.Guid);
-            return;
+            return Task.CompletedTask;
         }
 
         CircuitTrace.Hit(hello.Guid, "bridge: HELLO adopted, bot registered", hello.Level);
@@ -1611,6 +1722,8 @@ public class BotBridgeService : BackgroundService
                 Connections.TryGetValue(hello.Guid, out replacedConnection);
                 Connections[hello.Guid] = conn;
                 BotStates[hello.Guid] = conn.State;
+                _stateUpdates.Remove(hello.Guid);
+                _stateUpdates.Enqueue(conn.State.CreateUiSnapshot());
             }
         }
         finally
@@ -1635,10 +1748,6 @@ public class BotBridgeService : BackgroundService
         _logger.LogInformation("BotBridge: HELLO from {Name} (guid={Guid}, class={Class}, level={Level})",
             hello.Name, hello.Guid, hello.ClassId, hello.Level);
 
-        // Publish to web clients only after the hydration replay has been
-        // registered and started for this exact socket.
-        await _hub.Clients.All.SendAsync("BotConnected", conn.State);
-
         // [RAID-PLAN] Same law for the raid plan: the persisted assignment re-pushes
         // on every HELLO, fire-and-forget, failures log inside (PLAN_19 M-B).
         if (_raidPlans != null)
@@ -1655,25 +1764,27 @@ public class BotBridgeService : BackgroundService
             _ = SendToBotAsync(hello.Guid, "CIRCUIT_TRACE",
                 new { mode = 1, ship = CircuitTrace.IsArmed(hello.Guid) ? 1 : 0 });
         }
+
+        return Task.CompletedTask;
     }
 
-    private async Task HandleStateAsync(JsonElement payload, BotConnection conn)
+    private Task HandleStateAsync(JsonElement payload, BotConnection conn)
     {
         var state = payload.Deserialize<BotStatePayload>(JsonOpts);
-        if (state == null) { CircuitTrace.Hit(conn.Guid, "bridge: STATE payload malformed"); return; }
+        if (state == null) { CircuitTrace.Hit(conn.Guid, "bridge: STATE payload malformed"); return Task.CompletedTask; }
         if (conn.Guid == 0 || state.Guid != conn.Guid)
         {
             CircuitTrace.HitNote(conn.Guid, "bridge: STATE guid mismatch dropped", state.Guid.ToString());
             _logger.LogWarning(
                 "BotBridge: dropped STATE guid={StateGuid} on connection owned by guid={ConnectionGuid}",
                 state.Guid, conn.Guid);
-            return;
+            return Task.CompletedTask;
         }
         if (!Connections.TryGetValue(conn.Guid, out BotConnection? active)
             || !ReferenceEquals(active, conn))
         {
             CircuitTrace.Hit(conn.Guid, "bridge: STATE from superseded connection ignored");
-            return;
+            return Task.CompletedTask;
         }
         DateTime receivedUtc = DateTime.UtcNow;
         BotState bs;
@@ -1685,7 +1796,7 @@ public class BotBridgeService : BackgroundService
                 // The watchdog already committed to closing this stale session.
                 // The reconnect's first STATE will establish fresh truth.
                 CircuitTrace.Hit(conn.Guid, "bridge: STATE raced committed recycle, ignored");
-                return;
+                return Task.CompletedTask;
             }
 
         CircuitTrace.Hit(conn.Guid, "bridge: STATE heartbeat applied");
@@ -1744,15 +1855,16 @@ public class BotBridgeService : BackgroundService
                     || !ReferenceEquals(stillActive, conn))
                 {
                     CircuitTrace.Hit(conn.Guid, "bridge: completed STATE from superseded connection discarded");
-                    return;
+                    return Task.CompletedTask;
                 }
                 BotStates[conn.Guid] = bs;
-            }
 
-            // Publish both freshness clocks only after the complete projection is
-            // visible under SensoryFeedGate. Snapshot readers take this same gate,
-            // so no brain tick can observe a half-old/half-new heartbeat.
-            Volatile.Write(ref conn.LastStateReceivedUtcTicks, receivedUtc.Ticks);
+                // Publish both freshness clocks only after the complete projection
+                // is visible. Queue under this same lifecycle gate so teardown can
+                // deterministically purge the final active snapshot.
+                Volatile.Write(ref conn.LastStateReceivedUtcTicks, receivedUtc.Ticks);
+                _stateUpdates.Enqueue(bs.CreateUiSnapshot());
+            }
         }
 
         if (feedRecovered)
@@ -1763,7 +1875,7 @@ public class BotBridgeService : BackgroundService
                 bs.Name, conn.Guid);
         }
 
-        await _hub.Clients.All.SendAsync("BotStateUpdate", bs);
+        return Task.CompletedTask;
     }
 
     private async Task HandleEventAsync(JsonElement payload, long? cbt, BotConnection conn)
@@ -2786,11 +2898,77 @@ public class BotBridgeService : BackgroundService
             .ToList();
     }
 
+    /// <summary>
+    /// Detached browser roster without the planner-only quest-log wire blob.
+    /// Active connections are copied under the same sensory gate as STATE.
+    /// </summary>
+    public List<BotState> GetAllBotUiStates()
+    {
+        var snapshots = new List<BotState>(BotStates.Count);
+        foreach (KeyValuePair<int, BotState> entry in BotStates)
+        {
+            BotState? snapshot = null;
+            if (Connections.TryGetValue(entry.Key, out BotConnection? connection))
+            {
+                lock (connection.SensoryFeedGate)
+                {
+                    if (Connections.TryGetValue(entry.Key, out BotConnection? active)
+                        && ReferenceEquals(active, connection))
+                    {
+                        snapshot = connection.State.CreateUiSnapshot();
+                    }
+                }
+            }
+
+            // Disconnected projections are stable last-seen values. A connection
+            // replacement race may also land here; the next batch corrects it.
+            snapshots.Add(snapshot ?? entry.Value.CreateUiSnapshot());
+        }
+
+        return snapshots.OrderBy(state => state.Name).ToList();
+    }
+
+    /// <summary>
+    /// Publish an initial roster under the same ordering barrier as state batches
+    /// and deletion tombstones. A delayed snapshot can therefore never arrive
+    /// after a newer BotRemoved/BotsRemoved event and resurrect stale UI state.
+    /// </summary>
+    public async Task PublishAllBotUiStatesAsync(
+        IClientProxy client,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+        await _uiPublishGate.WaitAsync(cancellationToken);
+        try
+        {
+            List<BotState> bots = GetAllBotUiStates();
+            using var publishTimeout = CancellationTokenSource
+                .CreateLinkedTokenSource(cancellationToken);
+            publishTimeout.CancelAfter(_uiPublishTimeout);
+            await client.SendAsync("AllBots", bots, publishTimeout.Token);
+        }
+        finally
+        {
+            _uiPublishGate.Release();
+        }
+    }
+
     public BotState? GetBotState(int guid)
     {
         BotStates.TryGetValue(guid, out var state);
         return state;
     }
+
+    /// <param name="resetPeaks">
+    /// Only the periodic scale sampler passes true; it owns the high-water
+    /// window that the UI-backlog stop gate is judged on.
+    /// </param>
+    public BotStateBatchMetrics GetStateBatchMetrics(bool resetPeaks = false)
+        => _stateUpdates.GetMetrics(resetPeaks);
+
+    public int StateBatchPublishIntervalMilliseconds => (int)_stateBatchPublishInterval.TotalMilliseconds;
+    public int StateBatchMaxSize => _stateBatchMaxSize;
+    public int UiPublishTimeoutMilliseconds => (int)_uiPublishTimeout.TotalMilliseconds;
 
     /// <summary>
     /// Capture one internally consistent sensory heartbeat. HandleStateAsync
@@ -2866,9 +3044,68 @@ public class BotBridgeService : BackgroundService
     /// removes the live Connections entry, not BotStates) — without this, a deleted
     /// bot lingers forever in /Bots/States and the IBot Monitor page.
     /// </summary>
-    public void RemoveBotState(int guid)
+    public Task RemoveBotStateAsync(int guid)
+        => RemoveBotStatesAsync(new[] { guid });
+
+    /// <summary>
+    /// Batch form used by fleet deletion so one database operation produces one
+    /// ordered browser tombstone rather than thousands of serialized hub sends.
+    /// </summary>
+    public async Task RemoveBotStatesAsync(IEnumerable<int> guids)
     {
-        BotStates.TryRemove(guid, out _);
-        Connections.TryRemove(guid, out _);
+        ArgumentNullException.ThrowIfNull(guids);
+        int[] removedGuids = guids
+            .Where(guid => guid > 0)
+            .Distinct()
+            .ToArray();
+        if (removedGuids.Length == 0)
+            return;
+
+        lock (_connectionPublishGate)
+        {
+            foreach (int guid in removedGuids)
+            {
+                BotStates.TryRemove(guid, out _);
+                Connections.TryRemove(guid, out _);
+                _stateUpdates.Remove(guid);
+            }
+        }
+
+        // Wait behind any state batch that was already in flight. Remove once
+        // more after the barrier in case a failed send requeued its payload.
+        await _uiPublishGate.WaitAsync();
+        try
+        {
+            foreach (int guid in removedGuids)
+                _stateUpdates.Remove(guid);
+
+            using var publishTimeout = new CancellationTokenSource(_uiPublishTimeout);
+            try
+            {
+                if (removedGuids.Length == 1)
+                {
+                    await _hub.Clients.All.SendAsync(
+                        "BotRemoved",
+                        removedGuids[0],
+                        publishTimeout.Token);
+                }
+                else
+                {
+                    await _hub.Clients.All.SendAsync(
+                        "BotsRemoved",
+                        removedGuids,
+                        publishTimeout.Token);
+                }
+            }
+            catch (Exception ex)
+            {
+                // The database operation has already succeeded. Keep local state
+                // deleted even if a browser transport disappears mid-notification.
+                _logger.LogWarning(ex,
+                    "BotBridge: failed to publish removal tombstone for {Count} deleted bot(s)",
+                    removedGuids.Length);
+            }
+        }
+        finally { _uiPublishGate.Release(); }
     }
 }

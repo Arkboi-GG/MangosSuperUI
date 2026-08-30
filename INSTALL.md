@@ -351,6 +351,22 @@ Type `.server info` to confirm commands work, then exit with `Ctrl+]` and type `
 
 ### Step 8: Configure sudo for MangosSuperUI
 
+> **Do this step now, and know that Step 13 will extend it.**
+>
+> The line below grants service lifecycle control, which is what Steps 9–12
+> need. Later, `setup-mangossuperui.sh` (Step 13) **regenerates this same file**
+> with an additional grant for a root-owned privileged helper — that second
+> grant is what lets SuperUI raise mangosd's **descriptor limit** from the web
+> UI instead of you editing systemd files by hand.
+>
+> That limit matters more than it sounds: it defaults to 1024, and since every
+> bot holds one bridge socket in the world process, it caps the fleet near 990
+> bots regardless of CPU or RAM.
+>
+> Running setup is therefore not optional on a bot server, and it is safe to
+> re-run at any time — it validates the generated sudoers file with `visudo -c`
+> before installing it.
+
 MangosSuperUI needs passwordless sudo access to start/stop/restart the mangosd and realmd services.
 
 ```bash
@@ -616,6 +632,12 @@ The script will:
 8. **Generate `server-config.json`** — writes the config file to `/opt/mangossuperui/server-config.json` and shows you a summary of everything it discovered.
 
 9. **Start MangosSuperUI and verify the queue schema** — starts or restarts the service, lets runtime migrations finish, then checks every required queue column and index.
+
+10. **Install the privileged helper and regenerate the sudoers grant** — copies `superui-privileged.sh` to `/usr/local/lib/mangossuperui/` as `root:root` (deliberately *outside* the app directory, which the service user can write during a deploy), then rewrites `/etc/sudoers.d/mangossuperui` with the Step 8 lifecycle grants **plus** one grant for that helper. The file is validated with `visudo -c` before installation, so a bad file can never lock you out of `sudo`.
+
+    This is what enables **Dashboard → raise descriptor limit**. Without it, SuperUI can still start and stop services (Step 8's grant), but cannot change `LimitNOFILE`, and the bot fleet stays capped near 990.
+
+    The helper accepts only two verbs, on an allowlist of four units, with numeric range checks — it is the entire surface SuperUI can touch as root, and it never restarts anything.
 
 **Example output from a successful run:**
 
