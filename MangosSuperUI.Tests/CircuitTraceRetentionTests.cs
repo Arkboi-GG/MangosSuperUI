@@ -1,4 +1,5 @@
 using MangosSuperUI.BotLogic.Tracking;
+using MangosSuperUI.Services;
 using Xunit;
 
 namespace MangosSuperUI.Tests;
@@ -17,6 +18,28 @@ namespace MangosSuperUI.Tests;
 public sealed class CircuitTraceRetentionTests
 {
     private const int SegmentRingCap = 1024;
+
+    [Fact]
+    public void HelloCircuitState_ShipsArmedBotWhileFleetShadowIsOff()
+    {
+        const int armedGuid = 14;
+        const int unarmedGuid = 15;
+
+        CircuitTrace.Mode = CircuitTrace.TraceMode.Off;
+        CircuitTrace.Arm(armedGuid);
+        CircuitTrace.Disarm(unarmedGuid);
+        try
+        {
+            Assert.Equal((0, 1), BotBridgeService.CircuitStateForHello(armedGuid));
+            Assert.Equal((0, 0), BotBridgeService.CircuitStateForHello(unarmedGuid));
+        }
+        finally
+        {
+            CircuitTrace.Disarm(armedGuid);
+            CircuitTrace.Forget(armedGuid);
+            CircuitTrace.Forget(unarmedGuid);
+        }
+    }
 
     /// <summary>
     /// Drives one tick whose probe path length varies with <paramref name="hits"/>.
@@ -135,6 +158,35 @@ public sealed class CircuitTraceRetentionTests
         finally
         {
             CircuitTrace.Forget(guid);
+            CircuitTrace.Mode = priorMode;
+        }
+    }
+
+    [Fact]
+    public void ArmedBot_RecordsWhileFleetShadowIsOff_AndUnarmedBotDoesNot()
+    {
+        const int armedGuid = 918_004;
+        const int unarmedGuid = 918_005;
+        CircuitTrace.TraceMode priorMode = CircuitTrace.Mode;
+        try
+        {
+            AssertIsolated(CircuitTrace.GetRetentionSnapshot());
+            CircuitTrace.Mode = CircuitTrace.TraceMode.Off;
+            CircuitTrace.Arm(armedGuid);
+
+            DriveTick(armedGuid, 2);
+            DriveTick(unarmedGuid, 2);
+
+            Assert.True(CircuitTrace.IsRecording(armedGuid));
+            Assert.False(CircuitTrace.IsRecording(unarmedGuid));
+            Assert.Single(CircuitTrace.PeekSegments(armedGuid));
+            Assert.Empty(CircuitTrace.PeekSegments(unarmedGuid));
+        }
+        finally
+        {
+            CircuitTrace.Disarm(armedGuid);
+            CircuitTrace.Forget(armedGuid);
+            CircuitTrace.Forget(unarmedGuid);
             CircuitTrace.Mode = priorMode;
         }
     }

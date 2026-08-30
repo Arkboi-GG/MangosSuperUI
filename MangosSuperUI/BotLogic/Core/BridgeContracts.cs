@@ -99,6 +99,12 @@ public class BotEvent
     public string EventType { get; set; } = "";
     public int CreatureEntry { get; set; }
     public long CreatureGuid { get; set; }
+    /// <summary>
+    /// True when the core found the victim's corpse before crediting the kill.
+    /// Defaults true so a C#-first deploy and an older-core rollback preserve
+    /// the pre-F2 behavior rather than dropping otherwise valid KILL events.
+    /// </summary>
+    public bool KillConfirmed { get; set; } = true;
     public int? QuestId { get; set; }
     public string QuestStatus { get; set; } = "";
     public int NewLevel { get; set; }

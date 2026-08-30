@@ -308,6 +308,11 @@ public class BotEventPayload
     [JsonPropertyName("creature_guid")]
     public int? CreatureGuid { get; set; }
 
+    // F2 (2026-08-30): corpse proof on the KILL event. Missing means an older
+    // core that cannot distinguish, which deliberately preserves legacy trust.
+    [JsonPropertyName("confirmed")]
+    public int? Confirmed { get; set; }
+
     [JsonPropertyName("quest_id")]
     public int? QuestId { get; set; }
 
@@ -1756,17 +1761,20 @@ public class BotBridgeService : BackgroundService
             _ = _raidPlans.OnBotHelloAsync(hello.Guid, hello.Name);
         }
 
-        // [CIRCUIT] Push the current recording state to the freshly-connected C++ side
-        // (R6 — one switch arms both probes; a reconnect must re-learn mode + ship).
-        if (CircuitTrace.Mode != CircuitTrace.TraceMode.Off)
-        {
-            CircuitTrace.Hit(conn.Guid, "bridge: circuit state pushed on hello");
-            _ = SendToBotAsync(hello.Guid, "CIRCUIT_TRACE",
-                new { mode = 1, ship = CircuitTrace.IsArmed(hello.Guid) ? 1 : 0 });
-        }
+        // [CIRCUIT] Push the current recording state to the freshly-connected C++ side.
+        // Off is armed-only, not globally disabled: every reconnect must re-learn both
+        // fleet mode and this bot's ship bit. Sending ship=0 also clears stale C++ state.
+        (int circuitMode, int circuitShip) = CircuitStateForHello(hello.Guid);
+        CircuitTrace.Hit(conn.Guid, "bridge: circuit state pushed on hello");
+        _ = SendToBotAsync(hello.Guid, "CIRCUIT_TRACE",
+            new { mode = circuitMode, ship = circuitShip });
 
         return Task.CompletedTask;
     }
+
+    internal static (int Mode, int Ship) CircuitStateForHello(int guid) =>
+        (CircuitTrace.Mode == CircuitTrace.TraceMode.Shadow ? 1 : 0,
+         CircuitTrace.IsArmed(guid) ? 1 : 0);
 
     private Task HandleStateAsync(JsonElement payload, BotConnection conn)
     {
@@ -2011,6 +2019,7 @@ public class BotBridgeService : BackgroundService
                     eventType = "KILL",
                     creatureEntry = evt.CreatureEntry,
                     creatureGuid = evt.CreatureGuid,
+                    confirmed = evt.Confirmed is not int c || c != 0,
                     timestamp = DateTime.UtcNow
                 });
                 break;
@@ -2313,6 +2322,7 @@ public class BotBridgeService : BackgroundService
                 EventType = eventType,
                 CreatureEntry = evt.CreatureEntry ?? 0,
                 CreatureGuid = evt.CreatureGuid ?? 0,
+                KillConfirmed = evt.Confirmed is not int c || c != 0,
                 QuestId = evt.QuestId ?? 0,
                 QuestStatus = evt.Status ?? "",
                 NewLevel = evt.NewLevel ?? 0,
