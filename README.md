@@ -365,7 +365,7 @@ Basic server administration and normal Vanilla play can be used separately. The 
 
 Optional advanced integrations:
 
-- Ollama for bot chat and supported prompt workflows.
+- Ollama or vllm for bot chat and supported prompt workflows.
 - ComfyUI for supported image and texture generation paths.
 
 ### SuperUI-Core
