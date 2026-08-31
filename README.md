@@ -1,6 +1,6 @@
 # MangosSuperUI
 
-[Community Discord](https://discord.gg/AzCdnyPHPY) - Updates, questions, bugs, discussion, and development notes.
+[Community Discord](https://discord.gg/3u3tnMnweE) - Updates, questions, bugs, discussion, and development notes.
 
 [YouTube](https://www.youtube.com/@Yafrovon) - Video walkthroughs, feature demos, and progress updates.
 
@@ -143,11 +143,13 @@ The full web editors for vendors, quests, and creature templates are not finishe
 
 ### Weapon Forge and Armor Forge
 
-Weapon Forge and Armor Forge are now major parts of MangosSuperUI, not small additions to the Items page.
+Weapon Forge and Armor Forge are now major compliments to the Items page.
 
-Weapon Forge can build Vanilla-compatible weapons from cloned Vanilla assets, compatible TBC and Wrath assets, or imported GLB models. It handles the model, textures, display information, placement, recoloring, effects, item fields, preview, registry, and generated client patch as one workflow.
+Weapon Forge can build Vanilla-compatible weapons from cloned Vanilla assets, all TBC and Wrath assets, or imported GLB models. It handles the model, textures, display information, placement, recoloring, effects, item fields, preview, registry, and generated client patch as one workflow.
 
-Armor Forge applies the same idea to armor pieces and sets. It can import compatible expansion pieces, clone Vanilla equipment, build full sets, define itemization and set bonuses, create recolors during import and also recolor effects, and register the result for patch generation. 
+Armor Forge applies the same idea to armor pieces and sets. It can import compatible expansion pieces, clone Vanilla equipment, import TBC and Wrath assets, build full sets, define itemization and set bonuses, create recolors during import and also recolor effects, and register the result for patch generation. 
+
+Recolors of the assets & the spell effects (animations etc.) are all live preview in the MSUI web app as see below in the screenshot. You can tune intensity, colors, and you preview this realtime.
 
 The item builder exposes the real Vanilla fields instead of translating everything into a simplified modern stat system. Flat stats remain flat. Spell and equip effects keep their trigger, charges, cooldowns, categories, and other native behavior.
 
