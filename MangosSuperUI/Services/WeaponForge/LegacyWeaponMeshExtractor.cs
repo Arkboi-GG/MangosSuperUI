@@ -162,16 +162,13 @@ public static class LegacyWeaponMeshExtractor
                 BatchFlags = sp.BatchFlags,
                 PriorityPlane = sp.PriorityPlane,
                 ShaderId = sp.ShaderId,
-                // An ADDITIVE pass with no colour track of its own gets a neutral one (white, full
-                // alpha — mathematically identity, so nothing renders differently). It exists so the
-                // glow has something to animate later: M2GlowPulseWriter turns a colour record's
-                // constant alpha into a global-sequence breath, and it can only do that to a record
-                // that exists. Measured need: Axe_2h_OutlandRaid_D_04's two additive glow passes both
-                // arrive with ColorIndex -1, so without this the axe's glow could never move.
-                ColorIndex = sp.RestColor is null && sp.BlendMode is 3 or 4 ? (short)0 : sp.ColorIndex,
+                // Fidelity imports retain the source colour link exactly. A missing colour record
+                // means identity white/opaque at runtime; synthesizing one solely to animate it
+                // later changed steady source glows into an invented breathing loop.
+                ColorIndex = sp.ColorIndex,
                 RestColor = sp.RestColor is not null
                     ? new WeaponRestColor(sp.RestColor.Rgb, sp.RestColor.Alpha, sp.RestColor.AnimationFrozen)
-                    : sp.BlendMode is 3 or 4 ? NeutralGlowColor : null,
+                    : null,
                 TextureBindings = bindings,
             });
 
@@ -219,12 +216,6 @@ public static class LegacyWeaponMeshExtractor
             }).ToList(),
         };
     }
-
-    /// <summary>Identity colour (white, opaque) handed to additive passes that carry no colour track
-    /// of their own, purely so a pulse has a record to animate. One shared instance: the writer
-    /// de-duplicates rest colours by value, so every glow pass on a model lands on ONE track and
-    /// breathes together rather than each drifting on its own phase.</summary>
-    private static readonly WeaponRestColor NeutralGlowColor = new(System.Numerics.Vector3.One, 1f, false);
 
     // ── Emitter baking ───────────────────────────────────────────────────
     // Vanilla's donor scaffold cannot host a later-client particle emitter graph, so the visible part of

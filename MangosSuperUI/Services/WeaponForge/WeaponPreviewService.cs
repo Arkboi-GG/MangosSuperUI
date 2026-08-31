@@ -141,6 +141,14 @@ public sealed class WeaponPreviewService
         return result;
     }
 
+    /// <summary>The Warglaive's two-stage glow keeps a steady UV0 energy base while UV1
+    /// supplies the moving modulation wave. Other two-unit materials remain pure modulation.</summary>
+    internal static bool UsesSteadyModulatedGlow(ushort blendMode,
+        WeaponTextureBinding first, WeaponTextureBinding second)
+        => blendMode == 4 &&
+           (first.TextureCoordinate & 0x7fff) == 0 &&
+           (second.TextureCoordinate & 0x7fff) == 1;
+
     internal static bool SamplesDisplayTexture(M2Model m2)
         => SampledTextureSlots(m2).Any(slot => UsesDisplayTexture(m2.Textures[slot]));
 
@@ -235,7 +243,8 @@ public sealed class WeaponPreviewService
         try
         {
             MaterialBuilder BuildMaterial(string name, byte[]? png, ushort blend, Vector3 tint,
-                float staticAlpha, bool twoSided, bool environmentMapped, bool modCombine = false)
+                float staticAlpha, bool twoSided, bool environmentMapped, bool modCombine = false,
+                bool steadyModulatedGlow = false)
             {
                 if (!float.IsFinite(staticAlpha)) staticAlpha = 1f;
                 staticAlpha = Math.Clamp(staticAlpha, 0f, 1f);
@@ -251,7 +260,8 @@ public sealed class WeaponPreviewService
                 // `_mod` marks a multi-texture MODULATE pass (two energy copies multiplied — the wave).
                 // blend-suffix.js applyMultiTexture reconstructs the second sample; kept before `_blend`
                 // so the blend-mode regex still resolves.
-                name = $"{name}{(environmentMapped ? "_env" : "")}{(modCombine ? "_mod" : "")}_blend{blend}_a{alphaPercent}";
+                name = $"{name}{(environmentMapped ? "_env" : "")}{(modCombine ? "_mod" : "")}" +
+                       $"{(steadyModulatedGlow ? "_steady" : "")}_blend{blend}_a{alphaPercent}";
                 var m = new MaterialBuilder(name).WithUnlitShader();
                 if (png is { Length: > 0 })
                     m.WithBaseColor(new SharpGLTF.Memory.MemoryImage(png))
@@ -372,8 +382,10 @@ public sealed class WeaponPreviewService
                         // faces (its blade edges point away from a fixed camera), and single-sided
                         // FrontSide culls it entirely — which is why the wave never appeared and only the
                         // base blade showed. Additive energy reads correctly from either face.
+                        bool steadyGlow = UsesSteadyModulatedGlow(pass.BlendMode, b0, b1);
                         var material = BuildMaterial($"pass{sourcePassIndex}_tex1", png, pass.BlendMode,
-                            tint, sa * colorAlpha, twoSided: true, environmentMapped: false, modCombine: true);
+                            tint, sa * colorAlpha, twoSided: true, environmentMapped: false,
+                            modCombine: true, steadyModulatedGlow: steadyGlow);
 
                         // The scroll rides the material's own map.matrix (m2fx), keyed by material name.
                         var fx = BuildUvFx(b1.RestTransform, tint, sa * colorAlpha);
@@ -491,8 +503,9 @@ public sealed class WeaponPreviewService
             // so a pre-change GLB in the cache is no longer an acceptable answer for the same mesh.
             // v7: env-mapped passes carry the `_env` marker for the matcap render path.
             // v8: multi-texture passes emit ONE 2-UV primitive (`_mod`) for the modulate/wave combine.
-            // v9: the `_mod` (additive energy) pass is forced double-sided so it isn't backface-culled.
-            writer.Write("WeaponPreviewMesh/v9");
+            // v9: the _mod (additive energy) pass is forced double-sided so it isn't backface-culled.
+            // v10: blend-4 UV0+UV1 modulation carries a steady-base marker for glow + wave.
+            writer.Write("WeaponPreviewMesh/v10");
             writer.Write(visualEffects?.Count ?? -1);
             foreach (var v in visualEffects ?? Array.Empty<M2Fx.ItemVisualEffects.Effect>())
             {

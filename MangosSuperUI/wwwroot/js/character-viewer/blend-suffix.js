@@ -238,6 +238,8 @@ export function applyEnvMapping(sceneRoot) {
 // `_mod` marker WeaponPreviewService adds to a multi-texture MODULATE pass (e.g.
 // "pass3_tex1_mod_blend4_a100"). Sits before the blend suffix so applyBlendSuffix still parses it.
 const _MOD_RE = /_mod(?:_|$)/;
+// Blend-4 UV0+UV1 Warglaive form: steady UV0 energy plus its UV1-modulated wave.
+const _STEADY_MOD_RE = /_steady(?:_|$)/;
 
 /**
  * Reconstruct a WoW multi-texture MODULATE pass — the "wave" combine.
@@ -288,16 +290,20 @@ export function applyMultiTexture(sceneRoot) {
             mat.aoMap = modTex;
             mat.aoMapIntensity = 0;
 
+            const steadyGlow = _STEADY_MOD_RE.test(mat.name);
             mat.onBeforeCompile = (shader) => {
-                // map_fragment has just set diffuseColor from the SCROLLED sample (vMapUv). Multiply the
-                // STATIC sample (aoMap at vAoMapUv = UV1) to get the modulated, moving wave — the product
-                // WoW's fixed-function multi-texture stage produces and two additive passes cannot.
+                // map_fragment has set diffuseColor from the SCROLLING sample. The ordinary form
+                // multiplies it by the static UV1 sample. The Warglaive's marked blend-4 form also
+                // retains that static sample as a permanent glow beneath the brighter moving wave.
+                const combine = steadyGlow
+                    ? 'vec4 suiMoving = diffuseColor;\n\tvec4 suiSteady = texture2D( aoMap, vAoMapUv );\n\tvec4 suiWave = suiSteady * suiMoving;\n\tdiffuseColor = suiSteady;\n\tdiffuseColor.rgb += suiWave.rgb;\n\tdiffuseColor.a = max( suiSteady.a, suiWave.a );'
+                    : 'diffuseColor *= texture2D( aoMap, vAoMapUv );';
                 shader.fragmentShader = shader.fragmentShader.replace(
                     '#include <map_fragment>',
-                    '#include <map_fragment>\n\tdiffuseColor *= texture2D( aoMap, vAoMapUv );');
+                    '#include <map_fragment>\n\t' + combine);
             };
             // Keep this program out of the shared cache so a plain additive material never reuses it.
-            mat.customProgramCacheKey = () => 'suiModCombine';
+            mat.customProgramCacheKey = () => steadyGlow ? 'suiSteadyModCombine' : 'suiModCombine';
             mat.needsUpdate = true;
             converted++;
         }
