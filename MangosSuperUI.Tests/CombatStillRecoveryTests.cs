@@ -85,6 +85,7 @@ public sealed class CombatStillRecoveryTests
         var (ctx, id) = ContextAt(100, 200, inCombat: true);
         ctx.LastStateReceivedUtc = T0;
         BotBrain.ObserveFreshStillPosition(ctx, id);
+        id.WedgeStreak = 2;
 
         ctx.Pos = new Vec3(104, 200, 30);
         ctx.LastStateReceivedUtc = T0.AddSeconds(5);
@@ -94,6 +95,119 @@ public sealed class CombatStillRecoveryTests
         Assert.Equal(StillObservationKind.Moved, observation.Kind);
         Assert.Equal(104, id.StillAnchorX);
         Assert.Equal(T0.AddSeconds(5), id.StillSinceUtc);
+        Assert.Equal(T0.AddSeconds(5), ctx.LastPhysicalAdvanceUtc);
+        Assert.Equal(ctx.BridgeSessionId, ctx.LastPhysicalAdvanceBridgeSessionId);
+        Assert.Equal(0, id.WedgeStreak);
+    }
+
+    [Fact]
+    public void StaleOutcome_WithFreshSameSessionMovement_DoesNotTripWedge()
+    {
+        var (ctx, _) = ContextAt(100, 200, inCombat: false);
+        ctx.Sense(State(sessionId: 77, stateUtc: T0, inCombat: false));
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        ctx.LastPhysicalAdvanceUtc = T0.AddSeconds(-10);
+        ctx.LastPhysicalAdvanceBridgeSessionId = 77;
+
+        Assert.Equal(WedgeGate.PhysicalAdvanceFresh, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void FreshMovement_CannotMaskFastFailureLoop()
+    {
+        var (ctx, _) = ContextAt(100, 200, inCombat: false);
+        ctx.Sense(State(sessionId: 77, stateUtc: T0, inCombat: false));
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        ctx.LastPhysicalAdvanceUtc = T0.AddSeconds(-1);
+        ctx.LastPhysicalAdvanceBridgeSessionId = 77;
+        ctx.ConsecutiveFailures = 8;
+
+        Assert.Equal(WedgeGate.FailureLoop, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void OldOrSupersededMovement_CannotMaskStaleOutcome()
+    {
+        var (ctx, _) = ContextAt(100, 200, inCombat: false);
+        ctx.Sense(State(sessionId: 77, stateUtc: T0, inCombat: false));
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        ctx.LastPhysicalAdvanceUtc = T0.AddSeconds(-16);
+        ctx.LastPhysicalAdvanceBridgeSessionId = 77;
+
+        Assert.Equal(WedgeGate.OutcomeStale, BotBrain.ClassifyWedgeGate(ctx, T0));
+
+        ctx.LastPhysicalAdvanceUtc = T0.AddSeconds(-1);
+        ctx.LastPhysicalAdvanceBridgeSessionId = 76;
+        Assert.Equal(WedgeGate.OutcomeStale, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void DeadBot_IsOwnedByDeathRecoveryInsteadOfSlowWedge()
+    {
+        var (ctx, _) = ContextAt(100, 200, inCombat: false);
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        ctx.Dead = true;
+
+        Assert.Equal(WedgeGate.DeathRecovery, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void ActiveCombat_IsProtectedBeforePhysicalStillProofMatures()
+    {
+        var (ctx, id) = ContextAt(100, 200, inCombat: true);
+        ctx.Sense(State(sessionId: 77, stateUtc: T0, inCombat: true));
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        id.StillSinceUtc = T0.AddSeconds(-30);
+        ctx.LastStillObservationStateUtc = T0;
+        ctx.LastStillObservationBridgeSessionId = 77;
+
+        Assert.Equal(WedgeGate.ActiveCombat, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void HeldEngagement_ProtectsSlowClockWhenCombatBitLags()
+    {
+        var (ctx, _) = ContextAt(100, 200, inCombat: false);
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        ctx.HeldTask = new HeldTaskEcho(
+            HeldTaskKind.Grind, TaskActivity.Engaged, 123, default, 0);
+
+        Assert.Equal(WedgeGate.ActiveCombat, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void HeldRecovery_IsOwnedByTaskInsteadOfSlowWedge()
+    {
+        var (ctx, _) = ContextAt(100, 200, inCombat: false);
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        ctx.HeldTask = new HeldTaskEcho(
+            HeldTaskKind.Grind, TaskActivity.Recovering, 123, default, 0);
+
+        Assert.Equal(WedgeGate.TaskRecovery, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void ProvenCombatStill_RemainsEligibleToAccrueRecoveryStreak()
+    {
+        var (ctx, id) = ContextAt(100, 200, inCombat: true);
+        ctx.Sense(State(sessionId: 77, stateUtc: T0, inCombat: true));
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        id.StillSinceUtc = T0.AddSeconds(-120);
+        ctx.LastStillObservationStateUtc = T0;
+        ctx.LastStillObservationBridgeSessionId = 77;
+
+        Assert.Equal(WedgeGate.OutcomeStale, BotBrain.ClassifyWedgeGate(ctx, T0));
+    }
+
+    [Fact]
+    public void ProtectedState_CannotMaskFastFailureLoop()
+    {
+        var (ctx, _) = ContextAt(100, 200, inCombat: true);
+        ctx.LastProgressUtc = T0.AddSeconds(-151);
+        ctx.Dead = true;
+        ctx.ConsecutiveFailures = 8;
+
+        Assert.Equal(WedgeGate.FailureLoop, BotBrain.ClassifyWedgeGate(ctx, T0));
     }
 
     [Fact]

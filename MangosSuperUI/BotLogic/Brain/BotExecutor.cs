@@ -734,6 +734,30 @@ public sealed class BotExecutor
         _logger.LogDebug("[EXEC] {Name} ack {Type} via {Evt}",
             ctx.Name, pending.CommandType, evt.EventType);
 
+        if (pending.CommandType.Equals("SELL_ITEMS", StringComparison.OrdinalIgnoreCase)
+            && evt.EventType.Equals("SELL_ACK", StringComparison.OrdinalIgnoreCase))
+        {
+            var sell = ParsePipe(evt.Data);
+            if (sell.TryGetValue("free_slots", out string? freeText)
+                && int.TryParse(freeText, out int freeSlots)
+                && freeSlots >= 0)
+            {
+                ctx.FreeSlots = freeSlots;
+            }
+
+            bool nothingToSell = sell.TryGetValue("nothing_to_sell", out string? nothingText)
+                && nothingText == "1";
+            if (ctx.Service is { } vendor)
+                vendor.NothingToSell = nothingToSell;
+
+            CircuitTrace.Hit(
+                ctx.Guid,
+                nothingToSell
+                    ? "event: correlated SELL_ACK says bags full with nothing sellable"
+                    : "event: correlated SELL_ACK projected free slots",
+                ctx.FreeSlots);
+        }
+
         bool combatStillResetAck = pending.CommandType.Equals(
                 BotBrain.CombatStillResetCommandType,
                 StringComparison.OrdinalIgnoreCase)

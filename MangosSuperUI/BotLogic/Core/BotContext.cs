@@ -216,6 +216,7 @@ public sealed class ServiceScratch
     public bool CanRepair { get; set; }                   // selected vendor has UNIT_NPC_FLAG_REPAIR
     public DateTime StartedUtc { get; set; }              // trip start — drives the never-arrived give-up
     public int RouteFails { get; set; }                   // consecutive no_paths on the vendor route leg — drives the teleport-assist (TeleportAssist.AfterNoPaths)
+    public bool NothingToSell { get; set; }               // correlated SELL_ACK said sold=0/free_slots=0; use the longer retry cooldown
 }
 
 // Trainer errand scratch (driven by TrainingPlanner under Goal.Training, on ctx.Train).
@@ -471,7 +472,7 @@ public sealed class BotContext
     public int? DeathBlameQuestId { get; set; }
 
     // ---- progress ----
-    public DateTime LastProgressUtc { get; set; } = DateTime.UtcNow;  // last forward motion of ANY kind
+    public DateTime LastProgressUtc { get; set; } = DateTime.UtcNow;  // acknowledged/outcome progress; physical travel is tracked separately
     public DateTime LastKillUtc { get; set; }
     public DateTime LastQuestAdvanceUtc { get; set; }
     public DateTime LastLevelUtc { get; set; }
@@ -583,6 +584,11 @@ public sealed class BotContext
     internal DateTime LastStillObservationStateUtc { get; set; }
     internal long LastStillObservationBridgeSessionId { get; set; }
     internal int StillAnchorMapId { get; set; } = -1;
+    // Positive, fresh-STATE proof that the bot crossed the physical-still radius. The wedge breaker
+    // consumes this separately from LastProgressUtc so travel can disprove stranding without pretending
+    // that walking completed a kill, quest, or acknowledged objective.
+    internal DateTime LastPhysicalAdvanceUtc { get; set; }
+    internal long LastPhysicalAdvanceBridgeSessionId { get; set; }
     internal CombatStillRecoveryStage CombatStillRecoveryStage { get; set; }
     internal DateTime CombatStillResetIssuedStateUtc { get; set; }
     internal DateTime CombatStillResetAckReceivedUtc { get; set; }

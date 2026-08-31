@@ -19,6 +19,17 @@ internal enum StillObservationKind
 
 internal readonly record struct StillObservation(StillObservationKind Kind, double ElapsedSeconds);
 
+internal enum WedgeGate
+{
+    ProgressFresh,
+    PhysicalAdvanceFresh,
+    DeathRecovery,
+    ActiveCombat,
+    TaskRecovery,
+    OutcomeStale,
+    FailureLoop
+}
+
 internal enum CombatStillResetGate
 {
     Eligible,
@@ -73,12 +84,19 @@ public sealed class BotBrain
 
     // ── No-progress circuit breaker (the universal silent/fast-stall net) ──
     // LastProgressUtc advances ONLY on a real ack/kill/quest/level. A silent no-kill grind and a fast
-    // fail-loop (negated <1s, never marks progress) both FREEZE it; the Supervisor's deadline rule only
-    // catches a slow hang (a WAIT past its deadline), so these slip through. This fires every tick,
-    // regardless of Pending/Failure/goal.
+    // fail-loop (negated <1s, never marks progress) both FREEZE it. Fresh same-session position movement
+    // vetoes only the slow outcome-clock arm; explicit failures remain authoritative. The Supervisor's
+    // deadline rule only catches a slow hang (a WAIT past its deadline). Death recovery, productive
+    // combat, and the C++ Recovering activity also own their ticks; proven 120-second combat immobility
+    // deliberately remains eligible so the correlated combat-still ladder can accrue its wedge streak.
+    // This still evaluates every tick, regardless of Pending/Failure/goal.
     private const double WedgeCeilingSec = 150;   // no real progress this long → wedged
     private const int WedgeFailCap = 8;     // …or this many back-to-back negated WAITs (fast fail-loop)
     private const double WedgeBackoffSec = 5;    // park this long, then resume + relocate to a fresh cell
+    // ObserveFreshStillPosition consumes STATE at most once. Retain its positive movement proof for the
+    // same 15-second budget as STATE continuity so the faster brain ticks between fresh STATE packets do
+    // not turn a long, healthy travel leg into an outcome-clock wedge.
+    private const double PhysicalAdvanceFreshSec = StillStateContinuitySec;
 
     // [ESCAPE] (FINDING_010) Stranded escalation: this many consecutive wedge trips with zero real
     // kills in between (WedgeStreak — a kill clears it) means the park→local-relocate ladder is not
@@ -354,8 +372,9 @@ public sealed class BotBrain
     /// <summary>
     /// No-progress circuit breaker. Trips when the bot has made no REAL progress for WedgeCeilingSec
     /// (LastProgressUtc — kills/acks only) OR is in a fast fail-loop (WedgeFailCap back-to-back negated
-    /// WAITs, e.g. relocate MOVE_FAILED no_path at tick speed when the bot is off the navmesh). On trip:
-    /// stop whatever's in flight, record the current grind cell as DEAD so the next relocation goes
+    /// WAITs, e.g. relocate MOVE_FAILED no_path at tick speed when the bot is off the navmesh). The slow
+    /// clock cannot trip while fresh same-session STATE proves physical advancement. On trip: stop
+    /// whatever's in flight, record the current grind cell as DEAD so the next relocation goes
     /// somewhere new, and PARK on a backoff (GoalSelector holds Idle) so it stops thrashing. A real kill
     /// clears the streak + dead-cell history (BotContext.OnGrindProgress). There is no live-teleport in
     /// the bridge, so a genuinely off-mesh bot can only be parked + probed slowly here — un-wedging it is
@@ -368,18 +387,50 @@ public sealed class BotBrain
         // gate; kept as a wall against call-order drift.)
         if (ctx.Conscripted || ctx.Possessed) { CircuitTrace.Hit(ctx.Guid, "wedge: external control exempt"); return false; }
         var id = ctx.Identity;
-        if (id?.WedgeBackoffUntil is DateTime parked && DateTime.UtcNow < parked)
+        DateTime utcNow = DateTime.UtcNow;
+        if (id?.WedgeBackoffUntil is DateTime parked && utcNow < parked)
         {
             CircuitTrace.Hit(ctx.Guid, "wedge: already parked, backoff holds");
             return false;   // already parked — let the backoff hold; GoalSelector keeps it Idle
         }
 
-        bool wedged = ctx.TimeSinceProgressSec > WedgeCeilingSec || ctx.ConsecutiveFailures >= WedgeFailCap;
-        if (!wedged) { CircuitTrace.Hit(ctx.Guid, "wedge: no wedge (progress fresh)"); return false; }
-        CircuitTrace.Hit(ctx.Guid, "wedge: TRIPPED", ctx.TimeSinceProgressSec);
+        WedgeGate gate = ClassifyWedgeGate(ctx, utcNow);
+        if (gate == WedgeGate.ProgressFresh)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: no wedge (progress fresh)");
+            return false;
+        }
+        if (gate == WedgeGate.PhysicalAdvanceFresh)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: outcome stale but physical advance fresh",
+                Math.Max(0, (utcNow - ctx.LastPhysicalAdvanceUtc).TotalSeconds));
+            return false;
+        }
+
+        if (gate == WedgeGate.DeathRecovery)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: outcome stale but death recovery owns bot");
+            return false;
+        }
+        if (gate == WedgeGate.ActiveCombat)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: outcome stale but active combat owns bot");
+            return false;
+        }
+        if (gate == WedgeGate.TaskRecovery)
+        {
+            CircuitTrace.Hit(ctx.Guid, "wedge: outcome stale but task recovery owns bot");
+            return false;
+        }
+
+        double noProg = Math.Max(0, (utcNow - ctx.LastProgressUtc).TotalSeconds);
+        CircuitTrace.Hit(ctx.Guid, "wedge: TRIPPED", noProg);
+        if (gate == WedgeGate.FailureLoop)
+            CircuitTrace.Hit(ctx.Guid, "wedge: trip cause failure loop", ctx.ConsecutiveFailures);
+        else
+            CircuitTrace.Hit(ctx.Guid, "wedge: trip cause outcome stale", noProg);
         CircuitTrace.RequestDump(ctx.Guid, "wedge");   // R8: flush this bot's recent ring even if nobody armed it
 
-        double noProg = ctx.TimeSinceProgressSec;
         int fails = ctx.ConsecutiveFailures;
 
         _executor.ClearPending(ctx);
@@ -714,6 +765,7 @@ public sealed class BotBrain
         if (priorStateUtc != default
             && ctx.LastStillObservationBridgeSessionId != ctx.BridgeSessionId)
         {   // cb:fold observation classifier; caller probes BridgeSessionChanged
+            ClearPhysicalAdvanceEvidence(ctx);
             ResetStillWindow(ctx, id, stateUtc);
             return new(StillObservationKind.BridgeSessionChanged, 0);
         }
@@ -722,12 +774,14 @@ public sealed class BotBrain
 
         if (priorStateUtc == default || id.StillSinceUtc == default)   // cb:fold observation classifier; caller probes Seeded
         {   // cb:fold observation classifier; caller probes Seeded
+            ClearPhysicalAdvanceEvidence(ctx);
             ResetStillWindow(ctx, id, stateUtc);
             return new(StillObservationKind.Seeded, 0);
         }
 
         if ((stateUtc - priorStateUtc).TotalSeconds > StillStateContinuitySec)   // cb:fold observation classifier; caller probes ContinuityReset
         {   // cb:fold observation classifier; caller probes ContinuityReset
+            ClearPhysicalAdvanceEvidence(ctx);
             ResetStillWindow(ctx, id, stateUtc);
             return new(StillObservationKind.ContinuityReset, 0);
         }
@@ -735,6 +789,7 @@ public sealed class BotBrain
         ctx.LastStillObservationStateUtc = stateUtc;
         if (ctx.StillAnchorMapId != ctx.MapId)   // cb:fold observation classifier; caller probes MapChanged
         {   // cb:fold observation classifier; caller probes MapChanged
+            ClearPhysicalAdvanceEvidence(ctx);
             ResetStillWindow(ctx, id, stateUtc);
             return new(StillObservationKind.MapChanged, 0);
         }
@@ -744,12 +799,60 @@ public sealed class BotBrain
         if (dx * dx + dy * dy > StuckStillRadius * StuckStillRadius)   // cb:fold observation classifier; caller probes Moved
         {   // cb:fold observation classifier; caller probes Moved
             ResetStillWindow(ctx, id, stateUtc);
+            ctx.LastPhysicalAdvanceUtc = stateUtc;
+            ctx.LastPhysicalAdvanceBridgeSessionId = ctx.BridgeSessionId;
+            if (id.WedgeStreak > 0)
+            {
+                CircuitTrace.Hit(ctx.Guid, "wedge: physical advance clears stranded streak", id.WedgeStreak);
+                id.WedgeStreak = 0;
+            }
             return new(StillObservationKind.Moved, 0);
         }
 
         return new(
             StillObservationKind.Still,
             Math.Max(0, (stateUtc - id.StillSinceUtc).TotalSeconds));
+    }
+
+    internal static WedgeGate ClassifyWedgeGate(BotContext ctx, DateTime utcNow)
+    {
+        // A rapid series of explicit failures remains authoritative even if the bot happened to move
+        // recently. Every exemption below applies only to the slow outcome-clock arm.
+        if (ctx.ConsecutiveFailures >= WedgeFailCap)   // cb:fold pure wedge classifier; caller probes FailureLoop
+            return WedgeGate.FailureLoop;
+
+        if ((utcNow - ctx.LastProgressUtc).TotalSeconds <= WedgeCeilingSec)   // cb:fold pure wedge classifier; caller probes ProgressFresh
+            return WedgeGate.ProgressFresh;
+
+        if (ctx.Dead)   // cb:fold pure wedge classifier; caller probes DeathRecovery
+            return WedgeGate.DeathRecovery;
+
+        bool productiveCombat = ctx.InCombat || ctx.HeldTask.Activity == TaskActivity.Engaged;
+        if (productiveCombat && !HasProvenPhysicalStill(ctx))   // cb:fold pure wedge classifier; caller probes ActiveCombat
+            return WedgeGate.ActiveCombat;
+
+        if (ctx.HeldTask.Activity == TaskActivity.Recovering)   // cb:fold pure wedge classifier; caller probes TaskRecovery
+            return WedgeGate.TaskRecovery;
+
+        bool physicalAdvanceFresh = ctx.LastPhysicalAdvanceUtc != default
+            && ctx.LastPhysicalAdvanceBridgeSessionId == ctx.BridgeSessionId
+            && utcNow >= ctx.LastPhysicalAdvanceUtc
+            && (utcNow - ctx.LastPhysicalAdvanceUtc).TotalSeconds <= PhysicalAdvanceFreshSec;
+        if (physicalAdvanceFresh)   // cb:fold pure wedge classifier; caller probes PhysicalAdvanceFresh
+            return WedgeGate.PhysicalAdvanceFresh;
+
+        return WedgeGate.OutcomeStale;
+    }
+
+    private static bool HasProvenPhysicalStill(BotContext ctx)
+    {
+        BotIdentity? id = ctx.Identity;
+        return id != null
+            && id.StillSinceUtc != default
+            && ctx.LastStillObservationStateUtc != default
+            && ctx.LastStillObservationBridgeSessionId == ctx.BridgeSessionId
+            && ctx.LastStillObservationStateUtc >= id.StillSinceUtc
+            && (ctx.LastStillObservationStateUtc - id.StillSinceUtc).TotalSeconds >= StuckStillSeconds;
     }
 
     internal static CombatStillResetGate ClassifyCombatStillResetGate(
@@ -939,6 +1042,12 @@ public sealed class BotBrain
         ctx.StillAnchorMapId = ctx.MapId;
         ctx.LastStillObservationStateUtc = stateUtc;
         ctx.LastStillObservationBridgeSessionId = ctx.BridgeSessionId;
+    }
+
+    private static void ClearPhysicalAdvanceEvidence(BotContext ctx)
+    {
+        ctx.LastPhysicalAdvanceUtc = default;
+        ctx.LastPhysicalAdvanceBridgeSessionId = 0;
     }
 
     private static void ResetCombatStillRecovery(BotContext ctx, bool clearCooldown)

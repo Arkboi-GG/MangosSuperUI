@@ -79,6 +79,49 @@ public sealed class BridgeIntegrityTests
     }
 
     [Fact]
+    public void SellAck_NothingToSell_RequiresCorrelationAndProjectsVendorState()
+    {
+        var executor = new BotExecutor(
+            bridge: null!,
+            safety: null!,
+            logger: NullLogger<BotExecutor>.Instance);
+        var context = new BotContext
+        {
+            FreeSlots = 5,
+            Service = new ServiceScratch(),
+            Pending = Pending("SELL_ITEMS", "SELL_ACK", 42)
+        };
+
+        Assert.False(executor.OnEvent(context, new BotEvent
+        {
+            EventType = "SELL_ACK",
+            CorrelationId = 41,
+            Data = "sold=0|free_slots=0|nothing_to_sell=1"
+        }));
+        Assert.NotNull(context.Pending);
+        Assert.False(context.Service.NothingToSell);
+        Assert.Equal(5, context.FreeSlots);
+
+        Assert.True(executor.OnEvent(context, new BotEvent
+        {
+            EventType = "SELL_ACK",
+            CorrelationId = 42,
+            Data = "sold=0|free_slots=0|nothing_to_sell=1"
+        }));
+        Assert.Null(context.Pending);
+        Assert.True(context.Service.NothingToSell);
+        Assert.Equal(0, context.FreeSlots);
+    }
+
+    [Fact]
+    public void NothingToSell_UsesLongerVendorCompletionCooldown()
+    {
+        Assert.True(
+            MaintenancePlanner.VendorCompletionCooldownSeconds(nothingToSell: true)
+            > MaintenancePlanner.VendorCompletionCooldownSeconds(nothingToSell: false));
+    }
+
+    [Fact]
     public void QuestCastFailure_NegatesOnlyItsCorrelatedCast()
     {
         var pending = Pending("QUEST_CAST", "QUEST_CAST_ACK", 77);
