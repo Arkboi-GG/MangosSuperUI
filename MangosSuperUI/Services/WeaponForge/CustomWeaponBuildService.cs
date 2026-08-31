@@ -150,6 +150,11 @@ public sealed class CustomWeaponBuildService
         public string Stage = "start";
     }
 
+    /// <summary>Later-client fidelity imports already carry authored material timing.
+    /// Adding a generic pulse changes a steady source glow into an invented bright/dim loop.</summary>
+    internal static bool ShouldInventGlowPulse(string sourceKind)
+        => sourceKind is not ("tbc_import" or "wotlk_import");
+
     public async Task<CustomWeaponBuildResult> BuildAsync(CustomWeaponBuildRequest request)
     {
         var trace = new ForgeAttemptTrace();
@@ -339,27 +344,35 @@ public sealed class CustomWeaponBuildService
                 }
                 catch (Exception ex) { diag.Warn("motion.failed", $"Emitter graft skipped: {ex.Message}"); }
             }
-            // Motion, part two: a glow baked in as an additive PASS (rather than an emitter) still
-            // sits dead. 1.12 animates exactly this with a colour track on a global sequence — the
-            // same thing Sparkle_A does — so give every additive pass a slow breath.
-            try
+            // Generated art can opt into the Forge's generic additive "breath". Later-client
+            // fidelity imports must keep their authored timing: the TBC Warglaive's glow is
+            // constant while its second texture unit scrolls the lines up the blade.
+            if (ShouldInventGlowPulse(request.SourceKind))
             {
-                var parsedForPulse = M2Reader.Parse(m2);
-                if (parsedForPulse is not null)
+                try
                 {
-                    var glowColors = RawM2.M2GlowPulseWriter.AdditiveColorIndices(parsedForPulse);
-                    if (glowColors.Count > 0)
+                    var parsedForPulse = M2Reader.Parse(m2);
+                    if (parsedForPulse is not null)
                     {
-                        var pulse = RawM2.M2GlowPulseWriter.Apply(m2, glowColors);
-                        if (pulse.Pulsed > 0)
+                        var glowColors = RawM2.M2GlowPulseWriter.AdditiveColorIndices(parsedForPulse);
+                        if (glowColors.Count > 0)
                         {
-                            m2 = pulse.M2;
-                            foreach (var note in pulse.Notes) diag.Info("motion.pulse", note);
+                            var pulse = RawM2.M2GlowPulseWriter.Apply(m2, glowColors);
+                            if (pulse.Pulsed > 0)
+                            {
+                                m2 = pulse.M2;
+                                foreach (var note in pulse.Notes) diag.Info("motion.pulse", note);
+                            }
                         }
                     }
                 }
+                catch (Exception pex) { diag.Warn("motion.pulse.failed", $"Glow pulse skipped: {pex.Message}"); }
             }
-            catch (Exception pex) { diag.Warn("motion.pulse.failed", $"Glow pulse skipped: {pex.Message}"); }
+            else
+            {
+                diag.Info("motion.pulse.preserved",
+                    "Preserved the later-client material timing; no synthetic additive glow pulse was added.");
+            }
             blp = compiled.Blp ?? ExtractDonorBlp(donor);
             for (int i = 0; i < compiled.EffectBlps.Count && effectPaths is not null; i++)
                 effectBlps.Add((effectPaths[i], compiled.EffectBlps[i]));
