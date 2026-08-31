@@ -223,7 +223,10 @@ public sealed class MaintenancePlanner : IBotPlanner
     private const double VendorPhantomCooldownSec = 45;   // vendor/repair NPC wasn't in the world at arrival (runtime despawn / pool rotation past the load-time event-gate filter) — re-resolves fast, so a SHORT retry, not the 300s policy giveup
     private const double VendorDoneCooldownSec = 90;   // after a completed trip, let STATE durability/slots refresh before re-triggering
     private const float VendorArriveYards = 15f;  // C++ finds the NPC within 15yd — must be this close to sell/repair
-    private const int SellKeepQuality = 2;    // sell grey+white, keep green+ (personality-tuned greed dropped for now)
+    private const int SellKeepQuality = 2;    // misc keeps green+; C++ temporarily sells recipes until bots join the simulated economy
+
+    internal static double VendorCompletionCooldownSeconds(bool nothingToSell)
+        => nothingToSell ? VendorGiveupCooldownSec : VendorDoneCooldownSec;
 
     public Goal Handles => Goal.Maintenance;
 
@@ -794,19 +797,32 @@ public sealed class MaintenancePlanner : IBotPlanner
         return null;
     }
 
-    // Trip done — short cooldown so STATE (durability/slots) can refresh before the trigger
-    // re-evaluates, clear the errand, release to the GoalSelector.
+    // Trip done — normally use a short cooldown so STATE can refresh. A correlated
+    // nothing_to_sell=1 means the core proved that a full inventory contains no item
+    // permitted by the current sell policy; use the longer give-up cooldown so the bot
+    // can pursue a quest/turn-in instead of commuting back to the same vendor every 90s.
     private StepResult FinishVendor(BotContext ctx)
     {
         if (ReturnIfTeleported(ctx, tripFailed: false) is { } ret) { CircuitTrace.Hit(ctx.Guid, "maint: return hop before finish"); return ret; }   // hop home first if we teleported in
-        if (ctx.Identity is { } id) { CircuitTrace.Hit(ctx.Guid, "maint: vendor done, cooldown set", VendorDoneCooldownSec); id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(VendorDoneCooldownSec); }
+        bool nothingToSell = ctx.Service?.NothingToSell == true;
+        double cooldownSec = VendorCompletionCooldownSeconds(nothingToSell);
+        if (ctx.Identity is { } id)
+        {
+            CircuitTrace.Hit(
+                ctx.Guid,
+                nothingToSell
+                    ? "maint: nothing sellable, longer cooldown set"
+                    : "maint: vendor done, cooldown set",
+                cooldownSec);
+            id.VendorCooldownUntil = DateTime.UtcNow.AddSeconds(cooldownSec);
+        }
         ctx.Service = null;
-        ctx.SetStep("vendor_done");
+        ctx.SetStep(nothingToSell ? "vendor_done:nothing_sellable" : "vendor_done");
         // [VENDOR] point 5 — reached the END of the errand cleanly. If bag is STILL 0 / dur
-        // still low here, the trip completed but accomplished nothing (→ it'll re-trigger
-        // after the done-cooldown). This is the success path's narration.
-        _log.LogInformation("[VENDOR] {Name} FINISH (done cooldown {Sec}s) bag={Bag} dur={Dur}",
-            ctx.Name, VendorDoneCooldownSec, ctx.FreeSlots, ctx.Durability);
+        // still low here, the correlated SELL_ACK disposition explains whether this was a
+        // normal refresh delay or a policy-limited no-sale backoff.
+        _log.LogInformation("[VENDOR] {Name} FINISH (cooldown {Sec}s, nothingSellable={Nothing}) bag={Bag} dur={Dur}",
+            ctx.Name, cooldownSec, nothingToSell, ctx.FreeSlots, ctx.Durability);
         return StepResult.Complete();
     }
 

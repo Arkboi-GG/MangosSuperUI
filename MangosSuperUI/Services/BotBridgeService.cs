@@ -2215,12 +2215,13 @@ public class BotBridgeService : BackgroundService
                 {
                     var sellParts = ParsePipeDelimited(evt.Data);
                     _logger.LogInformation(
-                        "BotBridge: SELL_ACK {Name} — sold={Sold} earned={Earned}c free={Free} total={Total}c",
+                        "BotBridge: SELL_ACK {Name} — sold={Sold} earned={Earned}c free={Free} total={Total}c nothingToSell={Nothing}",
                         conn.State.Name,
                         sellParts.GetValueOrDefault("sold", "0"),
                         sellParts.GetValueOrDefault("copper_earned", "0"),
                         sellParts.GetValueOrDefault("free_slots", "0"),
-                        sellParts.GetValueOrDefault("copper_total", "0"));
+                        sellParts.GetValueOrDefault("copper_total", "0"),
+                        sellParts.GetValueOrDefault("nothing_to_sell", "0"));
                     await _hub.Clients.All.SendAsync("BotEvent", new
                     {
                         guid = conn.Guid,
