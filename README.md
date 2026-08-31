@@ -1,417 +1,505 @@
 # MangosSuperUI
 
-[https://discord.gg/AzCdnyPHPY](https://discord.gg/3u3tnMnweE) - Community Discord for updates, questions, bugs, etc.
+[Community Discord](https://discord.gg/AzCdnyPHPY) - Updates, questions, bugs, discussion, and development notes.
 
-https://www.youtube.com/@Yafrovon — Video walkthroughs and feature demos
+[YouTube](https://www.youtube.com/@Yafrovon) - Video walkthroughs, feature demos, and progress updates.
 
-MangosSuperUI is an integrated development platform for building a deeply modified Vanilla WoW experience around a [VMaNGOS](https://github.com/vmangos/core) fork (SuperUi-Core).
+<!-- RELEASE TODO
+Confirm that AzCdnyPHPY is the permanent Discord invite before publishing. The previous README displayed this invite but linked to a different one.
+Publish the MSUIClient repository before this draft replaces the live README. Its links currently return 404 while the repository is private or unavailable.
+-->
 
-It combines a browser-based operations and content-authoring platform, a companion VMaNGOS fork, an autonomous playerbot simulation, custom loot and spell pipelines, world-editing tools, and an engineering knowledge base.
+MangosSuperUI is the tooling and game stack I'm building for the version of Vanilla WoW I want to play.
 
-I am not designing these as isolated utilities. They are instead designed as one system: SuperUI allows you to modify and tweak the gameplay feel from a UI and operates the world, while SuperUI-Core executes the server-side mechanics and bots (the VMaNGOS fork).
+It started as a web UI for running my SuperUI-Core (a heavily moodified VMaNGOS server) and making large changes to the world without living in SQL editors, configuration files, and one-off scripts.
 
-It is the tooling and runtime stack I'm building for the particular version of Vanilla I want to build and play. It can absolutely still be used with stock VMaNGOS - but many of the features (the SuperUI bots, lootifiers, and other future changes) simply won't work as there is no mechanism within stock VMaNGOS for those actions to happen.
+From there it grew into content creation, custom loot, spells, world editing, playerbots, and the tools to understand what the server is actually doing.
 
+Now it also includes MSUIClient, because I eventually hit the same wall on the client side. Some of the things I want to build are not addon problems. If I want a different camera, direct access to my party, in-world creation tools, and controls the original client never had, then I need a client I can change too.
 
+A lot of it works today. A lot of it still needs work.
 
-<!-- Nico: leaving "Why This Exists" untouched per your note that you're rewriting it. -->
+> **Work in Progress:** All three projects are functional and all three are still being built. Nothing here is done by the standard I'm aiming for.
+
+![MSUIClient gameplay](Screenshots/msuiclient-gameplay.png)
+
+## Why There Are Three Projects Now
+
+This stopped fitting into one application because different parts of the game have to happen in different places.
+
+- [MangosSuperUI](https://github.com/Yafrovon/MangosSuperUI) is where I run the server, edit the world, forge items, create spells, manage bots, inspect data, build patches, and generally decide what I want the world to be.
+- [SuperUI-Core](https://github.com/Yafrovon/SuperUI-Core) is my VMaNGOS fork. It handles the things that have to happen inside the running server, including persistent playerbots, custom gameplay hooks, Lootifiers, combat execution, possession, and party control.
+- [MSUIClient](https://github.com/Yafrovon/MSUIClient) is the client I actually enter the world through. It supports normal MMO play, but it also gives me room to build the party controls and in-world creation tools I could never add cleanly to the original 1.12 client.
+
+I'm not trying to turn these into three products that happen to share a name. MangosSuperUI is where I shape the world, SuperUI-Core is where that world runs, and MSUIClient is where I play it.
+
+Do you need all three to get any use out of this? No.
+
+- MangosSuperUI can still do a lot with stock VMaNGOS.
+- The original 1.12.1 client still works with SuperUI-Core.
+- MSUIClient can do basic Vanilla play against a compatible VMaNGOS server.
+- The bots, Lootifiers, possession, and party controls use SuperUI-Core.
+- Creator Mode and NPC Dev use MangosSuperUI when they hand work back to the web app.
+
+The version I'm building for myself uses all three. That is where the persistent bots, custom game mechanics, in-client tools, and party controls come together.
+
+![The SuperUI project architecture](Screenshots/superui-architecture.png)
 
 ## Why This Exists
 
-I run a 1.12 VMaNGOS emulation server at home — not public, just for me. 
+I run a 1.12 VMaNGOS emulation server at home - not public, just for me.
 
-We all have our own idea of what vanilla could have been, or what we wanted it to be. To make that happen for myself, I needed a way to modify and tune the gameworld in large, batched jobs, so that I could achieve that vision, and replay later with potentially a slightly new take.
+We all have our own idea of what Vanilla could have been, or what we wanted it to be. To make that happen for myself, I needed a way to modify and tune the game world in large, repeatable jobs so I could build that version, play it, and later start again with a slightly different take.
 
-My end goal is a living game world with thousands of AI-driven bots that feel real enough, custom spells, items, gameplay loop additions that feel vanilla but add flavor, and the tooling to iterate on all of it rapidly and repeatedly from a single coherent tool that works via intuitive user interfaces instead of retooling myself mentally for each separate subsystem.
+My end goal is a living game world with thousands of AI-driven characters that feel real enough, custom spells and items, gameplay additions that feel like they belong in Vanilla, and the tooling to iterate on all of it without mentally retooling myself for every separate subsystem.
 
-I'm open-sourcing it because if I wanted this, other people running VMaNGOS — or those who want to explore 1.12 vanilla emulation — probably could too. It's first and foremost a tool I'm building towards my vision and is not a commercial product. Feedback, bug reports, and contributions are welcome.
+I want to be able to change an entire loot system, forge a weapon, move a building, inspect why a bot made a bad decision, change its combat priorities, and then log in and play the result. That is what turned a server-admin UI into this much larger project.
 
-> **⚠️ Work in Progress:** MangosSuperUI is functional and actively used, but it is not finished. Nothing in it is "done" — see the status board below for where each piece actually stands. Some planned sections (vendors, creatures, quests) are not yet built.
+MSUIClient closes the missing part of that loop. I can modify the world, run the world, and now change how I interact with it from inside the game.
 
-![Dashboard](Screenshots/dashboard.png)
+I'm open-sourcing it because if I wanted this, other people running VMaNGOS - or people who simply want to explore Vanilla client and server emulation - probably could too. It is first and foremost the tooling and game stack I'm building toward my own vision. It is not a commercial product. Feedback, bug reports, and contributions are welcome.
 
-## Disclaimer
+## MMO First, Party CRPG When I Want It
 
-This project is not affiliated with or endorsed by Blizzard Entertainment.
-World of Warcraft® is a registered trademark of Blizzard Entertainment, Inc.
-MangosSuperUI does not distribute any Blizzard assets — icons, 3D models, and minimap tiles are read on demand from your own WoW 1.12.1 client's MPQ archives (set the Client Data Path in Settings). No extraction step is required.
-MangosSuperUI is a tooling and interoperability framework intended for educational, research, archival, and private emulator development purposes.
+Most of the time I still want to play normally. I log into one character, run through the world, pick up quests, fight, loot, equip gear, talk to people, and do all the things I would expect from a Vanilla client.
 
----
+When I am grouped with my bots, I also want the option to pull the camera back and control the party as a group. That means selecting characters, assigning control groups, setting formations, giving movement orders, and using command cards instead of clicking through the party one character at a time.
 
-## Features
+Box-selecting the party and putting them into formation is an RTS kind of interface. I am borrowing that interface because it makes sense for controlling a party. It is still the CRPG experience inside the same running MMO world.
 
-The project is two code bases working as one: the **web platform** (this repo) and **SuperUI-Core**, the VMaNGOS C++ fork it drives. Below is everything currently in the project, and roughly how finished each piece is — rated against *my own* vision for it, not against "does it technically work."
+If I pull the camera back and tell my priest where to stand, I have not left the MMO world or loaded a different game mode. I am still controlling the priest I leveled and geared. She still has her mana, threat, equipment, quests, repair bills, and a corpse to run back to when things go wrong. I have only changed how I am controlling the party.
 
-**Status scale** — `0` not started · `3` early / partial · `5` works, with real gaps · `7` solid, in daily use · `9` near-complete · `10` does everything I envisioned, perfectly (nothing here has earned a 10 yet).
+Right now I can log in and play, possess bots, move into free view, keep the party together, and inspect their bags and character sheets. Selection, control groups, formations, command cards, and the rest of the larger party-control UI are built and largely functional but under active development.
 
-| Area                         | What it is                                                                                                                                         | Status   |
-| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
-| SuperUI-Core                 | The forked C++ engine: bot fleet, in-core loot generation, rotation system, the bridge                                                             | **5/10** |
-| Server Operations            | Dashboard, console, players/accounts, config editor, audit log, live logs, backup/restore                                                          | **8/10** |
-| Content Editing              | Items, spells, game objects, loot tuner, per-boss instance loot                                                                                    | **4/10** |
-| Lootifiers                   | Additive stat/dps/named-variant generators — ARPG (openworld/dungeons), Quest, Crafting                                                            | **7/10** |
-| Retexture Engine             | Tier-based item recoloring with 3D preview, theories, value inversion                                                                              | **4/10** |
-| World Map                    | Leaflet minimap viewer + click-to-place object spawning                                                                                            | **5/10** |
-| 3D World Editor              | In-browser terrain sculpting + WMO placement injected back into the game world                                                                     | **4/10** |
-| Spell Creator                | Concept-to-playable custom spells with AI visuals and client patching                                                                              | **4/10** |
-| AI Playerbots — Barrens Chat | Autonomous questing/combat/economy bots with LLM chat and personas                                                                                 | **4/10** |
-| Data & Development           | Database Explorer, Source Map, OG Baseline, Wiki reader, Downloads, Settings                                                                       | **6/10** |
-| Wiki                         | Wiki for the entire VMaNGOS fork source code (~1200 docs), future is SuperUI this project full docs, as well as gameplay wiki (quests/tactics/tbd) | **3/10** |
-| Profession Tuning            | Batch recipe tuning (mat costs, later adding items to professions)                                                                                 | **2/10** |
-| Managed MPQ / BLP layer      | Bespoke C# MPQ+BLP pipeline replacing native StormLib / War3Net                                                                                    | **7/10** |
+![MSUIClient party command controls](Screenshots/msuiclient-party-command.png)
 
----
+## Where It Is Right Now
 
-### SuperUI-Core — the VMaNGOS fork
+This is a large project and nothing here is done by the standard I am aiming for. Some parts I use all the time. Some are a solid first version with plenty left to add. Some exist because I proved the path and have not finished the rest of it yet.
 
-**Status: 5/10**
+| Area | Where it stands |
+| --- | --- |
+| Server administration | **Working and in regular use.** The dashboard, console, accounts, configuration, logs, diagnostics, backups, and normal server operations are some of the most complete parts of MangosSuperUI. |
+| SuperUI-Core | **Working and under active development.** It runs the bots, Lootifier hooks, combat rotations, possession, and the server side of the party controls. |
+| World States and Change Graph | **Working and expanding.** Worlds can be parked, resumed, forked, labeled, and inspected, while the Change Graph records what the different tools changed. |
+| Content editing | **Working, with real gaps.** Items, spells, game objects, loot, instance rewards, and baseline resets work. The full vendor, quest, and creature editors are not finished. |
+| Weapon Forge and Armor Forge | **Working, but still being expanded.** They can clone Vanilla equipment, import any gear from TBC or WRATH, uvunwrapped & textured .glb weapons from the web, build item data, preview results, and generate client patches. Not every imported asset automatically looks or behaves like it was made for 1.12.1, as not every effect from TBC or WRATH can be rendered in the vanilla client. In those cases, a substitute 1.12 effect is used.|
+| Lootifiers | **Working.** ARPG, quest, and crafting variants use the same tier rules, with SuperUI-Core handling the parts that happen when an item is awarded or crafted. |
+| Retexture Engine | **Experimental.** Palette-based recoloring and tier variations work. It is not yet the general-purpose, art-directed retexturing system I eventually want. |
+| World Map | **Working.** I can browse the world, inspect spawns, resolve terrain height, and place game objects visually. |
+| 3D World Editor | **Experimental.** Terrain viewing, sculpting, WMO placement, patch generation, and rebuild paths exist. The complete edit-to-play loop still has gaps. |
+| Spell authoring | **Working, but limited.** I can build spells from understood source spells, change visuals, build rank chains, register trainers, and generate patches. Making a truly new spell family from nothing is still much harder than I want it to be. |
+| AI playerbots | **Working, but far from finished.** They level, quest, fight, travel, group, use real character state, and run dynamic combat rotations. Long-term autonomy and serious raid behavior still need a lot of work. |
+| Bot Cockpit and Circuit Board | **In development.** The administration, inspection, maps, roles, loadouts, execution tracing, and debugging tools exist and are continuing to grow with the bot system. |
+| MSUIClient normal play | **Playable and under heavy development.** I can log in, enter the world, move, fight, quest, loot, equip gear, and use the normal game interfaces. There are still visual and gameplay bugs to find. |
+| MSUIClient party play | **Early, but real.** Possession, free view, party following, bot bags, and character sheets work. The larger RTS-style control set is the part I am building now. |
+| MSUIClient Creator and NPC tools | **In development.** Creator Mode can send spell work into MangosSuperUI, and NPC Dev can submit spatial edits from inside the client. Both workflows are still being expanded. |
+| Database Explorer and documentation | **Working and expanding.** Database relationships, source indexing, generated Core documentation, and Vanilla Lua and UI references are available. |
+| Profession Tuning | **Early.** Reagent-cost tuning and rollback work. Building completely new profession content is still future work. |
 
-A fork of VMaNGOS that carries everything the web platform can't do from the outside. This is the C++ half of the project and it's what the server actually runs.
+## MangosSuperUI - Operate and Author the World
 
-- **The bot fleet** — a `SuperUiBots/` module tree (`AiBotAI`, `GroupCoordinator`, and combat / grind / loot / movement / teamplay units) forked from VMaNGOS's `BattleBotAI` into a fully autonomous open-world bot.
-- **The bridge** — a bidirectional TCP link (port 3444) so the C# behavioral engine can drive the C++ bots in real time.
-- **In-core loot generation** — award-time hooks that swap vanilla rewards for rolled variants without touching drop tables: `QuestRewardVariantStore` (`RewardQuest`), `CraftingRewardVariantStore` (`Spell::DoCreateItem`), each with boot-load, reload commands, and chat-command registration.
-- **Combat rotation slate** — a priority-sorted, first-match-wins rotation system loaded into a bot at runtime over the bridge, with the original VMaNGOS AI as the fallback branch (no core patching required to run vanilla behavior).
-
-The fork is functional and stable. Everything is additive. Your base unmodified vanilla VMaNGOS is there, and everything additional is something you opt to use via the SuperUI (SuperUI permanent bots, crafting lootifier, quest lootifier, and other future additions).
+MangosSuperUI is the web application in this repository. It started as an administration layer, but it is now also the main authoring and inspection surface for the rest of the stack.
 
 ### Server Operations
 
-**Status: 8/10**
+**Dashboard** - World and authentication server health, RA connectivity, database status, players, uptime, revision information, CPU and memory use, per-core information, setup warnings, and targeted diagnostics.
 
-**Dashboard** — At-a-glance server health with a built-in **Diagnose** button that probes every subsystem and tells you specifically *why* something is broken. Process status for mangosd and realmd (with auto-detection of process names via `/proc` scanning), RA connection status, all five database connections, players online, uptime, core revision. First-run detection shows a setup banner when configuration is missing.
+**Console** - A full RA terminal in the browser with live responses, command history, and autocomplete.
 
-**Console** — Full RA terminal in the browser via SignalR. Send any GM command, see responses in real time. Command history and autocomplete.
+**Players, Accounts, and Realm** - Search and inspect characters and accounts, perform administrative actions, edit realm configuration, and keep those changes visible in the audit trail.
 
-**Players & Accounts** — Search, inspect, and manage characters and accounts. Kick, mute, ban, teleport, send mail/items, adjust GM levels. Everything audit-logged.
+**Configuration** - The large mangosd configuration surface is organized into human-readable groups with descriptions and inline editing instead of requiring every change to happen in a long configuration file.
 
-**Config Editor** — All 601 `mangosd.conf` settings organized into 22 human-readable tabs with descriptions and inline editing. Built from a curated metadata mapping — no more hunting through a 2,000-line conf file.
+**Logs** - Live log streaming plus browsable character, chat, economy, transaction, Warden, spam, behavior, and battleground records.
 
-**Activity Log** — Append-only audit trail. Every action recorded with operator, IP, full before/after state snapshots, RA commands, and timestamps. Filter by category, action, or target.
+**Diagnostics** - The Dashboard can test the systems around the server instead of only reporting that something failed. Recent work also exposes resource use and file-limit conditions that can place a hard ceiling on a large bot population.
 
-**Live Logs** — Real-time log tailing via SignalR. Streams new log lines to the browser every 500ms.
+![MangosSuperUI dashboard](Screenshots/dashboard-healthy.png)
 
-**Backup & Restore** — Three backup groups (Game World databases, Characters, Core Source). Timestamped snapshots with `mysqldump`, one-click restore, auto-safety snapshots before destructive operations. Labels, stats, audit-logged.
+### World States, Backups, and Change History
+
+The normal backup system handles the game databases, characters, and Core source with labels, validation, and safety snapshots.
+
+World States let me park one version of the world, fork it, try something completely different, and come back later. I can label snapshots, inspect the lineage, and choose which world I want to run. Once one is running, it behaves like any other VMaNGOS world.
+
+The **Change Graph** separates current drift from complete history. It can group changes by domain, batch, and entry, show field-level differences, drill into what a tool changed, and undo supported entries or batches.
+
+It is the difference between knowing that I changed 400 items and knowing why those 400 items changed together.
 
 ### Content Editing
 
-**Status: 4/10**
+**Items** - Browse and search the world item database, inspect stats and sources, edit or clone items, reset against the original baseline, stage retextures, and preview equipment and held models on a 3D character.
 
-**Items** — Browse 25,000+ items. Search, filter, paginate. Full detail panel with stats, spells, and loot sources. 3D model viewer for weapons/shields/objects. Clone base game items to create custom variants. Icon picker with DBC-resolved names.
+**Spells** - Search and edit server spell templates with DBC-resolved metadata, families, icons, durations, cast times, and ranges.
 
-**Spells** — Browse, search, and batch-edit the spell_template table. Grouped search across spell families. DBC-resolved icons, duration, cast time, and range.
+**Game Objects** - Browse, clone, edit, delete, preview, and place game objects through the World Map and related tools.
 
-**Game Objects** — Browse, search, clone, edit, delete. 3D model viewer. Custom summary field. Integration with World Map for visual placement.
+**Loot Tuner** - Adjust loot rates in batches by quality, level, rank, instance, or other filters, compare the result against the baseline, and reset it.
 
-**Loot Tuner** — Bulk loot rate adjustment by quality, level, rank, or instance. Baseline diffs and one-click reset to original values.
+**Instance Loot** - Inspect real boss and reference-loot chains, edit drop chances, and add or remove rewards at the encounter level.
 
-**Instance Loot** — Per-boss loot editing for all 26 instances (~256 curated bosses). Full loot tree with reference chain expansion. Edit drop rates, add/remove items.
+The full web editors for vendors, quests, and creature templates are not finished. MSUIClient can play through those systems, and NPC Dev can edit creature placement and movement, but that is not the full browser editor I want.
 
-> The **Vendors**, **Creatures**, and **Quests** editors are still on the roadmap — see Planned
+### Weapon Forge and Armor Forge
 
-![Content Editing](Screenshots/3d-armory.png)
+Weapon Forge and Armor Forge are now major parts of MangosSuperUI, not small additions to the Items page.
+
+Weapon Forge can build Vanilla-compatible weapons from cloned Vanilla assets, compatible TBC and Wrath assets, or imported GLB models. It handles the model, textures, display information, placement, recoloring, effects, item fields, preview, registry, and generated client patch as one workflow.
+
+Armor Forge applies the same idea to armor pieces and sets. It can import compatible expansion pieces, clone Vanilla equipment, build full sets, define itemization and set bonuses, create recolors during import and also recolor effects, and register the result for patch generation. 
+
+The item builder exposes the real Vanilla fields instead of translating everything into a simplified modern stat system. Flat stats remain flat. Spell and equip effects keep their trigger, charges, cooldowns, categories, and other native behavior.
+
+Can it import an asset and make it work in Vanilla? Yes. Does every imported weapon or armor set automatically look like Blizzard built it for 1.12? No. Asset choice, placement, effects, texture work, and item design still matter.
+
+Forged weapons, forged armor, and retextures are all under patch-4.MPQ.
+
+![Weapon Forge and Armor Forge](Screenshots/forge.png)
 
 ### Lootifiers
 
-**Status: 7/10**
+The Lootifiers are additive item-variant systems. They preserve the base item and roll new versions on top of it through shared stat budgets, tier bands, naming rules, quality floors, and rollback data.
 
-A family of additive stat-variant generators that turn vanilla items into ARPG-style loot without breaking the base game. Each shares the same tier/band engine and commits with full rollback.
+- **ARPG Lootifier** - Builds dungeon, raid, and open-world item variants with named tiers, stat families, quality promotion, boss-named results, and additive drop pools.
+- **Quest Lootifier** - Selects generated quest-reward variants at award time through a SuperUI-Core hook instead of replacing the original quest table.
+- **Crafting Lootifier** - Selects generated crafted variants when the item is created. It discovers gear-producing recipes from client data and can tune them by profession.
 
-- **ARPG Lootifier** — Diablo-style item variant generator. Tier-quota system (Improved, of Power, of Glory, of the Gods), stat family detection, spell-effect items, quality promotion to Epic/Legendary, boss-named legendaries at 150% budget. Batch mode across entire dungeons/raids with full rollback.
-- **Quest Lootifier** — swaps quest rewards for rolled variants at award time (via the in-core `QuestRewardVariantStore` hook), with a player-item reroll pass on regeneration.
-- **Crafting Lootifier** — swaps crafted outputs for rolled variants at craft time (in-core `Spell::DoCreateItem` hook). Enumerates gear-producing recipes straight from `SkillLineAbility.dbc` / `Spell.dbc` and lets you batch-tune per profession.
-- **Additive-only, band-based tiers** — generation is purely additive on top of base stats, bucketed by named tier bands with quality/color floor rules and naming conventions, plus an additive drop-pool mode for open-world mobs.
-
-![Content Editing](Screenshots/crafting-lootifer.png)
+The goal is not to erase Vanilla itemization. It is to keep the original item recognizable while making later playthroughs and repeated content less solved.
 
 ### Retexture Engine
 
-**Status: 4/10**
+The Retexture Engine creates tier-based palette variants for equipment. It can keep sets visually coherent, apply different color theories, invert or preserve value ranges, preview results on a 3D character, and feed the chosen textures into the unified item patch.
 
-A dedicated section for recoloring items into full tier sets — its own controller, JS, and 3D-preview UI, separate from the Lootifier. Recolors are computed in C# (palette-swap engine with smooth chroma-map recoloring) and delivered as a client patch MPQ.
+At the moment, it is a palette and value transformation system. It is useful, but it is not yet the general tool where I can ask for a completely new hand-painted texture and reliably get one that belongs in the game world.
 
-- **Tier colourways** — each tier gets its own coherent palette; progressive swap budget grows by tier (subtle on the low tiers, full colourway swaps at the top).
-- **Value inversion** — a global value axis (histogram flip + dark-desat) exposed as UI knobs, on top of the per-family hue work.
-- **Set-coherent recoloring** — real item sets *and* ad-hoc multi-select groups share one colourway per tier, so pieces that "look like a set" recolor together.
-- **3D preview** — the character viewer is the centrepiece: dress a mannequin in class + tier gear, drop the selected item on top, and see the recolor on the actual model. Skin-slot targeting reads what the geometry actually samples (fixed for tricky weapons like Gressil and Corrupted Ashbringer).
-- **Rich item browse** — filter by class, weapon type, armor slot, quality, and level range; navigate by base item name; see which creatures / vendors / quests an item comes from.
+![Lootifier and Retexture Engine](Screenshots/lootifier-retexture.png)
 
-Currently its only doing recolors / palette swaps. It's all CPU, and you have different mathematical/logical loops for the existing 7 "theories". While the items page has a pathway that goes to ComfyUI for actual retexturing - at the moment this is too random and uncontrolled. The end goal is to be able to generate coherent retextures that fit the gameworld look.
+### Spell Creator and Spell Completer
 
-You can choose to apply a palette change to lootified items in their various tiers (green/blue/epic/legendary) across the current three major lootifier avenues: Crafting, Questing, and Dungeon/Raid/Openworld. 
+There are now two spell-authoring paths.
 
-![Content Editing](Screenshots/retexture-engine.png)
+The original **browser Spell Creator** provides a guided wizard, workshop controls, experiments, previews, icon generation, rank chains, trainer registration, and patch output.
 
-### World Map
+**MSUIClient Creator Mode** starts the other route inside the client, where I can see and hear the spell while I work on it. When I am happy with the result, it sends the session to **Spell Completer** in MangosSuperUI.
 
-**Status: 5/10**
+Spell Completer builds the spell rows, spellbook classification, rank chains, trainer wrappers, custom sounds, and patch content.
 
-Leaflet.js minimap viewer for all continents, dungeons, and raids. Click-to-place game objects with automatic terrain Z resolution from VMaNGOS `.map` files. Spawn overlay, compass widget, orientation control.
+Can it take a known spell, recolor it, alter its emitters, give it a new identity, build ranks, add a trainer path, and make it playable? Yes. Can it create every genuinely novel spell effect from nothing while explaining every unknown M2 phase and client rule? No. It is a good start to the spellmaking system, but it still has a lot to go.
 
-### 3D World Editor
+![Spell creation pipeline](Screenshots/spell-pipeline.png)
 
-**Status: 4/10**
+### World Map and 3D World Editor
 
-A browser-based Three.js terrain renderer reading directly from WoW 1.12.1 MPQ archives — V9 heightmap geometry, server-side composite textures, M2 doodad models with InstancedMesh batching, WMO building rendering, spatial streaming, PBR golden-hour lighting, and a walk mode (WASD + FPS look). On top of the viewer sits a real editor: terrain sculpting with correct MCVT delta patching, WMO placement with full ADT MODF patching, and a server-data regeneration pipeline (vmap/mmap per-tile rebuild).
+The **World Map** uses the client minimaps for continents, dungeons, and raids. It can display spawns, resolve terrain height from server map data, and place game objects with position and orientation controls.
 
-> **In Progress:** The commit-to-game-world pipeline (DBC patching + patch MPQ generation) is built and functional — place buildings, download the MPQ, restart the world + delete your WDB, and boot the client to see them. Client-side rendering of custom displayIds, cave/interior WMO geometry, and a few terrain "fall-through-floor" cases are still being worked.
+The **3D World Editor** reads terrain and world assets from the user's client data and renders ADT terrain, textures, M2 doodads, and WMO buildings in the browser. It includes walk mode, spatial streaming, object placement, and terrain-editing paths that can generate the corresponding client and server artifacts.
 
-![World Viewer](Screenshots/world-viewer.png)
+I can place a WMO, build the patch, and see it in the game world. Interiors, caves, collision, and some vmap, mmap, and custom-display cases are still rough.
 
-### Spell Creator
+This will likely be deprecated in the future as I migrate this workflow into the client's creator mode where it's more natural.
 
-**Status: 4/10**
+![3D World Editor](Screenshots/world-editor.png)
 
-A complete custom spell creation pipeline from concept to playable in-game. Create spells with unique visuals, register them at trainers, and generate client patches — all from the browser.
+### NPC Development
 
-- **Guided Wizard** — 6-step creation flow: search source spell → identity → power presets → appearance (color, intensity, per-phase fine-tune, icon) → ranks & training → review & create
-- **Workshop** — per-phase particle controls with independent color, texture, and emission settings
-- **Experiment Lab** — SpellDNA extreme parameter testing for discovering visual effects
-- **Visual Lab** — Three.js particle renderer with spatial caster/target markers, missile travel, sequence playback, and terrain presets
-- **AI-powered visuals** — ComfyUI/FLUX icon generation, AI texture generation (7 themes × 6 roles), Ollama prompt crafting
-- **Rank chain system** — auto-generates full rank progressions (e.g. 12 Fireball ranks) with proportional damage/mana scaling
-- **Trainer registration** — copy-from-source or add-to-all-class-trainers with SPELL_EFFECT_LEARN_SPELL wrapper generation
-- **Unified patch** — a single patch MPQ for all custom spells including DBC entries, icons, textures, and M2 particles
+The full browser creature catalog and template editor is still planned.
 
-![Spell Creator](Screenshots/spell-creator.png)
+NPC Development turns the live world into the editor. I can click the NPC standing in front of me, move or rotate it, change its respawn and movement settings, build waypoints or creature groups, then send the result to MangosSuperUI to save and audit.
 
-While trainer registration, icons, and visual changes all work - it is still a farcry from being a tool that allows you to add a coherent spell family, or make true novel spell effects. Can you turn frostbolt pink and change the particle speeds/density/emit patterns and make it arcane? Sure. Can you create a spell from scratch without choosing a base spell and easily understand what each spell phase does? No. It's a good start, but it needs a lot more.
-
-### AI Playerbots — Barrens Chat
-
-**Status: 4/10**
-
-This is probably the largest subsystem of the SuperUI project. A fleet of autonomous bots (the "Barrens Chat" server) that quest, fight, travel, trade, and talk — built to feel like real enough players you can group with, dungeon with, AND raid with. The low-latency half lives in the C++ **SuperUI-Core** fork; the high-level decisions live in C#.
-
-- **Bot Tuner Dashboard** — roster, personality bars, decision weights, real economy display, inventory with icons, activity timeline.
-- **Behavioral Engine** — domain-based decision system: Questing (full quest graph with sub-phase sequencer), Economy (vendoring, training, repair), Combat (grinding, corpse run), Social (LLM chat via Ollama). Uses *real* character_inventory, real gold, real spell progression — no shadow state.
-- **Grouping & escort** — multi-class groups with a virtual god-bot coordinator, player-party escort doctrine, and in-chat commands (`{bot} follow me/auto`) — verified in play following real players into dungeons.
-- **Combat rotations** — per-bot rotation profiles authored in C#, pushed to a bot at runtime and evaluated on a 250 ms in-combat sub-tick, with vanilla class AI as the fallback.
-- **Chat & social** — LLM personas ("the fictional human behind the bot"), a voice library, tiered chat memory, urge-scored arbitration, and a typing scheduler, tuned for era-authentic 2005-style banter. Health tooling (library + chat diagnostics, rebuild/reassign) keeps it all editable from the UI with no SQL.
-
-Working, but still a far way from done. They level, they quest, and you can invite them to party. However, in real player parties at the moment they follow you more like henchmen in Guild Wars. 
-
-### Data & Development
-
-**Status: 6/10**
-
-**Database Explorer** — Universal browser for all tables across the VMaNGOS databases. This isn't phpMyAdmin — it treats the schema as a connected graph.
-
-- 749 curated relationship edges (discovered via brute-force column overlap testing, because the schema declares no foreign keys)
-- Inline editing with audit-logged before/after state
-- Relationship panel with expand-to-see-rows navigation
-- Interactive SVG ER diagrams with radial layout
-
-![ER Diagram](Screenshots/er-diagram.png)
-
-**Source Map** — C++ source tree explorer for VMaNGOS/SuperUI-Core development. 4-layer indexing (files, symbols, types, enums), interactive call graph visualization, inline source preview, Topic Explorer and Deep Dive context bundles. Built for understanding the core internals without an IDE.
-
-**OG Baseline System** — Pristine snapshots of your mangos tables before editing. Field-level diffs on every content page. One-click reset at any granularity.
-
-**Downloads** — Host addon ZIPs for players. Auto-generates `Catalog.lua` for the MangosSuperUI_Placer WoW addon.
-
-**Settings** — Full path and credential configuration through the web UI. DBC file status, ComfyUI node pool monitoring, Ollama connectivity. Configuration override system (`server-config.json` over `appsettings.json`).
-
-### Wiki
-
-**Status: 3/10**
-
-The wiki is intended to be the knowledge base for every part of the system. Currently, there is only the SuperUI-Core generated documentation. The future will have the docs for the SuperUI project itself (this), as well as gameplay wiki's (quests/tactics/tbd).
-
-How were these documents generated and how are they usable and not ai slop?
-
-The model I used for these docs is qwen 3.6-27B
-
-The wiki is generated, but it isn't a model's summary of the code. Every structural fact in it — which unit calls what, which functions touch which tables, what line a symbol lives on — comes from a deterministic clang/AST pass over the C++ tree, not from a model reading files and reporting what it thinks it saw. That graph is then pinned against files taken from the running server: the real `mangosd.conf` key set, the live database schemas, and the empirically validated foreign-key map (the same relationship graph behind the Database Explorer, mined by consensus and verified with actual orphan-rate joins). 
-
-Only after all of that is assembled does the local model get involved, and it gets one job: write the prose explaining facts that were already proven. It never produces the map. 
-
-Every page is then checked before it's accepted. Mechanical verifiers confirm that each mined member actually appears in the narrative, that documented boundaries are grounded in real code spans, and that nothing was invented: a config key that isn't in the mined key set, or a table that isn't in the real schema, fails the page and sends it back for another pass. Degenerate output retries automatically. 
-
-The documents provide a very useful way to modify and add functionality to the core, as all of the empirical calls/callees & other data allows a frontier model to 99% pinpoint exactly which source files we need to make a given modification.
+Moving an NPC and reloading it in the world works now. Baseline comparison and reset are the next parts I need to finish.
 
 ### Profession Tuning
 
-**Status: 2/10**
+Profession Tuning can preview and apply non-compounding reagent reductions across a profession, opt individual recipes out, show what has already been tuned, restore one recipe, or roll the entire batch back.
 
-A new tool (just kicked off) for batch-tuning professions, modeled on the Crafting Lootifier's Professions tab but *without* lootifying. The first feature — reduce materials required per recipe by a %, batched across a whole profession with per-recipe opt-out — is in progress. The larger goal is adding items into professions (trainers, drops, etc.), which hasn't started.
+The larger goal of adding completely new items into profession progression, trainer lists, and drop paths is still planned.
 
-### Under the Hood — Managed MPQ / BLP
+### Data, Source, and Documentation
 
-**Status: 7/10**
+**Database Explorer** treats the VMaNGOS schema as a connected graph rather than a pile of unrelated tables. It includes relationship navigation, inline editing, audit history, and interactive ER views built from validated relationships.
 
-A bespoke, fully managed C# MPQ v1 reader + writer and BLP decoder, written to drop the native StormLib P/Invoke and the War3Net library entirely — no native `.so` to build or ship. WoW 1.12 only uses MPQ format v1, which keeps the scope tight. The write path is proven in-client; the reader cutover and BLP decoder are in final on-box validation. Once done, the whole asset pipeline is native-dependency-free.
+**OG Baselines** preserve the original values used for field-level comparisons and targeted resets.
 
----
+**Source Map** indexes the C++ tree by files, symbols, types, enums, and calls. It provides source previews, call graphs, and context bundles for understanding where a mechanic actually lives.
 
-## Architecture
+**Wiki** contains generated SuperUI-Core documentation grounded in deterministic source analysis. The model writes the prose after the structural facts are mined and validated. It does not invent the map.
 
-Every page follows the same pattern:
+The Wiki also includes Vanilla Lua and UI references built from harvested FrameXML templates, frames, textures, functions, and globals.
 
-```
-Controller (C#)          →  View (Razor .cshtml)      →  JS file (jQuery)
-Routes, DB queries,         Thin HTML shell,              All dynamic rendering,
-RA commands, audit          scoped CSS                    AJAX calls, DOM updates
-```
+![Database, source, and documentation tools](Screenshots/data-and-wiki.png)
 
-Key services:
+### Included Addons
 
-| Service                                  | Role                                                                                            |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| **RaService**                            | Singleton persistent TCP to mangosd RA. App-level keepalive, prompt-based read, auto-reconnect. |
-| **AuditService**                         | Append-only audit trail with before/after state snapshots.                                      |
-| **ProcessManagerService**                | Process detection via `/proc` scanning with 3-strategy fallback. Systemd start/stop/restart.    |
-| **DbcService**                           | Parses 1.12.1 DBC binary files at startup for icon/spell/item metadata.                         |
-| **HeightMapService**                     | Reads VMaNGOS `.map` binary files for terrain Z resolution.                                     |
-| **BotBridgeService**                     | TCP bridge (port 3444) between the C++ SuperUI-Core bots and the C# behavioral engine.          |
-| **BotBrainService**                      | Decision loop orchestrator, domain routing, Ollama LLM dispatch.                                |
-| **RotationService**                      | Loads per-bot combat rotation profiles and pushes them to the fork over the bridge.             |
-| **PatchBuilderService**                  | DBC/M2/MPQ pipeline for Spell Creator unified patch generation.                                 |
-| **PaletteSwapService**                   | C# recoloring engine behind the Lootifiers and Retexture Engine.                                |
-| **SpellTextureService**                  | AI texture generation via ComfyUI/FLUX with BLP conversion.                                     |
-| **SourceIndexerService**                 | C++ source tree indexer for Source Map (files, symbols, types, enums).                          |
-| **ComfyUIDispatcher**                    | Multi-node ComfyUI pool with channel-based token allocation.                                    |
-| **MpqReaderService / MpqBuilderService** | Read/write MPQ archives via the managed C# MPQ layer (StormLib-free).                           |
+MangosSuperUI also builds or hosts optional addons for the original 1.12.1 client:
 
-Database access uses Dapper for VMaNGOS tables (raw SQL, read-heavy) and auto-created tables in `vmangos_admin` for MangosSuperUI's own state. All SQL identifiers validated against schema whitelists.
+- **MSUI Loot Browser** - Generates an in-game loot browser from the live server data, including dungeon, raid, crafting, and generated variant information.
+- **MSUI Dual Spec** - Adds two in-place talent and action-bar snapshots with switching rules designed for Vanilla.
+- **MangosSuperUI Placer** - Provides an in-game catalog and controls for spawning, selecting, moving, rotating, and deleting supported custom objects.
 
----
+These addons are separate from MSUIClient. MSUIClient can implement client functionality directly, while the addons remain useful for players using the original client.
+
+## SuperUI-Core - Run and Persist the World
+
+SuperUI-Core is a customized VMaNGOS fork. VMaNGOS remains the foundation: its world simulation, networking, databases, scripts, progression model, and years of emulator work are underneath everything here.
+
+SuperUI-Core is the C++ half of the project. It carries the things that have to happen immediately inside the running server:
+
+- Persistent playerbots with real characters, inventories, equipment, spells, gold, quests, groups, and progression.
+- Movement, combat, interaction, travel, and party commands.
+- The TCP bridge that lets the C# bot brain assign work and inspect what happened.
+- Per-bot combat rotations, with the original VMaNGOS behavior still available as a fallback.
+- Quest and crafting reward hooks for the Lootifiers.
+- The extra messages MSUIClient uses for possession, party facts, and party control.
+
+The original 1.12.1 client can still connect because those extra messages are only sent to MSUIClient.
+
+This is the server I use for the full SuperUI stack. It works, it moves quickly, and it is not finished.
+
+## AI Playerbots - Barrens Chat
+
+The bot system is probably the largest subsystem across the three repositories.
+
+These are persistent in-world characters, not external automation clients and not temporary dungeon companions. They use the real character tables, real equipment, real gold, real spells, real quest status, and real group state.
+
+A bot uses all three projects:
+
+- **SuperUI-Core** moves it, fights, interacts with the world, travels, and executes the immediate party commands.
+- **MangosSuperUI** decides what it should quest for, when it should repair or train, who it should group with, what it should say, and which combat rotation it should use.
+- **MSUIClient** is where I can take one over, pull back into free view, or control the party.
+
+### What the Bots Do Today
+
+- Quest through a real quest graph with objective and sub-phase tracking.
+- Grind, fight, die, corpse-run, loot, repair, train, travel, and vendor.
+- Join groups, follow real players, and operate through party and escort rules.
+- Load per-bot role, specialization, talent, spellbook, and rotation information.
+- Use real inventory and economy state rather than a shadow copy.
+- Talk through optional local LLM support with personas, voice rules, memory, urge scoring, typing delays, and editable chat settings.
+
+They work, but they are still far from the final goal. They level and quest. You can group with them. They can follow a real player into content. They still die too much, make bad long-horizon decisions, and often behave more like henchmen than convincing independent players. Full dungeon and raid autonomy is not solved.
+
+### Bot Cockpit, Fleet View, and Map
+
+The Bot Cockpit can batch-spawn bots, inspect their live state, control grouping, reload or reconnect them, manage roles and loadouts, view talents and spellbooks, inspect quests and inventory, and issue per-bot or population-wide administrative commands.
+
+Fleet View correlates failures and activity across the population instead of forcing every diagnosis to start with one bot.
+
+The Bot Map shows live positions, trails, incidents, failure hotspots, and context exports across the world.
+
+Chat Feel and Chat Capacity separate the personality and presentation controls from the practical limits of the local language-model service.
+
+![Bot Cockpit](Screenshots/bot-cockpit.png)
+
+### Circuit Board
+
+Circuit Board traces a bot decision from human-scale activity back into the logic that produced it.
+
+It includes a live circuit schematic, activity episodes, raw events, exact C# and C++ source around instrumented probes, arm and disarm controls, shadow tracing, forced dumps, and exportable Markdown packets for debugging.
+
+This replaced older tracing paths that produced data without making the decision chain understandable. The point is not another dashboard. The point is being able to answer: What did this bot think it was doing, which layer changed that intent, what reached the Core, and where did the result stop matching the plan?
+
+
+
+## MSUIClient - Play and Control Your Party
+
+MSUIClient is a separate playable client. It isn't an addon, a reskin of the original client, or a browser viewer.
+
+It is written in C# on .NET and Silk.NET/OpenGL. It reads the user's own WoW data directly from MPQ archives, parses the Vanilla client formats it needs, and speaks the genuine 1.12.1 network protocol.
+
+The normal client loop includes:
+
+- Login and character selection.
+- A streamed 3D world with ADT terrain, WMO buildings, M2 models, characters, creatures, equipment, water, foliage, lighting, particles, and collision.
+- Movement, camera control, targeting, combat, spell casting, action bars, inventory, equipment, loot, quests, vendors, chat, groups, maps, audio, and normal interface panels.
+- Normal VMaNGOS support for normal Vanilla play.
+- Extra possession, Creator, and party controls when connected to SuperUI-Core.
+
+MSUIClient is playable, but it is not finished. Animation, rendering, UI, audio, collision, and edge cases all still need work. I would call it a mid alpha, with plenty left to do.
+
+![MSUIClient interface](Screenshots/msuiclient-ui.png)
+
+### Creator Mode
+
+Creator Mode starts a spell inside the client, where I can see the effect, hear it, change it, and test it in the actual world. When I am happy with it, the client sends the session to Spell Completer in MangosSuperUI to build the database rows, ranks, trainer entries, sounds, and patch.
+
+### NPC Development
+
+NPC Dev lets me click the NPC standing in front of me, move or rotate it, change its movement and respawn settings, build waypoints or creature groups, and send the result to MangosSuperUI to save and audit.
+
+### Playing the Whole Party
+
+I can possess one of my bots, move it directly, pull back into free view, keep the party following, and inspect each character's bags and character sheet.
+
+Selection, control groups, formations, command cards, party-wide inventory, and quest actions are the next part of that same party UI. The complete control surface is still being built.
+
+### Encounter Lab
+
+Encounter Lab is my attempt to plan dungeon and raid fights from inside the actual world.
+
+I can select the groups, click where I want them to stand, assign targets and movement, connect the plan to combat rotations, and save it for another pull.
+
+The editor and early simulator exist, but Core does not execute the full plan yet. This is not something I can raid with today.
+
+## How the Pieces Connect
+
+Basic server administration and normal Vanilla play can be used separately. The bots, client Creator tools, NPC Dev, possession, and party controls are where the projects start working together.
+
+- MangosSuperUI talks to SuperUI-Core through RA, the databases and configuration, generated content, and the bot bridge.
+- MSUIClient logs in through the normal 1.12.1 protocol. SuperUI-Core adds the messages used for possession and party control.
+- Creator Mode, Spell Completer, NPC Dev, and Encounter Lab pass work directly between MSUIClient and MangosSuperUI.
+- Generated patches carry custom items, spells, models, textures, sounds, and DBC data into the client.
 
 ## Requirements
 
-- A working **VMaNGOS 1.12.1** server (compiled, databases populated, able to log in and play) — SuperUI-Core if you want the bots and in-core loot generation
-- **Ubuntu 22.04+** or similar Linux (tested on Ubuntu 24.04 LTS)
-- **ASP.NET Core 8.0 Runtime** (or SDK if building from source)
-- **MariaDB 10.x+** or MySQL 5.5+
-- **WoW 1.12.1 client** 
+### MangosSuperUI
 
-Optional for advanced features:
+- A working VMaNGOS or SuperUI-Core server with populated databases.
+- Ubuntu 22.04 or a similar Linux environment for the currently tested web deployment.
+- .NET 8 runtime, or the SDK when building from source.
+- MariaDB or MySQL compatible with the selected VMaNGOS revision.
+- Access to user-owned compatible WoW client data for asset-backed authoring features.
+- Compatible user-provided TBC or Wrath client data only when using those specific Forge import lanes.
 
-- **Ollama** with a model like `qwen3:4b` (for Spell Creator prompts + AiBot chat)
-- **ComfyUI** with FLUX (for AI icon/texture generation)
-- **Python 3 + mpyq** (for M2/BLP extraction on the server)
+Optional advanced integrations:
 
----
+- Ollama for bot chat and supported prompt workflows.
+- ComfyUI for supported image and texture generation paths.
+
+### SuperUI-Core
+
+- The build requirements and database prerequisites documented by the [SuperUI-Core repository](https://github.com/Yafrovon/SuperUI-Core).
+- The database and script updates that go with the Core release.
+- The MSUIClient release paired with that Core release when using possession and party controls.
+
+### MSUIClient
+
+- Windows 10 or Windows 11. Linux and mobile are not supported release targets yet.
+- .NET 8 runtime, or the SDK when building from source.
+- User-owned WoW 1.12.1 build 5875 client data.
+- A compatible VMaNGOS or SuperUI-Core realm.
 
 ## Installation
 
-See **[INSTALL.md](INSTALL.md)** for the full step-by-step guide covering:
+Each repository keeps its own setup guide:
 
-- **Part 1:** VMaNGOS prerequisites — RA configuration (including the critical `Ra.MinLevel` gotcha), systemd services, account setup, sudo permissions
-- **Part 2:** MangosSuperUI deployment — .NET runtime, download/build, systemd service, setup script, dashboard verification with Diagnose button
-- **Part 3:** Asset extraction — icons, 3D models, and minimap tiles from your WoW client
-- **Part 4:** SpellCreator & WorldViewer assets — M2/BLP extraction via python mpyq
-- **Part 5:** Validation script — comprehensive audit of your entire installation
+- [MangosSuperUI installation guide](INSTALL.md)
+- [SuperUI-Core installation guide](https://github.com/Yafrovon/SuperUI-Core/blob/development/INSTALL.md)
+- [MSUIClient repository](https://github.com/Yafrovon/MSUIClient)
 
-The setup script auto-discovers your VMaNGOS paths, database connections, and configuration from `mangosd.conf`. The Dashboard's Diagnose button actively tests every subsystem and tells you specifically what needs fixing.
+<!-- RELEASE TODO
+Replace the MSUIClient repository link above with its finished release-facing README and setup guide once those files are finalized.
+Confirm and document the exact matched release set for MSUIClient and SuperUI-Core.
+-->
 
----
+For the full stack, set up SuperUI-Core, point MangosSuperUI at that world, prepare the client data, then use the MSUIClient release paired with that Core release. It is not a one-click setup yet, so the details stay in the three setup guides.
+
+## Game Assets and Disclaimer
+
+This project is not affiliated with or endorsed by Blizzard Entertainment.
+
+World of Warcraft is a registered trademark of Blizzard Entertainment, Inc.
+
+The repositories do not distribute Blizzard game assets. Users supply their own compatible client data.
+
+MSUIClient reads the user's own 1.12.1 MPQs directly. MangosSuperUI can read the same user-provided data and create local caches, previews, converted assets, or generated patches for its tools.
+
+Some MangosSuperUI features still need prepared DBCs, maps, vmaps, mmaps, M2 files, or browser-ready assets. [INSTALL.md](INSTALL.md) lists what each feature needs.
+
+Contributors must not submit proprietary client assets, private server data, credentials, generated local caches containing protected material, or other files they do not have permission to distribute.
+
+MangosSuperUI is intended for educational, research, archival, interoperability, and private emulator-development use.
+
+## Technology
+
+| Project | Main technologies |
+| --- | --- |
+| **MangosSuperUI** | ASP.NET Core 8 MVC, C#, Razor, JavaScript, SignalR, Dapper, MariaDB/MySQL, Three.js, Leaflet, managed game-data tooling, and conditionally packaged StormLib binaries for legacy paths. |
+| **SuperUI-Core** | C++, CMake, VMaNGOS, MariaDB/MySQL, and the SuperUI server modules and protocol. |
+| **MSUIClient** | .NET 8, C#, Silk.NET, OpenGL, ImGui, direct MPQ and Vanilla-format readers, and the 1.12.1 network protocol. |
+
+## Repository Map
+
+These are separate repositories, not folders in one solution:
+
+~~~text
+MangosSuperUI/
+  MangosSuperUI/             ASP.NET web application
+  MangosSuperUI.Tests/       focused application and system tests
+  docs/                      engineering and feature documentation
+  docs_full/                 generated Core documentation
+  Screenshots/               README and documentation images
+
+SuperUI-Core/
+  src/game/SuperUiContent/
+    SuiBots/                 persistent bot execution and related Core systems
+  sql/                       database and migration requirements
+  docs/                      protocol and Core documentation
+
+MSUIClient/
+  MSUIClient/
+    Engine/                  platform, rendering, UI, and shared runtime systems
+    Formats/                 Vanilla client-format readers
+    GameLoop/                gameplay, HUD, panels, combat, and scene control
+    Net/                     login, world protocol, and SuperUI capabilities
+    World/                   streamed world and entity rendering
+  docs/                      current systems, plans, and implementation records
+  tools/                     focused verification and diagnostic tools
+~~~
 
 ## Roadmap
 
-### Built and Working
+### Being Finished Now
 
-Everything in the status board above at 3/10 or higher. Server management, content editors, world map, 3D world editor with WMO placement/injection, spell creator with AI visuals, AI playerbots with LLM chat and combat rotations, database explorer with ER diagrams, source map, backup system, full audit trail — plus the SuperUI-Core fork underneath it all.
+- Finish the public MSUIClient documentation, setup, license, and release package.
+- Tag the MSUIClient and SuperUI-Core releases that work together.
+- Keep playing through quests, vendors, inventory, groups, combat, audio, animation, and instances, and fix what breaks.
+- Polish Weapon Forge, Armor Forge, and the unified item patch.
+- Polish the Spell Creator and Spell Completer workflow.
+- Keep improving bot progression, grouping, economy, and long-horizon behavior.
+- Replace the old screenshots and finish the documentation across all three repositories.
+- Continue the painterly renderer work.
 
-### In Progress
+### Experimental Systems
 
-- **Retexture Engine settling** — functional but still simple and lack of fine-tune control on outcome.
-- **WorldViewer client rendering** — WMO placements commit to the game database but maps regeneration seems shaky.
-- **Bot progression 1-60** — bots level, but die too much and need dynamic grouping
-- **Bot chat depth** — later chat phases, and reducing open-world grind/travel drift
-- **Profession Tuning** — first pass (per-recipe material-cost reduction)
+- Expand the party-wide facts and tactical commands.
+- Finish party inventory transfer, formations, roles, and tactics.
+- Connect Encounter Lab plans to Core in the normal MMO world.
+- Finish the later NPC Dev phases.
+- Expand Creator Mode beyond the current spell workflow.
 
-### Planned
+### Longer-Term Direction
 
-- **Vendors & Creatures** — NPC browsing, vendor inventory editing, trainer spell lists
-
-- **Quests** — quest template editor
-
-- **Game Tuning** — XP/honor/reputation rate sliders
-
-- **Adding items to professions** — the larger Profession Tuning goal
-
-- **Docker Compose** packaging for one-command deployment
-
-- **Sound integration** for Spell Creator via SoundEntries.dbc
-
-### Development Philosophy
-
-If any single feature hits a wall beyond ~50 hours, I skip it and move on. Steady forward momentum across the whole platform rather than getting stuck on one piece.
-
----
-
-## Tech Stack
-
-| Layer            | Technology                                                                                                 |
-| ---------------- | ---------------------------------------------------------------------------------------------------------- |
-| Backend          | ASP.NET Core 8.0 MVC (C#)                                                                                  |
-| Server core      | VMaNGOS fork (**SuperUI-Core**, C++)                                                                       |
-| Frontend         | jQuery, vanilla JS                                                                                         |
-| 3D Rendering     | Three.js — r128 (World Viewer, Visual Lab) and an r162 ES-module build (World Editor)                      |
-| Real-time        | SignalR (Console, Live Logs, Bot Bridge)                                                                   |
-| Bot bridge       | Bidirectional TCP (port 3444) between C# and the C++ fork                                                  |
-| Database         | MariaDB/MySQL via Dapper                                                                                   |
-| 3D Models        | Google `<model-viewer>` (GLB), Three.js (terrain/WMO/M2)                                                   |
-| World Map        | Leaflet.js with custom tile layers                                                                         |
-| AI Inference     | Ollama (LLM chat/prompts), ComfyUI/FLUX (icons/textures)                                                   |
-| MPQ / BLP / DBC  | Managed C# MPQ v1 reader/writer + BLP decoder (replacing native StormLib / War3Net), custom binary parsers |
-| Game Assets      | Decoded on demand from the client MPQs (icons, M2/WMO → GLB models, minimap tiles) — no extraction step    |
-
----
-
-## Project Structure
-
-```
-MangosSuperUI/                # the web platform (this repo)
-├── Controllers/              # ~25+ controllers — one per page + API endpoints
-├── Services/                 # RA, Audit, DBC, Patch, Texture, Bot, Rotation, MPQ, etc.
-│   └── Mpq/                  # managed C# MPQ v1 reader/writer + BLP decoder
-├── BotLogic/                 # AI playerbot behavioral engine (domains, tracking, data loaders)
-│   └── Chat/                 # persona/voice-library chat stack + health tooling
-├── Models/                   # ConnectionFactory, POCOs
-├── Hubs/                     # SignalR hubs (Console, Live Logs, Bot Bridge)
-├── Views/                    # Razor views — thin HTML shells
-├── wwwroot/
-│   ├── js/                   # One JS file per page — all dynamic rendering lives here
-│   ├── css/                  # Global theme, baseline styles
-│   ├── data/                 # Curated JSON (commands, config metadata, relationships, etc.)
-│   ├── lib/                  # Vendored libs (Leaflet, model-viewer, Three.js)
-│   ├── addons/               # MangosSuperUI_Placer WoW addon
-│   ├── icons/                # Item/spell icon PNGs (user-extracted)
-│   ├── models/               # Game object GLB models (user-extracted)
-│   ├── item_models/          # Item GLB models (user-extracted)
-│   └── minimap/              # Minimap tile PNGs (user-extracted)
-└── sql/                      # vmangos_admin schema
-
-SuperUI-Core/                 # the VMaNGOS C++ fork (separate repo)
-└── src/game/SuperUiBots/     # AiBotAI, GroupCoordinator, combat/grind/loot/movement/teamplay
-                              # + in-core lootifier hooks and the rotation slate
-```
-
----
+- Complete Encounter Lab raid-plan authoring and execution.
+- Full web editors for creature templates, vendors, and quests.
+- Adding completely new items into profession progression.
 
 ## Contributing
 
-See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide. The short version:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the MangosSuperUI contribution guide.
 
-Open an issue before submitting a PR. Bug reports, feature requests, and documentation improvements are all welcome.
+Open an issue before beginning a large change.
 
-If you're adding a new page, follow the existing pattern: C# controller for routing and data, thin Razor view for the HTML shell, JS file for all dynamic rendering. Keep VMaNGOS database writes going through RA commands where possible, with direct SQL for content tables — and always audit-log the before/after state.
+For a cross-project bug, include the three versions you were running and the exact workflow that failed. Circuit Board exports are especially useful for bot bugs.
 
----
+Never include Blizzard client assets, credentials, personal database snapshots, or generated private-server state in a contribution.
 
 ## Acknowledgments
 
-MangosSuperUI is co-developed using [Claude](https://claude.ai/) (Anthropic) — the same way I use it in my professional work. While I am a systems engineer & software developer by trade, there is no chance I could build this tool this quickly without said help.
+MangosSuperUI and the larger SuperUI stack are co-developed with AI tools, especially Claude and Codex. I am a systems engineer and software developer by trade, but there is no chance I could have built this much this quickly without that help.
 
-None of this would exist without the years of work by the VMaNGOS team and the broader MaNGOS lineage. The WoW modding community that reverse-engineered DBC formats, M2 particle systems, loot table mechanics, stat budget formulas, and the RA protocol. The wiki editors, forum posters, and GitHub contributors who wrote it all down so someone like me could find it fifteen years later. MangosSuperUI is a UI layer on top of knowledge that thousands of people contributed over two decades. I'm just connecting it all into one place for a very specific 1.12 experience.
+None of this would exist without the years of work by the VMaNGOS team and the broader MaNGOS lineage. The same is true of the modding and emulation communities that documented DBC files, MPQ and BLP formats, M2 and WMO structures, spell effects, loot systems, client packets, UI behavior, and the hundreds of strange rules that make Vanilla work.
 
----
+I am connecting that work into one place for a very particular 1.12 experience. The foundation belongs to the people who spent years making it possible to understand.
 
 ## License
 
-This project is licensed under the **GNU General Public License v2.0**. See [LICENSE](ICENSE.txt) for the full text.
+MangosSuperUI is licensed under the [GNU General Public License v2.0](LICENSE).
 
-Third-party library licenses are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Third-party library licenses for this repository are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+SuperUI-Core retains the licensing requirements of its VMaNGOS foundation. See the [SuperUI-Core license](https://github.com/Yafrovon/SuperUI-Core/blob/development/LICENSE).
+
+<!-- RELEASE TODO
+Add the final MSUIClient license name and link here before publishing this README.
+-->
