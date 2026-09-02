@@ -396,13 +396,13 @@ public static class GlbWriter
             // Declared before the emit helpers below, which capture it.
             var submeshTexture = BuildSubmeshTextureMap(m2);
 
-            // Batches for one submesh, in SOURCE ORDER. Batch 0 is the base material; later batches
-            // are additional material LAYERS the client composites over it. This writer historically
-            // kept only batch 0 (the first-wins guards in the Build*Map helpers), which is why a
-            // Warglaive renders dead here while the Weapon Forge shows it alive: its blade energy is
-            // entirely in the dropped layers.
+            // Batches for one submesh, in DRAW ORDER (material layer, then source order — see
+            // BatchesInDrawOrder). Batch 0 is the base material; later batches are additional material
+            // LAYERS the client composites over it. This writer historically kept only batch 0 (the
+            // first-wins guards in the Build*Map helpers), which is why a Warglaive renders dead here
+            // while the Weapon Forge shows it alive: its blade energy is entirely in the dropped layers.
             var batchesBySubmesh = new Dictionary<int, List<M2Batch>>();
-            foreach (var b in m2.Batches)
+            foreach (var b in BatchesInDrawOrder(m2))
             {
                 if (!batchesBySubmesh.TryGetValue(b.SubmeshIndex, out var list))
                     batchesBySubmesh[b.SubmeshIndex] = list = new List<M2Batch>();
@@ -940,7 +940,7 @@ public static class GlbWriter
     {
         var map = new Dictionary<int, Vector3>();
 
-        foreach (var batch in m2.Batches)
+        foreach (var batch in BatchesInDrawOrder(m2))
         {
             int subIdx = batch.SubmeshIndex;
             if (map.ContainsKey(subIdx)) continue;
@@ -959,10 +959,32 @@ public static class GlbWriter
     }
 
     /// <summary>
+    /// The model's batches in the order the client composites them: material layer ascending,
+    /// source order within a layer. Every "base batch of a submesh" decision in this writer — the
+    /// blend/texture/alpha/tint maps and EmitSubmesh's batches[0] — must go through this, never
+    /// through raw m2.Batches order.
+    ///
+    /// Why: file order is NOT draw order. TBC Tier 5/6 plate (Onslaught, Lightbringer, ...) helms
+    /// and spaulders list their layer-1 pass FIRST — an alpha-blended (blend 2, no depth write)
+    /// redraw of the skin whose alpha channel is a shininess mask over the env-mapped base — and the
+    /// layer-0 opaque diffuse+reflect base SECOND. Taking the first batch as the base exported only
+    /// the mask pass as a BLEND material, so the helm rendered see-through in the previewer (the
+    /// Onslaught skin has no fully-opaque texel) while the real base was dropped as a "blend &lt; 3
+    /// overlay". Vanilla models list layer 0 first, so they are unchanged by this.
+    /// </summary>
+    internal static IReadOnlyList<M2Batch> BatchesInDrawOrder(M2Model m2)
+        => m2.Batches
+            .Select((batch, sourceIndex) => (batch, sourceIndex))
+            .OrderBy(x => x.batch.MaterialLayer)
+            .ThenBy(x => x.sourceIndex)
+            .Select(x => x.batch)
+            .ToList();
+
+    /// <summary>
     /// Build a mapping of submeshIndex → blendMode using the batch chain:
     ///   batch.SubmeshIndex → batch.MaterialIndex → m2.RenderFlags[idx] → blendingMode.
-    /// First-wins on duplicates (one batch per submesh is the common case;
-    /// when there are layered batches on the same submesh, the first-listed
+    /// First-wins on duplicates in DRAW order (one batch per submesh is the common case;
+    /// when there are layered batches on the same submesh, the lowest material layer
     /// is the base material). Submeshes with no batch reference fall back to
     /// opaque (0) via the caller's ContainsKey check.
     /// </summary>
@@ -970,7 +992,7 @@ public static class GlbWriter
     {
         var map = new Dictionary<int, int>();
 
-        foreach (var batch in m2.Batches)
+        foreach (var batch in BatchesInDrawOrder(m2))
         {
             int subIdx = batch.SubmeshIndex;
             if (map.ContainsKey(subIdx)) continue;
@@ -995,7 +1017,7 @@ public static class GlbWriter
     {
         var map = new Dictionary<int, int>();
 
-        foreach (var batch in m2.Batches)
+        foreach (var batch in BatchesInDrawOrder(m2))
         {
             int subIdx = batch.SubmeshIndex;
             if (map.ContainsKey(subIdx)) continue;
@@ -1095,7 +1117,7 @@ public static class GlbWriter
     {
         var map = new Dictionary<int, float>();
 
-        foreach (var batch in m2.Batches)
+        foreach (var batch in BatchesInDrawOrder(m2))
         {
             int subIdx = batch.SubmeshIndex;
             if (map.ContainsKey(subIdx)) continue;
