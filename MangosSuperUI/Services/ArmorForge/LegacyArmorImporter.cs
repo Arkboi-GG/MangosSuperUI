@@ -241,6 +241,7 @@ public abstract class LegacyArmorImporter
         if (parsed.Count == 0) { diag.Error("import.helm.none", $"{Label} has no parseable variant of {stem}."); return false; }
         string fallbackSuffix = parsed.ContainsKey("HuM") ? "HuM" : parsed.Keys.First();
         var fallback = parsed[fallbackSuffix];
+        bool stripMasks = DecideSkinAlphaPolicy(src, parsed.Values, diag, "helm");
 
         // Pass 2: emit all 16. A single bad race/gender variant is a WARNING (that race sees the
         // fallback or nothing), not a failure of the whole helm — only zero emitted fails.
@@ -260,7 +261,8 @@ public abstract class LegacyArmorImporter
             if (donor is null) { diag.Warn("import.helm.donor", $"{suffix}: no vanilla donor helm — this race/gender ships no file."); continue; }
 
             var vdiag = new ForgeDiagnostics("helm-" + suffix);
-            var bytes = Emit(m2, donor, $"{ArmorNaming.ModelStem(displayIndex)}_{suffix}", ArmorNaming.HeadDir, displayIndex, effects, vdiag, $"helm {suffix}", glowColor, glowIntensity);
+            var bytes = Emit(m2, donor, $"{ArmorNaming.ModelStem(displayIndex)}_{suffix}", ArmorNaming.HeadDir, displayIndex, effects, vdiag, $"helm {suffix}", glowColor, glowIntensity,
+                stripReflectionMasks: stripMasks);
             // 16 variants repeat the same emitter/bake notes — keep one copy of each distinct message.
             foreach (var item in vdiag.Items.Where(i => i.Severity != ForgeSeverity.Error))
                 if (!diag.Items.Any(x => x.Code == item.Code && x.Message == item.Message)) diag.Add(item.Severity, item.Code, item.Message, item.Context);
@@ -276,6 +278,7 @@ public abstract class LegacyArmorImporter
         if (emitted == 0) { diag.Error("import.helm.none", "No helm variant could be emitted."); return false; }
         if (emitted < ArmorNaming.HelmVariantSuffixes.Count) diag.Warn("import.helm.partial", $"{emitted}/{ArmorNaming.HelmVariantSuffixes.Count} race/gender variants emitted.");
         if (fellBack > 0) diag.Warn("import.helm.fallback", $"{fellBack} race/gender variant(s) used the {fallbackSuffix} mesh.");
+        if (stripMasks) FlattenSkinAlpha(src, diag, "helm");
         AttachIcon(src, row, diag);
         src.ModelName = ArmorNaming.DbcModelName(displayIndex); // "SUI_A_####.mdx" — client appends _{Ra}{G}
         src.ModelName2 = null;
@@ -302,10 +305,12 @@ public abstract class LegacyArmorImporter
         byte[]? ld = _vanilla.ExtractFile($@"{ArmorNaming.ShoulderDir}\{left}.m2") ?? _vanilla.ExtractFile($@"{ArmorNaming.ShoulderDir}\{DefaultShoulderLeft}.m2");
         byte[]? rd = _vanilla.ExtractFile($@"{ArmorNaming.ShoulderDir}\{right}.m2") ?? _vanilla.ExtractFile($@"{ArmorNaming.ShoulderDir}\{DefaultShoulderRight}.m2");
         if (ld is null || rd is null) { diag.Error("import.shoulder.donor", "No vanilla shoulder donor found."); return false; }
+        bool stripMasks = DecideSkinAlphaPolicy(src, new[] { lm, rm! }, diag, "shoulder");
 
-        var lb = Emit(lm, ld, $"{ArmorNaming.ModelStem(displayIndex)}_L", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder L", glowColor, glowIntensity);
-        var rb = Emit(rm!, rd, $"{ArmorNaming.ModelStem(displayIndex)}_R", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder R", glowColor, glowIntensity);
+        var lb = Emit(lm, ld, $"{ArmorNaming.ModelStem(displayIndex)}_L", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder L", glowColor, glowIntensity, stripReflectionMasks: stripMasks);
+        var rb = Emit(rm!, rd, $"{ArmorNaming.ModelStem(displayIndex)}_R", ArmorNaming.ShoulderDir, displayIndex, effects, diag, "shoulder R", glowColor, glowIntensity, stripReflectionMasks: stripMasks);
         if (lb is null || rb is null) return false;
+        if (stripMasks) FlattenSkinAlpha(src, diag, "shoulder");
         src.ModelMembers.Add(new MpqMember { MpqPath = ArmorNaming.ShoulderLeftMpqPath(displayIndex), Data = lb });
         src.ModelMembers.Add(new MpqMember { MpqPath = ArmorNaming.ShoulderRightMpqPath(displayIndex), Data = rb });
         src.ModelMembers.AddRange(effects.Members);
@@ -438,7 +443,8 @@ public abstract class LegacyArmorImporter
     /// are pulled from TBC and packed under SUI_A effect paths, shared across variants via
     /// <paramref name="effects"/>.</summary>
     private byte[]? Emit(M2Model m2, byte[] donor, string internalName, string componentDir, int displayIndex,
-        EffectTextureMap effects, ForgeDiagnostics diag, string what, Vector3? glowColor = null, float glowIntensity = 1f)
+        EffectTextureMap effects, ForgeDiagnostics diag, string what, Vector3? glowColor = null, float glowIntensity = 1f,
+        bool stripReflectionMasks = false)
     {
         try
         {
@@ -455,6 +461,20 @@ public abstract class LegacyArmorImporter
                 diag.Info("motion.plan", $"{what}: {motionPlan.SourceEmitterCount} source particle emitter(s) rebuilt as animated 1.12 emitters instead of static sprites.");
             }
             var mesh = extracted.Mesh;
+
+            // Reflection-mask layers (see ImportedSkinAlphaPolicy): decided once per piece by
+            // DecideSkinAlphaPolicy so the packaged skin and every variant's pass list agree.
+            if (stripReflectionMasks && mesh.Passes is { Count: > 0 } sourcePasses)
+            {
+                var policy = ImportedSkinAlphaPolicy.Apply(sourcePasses);
+                if (policy.StrippedMaskPasses > 0)
+                {
+                    mesh = ImportedSkinAlphaPolicy.WithPasses(mesh, policy.Passes);
+                    diag.Info("import.skin.mask.dropped",
+                        $"{what}: {policy.StrippedMaskPasses} alpha-blended reflection-mask layer(s) dropped — the skin's alpha channel " +
+                        "is a shininess mask the 1.12 character frame renders as transparency; the reflection now shows unmasked.");
+                }
+            }
 
             // Effect textures: slot 0 is the replaceable display texture; slots ≥1 are hardcoded files.
             // Packaged members are keyed by the TBC SOURCE file (not the slot index) so variants that
@@ -556,6 +576,68 @@ public abstract class LegacyArmorImporter
         {
             diag.Error("import.emit", $"{what}: {ex.Message}");
             return null;
+        }
+    }
+
+    /// <summary>Whether this piece's skin alpha channel is a reflection mask that 1.12's character frame
+    /// would render as transparency (so the mask layers get dropped and the skin flattened), or is
+    /// genuinely needed by an alpha-keyed / alpha-blended / add-alpha pass in ANY variant (kept as is).
+    /// Probes with the same extractor Emit uses, so the decision and the emitted passes cannot drift.</summary>
+    private bool DecideSkinAlphaPolicy(ArmorImportSource src, IEnumerable<M2Model> models, ForgeDiagnostics diag, string what)
+    {
+        if (!ImportedSkinAlphaPolicy.BlpHasAlphaChannel(src.TextureBlp)) return false; // opaque skin: nothing to do
+        bool anyMask = false;
+        foreach (var m2 in models)
+        {
+            LegacyExtractResult? probe;
+            try { probe = LegacyWeaponMeshExtractor.Extract(m2, new ForgeDiagnostics("skin-alpha-probe"), Label, bakeEmitters: false); }
+            catch { probe = null; }
+            if (probe?.Mesh.Passes is not { Count: > 0 } passes) continue;
+            var policy = ImportedSkinAlphaPolicy.Apply(passes);
+            if (policy.SkinAlphaRequired)
+            {
+                diag.Info("import.skin.alpha.kept",
+                    $"{what}: the skin's alpha channel is sampled by an alpha-keyed/blended pass and is kept as authored " +
+                    "(the 1.12 character frame may show it as transparency).");
+                return false;
+            }
+            anyMask |= policy.StrippedMaskPasses > 0;
+        }
+        if (!anyMask)
+            diag.Info("import.skin.alpha.unused", $"{what}: the skin carries an alpha channel no pass depends on; it is flattened to opaque for the 1.12 character frame.");
+        return true;
+    }
+
+    /// <summary>Re-encode the packaged skin with every texel fully opaque (DXT1, the vanilla format for
+    /// opaque skins). Any later recolor bake re-encodes from these pixels and stays opaque.</summary>
+    private static void FlattenSkinAlpha(ArmorImportSource src, ForgeDiagnostics diag, string what)
+    {
+        if (src.TextureBlp is not { Length: > 0 } blp) return;
+        try
+        {
+            var pixels = BlpDecoder.GetPixels(blp, 0, out int w, out int h);
+            if (w <= 0 || h <= 0 || pixels.Length < w * h * 4)
+            { diag.Warn("import.skin.alpha.flatten", $"{what}: skin could not be decoded; its alpha channel is kept."); return; }
+            int translucent = 0;
+            for (int i = 3; i < pixels.Length; i += 4)
+            {
+                if (pixels[i] != 255) translucent++;
+                pixels[i] = 255;
+            }
+            if (translucent == 0) return; // header said alpha, but every texel is already solid
+            using var bmp = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+            System.Runtime.InteropServices.Marshal.Copy(pixels, 0, bmp.GetPixels(), pixels.Length);
+            bmp.NotifyPixelsChanged();
+            var re = new BlpWriterService().EncodeBitmapToBlp(bmp, useDxt1: true);
+            if (re is null)
+            { diag.Warn("import.skin.alpha.flatten", $"{what}: opaque DXT1 re-encode failed ({w}×{h}); the skin's alpha channel is kept."); return; }
+            src.TextureBlp = re;
+            diag.Info("import.skin.alpha.flattened",
+                $"{what}: skin alpha channel flattened to opaque ({translucent * 100L / (w * h)}% of texels were translucent) so the 1.12 character frame draws the piece solid.");
+        }
+        catch (Exception ex)
+        {
+            diag.Warn("import.skin.alpha.flatten", $"{what}: skin flatten failed ({ex.Message}); its alpha channel is kept.");
         }
     }
 
