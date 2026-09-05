@@ -143,7 +143,7 @@
             <span class="af-pill" id="pillWotlk">WotLK …</span>
             <span class="af-pill" id="pillVanilla" title="Checked when you open the Clone Vanilla card — it is a live world-database query">Vanilla: clone</span>
             <span class="af-pill" id="pillPatch">patch …</span>
-            <span class="af-pill" id="pillDeploy" title="Is the patch-4.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
+            <span class="af-pill" id="pillDeploy" title="Imports and deletes are queued; the patch-4.MPQ in the client is only rebuilt and deployed when you click Rebuild patch. The game client locks its MPQs while running, so close it first.">deploy …</span>
             <span class="af-pill" id="pillItemSet" title="Set membership and n-piece bonuses need ItemSet.dbc in the SERVER's dbc directory, not just in the client patch. The core reads it once at startup and zeroes item_template.set_id for any set it cannot find — so a freshly deployed file does nothing until mangosd restarts.">sets …</span>
         </div>
     </div>
@@ -181,7 +181,7 @@
 
             <div class="af-card collapsed">
                 <h3><span class="phase">Clone</span> Vanilla armor</h3>
-                <p id="vanillaState">Clone an existing vanilla armor piece — or a whole stock set — into new custom items. Each piece reuses the source's own model/textures (already in your client) and can be re-itemized (value, stats, effects). <strong>A single piece packages nothing</strong>: no patch, no download, no client restart, usable via <code>.additem</code> as soon as the core reloads. <strong>Cloning a SET does package one thing</strong> — the set itself is a row in ItemSet.dbc, so it ships in patch-6 and needs a client restart plus a mangosd restart to take effect. A recolor or glow tint cannot ride along either way: new art needs a new display, which is what the import lanes build.</p>
+                <p id="vanillaState">Clone an existing vanilla armor piece — or a whole stock set — into new custom items. Each piece reuses the source's own model/textures (already in your client) and can be re-itemized (value, stats, effects). <strong>A single piece packages nothing</strong>: no patch, no download, no client restart, usable via <code>.additem</code> as soon as the core reloads. <strong>Cloning a SET does package one thing</strong> — the set itself is a row in ItemSet.dbc, so it ships in the client patch (rebuilt on request) and needs a client restart plus a mangosd restart to take effect. A recolor or glow tint cannot ride along either way: new art needs a new display, which is what the import lanes build.</p>
                 <div class="af-search">
                     <input type="text" id="vanillaSearch" class="af-input" placeholder="Search vanilla armor by name, item id, or slot — e.g. Cenarion, 16795, boots…">
                     <select id="vanillaFamily" class="af-input" title="Filter by slot">
@@ -199,7 +199,7 @@
                    Delete removes it from the world DB and the patch; ids return to the pool.</p>
                 <div id="afList" class="af-list"><span class="muted" style="font-size:12px;">Loading…</span></div>
                 <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
-                    <button class="af-btn secondary" data-action="rebuildPatch">Rebuild patch</button>
+                    <button class="af-btn secondary" data-action="rebuildPatch" title="Package every queued change into patch-4.MPQ and deploy it to the client Data folder. Close WoW first — a running client locks the file.">Rebuild patch</button>
                     <a class="af-btn secondary" href="/ArmorForge/DownloadPatch" style="text-decoration:none;"><i class="fa-solid fa-download"></i> Download patch-4.MPQ</a>
                     <button class="af-btn secondary" id="btnRestartMangosd" data-action="restartMangosd" style="display:none;"
                             title="ItemSet.dbc has been written to the server's dbc directory but mangosd has not restarted since. The core only reads DBCs at startup, so forged sets stay inert until it does.">
@@ -628,11 +628,17 @@
     // restarts, so they live in their own function that can be re-run without disturbing the lane
     // searches (re-running the whole Status handler would reset every search box).
     function applyDeployPills(s) {
-        var p = $('pillPatch'); p.textContent = s.patchPresent ? 'patch-6 built' : 'no patch yet'; p.className = 'af-pill ' + (s.patchPresent ? 'ok' : '');
+        var p = $('pillPatch'); p.textContent = s.patchPresent ? 'patch-4 built' : 'no patch yet'; p.className = 'af-pill ' + (s.patchPresent ? 'ok' : '');
         var dp = s.deployedPatch || {}, dpEl = $('pillDeploy');
-        dpEl.textContent = !dp.configured ? 'deploy: no client path' : dp.stale ? 'patch-6 STALE in client — close WoW, Rebuild patch' : 'patch-6 deployed ✓';
-        dpEl.className = 'af-pill ' + (!dp.configured ? 'warn' : dp.stale ? 'bad' : 'ok');
-        if (dp.message) dpEl.title = dp.message;
+        // Queue depth first: it is the thing the operator acts on. Stale is the failure mode (client
+        // was running during the deploy); the rest is plain state.
+        dpEl.textContent = !dp.configured ? 'deploy: no client path'
+            : dp.pending > 0 ? dp.pending + ' change' + (dp.pending === 1 ? '' : 's') + ' queued — close WoW, Rebuild patch'
+            : dp.stale ? 'patch-4 STALE in client — close WoW, Rebuild patch'
+            : dp.deployedExists ? 'patch-4 deployed ✓'
+            : dp.built ? 'patch-4 not deployed yet' : 'no patch yet';
+        dpEl.className = 'af-pill ' + (!dp.configured ? 'warn' : dp.pending > 0 ? 'warn' : dp.stale ? 'bad' : dp.deployedExists ? 'ok' : '');
+        dpEl.title = (dp.message || '') + (dp.pendingReasons && dp.pendingReasons.length ? '\n\nPending:\n• ' + dp.pendingReasons.join('\n• ') : '');
         // Server-side sets: the client patch alone is not enough — the core needs ItemSet.dbc in its own
         // dbc dir, and only picks it up at startup.
         var si = s.serverItemSet || {}, siEl = $('pillItemSet');
@@ -703,7 +709,7 @@
             if (vs.configured) {
                 vp.textContent = 'Vanilla: ' + (vs.pieces || 0).toLocaleString() + ' pieces';
                 vp.className = 'af-pill ok';
-                $('vanillaState').innerHTML = (vs.pieces || 0).toLocaleString() + ' stock armor pieces available to clone, grouped into their sets below. Each piece reuses the source’s own model/textures and can be re-itemized. <strong>A single piece packages nothing</strong> — no patch, no download, no client restart. <strong>Cloning a SET ships an ItemSet.dbc row in patch-6</strong>, so it needs a client restart and a mangosd restart to take effect. A recolor or glow tint cannot ride along either way.';
+                $('vanillaState').innerHTML = (vs.pieces || 0).toLocaleString() + ' stock armor pieces available to clone, grouped into their sets below. Each piece reuses the source’s own model/textures and can be re-itemized. <strong>A single piece packages nothing</strong> — no patch, no download, no client restart. <strong>Cloning a SET ships an ItemSet.dbc row in the client patch</strong> (rebuilt on request), so it needs a Rebuild patch, a client restart and a mangosd restart to take effect. A recolor or glow tint cannot ride along either way.';
                 $('vanillaState').style.color = '';
             } else {
                 vp.textContent = 'Vanilla: world DB unreachable';
@@ -915,10 +921,10 @@
         var laneLabel = (LANES[p.expansion] || LANES.tbc).label;
         var vanilla = p.expansion === 'vanilla';
         var verbing = vanilla ? 'Cloning ' : 'Importing ';
-        // A clone packages nothing, so neither patch-6 line is true of it.
+        // A clone packages nothing, so neither packaging line is true of it.
         var detail = vanilla
             ? 'Copying the item row and applying your configuration — no art is packaged.'
-            : (p.renderKind === 'Modelled' ? 'Re-emitting ' + laneLabel + ' model(s) as native vanilla, packaging patch-6…' : 'Packaging textures into patch-6…');
+            : (p.renderKind === 'Modelled' ? 'Re-emitting ' + laneLabel + ' model(s) as native vanilla and storing them; the client patch rebuild is queued…' : 'Storing textures; the client patch rebuild is queued…');
         result('<div class="title">' + verbing + esc(p.name) + '…</div><div class="muted">' + detail + '</div>');
         var fd = new FormData(); fd.append('expansion', p.expansion || 'tbc'); fd.append('entry', p.entry);
         if (itemConfigJson) fd.append('itemConfig', itemConfigJson);
@@ -943,20 +949,23 @@
     function showPiece(r) {
         if (!r.ok) { result('<div class="title bad">Import failed</div><div class="bad" style="white-space:pre-wrap;">' + esc(r.body) + '</div>'); return; }
         var d = JSON.parse(r.body), a = d.apply || {};
-        function line(o, label) { return o ? ('<b>' + label + '</b><span class="' + (o.ok ? 'ok' : 'bad') + '">' + esc(o.msg) + '</span>') : ''; }
+        // A queued client-patch rebuild is pending work, not a failure: render it as such.
+        function line(o, label) { return o ? ('<b>' + label + '</b><span class="' + (o.queued ? 'muted' : o.ok ? 'ok' : 'bad') + '">' + (o.queued ? '⏳ ' : '') + esc(o.msg) + '</span>') : ''; }
         // A clone ships no art: no patch, no download, no client restart. Calling it "Imported" above a
         // red empty Deploy row made a finished job read as a half-failed import. (The server now omits
         // `deploy` entirely when there was no patch step, so line() renders nothing for it.)
         var cloned = d.expansion === 'vanilla';
         var tail = cloned
             ? '<code>.additem ' + d.itemEntry + '</code> once the core reloads — no patch and no client restart, it reuses display ' + d.displayId + '.'
-            : 'Restart the client, then <code>.additem ' + d.itemEntry + '</code>.';
+            : (a.deploy && a.deploy.queued
+                ? 'The client patch was <strong>not rebuilt</strong> — import anything else you want first, then close WoW and click <strong>Rebuild patch</strong> (Registry card) to ship ' + (a.deploy.pending > 1 ? 'all ' + a.deploy.pending + ' pending changes' : 'it') + ' at once. Then start the client and <code>.additem ' + d.itemEntry + '</code>.'
+                : 'Restart the client, then <code>.additem ' + d.itemEntry + '</code>.');
         result('<div class="title ok">' + (cloned ? 'Cloned: ' : 'Imported: ') + esc(d.name) + '</div><div class="af-kv"><b>Item entry</b><span>' + d.itemEntry + '</span><b>Display id</b><span>' + d.displayId + (cloned ? ' (the source’s own)' : '') + '</span>' +
             '<b>Piece</b><span>' + esc(d.family) + ' (' + esc(d.renderKind) + ')' + (d.models ? ' · ' + d.models + ' model file(s)' : '') + (d.components ? ' · ' + d.components + ' texture(s)' : '') + '</span>' +
             line(a.sql, 'World DB') + line(a.reload, 'Reload') + line(a.deploy, 'Deploy') + line(a.serverSets, 'Server sets') + '</div>' +
             (d.diagnostics && d.diagnostics.length ? '<div class="af-diag">' + esc(d.diagnostics.slice(0, 20).join('\n')) + '</div>' : '') +
             '<div class="muted" style="margin-top:6px;">' + tail + '</div>');
-        loadList();
+        loadList(); refreshStatus();
         if (window.afViewer) {
             var items = window.afViewer.defaultOutfit.map(function (o) { return { displayId: o.displayId, itemId: o.itemId }; });
             items.push({ displayId: d.displayId, itemId: d.itemEntry });
@@ -1461,8 +1470,8 @@
         $('setError').style.display = 'none'; $('setSubmit').disabled = true;
         result('<div class="title">' + (vanillaSet ? 'Cloning set ' : 'Importing set ') + esc(s.name) + ' (' + s.pieces.length + ' pieces)…</div><div class="muted">'
             + (vanillaSet
-                ? 'Each piece is cloned with its configuration and stamped with the new set id; patch-6 is rebuilt once to ship the set definition.'
-                : 'Each piece is configured, reserved and persisted; patch-6 is rebuilt once.')
+                ? 'Each piece is cloned with its configuration and stamped with the new set id; the set definition is queued for the next Rebuild patch.'
+                : 'Each piece is configured, reserved and persisted; the client patch rebuild is queued.')
             + '</div>');
         fetch('/ArmorForge/ImportSet', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
             .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, body: t }; }); })
@@ -1476,12 +1485,14 @@
         var h = '<div class="title ok">Set ' + d.setId + ' — ' + esc(d.name) + '</div><div class="muted">' + esc(d.message) + '</div><div class="af-kv" style="margin-top:6px;">';
         (d.pieces || []).forEach(function (p) { h += '<b class="' + (p.ok ? 'ok' : 'bad') + '">' + (p.ok ? '✓' : '✗') + ' ' + esc(p.name || p.tbcEntry) + '</b><span>' + (p.ok ? 'entry ' + p.itemEntry + ' · display ' + p.displayId : esc(p.message)) + '</span>'; });
         h += '<b class="' + (d.serverItemSetDeployed ? 'ok' : 'bad') + '">Server sets</b><span class="' + (d.serverItemSetDeployed ? 'ok' : 'bad') + '">' + esc(d.serverItemSetMessage || '') + '</span>';
+        if (d.patchQueued)
+            h += '<b>Client patch</b><span class="muted">⏳ rebuild queued — ' + d.patchPending + ' change' + (d.patchPending === 1 ? '' : 's') + ' pending; close WoW and click Rebuild patch to ship them</span>';
         h += '</div>';
         // The one place the lane's "nothing is packaged" promise does not hold, so say it plainly rather
         // than leaving the operator to discover it: the PIECES ship no art, but the SET only exists as a
-        // row in ItemSet.dbc, which has to reach the client in patch-6 and the server in its dbc dir.
+        // row in ItemSet.dbc, which has to reach the client in the patch and the server in its dbc dir.
         if (d.expansion === 'vanilla')
-            h += '<div class="muted" style="margin-top:6px;">The cloned pieces reuse their sources’ own art, so nothing was packaged for them — but the <strong>set itself</strong> is a row in ItemSet.dbc, which ships in patch-6. Close and restart the client to see the set block on the tooltips.</div>';
+            h += '<div class="muted" style="margin-top:6px;">The cloned pieces reuse their sources’ own art, so nothing was packaged for them — but the <strong>set itself</strong> is a row in ItemSet.dbc, which ships in the client patch. Close WoW, click Rebuild patch, then restart the client to see the set block on the tooltips.</div>';
         // A set that could not reach the server's dbc directory is not a working set: the core zeroes
         // every member's set_id at load and writes one "has wrong ItemSet" line per piece to
         // DBErrors.log. That used to be reported only as a green/red pair inside the af-kv table.
@@ -1518,7 +1529,7 @@
         if (!note) return;
         note.style.display = on ? 'none' : '';
         note.textContent = 'Preview only for a vanilla clone. A clone reuses the source item’s own display, and new '
-            + 'art needs a new display plus a patch-6 rebuild — which is what the TBC and WotLK import lanes do. '
+            + 'art needs a new display plus a patch rebuild — which is what the TBC and WotLK import lanes do. '
             + 'Recolor and glow here to see how a piece could look, then import it from a lane to keep it.';
         if (!on) apActive = null;
     }
@@ -1705,7 +1716,7 @@
         var ok = d.ok !== false;
         result('<div class="title ' + (ok ? 'ok' : 'bad') + '">' + (ok ? 'Deleted ' + what : 'Delete ' + what + ' incomplete') + '</div>' +
             '<div class="' + (ok ? 'muted' : 'bad') + '" style="white-space:pre-wrap;">' + esc(d.message || '') + '</div>' +
-            (ok ? '' : '<div class="muted" style="margin-top:6px;">The set was left in place so you can try again once the cause is cleared (a running game client locks patch-6).</div>'));
+            (ok ? '' : '<div class="muted" style="margin-top:6px;">The set was left in place so you can try again once the cause is cleared (a running game client locks the patch).</div>'));
     }
 
     // ── Optional vanilla set bonuses ──

@@ -330,7 +330,7 @@
             <span class="wf-pill" id="pillFixture">fixture …</span>
             <span class="wf-pill" id="pillDonor">donor …</span>
             <span class="wf-pill" id="pillContract">contract …</span>
-            <span class="wf-pill" id="pillDeploy" title="Is the patch-4.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
+            <span class="wf-pill" id="pillDeploy" title="Forges and deletes are queued; the patch-4.MPQ in the client is only rebuilt and deployed when you click Rebuild patch. The game client locks its MPQs while running, so close it first.">deploy …</span>
         </div>
     </div>
 
@@ -542,6 +542,7 @@
                         <input type="hidden" id="tbcTarget" value="0">
                         <span class="val" id="tbcTargetVal">exact source</span>
                     </div>
+                    <label class="wf-check" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand on two-handers (approximate). Off by default — a TBC import keeps the source's own hand placement, so it is always in the right spot."><input type="checkbox" id="tbcShowGrip"> grip markers</label>
                     <button class="wf-btn secondary" data-action="tbcPreview" id="tbcPreviewBtn" disabled>Preview</button>
                     <button class="wf-btn" data-action="tbcForge" id="tbcForgeBtn" disabled><i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
@@ -620,6 +621,7 @@
                         <input type="hidden" id="wotlkTarget" value="0">
                         <span class="val" id="wotlkTargetVal">exact source</span>
                     </div>
+                    <label class="wf-check" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand on two-handers (approximate). Off by default — a WotLK import keeps the source's own hand placement, so it is always in the right spot."><input type="checkbox" id="wotlkShowGrip"> grip markers</label>
                     <button class="wf-btn secondary" data-action="wotlkPreview" id="wotlkPreviewBtn" disabled>Preview</button>
                     <button class="wf-btn" data-action="wotlkForge" id="wotlkForgeBtn" disabled><i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
@@ -700,6 +702,7 @@
                         <label>Selected</label>
                         <input type="text" id="vanillaSelected" readonly placeholder="nothing selected" style="width:100%;">
                     </div>
+                    <label class="wf-check" title="Show where the main hand lands: green band at the model origin, where the palm wraps. Off by default — a stock vanilla display is already placed correctly."><input type="checkbox" id="vanillaShowGrip"> grip markers</label>
                     <button class="wf-btn" data-action="vanillaClone" id="vanillaCloneBtn" disabled>
                         <i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
@@ -742,11 +745,14 @@
                 <h3><span class="phase">Registry</span> Forged Weapons</h3>
                 <p>The weapons currently in the registry — the weapons inside <code>patch-4.MPQ</code>.
                    <strong>View</strong> renders a weapon's stored M2+BLP in the viewer. <strong>Delete</strong>
-                   removes it from the game: world-database row, packaged patch, and registry entry; its IDs return
-                   to the pool. All forge and delete actions are recorded in the Activity Log.</p>
+                   removes it from the game: world-database row, registry entry, and (at the next rebuild) the
+                   packaged patch; its IDs return to the pool. Forges and deletes <strong>queue</strong> a patch
+                   rebuild rather than running one each time: forge as many as you like, then close WoW and click
+                   <strong>Rebuild patch</strong> once to package every lane (weapons, armor, retextures) and deploy
+                   it. All forge and delete actions are recorded in the Activity Log.</p>
                 <div id="wfWeapons" class="wf-weapons"><span style="color:var(--text-muted);font-size:12px;">Loading…</span></div>
                 <div class="wf-row" style="margin-top:10px;">
-                    <button class="wf-btn secondary" data-action="rebuildPatch">Rebuild patch</button>
+                    <button class="wf-btn secondary" data-action="rebuildPatch" title="Package every queued change into patch-4.MPQ and deploy it to the client Data folder. Close WoW first — a running client locks the file.">Rebuild patch</button>
                     <a class="wf-btn secondary" href="/WeaponForge/DownloadPatch" style="text-decoration:none;">
                         <i class="fa-solid fa-download"></i> Download current patch-4.MPQ</a>
                 </div>
@@ -756,7 +762,7 @@
 
         <div class="wf-preview">
             <div class="wf-viewer" id="wfViewer"><div class="hint" id="wfHint">Preview a model to inspect it here</div>
-                <div class="wf-cameras"><button data-camera="three">3/4</button><button data-camera="front">front</button><button data-camera="edge">edge</button><button id="wfExpand" title="Expand viewer">⤢ expand</button></div></div>
+                <div class="wf-cameras"><button data-camera="three">3/4</button><button data-camera="front">front</button><button data-camera="edge">edge</button><button id="wfGrid" title="Show or hide the floor grid">grid</button><button id="wfExpand" title="Expand viewer">⤢ expand</button></div></div>
             <div class="wf-result" id="wfResult">
                 <div class="title">Ready</div>
                 <div style="color:var(--text-muted);">Results, IDs, downloads, and diagnostics appear here.</div>
@@ -1088,7 +1094,7 @@
         // ---------- 3D viewer ----------
         const host = document.getElementById('wfViewer');
         const hint = document.getElementById('wfHint');
-        let renderer, scene, camera, controls, current = null;
+        let renderer, scene, camera, controls, current = null, grid = null;
         // Material animation for the previewed weapon: colour / opacity / UV-scroll tracks the
         // server ships as a `suiFx` manifest inside the GLB. A forged weapon that got a glow pulse
         // written into its M2 renders frozen at the pulse's dimmest key without this.
@@ -1113,8 +1119,12 @@
             scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.1));
             const dir = new THREE.DirectionalLight(0xffffff, 1.4);
             dir.position.set(2, 3, 2); scene.add(dir);
-            const grid = new THREE.GridHelper(2, 20, 0x3a4150, 0x262b33);
+            grid = new THREE.GridHelper(2, 20, 0x3a4150, 0x262b33);
             grid.position.y = -0.001; scene.add(grid);
+            // The grid is a reading aid, not part of the weapon; remember the choice per browser.
+            let gridOn = true;
+            try { gridOn = localStorage.getItem('wfGrid') !== 'off'; } catch { }
+            setGrid(gridOn);
 
             window.addEventListener('resize', onResize);
             animate();
@@ -1243,14 +1253,48 @@
         // The weapon mounts to the character's hand bone AT ITS ORIGIN, so the green band at x=0 is
         // exactly where the palm wraps. The blue band (two-handers) marks the approximate off-hand
         // zone — the character animation places that hand, not the weapon file.
+        //
+        // Each lane owns its own toggle. Only the GLB import defaults ON: a raw web GLB has no
+        // idea where the hand goes, so the marker is the whole point of its placement sliders.
+        // TBC / WotLK imports and vanilla clones keep the source's own placement, which is always
+        // in the right spot, so their markers are opt-in.
         let lastGrip = null, gripGroup = null;
+        const GRIP_TOGGLES = { glb: 'impShowGrip', tbc: 'tbcShowGrip', wotlk: 'wotlkShowGrip', vanilla: 'vanillaShowGrip' };
+        function gripToggleFor(owner) {
+            // A forge result is shown under 'forged'; it came from whichever lane the modal was
+            // configuring, so follow that lane's toggle.
+            const key = owner === 'forged' ? (itemBuildState.mode || 'glb') : owner;
+            return document.getElementById(GRIP_TOGGLES[key] || 'impShowGrip');
+        }
+        function gripMarkersOn() {
+            const cb = gripToggleFor(viewerOwner);
+            return !!(cb && cb.checked);
+        }
+        // A stock display carries no forge grip payload, but its origin IS the palm (the weapon mounts
+        // to the hand bone at its origin), so when asked for, size the band from the mesh itself.
+        function estimatePalmRadius(model) {
+            const box = new THREE.Box3().setFromObject(model);
+            const len = Math.max(box.max.x - box.min.x, 1e-3);
+            const v = new THREE.Vector3();
+            let r = 0;
+            model.traverse(node => {
+                if (!node.isMesh || !node.geometry || !node.geometry.attributes.position) return;
+                const pos = node.geometry.attributes.position;
+                for (let i = 0; i < pos.count; i++) {
+                    v.fromBufferAttribute(pos, i); node.localToWorld(v);
+                    if (Math.abs(v.x) > len * 0.03) continue;   // only the slice through the origin
+                    r = Math.max(r, Math.hypot(v.y, v.z));
+                }
+            });
+            return r || Math.min(box.max.y - box.min.y, box.max.z - box.min.z) / 2;
+        }
         function drawGripMarkers() {
             if (gripGroup) { scene.remove(gripGroup); gripGroup = null; }
-            const on = document.getElementById('impShowGrip').checked;
-            if (!on || !lastGrip || !current) return;
+            if (!current || !gripMarkersOn()) return;
+            const grip = lastGrip || { palm: { radius: estimatePalmRadius(current) } };
             gripGroup = new THREE.Group();
-            addGripBand(0, lastGrip.palm.radius, 0x38e06c);
-            if (lastGrip.secondHand) addGripBand(lastGrip.secondHand.x, lastGrip.secondHand.radius, 0x38b6ff);
+            addGripBand(0, grip.palm.radius, 0x38e06c);
+            if (grip.secondHand) addGripBand(grip.secondHand.x, grip.secondHand.radius, 0x38b6ff);
             scene.add(gripGroup);
         }
         function addGripBand(x, r, color) {
@@ -1267,7 +1311,7 @@
             tick.renderOrder = 2;
             gripGroup.add(tick);
         }
-        document.getElementById('impShowGrip').addEventListener('change', drawGripMarkers);
+        Object.values(GRIP_TOGGLES).forEach(id => document.getElementById(id).addEventListener('change', drawGripMarkers));
         function frameObject(obj) {
             const box = new THREE.Box3().setFromObject(obj);
             const size = box.getSize(new THREE.Vector3());
@@ -1285,6 +1329,14 @@
             camera.position.copy(center).add(offset); camera.up.set(0,1,0); camera.lookAt(center); controls.update();
         }
         document.querySelectorAll('[data-camera]').forEach(b => b.addEventListener('click', () => setDiagnosticCamera(b.dataset.camera)));
+        function setGrid(on) {
+            if (grid) grid.visible = on;
+            const b = document.getElementById('wfGrid');
+            b.textContent = on ? 'grid' : 'grid off';
+            b.style.opacity = on ? '' : '0.6';
+            try { localStorage.setItem('wfGrid', on ? 'on' : 'off'); } catch { }
+        }
+        document.getElementById('wfGrid').addEventListener('click', () => setGrid(!grid.visible));
         document.getElementById('wfExpand').addEventListener('click', () => {
             const v = document.getElementById('wfViewer');
             const on = v.classList.toggle('expanded');
@@ -1350,10 +1402,13 @@
         }
         function previewUrl(data) { return (data.preview && data.preview.glbWebPath) || data.previewGlbWebPath || null; }
         function applyLine(ok, label, msg) { return `${ok ? '✓' : '✗'} ${label}: ${msg}`; }
+        function queuedLine(label, msg) { return `⏳ ${label}: ${msg}`; }
         function forgeResult(d, titleOk) {
             if (!d.ok) return setResult({ title: 'Forge failed', error: d.error || d.message, diagnostics: d.diagnostics });
             const a = d.apply || {};
-            const allApplied = a.sqlApplied && a.reloaded && a.patchDeployed;
+            // The client patch is no longer rebuilt per forge: a queued rebuild counts as applied here,
+            // and the note below says what is left to do (Rebuild patch, once, when done forging).
+            const allApplied = a.sqlApplied && a.reloaded && (a.patchDeployed || a.patchQueued);
             lastGrip = d.grip || null;
             setResult({
                 title: titleOk + (allApplied ? ' & applied to server' : ' — some apply steps need attention'),
@@ -1372,15 +1427,18 @@
                 diagnostics: [
                     applyLine(a.sqlApplied, 'World DB', a.sqlMessage || ''),
                     applyLine(a.reloaded, 'Reload', a.reloadMessage || ''),
-                    applyLine(a.patchDeployed, 'Patch deploy', a.patchDeployMessage || ''),
+                    a.patchQueued ? queuedLine('Client patch', a.patchDeployMessage || '') : applyLine(a.patchDeployed, 'Patch deploy', a.patchDeployMessage || ''),
                     ...(d.diagnostics || []),
                 ],
                 note: allApplied
-                    ? `Live on the server. Fully restart the client(s), then .additem ${d.itemEntry}. If that entry was cached with older metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`
+                    ? (a.patchQueued
+                        ? `Live on the server. The client patch was NOT rebuilt — forge anything else you want first, then close WoW and click Rebuild patch (Forged Weapons card) to ship ${a.patchPending > 1 ? 'all ' + a.patchPending + ' pending changes' : 'it'} at once. Then start the client and .additem ${d.itemEntry}. If that entry was cached with older metadata, remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`
+                        : `Live on the server. Fully restart the client(s), then .additem ${d.itemEntry}. If that entry was cached with older metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`)
                     : 'One or more steps require manual action — see the lines above; the downloads contain the files. Then fully restart the client and .additem. If metadata is stale, close WoW and remove WDB\\itemcache.wdb or the whole WDB cache directory.'
             });
             loadGlb(previewUrl(d), 'forged');
             loadWeapons();
+            loadStatus();
         }
 
         // ---------- final item configuration ----------
@@ -2468,6 +2526,7 @@
                     diagnostics: [applyLine(d.patchDeployed || d.patchRemoved, 'Deploy', d.patchDeployMessage || ''), ...(d.diagnostics || [])]
                 });
                 loadWeapons();
+                loadStatus();
             },
         };
         document.querySelectorAll('[data-action]').forEach(btn => {
@@ -3150,16 +3209,16 @@
                 if (!d.ok) return setResult({ title: 'Delete failed', error: d.error });
                 setResult({
                     title: `Deleted "${d.deleted.name}" everywhere`,
-                    kv: { 'Weapons remaining': d.weaponsRemaining, 'Patch': d.patchRemoved ? 'removed' : 'repackaged & redeployed' },
+                    kv: { 'Weapons remaining': d.weaponsRemaining, 'Patch': d.patchQueued ? 'rebuild queued' : d.patchRemoved ? 'removed' : 'repackaged & redeployed' },
                     diagnostics: [
                         applyLine(d.itemRowDeleted, 'World DB', d.itemRowMessage || ''),
                         applyLine(d.reloaded, 'Reload', d.reloadMessage || ''),
-                        applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
+                        d.patchQueued ? queuedLine('Client patch', d.patchDeployMessage || '') : applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
                     ],
                     downloads: d.patchDownloadUrl ? [{ label: 'patch-4.MPQ', url: d.patchDownloadUrl }] : [],
-                    note: 'IDs returned to the pool. Fully restart the client. If a reused entry shows cached item metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory); WoW recreates it.'
+                    note: 'IDs returned to the pool. The weapon stays in the client until you close WoW and click Rebuild patch. If a reused entry shows cached item metadata, remove WDB\\itemcache.wdb (or the whole WDB cache directory); WoW recreates it.'
                 });
-            } finally { btn.disabled = false; loadWeapons(); }
+            } finally { btn.disabled = false; loadWeapons(); loadStatus(); }
         }
 
         // ---------- status pills + weapon-type dropdown ----------
@@ -3171,9 +3230,15 @@
                 document.getElementById('pillContract').textContent = 'contract v' + s.coordinateContractVersion;
                 const dp = s.deployedPatch || {};
                 const dpEl = document.getElementById('pillDeploy');
-                dpEl.textContent = !dp.configured ? 'deploy: no client path' : dp.stale ? 'patch-5 STALE in client — close WoW, Rebuild patch' : (dp.deployedExists ? 'patch-5 deployed ✓' : 'patch-5 not deployed yet');
-                dpEl.className = 'wf-pill ' + (!dp.configured ? 'warn' : dp.stale ? 'bad' : 'ok');
-                dpEl.title = dp.message || dpEl.title;
+                // Queue depth first: it is the thing the operator acts on. Stale is the failure
+                // mode (client was running during the deploy); the rest is plain state.
+                dpEl.textContent = !dp.configured ? 'deploy: no client path'
+                    : dp.pending > 0 ? `${dp.pending} change${dp.pending === 1 ? '' : 's'} queued — close WoW, Rebuild patch`
+                    : dp.stale ? 'patch-4 STALE in client — close WoW, Rebuild patch'
+                    : dp.deployedExists ? 'patch-4 deployed ✓'
+                    : dp.built ? 'patch-4 not deployed yet' : 'no patch yet';
+                dpEl.className = 'wf-pill ' + (!dp.configured ? 'warn' : dp.pending > 0 ? 'warn' : dp.stale ? 'bad' : dp.deployedExists ? 'ok' : '');
+                dpEl.title = (dp.message || '') + (dp.pendingReasons && dp.pendingReasons.length ? '\n\nPending:\n• ' + dp.pendingReasons.join('\n• ') : '');
                 fillWeaponTypes(s.weaponTypes || []);
             } catch { pill('pillFixture', false, '', 'status unavailable'); }
         }

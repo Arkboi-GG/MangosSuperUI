@@ -1461,8 +1461,6 @@ $(function () {
         $.getJSON('/CircuitTrace/Status', function (d) {
             if (!d) return;
             var armed = d.armed || [];
-            var nameOf = {};
-            botList.forEach(function (b) { nameOf[b.guid] = b.name; });
             $('#cbWhoSub').text('mode: ' + d.mode + ' · ' + armed.length + ' armed (writing to disk) · ' +
                 d.ringBots + ' bots ringing in memory · ' + d.sites + ' sites');
             if (!armed.length) {
@@ -1472,18 +1470,63 @@ $(function () {
                         : ' Shadow mode is off — turn it on to record.') + '</div>');
                 return;
             }
-            var html = '';
-            armed.slice().sort(function (a, b) { return (nameOf[a] || ('' + a)).localeCompare(nameOf[b] || ('' + b)); })
-                .forEach(function (g) {
-                    html += '<div class="cb-who-row" data-guid="' + g + '">' +
-                        '<span class="cb-who-rec">● REC</span>' +
-                        '<span class="cb-who-name">' + esc(nameOf[g] || ('bot ' + g)) + '</span>' +
+            // Resolve the armed guids against the characters DB + bridge: an armed guid
+            // outlives its bot (deleted bots stayed "armed" forever), so label the dead
+            // and offline ones and offer a one-click prune of the deleted ones.
+            $.getJSON('/CircuitTrace/ArmedRoster', function (r) {
+                var rows = (r && r.rows) || [];
+                var missing = (r && r.missing) || 0;
+                var html = '';
+                if (missing > 0) {
+                    html += '<div class="cb-who-row cb-who-prune" style="justify-content:space-between">' +
+                        '<span class="cb-who-name" style="color:var(--text-secondary)">' + missing +
+                        ' armed guid' + (missing === 1 ? '' : 's') + ' no longer exist in the characters DB</span>' +
+                        '<button type="button" id="cbWhoPrune" class="cb-who-go" style="cursor:pointer">untrack deleted →</button></div>';
+                }
+                rows.forEach(function (b) {
+                    var g = b.guid;
+                    var state = !b.exists ? 'deleted' : (!b.onBridge ? 'offline' : (b.ringing ? 'rec' : 'idle'));
+                    var rec = state === 'rec' ? '● REC' : state === 'idle' ? '○ ARMED' : state === 'offline' ? '○ OFFLINE' : '✕ DELETED';
+                    var dim = state === 'deleted' || state === 'offline' ? ' style="opacity:.55"' : '';
+                    html += '<div class="cb-who-row" data-guid="' + g + '" data-state="' + state + '"' + dim + '>' +
+                        '<span class="cb-who-rec">' + rec + '</span>' +
+                        '<span class="cb-who-name">' + esc(b.name || ('bot ' + g)) + '</span>' +
                         '<span class="cb-who-guid">#' + g + '</span>' +
-                        '<span class="cb-who-go">select →</span></div>';
+                        (state === 'deleted'
+                            ? '<span class="cb-who-go cb-who-disarm" data-guid="' + g + '">disarm →</span>'
+                            : '<span class="cb-who-go">select →</span>') + '</div>';
                 });
-            $('#cbWhoBody').html(html);
+                $('#cbWhoBody').html(html);
+            }).fail(function () {
+                // Roster lookup failed (DB down?) — fall back to the plain armed list.
+                var nameOf = {};
+                botList.forEach(function (b) { nameOf[b.guid] = b.name; });
+                var html = '';
+                armed.slice().sort(function (a, b) { return (nameOf[a] || ('' + a)).localeCompare(nameOf[b] || ('' + b)); })
+                    .forEach(function (g) {
+                        html += '<div class="cb-who-row" data-guid="' + g + '">' +
+                            '<span class="cb-who-rec">● REC</span>' +
+                            '<span class="cb-who-name">' + esc(nameOf[g] || ('bot ' + g)) + '</span>' +
+                            '<span class="cb-who-guid">#' + g + '</span>' +
+                            '<span class="cb-who-go">select →</span></div>';
+                    });
+                $('#cbWhoBody').html(html);
+            });
         });
     }
+
+    $(document).on('click', '#cbWhoPrune', function (e) {
+        e.stopPropagation();
+        $.post('/CircuitTrace/Prune').done(function (r) {
+            showToastLite('untracked ' + ((r && r.removed) || []).length + ' deleted bot(s)');
+            refreshStatus(); renderWho();
+        });
+    });
+    $(document).on('click', '.cb-who-disarm', function (e) {
+        e.stopPropagation();
+        var g = +$(this).data('guid');
+        $.post('/CircuitTrace/Disarm?guid=' + g).done(function () { refreshStatus(); renderWho(); });
+    });
 
     $('#cbWho').on('click', openWho);
     $('#cbWhoClose').on('click', closeWho);

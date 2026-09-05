@@ -12,7 +12,7 @@ namespace MangosSuperUI.Controllers;
 /// The Armor Forge (ARMOR_FORGE.md) — imports TBC (2.4.3) and WotLK (3.3.5a) armor into the live
 /// vanilla server, as whole sets or single pieces. Painted pieces carry their body-atlas BLPs;
 /// helms/shoulders are re-emitted as native vanilla M2s; cloaks carry their cape BLP. Everything
-/// ships in <c>patch-6.MPQ</c>. Vanilla set bonuses are an optional, operator-defined extra (never
+/// ships in the unified <c>patch-4.MPQ</c>, rebuilt on request. Vanilla set bonuses are an optional, operator-defined extra (never
 /// imported). Every browse/preview/import endpoint exists per lane (<c>Tbc*</c> / <c>Wotlk*</c>) and
 /// as an <c>expansion=</c> keyed form; all share one implementation over <see cref="ArmorImportLane"/>.
 /// </summary>
@@ -28,14 +28,16 @@ public class ArmorForgeController : Controller
     private readonly BlpWriterService _blp;
     private readonly ProcessManagerService _processes;
     private readonly IWebHostEnvironment _env;
+    private readonly MangosSuperUI.Services.UnifiedPatch.UnifiedPatchService _unified;
     private readonly ILogger<ArmorForgeController> _logger;
 
     // Armor equip slots the gameplay contract accepts (VanillaItemBuildConfigurationTranslator.ArmorInventoryTypes).
     private const string ArmorInventoryTypeError =
         "inventoryType must be a wearable Vanilla armor slot: 1 head, 3 shoulder, 5 chest, 6 waist, 7 legs, 8 feet, 9 wrists, 10 hands, 16 back, 20 robe, 23 held.";
 
-    public ArmorForgeController(CustomArmorBuildService armor, ArmorImportSources lanes, VanillaArmorSetCatalog vanillaSets, DbcService dbc, ItemConfigurationParser itemConfig, ItemBudgetGenerator itemize, PaletteSwapService palette, BlpWriterService blp, ProcessManagerService processes, IWebHostEnvironment env, ILogger<ArmorForgeController> logger)
+    public ArmorForgeController(CustomArmorBuildService armor, ArmorImportSources lanes, VanillaArmorSetCatalog vanillaSets, DbcService dbc, ItemConfigurationParser itemConfig, ItemBudgetGenerator itemize, PaletteSwapService palette, BlpWriterService blp, ProcessManagerService processes, IWebHostEnvironment env, MangosSuperUI.Services.UnifiedPatch.UnifiedPatchService unified, ILogger<ArmorForgeController> logger)
     {
+        _unified = unified;
         _armor = armor; _lanes = lanes; _vanillaSets = vanillaSets; _dbc = dbc; _itemConfig = itemConfig; _itemize = itemize; _palette = palette; _blp = blp; _processes = processes; _env = env; _logger = logger;
     }
 
@@ -61,7 +63,7 @@ public class ArmorForgeController : Controller
             fixtureOk = DonorItemTemplateFixture.Verify(),
             tbc = LaneStatus(_lanes.Tbc),
             wotlk = LaneStatus(_lanes.Wotlk),
-            patchPresent = _armor.CanonicalPatchPath is not null,
+            patchPresent = System.IO.File.Exists(_unified.ArtifactPath),
             deployedPatch = DeployedPatchJson(),
             serverItemSet = ServerItemSetJson(),
         });
@@ -89,10 +91,20 @@ public class ArmorForgeController : Controller
         }
     }
 
+    /// <summary>The unified patch-4.MPQ as the page sees it: built / deployed / stale, plus how many
+    /// imports and deletes are queued for the next Rebuild patch click.</summary>
     private object DeployedPatchJson()
     {
-        try { var (configured, stale, message) = _armor.DeployedPatchStatus(); return new { configured, stale, message }; }
-        catch (Exception ex) { return new { configured = false, stale = false, message = ex.Message }; }
+        try
+        {
+            var st = _unified.DeployStatus();
+            return new
+            {
+                configured = st.Configured, built = st.Built, deployedExists = st.Deployed, stale = st.Stale,
+                pending = st.Pending, pendingReasons = st.PendingReasons, message = st.Message,
+            };
+        }
+        catch (Exception ex) { return new { configured = false, built = false, deployedExists = false, stale = false, pending = 0, pendingReasons = Array.Empty<string>(), message = ex.Message }; }
     }
 
     /// <summary>Server-side set state: is our ItemSet.dbc in the core's dbc dir, and has mangosd been
@@ -893,6 +905,7 @@ public class ArmorForgeController : Controller
             return Json(new
             {
                 ok = true, expansion = lane!.Key, setId = r.SetId, name = r.Name, message = r.Message, patchDeployed = r.PatchDeployed,
+                patchQueued = r.PatchQueued, patchPending = r.PatchPending,
                 serverItemSetDeployed = r.ServerItemSetDeployed, serverItemSetMessage = r.ServerItemSetMessage,
                 bonusCount = bonuses.Count(b => b.Threshold > 0 && b.SpellId > 0),
                 pieces = r.Pieces.Select(ResultDto),
@@ -917,7 +930,7 @@ public class ArmorForgeController : Controller
             || (dto.GlowIntensity is { } g && Math.Abs(g - 1f) > 0.01f))
             return BadRequest(
                 "A cloned set cannot carry a recolor or glow tint — its pieces reuse the source items' own " +
-                "displays, and new art needs new displays plus a patch-6 rebuild. Import the set from the " +
+                "displays, and new art needs new displays plus a patch rebuild. Import the set from the " +
                 "TBC or WotLK lane if you want the appearance baked in.");
 
         var source = _vanillaSets.Get((int)dto.SourceSetId);
@@ -941,7 +954,7 @@ public class ArmorForgeController : Controller
         return Json(new
         {
             ok = true, expansion = "vanilla", setId = r.SetId, name = r.Name, message = r.Message,
-            patchDeployed = r.PatchDeployed,
+            patchDeployed = r.PatchDeployed, patchQueued = r.PatchQueued, patchPending = r.PatchPending,
             serverItemSetDeployed = r.ServerItemSetDeployed, serverItemSetMessage = r.ServerItemSetMessage,
             bonusCount = bonuses.Count(b => b.Threshold > 0 && b.SpellId > 0),
             pieces = r.Pieces.Select(ResultDto),
@@ -984,7 +997,7 @@ public class ArmorForgeController : Controller
             // false failure" idiom as serverSets below. A vanilla clone ships no art, so the untouched
             // PatchDeployed=false / empty-message pair used to render as a red, blank "Deploy ✗" row on
             // every successful clone — the operator reading a completed job as half-broken.
-            deploy = r.Apply.PatchRequired ? new { ok = r.Apply.PatchDeployed, msg = r.Apply.PatchDeployMessage } : null,
+            deploy = r.Apply.PatchRequired ? new { ok = r.Apply.PatchDeployed, queued = r.Apply.PatchQueued, pending = r.Apply.PatchPending, msg = r.Apply.PatchDeployMessage } : null,
             serverSets = r.Apply.ServerItemSetState == nameof(ItemSetDeployState.NotNeeded) ? null : new
             {
                 ok = r.Apply.ServerItemSetState == nameof(ItemSetDeployState.Deployed),

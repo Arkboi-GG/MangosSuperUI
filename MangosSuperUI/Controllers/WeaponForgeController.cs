@@ -18,7 +18,7 @@ namespace MangosSuperUI.Controllers;
 /// Weapon Forge (WEAPON_GEN.md) HTTP surface — the IMPORT page. It accepts a finished,
 /// pre-textured GLB (UVs + embedded texture authored elsewhere), decimates it to a game budget
 /// with the UV-preserving decimator, and packages it through the one proofed path: M2 + BLP
-/// compile, world-DB insert + reload, unified patch-5.MPQ deploy, registry entry.
+/// compile, world-DB insert + reload, registry entry, and a queued unified patch-4.MPQ rebuild.
 ///
 /// The creation tooling that used to live here (sketch workbench, texture zones, local AI
 /// texturing) is archived under Desktop\ItemForgeMSUIFiles.
@@ -45,6 +45,7 @@ public class WeaponForgeController : Controller
     private readonly ItemBudgetGenerator _itemize;
     private readonly PaletteSwapService _palette;
     private readonly BlpWriterService _blp;
+    private readonly MangosSuperUI.Services.UnifiedPatch.UnifiedPatchService _unified;
     private readonly ILogger<WeaponForgeController> _logger;
 
     // High-poly sources are welcome — they are decimated to budget before forging.
@@ -71,9 +72,11 @@ public class WeaponForgeController : Controller
         LegacyImportSources sources, ConnectionFactory db, DbcService dbc,
         ItemTextureService itemTextures, VanillaItemSpellCatalog itemSpells,
         ItemBudgetGenerator itemize, PaletteSwapService palette, BlpWriterService blp,
+        MangosSuperUI.Services.UnifiedPatch.UnifiedPatchService unified,
         ILogger<WeaponForgeController> logger)
     {
         _mpq = mpq;
+        _unified = unified;
         _preview = preview;
         _builder = builder;
         _glbImporter = glbImporter;
@@ -311,14 +314,20 @@ public class WeaponForgeController : Controller
         };
     }
 
+    /// <summary>The unified patch-4.MPQ as the page sees it: built / deployed / stale, plus how many
+    /// forges and deletes are queued for the next Rebuild patch click.</summary>
     private object DeployedPatchJson()
     {
         try
         {
-            var (configured, canonicalExists, deployedExists, stale, message) = _builder.DeployedPatchStatus();
-            return new { configured, canonicalExists, deployedExists, stale, message };
+            var st = _unified.DeployStatus();
+            return new
+            {
+                configured = st.Configured, built = st.Built, deployedExists = st.Deployed, stale = st.Stale,
+                pending = st.Pending, pendingReasons = st.PendingReasons, message = st.Message,
+            };
         }
-        catch (Exception ex) { return new { configured = false, canonicalExists = false, deployedExists = false, stale = false, message = ex.Message }; }
+        catch (Exception ex) { return new { configured = false, built = false, deployedExists = false, stale = false, pending = 0, pendingReasons = Array.Empty<string>(), message = ex.Message }; }
     }
 
     /// <summary>GET /WeaponForge — the Item Assets import page (Game Development).</summary>
@@ -479,7 +488,7 @@ public class WeaponForgeController : Controller
     }
 
     /// <summary>GET /WeaponForge/ListWeapons — the Forge's inventory: every weapon currently
-    /// recorded in the registry (and therefore packaged into patch-5).</summary>
+    /// recorded in the registry (and therefore packaged into the unified patch).</summary>
     [HttpGet]
     public async Task<IActionResult> ListWeapons()
     {
@@ -534,6 +543,8 @@ public class WeaponForgeController : Controller
                 reloadMessage = result.ReloadMessage,
                 patchDeployed = result.Rebuild.PatchDeployed,
                 patchDeployMessage = result.Rebuild.PatchDeployMessage,
+                patchQueued = result.Rebuild.PatchQueued,
+                patchPending = result.Rebuild.PatchPending,
                 patchDownloadUrl = result.Rebuild.PatchRemoved ? null : "/WeaponForge/DownloadPatch",
             });
         }
@@ -548,8 +559,9 @@ public class WeaponForgeController : Controller
         }
     }
 
-    /// <summary>POST /WeaponForge/RebuildPatch — repackage patch-5 from current DB state without
-    /// adding anything, and redeploy it to the client Data folder.</summary>
+    /// <summary>POST /WeaponForge/RebuildPatch — repackage the unified patch-4.MPQ from current DB
+    /// state (every lane), deploy it to the client Data folder, and drain the pending-rebuild queue.
+    /// This is the ONE place a forge or delete reaches the client.</summary>
     [HttpPost]
     public async Task<IActionResult> RebuildPatch()
     {

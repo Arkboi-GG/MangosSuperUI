@@ -73,6 +73,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<RuntimeScaleDiagno
 builder.Services.AddSingleton<BotSpawnService>();   // Add Bots batches: background RA loop + SpawnProgress over the bridge hub
 builder.Services.AddSingleton<OllamaChatService>();
 builder.Services.AddSingleton<SourceIndexerService>();
+builder.Services.AddHostedService<SourceIndexWarmupService>();   // build the Source Map index at startup (was lost on every restart)
 builder.Services.AddSingleton<CircuitTraceSourceService>();
 builder.Services.AddSingleton<ZoneSafetyMap>();
 builder.Services.AddSingleton<BotFallRecorder>();   // always-on void/fall black box (flush-only-on-fall)

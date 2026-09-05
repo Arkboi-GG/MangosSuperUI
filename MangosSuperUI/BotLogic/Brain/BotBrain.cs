@@ -1165,7 +1165,15 @@ public sealed class BotBrain
     /// island escape so "get the bot OUT" is one code path with one behaviour.</summary>
     private async Task IssueEscapePortAsync(BotContext ctx, BotIdentity id, (float X, float Y, float Z, int Map) dest, string kind)
     {
-        id.WedgeStreak = 0;
+        // WedgeStreak is deliberately NOT cleared here. The port is unconfirmed: the core
+        // refuses PORT_HOME in combat, and a bot frozen in a combat stalemate (evading mob on
+        // a navmesh island) flickers out of combat for one STATE, gets this port issued, and
+        // is refused. Zeroing the streak on every refused port kept it at 0-2 forever, so the
+        // combat-still bounded reset (StrandedWedgeCap) never became eligible and the bot
+        // stayed parked for a day (Daelbrook, 2026-09-04: 56 refused ports, 140 wedges).
+        // The streak clears on PHYSICAL ADVANCE (ObserveFreshStillPosition) — i.e. when the
+        // port actually landed — which is the only proof that the escape worked.
+        CircuitTrace.Hit(ctx.Guid, "wedge: escape port issued, streak kept until physical advance", id.WedgeStreak);
         id.IslandStreak = 0;
         id.GrindLockUntil = null;
         id.GrindLockReleaseCooldownUntil = null;
