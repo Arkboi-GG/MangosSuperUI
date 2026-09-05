@@ -135,6 +135,11 @@ public class SourceMapController : Controller
         if (string.IsNullOrWhiteSpace(q))
             return Json(new { results = Array.Empty<object>() });
 
+        // The live index knows "symbol|type|enum|file"; the legacy graph ignored kind, so
+        // callers learned to pass "function"/"method" and silently got nothing back once
+        // the live index existed. Fold the natural aliases instead of returning [].
+        kind = NormalizeKind(kind);
+
         var idx = _indexer.GetIndex();
         if (idx != null)
         {
@@ -314,7 +319,15 @@ public class SourceMapController : Controller
     public IActionResult File([FromQuery] string path)
     {
         var f = _indexer.GetFile(path ?? "");
-        if (f == null) return NotFound(new { error = $"File '{path}' not found" });
+        if (f == null)
+        {
+            // Accept a bare file name or any unique path suffix ("AiBotAIMain.cpp",
+            // "SuiBots/AiBotAIMain.cpp") — the Circuit site manifest only carries "cpp/<name>".
+            var resolved = ResolveFile(path ?? "", out var ambiguous);
+            if (resolved != null) f = _indexer.GetFile(resolved);
+            if (f == null)
+                return NotFound(new { error = $"File '{path}' not found", ambiguous });
+        }
         return Json(new { file = f });
     }
 
@@ -362,7 +375,7 @@ public class SourceMapController : Controller
     // ──────────── Function Body ────────────
 
     [HttpGet]
-    public IActionResult Body([FromQuery] string id)
+    public IActionResult Body([FromQuery] string id, [FromQuery] string format = "json")
     {
         var idx = _indexer.GetIndex();
         if (idx == null) return NotFound(new { error = "No index" });
@@ -373,16 +386,172 @@ public class SourceMapController : Controller
         if (sym.DefinedInFile == null || sym.BodyLineStart == 0)
             return Json(new { body = "", signature = sym.Signature, note = "No body found (declaration only)" });
 
-        var fullPath = Path.Combine(idx.SourcePath, sym.DefinedInFile);
-        if (!System.IO.File.Exists(fullPath))
+        var lines = ReadSourceLines(idx, sym.DefinedInFile);
+        if (lines == null)
             return Json(new { body = "", signature = sym.Signature, note = "Source file not found" });
 
-        var lines = System.IO.File.ReadAllLines(fullPath);
+        if (IsText(format))
+        {
+            // Plain text with line numbers: no JSON escaping (> for every '>'), so a
+            // reader that only wants the code pays for the code. ~15% smaller than json.
+            var t = new StringBuilder();
+            t.AppendLine($"// {sym.Id}  —  {sym.DefinedInFile}:{sym.BodyLineStart}-{sym.BodyLineEnd}");
+            AppendNumbered(t, lines, sym.BodyLineStart, sym.BodyLineEnd);
+            return Content(t.ToString(), "text/plain; charset=utf-8");
+        }
+
         var sb = new StringBuilder();
         for (int i = sym.BodyLineStart - 1; i < sym.BodyLineEnd && i < lines.Length; i++)
             sb.AppendLine(lines[i]);
 
         return Json(new { body = sb.ToString().TrimEnd(), signature = sym.Signature, file = sym.DefinedInFile, lineStart = sym.BodyLineStart, lineEnd = sym.BodyLineEnd });
+    }
+
+    // ──────────── At (file:line window, plain text) ────────────
+    //
+    // The Circuit site manifest names code as "AiBotAICombat.cpp:448". This turns that into
+    // a numbered source window plus the enclosing function, in one call — the thing that
+    // otherwise costs an ssh + sed per site. `file` may be a bare name or any unique suffix.
+
+    [HttpGet]
+    public IActionResult At([FromQuery] string file, [FromQuery] int line, [FromQuery] int before = 30,
+        [FromQuery] int after = 30, [FromQuery] string format = "text")
+    {
+        var idx = _indexer.GetIndex();
+        if (idx == null) return NotFound(new { error = "No index" });
+        if (string.IsNullOrWhiteSpace(file) || line <= 0) return BadRequest(new { error = "file and line required" });
+
+        var rel = ResolveFile(file, out var ambiguous);
+        if (rel == null) return NotFound(new { error = $"File '{file}' not found", ambiguous });
+        var lines = ReadSourceLines(idx, rel);
+        if (lines == null) return NotFound(new { error = $"File '{rel}' not on disk" });
+
+        before = Math.Clamp(before, 0, 400);
+        after = Math.Clamp(after, 0, 400);
+        int start = Math.Max(1, line - before);
+        int end = Math.Min(lines.Length, line + after);
+        var enclosing = EnclosingSymbol(idx, rel, line);
+
+        if (!IsText(format))
+        {
+            return Json(new
+            {
+                file = rel,
+                line,
+                start,
+                end,
+                enclosing = enclosing == null ? null : new { id = enclosing.Id, signature = enclosing.Signature, enclosing.BodyLineStart, enclosing.BodyLineEnd },
+                lines = lines.Skip(start - 1).Take(end - start + 1).ToArray()
+            });
+        }
+
+        var t = new StringBuilder();
+        t.AppendLine(enclosing == null
+            ? $"// {rel}:{line}  —  lines {start}-{end} (no enclosing symbol)"
+            : $"// {rel}:{line}  —  lines {start}-{end}  —  in {enclosing.Id} ({enclosing.BodyLineStart}-{enclosing.BodyLineEnd})");
+        AppendNumbered(t, lines, start, end, mark: line);
+        return Content(t.ToString(), "text/plain; charset=utf-8");
+    }
+
+    // ──────────── Outline (a function's probe skeleton, plain text) ────────────
+    //
+    // Circuit traces are sequences of probe descriptions ("cpp-combat: stalemate nudge hop").
+    // To map a trace back onto the logic you rarely need the whole body — you need WHERE each
+    // probe sits, what the function calls, and who calls it. For HandleCombatStalemate that
+    // is ~1.5 KB instead of the 10 KB body. Probes: CB_HIT / CB_HITV / CircuitTrace.Hit; the
+    // sLog tags are kept too because Server.log lines are the other half of the evidence.
+
+    [HttpGet]
+    public IActionResult Outline([FromQuery] string id, [FromQuery] string? file = null, [FromQuery] int line = 0)
+    {
+        var idx = _indexer.GetIndex();
+        if (idx == null) return NotFound(new { error = "No index" });
+
+        SymbolEntry? sym = null;
+        if (!string.IsNullOrWhiteSpace(id)) sym = _indexer.GetSymbol(id);
+        else if (!string.IsNullOrWhiteSpace(file) && line > 0)
+        {
+            var rel = ResolveFile(file, out _);
+            if (rel != null) sym = EnclosingSymbol(idx, rel, line);
+        }
+        if (sym == null) return NotFound(new { error = "Symbol not found (pass id=, or file=&line=)" });
+        if (sym.DefinedInFile == null || sym.BodyLineStart == 0)
+            return Content($"// {sym.Id}: declaration only ({sym.DeclaredIn})", "text/plain; charset=utf-8");
+
+        var lines = ReadSourceLines(idx, sym.DefinedInFile);
+        if (lines == null) return NotFound(new { error = "Source file not on disk" });
+
+        var t = new StringBuilder();
+        t.AppendLine($"{sym.Signature}");
+        t.AppendLine($"  {sym.DefinedInFile}:{sym.BodyLineStart}-{sym.BodyLineEnd}  ({sym.LineCount} lines, complexity {sym.Complexity})");
+        t.AppendLine("probes / log tags (line: text):");
+        int shown = 0, lastPrinted = -1;
+        for (int i = sym.BodyLineStart - 1; i < sym.BodyLineEnd && i < lines.Length; i++)
+        {
+            string s = lines[i];
+            if (s.Contains("CB_HIT") || s.Contains("CircuitTrace.Hit") || s.Contains("[AIBOT") || s.Contains("sLog.Out"))
+            {
+                // Collapse a multi-line sLog.Out to the line that carries the tag text, and
+                // don't print that tag line again when the loop reaches it.
+                int at = i;
+                if (s.Contains("sLog.Out") && !s.Contains('"') && i + 2 < lines.Length)
+                {
+                    if (lines[i + 1].Contains('"')) at = i + 1;
+                    else if (lines[i + 2].Contains('"')) at = i + 2;
+                    else continue;
+                    s = lines[at];
+                }
+                if (at <= lastPrinted) continue;
+                lastPrinted = at;
+                t.AppendLine($"  {at + 1,6}: {s.Trim()}");
+                shown++;
+            }
+        }
+        if (shown == 0) t.AppendLine("  (none)");
+        var calls = sym.CallsOut.Distinct().OrderBy(c => c, StringComparer.Ordinal).ToList();
+        t.AppendLine($"calls ({calls.Count}): {string.Join(", ", calls)}");
+        var callers = sym.CalledBy.Distinct().OrderBy(c => c, StringComparer.Ordinal).ToList();
+        t.AppendLine($"called by ({callers.Count}): {string.Join(", ", callers)}");
+        return Content(t.ToString(), "text/plain; charset=utf-8");
+    }
+
+    // ──────────── Grep (literal search across the indexed tree, plain text) ────────────
+    //
+    // "where is m_stalemateNudges reset?" without an ssh. Literal, case-insensitive by
+    // default; `dir` narrows to a path fragment (e.g. SuiBots). Capped so a wide query can't
+    // return the tree.
+
+    [HttpGet]
+    public IActionResult Grep([FromQuery] string q, [FromQuery] string? dir = null, [FromQuery] int max = 60,
+        [FromQuery] bool caseSensitive = false)
+    {
+        var idx = _indexer.GetIndex();
+        if (idx == null) return NotFound(new { error = "No index" });
+        if (string.IsNullOrWhiteSpace(q)) return BadRequest(new { error = "q required" });
+        max = Math.Clamp(max, 1, 500);
+        var cmp = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+
+        var t = new StringBuilder();
+        int hits = 0, filesHit = 0;
+        foreach (var rel in idx.Files.Keys.OrderBy(k => k, StringComparer.Ordinal))
+        {
+            if (dir != null && !rel.Contains(dir, StringComparison.OrdinalIgnoreCase)) continue;
+            var lines = ReadSourceLines(idx, rel);
+            if (lines == null) continue;
+            bool any = false;
+            for (int i = 0; i < lines.Length && hits < max; i++)
+            {
+                if (lines[i].Contains(q, cmp))
+                {
+                    t.AppendLine($"{rel}:{i + 1}: {lines[i].Trim()}");
+                    hits++; any = true;
+                }
+            }
+            if (any) filesHit++;
+            if (hits >= max) { t.AppendLine($"// capped at {max} hits — narrow with dir= or a longer q"); break; }
+        }
+        t.Insert(0, $"// grep '{q}'{(dir != null ? $" in *{dir}*" : "")}: {hits} hit(s) in {filesHit} file(s)\n");
+        return Content(t.ToString(), "text/plain; charset=utf-8");
     }
 
     // ──────────── Trace Export ────────────
@@ -673,7 +842,7 @@ public class SourceMapController : Controller
     [HttpPost]
     public async Task<IActionResult> Reindex()
     {
-        var sourcePath = _config["Vmangos:VmangosSourcePath"] ?? "/home/wowvmangos/vmangos/src";
+        var sourcePath = SourceIndexWarmupService.ResolveSourcePath(_config);
         var result = await _indexer.ReindexAsync(sourcePath);
         return Json(result);
     }
@@ -682,6 +851,72 @@ public class SourceMapController : Controller
     public IActionResult ReindexProgress()
     {
         return Json(_indexer.CurrentProgress);
+    }
+
+    // ──────────── Text-endpoint helpers ────────────
+
+    private static string NormalizeKind(string? kind) => (kind ?? "all").Trim().ToLowerInvariant() switch
+    {
+        "function" or "functions" or "method" or "methods" or "symbols" or "func" => "symbol",
+        "types" or "class" or "classes" or "struct" => "type",
+        "enums" => "enum",
+        "files" => "file",
+        "" => "all",
+        var k => k
+    };
+
+    private static bool IsText(string? format) =>
+        string.Equals(format, "text", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(format, "txt", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Exact key, else a unique case-insensitive path-suffix / file-name match.
+    /// Sets <paramref name="ambiguous"/> to the candidates when more than one file matches.</summary>
+    private string? ResolveFile(string file, out string[]? ambiguous)
+    {
+        ambiguous = null;
+        var idx = _indexer.GetIndex();
+        if (idx == null || string.IsNullOrWhiteSpace(file)) return null;
+        string f = file.Trim().Replace('\\', '/');
+        if (f.StartsWith("cpp/", StringComparison.OrdinalIgnoreCase)) f = f[4..];   // Circuit manifest prefix
+        if (idx.Files.ContainsKey(f)) return f;
+
+        bool bare = !Path.HasExtension(f);   // "AiBotAIMain" → both AiBotAIMain.cpp and .h (reported as ambiguous)
+        var matches = idx.Files.Keys
+            .Where(k => k.EndsWith("/" + f, StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(k, f, StringComparison.OrdinalIgnoreCase)
+                     || string.Equals(idx.Files[k].FileName, f, StringComparison.OrdinalIgnoreCase)
+                     || (bare && string.Equals(Path.GetFileNameWithoutExtension(idx.Files[k].FileName), f, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+        if (matches.Length == 1) return matches[0];
+        if (matches.Length > 1) ambiguous = matches;
+        return null;
+    }
+
+    private static string[]? ReadSourceLines(SourceIndex idx, string rel)
+    {
+        var fullPath = Path.Combine(idx.SourcePath, rel);
+        return System.IO.File.Exists(fullPath) ? System.IO.File.ReadAllLines(fullPath) : null;
+    }
+
+    /// <summary>Innermost indexed symbol whose body span contains <paramref name="line"/>.</summary>
+    private static SymbolEntry? EnclosingSymbol(SourceIndex idx, string rel, int line)
+    {
+        if (!idx.FileToSymbols.TryGetValue(rel, out var ids)) return null;
+        SymbolEntry? best = null;
+        foreach (var id in ids)
+        {
+            if (!idx.Symbols.TryGetValue(id, out var s)) continue;
+            if (s.DefinedInFile != rel || s.BodyLineStart == 0) continue;
+            if (line < s.BodyLineStart || line > s.BodyLineEnd) continue;
+            if (best == null || s.LineCount < best.LineCount) best = s;
+        }
+        return best;
+    }
+
+    private static void AppendNumbered(StringBuilder t, string[] lines, int start, int end, int mark = 0)
+    {
+        for (int i = Math.Max(1, start); i <= end && i <= lines.Length; i++)
+            t.Append(i == mark ? "=>" : "  ").Append(i.ToString().PadLeft(5)).Append(": ").AppendLine(lines[i - 1]);
     }
 
     // ──────────── Legacy fallback helpers ────────────

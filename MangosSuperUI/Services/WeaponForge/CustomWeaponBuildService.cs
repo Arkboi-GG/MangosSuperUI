@@ -93,6 +93,28 @@ public sealed class CustomWeaponBuildService
         }
     }
 
+    /// <summary>Record a registry change WITHOUT rebuilding or deploying the unified patch. Forging
+    /// used to repack and deploy on every single weapon; now the operator forges a batch and ships it
+    /// with one Rebuild patch click. Returns a result shaped like a deploy so the apply rows can show
+    /// it, with <c>Queued</c> so the UI renders "pending" rather than a failed deploy.</summary>
+    private (bool Ok, bool Queued, int Pending, string Message) QueueUnifiedRebuild(string reason)
+    {
+        try
+        {
+            using var scope = _services.CreateScope();
+            if (scope.ServiceProvider.GetService(typeof(UnifiedPatch.UnifiedPatchService))
+                is not UnifiedPatch.UnifiedPatchService unified)
+                return (false, false, 0, "unified patch service unavailable — nothing queued");
+            int pending = unified.QueueChange("weapon", reason);
+            return (true, true, pending,
+                $"rebuild queued — {pending} change(s) pending; close WoW and click Rebuild patch when you are done forging");
+        }
+        catch (Exception ex)
+        {
+            return (false, false, 0, $"could not queue the patch rebuild ({ex.Message}) — click Rebuild patch yourself");
+        }
+    }
+
     private async Task RebuildArmorPatchAsync(string reason)
     {
         try
@@ -502,12 +524,15 @@ public sealed class CustomWeaponBuildService
         trace.Stage = "apply";
         var sqlApply = await ApplyItemSqlAsync(sql, entryRes.Id);
         var reload = sqlApply.Ok ? await ReloadItemTemplateAsync() : (Ok: false, Message: "skipped — SQL was not applied");
-        var deploy = await DeployUnifiedAsync("weapon forged: " + buildId);
+        // The client patch is NOT rebuilt here any more — the change is queued and shipped with the
+        // next Rebuild patch click, so several weapons can be forged before one repack + deploy.
+        var deploy = QueueUnifiedRebuild($"forged '{weaponName}' (entry {entryRes.Id})");
         var apply = new ServerApplyStatus
         {
             SqlApplied = sqlApply.Ok, SqlMessage = sqlApply.Message,
             Reloaded = reload.Ok, ReloadMessage = reload.Message,
-            PatchDeployed = deploy.Ok, PatchDeployMessage = deploy.Message,
+            PatchDeployed = false, PatchDeployMessage = deploy.Message,
+            PatchQueued = deploy.Queued, PatchPending = deploy.Pending,
         };
 
         _logger.LogInformation(
@@ -546,7 +571,7 @@ public sealed class CustomWeaponBuildService
             // rather than report a flat success the operator has to read the Notes to disbelieve.
             Success = sqlApply.Ok,
             Notes = $"{PatchFileName} rebuilt with {assembly.PackagedCount} weapon(s). " +
-                    $"SQL: {sqlApply.Message}. Reload: {reload.Message}. Deploy: {deploy.Message}. " +
+                    $"SQL: {sqlApply.Message}. Reload: {reload.Message}. Client patch: {deploy.Message}. " +
                     "Undo via the Forged Weapons list on the Item Assets page.",
         });
 
@@ -591,7 +616,11 @@ public sealed class CustomWeaponBuildService
     /// fresh retexture rows instead of shadowing them). With zero weapons the canonical patch is
     /// removed — an empty overlay would serve no purpose and still shadow patch-4's DBC.
     /// </summary>
-    public async Task<WeaponPatchRebuildSummary> RebuildPatchAsync(string reason)
+    /// <param name="reason">Free text for the log and audit row.</param>
+    /// <param name="deploy">True (the Rebuild patch button, the retexture cascade) repacks the unified
+    /// patch and deploys it. False (deletes) repacks this lane's own artifact only and QUEUES the
+    /// unified rebuild for the next Rebuild patch click.</param>
+    public async Task<WeaponPatchRebuildSummary> RebuildPatchAsync(string reason, bool deploy = true)
     {
         try
         {
@@ -618,36 +647,53 @@ public sealed class CustomWeaponBuildService
                                $"from the client Data folder ({removal.Message}). Triggered by: {reason}. " +
                                "The unified patch rebuild runs next and will restore the server's stock ItemSet.dbc if no armor remains either.");
 
-                await DeployUnifiedAsync("weapon registry emptied: " + reason);
+                bool emptiedQueued = false; int emptiedPending = 0; string emptiedMessage;
+                if (deploy)
+                    emptiedMessage = (await DeployUnifiedAsync("weapon registry emptied: " + reason)).Message;
+                else
+                {
+                    var q = QueueUnifiedRebuild("weapon registry emptied: " + reason);
+                    emptiedQueued = q.Queued; emptiedPending = q.Pending; emptiedMessage = q.Message;
+                }
+                var emptied = (Queued: emptiedQueued, Pending: emptiedPending, Message: emptiedMessage);
                 return new WeaponPatchRebuildSummary
                 {
                     WeaponCount = 0,
                     PatchRemoved = true,
                     MpqSha256 = null,
                     PatchDeployed = false,
-                    PatchDeployMessage = removal.Message,
+                    PatchDeployMessage = deploy ? removal.Message : emptied.Message,
+                    PatchQueued = emptied.Queued,
+                    PatchPending = emptied.Pending,
                     Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
                 };
             }
 
             WriteCanonicalPatch(assembly.Patch.MpqBytes);
-            var deploy = await DeployUnifiedAsync("weapon patch rebuild: " + reason);
+            var queued = deploy
+                ? (Ok: false, Queued: false, Pending: 0, Message: "")
+                : QueueUnifiedRebuild("weapon patch rebuild: " + reason);
+            var deployed = deploy
+                ? await DeployUnifiedAsync("weapon patch rebuild: " + reason)
+                : (Ok: queued.Ok, Message: queued.Message);
             _logger.LogInformation("WeaponForge: rebuild ({Reason}) — {Patch} repackaged with {Count} weapon(s); deploy={Deploy}",
-                reason, PatchFileName, assembly.PackagedCount, deploy.Ok);
+                reason, PatchFileName, assembly.PackagedCount, deploy ? deployed.Ok : "queued");
 
             await LogPatchAuditAsync("patch_rebuild", reason, assembly.PackagedCount, assembly.Patch.MpqSha256,
-                ok: deploy.Ok, message: deploy.Message,
+                ok: deployed.Ok, message: deployed.Message,
                 notes: $"{PatchFileName} repackaged with {assembly.PackagedCount} weapon(s)" +
                        (assembly.SkippedCount > 0 ? $" ({assembly.SkippedCount} skipped — no compiled bytes)" : "") +
-                       $". Deploy: {deploy.Message}. Triggered by: {reason}.");
+                       $". {(deploy ? "Deploy" : "Client patch")}: {deployed.Message}. Triggered by: {reason}.");
 
             return new WeaponPatchRebuildSummary
             {
                 WeaponCount = assembly.PackagedCount,
                 PatchRemoved = false,
                 MpqSha256 = assembly.Patch.MpqSha256,
-                PatchDeployed = deploy.Ok,
-                PatchDeployMessage = deploy.Message,
+                PatchDeployed = deploy && deployed.Ok,
+                PatchDeployMessage = deployed.Message,
+                PatchQueued = queued.Queued,
+                PatchPending = queued.Pending,
                 Diagnostics = diag.Items.Select(i => i.ToString()).ToArray(),
             };
         }
@@ -872,7 +918,9 @@ public sealed class CustomWeaponBuildService
             : (Ok: true, Message: "no item entry recorded");
         var reload = itemRow.Ok ? await ReloadItemTemplateAsync() : (Ok: false, Message: "skipped — world row not deleted");
 
-        var rebuild = await RebuildPatchAsync($"deleted weapon display {displayId}");
+        // Repack this lane's artifact so the registry and the build output agree, but leave the
+        // client patch alone: the removal ships with the next Rebuild patch click like every forge.
+        var rebuild = await RebuildPatchAsync($"deleted weapon display {displayId}", deploy: false);
 
         await _audit.LogAsync(new AuditEntry
         {
@@ -1407,31 +1455,6 @@ public sealed class CustomWeaponBuildService
         {
             return (false, $"deploy failed ({ex.Message}) — the client is probably running; close it and click Rebuild patch");
         }
-    }
-
-    /// <summary>Is the patch in the client Data folder the one we last built? The game client holds
-    /// its MPQs open while running, so a deploy over an existing patch fails and the client keeps
-    /// showing yesterday's file (error cubes for anything forged since). Surfaced on the page so the
-    /// operator knows to close the client and click Rebuild patch.</summary>
-    public (bool Configured, bool CanonicalExists, bool DeployedExists, bool Stale, string Message) DeployedPatchStatus()
-    {
-        var dataPath = ClientDataPath;
-        string canonicalPath = Path.Combine(ArtifactRoot, PatchFileName);
-        string? canonical = File.Exists(canonicalPath) ? canonicalPath : null;
-        if (dataPath is null) return (false, canonical is not null, false, false, "no client Data path configured");
-        string target = Path.Combine(dataPath, PatchFileName);
-        bool deployed = File.Exists(target);
-        if (canonical is null) return (true, false, deployed, false, deployed ? "deployed patch present; nothing built in this install yet" : "no patch built or deployed");
-        if (!deployed) return (true, true, false, true, $"{PatchFileName} is not in the client Data folder — click Rebuild patch");
-        try
-        {
-            var a = new FileInfo(canonical); var b = new FileInfo(target);
-            bool same = a.Length == b.Length && Sha256(File.ReadAllBytes(canonical)) == Sha256(File.ReadAllBytes(target));
-            return (true, true, true, !same, same
-                ? $"deployed {PatchFileName} matches the last build ({b.LastWriteTime:yyyy-MM-dd HH:mm})"
-                : $"deployed {PatchFileName} is STALE ({b.LastWriteTime:yyyy-MM-dd HH:mm}, built {a.LastWriteTime:yyyy-MM-dd HH:mm}) — the client was probably running during the last deploy; close it and click Rebuild patch");
-        }
-        catch (Exception ex) { return (true, true, deployed, false, $"could not compare deployed patch: {ex.Message}"); }
     }
 
     private (bool Ok, bool Changed, string Message) RemoveDeployedPatch()
@@ -2362,6 +2385,11 @@ public sealed class ServerApplyStatus
     public required string ReloadMessage { get; init; }
     public required bool PatchDeployed { get; init; }
     public required string PatchDeployMessage { get; init; }
+    /// <summary>The client patch was not rebuilt; the change waits for the next Rebuild patch click.
+    /// Rendered as "pending", not as a failed deploy.</summary>
+    public bool PatchQueued { get; init; }
+    /// <summary>Queue depth after this change, when <see cref="PatchQueued"/>.</summary>
+    public int PatchPending { get; init; }
 }
 
 public sealed class WeaponPatchRebuildSummary
@@ -2371,6 +2399,8 @@ public sealed class WeaponPatchRebuildSummary
     public required string? MpqSha256 { get; init; }
     public required bool PatchDeployed { get; init; }
     public required string PatchDeployMessage { get; init; }
+    public bool PatchQueued { get; init; }
+    public int PatchPending { get; init; }
     public required IReadOnlyList<string> Diagnostics { get; init; }
 }
 

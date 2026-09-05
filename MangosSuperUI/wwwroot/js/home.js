@@ -232,8 +232,11 @@ $(function () {
             var fill = Math.max(0, Math.min(100, pct));
             var tip = 'Core ' + i + ': ' + pct.toFixed(1) + '%'
                 + (c && c.threads ? ' (' + c.threads + ' thread' + (c.threads > 1 ? 's' : '') + ')' : '');
+            // Themed background + a real border: on the light theme a translucent white
+            // fill is invisible against the white card, so idle cores vanished entirely.
             html += '<div title="' + tip + '" style="position:relative; width:22px; height:36px;'
-                + ' border-radius:3px; background:rgba(255,255,255,0.06); overflow:hidden;">'
+                + ' border-radius:3px; background:var(--bg-card-alt); border:1px solid var(--border-medium);'
+                + ' box-sizing:border-box; overflow:hidden;">'
                 + '<div style="position:absolute; bottom:0; left:0; right:0; height:' + fill.toFixed(1)
                 + '%; background:' + colour + ';"></div>'
                 + '</div>';
@@ -256,7 +259,7 @@ $(function () {
 
         var rows = [
             { label: 'World Server', bd: cores.mangosd, colour: 'var(--accent, #4f8ef7)' },
-            { label: 'SuperUI', bd: cores.superui, colour: 'rgba(255,255,255,0.45)' }
+            { label: 'SuperUI', bd: cores.superui, colour: 'var(--text-secondary)' }
         ];
 
         var html = '';
