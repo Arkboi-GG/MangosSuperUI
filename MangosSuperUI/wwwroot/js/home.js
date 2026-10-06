@@ -216,7 +216,7 @@ $(function () {
     // One cell per core, filled by how much of THAT core the process used.
     // Every core is drawn, present or idle, so the machine's width is visible
     // at a glance and a single hot core stands out against its idle neighbours.
-    function coreStrip(breakdown, colour) {
+    function coreStrip(breakdown, fillClass) {
         if (!breakdown || !breakdown.supported) {
             return '<span class="dash-label">per-core breakdown requires Linux</span>';
         }
@@ -225,17 +225,16 @@ $(function () {
         var byCore = {};
         (breakdown.cores || []).forEach(function (c) { byCore[c.core] = c; });
 
-        var html = '<div style="display:flex; gap:2px; flex-wrap:wrap;">';
+        var html = '<div class="core-strip">';
         for (var i = 0; i < breakdown.processorCount; i++) {
             var c = byCore[i];
             var pct = c ? c.percent : 0;
             var fill = Math.max(0, Math.min(100, pct));
             var tip = 'Core ' + i + ': ' + pct.toFixed(1) + '%'
                 + (c && c.threads ? ' (' + c.threads + ' thread' + (c.threads > 1 ? 's' : '') + ')' : '');
-            html += '<div title="' + tip + '" style="position:relative; width:22px; height:36px;'
-                + ' border-radius:3px; background:rgba(255,255,255,0.06); overflow:hidden;">'
-                + '<div style="position:absolute; bottom:0; left:0; right:0; height:' + fill.toFixed(1)
-                + '%; background:' + colour + ';"></div>'
+            html += '<div class="core-cell" title="' + tip + '">'
+                + '<div class="core-cell-fill ' + fillClass + '" style="height:' + fill.toFixed(1)
+                + '%;"></div>'
                 + '</div>';
         }
         return html + '</div>';
@@ -255,8 +254,8 @@ $(function () {
         if (!cores) { $out.empty(); return; }
 
         var rows = [
-            { label: 'World Server', bd: cores.mangosd, colour: 'var(--accent, #4f8ef7)' },
-            { label: 'SuperUI', bd: cores.superui, colour: 'rgba(255,255,255,0.45)' }
+            { label: 'World Server', bd: cores.mangosd, fillClass: 'core-cell-fill-world' },
+            { label: 'SuperUI', bd: cores.superui, fillClass: 'core-cell-fill-superui' }
         ];
 
         var html = '';
@@ -271,7 +270,7 @@ $(function () {
                 + '<div class="dash-value" style="font-size:15px;">' + r.label + '</div>'
                 + '<div class="dash-label">' + summary + '</div>'
                 + '</div>'
-                + coreStrip(bd, r.colour)
+                + coreStrip(bd, r.fillClass)
                 + '<div class="dash-label mt-1">' + coreDetailLine(bd) + '</div>'
                 + '</div>';
         });
