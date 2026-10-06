@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text.Json;
 using MangosSuperUI.Services.ArmorForge;
 using MangosSuperUI.Services.Mpq;
 using MangosSuperUI.Services.WeaponForge;
@@ -44,6 +46,118 @@ public sealed class UnifiedPatchService
     public string ArtifactDir => Path.Combine(_env.WebRootPath, "patches", "unified");
     public string ArtifactPath => Path.Combine(ArtifactDir, PatchFileName);
 
+    // ── Pending rebuild queue ────────────────────────────────────────────────────────────────
+    //
+    // Forging used to rebuild AND deploy this patch on every single item. That is one full three-lane
+    // repack per weapon, and a deploy that fails whenever the game client is running — for one item
+    // at a time. Lanes now QUEUE a change here instead and the operator ships the whole batch with
+    // one "Rebuild patch" click. The queue lives in a small file next to the artifact (this service
+    // is scoped, so nothing in-memory survives the request, and the file survives a restart too).
+
+    /// <summary>One registry change that has not yet been packaged into the patch.</summary>
+    public sealed record PendingChange(string Lane, string Reason, DateTime QueuedUtc);
+
+    private static readonly object PendingLock = new();
+    private string PendingPath => Path.Combine(ArtifactDir, "pending-rebuild.json");
+
+    /// <summary>Changes made since the artifact was last (re)built, oldest first.</summary>
+    public IReadOnlyList<PendingChange> PendingChanges
+    {
+        get { lock (PendingLock) return ReadPending(); }
+    }
+
+    /// <summary>Record that a lane changed the registry without rebuilding the patch. Returns the
+    /// queue depth after the add, for the lane's own result message.</summary>
+    public int QueueChange(string lane, string reason)
+    {
+        lock (PendingLock)
+        {
+            var list = ReadPending();
+            list.Add(new PendingChange(lane, reason, DateTime.UtcNow));
+            WritePending(list);
+            _logger.LogInformation("UnifiedPatch: queued rebuild ({Lane}: {Reason}) — {Count} change(s) pending", lane, reason, list.Count);
+            return list.Count;
+        }
+    }
+
+    private void ClearPending()
+    {
+        lock (PendingLock) TryDelete(PendingPath);
+    }
+
+    private List<PendingChange> ReadPending()
+    {
+        try
+        {
+            if (!File.Exists(PendingPath)) return new List<PendingChange>();
+            return JsonSerializer.Deserialize<List<PendingChange>>(File.ReadAllText(PendingPath)) ?? new List<PendingChange>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "UnifiedPatch: could not read the pending-rebuild queue; treating it as empty");
+            return new List<PendingChange>();
+        }
+    }
+
+    private void WritePending(List<PendingChange> list)
+    {
+        Directory.CreateDirectory(ArtifactDir);
+        File.WriteAllText(PendingPath, JsonSerializer.Serialize(list));
+    }
+
+    /// <summary>What the operator needs to know on the forge pages: is there a patch, is it in the
+    /// configured client Data directory, does that copy match, and how many changes await a rebuild.
+    /// This replaces the per-lane checks that compared patch-5 / patch-6 files that no longer exist.</summary>
+    public UnifiedPatchDeployStatus DeployStatus()
+    {
+        var pending = PendingChanges;
+        var dataPath = ClientDataPath;
+        bool built = File.Exists(ArtifactPath);
+        string? target = dataPath is null ? null : Path.Combine(dataPath, PatchFileName);
+        bool deployed = target is not null && File.Exists(target);
+        ForgeFileComparison? comparison = null;
+        string message;
+
+        if (dataPath is null)
+            message = "no existing configured client Data directory; other clients are not inspected";
+        else if (!built && !deployed)
+            message = "no patch built yet";
+        else if (built && !deployed)
+        {
+            comparison = ForgeArtifactDiagnostics.CompareFiles(ArtifactPath, target!);
+            message = comparison.Message;
+        }
+        else if (!built)
+            message = $"{PatchFileName} exists in the configured client Data directory, but no unified build is available for comparison";
+        else
+        {
+            comparison = ForgeArtifactDiagnostics.CompareFiles(ArtifactPath, target!);
+            message = comparison.Message;
+        }
+
+        if (pending.Count > 0)
+            message = $"{pending.Count} change(s) queued since the last rebuild; Rebuild patch packages these changes. " + message;
+
+        return new UnifiedPatchDeployStatus
+        {
+            Configured = dataPath is not null,
+            Built = built,
+            Deployed = deployed,
+            Stale = comparison?.Stale ?? false,
+            ComparisonKnown = comparison?.ComparisonKnown ?? false,
+            ComparisonState = comparison?.State ?? "unavailable",
+            ReferencePath = ArtifactPath,
+            TargetPath = target,
+            ExpectedSha256 = comparison?.ExpectedSha256,
+            ActualSha256 = comparison?.ActualSha256,
+            Pending = pending.Count,
+            PendingReasons = pending.Select(c => $"{c.Lane}: {c.Reason}").ToArray(),
+            Message = message,
+        };
+    }
+
+    private static string Sha256(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes));
+
     private string? ClientDataPath
     {
         get
@@ -79,6 +193,7 @@ public sealed class UnifiedPatchService
             var removed = deploy ? RemoveFromClient(PatchFileName) : (Ok: true, Changed: false, Message: "not deployed (build-only)");
             var retiredEmpty = deploy ? RetireSupersededPatches() : Array.Empty<string>();
             TryDelete(ArtifactPath);
+            ClearPending();
             _logger.LogInformation("UnifiedPatch: nothing to build ({Reason}) — {Msg}", reason, removed.Message);
             return new UnifiedPatchSummary
             {
@@ -111,6 +226,9 @@ public sealed class UnifiedPatchService
 
         Directory.CreateDirectory(ArtifactDir);
         File.WriteAllBytes(ArtifactPath, patch.MpqBytes);
+        // The artifact now reflects every queued change. Whether it reached the CLIENT is a separate
+        // question, answered by DeployStatus comparing the two files.
+        ClearPending();
 
         string deployMessage = "not deployed (build-only)";
         IReadOnlyList<string> retired = Array.Empty<string>();
@@ -240,6 +358,25 @@ public sealed class UnifiedPatchService
     {
         try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort cleanup */ }
     }
+}
+
+public sealed class UnifiedPatchDeployStatus
+{
+    public bool Configured { get; init; }
+    public bool Built { get; init; }
+    public bool Deployed { get; init; }
+    /// <summary>The configured client Data copy is missing or differs from the unified build.</summary>
+    public bool Stale { get; init; }
+    public bool ComparisonKnown { get; init; }
+    public string ComparisonState { get; init; } = "unavailable";
+    public string? ReferencePath { get; init; }
+    public string? TargetPath { get; init; }
+    public string? ExpectedSha256 { get; init; }
+    public string? ActualSha256 { get; init; }
+    /// <summary>Registry changes queued since the artifact was last rebuilt.</summary>
+    public int Pending { get; init; }
+    public IReadOnlyList<string> PendingReasons { get; init; } = Array.Empty<string>();
+    public string Message { get; init; } = "";
 }
 
 public sealed class UnifiedPatchSummary

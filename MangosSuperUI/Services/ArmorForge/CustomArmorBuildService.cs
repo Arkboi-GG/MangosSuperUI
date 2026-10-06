@@ -16,15 +16,16 @@ namespace MangosSuperUI.Services.ArmorForge;
 /// <c>patch-6.MPQ</c> from DB → apply live (world <c>item_template</c> INSERT via the weapon forge's
 /// donor-clone SQL, <c>.reload item_template</c>, patch deploy) → audit.
 ///
-/// patch-6 stacks ABOVE patch-5 (weapons) and patch-4 (retextures); its ItemDisplayInfo.dbc is built
-/// on the mounted state beneath patch-6, so it re-unions those rows instead of shadowing them.
-/// The weapon/retexture rebuilds call <see cref="RebuildPatchAsync"/> so patch-6 never goes stale.
+/// Everything ships in the single unified patch-4.MPQ (see UnifiedPatchService); this lane keeps its
+/// own patch-6 artifact for build output and the server-side ItemSet.dbc, but the client only ever
+/// receives the unified archive. Imports, clones and deletes QUEUE a unified rebuild; the operator
+/// ships the whole batch with one Rebuild patch click.
 ///
 /// Sets: a TBC set is imported as a unit — one <c>custom_armor_set</c> row (TBC name, NO bonuses;
 /// vanilla bonuses are the operator's own business, editable afterwards) and every member stamped
 /// with <c>set_id</c> (item_template.set_id too). ItemSet.dbc is emitted for the client tooltip.
 /// </summary>
-public sealed class CustomArmorBuildService
+public sealed partial class CustomArmorBuildService : ICustomMpqMemberSource
 {
     public const string PatchFileName = "patch-6.MPQ";
 
@@ -53,7 +54,8 @@ public sealed class CustomArmorBuildService
         BlpWriterService blp, IWebHostEnvironment env,
         IConfiguration config, IServiceProvider services, ILogger<CustomArmorBuildService> logger)
     {
-        _mpq = mpq; _ids = ids; _patch = patch; _lanes = lanes; _dbc = dbc;
+        _mpq = mpq; _ids = ids;
+        _mpq.RegisterCustomMemberSource(this); _patch = patch; _lanes = lanes; _dbc = dbc;
         _audit = audit; _ra = ra; _db = db; _palette = palette; _blp = blp; _env = env; _config = config;
         _services = services; _logger = logger;
     }
@@ -123,8 +125,8 @@ public sealed class CustomArmorBuildService
     /// <summary>Lane-keyed form ("tbc" / "wotlk").</summary>
     public Task<CustomArmorBuildResult> ImportAsync(string expansion, uint entry, string? nameOverride = null,
         int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f) =>
-        ImportAsync(_lanes.Get(expansion), entry, nameOverride, vanillaSetId, rebuild, gameplay, recolorHue, recolorTheory, recolorTier, glowColor, glowIntensity);
+        float? recolorHue = null, float? recolorSat = null, float? recolorLight = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f) =>
+        ImportAsync(_lanes.Get(expansion), entry, nameOverride, vanillaSetId, rebuild, gameplay, recolorHue, recolorSat, recolorLight, recolorTheory, recolorTier, glowColor, glowIntensity);
 
     /// <summary>Import one later-client armor piece. <paramref name="vanillaSetId"/> is OUR set id
     /// (0 = none); <paramref name="rebuild"/> false lets a set import batch pieces and rebuild once at
@@ -134,13 +136,13 @@ public sealed class CustomArmorBuildService
     /// lane-agnostic: the same ids, SQL, persistence and patch.</summary>
     public async Task<CustomArmorBuildResult> ImportAsync(ArmorImportLane lane, uint entry, string? nameOverride = null,
         int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
+        float? recolorHue = null, float? recolorSat = null, float? recolorLight = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
     {
         var trace = new ArmorAttemptTrace();
         try
         {
             return await ImportCoreAsync(lane, entry, trace, nameOverride, vanillaSetId, rebuild, gameplay,
-                recolorHue, recolorTheory, recolorTier, glowColor, glowIntensity);
+                recolorHue, recolorSat, recolorLight, recolorTheory, recolorTier, glowColor, glowIntensity);
         }
         catch (Exception ex)
         {
@@ -195,7 +197,7 @@ public sealed class CustomArmorBuildService
     private async Task<CustomArmorBuildResult> ImportCoreAsync(ArmorImportLane lane, uint entry, ArmorAttemptTrace trace,
         string? nameOverride = null,
         int vanillaSetId = 0, bool rebuild = true, ValidatedVanillaItemBuildConfiguration? gameplay = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
+        float? recolorHue = null, float? recolorSat = null, float? recolorLight = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
     {
         if (!DonorItemTemplateFixture.Verify())
             throw new InvalidOperationException("Donor item_template fixture failed hash verification.");
@@ -247,7 +249,7 @@ public sealed class CustomArmorBuildService
         if (recolorHue.HasValue && (src.Components.Count > 0 || src.TextureBlp is { Length: > 0 }))
         {
             int rseed = RetextureSupport.SeedFor((int)(lane.Catalog.FindEntry(entry)?.DisplayId ?? entry), recolorTier);
-            await RecolorSourceAsync(src, rseed, recolorHue.Value, recolorTheory, recolorTier, CancellationToken.None);
+            await RecolorSourceAsync(src, rseed, recolorHue.Value, recolorSat, recolorLight, recolorTheory, recolorTier, CancellationToken.None);
         }
 
         var profile = ArmorTypeCatalog.Get(src.FamilyKey);
@@ -320,7 +322,11 @@ public sealed class CustomArmorBuildService
         {
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, sql.Text);
-            var dep = await DeployUnifiedAsync($"armor imported: {name}"); apply.PatchDeployed = dep.Ok; apply.PatchDeployMessage = dep.Message;
+            // Client patch NOT rebuilt here — queued for the next Rebuild patch click. The server-side
+            // ItemSet.dbc still goes out now: it is a different file on a different machine.
+            var dep = QueueUnifiedRebuild($"imported '{name}' (entry {entryRes.Id})");
+            apply.PatchDeployed = false; apply.PatchDeployMessage = dep.Message;
+            apply.PatchQueued = dep.Queued; apply.PatchPending = dep.Pending;
             var setDep = DeployItemSetToServer(patch);
             apply.ServerItemSetState = setDep.State.ToString();
             apply.ServerItemSetMessage = setDep.Message;
@@ -371,7 +377,7 @@ public sealed class CustomArmorBuildService
         IReadOnlyList<uint>? onlyEntries = null,
         IReadOnlyDictionary<uint, ValidatedVanillaItemBuildConfiguration>? perPieceGameplay = null,
         IReadOnlyList<ArmorSetBonus>? bonuses = null, int reqSkill = 0, int reqSkillRank = 0, string? setNameOverride = null,
-        float? recolorHue = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
+        float? recolorHue = null, float? recolorSat = null, float? recolorLight = null, string recolorTheory = "fan", string recolorTier = "improved", Vector3? glowColor = null, float glowIntensity = 1f)
     {
         var set = lane.Catalog.GetSet(tbcSetId)
             ?? throw new ArgumentException($"{lane.Label} set {tbcSetId} not found (is the {lane.Label} client mounted?).");
@@ -413,7 +419,7 @@ public sealed class CustomArmorBuildService
                     ValidatedVanillaItemBuildConfiguration? pieceGameplay = null;
                     perPieceGameplay?.TryGetValue(entry, out pieceGameplay);
                     var piece = await ImportAsync(lane, entry, null, setId, rebuild: false, gameplay: pieceGameplay,
-                        recolorHue: recolorHue, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor, glowIntensity: glowIntensity);
+                        recolorHue: recolorHue, recolorSat: recolorSat, recolorLight: recolorLight, recolorTheory: recolorTheory, recolorTier: recolorTier, glowColor: glowColor, glowIntensity: glowIntensity);
                     result.Pieces.Add(piece);
                 }
                 catch (Exception ex)
@@ -426,9 +432,11 @@ public sealed class CustomArmorBuildService
             // One rebuild + deploy for the whole set.
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, null);
-            var dep = await DeployUnifiedAsync("armor set import");
+            var dep = QueueUnifiedRebuild($"imported set {setId} '{result.Name}'");
             var serverDeploy = DeployItemSetToServer(patch);
-            result.PatchDeployed = dep.Ok;
+            result.PatchDeployed = false;
+            result.PatchQueued = dep.Queued;
+            result.PatchPending = dep.Pending;
             result.ServerItemSetDeployed = serverDeploy.State == ItemSetDeployState.Deployed;
             result.ServerItemSetMessage = serverDeploy.Message;
             // The server DBC line is NOT conditional on bonuses: without it the core zeroes set_id and the
@@ -520,7 +528,7 @@ public sealed class CustomArmorBuildService
             var stamp = await StampItemSetAsync(setId, stampEntries);
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, null);
-            var deploy = await DeployUnifiedAsync("armor set clone");
+            var deploy = QueueUnifiedRebuild($"saved set {setId} '{setName}'");
             var serverDeploy = DeployItemSetToServer(patch);
             var reload = await ReloadItemTemplateAsync();
 
@@ -534,13 +542,15 @@ public sealed class CustomArmorBuildService
                 // The registry write is committed by here; the item_template stamp is what the core
                 // actually reads for set membership, so a failed stamp is a failed save.
                 Success = stamp.Ok,
-                Notes = $"Set {setId} saved with {request.MemberEntries.Count} member(s). Stamp: {stamp.Message}. Deploy: {deploy.Message}. Server DBC: {serverDeploy.Message}. Reload: {reload.Message}.",
+                Notes = $"Set {setId} saved with {request.MemberEntries.Count} member(s). Stamp: {stamp.Message}. Client patch: {deploy.Message}. Server DBC: {serverDeploy.Message}. Reload: {reload.Message}.",
             });
 
             return new ArmorSetResult
             {
                 SetId = setId, MemberCount = request.MemberEntries.Count, BonusCount = bonuses.Count,
-                PatchDeployed = deploy.Ok,
+                PatchDeployed = false,
+                PatchQueued = deploy.Queued,
+                PatchPending = deploy.Pending,
                 ServerDbcDeployed = serverDeploy.State == ItemSetDeployState.Deployed,
                 ItemTemplateStamped = stamp.Ok,
                 Message = $"Set {setId}: {deploy.Message}; server sets: {serverDeploy.Message}",
@@ -606,20 +616,36 @@ public sealed class CustomArmorBuildService
     /// <summary>Recolor the resolved source's textures in place (body-atlas components + helm/shoulder/cloak
     /// skin) at the chosen primary hue — same palette engine and aggressive coverage the live preview uses,
     /// seeded off the SOURCE display id for parity — so the packaged item ships recolored.</summary>
-    private async Task RecolorSourceAsync(ArmorImportSource src, int seed, float hue, string theory, string tier, CancellationToken ct)
+    private async Task RecolorSourceAsync(ArmorImportSource src, int seed, float hue, float? sat, float? light, string theory, string tier, CancellationToken ct)
     {
-        if (Array.IndexOf(PaletteSwapService.RecolorTheories, theory) < 0) theory = "fan";
+        if (Array.IndexOf(PaletteSwapService.RecolorTheories, theory) < 0) theory = "none";
         var (kd, ku, mm, pop) = RetextureSupport.TierShape(tier);
         string tmpDir = Path.Combine(Path.GetTempPath(), "armorbake", Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(tmpDir);
         try
         {
+            // One primary for the whole piece, detected across every texture it paints — the same
+            // anchor the preview used — so the bake does not put each slot's own biggest material on
+            // the pick and ship a flat red piece.
+            var anchorPngs = new List<string>();
+            foreach (var c in src.Components)
+            {
+                string pngPath = Path.Combine(tmpDir, $"anchor_c{c.Slot}{c.GenderSuffix}.png");
+                if (await TryWriteBlpAsPngAsync(c.Blp, pngPath, ct)) anchorPngs.Add(pngPath);
+            }
+            if (src.TextureBlp is { Length: > 0 })
+            {
+                string pngPath = Path.Combine(tmpDir, "anchor_skin.png");
+                if (await TryWriteBlpAsPngAsync(src.TextureBlp, pngPath, ct)) anchorPngs.Add(pngPath);
+            }
+            RecolorAnchor? anchor = anchorPngs.Count > 0 ? _palette.DetectPrimaryAcross(anchorPngs) : null;
+
             if (src.Components.Count > 0)
             {
                 var recolored = new List<ArmorComponentBlob>();
                 foreach (var c in src.Components)
                 {
-                    var rb = await RecolorBlpBytesAsync(c.Blp, tmpDir, $"c{c.Slot}{c.GenderSuffix}", seed, hue, theory, kd, ku, mm, pop, uncompressed: true, ct);
+                    var rb = await RecolorBlpBytesAsync(c.Blp, tmpDir, $"c{c.Slot}{c.GenderSuffix}", seed, hue, sat, light, anchor, theory, kd, ku, mm, pop, uncompressed: true, ct);
                     recolored.Add(new ArmorComponentBlob { Slot = c.Slot, GenderSuffix = c.GenderSuffix, MpqPath = c.MpqPath, Blp = rb ?? c.Blp });
                 }
                 src.Components.Clear();
@@ -627,15 +653,32 @@ public sealed class CustomArmorBuildService
             }
             if (src.TextureBlp is { Length: > 0 })
             {
-                var rb = await RecolorBlpBytesAsync(src.TextureBlp, tmpDir, "skin", seed, hue, theory, kd, ku, mm, pop, uncompressed: false, ct);
+                var rb = await RecolorBlpBytesAsync(src.TextureBlp, tmpDir, "skin", seed, hue, sat, light, anchor, theory, kd, ku, mm, pop, uncompressed: false, ct);
                 if (rb != null) src.TextureBlp = rb;
             }
         }
         finally { try { Directory.Delete(tmpDir, true); } catch { } }
     }
 
-    private async Task<byte[]?> RecolorBlpBytesAsync(byte[] blp, string tmpDir, string stem, int seed, float hue,
-        string theory, float kd, float ku, float mm, float pop, bool uncompressed, CancellationToken ct)
+    private static async Task<bool> TryWriteBlpAsPngAsync(byte[] blp, string pngPath, CancellationToken ct)
+    {
+        try
+        {
+            var px = BlpDecoder.GetPixels(blp, 0, out int w, out int h);
+            if (w == 0 || h == 0) return false;
+            using var bmp = new SKBitmap(w, h, SKColorType.Bgra8888, SKAlphaType.Unpremul);
+            System.Runtime.InteropServices.Marshal.Copy(px, 0, bmp.GetPixels(), px.Length);
+            bmp.NotifyPixelsChanged();
+            using var img = SKImage.FromBitmap(bmp);
+            using var data = img.Encode(SKEncodedImageFormat.Png, 100);
+            await File.WriteAllBytesAsync(pngPath, data.ToArray(), ct);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private async Task<byte[]?> RecolorBlpBytesAsync(byte[] blp, string tmpDir, string stem, int seed, float hue, float? sat, float? light,
+        RecolorAnchor? anchor, string theory, float kd, float ku, float mm, float pop, bool uncompressed, CancellationToken ct)
     {
         try
         {
@@ -652,7 +695,8 @@ public sealed class CustomArmorBuildService
             }
             string outPng = Path.Combine(tmpDir, stem + "_r.png");
             var okp = await _palette.RecolorSeededAsync(basePng, outPng, seed, 1f, 0f, tintStructural: true, ct,
-                theory, kd, ku, mm, pop, swapBudget: 1.01f, hueLeash: 180f, value: ValueSettings.Keep, baseHueOverride: hue);
+                theory, kd, ku, mm, pop, swapBudget: 1.01f, hueLeash: 180f, value: ValueSettings.Keep, baseHueOverride: hue,
+                baseSatOverride: sat, baseLightOverride: light, anchor: anchor);
             if (okp == null) return null;
             using var recoloredBmp = SKBitmap.Decode(outPng);
             if (recoloredBmp == null) return null;
@@ -1240,9 +1284,11 @@ public sealed class CustomArmorBuildService
             var reload = await ReloadItemTemplateAsync();
             var patch = await AssembleUnifiedPatchAsync();
             WriteOutputs(buildId, patch, null);
-            var dep = await DeployUnifiedAsync("armor vanilla clone");
+            var dep = QueueUnifiedRebuild($"cloned vanilla set {setId} '{setName}'");
             var serverDeploy = DeployItemSetToServer(patch);
-            result.PatchDeployed = dep.Ok;
+            result.PatchDeployed = false;
+            result.PatchQueued = dep.Queued;
+            result.PatchPending = dep.Pending;
             result.ServerItemSetDeployed = serverDeploy.State == ItemSetDeployState.Deployed;
             result.ServerItemSetMessage = serverDeploy.Message;
 
@@ -1294,6 +1340,15 @@ public sealed class CustomArmorBuildService
         await conn.OpenAsync();
         await using var tx = await conn.BeginTransactionAsync();
 
+        await PersistInTransactionAsync(conn, tx, row, components, models);
+        await tx.CommitAsync();
+    }
+
+    private static async Task PersistInTransactionAsync(MySqlConnector.MySqlConnection conn,
+        MySqlConnector.MySqlTransaction tx, ArmorPersistRow row,
+        IReadOnlyList<ArmorComponentBlob> components, IReadOnlyList<MpqMember> models)
+    {
+
         await conn.ExecuteAsync(
             @"INSERT INTO custom_armor_display
                 (display_id, item_entry, build_id, set_id, render_kind, armor_type_key, material,
@@ -1323,7 +1378,6 @@ public sealed class CustomArmorBuildService
                 @"INSERT INTO custom_armor_model (display_id, mpq_path, compiled_m2, created_at) VALUES (@DisplayId, @MpqPath, @Data, NOW())",
                 new { row.DisplayId, m.MpqPath, m.Data }, tx);
 
-        await tx.CommitAsync();
     }
 
     /// <summary>Mirror the patch-6 ItemDisplayInfo row into the in-memory DBC the web previewer reads.
@@ -1673,13 +1727,45 @@ public sealed class CustomArmorBuildService
         }
     }
 
+    /// <summary>Record a registry change WITHOUT rebuilding or deploying the unified patch. Every
+    /// import used to repack all three lanes and deploy — one item at a time, failing whenever the
+    /// game client was running. Now the operator forges a batch and ships it with one Rebuild patch
+    /// click. Shaped like a deploy result so the apply rows can show it, with <c>Queued</c> so the
+    /// UI renders "pending" rather than a failed deploy.</summary>
+    private (bool Ok, bool Queued, int Pending, string Message) QueueUnifiedRebuild(string reason)
+    {
+        try
+        {
+            using var scope = _services.CreateScope();
+            if (scope.ServiceProvider.GetService(typeof(UnifiedPatch.UnifiedPatchService))
+                is not UnifiedPatch.UnifiedPatchService unified)
+                return (false, false, 0, "unified patch service unavailable — nothing queued");
+            int pending = unified.QueueChange("armor", reason);
+            return (true, true, pending,
+                $"rebuild queued — {pending} change(s) pending; close WoW and click Rebuild patch when you are done");
+        }
+        catch (Exception ex)
+        {
+            return (false, false, 0, $"could not queue the patch rebuild ({ex.Message}) — click Rebuild patch yourself");
+        }
+    }
+
+    /// <summary>Queue, shaped exactly like <see cref="DeployUnifiedAsync"/> for the paths that take either.</summary>
+    private (bool Ok, string Message) QueueAsDeployResult(string reason)
+    {
+        var q = QueueUnifiedRebuild(reason);
+        return (q.Ok, q.Message);
+    }
+
     /// <summary>Standalone patch-6 assembly — this lane packing its own archive, as it did before the
     /// unified patch existed. Kept so the Armor Forge can still build in isolation; the unified
     /// service calls <see cref="GetPatchContributionAsync"/> and packs one archive for all lanes.</summary>
     public async Task<ArmorPatchResult?> AssembleUnifiedPatchAsync()
     {
         var diag = new ForgeDiagnostics("armor-assemble");
-        var contribution = await GetPatchContributionAsync(diag);
+        // Same ceiling as the unified build: our own previously packaged sets must never be read
+        // back as "base", or a released set id collides with its own ghost in the mounted patch.
+        var contribution = await GetPatchContributionAsync(diag, UnifiedPatch.UnifiedPatchService.PatchFileName);
         if (contribution is null) return null;
 
         byte[] baseDbc = ResolveBaseDbc();
@@ -1703,7 +1789,11 @@ public sealed class CustomArmorBuildService
         return _patch.Build(input, tempDir);
     }
 
-    public async Task<string> RebuildPatchAsync(string reason)
+    /// <param name="reason">Free text for the log and audit row.</param>
+    /// <param name="deploy">True (the Rebuild patch button, the weapon/retexture cascade) repacks the
+    /// unified patch and deploys it. False (deletes) repacks this lane's own artifact and the server
+    /// ItemSet.dbc only, and QUEUES the unified rebuild for the next Rebuild patch click.</param>
+    public async Task<string> RebuildPatchAsync(string reason, bool deploy = true)
     {
         try
         {
@@ -1712,6 +1802,10 @@ public sealed class CustomArmorBuildService
             {
                 var removal = RemoveDeployedPatch();
                 var restore = RestoreServerItemSetIfEmpty();
+                // The unified archive still carries this lane's old rows until it is repacked.
+                var unifiedEmpty = deploy
+                    ? await DeployUnifiedAsync("armor registry emptied: " + reason)
+                    : QueueAsDeployResult("armor registry emptied: " + reason);
 
                 // This is the most consequential unlogged path in either forge. With no armor left in
                 // the registry it deletes patch-6 out of the live client AND copies the .vanilla
@@ -1730,27 +1824,29 @@ public sealed class CustomArmorBuildService
                                $"Triggered by: {reason}. The server keeps the previous ItemSet.dbc in memory until mangosd is restarted.",
                         extra: new { patchRemoved = removal.Changed, clientRemoval = removal.Message, serverItemSetRestore = restore.Message });
 
-                return "no armor in registry — patch-6 removed";
+                return $"no armor in registry — client patch: {unifiedEmpty.Message}";
             }
             WriteCanonicalPatch(patch);
-            var deploy = await DeployUnifiedAsync("armor patch rebuild: " + reason);
+            var dep = deploy
+                ? await DeployUnifiedAsync("armor patch rebuild: " + reason)
+                : QueueAsDeployResult("armor patch rebuild: " + reason);
             var setDeploy = DeployItemSetToServer(patch);
             if (setDeploy.State == ItemSetDeployState.Failed)
                 _logger.LogWarning("ArmorForge: server ItemSet.dbc NOT deployed — {Msg}", setDeploy.Message);
-            _logger.LogInformation("ArmorForge: rebuilt patch-6 ({Reason}) — {Msg}", reason, deploy.Message);
+            _logger.LogInformation("ArmorForge: rebuilt armor patch ({Reason}) — {Msg}", reason, dep.Message);
 
             await LogPatchAuditAsync("patch_rebuild", reason,
-                ok: deploy.Ok && setDeploy.State != ItemSetDeployState.Failed,
-                notes: $"patch-6 repackaged and deployed ({deploy.Message}). " +
+                ok: dep.Ok && setDeploy.State != ItemSetDeployState.Failed,
+                notes: $"armor patch repackaged; client patch: {dep.Message}. " +
                        $"Server ItemSet.dbc: {setDeploy.State} — {setDeploy.Message}. Triggered by: {reason}." +
                        (setDeploy.State == ItemSetDeployState.Deployed
                            ? " mangosd must be restarted before it reads the new ItemSet.dbc."
                            : ""),
-                extra: new { patchRemoved = false, clientDeploy = deploy.Message, serverItemSetState = setDeploy.State.ToString(), serverItemSetMessage = setDeploy.Message });
+                extra: new { patchRemoved = false, clientDeploy = dep.Message, serverItemSetState = setDeploy.State.ToString(), serverItemSetMessage = setDeploy.Message });
 
             return setDeploy.State == ItemSetDeployState.NotNeeded
-                ? deploy.Message
-                : $"{deploy.Message}. Server sets: {setDeploy.Message}";
+                ? dep.Message
+                : $"{dep.Message}. Server sets: {setDeploy.Message}";
         }
         catch (Exception ex)
         {
@@ -1832,7 +1928,7 @@ public sealed class CustomArmorBuildService
             if (rebuild)
             {
                 reloadMessage = (await ReloadItemTemplateAsync()).Message;
-                patchMessage = await RebuildPatchAsync("delete");
+                patchMessage = await RebuildPatchAsync("delete", deploy: false);
             }
             await _audit.LogAsync(new AuditEntry
             {
@@ -1909,7 +2005,55 @@ public sealed class CustomArmorBuildService
     /// Per-piece failures are contained and reported instead of aborting the loop, and the set row
     /// (and its id) are only released when every piece actually went.
     /// </summary>
-    public async Task<ArmorDeleteResult> DeleteSetAsync(int setId)
+    /// <summary>Delete a selection of sets and single pieces with ONE world reload, ONE lane repack and
+    /// one queued unified rebuild at the end. Sets go first (their pieces come with them); a piece that
+    /// was ticked as well as its set is simply already gone by the time its turn comes.</summary>
+    public async Task<ArmorBulkDeleteResult> DeleteManyAsync(IReadOnlyList<long> displayIds, IReadOnlyList<int> setIds)
+    {
+        var result = new ArmorBulkDeleteResult();
+        foreach (int setId in setIds.Distinct())
+        {
+            try
+            {
+                var r = await DeleteSetAsync(setId, rebuild: false);
+                result.Items.Add(new ArmorBulkDeleteItem { Kind = "set", Id = setId, Ok = r.Ok, Message = r.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ArmorForge: bulk delete of set {SetId} failed", setId);
+                result.Items.Add(new ArmorBulkDeleteItem { Kind = "set", Id = setId, Ok = false, Message = ex.Message });
+            }
+        }
+        foreach (long displayId in displayIds.Distinct())
+        {
+            try
+            {
+                var r = await DeleteAsync(displayId, rebuild: false);
+                // Already gone (its set was deleted above) is the goal, not a failure.
+                result.Items.Add(new ArmorBulkDeleteItem { Kind = "piece", Id = displayId, Ok = r.Ok || r.NotFound, Message = r.NotFound ? "already removed with its set" : r.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ArmorForge: bulk delete of display {DisplayId} failed", displayId);
+                result.Items.Add(new ArmorBulkDeleteItem { Kind = "piece", Id = displayId, Ok = false, Message = ex.Message });
+            }
+        }
+
+        int ok = result.Items.Count(i => i.Ok), failed = result.Items.Count - ok;
+        // Nothing removed means nothing to reload or repack — and no rebuild to queue.
+        var reload = ok > 0 ? await ReloadItemTemplateAsync() : (Ok: true, Message: "nothing deleted — no reload");
+        string rebuild = ok > 0
+            ? await RebuildPatchAsync($"deleted {ok} armor item(s) in one batch", deploy: false)
+            : "nothing deleted — patch untouched";
+        result.Ok = failed == 0;
+        result.Message = $"deleted {ok} of {result.Items.Count} selected" + (failed > 0 ? $"; {failed} failed — see the list" : "")
+            + $". Reload: {reload.Message}. {rebuild}";
+        return result;
+    }
+
+    /// <param name="rebuild">Reload the world table and repack after the set. False when deleting a
+    /// batch of sets and pieces, so that happens ONCE at the end (see <see cref="DeleteManyAsync"/>).</param>
+    public async Task<ArmorDeleteResult> DeleteSetAsync(int setId, bool rebuild = true)
     {
         List<long> displays;
         string? setName;
@@ -1975,16 +2119,16 @@ public sealed class CustomArmorBuildService
                 await _ids.ReleaseAsync(KindSet, setId);
             }
 
-            // Now, once, for the whole set.
-            var reload = await ReloadItemTemplateAsync();
-            string rebuild = await RebuildPatchAsync($"delete set {setId}");
+            // Now, once, for the whole set (or once for the whole batch, when the caller defers it).
+            var reload = rebuild ? await ReloadItemTemplateAsync() : (Ok: true, Message: "deferred to the end of the batch");
+            string rebuildMsg = rebuild ? await RebuildPatchAsync($"delete set {setId}", deploy: false) : "patch repack deferred to the end of the batch";
 
             string label = string.IsNullOrWhiteSpace(setName) ? $"set {setId}" : $"set {setId} '{setName}'";
             int totalPieces = displays.Count + clonedEntries.Count;
             string message = complete
                 ? $"deleted {label} and all {deleted} piece(s)"
-                    + (clonedEntries.Count > 0 ? $" ({clonedEntries.Count} cloned)" : "") + $". {rebuild}"
-                : $"deleted {deleted}/{totalPieces} piece(s) of {label}; {failures.Count} failed, so the set was KEPT so you can retry: {string.Join("; ", failures.Take(4))}. {rebuild}";
+                    + (clonedEntries.Count > 0 ? $" ({clonedEntries.Count} cloned)" : "") + $". {rebuildMsg}"
+                : $"deleted {deleted}/{totalPieces} piece(s) of {label}; {failures.Count} failed, so the set was KEPT so you can retry: {string.Join("; ", failures.Take(4))}. {rebuildMsg}";
 
             await _audit.LogAsync(new AuditEntry
             {
@@ -2044,6 +2188,33 @@ public sealed class CustomArmorBuildService
     }
     public sealed class ArmorComponentRow { public int Slot; public string GenderSuffix = "_U"; public string MpqPath = ""; public string ComponentStem = ""; public byte[]? Blp; }
     public sealed class ArmorModelRow { public string MpqPath = ""; public byte[]? M2; }
+
+    // ── ICustomMpqMemberSource ─────────────────────────────────────────────────────────────
+    // Previews resolve a forged piece's helm/shoulder M2 and BLPs through MpqReaderService; until the
+    // next Rebuild patch those bytes exist only here. One row per path, cached briefly so a dressing
+    // pass (a dozen texture reads) is one query per member, not one per read.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime At, byte[]? Data)> _memberCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan MemberCacheTtl = TimeSpan.FromSeconds(30);
+
+    public byte[]? TryGetMember(string mpqPath)
+    {
+        if (string.IsNullOrEmpty(mpqPath)) return null;
+        if (_memberCache.TryGetValue(mpqPath, out var hit) && DateTime.UtcNow - hit.At < MemberCacheTtl)
+            return hit.Data;
+        byte[]? data = null;
+        try
+        {
+            using var conn = _db.Admin();
+            conn.Open();
+            data = conn.ExecuteScalar<byte[]?>("SELECT compiled_m2 FROM custom_armor_model WHERE mpq_path = @p LIMIT 1", new { p = mpqPath })
+                ?? conn.ExecuteScalar<byte[]?>("SELECT compiled_blp FROM custom_armor_component WHERE mpq_path = @p LIMIT 1", new { p = mpqPath })
+                ?? conn.ExecuteScalar<byte[]?>("SELECT compiled_blp FROM custom_armor_display WHERE texture_mpq_path = @p LIMIT 1", new { p = mpqPath });
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "ArmorForge: registry member lookup failed for {Path}", mpqPath); }
+        _memberCache[mpqPath] = (DateTime.UtcNow, data);
+        return data;
+    }
 
     public async Task<List<ArmorRow>> LoadArmorRowsAsync(bool includeBlobs = true)
     {
@@ -2396,56 +2567,24 @@ public sealed class CustomArmorBuildService
         get { var p = Path.Combine(ArtifactRoot, PatchFileName); return File.Exists(p) ? p : null; }
     }
 
-    /// <summary>Same check as the weapon forge's: is the patch-6 in the client Data folder the one we
-    /// last built, or did a running client block the deploy?</summary>
-    public (bool Configured, bool Stale, string Message) DeployedPatchStatus()
-    {
-        var dataPath = ClientDataPath;
-        string? canonical = CanonicalPatchPath;
-        if (dataPath is null) return (false, false, "no client Data path configured");
-        string target = Path.Combine(dataPath, PatchFileName);
-        if (canonical is null) return (true, false, File.Exists(target) ? "deployed patch present" : "no patch built yet");
-        if (!File.Exists(target)) return (true, true, $"{PatchFileName} is not in the client Data folder — click Rebuild patch");
-        try
-        {
-            var a = File.ReadAllBytes(canonical); var b = File.ReadAllBytes(target);
-            bool same = a.Length == b.Length && a.AsSpan().SequenceEqual(b);
-            return (true, !same, same
-                ? $"deployed {PatchFileName} matches the last build"
-                : $"deployed {PatchFileName} is STALE — the client was probably running during the last deploy; close it and click Rebuild patch");
-        }
-        catch (Exception ex) { return (true, false, $"could not compare deployed patch: {ex.Message}"); }
-    }
-
     /// <summary>
-    /// Is the SERVER's ItemSet.dbc the one we last built, and has mangosd been restarted since?
+    /// Compare the SERVER's ItemSet.dbc to the exact current unified artifact. The controller
+    /// checks the core startup epoch separately; legacy per-lane sidecars are not authoritative.
     ///
     /// Unlike the client patch this has a second failure mode beyond "stale": the core reads DBCs once,
     /// at startup (<c>World::SetInitialWorldSettings</c> → <c>LoadDBCStores</c>, and no <c>.reload</c>
     /// command touches a DBC store), so a correctly deployed file still does nothing until the world
     /// server is restarted. Until then every forged <c>set_id</c> is zeroed at load.
     /// </summary>
-    public (bool Configured, bool Stale, DateTime? WrittenUtc, string Message) ServerItemSetStatus()
+    public (bool Configured, UnifiedPatch.ForgeFileComparison Comparison) ServerItemSetStatus(string unifiedPatchPath)
     {
         var (dir, detail) = ResolveServerDbcDir();
-        if (dir is null) return (false, false, null, $"no server dbc directory resolved — forged sets cannot work in game (tried: {detail})");
-
-        string target = Path.Combine(dir, "ItemSet.dbc");
-        string? canonical = CanonicalItemSetPath;
-        if (canonical is null)
-            return (true, false, File.Exists(target) ? File.GetLastWriteTimeUtc(target) : null,
-                $"no forged sets — server ItemSet.dbc untouched ({detail})");
-        if (!File.Exists(target))
-            return (true, true, null, $"forged sets exist but {target} is missing — click Rebuild patch");
-        try
+        if (dir is null) return (false, new UnifiedPatch.ForgeFileComparison
         {
-            var a = File.ReadAllBytes(canonical); var b = File.ReadAllBytes(target);
-            bool same = a.Length == b.Length && a.AsSpan().SequenceEqual(b);
-            return (true, !same, File.GetLastWriteTimeUtc(target), same
-                ? $"server ItemSet.dbc matches the last build ({target})"
-                : $"server ItemSet.dbc is STALE — it does not match the last build; click Rebuild patch ({target})");
-        }
-        catch (Exception ex) { return (true, false, null, $"could not compare the server ItemSet.dbc: {ex.Message}"); }
+            ReferencePath = unifiedPatchPath, ReferenceMember = ArmorNaming.ItemSetMember,
+            Message = $"no server dbc directory resolved (tried: {detail})",
+        });
+        return (true, UnifiedPatch.ForgeArtifactDiagnostics.CompareServerItemSet(unifiedPatchPath, Path.Combine(dir, "ItemSet.dbc")));
     }
 
     /// <summary>The base ItemDisplayInfo.dbc: the mounted copy from strictly BENEATH patch-6, so
@@ -2460,7 +2599,11 @@ public sealed class CustomArmorBuildService
         // patch-5, and patch-6 (top of the mount) built on it would shadow every forged weapon.
         var cfgPath = _config["ArmorForge:CleanDbcPath"];
         if (!string.IsNullOrWhiteSpace(cfgPath) && File.Exists(cfgPath)) return File.ReadAllBytes(cfgPath);
-        int myRank = Mpq.MpqPatchOrder.Rank(PatchFileName);
+        // Beneath the UNIFIED patch, not this lane's old patch-6: the forge's own rows live in
+        // patch-4 now, and a base that includes them makes every re-used id "already exist" —
+        // measured as "ItemSet id 5011 already exists in the base DBC" after a set was deleted and
+        // the (on-request) rebuild had not yet replaced the client's copy.
+        int myRank = Mpq.MpqPatchOrder.Rank(UnifiedPatch.UnifiedPatchService.PatchFileName);
         return _mpq.ExtractFile(ArmorNaming.ItemDisplayInfoMember, skipArchive: n => Mpq.MpqPatchOrder.Rank(n) >= myRank)
             ?? throw new InvalidOperationException("Could not extract a base ItemDisplayInfo.dbc from the mounted archives.");
     }
@@ -2495,6 +2638,9 @@ public sealed class ArmorSetImportResult
     public string Name { get; set; } = "";
     public List<CustomArmorBuildResult> Pieces { get; } = new();
     public bool PatchDeployed { get; set; }
+    /// <summary>The client patch was not rebuilt; the change waits for the next Rebuild patch click.</summary>
+    public bool PatchQueued { get; set; }
+    public int PatchPending { get; set; }
     /// <summary>Whether the server's own ItemSet.dbc was written. False means the core will zero this
     /// set's <c>set_id</c> at load — no tooltip set block, no n-piece bonuses.</summary>
     public bool ServerItemSetDeployed { get; set; }
@@ -2510,6 +2656,10 @@ public sealed class ServerApplyStatus
     public string ReloadMessage { get; set; } = "";
     public bool PatchDeployed { get; set; }
     public string PatchDeployMessage { get; set; } = "";
+    /// <summary>The client patch was not rebuilt; the change waits for the next Rebuild patch click.
+    /// Rendered as "pending", not as a failed deploy.</summary>
+    public bool PatchQueued { get; set; }
+    public int PatchPending { get; set; }
     /// <summary>False when the operation ships no art and therefore has no patch step — a vanilla
     /// clone reuses the source's own display. Without this the result panel rendered the untouched
     /// <see cref="PatchDeployed"/>=false / empty-message pair as a red, blank "Deploy ✗" row on every
@@ -2536,6 +2686,8 @@ public sealed class ArmorSetResult
     public int MemberCount { get; set; }
     public int BonusCount { get; set; }
     public bool PatchDeployed { get; set; }
+    public bool PatchQueued { get; set; }
+    public int PatchPending { get; set; }
     public bool ServerDbcDeployed { get; set; }
     public bool ItemTemplateStamped { get; set; }
     public string Message { get; set; } = "";
@@ -2549,6 +2701,21 @@ public sealed class ArmorSetSummary
     public int BonusCount { get; set; }
     public List<ArmorSetBonus> Bonuses { get; set; } = new();
     public List<int> MemberEntries { get; set; } = new();
+}
+
+public sealed class ArmorBulkDeleteResult
+{
+    public bool Ok { get; set; }
+    public string Message { get; set; } = "";
+    public List<ArmorBulkDeleteItem> Items { get; } = new();
+}
+
+public sealed class ArmorBulkDeleteItem
+{
+    public string Kind { get; set; } = "";   // "set" | "piece"
+    public long Id { get; set; }
+    public bool Ok { get; set; }
+    public string Message { get; set; } = "";
 }
 
 public sealed class ArmorDeleteResult

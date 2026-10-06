@@ -1,4 +1,6 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Dapper;
+using MangosSuperUI.Models;
+using Microsoft.AspNetCore.Mvc;
 using MangosSuperUI.BotLogic.Tracking;
 using MangosSuperUI.Services;
 
@@ -22,21 +24,83 @@ namespace MangosSuperUI.Controllers;
 //   POST /CircuitTrace/Disarm/{guid}   disarm (flushes the tail first; persists)
 //   POST /CircuitTrace/Mode?mode=off|shadow   global recording mode (persists)
 //   POST /CircuitTrace/Dump/{guid}     manual ring dump to the daily JSONL (like the wedge auto-dump)
+//   GET  /CircuitTrace/ArmedRoster     armed guids resolved against characters DB + bridge (exists/onBridge/ringing)
+//   POST /CircuitTrace/Prune           disarm armed guids whose character row is gone (deleted bots)
 // ════════════════════════════════════════════════════════════════════════════
 public class CircuitTraceController : Controller
 {
     private readonly BotBrainService _brain;
     private readonly SourceIndexerService _sourceIndexer;
     private readonly CircuitTraceSourceService _circuitSources;
+    private readonly ConnectionFactory _db;
+    private readonly BotBridgeService _bridge;
 
     public CircuitTraceController(
         BotBrainService brain,
         SourceIndexerService sourceIndexer,
-        CircuitTraceSourceService circuitSources)
+        CircuitTraceSourceService circuitSources,
+        ConnectionFactory db,
+        BotBridgeService bridge)
     {
         _brain = brain;
         _sourceIndexer = sourceIndexer;
         _circuitSources = circuitSources;
+        _db = db;
+        _bridge = bridge;
+    }
+
+    // ──────────── Armed roster (who is armed vs. who still exists) ────────────
+    //
+    // The armed guid list is persisted and outlives the bots: a bot deleted from the
+    // roster stays "armed" forever (12 armed / 9 ringing in the Traced… modal). This
+    // resolves every armed guid against the characters DB and the live bridge so the
+    // UI can label the dead ones and Prune can drop them.
+
+    private sealed record ArmedRosterRow(int guid, string? name, bool exists, bool onBridge, bool ringing);
+
+    private async Task<List<ArmedRosterRow>> BuildArmedRosterAsync()
+    {
+        int[] armed = CircuitTrace.ArmedGuids();
+        var names = new Dictionary<int, string>();
+        if (armed.Length > 0)
+        {
+            using var conn = _db.Characters();
+            foreach (var row in await conn.QueryAsync<(int guid, string name)>(
+                "SELECT guid, name FROM characters WHERE guid IN @Guids", new { Guids = armed }))
+                names[row.guid] = row.name;
+        }
+        var bridge = _bridge.BotStates;
+        return armed
+            .Select(g => new ArmedRosterRow(
+                g,
+                names.TryGetValue(g, out var n) ? n : null,
+                names.ContainsKey(g),
+                bridge.TryGetValue(g, out var bs) && bs.TaskState != "DISCONNECTED",
+                CircuitTrace.RingDepth(g).Depth > 0))
+            .OrderBy(r => r.exists ? 0 : 1)
+            .ThenBy(r => r.name ?? ("bot " + r.guid), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    [HttpGet]
+    public async Task<IActionResult> ArmedRoster()
+    {
+        var rows = await BuildArmedRosterAsync();
+        return Json(new { rows, missing = rows.Count(r => !r.exists) });
+    }
+
+    /// <summary>Disarm every armed guid that no longer has a characters row (deleted bots).</summary>
+    [HttpPost]
+    public async Task<IActionResult> Prune()
+    {
+        var rows = await BuildArmedRosterAsync();
+        var removed = new List<int>();
+        foreach (var r in rows.Where(r => !r.exists))
+        {
+            await _brain.Circuit.DisarmAsync(r.guid);
+            removed.Add(r.guid);
+        }
+        return Json(new { ok = true, removed, armed = CircuitTrace.ArmedGuids() });
     }
 
     /// <summary>The Circuit Board viewer page (Bot Development → Circuit Board).</summary>

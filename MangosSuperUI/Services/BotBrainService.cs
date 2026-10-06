@@ -171,6 +171,11 @@ public class BotBrainService : BackgroundService
         _disconnectedAt.TryRemove(guid, out _);
         _tracker.Remove(guid);
         _fallRecorder.Forget(guid);
+        // A deleted bot must not stay in the persisted armed list (it showed as "armed"
+        // in the Traced… modal forever). Disarm first: it flushes the sealed tail and
+        // rewrites the setting before RetireBot drops the ring.
+        if (CircuitTrace.IsArmed(guid))
+            _ = _circuit.DisarmAsync(guid);
         _circuit.RetireBot(guid, "roster-delete");
     }
 

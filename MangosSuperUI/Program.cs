@@ -54,6 +54,9 @@ builder.Services.AddSingleton<ProcessCoreSampler>();
 builder.Services.AddSingleton<StateCaptureService>();
 builder.Services.AddHttpContextAccessor();            // lets AuditService stamp the caller's ip on rows written deep in a service
 builder.Services.AddSingleton<AuditService>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WorldPacks.WorldPackStore>();        // World Builder packs (MSUIClient shared_docs/WORLD_BUILDER.md)
+builder.Services.AddSingleton<MangosSuperUI.Services.WorldPacks.WorldPackBuildService>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WorldPacks.WorldPackVerifier>();
 builder.Services.AddSingleton<WorldArtifactService>();
 builder.Services.AddSingleton<RtsWorldCreationService>();
 builder.Services.AddSingleton<WorldMaintenanceGate>();
@@ -73,6 +76,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<RuntimeScaleDiagno
 builder.Services.AddSingleton<BotSpawnService>();   // Add Bots batches: background RA loop + SpawnProgress over the bridge hub
 builder.Services.AddSingleton<OllamaChatService>();
 builder.Services.AddSingleton<SourceIndexerService>();
+builder.Services.AddHostedService<SourceIndexWarmupService>();   // build the Source Map index at startup (was lost on every restart)
 builder.Services.AddSingleton<CircuitTraceSourceService>();
 builder.Services.AddSingleton<ZoneSafetyMap>();
 builder.Services.AddSingleton<BotFallRecorder>();   // always-on void/fall black box (flush-only-on-fall)
@@ -339,7 +343,20 @@ app.UseDefaultFiles(new DefaultFilesOptions
 
 app.UseStaticFiles(new StaticFileOptions
 {
-    ContentTypeProvider = contentTypeProvider
+    ContentTypeProvider = contentTypeProvider,
+    // Script and stylesheet files are NOT version-stamped when they are pulled in as ES-module
+    // imports (embed.js → viewer.js → …), so without an explicit policy the browser applies its
+    // heuristic freshness and keeps serving yesterday's module for a while after a publish — the
+    // Armor Forge viewer kept the old resize logic through several reloads. no-cache still lets the
+    // ETag answer 304 on every navigation; it just forces that revalidation.
+    OnPrepareResponse = ctx =>
+    {
+        string ext = Path.GetExtension(ctx.File.Name);
+        if (ext.Equals(".js", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".mjs", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".css", StringComparison.OrdinalIgnoreCase))
+            ctx.Context.Response.Headers.CacheControl = "no-cache";
+    }
 });
 
 // ---------- MSUI Client: WebSocket ↔ TCP bridge (design doc DD-4) ----------

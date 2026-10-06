@@ -3,6 +3,7 @@
 }
 
 @section Styles {
+    <link rel="stylesheet" href="/css/equipment-workshop.css" asp-append-version="true" />
     <style>
         .wf-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
         .wf-header { padding: 20px 28px 14px; border-bottom: 1px solid var(--border-light); }
@@ -131,6 +132,9 @@
             border: 1px solid #b4231855; background: #b4231814; color: #b42318; }
         .wf-weapons .wf-del:hover { background: #b4231828; }
         .wf-weapons .empty { color: var(--text-muted); font-size: 12px; }
+        .wf-weapons td.sel, .wf-weapons th.sel { width: 22px; padding-right: 4px; }
+        .wf-weapons input[type=checkbox] { margin: 0; cursor: pointer; }
+        .wf-weapons tr.selected td { background: #4f8ef714; }
 
         /* Final item configuration — one shared build step for GLB and TBC sources. */
         body.wf-build-open { overflow: hidden; }
@@ -319,10 +323,10 @@
     <div class="wf-header">
         <h1><i class="fa-solid fa-hammer"></i> Weapon Forge</h1>
         <div class="wf-header-sub">
-            The import station: bring a <strong>finished GLB</strong> (UVs + texture authored elsewhere), decimate it
-            to a game budget, and forge it into the game. Forging inserts the item into the world database, reloads
-            <code>item_template</code>, and deploys <code>patch-4.MPQ</code> to the client Data folder. Restart the
-            client, then <code>.additem</code> the new entry. If an existing custom entry shows an old name or equip
+            Study original equipment, inspect an authored candidate or bring a <strong>finished GLB</strong>
+            with UVs and texture. Forging inserts the item into the world database, reloads
+            <code>item_template</code>, and queues the client patch. Use <strong>Rebuild patch</strong> to package
+            and deploy it, then restart the client and <code>.additem</code> the new entry. If an existing custom entry shows an old name or equip
             slot, fully close WoW and remove <code>WDB\itemcache.wdb</code> (or the whole <code>WDB</code> cache
             directory) before relaunching; the client recreates it. All build files are also kept in the artifact folder.
         </div>
@@ -330,21 +334,23 @@
             <span class="wf-pill" id="pillFixture">fixture …</span>
             <span class="wf-pill" id="pillDonor">donor …</span>
             <span class="wf-pill" id="pillContract">contract …</span>
-            <span class="wf-pill" id="pillDeploy" title="Is the patch-4.MPQ in the client Data folder the one last built? The game client locks its MPQs while running, so a deploy over an existing patch fails until you close it and click Rebuild patch.">deploy …</span>
+            <span class="wf-pill" id="pillDeploy" title="Forges and deletes are queued; the patch-4.MPQ in the client is only rebuilt and deployed when you click Rebuild patch. The game client locks its MPQs while running, so close it first.">deploy …</span>
         </div>
     </div>
 
     <div class="wf-body">
         <div class="wf-controls">
 
+            @await Html.PartialAsync("_RaidWeaponReview")
+            @await Html.PartialAsync("_EquipmentWorkshop")
+
             <div class="wf-card">
                 <h3><span class="phase">Import</span> Pre-textured GLB → Game item</h3>
                 <p>Accepts any triangle count — a ZBrush export, a TRELLIS reconstruction, anything with
                    <strong>UV0 and an embedded texture</strong> already authored. The slider decimates it with a
-                   UV-preserving edge collapse (seams locked, the texture never smears), so what you preview is
-                   byte-for-byte what forges. Vanilla weapons are ~100–250 triangles; detail-heavy exports (separate gems,
-                   fittings, pommels) keep their pieces best at 1,000–2,000 — every part keeps a floor of detail, so nothing
-                   vanishes, it just gets coarser. The Forge ceiling is 4,000.</p>
+                    UV-preserving edge collapse. Inspect the resulting shape and texture before forging.
+                    Use the original-reference study to measure the relevant weapon family; triangle count alone
+                    does not establish the right style. The Forge capacity ceiling is 4,000 triangles.</p>
                 <div class="wf-row">
                     <div class="wf-field" style="flex:1;min-width:220px;">
                         <label>Finished GLB (.glb, UVs + texture)</label>
@@ -364,6 +370,8 @@
                     <div class="wf-group" title="Discrete orientation fixes, applied after the automatic orientation">
                         <div class="wf-group-title"><span>Orientation</span></div>
                         <div class="wf-checks">
+                            <label title="Keep the model's authored axes and palm origin instead of fitting a stock donor"><input type="checkbox" id="impPreserveAxes"> preserve authored axes / grip</label>
+                            <label title="Keep the source topology instead of applying the triangle target"><input type="checkbox" id="impKeepTopology"> no decimation</label>
                             <label title="Rotate 180° so the grip and tip swap ends"><input type="checkbox" id="impFlip"> flip grip/tip</label>
                             <label title="Roll 180° about the long axis — bow string side, rifle stock, crossbow stock or axe blade ended up on the wrong side"><input type="checkbox" id="impFlipUp"> flip upside down</label>
                             <label title="Mirror left/right across the hand (true reflection; faces stay outward) — bolt handles, one-sided ornaments"><input type="checkbox" id="impMirror"> mirror left/right</label>
@@ -542,6 +550,7 @@
                         <input type="hidden" id="tbcTarget" value="0">
                         <span class="val" id="tbcTargetVal">exact source</span>
                     </div>
+                    <label class="wf-check" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand on two-handers (approximate). Off by default — a TBC import keeps the source's own hand placement, so it is always in the right spot."><input type="checkbox" id="tbcShowGrip"> grip markers</label>
                     <button class="wf-btn secondary" data-action="tbcPreview" id="tbcPreviewBtn" disabled>Preview</button>
                     <button class="wf-btn" data-action="tbcForge" id="tbcForgeBtn" disabled><i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
@@ -620,6 +629,7 @@
                         <input type="hidden" id="wotlkTarget" value="0">
                         <span class="val" id="wotlkTargetVal">exact source</span>
                     </div>
+                    <label class="wf-check" title="Show where the hands land: green band = main-hand palm (model origin, exact); blue band ≈ off-hand on two-handers (approximate). Off by default — a WotLK import keeps the source's own hand placement, so it is always in the right spot."><input type="checkbox" id="wotlkShowGrip"> grip markers</label>
                     <button class="wf-btn secondary" data-action="wotlkPreview" id="wotlkPreviewBtn" disabled>Preview</button>
                     <button class="wf-btn" data-action="wotlkForge" id="wotlkForgeBtn" disabled><i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
@@ -700,6 +710,7 @@
                         <label>Selected</label>
                         <input type="text" id="vanillaSelected" readonly placeholder="nothing selected" style="width:100%;">
                     </div>
+                    <label class="wf-check" title="Show where the main hand lands: green band at the model origin, where the palm wraps. Off by default — a stock vanilla display is already placed correctly."><input type="checkbox" id="vanillaShowGrip"> grip markers</label>
                     <button class="wf-btn" data-action="vanillaClone" id="vanillaCloneBtn" disabled>
                         <i class="fa-solid fa-sliders"></i> Configure item…</button>
                 </div>
@@ -742,11 +753,15 @@
                 <h3><span class="phase">Registry</span> Forged Weapons</h3>
                 <p>The weapons currently in the registry — the weapons inside <code>patch-4.MPQ</code>.
                    <strong>View</strong> renders a weapon's stored M2+BLP in the viewer. <strong>Delete</strong>
-                   removes it from the game: world-database row, packaged patch, and registry entry; its IDs return
-                   to the pool. All forge and delete actions are recorded in the Activity Log.</p>
+                   removes it from the game: world-database row, registry entry, and (at the next rebuild) the
+                   packaged patch; its IDs return to the pool. Forges and deletes <strong>queue</strong> a patch
+                   rebuild rather than running one each time: forge as many as you like, then close WoW and click
+                   <strong>Rebuild patch</strong> once to package every lane (weapons, armor, retextures) and deploy
+                   it. All forge and delete actions are recorded in the Activity Log.</p>
                 <div id="wfWeapons" class="wf-weapons"><span style="color:var(--text-muted);font-size:12px;">Loading…</span></div>
                 <div class="wf-row" style="margin-top:10px;">
-                    <button class="wf-btn secondary" data-action="rebuildPatch">Rebuild patch</button>
+                    <button class="wf-btn secondary" id="wfDeleteSelected" disabled title="Delete every ticked weapon in one go: one world reload, one repack, one queued patch rebuild.">Delete selected</button>
+                    <button class="wf-btn secondary" data-action="rebuildPatch" title="Package every queued change into patch-4.MPQ and deploy it to the client Data folder. Close WoW first — a running client locks the file.">Rebuild patch</button>
                     <a class="wf-btn secondary" href="/WeaponForge/DownloadPatch" style="text-decoration:none;">
                         <i class="fa-solid fa-download"></i> Download current patch-4.MPQ</a>
                 </div>
@@ -756,7 +771,7 @@
 
         <div class="wf-preview">
             <div class="wf-viewer" id="wfViewer"><div class="hint" id="wfHint">Preview a model to inspect it here</div>
-                <div class="wf-cameras"><button data-camera="three">3/4</button><button data-camera="front">front</button><button data-camera="edge">edge</button><button id="wfExpand" title="Expand viewer">⤢ expand</button></div></div>
+                <div class="wf-cameras"><button data-camera="three">3/4</button><button data-camera="front">front</button><button data-camera="edge">edge</button><button id="wfGrid" title="Show or hide the floor grid">grid</button><button id="wfExpand" title="Expand viewer">⤢ expand</button></div></div>
             <div class="wf-result" id="wfResult">
                 <div class="title">Ready</div>
                 <div style="color:var(--text-muted);">Results, IDs, downloads, and diagnostics appear here.</div>
@@ -1083,11 +1098,12 @@
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { applyBlendSuffix, applyEnvMapping, applyMultiTexture } from '/js/character-viewer/blend-suffix.js';
         import { installM2Fx } from '/js/character-viewer/m2fx.js';
+        import { initEquipmentWorkshop } from '/js/equipment-workshop.js';
 
         // ---------- 3D viewer ----------
         const host = document.getElementById('wfViewer');
         const hint = document.getElementById('wfHint');
-        let renderer, scene, camera, controls, current = null;
+        let renderer, scene, camera, controls, current = null, grid = null;
         // Material animation for the previewed weapon: colour / opacity / UV-scroll tracks the
         // server ships as a `suiFx` manifest inside the GLB. A forged weapon that got a glow pulse
         // written into its M2 renders frozen at the pulse's dimmest key without this.
@@ -1112,8 +1128,12 @@
             scene.add(new THREE.HemisphereLight(0xffffff, 0x30343c, 1.1));
             const dir = new THREE.DirectionalLight(0xffffff, 1.4);
             dir.position.set(2, 3, 2); scene.add(dir);
-            const grid = new THREE.GridHelper(2, 20, 0x3a4150, 0x262b33);
+            grid = new THREE.GridHelper(2, 20, 0x3a4150, 0x262b33);
             grid.position.y = -0.001; scene.add(grid);
+            // The grid is a reading aid, not part of the weapon; remember the choice per browser.
+            let gridOn = true;
+            try { gridOn = localStorage.getItem('wfGrid') !== 'off'; } catch { }
+            setGrid(gridOn);
 
             window.addEventListener('resize', onResize);
             animate();
@@ -1242,14 +1262,48 @@
         // The weapon mounts to the character's hand bone AT ITS ORIGIN, so the green band at x=0 is
         // exactly where the palm wraps. The blue band (two-handers) marks the approximate off-hand
         // zone — the character animation places that hand, not the weapon file.
+        //
+        // Each lane owns its own toggle. Only the GLB import defaults ON: a raw web GLB has no
+        // idea where the hand goes, so the marker is the whole point of its placement sliders.
+        // TBC / WotLK imports and vanilla clones keep the source's own placement, which is always
+        // in the right spot, so their markers are opt-in.
         let lastGrip = null, gripGroup = null;
+        const GRIP_TOGGLES = { glb: 'impShowGrip', tbc: 'tbcShowGrip', wotlk: 'wotlkShowGrip', vanilla: 'vanillaShowGrip' };
+        function gripToggleFor(owner) {
+            // A forge result is shown under 'forged'; it came from whichever lane the modal was
+            // configuring, so follow that lane's toggle.
+            const key = owner === 'forged' ? (itemBuildState.mode || 'glb') : owner;
+            return document.getElementById(GRIP_TOGGLES[key] || 'impShowGrip');
+        }
+        function gripMarkersOn() {
+            const cb = gripToggleFor(viewerOwner);
+            return !!(cb && cb.checked);
+        }
+        // A stock display carries no forge grip payload, but its origin IS the palm (the weapon mounts
+        // to the hand bone at its origin), so when asked for, size the band from the mesh itself.
+        function estimatePalmRadius(model) {
+            const box = new THREE.Box3().setFromObject(model);
+            const len = Math.max(box.max.x - box.min.x, 1e-3);
+            const v = new THREE.Vector3();
+            let r = 0;
+            model.traverse(node => {
+                if (!node.isMesh || !node.geometry || !node.geometry.attributes.position) return;
+                const pos = node.geometry.attributes.position;
+                for (let i = 0; i < pos.count; i++) {
+                    v.fromBufferAttribute(pos, i); node.localToWorld(v);
+                    if (Math.abs(v.x) > len * 0.03) continue;   // only the slice through the origin
+                    r = Math.max(r, Math.hypot(v.y, v.z));
+                }
+            });
+            return r || Math.min(box.max.y - box.min.y, box.max.z - box.min.z) / 2;
+        }
         function drawGripMarkers() {
             if (gripGroup) { scene.remove(gripGroup); gripGroup = null; }
-            const on = document.getElementById('impShowGrip').checked;
-            if (!on || !lastGrip || !current) return;
+            if (!current || !gripMarkersOn()) return;
+            const grip = lastGrip || { palm: { radius: estimatePalmRadius(current) } };
             gripGroup = new THREE.Group();
-            addGripBand(0, lastGrip.palm.radius, 0x38e06c);
-            if (lastGrip.secondHand) addGripBand(lastGrip.secondHand.x, lastGrip.secondHand.radius, 0x38b6ff);
+            addGripBand(0, grip.palm.radius, 0x38e06c);
+            if (grip.secondHand) addGripBand(grip.secondHand.x, grip.secondHand.radius, 0x38b6ff);
             scene.add(gripGroup);
         }
         function addGripBand(x, r, color) {
@@ -1266,7 +1320,7 @@
             tick.renderOrder = 2;
             gripGroup.add(tick);
         }
-        document.getElementById('impShowGrip').addEventListener('change', drawGripMarkers);
+        Object.values(GRIP_TOGGLES).forEach(id => document.getElementById(id).addEventListener('change', drawGripMarkers));
         function frameObject(obj) {
             const box = new THREE.Box3().setFromObject(obj);
             const size = box.getSize(new THREE.Vector3());
@@ -1284,6 +1338,14 @@
             camera.position.copy(center).add(offset); camera.up.set(0,1,0); camera.lookAt(center); controls.update();
         }
         document.querySelectorAll('[data-camera]').forEach(b => b.addEventListener('click', () => setDiagnosticCamera(b.dataset.camera)));
+        function setGrid(on) {
+            if (grid) grid.visible = on;
+            const b = document.getElementById('wfGrid');
+            b.textContent = on ? 'grid' : 'grid off';
+            b.style.opacity = on ? '' : '0.6';
+            try { localStorage.setItem('wfGrid', on ? 'on' : 'off'); } catch { }
+        }
+        document.getElementById('wfGrid').addEventListener('click', () => setGrid(!grid.visible));
         document.getElementById('wfExpand').addEventListener('click', () => {
             const v = document.getElementById('wfViewer');
             const on = v.classList.toggle('expanded');
@@ -1307,12 +1369,37 @@
             if (d === 0) h = 0; else if (mx === r) h = ((g - b) / d) % 6; else if (mx === g) h = (b - r) / d + 2; else h = (r - g) / d + 4;
             h *= 60; if (h < 0) h += 360; return h;
         }
+        // Saturation + lightness of the pick (0..1), so white/grey/black picks mean what they say.
+        function hexToSL(hex) {
+            const [r, g, b] = hexToRgb01(hex);
+            const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+            const sat = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+            return { s: +sat.toFixed(3), l: +l.toFixed(3) };
+        }
+        function appendRecolorPick(target, hex) {
+            target.append('recolorHue', Math.round(hexToHue(hex)));
+            const sl = hexToSL(hex);
+            target.append('recolorSat', sl.s);
+            target.append('recolorLight', sl.l);
+        }
         function hexToRgb01(hex) {
             const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex); if (!m) return [1, 1, 1];
             return [parseInt(m[1], 16) / 255, parseInt(m[2], 16) / 255, parseInt(m[3], 16) / 255];
         }
         // Palette theories shared by every recolor group (GLB card + import lanes).
-        const RC_THEORIES = [['primary', 'Primary'], ['fan', 'Fan'], ['identity', 'Shift'], ['analogous', 'Analogous'], ['accent', 'Accent'], ['luminance', 'Luminance'], ['bank', 'Palette']];
+        // 'none' first and default: the picked colour, straight, on every material. The rest are
+        // the palette engine's generators, for when you want it to compose a colourway around the pick.
+        const RC_THEORY_HINTS = {
+            none: 'No palette theory — every material takes the picked colour straight, keeping its own shade and shine.',
+            primary: 'Dominant material takes the pick exactly; the others keep their source offsets around it, compressed.',
+            fan: 'Palette generator: the pick on the dominant material, the rest spread by the golden angle.',
+            identity: 'Same colour story, shifted: all materials move together by a seeded amount.',
+            analogous: 'Neighbouring hues around the pick.',
+            accent: 'Muted body with one saturated accent material.',
+            luminance: 'Contrast-led: hue barely moves, dark goes richer, light goes cleaner.',
+            bank: 'One of the curated three-hue palettes, roles by coverage.',
+        };
+        const RC_THEORIES = [['none', 'None'], ['primary', 'Primary'], ['fan', 'Fan'], ['identity', 'Shift'], ['analogous', 'Analogous'], ['accent', 'Accent'], ['luminance', 'Luminance'], ['bank', 'Palette']];
         function setResult({ title, kv, diagnostics, downloads, note, error }) {
             const r = document.getElementById('wfResult');
             let html = `<div class="title">${esc(title || 'Result')}</div>`;
@@ -1349,10 +1436,13 @@
         }
         function previewUrl(data) { return (data.preview && data.preview.glbWebPath) || data.previewGlbWebPath || null; }
         function applyLine(ok, label, msg) { return `${ok ? '✓' : '✗'} ${label}: ${msg}`; }
+        function queuedLine(label, msg) { return `⏳ ${label}: ${msg}`; }
         function forgeResult(d, titleOk) {
             if (!d.ok) return setResult({ title: 'Forge failed', error: d.error || d.message, diagnostics: d.diagnostics });
             const a = d.apply || {};
-            const allApplied = a.sqlApplied && a.reloaded && a.patchDeployed;
+            // The client patch is no longer rebuilt per forge: a queued rebuild counts as applied here,
+            // and the note below says what is left to do (Rebuild patch, once, when done forging).
+            const allApplied = a.sqlApplied && a.reloaded && (a.patchDeployed || a.patchQueued);
             lastGrip = d.grip || null;
             setResult({
                 title: titleOk + (allApplied ? ' & applied to server' : ' — some apply steps need attention'),
@@ -1371,15 +1461,18 @@
                 diagnostics: [
                     applyLine(a.sqlApplied, 'World DB', a.sqlMessage || ''),
                     applyLine(a.reloaded, 'Reload', a.reloadMessage || ''),
-                    applyLine(a.patchDeployed, 'Patch deploy', a.patchDeployMessage || ''),
+                    a.patchQueued ? queuedLine('Client patch', a.patchDeployMessage || '') : applyLine(a.patchDeployed, 'Patch deploy', a.patchDeployMessage || ''),
                     ...(d.diagnostics || []),
                 ],
                 note: allApplied
-                    ? `Live on the server. Fully restart the client(s), then .additem ${d.itemEntry}. If that entry was cached with older metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`
+                    ? (a.patchQueued
+                        ? `Live on the server. The client patch was NOT rebuilt — forge anything else you want first, then close WoW and click Rebuild patch (Forged Weapons card) to ship ${a.patchPending > 1 ? 'all ' + a.patchPending + ' pending changes' : 'it'} at once. Then start the client and .additem ${d.itemEntry}. If that entry was cached with older metadata, remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`
+                        : `Live on the server. Fully restart the client(s), then .additem ${d.itemEntry}. If that entry was cached with older metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory) first; WoW recreates it.`)
                     : 'One or more steps require manual action — see the lines above; the downloads contain the files. Then fully restart the client and .additem. If metadata is stale, close WoW and remove WDB\\itemcache.wdb or the whole WDB cache directory.'
             });
             loadGlb(previewUrl(d), 'forged');
             loadWeapons();
+            loadStatus();
         }
 
         // ---------- final item configuration ----------
@@ -2146,8 +2239,8 @@
                     if (vanillaRecolorOn()) {
                         fd.append('weaponType', vanillaSource.family || '');
                         if (document.getElementById('vanillaRcOn').checked) {
-                            fd.append('recolorHue', Math.round(hexToHue(document.getElementById('vanillaRcColor').value)));
-                            fd.append('recolorTheory', (VANILLA.rcTheory && VANILLA.rcTheory()) || 'primary');
+                            appendRecolorPick(fd, document.getElementById('vanillaRcColor').value);
+                            fd.append('recolorTheory', (VANILLA.rcTheory && VANILLA.rcTheory()) || 'none');
                             fd.append('recolorTier', document.getElementById('vanillaRcTier').value || 'improved');
                         }
                         if (document.getElementById('vanillaRcGlowOn').checked)
@@ -2280,7 +2373,8 @@
         function targetTris() { return +targetEl.value; }
         function importParams(fd) {
             fd.append('weaponType', document.getElementById('impType').value || 'sword1h');
-            fd.append('targetTriangles', targetTris());
+            fd.append('reorient', !document.getElementById('impPreserveAxes').checked);
+            fd.append('targetTriangles', document.getElementById('impKeepTopology').checked ? 0 : targetTris());
             fd.append('rollDegrees', +document.getElementById('impRoll').value || 0);
             fd.append('flipGripEnd', document.getElementById('impFlip').checked);
             fd.append('straightenBlade', document.getElementById('impStraighten').checked);
@@ -2296,7 +2390,7 @@
             fd.append('depthPercent', +document.getElementById('impDepth').value || 100);
             fd.append('headPercent', +document.getElementById('impHead').value || 100);
             fd.append('haftPercent', +document.getElementById('impHaft').value || 100);
-            fd.append('gripPercent', +document.getElementById('impGrip').value);
+            fd.append('gripPercent', document.getElementById('impPreserveAxes').checked ? -1 : +document.getElementById('impGrip').value);
             fd.append('offsetUpCm', +document.getElementById('impUp').value || 0);
             fd.append('offsetSideCm', +document.getElementById('impSide').value || 0);
             fd.append('pitchDegrees', +document.getElementById('impPitch').value || 0);
@@ -2310,7 +2404,7 @@
             // Pre-import recolor of the embedded texture — same fields the lanes send; preview and
             // forge share the sha-seeded palette roll so what previews is what bakes.
             if (document.getElementById('impRcOn').checked) {
-                fd.append('recolorHue', Math.round(hexToHue(document.getElementById('impRcColor').value)));
+                appendRecolorPick(fd, document.getElementById('impRcColor').value);
                 fd.append('recolorTheory', impRcTheory);
                 fd.append('recolorTier', document.getElementById('impRcTier').value || 'improved');
             }
@@ -2333,7 +2427,7 @@
         bindGrade('impGlowFrom', 'impGlowFromVal', v => v + '%');
         bindGrade('impGlowTo', 'impGlowToVal', v => v + '%');
         // GLB recolor controls: theory chips + live re-preview, mirroring the import lanes.
-        let impRcTheory = 'primary';
+        let impRcTheory = 'none';
         {
             const host = document.getElementById('impRcTheories');
             const schedule = () => {
@@ -2346,6 +2440,7 @@
                 b.type = 'button'; b.className = 'wf-btn secondary';
                 b.style.cssText = 'padding:3px 10px;font-size:12px;';
                 b.textContent = label;
+                b.title = RC_THEORY_HINTS[key] || '';
                 if (key === impRcTheory) b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
                 b.addEventListener('click', () => {
                     impRcTheory = key;
@@ -2427,11 +2522,11 @@
                         ? `Recolored at ${Math.round(hexToHue(document.getElementById('impRcColor').value))}° (${impRcTheory}, ${document.getElementById('impRcTier').value}) — will bake on forge.`
                         : 'No recolorable colour families in the embedded texture — showing the original.';
                 setResult({
-                    title: d.ok ? 'Imported & decimated (preview only)' : 'Import finished with issues',
+                    title: d.ok ? (d.decimation ? 'Imported & decimated (preview only)' : 'Imported (preview only)') : 'Import finished with issues',
                     kv: {
                         'Type': d.weaponTypeLabel || d.weaponType || '1H Sword',
                         'Source triangles': (d.originalTriangleCount ?? 0).toLocaleString(),
-                        'After decimation': (d.triangleCount ?? 0).toLocaleString() + (d.withinForgeBudget === false ? '  — OVER the 1000 forge ceiling' : ''),
+                        'Imported triangles': (d.triangleCount ?? 0).toLocaleString() + (d.withinForgeBudget === false ? '  — OVER the forge capacity ceiling' : ''),
                         'Vertices': (d.vertexCount ?? 0).toLocaleString(),
                         'Texture': d.hasTexture ? 'embedded ✓' : 'MISSING',
                         'Source sha': (d.sourceSha256 || '').slice(0, 12),
@@ -2441,6 +2536,7 @@
                 });
                 previewedOnce = true;
                 loadGlb(previewUrl(d), 'glb');
+                return d;
             },
             async forgeGlb(btn) {
                 const f = document.getElementById('glbFile').files[0];
@@ -2467,6 +2563,7 @@
                     diagnostics: [applyLine(d.patchDeployed || d.patchRemoved, 'Deploy', d.patchDeployMessage || ''), ...(d.diagnostics || [])]
                 });
                 loadWeapons();
+                loadStatus();
             },
         };
         document.querySelectorAll('[data-action]').forEach(btn => {
@@ -2509,8 +2606,8 @@
         // by both the preview (live server-side recolor of the source skin) and the forge (bake).
         function laneRecolorParams(lane, target) {
             if (!lane.el('RcOn').checked) return;
-            target.append('recolorHue', Math.round(hexToHue(lane.el('RcColor').value)));
-            target.append('recolorTheory', lane.rcTheory || 'primary');
+            appendRecolorPick(target, lane.el('RcColor').value);
+            target.append('recolorTheory', lane.rcTheory || 'none');
             target.append('recolorTier', lane.el('RcTier').value || 'improved');
         }
         // Imported material effects need a real hue-shifted texture, not material.color
@@ -2518,7 +2615,7 @@
         // The same glowColor now drives the server preview and the forge bake.
         function laneGlowTint(lane) { return lane.el('RcGlowOn').checked ? lane.el('RcGlowColor').value : null; }
         function wireLaneRecolor(lane) {
-            lane.rcTheory = 'primary';
+            lane.rcTheory = 'none';
             const schedule = () => {
                 if (!lane.sel) { lane.el('RcStatus').textContent = 'Browse and pick a weapon first.'; return; }
                 lane.el('RcStatus').textContent = lane.el('RcOn').checked ? 'Recoloring preview…' : 'Recolor off — previewing the original skin.';
@@ -2546,6 +2643,7 @@
                 b.type = 'button'; b.className = 'wf-btn secondary'; b.dataset.theory = key;
                 b.style.cssText = 'padding:3px 10px;font-size:12px;';
                 b.textContent = label;
+                b.title = RC_THEORY_HINTS[key] || '';
                 if (key === lane.rcTheory) b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
                 b.addEventListener('click', () => {
                     lane.rcTheory = key;
@@ -2636,12 +2734,13 @@
         }
         function wireVanillaRecolor() {
             const host = document.getElementById('vanillaRcTheories');
-            let theory = 'primary';
+            let theory = 'none';
             for (const [key, label] of RC_THEORIES) {
                 const b = document.createElement('button');
                 b.type = 'button'; b.className = 'wf-btn secondary'; b.dataset.theory = key;
                 b.style.cssText = 'padding:3px 10px;font-size:12px;';
                 b.textContent = label;
+                b.title = RC_THEORY_HINTS[key] || '';
                 if (key === theory) b.style.outline = '2px solid var(--accent-color, #3b6fd4)';
                 b.addEventListener('click', () => {
                     theory = key;
@@ -2708,8 +2807,8 @@
                         weaponType: w.family || '',
                     });
                     if (document.getElementById('vanillaRcOn').checked) {
-                        q.append('recolorHue', Math.round(hexToHue(document.getElementById('vanillaRcColor').value)));
-                        q.append('recolorTheory', (VANILLA.rcTheory && VANILLA.rcTheory()) || 'primary');
+                        appendRecolorPick(q, document.getElementById('vanillaRcColor').value);
+                        q.append('recolorTheory', (VANILLA.rcTheory && VANILLA.rcTheory()) || 'none');
                         q.append('recolorTier', document.getElementById('vanillaRcTier').value || 'improved');
                     }
                     if (document.getElementById('vanillaRcGlowOn').checked)
@@ -3111,9 +3210,9 @@
                 const d = await (await fetch('/WeaponForge/ListWeapons')).json();
                 if (!d.ok) { host.innerHTML = `<span class="empty">Could not load: ${esc(d.error || 'unknown')}</span>`; return; }
                 if (!d.weapons.length) { host.innerHTML = '<span class="empty">Nothing forged yet.</span>'; return; }
-                let html = '<table><tr><th>Name</th><th>Type</th><th>Slot</th><th>Entry</th><th>Display</th><th>Source</th><th>Created</th><th></th></tr>';
+                let html = '<table><tr><th class="sel"><input type="checkbox" id="wfSelAll" title="Select all"></th><th>Name</th><th>Type</th><th>Slot</th><th>Entry</th><th>Display</th><th>Source</th><th>Created</th><th></th></tr>';
                 for (const w of d.weapons) {
-                    html += `<tr><td>${esc(w.name)}</td><td class="muted">${esc(w.weaponTypeLabel || '—')}</td>` +
+                    html += `<tr><td class="sel"><input type="checkbox" class="wf-sel" data-sel="${w.displayId}" data-name="${esc(w.name)}"></td><td>${esc(w.name)}</td><td class="muted">${esc(w.weaponTypeLabel || '—')}</td>` +
                             `<td class="muted">${esc(w.inventoryTypeLabel || (w.inventoryType != null ? `Inventory type ${w.inventoryType}` : '—'))}</td>` +
                             `<td class="muted">${w.itemEntry || '—'}</td>` +
                             `<td class="muted">${w.displayId}</td><td class="muted">${esc(w.sourceKind)}</td>` +
@@ -3124,8 +3223,60 @@
                 host.innerHTML = html + '</table>';
                 host.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', () => deleteWeapon(btn)));
                 host.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => viewForged(btn)));
+                wireSelection(host);
             } catch (e) { host.innerHTML = `<span class="empty">Could not load: ${esc(e)}</span>`; }
+            updateSelection();
         }
+
+        // ---------- multi-select delete ----------
+        function selectedWeapons() {
+            return [...document.querySelectorAll('#wfWeapons .wf-sel:checked')].map(cb => ({ id: +cb.dataset.sel, name: cb.dataset.name }));
+        }
+        function updateSelection() {
+            const sel = selectedWeapons();
+            const all = document.querySelectorAll('#wfWeapons .wf-sel');
+            const btn = document.getElementById('wfDeleteSelected');
+            btn.disabled = sel.length === 0;
+            btn.textContent = sel.length ? `Delete selected (${sel.length})` : 'Delete selected';
+            const head = document.getElementById('wfSelAll');
+            if (head) { head.checked = all.length > 0 && sel.length === all.length; head.indeterminate = sel.length > 0 && sel.length < all.length; }
+            all.forEach(cb => cb.closest('tr').classList.toggle('selected', cb.checked));
+        }
+        function wireSelection(host) {
+            host.querySelectorAll('.wf-sel').forEach(cb => cb.addEventListener('change', updateSelection));
+            const head = host.querySelector('#wfSelAll');
+            if (head) head.addEventListener('change', () => { host.querySelectorAll('.wf-sel').forEach(cb => { cb.checked = head.checked; }); updateSelection(); });
+        }
+        document.getElementById('wfDeleteSelected').addEventListener('click', async () => {
+            const sel = selectedWeapons();
+            if (!sel.length) return;
+            const names = sel.slice(0, 8).map(w => `• ${w.name}`).join('\n') + (sel.length > 8 ? `\n• …and ${sel.length - 8} more` : '');
+            if (!confirm(`Delete ${sel.length} weapon${sel.length === 1 ? '' : 's'}?\n\n${names}\n\nRemoves them from the world database and the registry; the client patch rebuild is queued once for the whole batch. IDs return to the pool.`)) return;
+            const btn = document.getElementById('wfDeleteSelected');
+            busy(btn, true);
+            try {
+                const d = await (await fetch('/WeaponForge/DeleteWeapons', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ displayIds: sel.map(w => w.id) }),
+                })).json();
+                if (!d.ok) return setResult({ title: 'Delete failed', error: d.error });
+                const failed = d.failed || [];
+                setResult({
+                    title: failed.length ? `Deleted ${d.deleted.length} of ${sel.length} weapons` : `Deleted ${d.deleted.length} weapon${d.deleted.length === 1 ? '' : 's'} everywhere`,
+                    kv: { 'Weapons remaining': d.weaponsRemaining, 'Patch': d.patchQueued ? 'rebuild queued' : d.patchRemoved ? 'removed' : 'repackaged' },
+                    diagnostics: [
+                        ...d.deleted.map(w => `✓ Deleted: ${w.name} (entry ${w.itemEntry}, display ${w.displayId})`),
+                        ...failed.map(f => `✗ Display ${f.displayId}: ${f.error}`),
+                        applyLine(d.reloaded, 'Reload', d.reloadMessage || ''),
+                        d.patchQueued ? queuedLine('Client patch', d.patchDeployMessage || '') : applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
+                    ],
+                    downloads: d.patchDownloadUrl ? [{ label: 'patch-4.MPQ', url: d.patchDownloadUrl }] : [],
+                    note: 'IDs returned to the pool. The weapons stay in the client until you close WoW and click Rebuild patch.',
+                    error: failed.length ? `${failed.length} could not be deleted — see the lines above.` : undefined,
+                });
+            } catch (e) { setResult({ title: 'Delete failed', error: String(e) }); }
+            finally { busy(btn, false); updateSelection(); loadWeapons(); loadStatus(); }
+        });
         async function viewForged(btn) {
             const id = btn.dataset.view, name = btn.dataset.name || ('display ' + id);
             btn.disabled = true;
@@ -3149,16 +3300,16 @@
                 if (!d.ok) return setResult({ title: 'Delete failed', error: d.error });
                 setResult({
                     title: `Deleted "${d.deleted.name}" everywhere`,
-                    kv: { 'Weapons remaining': d.weaponsRemaining, 'Patch': d.patchRemoved ? 'removed' : 'repackaged & redeployed' },
+                    kv: { 'Weapons remaining': d.weaponsRemaining, 'Patch': d.patchQueued ? 'rebuild queued' : d.patchRemoved ? 'removed' : 'repackaged & redeployed' },
                     diagnostics: [
                         applyLine(d.itemRowDeleted, 'World DB', d.itemRowMessage || ''),
                         applyLine(d.reloaded, 'Reload', d.reloadMessage || ''),
-                        applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
+                        d.patchQueued ? queuedLine('Client patch', d.patchDeployMessage || '') : applyLine(d.patchDeployed || d.patchRemoved, 'Patch', d.patchDeployMessage || ''),
                     ],
                     downloads: d.patchDownloadUrl ? [{ label: 'patch-4.MPQ', url: d.patchDownloadUrl }] : [],
-                    note: 'IDs returned to the pool. Fully restart the client. If a reused entry shows cached item metadata, close WoW and remove WDB\\itemcache.wdb (or the whole WDB cache directory); WoW recreates it.'
+                    note: 'IDs returned to the pool. The weapon stays in the client until you close WoW and click Rebuild patch. If a reused entry shows cached item metadata, remove WDB\\itemcache.wdb (or the whole WDB cache directory); WoW recreates it.'
                 });
-            } finally { btn.disabled = false; loadWeapons(); }
+            } finally { btn.disabled = false; loadWeapons(); loadStatus(); }
         }
 
         // ---------- status pills + weapon-type dropdown ----------
@@ -3170,9 +3321,14 @@
                 document.getElementById('pillContract').textContent = 'contract v' + s.coordinateContractVersion;
                 const dp = s.deployedPatch || {};
                 const dpEl = document.getElementById('pillDeploy');
-                dpEl.textContent = !dp.configured ? 'deploy: no client path' : dp.stale ? 'patch-5 STALE in client — close WoW, Rebuild patch' : (dp.deployedExists ? 'patch-5 deployed ✓' : 'patch-5 not deployed yet');
-                dpEl.className = 'wf-pill ' + (!dp.configured ? 'warn' : dp.stale ? 'bad' : 'ok');
-                dpEl.title = dp.message || dpEl.title;
+                // Only the app host's configured Data copy is inspected.
+                dpEl.textContent = !dp.configured ? 'configured client Data: unavailable'
+                    : dp.pending > 0 ? `${dp.pending} change${dp.pending === 1 ? '' : 's'} queued — Rebuild patch`
+                    : !dp.comparisonKnown ? 'configured client Data: comparison unavailable'
+                    : dp.stale ? 'configured client Data: patch-4 differs or is missing'
+                    : 'configured client Data: patch-4 matches ✓';
+                dpEl.className = 'wf-pill ' + (!dp.configured || dp.pending > 0 || !dp.comparisonKnown ? 'warn' : dp.stale ? 'bad' : 'ok');
+                dpEl.title = (dp.message || '') + (dp.pendingReasons && dp.pendingReasons.length ? '\n\nPending:\n• ' + dp.pendingReasons.join('\n• ') : '');
                 fillWeaponTypes(s.weaponTypes || []);
             } catch { pill('pillFixture', false, '', 'status unavailable'); }
         }
@@ -3229,6 +3385,56 @@
         })();
 
         initViewer();
+        let preparedWorkshopSource = null;
+        function workshopImportSettings() {
+            const data = new FormData();
+            importParams(data);
+            return JSON.stringify([...data.entries()]);
+        }
+        initEquipmentWorkshop({
+            async prepareCandidate(candidate) {
+                // The workshop feeds the established GLB route and shared item configuration.
+                // It never writes an item or creates a second packaging implementation.
+                preparedWorkshopSource = null;
+                clearTimeout(sliderTimer);
+                const response = await fetch(candidate.glbUrl);
+                if (!response.ok) throw new Error(`Candidate GLB is unavailable (${response.status}).`);
+                const blob = await response.blob();
+                const transfer = new DataTransfer();
+                transfer.items.add(new File([blob], `${candidate.key}.glb`, { type: 'model/gltf-binary' }));
+                document.getElementById('glbFile').files = transfer.files;
+                const type = document.getElementById('impType');
+                if (![...type.options].some(option => option.value === candidate.weaponType))
+                    type.add(new Option(candidate.weaponType, candidate.weaponType));
+                type.value = candidate.weaponType;
+                document.getElementById('glbName').value = candidate.name;
+                document.getElementById('impPreserveAxes').checked = candidate.placement?.reorient === false;
+                document.getElementById('impKeepTopology').checked = candidate.placement?.targetTriangles === 0;
+                for (const [id, value] of [['impSize', 100], ['impLength', 100], ['impWidth', 100], ['impDepth', 100], ['impHead', 100], ['impHaft', 100], ['impProfile', 0], ['impRoll', 0], ['impUp', 0], ['impSide', 0], ['impPitch', 0], ['impYaw', 0], ['impBright', 0], ['impSat', 0], ['impVisual', 0]])
+                    document.getElementById(id).value = value;
+                for (const id of ['impFlip', 'impFlipUp', 'impMirror', 'impStraighten', 'impRcOn']) document.getElementById(id).checked = false;
+                const file = document.getElementById('glbFile').files[0];
+                const settings = workshopImportSettings();
+                const result = await actions.uploadGlb();
+                if (result?.ok) {
+                    if (file !== document.getElementById('glbFile').files[0] || settings !== workshopImportSettings())
+                        throw new Error('The import inputs changed while the candidate was being inspected. Inspect it again.');
+                    preparedWorkshopSource = { file, settings, sourceSha256: result.sourceSha256 };
+                    result.workshopImportSettings = JSON.parse(settings);
+                }
+                return result;
+            },
+            async configureCandidate(candidate, reviewed) {
+                // Bind this review to the exact File object and settings used by UploadGlb.
+                if (!preparedWorkshopSource || document.getElementById('glbFile').files[0] !== preparedWorkshopSource.file
+                    || preparedWorkshopSource.sourceSha256 !== reviewed.sourceSha256
+                    || workshopImportSettings() !== preparedWorkshopSource.settings)
+                    throw new Error('The prepared GLB or its import settings changed. Inspect this candidate again before configuring it.');
+                await itemBuildOpen('glb');
+            }
+        });
+        for (const id of ['impPreserveAxes', 'impKeepTopology'])
+            document.getElementById(id).addEventListener('change', schedulePreviewIfLive);
         loadStatus();
         LEGACY_LANES.forEach(loadLaneStatus);
         loadItemVisuals();
