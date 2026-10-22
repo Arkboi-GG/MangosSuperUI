@@ -430,7 +430,7 @@ WHERE id = @BuildId", new { s.Status, s.MpqSha1, s.MpqSize, log, s.BuildId });
 
         var paths = docs.Where(d => d.Kind == "path").Select(d => GradedPath.Parse(d.DocKey, d.Body)).ToList();
         var touched = sculpt.Keys.Concat(surfaceSculpt.Keys).Concat(wmos.Keys).Concat(m2s.Keys).Concat(_baseAdts.Keys)
-            .Concat(paths.SelectMany(p => p.Tiles().Select(t => (p.Map, t.col, t.row))))
+            .Concat(paths.SelectMany(p => p.TouchedTiles().Select(t => (p.Map, t.col, t.row))))
             .Where(k => mapDirs.ContainsKey(k.Item1)).Distinct().OrderBy(k => k).ToList();
         var present = new List<(int map, int col, int row)>();
         var built = new Dictionary<(int map, int col, int row), AdtDocument>();
@@ -474,6 +474,19 @@ WHERE id = @BuildId", new { s.Status, s.MpqSha1, s.MpqSize, log, s.BuildId });
         // Human edits are deltas to the finished surface, after all absolute shaping and stitching.
         // Shared border samples are mirrored at save time; Write rebuilds changed normals and minimaps see final heights.
         WorldPackSculptLayers.ApplySurface(built, surfaceSculpt);
+        // Road surfaces last: texture only, after every height change (they never move ground). The same TerrainPaint
+        // rule paints the client's live preview, so what the author saw is what ships.
+        foreach (var path in paths.Where(p => p.Surface is not null))
+        {
+            if (stock.ReadFile(path.Surface!.Texture) is null)
+            {
+                Log(s, $"path {path.Name}: surface texture {path.Surface.Texture} is not in the game archives - not painted");
+                continue;
+            }
+            foreach (var (col, row) in path.TouchedTiles())
+                if (built.TryGetValue((path.Map, col, row), out var doc) && path.PaintSurface(doc) is var painted && painted > 0)
+                    Log(s, $"path {path.Name}: tile {path.Map}:{col},{row} painted {path.Surface.Texture} ({painted} chunk(s))");
+        }
         foreach (var key in present)
         {
             var (map, col, row) = key;
@@ -590,10 +603,11 @@ WHERE id = @BuildId", new { s.Status, s.MpqSha1, s.MpqSize, log, s.BuildId });
         }
         // Graded paths last (after the seams): absolute heights, the same for every tile they cross.
         foreach (var path in paths)
-            foreach (var (col, row) in path.Tiles())
+            foreach (var (col, row) in path.TouchedTiles())
                 if (built.TryGetValue((path.Map, col, row), out var doc))
                 {
-                    int moved = doc.ApplySculpt(path.Deltas(col, row, doc.OuterHeights()));
+                    // grade:false = a road that follows the land (surface only); it still clears its lane.
+                    int moved = path.Grade ? doc.ApplySculpt(path.Deltas(col, row, doc.OuterHeights())) : 0;
                     int cleared = path.Clear ? doc.DropDoodads((_, pos) => path.InLane(pos)) : 0;
                     if (moved > 0 || cleared > 0) Log(s, $"path {path.Name}: tile {path.Map}:{col},{row} graded ({moved} height(s), {cleared} prop(s) cleared from the lane)");
                 }
