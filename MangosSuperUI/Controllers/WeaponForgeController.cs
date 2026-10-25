@@ -26,7 +26,7 @@ namespace MangosSuperUI.Controllers;
 /// Everything here is build/staging only in spirit: forging inserts and deploys via the audited
 /// build service; nothing else touches a live server or client.
 /// </summary>
-public class WeaponForgeController : Controller
+public partial class WeaponForgeController : Controller
 {
     // Golden donor fixture paths (WEAPON_GEN.md §13.3).
     private const string DonorM2Path = @"ITEM\ObjectComponents\WEAPON\Sword_1H_Short_A_01.m2";
@@ -324,6 +324,9 @@ public class WeaponForgeController : Controller
             return new
             {
                 configured = st.Configured, built = st.Built, deployedExists = st.Deployed, stale = st.Stale,
+                comparisonKnown = st.ComparisonKnown, comparisonState = st.ComparisonState,
+                referencePath = st.ReferencePath, targetPath = st.TargetPath,
+                expectedSha256 = st.ExpectedSha256, actualSha256 = st.ActualSha256,
                 pending = st.Pending, pendingReasons = st.PendingReasons, message = st.Message,
             };
         }
@@ -740,6 +743,7 @@ public class WeaponForgeController : Controller
             hasTexture = import.TexturePng is { Length: > 0 },
             withinForgeBudget = mesh.TriangleCount <= MaxForgeTriangles,
             normalization = mesh.Normalization,
+            qualityAudit = EquipmentMeshAudit.Analyze(mesh, AdjustTexture(texturePng, brightness, saturation)),
             recolorApplied,
             grip = BuildGripInfo(mesh, profile, donor),
             preview,
@@ -2991,9 +2995,14 @@ public class WeaponForgeController : Controller
             await System.IO.File.WriteAllBytesAsync(disk, png, HttpContext.RequestAborted);
             var families = _palette.DetectFamilies(disk);
             if (families.Count == 0) return Json(new { success = false, error = "no colour families detected" });
-            var chromatic = families.Where(f => f.Family is not ("white" or "black" or "grey")).ToList();
-            var primary = (chromatic.Count > 0 ? chromatic : families).OrderByDescending(f => f.Percent).First();
-            return Json(new { success = true, primaryHex = HslToHex(primary.MeanHue, Math.Max(0.5f, primary.MeanSat), 0.5f) });
+            // The same choice the "none" recolor makes, so the seed is the colour that will move.
+            // A neutral primary (bare steel) seeds as the steel it is, not a forced half-saturated hue.
+            var primary = PaletteSwapService.ChooseStraightPrimary(families)
+                          ?? families.OrderByDescending(f => f.Percent).First();
+            bool neutral = primary.Family is "grey" or "white" or "black";
+            return Json(new { success = true, primaryHex = neutral
+                ? HslToHex(primary.MeanHue, Math.Min(primary.MeanSat, 0.1f), Math.Clamp(primary.MeanLightness, 0.15f, 0.85f))
+                : HslToHex(primary.MeanHue, Math.Max(0.5f, primary.MeanSat), 0.5f) });
         }
         finally { try { Directory.Delete(tmpDir, true); } catch { } }
     }

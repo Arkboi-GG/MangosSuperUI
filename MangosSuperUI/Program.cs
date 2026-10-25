@@ -54,6 +54,9 @@ builder.Services.AddSingleton<ProcessCoreSampler>();
 builder.Services.AddSingleton<StateCaptureService>();
 builder.Services.AddHttpContextAccessor();            // lets AuditService stamp the caller's ip on rows written deep in a service
 builder.Services.AddSingleton<AuditService>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WorldPacks.WorldPackStore>();        // World Builder packs (MSUIClient shared_docs/WORLD_BUILDER.md)
+builder.Services.AddSingleton<MangosSuperUI.Services.WorldPacks.WorldPackBuildService>();
+builder.Services.AddSingleton<MangosSuperUI.Services.WorldPacks.WorldPackVerifier>();
 builder.Services.AddSingleton<WorldArtifactService>();
 builder.Services.AddSingleton<RtsWorldCreationService>();
 builder.Services.AddSingleton<WorldMaintenanceGate>();
@@ -193,6 +196,8 @@ builder.Services.AddSingleton<SpellProgressionLoader>();
 builder.Services.AddSingleton<ZoneDataLoader>();
 builder.Services.AddSingleton<CreatureSpawnLoader>();   // Scatter Build 2: per-entry spawn footprint sampler (QuestPlanner)
 builder.Services.AddSingleton<QuestGraphLoader>();
+builder.Services.AddSingleton<MangosSuperUI.Services.QuestAtlas.ReliefService>();   // Quest Atlas: compiled tabletop relief (QUEST_ATLAS.md)
+builder.Services.AddSingleton<MangosSuperUI.Services.QuestAtlas.QuestAtlasService>();
 builder.Services.AddSingleton<BotBrainDbInit>();
 
 // Brain spine (Strategy B rebuild): executor + supervisor + driver
